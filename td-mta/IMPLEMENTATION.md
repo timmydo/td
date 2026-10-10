@@ -2807,6 +2807,8 @@ atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
 M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
 unavailable until their owning increment lands; M19 supplies shared CLI wiring.
+The standalone offline selected-account `store verify` command below has
+landed independently and requires no serving runtime or control socket.
 
 **Acceptance:** unauthorized socket access fails by filesystem policy; stale
 IDs and concurrent controls cannot duplicate delivery. Health reports disk,
@@ -2825,6 +2827,16 @@ STORAGE.md. Snapshot service-wide credentials/configuration only while stopped
 until a separate consistency protocol exists. Preserve a pre-repair copy
 or manifest sufficient to audit changes. Rebuild indexes independently. Change
 store epoch on restore and refuse incompatible formats without altering them.
+
+The offline selected-account verification command is implemented:
+`td-mta store verify --root PATH --account ID [--timeout-seconds N]`. It
+combines physical database validation and snapshot-bound account metadata/body
+checks under the cooperative writer lock, with versioned JSON and explicit
+account scope. STORAGE.md defines deadlines, result fields, exit codes and
+SQLite recovery/sidecar effects. Process tests exercise real persisted chunks,
+digest corruption, shared object IDs, lock/policy refusal and invalid arguments.
+Whole-store semantic enumeration, repair, backup/restore commands and runtime
+administration remain separate increments.
 
 The native offline primitives now include consuming IndexStore::backup
 and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies

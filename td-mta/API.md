@@ -6532,8 +6532,10 @@ ViewIdentity; it grants neither body-pin custody nor current freshness.
 Empty accounts can complete under zero limits. This is neither a
 physical/index-consistency check nor full store verification: an offline
 coordinator must establish physical integrity separately and combine
-metadata and body results for the same snapshot. No verification CLI or
-service activation is enabled.
+metadata and body results for the same snapshot. The primitive alone enables
+no command or service activation. The separate offline selected-account
+`store verify` command composes these stages as specified in STORAGE.md;
+it does not enable serving.
 
 account_checks::combine(metadata, bodies) binds completed metadata and
 body reports only when their complete ViewIdentity values match and the

@@ -150,8 +150,9 @@ its tests in one named child directory. The previous nested response module
 tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
-The M03b2c packaging entry point supports only `--version` and `--help`;
-service commands arrive with their implementations. Its direct
+The packaging entry point supports `--version`, `--help`, and offline
+`store verify` for an explicitly selected account. STORAGE.md owns its scope
+and machine-readable results. Other commands arrive with their implementations. Its direct
 dependencies are the local `td-crypto`, `td-header`, `td-json`, `td-mime`
 and `td-nfc` crates, plus the approved private rusqlite dependency with
 bundled SQLite. Application protocols, configuration and scheduling use std

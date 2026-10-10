@@ -1395,8 +1395,8 @@ no service activation. Connection destruction retains its existing
 synchronous cleanup limits. Authorization, stopped service activity,
 resource admission, backup selection, digest/domain verification and
 compatible configuration/credentials remain caller responsibilities.
-Online backup, operational restore commands, verification/repair and
-history maintenance tools remain unimplemented. SQLite integrity checks
+Online backup, restore, repair and history maintenance tools remain
+unimplemented. Offline selected-account verification is implemented below. SQLite integrity checks
 do not replace digest and domain validation.
 
 ### Disposable ingress staging
@@ -2055,8 +2055,8 @@ The report is historical data, not a body pin, authentication credential
 or ongoing freshness proof. Physical/index consistency and orphan chunk
 absence require separate whole-store maintenance; metadata checks and
 body reports must identify the same snapshot before an offline
-coordinator combines them. This primitive does not enable the operational
-verify/restore CLI or qualify complete crash/fault/resource behavior.
+coordinator combines them. This primitive alone grants no operational
+authority or complete crash/fault/resource qualification.
 
 The pure account_checks::combine guard packages CompleteMetadata and
 CompleteBodies only after equality of account, epoch, committed sequence
@@ -2107,3 +2107,63 @@ returns Corrupt. No whole body is buffered or hashed by this query. It
 shares the original maintenance fence, deadline and finite VM allowance;
 resource, clock or I/O refusal cannot grant completion. Selected body
 pins still perform their own length, digest and extent verification.
+
+## Offline verification command
+
+`td-mta store verify --root PATH --account ID [--timeout-seconds N]`
+opens an existing store under its cooperative writer lock, runs full SQLite
+physical/index/foreign-key, anchor-cardinality and chunk-geometry validation,
+then checks the selected account's metadata references, mailbox forest,
+recipient coverage and every declared body's complete digest. The canonical
+local AccountId is required. Physical checks cover the database; semantic
+metadata and body-digest checks cover only that account, including when other
+accounts share its object IDs. Success never claims all accounts were checked.
+
+Run offline as a local administrator with filesystem access to the private
+root, under the existing stable-path and dedicated-owner deployment rules.
+The command is not a network authorization path. Invalid root permissions,
+links, ownership, schema and an occupied writer lock refuse. It never creates
+a store, changes object rows, repairs corruption or replaces a store epoch.
+Opening/closing SQLite may perform recovery/checkpoint work and create/remove
+sidecars; acquiring the lock may create LOCK. Logically read-only verification
+is not a promise that filesystem bytes remain unchanged.
+
+One RuntimeClock and one absolute deadline cover open, physical validation
+and the account scan. The default is 600 seconds; a positive decimal
+`--timeout-seconds` overrides it with checked millisecond arithmetic. The
+maintenance view retains its finite VM allowance across all metadata/body
+passes. Metadata row/parent and blob counters retain checked overflow; they
+have no additional CLI truncation limit. Total declared body bytes may not
+exceed the native database ceiling. The command reuses bounded streaming
+scratch and does not load bodies or the mailbox into RAM. Native recovery,
+sync, checkpoint and synchronous kernel I/O still have the interruption
+limitations specified above; this option is not a process wall-time guarantee.
+
+Each recognized `store` invocation emits one schema-1 JSON line to stdout.
+Missing or unsupported store subcommands report `command: "store"` and
+invalid usage; accepted verification dispatch reports `store.verify`.
+Success has `command: "store.verify"`, `status: "ok"`, `scope: "account"`,
+`physical_integrity: true`, canonical `account` and `epoch`, `sequence`,
+`history_floor`, metadata `checked_at_ms`, `metadata_rows`, `mailboxes`,
+`submissions`, `recipients`, `blobs` and `body_bytes`. The lock is released
+after verification and native cleanup, before output. The report is historical
+completion, not serving readiness, body custody or permanent freshness.
+Failure has `status: "error"`, a fixed `stage` and fixed `error` code; it emits
+no partial success counts, pathnames or message text. Root policy and root I/O
+share `root-policy-or-io`; metadata/report failures use `verification-failed`.
+Clock sampling uses `stage: "clock"`; absolute deadline arithmetic overflow
+uses `stage: "arguments"` and exits two before root access. Lock policy
+refusal uses `stage: "lock"`, `error: "lock-policy"`.
+Native/body failures retain fixed adapter codes such as `corrupt`, `deadline`,
+`capacity`, `not-found` and `io`. Lock contention is `stage: "lock"`,
+`error: "busy"`. Exit zero means verification completed; one means a
+verification/I/O failure (including output failure); two means invalid usage.
+Duplicate, unknown, missing, non-UTF-8 and overflowed options refuse before
+store access. Existing help/version behavior remains available.
+
+Process fixtures run the actual command on two accounts sharing a BlobId,
+including a body spanning multiple chunks. Corrupting the selected body's
+bytes refuses after physical validation; corrupting the other account's body
+does not enlarge selected-account scope. Corrupt database headers, occupied
+locks, missing accounts, invalid permissions and malformed arguments refuse.
+Reopen checks preserve the original epoch and committed account sequence.
