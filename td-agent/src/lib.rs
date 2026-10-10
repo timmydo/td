@@ -73,6 +73,7 @@ pub(crate) mod review_controls;
 pub(crate) mod review_environment;
 pub mod review_log;
 pub mod review_metrics;
+pub(crate) mod review_routing;
 pub mod review_session;
 pub mod review_workspace;
 pub mod rules;

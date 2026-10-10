@@ -246,6 +246,136 @@ fn run(fixture: &Fixture, mock: &MockFetch, cap: &str) -> std::process::Output {
 
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn provider_routing_prices_selected_endpoints_and_keeps_the_session_across_turns() {
+    let fixture = Fixture::new();
+    let endpoints = Reply::Http { status: 200, headers: vec![], body: format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap/fp8","context_length":1000000,"max_completion_tokens":32768,"supported_parameters":["tools","max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}},{{"tag":"dear","context_length":1000000,"supported_parameters":["tools","max_tokens"],"pricing":{{"prompt":"0.01","completion":"0.01"}}}}]}}}}"#).into_bytes() };
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            endpoints,
+            tool(
+                "read_file",
+                Json::Obj(vec![(
+                    "path".into(),
+                    Json::Str("/source/source-only".into()),
+                )]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = fixture
+        .command(&mock, "0.02")
+        .args([
+            "--routing",
+            "floor",
+            "--provider",
+            "cheap",
+            "--no-provider-fallbacks",
+            "--max-input-price",
+            "0.02",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].url.ends_with("/endpoints"));
+    let first = td_json::parse(&requests[1].text()).unwrap();
+    let next = td_json::parse(&requests[2].text()).unwrap();
+    assert_eq!(
+        first.get("model").and_then(Json::as_str),
+        Some(format!("{MODEL}:floor").as_str())
+    );
+    assert_eq!(
+        first.get_path(&["provider", "only"]),
+        Some(&Json::Arr(vec![Json::Str("cheap".into())]))
+    );
+    assert_eq!(
+        first.get_path(&["provider", "allow_fallbacks"]),
+        Some(&Json::Bool(false))
+    );
+    assert_eq!(
+        first
+            .get_path(&["provider", "max_price", "prompt"])
+            .and_then(Json::as_f64),
+        Some(0.01)
+    );
+    assert_eq!(first.get("session_id"), next.get("session_id"));
+    let logs = fixture.logs();
+    assert!(logs[0].contains("routing_endpoints"));
+    assert!(logs[0].contains(first.get("session_id").unwrap().as_str().unwrap()));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn diff_review_routes_and_explains_default_price_ceiling_refusals() {
+    for routed in [false, true] {
+        let fixture = Fixture::new();
+        let first = if routed {
+            Reply::Http {status:200,headers:vec![],body:format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap","supported_parameters":["max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}}]}}}}"#).into_bytes()}
+        } else {
+            models()
+        };
+        let mock = MockFetch::start(
+            &fixture.root.join("run"),
+            vec![
+                first,
+                Reply::Http {
+                    status: 404,
+                    headers: vec![("content-type".into(), "application/json".into())],
+                    body: br#"{"error":{"message":"No endpoints found"}}"#.to_vec(),
+                },
+            ],
+        );
+        let input = fixture.root.join("commit.txt");
+        fs::write(&input, "commit 1234567890\n\n    fixture review\n").unwrap();
+        let template = fixture.command(&mock, "0.02");
+        let mut command = Command::new(PROGRAM);
+        command.args([
+            "review",
+            "--model",
+            MODEL,
+            "--max-tokens",
+            "4096",
+            "--max-cost",
+            "0.02",
+        ]);
+        if routed {
+            command.args(["--routing", "fastest", "--provider", "cheap"]);
+        }
+        command.arg(input).stdin(Stdio::null());
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        let result = command.output().unwrap();
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("review provider price ceiling")
+                && stderr.contains("--routing balanced"),
+            "{stderr}"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        let body = td_json::parse(&requests[1].text()).unwrap();
+        assert!(body.get_path(&["provider", "max_price"]).is_some());
+        assert_eq!(
+            body.get_path(&["provider", "sort"]).and_then(Json::as_str),
+            if routed { Some("throughput") } else { None }
+        );
+        assert!(!fixture.config.join("td-agent/reviews").exists());
+    }
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn tools_read_only_source_write_scratch_expand_sparse_and_cleanup() {
     let fixture = Fixture::new();
     let args = Json::Obj(vec![("command".into(), Json::Str("if printf BAD > source-only; then echo SOURCE_WRITABLE; else echo SOURCE_READ_ONLY; fi; cat source-only; mkdir -p \"$CARGO_TARGET_DIR\"; printf SCRATCH_OK > \"$CARGO_TARGET_DIR/marker\"; cat \"$CARGO_TARGET_DIR/marker\"".into()))]);

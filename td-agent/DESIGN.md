@@ -224,6 +224,39 @@ and has no tools when reading FILE or standard input. `--max-cost USD`
 may lower the single request's cost limit. The commit goes to the provider
 because the person ran the command on it.
 
+Both forms accept `--routing balanced|cheapest|floor|fastest|nitro|latency`.
+Balanced is OpenRouter's default; cheapest/fastest/latency set provider
+sorting. Floor and Nitro send the corresponding model variant, enabling
+flex and priority tiers respectively; they are not synonyms for sorting.
+Metadata always names the base model. `--provider SLUG` restricts providers
+(repeatable, up to 32 distinct slugs, endpoint variants allowed), and
+`--no-provider-fallbacks` disables fallback attempts. `--max-input-price`
+and `--max-output-price` filter at dollars per million tokens.
+
+Explicit routing/filter choices fetch and retain the base model's endpoint
+listing. Matching provider tags, eligible service tiers and price filters select
+the metadata population; its maximum per-category prices and minimum capabilities form
+a conservative envelope, including all fallback candidates. Unpriced or
+empty selections fail before a completion. Every priced request sends
+`provider.max_price` for input, output and per-request rates matching that
+envelope, so a cheaper advertised model price cannot silently admit a
+dearer provider. Endpoints lacking required parameters or the chosen completion length
+are excluded before combining capabilities: one small or tool-less
+provider cannot restrict a capable alternative. If every eligible endpoint
+has a smaller completion cap, the largest available one bounds the review.
+Base provider slugs match ordinary regions/variants; non-default tiers
+require Floor/Nitro or an exact tier slug (fast/priority are aliases).
+Cache-write and reasoning rates still contribute to the reservation,
+without raising the wire base-input/output price ceilings; this is a metadata-based bound, not a billing reconciliation.
+The original parameter-support and data-collection restrictions remain.
+Default reviews use model-list metadata with the same wire price ceiling.
+
+Every review generates a random session id, retained in the start record
+and sent on every request/retry. It establishes OpenRouter session sticky
+routing without depending on opening-message hashes; it does not guarantee
+a cache hit or disable provider fallback. Exact routing policy, endpoint
+metadata, request bodies and served providers remain in the trace.
+
 `td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...`
 instead resolves REV (HEAD by default) once to a full commit id and reviews
 it in a disposable sparse checkout. The commit's full message and diff are
@@ -1640,14 +1673,16 @@ and how it ends. A model without pricing cannot be reserved against
 and is refused while a limit is set.
 
 The review command (§2) has no conversation and no day's ledger, which
-the window process alone keeps: each review fetches the models list and
-reserves from it as a turn does, its prompt estimated at one token per
+the window process alone keeps: default reviews fetch the models list and
+explicit routing/filter choices fetch eligible endpoint metadata (§2).
+Each reserves as a turn does, its prompt estimated at one token per
 three ASCII bytes and one per byte of anything else, at the highest
 prompt rate, its `max_tokens` at the highest completion rate, and the
 per-request fee; it is not sent when that alone passes
 `max_cost_per_turn`, or when the model is unlisted or unpriced while
-that limit is set. Without that limit, a list that cannot be had leaves
-the model unlisted rather than refusing the review. What it spends is not added to the day's total; it
+that limit is set. Without that limit, default diff-only reviews may leave the model
+unlisted when the list is unavailable. Explicit routing/filter choices
+require usable endpoint metadata even without a per-turn limit. What it spends is not added to the day's total; it
 is said on standard error, and the provider's own key limit is the
 bound across reviews.
 
@@ -1663,7 +1698,7 @@ keeps the reservation.
 An explicit `--max-cost` on a diff-only review uses this byte bound too
 and refuses a final reported charge above the limit.
 No further model request is sent if it would exceed the total. A reported
-charge above the cap stops the review. Pricing is the models list's bound,
+charge above the cap stops the review. Pricing uses the model or selected endpoint metadata envelope,
 not an independent guarantee about a provider's billing. The total and
 request count are printed to standard error even when the loop fails.
 

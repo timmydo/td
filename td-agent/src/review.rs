@@ -38,11 +38,13 @@ const MAX_MAX_TOKENS: u64 = 200_000;
 const ASCII_BYTES_PER_TOKEN: u64 = 3;
 
 pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL] \
-                         [--max-tokens N] [--max-cost USD] [--log-dir DIRECTORY] [--] [FILE]\n\
+                         [--max-tokens N] [--max-cost USD] [--log-dir DIRECTORY] [--routing MODE] [--] [FILE]\n\
        td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
                        [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
                        [--max-cost USD] [--log-dir DIRECTORY]\n\
                        [--tool-output-bytes N] [--tool-context-bytes N]\n\
+                       [--routing MODE] [--provider SLUG]... [--no-provider-fallbacks]\n\
+                       [--max-input-price USD/M] [--max-output-price USD/M]\n\
                        [--vendor DIRECTORY] [--test-runner TD-BUILDER]\n\
 \n\
 With --repo, reviews REV (HEAD by default) in a disposable sparse checkout,\n\
@@ -67,7 +69,7 @@ the model and provider that served it, its token counts and cost to\n\
 standard error. MODEL defaults to the configured `model`; LEVEL, one of\n\
 none, minimal, low, medium, high or xhigh, is sent only when given; N\n\
 defaults to 32768, cut to the model's own limit. Its worst case must fit\n\
-max_cost_per_turn, priced from the API's models list: for a dear model,\n\
+max_cost_per_turn, priced from model or endpoint metadata: for a dear model,\n\
 ask a smaller N or raise that limit. It exits non-zero unless the review\n\
 finished whole. It needs td's fetch service: on td, run it from a\n\
 terminal with XDG_RUNTIME_DIR naming /run/user/1000; on a host, as\n\
@@ -77,6 +79,13 @@ Both review forms retain full session traces after cleanup in\n\
 $XDG_STATE_HOME/td-agent/reviews (or ~/.local/state/td-agent/reviews).\n\
 --log-dir selects another private directory. The\n\
 private JSONL path is printed to stderr before the review starts.\n\
+\n\
+--routing selects balanced (default), cheapest, floor, fastest, nitro or latency.\n\
+--provider SLUG restricts eligible providers (repeatable); --max-input-price\n\
+and --max-output-price set dollars per million tokens. --no-provider-fallbacks\n\
+disables fallback attempts. Floor/Nitro enable\n\
+flex/priority tiers; cheapest/fastest only sort. Every request carries a\n\
+session id; priced requests carry a provider price envelope.\n\
 \n\
 For example:\n\
 \n\
@@ -103,6 +112,11 @@ plainly when you find nothing.";
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Options {
     pub model: Option<String>,
+    pub routing: Option<String>,
+    pub providers: Vec<String>,
+    pub no_provider_fallbacks: bool,
+    pub max_input_price: Option<u64>,
+    pub max_output_price: Option<u64>,
     pub effort: Option<String>,
     pub max_tokens: Option<u64>,
     /// None for standard input.
@@ -138,6 +152,47 @@ impl Options {
                 "--" if !options_done => options_done = true,
                 "--model" if !options_done && options.model.is_none() => {
                     options.model = Some(config::model_id("--model", &value()?)?)
+                }
+                "--routing" if !options_done && options.routing.is_none() => {
+                    let mode = value()?;
+                    if !crate::review_routing::MODES.contains(&mode.as_str()) {
+                        return Err(
+                            "--routing is balanced, cheapest, floor, fastest, nitro or latency"
+                                .into(),
+                        );
+                    }
+                    options.routing = Some(mode);
+                }
+                "--no-provider-fallbacks" if !options_done && !options.no_provider_fallbacks => {
+                    options.no_provider_fallbacks = true;
+                }
+                "--provider" if !options_done => {
+                    let slug = value()?;
+                    if slug.is_empty()
+                        || !slug.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b"-/".contains(&b)
+                        })
+                        || slug.split('/').any(str::is_empty)
+                    {
+                        return Err("--provider requires a lowercase provider slug".into());
+                    }
+                    if options.providers.len() >= 32 || options.providers.contains(&slug) {
+                        return Err("--provider requires at most 32 distinct slugs".into());
+                    }
+                    options.providers.push(slug);
+                }
+                "--max-input-price" | "--max-output-price" if !options_done => {
+                    let slot = if arg == "--max-input-price" {
+                        &mut options.max_input_price
+                    } else {
+                        &mut options.max_output_price
+                    };
+                    if slot.is_some() {
+                        return Err(usage());
+                    }
+                    let amount = crate::cost::parse(&value()?, false)
+                        .ok_or("provider price must be nonnegative dollars per million tokens")?;
+                    *slot = Some(amount / 1_000_000);
                 }
                 "--effort" if !options_done && options.effort.is_none() => {
                     let text = value()?;
@@ -622,10 +677,11 @@ fn run_diff(
     let sized = body("", &commit, &nonce)?;
     // Without a per-turn limit, a list that cannot be had only leaves
     // the model unlisted.
-    let wanted = options.model.as_deref().unwrap_or(&client.model);
-    let listed = match models(&client.base_url, &[wanted]) {
+    let listed = match crate::review_routing::prepare(options, client, journal) {
         Ok(listed) => listed,
-        Err(_) if client.limits.turn.is_none() => Models::default(),
+        Err(_) if client.limits.turn.is_none() && !crate::review_routing::explicit(options) => {
+            Models::default()
+        }
         Err(e) => return Err(e),
     };
     let model = options.model.as_deref().unwrap_or(&client.model);
@@ -649,7 +705,13 @@ fn run_diff(
             ),
         ]),
     )?;
-    let body = body(&head(&plan, client), &commit, &nonce)?;
+    let routed = crate::review_routing::head(
+        &head(&plan, client),
+        options,
+        listed.find(model),
+        journal.session(),
+    )?;
+    let body = body(&routed, &commit, &nonce)?;
     let mut out = std::io::stdout().lock();
     let (completion, served) = request(client, key, &body, &mut out, journal)?;
     out.write_all(b"\n")
@@ -700,6 +762,9 @@ pub(crate) fn request(
     journal: &mut crate::review_log::Journal,
 ) -> Result<(Completion, Served), String> {
     journal.text("request_body", body)?;
+    let rate_ceiling = td_json::parse(body)
+        .ok()
+        .and_then(|b| b.get_path(&["provider", "max_price"]).cloned());
     let url = format!("{}/chat/completions", client.base_url);
     let headers = client::headers(key.expose());
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
@@ -761,7 +826,12 @@ pub(crate) fn request(
         }
         match consumed {
             Ok(completion) => break completion,
-            Err(ended) => {
+            Err(mut ended) => {
+                if status == 404 {
+                    if let Some(ceiling) = &rate_ceiling {
+                        ended=Ended::Failed(format!("{}; review provider price ceiling {ceiling}; use --routing balanced to price eligible endpoints, or adjust explicit provider/price filters",ended.text()));
+                    }
+                }
                 journal.text("request_error", ended.text())?;
                 match again(attempt, &ended) {
                     Some(wait) => {

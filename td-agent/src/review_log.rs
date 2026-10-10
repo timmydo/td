@@ -11,6 +11,7 @@ pub(crate) struct Journal {
     file: File,
     directory: std::path::PathBuf,
     sequence: u64,
+    session: String,
     started: Instant,
 }
 
@@ -157,7 +158,8 @@ impl Journal {
         let binary = std::env::current_exe().map_err(|e| format!("review agent path: {e}"))?;
         let binary_hash = crate::sha256::sha256_file(std::path::Path::new("/proc/self/exe"))
             .map_err(|e| format!("review agent hash: {e}"))?;
-        let path = directory.join(format!("{}.jsonl", crate::store::random_hex(16)?));
+        let session = crate::store::random_hex(16)?;
+        let path = directory.join(format!("{session}.jsonl"));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -173,12 +175,18 @@ impl Journal {
             file,
             directory,
             sequence: 0,
+            session,
             started: Instant::now(),
         };
         journal.event(
             "start",
             Json::Obj(vec![
                 ("version".into(), Json::from(1u64)),
+                ("session_id".into(), Json::Str(journal.session.clone())),
+                (
+                    "routing".into(),
+                    Json::Str(options.routing.as_deref().unwrap_or("balanced").into()),
+                ),
                 (
                     "cwd".into(),
                     std::env::current_dir()
@@ -223,9 +231,29 @@ impl Journal {
                     },
                 ),
                 ("model".into(), Json::Str(model.into())),
+                (
+                    "provider_only".into(),
+                    Json::Arr(options.providers.iter().cloned().map(Json::Str).collect()),
+                ),
+                (
+                    "provider_fallbacks".into(),
+                    Json::Bool(!options.no_provider_fallbacks),
+                ),
+                (
+                    "max_input_price_per_token".into(),
+                    options.max_input_price.map_or(Json::Null, Json::from),
+                ),
+                (
+                    "max_output_price_per_token".into(),
+                    options.max_output_price.map_or(Json::Null, Json::from),
+                ),
             ]),
         )?;
         Ok(journal)
+    }
+
+    pub(crate) fn session(&self) -> &str {
+        &self.session
     }
 
     pub(crate) fn outside(&self, paths: &[std::path::PathBuf]) -> Result<(), String> {
