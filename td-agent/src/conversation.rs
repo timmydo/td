@@ -430,6 +430,12 @@ enum Inbound {
     /// A command's connection waits for a decision, or waited and is
     /// gone (DESIGN.md §10).
     Link(crate::egress::Asked),
+    /// `model`'s endpoints listing, fetched on its own thread, or why
+    /// not (DESIGN.md §5, Routing).
+    Listing {
+        model: String,
+        result: Result<td_json::Json, String>,
+    },
 }
 
 /// How a background process ended: `how` as `process_list` says it, and
@@ -632,6 +638,7 @@ pub fn serve_in(
         mode: crate::config::Mode::Ask,
         braked: false,
         system_revoked: false,
+        routes: Vec::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -958,6 +965,21 @@ struct Session {
     /// Settings that wait for the turn take the system view away, which
     /// is taken at once (DESIGN.md §8, System view).
     system_revoked: bool,
+    /// The endpoint envelopes fetched (DESIGN.md §5, Routing).
+    routes: Vec<Route>,
+}
+
+/// How long an endpoint envelope is kept before it is fetched again, so
+/// that a provider's new price is taken up.
+const ROUTE_KEPT: Duration = Duration::from_secs(15 * 60);
+
+/// A model's endpoint envelope for one routing, as fetched.
+struct Route {
+    model: String,
+    routing: String,
+    reasoning: bool,
+    fetched: Instant,
+    envelope: Model,
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -1005,7 +1027,7 @@ impl Session {
         while self.ended.is_none() {
             match self.inbox.try_recv() {
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 Ok(Inbound::Link(asked)) => self.link(asked),
@@ -1060,7 +1082,7 @@ impl Session {
                 Ok(Inbound::Closed) | Err(_) => return Ok(None),
                 Ok(Inbound::Broken(e)) => return Err(format!("the window: {e}")),
                 // A stream given up on, still reading to its next frame.
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
             }
         }
     }
@@ -1125,6 +1147,7 @@ impl Session {
                 Down::Compact { focus } => self.compact(focus)?,
                 Down::Kill { number } => self.killed_by_person(number),
                 Down::Choose { model, effort } => self.choose(model, effort)?,
+                Down::Route { routing } => self.route(routing)?,
                 Down::Fetched { remote, result } => self.stored(remote, result)?,
                 Down::Heads { remote, bases, ids } => self.heads(&remote, &bases, &ids)?,
                 // A reservation granted after its request gave up waiting:
@@ -1528,7 +1551,7 @@ impl Session {
                     }
                 }
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 Ok(Inbound::Link(asked)) => self.link(asked),
@@ -1554,7 +1577,7 @@ impl Session {
                 Inbound::Down(Down::Interrupt) => self.interrupt = true,
                 Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
                 Inbound::Down(down) => self.later(down),
-                Inbound::Fetch { .. } => {}
+                Inbound::Fetch { .. } | Inbound::Listing { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
                 Inbound::Link(asked) => self.link(asked),
@@ -1715,9 +1738,18 @@ impl Session {
             name,
             reasoning_effort,
             model,
+            routing,
         } = match self.asking()? {
             Ok(asking) => asking,
-            Err(why) => return Ok(Outcome::stop(why)),
+            // Interrupted, or the window closed, before anything was
+            // sent: asked again as a reservation cut short is.
+            Err(why) if self.interrupt => return Ok(Outcome::again(why)),
+            Err(why) => {
+                return Ok(Outcome {
+                    retry: self.gone,
+                    ..Outcome::stop(why)
+                })
+            }
         };
         let pricing = model.as_ref().and_then(|m| m.pricing);
         let notice = wrap.map(|why| {
@@ -1767,6 +1799,17 @@ impl Session {
                     cache: true,
                     tools,
                 });
+                // `routed` reads the mode alone; the envelope was chosen
+                // already.
+                let head = match &routing {
+                    Some(mode) => crate::review_routing::routed(
+                        &head,
+                        &crate::review_routing::Route::conversation(mode, false, max_tokens),
+                        pricing,
+                        None,
+                    )?,
+                    None => head,
+                };
                 let body = client::turn_body(&head, prefix_text, &messages)?;
                 Ok((head, body))
             };
@@ -2421,7 +2464,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 // The person is asked already: a card held back for the
@@ -2552,6 +2595,22 @@ impl Session {
             Ok(model) => model,
             Err(why) => return Ok(Err(why)),
         };
+        // An explicit routing is priced by the endpoints it may reach, not
+        // the list's price for the model (§5, Routing).
+        let routing = meta
+            .routing
+            .clone()
+            .unwrap_or_else(|| client.routing.clone());
+        let (model, routing) = if routing == crate::config::DEFAULT_ROUTING {
+            (model, None)
+        } else {
+            // Reasoning endpoints where the turn would send an effort.
+            let reasoning = model.as_ref().is_none_or(|m| m.supports("reasoning"));
+            match self.routed(&client, &name, &routing, reasoning) {
+                Ok(envelope) => (Some(envelope), Some(routing)),
+                Err(why) => return Ok(Err(why)),
+            }
+        };
         // Every request carries the tools and `max_tokens`, which bounds
         // what it may cost, and `require_parameters` would route one to no
         // provider of a model that does not list both (§5).
@@ -2588,6 +2647,7 @@ impl Session {
             name,
             reasoning_effort,
             model,
+            routing,
         }))
     }
 
@@ -3719,7 +3779,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => return interrupted(),
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 Ok(Inbound::Link(asked)) => self.link(asked),
@@ -5023,7 +5083,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 // The person is asked already: a card held back for the
@@ -5586,7 +5646,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => self.interrupt = true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 Ok(Inbound::Link(asked)) => {
@@ -6110,6 +6170,91 @@ impl Session {
         }
     }
 
+    /// The human chose the conversation's routing: logged, and kept in
+    /// `meta`.
+    fn route(&mut self, routing: Option<String>) -> Result<(), String> {
+        self.log(Kind::Routing {
+            routing: routing.clone(),
+        })?;
+        self.conversation.set_routing(routing)?;
+        self.sync()
+    }
+
+    /// The envelope of `model`'s endpoints `routing` may reach (DESIGN.md
+    /// §5, Routing), kept for `ROUTE_KEPT` for each model, routing and
+    /// whether it wants reasoning, then fetched again.
+    fn routed(
+        &mut self,
+        client: &Client,
+        model: &str,
+        routing: &str,
+        reasoning: bool,
+    ) -> Result<Model, String> {
+        self.routes
+            .retain(|route| route.fetched.elapsed() < ROUTE_KEPT);
+        if let Some(route) = self
+            .routes
+            .iter()
+            .find(|r| r.model == model && r.routing == routing && r.reasoning == reasoning)
+        {
+            return Ok(route.envelope.clone());
+        }
+        let refused = |e: String| {
+            format!("routing {model} {routing}: {e}; choose Conversation \u{2192} Routing \u{2192} balanced to route as the models list prices it")
+        };
+        // An interrupt or the window's closing is said as such.
+        let raw = match self.listing(&client.base_url, model) {
+            Ok(raw) => raw,
+            Err(why) if self.interrupt || self.gone => return Err(why),
+            Err(why) => return Err(refused(why)),
+        };
+        let envelope =
+            crate::review_routing::conversation_envelope(&raw, model, routing, reasoning)
+                .map_err(refused)?;
+        self.routes.push(Route {
+            model: model.to_string(),
+            routing: routing.to_string(),
+            reasoning,
+            fetched: Instant::now(),
+            envelope: envelope.clone(),
+        });
+        Ok(envelope)
+    }
+
+    /// `model`'s endpoints listing, fetched on a thread of its own while
+    /// the window is heard: an interrupt ends the wait.
+    fn listing(&mut self, base_url: &str, model: &str) -> Result<td_json::Json, String> {
+        let (send, base_url, of) = (self.sender.clone(), base_url.to_string(), model.to_string());
+        std::thread::Builder::new()
+            .name("td-agent-endpoints".into())
+            .spawn(move || {
+                let result = crate::review_routing::listing(&base_url, &of);
+                let _ = send.send(Inbound::Listing { model: of, result });
+            })
+            .map_err(|e| format!("the endpoints' thread: {e}"))?;
+        loop {
+            match self.inbox.recv() {
+                Ok(Inbound::Listing { model: got, result }) if got == model => return result,
+                // An earlier fetch's, interrupted.
+                Ok(Inbound::Listing { .. }) => {}
+                Ok(Inbound::Down(Down::Interrupt)) => {
+                    self.interrupt = true;
+                    return Err("interrupted before the endpoints came".into());
+                }
+                Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
+                Ok(Inbound::Down(down)) => self.later(down),
+                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
+                Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Link(asked)) => self.link(asked),
+                Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
+                    self.gone = true;
+                    return Err("the window has closed".into());
+                }
+            }
+        }
+    }
+
     /// The human chose the conversation's model and effort, which apply
     /// from its next request: logged, then kept in `meta`.
     fn choose(&mut self, model: Option<String>, effort: Option<String>) -> Result<(), String> {
@@ -6245,7 +6390,7 @@ impl Session {
                 Ok(Inbound::Down(Down::Interrupt)) => return true,
                 Ok(Inbound::Down(Down::Reservation { id, refusal: None })) => self.spent(id, 0),
                 Ok(Inbound::Down(down)) => self.later(down),
-                Ok(Inbound::Fetch { .. }) => {}
+                Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
                 Ok(Inbound::Link(asked)) => self.link(asked),
@@ -6304,7 +6449,7 @@ impl Session {
                         break end;
                     }
                 }
-                Inbound::Fetch { .. } => {}
+                Inbound::Fetch { .. } | Inbound::Listing { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
                 Inbound::Link(asked) => self.link(asked),
@@ -7176,6 +7321,9 @@ struct Asking {
     name: String,
     reasoning_effort: String,
     model: Option<Model>,
+    /// The routing a turn's requests ask for, none for balanced, `model`
+    /// then its eligible endpoints' envelope (DESIGN.md §5, Routing).
+    routing: Option<String>,
 }
 
 /// A turn request's `max_tokens`: the model's largest completion, at
@@ -7239,16 +7387,21 @@ fn pieces(text: &str, most: usize) -> Vec<&str> {
 }
 
 /// The frame the serve loop takes next of those that came while a turn
-/// ran. Settings come first: a key the human stored, and the model and
-/// effort they chose, apply to the next turn whatever was queued before
-/// them (DESIGN.md §2, §4), each kind in its order. Then a pause goes
-/// ahead of the messages from other conversations before it, and holds
-/// them (§3), though not of the human's own message or retry; else the
-/// first in order.
+/// ran. Settings come first: a key the human stored, and the model,
+/// effort and routing they chose, apply to the next turn whatever was
+/// queued before them (DESIGN.md §2, §4), each kind in its order. Then
+/// a pause goes ahead of the messages from other conversations before
+/// it, and holds them (§3), though not of the human's own message or
+/// retry; else the first in order.
 fn take(queue: &mut VecDeque<Down>) -> Option<Down> {
     let at = queue
         .iter()
-        .position(|down| matches!(down, Down::Setup { .. } | Down::Choose { .. }))
+        .position(|down| {
+            matches!(
+                down,
+                Down::Setup { .. } | Down::Choose { .. } | Down::Route { .. }
+            )
+        })
         .or_else(|| {
             queue
                 .iter()
@@ -7988,6 +8141,9 @@ mod tests {
             client: Box::default(),
         };
         let pause = Down::Pause { paused: true };
+        let route = Down::Route {
+            routing: Some("nitro".into()),
+        };
         let choose = |effort: &str| Down::Choose {
             model: None,
             effort: Some(effort.into()),
@@ -7998,6 +8154,7 @@ mod tests {
             setup.clone(),
             pause.clone(),
             choose("high"),
+            route.clone(),
         ]
         .into();
         // Settings in the order they came, so the later choice is the one
@@ -8005,6 +8162,7 @@ mod tests {
         assert_eq!(take(&mut queue), Some(choose("low")));
         assert_eq!(take(&mut queue), Some(setup));
         assert_eq!(take(&mut queue), Some(choose("high")));
+        assert_eq!(take(&mut queue), Some(route));
         assert_eq!(take(&mut queue), Some(pause));
         assert_eq!(take(&mut queue), Some(message.clone()));
         assert_eq!(take(&mut queue), None);

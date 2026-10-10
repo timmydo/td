@@ -457,6 +457,11 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Route { routing } => {
+                    if let Err(e) = self.supervisor.tell(&Down::Route { routing }) {
+                        self.app.note(e);
+                    }
+                }
                 // The open conversation's log read again and replayed, as
                 // opening an adopted one does.
                 Request::Redraw => {
@@ -2656,6 +2661,7 @@ pub fn run(
     }
     app.set_models(&client.model, Vec::new());
     app.set_offers(Vec::new(), &client.reasoning_effort);
+    app.set_default_routing(&client.routing);
     app.set_limits(client.limits);
     let setup = Down::Setup {
         key: key.clone(),
@@ -3343,6 +3349,7 @@ mod tests {
             paused: false,
             model: None,
             effort: None,
+            routing: None,
             workspace,
             archived: false,
             prepared: Vec::new(),
@@ -3383,6 +3390,7 @@ mod tests {
         let client = Client::default();
         local_remote(&remote, &places, &reached(&[], &client)).unwrap();
         let meta = crate::store::Meta {
+            routing: None,
             id: crate::store::Id::random().unwrap(),
             role: crate::store::Role::Conversation,
             title: String::new(),

@@ -146,6 +146,7 @@ fn kind(event: &Event) -> &'static str {
         Kind::Compaction { .. } => "compaction",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
+        Kind::Routing { .. } => "routing",
         Kind::Approval { .. } => "approval",
     }
 }
@@ -287,6 +288,10 @@ pub fn render(event: &Event) -> String {
             "the person chose the model {} and the reasoning effort {}",
             model.as_deref().unwrap_or("by default"),
             effort.as_deref().unwrap_or("by default")
+        ),
+        Kind::Routing { routing } => format!(
+            "the person chose the routing {}",
+            routing.as_deref().unwrap_or("by default")
         ),
         Kind::Approval { outcome, by, .. } => approval(outcome, by),
     };

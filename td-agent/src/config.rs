@@ -25,6 +25,15 @@ pub const DEFAULT_CLASSIFIER_MODEL: &str = "openai/gpt-oss-safeguard-20b";
 /// OpenRouter's reasoning efforts, `reasoning.effort`.
 pub const EFFORTS: [&str; 6] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const DEFAULT_EFFORT: &str = "medium";
+/// OpenRouter's routing modes a conversation or review may ask for
+/// (DESIGN.md §5, Routing): balanced is its default; cheapest, fastest
+/// and latency sort providers; floor and nitro ask for the model's flex
+/// and priority service tiers.
+pub const ROUTINGS: &[&str] = &[
+    "balanced", "cheapest", "floor", "fastest", "nitro", "latency",
+];
+/// The routing a conversation takes unless configured or chosen.
+pub const DEFAULT_ROUTING: &str = "balanced";
 /// The longest base URL or model id taken.
 pub(crate) const MAX_NAME: usize = 2048;
 
@@ -38,6 +47,9 @@ pub struct Client {
     pub model: String,
     pub title_model: String,
     pub reasoning_effort: String,
+    /// The routing a conversation with none of its own takes, one of
+    /// `ROUTINGS`.
+    pub routing: String,
     /// `provider.data_collection`: whether providers that may keep or
     /// train on prompts may serve a request; `deny` by default.
     pub allow_data_collection: bool,
@@ -272,6 +284,7 @@ impl Default for Client {
             model: DEFAULT_MODEL.into(),
             title_model: DEFAULT_TITLE_MODEL.into(),
             reasoning_effort: DEFAULT_EFFORT.into(),
+            routing: DEFAULT_ROUTING.into(),
             allow_data_collection: false,
             classifier_fast_model: DEFAULT_JEV_MODEL.into(),
             classifier_model: DEFAULT_CLASSIFIER_MODEL.into(),
@@ -447,6 +460,7 @@ impl Client {
                 "reasoning_effort".into(),
                 Json::Str(self.reasoning_effort.clone()),
             ),
+            ("routing".into(), Json::Str(self.routing.clone())),
             (
                 "data_collection".into(),
                 Json::Str(
@@ -566,6 +580,7 @@ impl Client {
             model: model_id("model", text("model")?)?,
             title_model: model_id("title_model", text("title_model")?)?,
             reasoning_effort: effort(text("reasoning_effort")?)?,
+            routing: routing(text("routing")?)?,
             allow_data_collection: data_collection(text("data_collection")?)?,
             classifier_fast_model: model_id(
                 "classifier_fast_model",
@@ -761,6 +776,18 @@ pub(crate) fn model_id(key: &str, text: &str) -> Result<String, String> {
     Ok(text.to_string())
 }
 
+/// A routing mode, one of `ROUTINGS`.
+pub fn routing(text: &str) -> Result<String, String> {
+    if ROUTINGS.contains(&text) {
+        Ok(text.to_string())
+    } else {
+        Err(format!(
+            "`routing` is one of {}; not {text:?}",
+            ROUTINGS.join(", ")
+        ))
+    }
+}
+
 pub(crate) fn effort(text: &str) -> Result<String, String> {
     if EFFORTS.contains(&text) {
         Ok(text.to_string())
@@ -921,6 +948,7 @@ const KEYS: &[(&str, Use)] = &[
     ("jev_threshold", Use::Read),
     ("jev_required", Use::Read),
     ("reasoning_effort", Use::Read),
+    ("routing", Use::Read),
     ("mode", Use::Read),
     ("data_collection", Use::Read),
     ("max_cost_per_turn", Use::Read),
@@ -1652,6 +1680,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if let Some(word) = text("reasoning_effort")? {
         client.reasoning_effort = effort(word)?;
     }
+    if let Some(word) = text("routing")? {
+        client.routing = routing(word)?;
+    }
     config.model_key = text("model")?.map(str::to_string);
     if let Some(word) = text("data_collection")? {
         client.allow_data_collection = data_collection(word)?;
@@ -1850,6 +1881,7 @@ mod tests {
         let client = Config::default().client;
         assert_eq!(client.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(client.reasoning_effort, "medium");
+        assert_eq!(client.routing, "balanced");
         assert!(!client.allow_data_collection);
         assert_eq!(
             client.limits,
@@ -2719,7 +2751,7 @@ mod tests {
         let config = parse(
             "base_url = \"https://example.test/api/v1/\"\nmodel = \"a/b\"\n\
              title_model = \"e/f\"\n\
-             reasoning_effort = \"high\"\ndata_collection = \"allow\"\n\
+             reasoning_effort = \"high\"\nrouting = \"floor\"\ndata_collection = \"allow\"\n\
              max_cost_per_turn = 0.5\nmax_cost_per_conversation = \"none\"\n\
              max_cost_per_day = 0\n",
         )
@@ -2733,6 +2765,7 @@ mod tests {
         assert_eq!(client.model, "a/b");
         assert_eq!(client.title_model, "e/f");
         assert_eq!(client.reasoning_effort, "high");
+        assert_eq!(client.routing, "floor");
         assert!(client.allow_data_collection);
         assert_eq!(
             client.limits,
@@ -2752,6 +2785,7 @@ mod tests {
             ("model = \"\"", "`model` must be a model id"),
             ("title_model = \"a b\"", "`title_model` must be"),
             ("reasoning_effort = \"max\"", "`reasoning_effort` is one of"),
+            ("routing = \"floor:nitro\"", "`routing` is one of"),
             ("data_collection = \"maybe\"", "`data_collection` is"),
             ("max_cost_per_turn = -1", "`max_cost_per_turn` is a number"),
             ("max_cost_per_day = -0.5", "`max_cost_per_day` is a number"),

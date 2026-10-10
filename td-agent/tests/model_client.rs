@@ -565,6 +565,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Compaction { .. } => "compaction",
             Kind::Pause { .. } => "pause",
             Kind::Choice { .. } => "choice",
+            Kind::Routing { .. } => "routing",
             Kind::Approval { .. } => "approval",
         })
         .collect()
@@ -1054,6 +1055,86 @@ fn a_chosen_model_and_effort_are_what_the_next_request_sends() {
         "{outcome}"
     );
     assert_eq!(h.mock.requests().len(), 2, "nothing more was sent");
+}
+
+/// A conversation's chosen routing is logged, kept in `meta`, and what
+/// its next request asks for: nitro the model's `:nitro` variant, its
+/// `max_price` the envelope of the endpoints nitro may reach, fetched
+/// once; balanced the model as the list prices it, unrouted.
+#[test]
+fn a_chosen_routing_is_what_the_next_request_asks_for() {
+    let mut h = Harness::new(
+        "route",
+        Role::Conversation,
+        vec![
+            Reply::ok("endpoints-sonnet.json"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Route {
+        routing: Some("nitro".into()),
+    });
+    h.say("hello");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let logged = kinds(&events);
+    let routing = logged.iter().position(|k| *k == "routing").unwrap();
+    let request = logged.iter().position(|k| *k == "request").unwrap();
+    assert!(routing < request, "{logged:?}");
+    let requests = h.mock.requests();
+    assert!(requests[0]
+        .url
+        .ends_with("/models/anthropic/claude-sonnet-5.5/endpoints"));
+    let body = flat(&requests[1].text());
+    assert_eq!(body["model"], "anthropic/claude-sonnet-5.5:nitro");
+    // The fast tier, nitro's alone, is the dearest it may reach.
+    assert_eq!(body["provider.max_price.prompt"], "6.000000");
+    assert_eq!(body["provider.max_price.completion"], "30.000000");
+    h.down(&Down::Route {
+        routing: Some("balanced".into()),
+    });
+    h.say("again");
+    assert_eq!(h.turn().1, "replied");
+    let requests = h.mock.requests();
+    let again = requests
+        .iter()
+        .rev()
+        .find(|r| r.text().contains("again"))
+        .unwrap();
+    let body = flat(&again.text());
+    assert_eq!(body["model"], "anthropic/claude-sonnet-5.5");
+    assert!(!body.keys().any(|k| k.starts_with("provider.max_price")));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.ends_with("/endpoints"))
+            .count(),
+        1
+    );
+    let (conversation, _) = h.close();
+    assert_eq!(conversation.meta().routing.as_deref(), Some("balanced"));
+}
+
+/// A routed turn's endpoints are fetched on a thread of their own, so a
+/// fetch that does not answer is interrupted as a stream is.
+#[test]
+fn a_stalled_endpoints_fetch_is_interrupted() {
+    let mut h = Harness::new("route-stall", Role::Conversation, vec![Reply::Hang]);
+    h.setup(Client::default());
+    h.down(&Down::Route {
+        routing: Some("floor".into()),
+    });
+    h.say("hello");
+    h.mock.wait_for(1);
+    h.down(&Down::Interrupt);
+    let (_, outcome, retry) = h.turn();
+    // Said as an interrupt, not as a routing to give up, and nothing was
+    // sent, so the turn may be asked again.
+    assert_eq!(outcome, "interrupted before the endpoints came");
+    assert!(retry);
 }
 
 #[test]

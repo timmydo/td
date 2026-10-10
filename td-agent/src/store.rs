@@ -859,6 +859,10 @@ pub struct Meta {
     /// in a meta written before.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The routing the human chose for it (DESIGN.md §5, Routing), none
+    /// being the configuration's: the list's copy of the log's last
+    /// `Routing`, absent in a meta written before.
+    pub routing: Option<String>,
     /// What it works in (DESIGN.md §7), fixed when it is created; null
     /// for a conversation with none.
     pub workspace: Option<Workspace>,
@@ -911,6 +915,7 @@ impl Meta {
             ("created".into(), Json::from(self.created)),
             ("paused".into(), Json::Bool(self.paused)),
             ("effort".into(), or_null(&self.effort)),
+            ("routing".into(), or_null(&self.routing)),
             ("archived".into(), Json::Bool(self.archived)),
             ("removed".into(), Json::Bool(self.removed)),
             (
@@ -961,6 +966,13 @@ impl Meta {
             },
             model: optional_str(value, "model").ok_or("meta's model is not a string")?,
             effort: optional_str(value, "effort").ok_or("meta's effort is not a string")?,
+            routing: match optional_str(value, "routing") {
+                Some(None) => None,
+                Some(Some(mode)) if crate::config::ROUTINGS.contains(&mode.as_str()) => {
+                    Some(mode)
+                }
+                _ => return Err("meta's routing is not a routing mode".into()),
+            },
             workspace: match value.get("workspace") {
                 None | Some(Json::Null) => None,
                 Some(workspace) => {
@@ -1479,6 +1491,9 @@ pub enum Kind {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// The human chose the conversation's routing (DESIGN.md §5,
+    /// Routing): none is the configuration's.
+    Routing { routing: Option<String> },
     /// An approval decision (DESIGN.md §6, §11): the `ToolCall` it
     /// decided, its outcome, who decided it (a rule, a classifier stage or
     /// the human), Jev's probabilities where it gave them, and the reason.
@@ -1779,6 +1794,10 @@ impl Event {
                 put("model", or_null(model));
                 put("effort", or_null(effort));
             }
+            Kind::Routing { routing } => {
+                put("kind", Json::Str("routing".into()));
+                put("routing", or_null(routing));
+            }
             Kind::Approval {
                 call,
                 outcome,
@@ -2054,6 +2073,14 @@ impl Event {
                 model: optional("model")?,
                 effort: optional("effort")?,
             },
+            Some("routing") => Kind::Routing {
+                routing: match optional("routing")? {
+                    Some(mode) if !crate::config::ROUTINGS.contains(&mode.as_str()) => {
+                        return Err(format!("{mode:?} is not a routing mode"))
+                    }
+                    routing => routing,
+                },
+            },
             Some("approval") => Kind::Approval {
                 call: number("call")?,
                 outcome: string("outcome")?,
@@ -2142,6 +2169,7 @@ impl Conversation {
         let meta = match create {
             Some((role, workspace)) => {
                 let meta = Meta {
+                    routing: None,
                     id: id.clone(),
                     role,
                     title: role.first_title().to_string(),
@@ -2285,6 +2313,11 @@ impl Conversation {
         });
         if let Some(paused) = paused.filter(|p| *p != conversation.meta.paused) {
             conversation.set_paused(paused)?;
+        }
+        // So is the human's routing.
+        let routing = conversation.routing();
+        if routing != conversation.meta.routing {
+            conversation.set_routing(routing)?;
         }
         // So is the human's choice of model and effort.
         let chosen = conversation.choice();
@@ -2542,6 +2575,25 @@ impl Conversation {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    /// The routing the log's last `Routing` holds, none being the
+    /// configuration's.
+    pub fn routing(&self) -> Option<String> {
+        self.events.iter().rev().find_map(|e| match &e.kind {
+            Kind::Routing { routing } => Some(routing.clone()),
+            _ => None,
+        })?
+    }
+
+    /// Records the human's routing in `meta`, the list's copy of the
+    /// log's `Routing` events.
+    pub fn set_routing(&mut self, routing: Option<String>) -> Result<(), String> {
+        let mut meta = self.meta.clone();
+        meta.routing = routing;
+        replace(&self.dir, "meta", meta.to_json().to_string().as_bytes())?;
+        self.meta = meta;
+        Ok(())
     }
 
     /// Records the human's choice in `meta`, the list's copy of the log's
@@ -3799,6 +3851,55 @@ pub mod tests {
         assert!(!Meta::from_json(&value).unwrap().removed);
         if let Json::Obj(pairs) = &mut value {
             pairs.push(("removed".into(), Json::Str("yes".into())));
+        }
+        assert!(Meta::from_json(&value).is_err());
+    }
+
+    /// A routing logged replays, `meta` keeping it; one logged by a
+    /// process that died before writing `meta` is put right at the next
+    /// open.
+    #[test]
+    fn a_routing_replays_and_is_kept_in_meta() {
+        let scratch = Scratch::new("routing");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        assert_eq!(conversation.routing(), None);
+        let nitro = Kind::Routing {
+            routing: Some("nitro".into()),
+        };
+        conversation.append(nitro.clone()).unwrap();
+        conversation.set_routing(Some("nitro".into())).unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        let (mut conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.events().last().map(|e| &e.kind), Some(&nitro));
+        assert_eq!(conversation.meta().routing.as_deref(), Some("nitro"));
+        conversation
+            .append(Kind::Routing {
+                routing: Some("floor".into()),
+            })
+            .unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        let (mut conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.meta().routing.as_deref(), Some("floor"));
+        conversation
+            .append(Kind::Routing { routing: None })
+            .unwrap();
+        conversation.sync().unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.meta().routing, None);
+        drop(conversation);
+        let (metas, _) = state.list();
+        assert_eq!(metas.first().map(|m| m.routing.clone()), Some(None));
+        // A mode td-agent does not know is refused in the log and in meta.
+        let mut value = metas.first().unwrap().to_json();
+        if let Json::Obj(fields) = &mut value {
+            fields.retain(|(k, _)| k != "routing");
+            fields.push(("routing".into(), Json::Str("random".into())));
         }
         assert!(Meta::from_json(&value).is_err());
     }

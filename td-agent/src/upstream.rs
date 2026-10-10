@@ -129,6 +129,7 @@ mod tests {
 
     fn bare(workspace: Option<Workspace>, archived: bool, removed: bool) -> Meta {
         Meta {
+            routing: None,
             id: Id::random().unwrap(),
             role: Role::Conversation,
             title: String::new(),

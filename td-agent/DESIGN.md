@@ -1430,10 +1430,16 @@ window too (below).
   does. Then come `Model…`, which opens the picker below, and
   `Effort`, a submenu of every effort §15 admits (`none`, `minimal`,
   `low`, `medium`, `high`, `xhigh`), the open conversation's checked.
-  Choosing one asks for it at once. `Model…` and `Effort` are off with
-  no conversation open, and `Effort` is off for a model whose cached
-  `supported_parameters` lacks `reasoning`, since it would not be sent
-  (§5). `Show tool activity` (§4) follows `Show archived`, last. The
+  Choosing one asks for it at once. `Routing` follows, a submenu of
+  the routing modes the review command takes (`balanced`, `cheapest`,
+  `floor`, `fastest`, `nitro`, `latency`, §2), the open conversation's
+  checked, the configuration's `routing` (§15) until one is chosen;
+  choosing one asks for it at once, said `routing nitro, from the next
+  request` once logged (§5, Routing). `Model…`, `Effort` and `Routing`
+  are off with no conversation open, and `Effort` is off for a model
+  whose cached `supported_parameters` lacks `reasoning`, since it would
+  not be sent (§5). `Show tool activity` (§4) follows `Show archived`,
+  last. The
   menu shows state, so the window builds it again, at a new
   revision, from the state of the moment each time it opens, by `F10`
   or a press on a header; while it is open nothing rebuilds it.
@@ -1749,6 +1755,34 @@ the window marks the message "stopped at a limit", neither answered
 nor failed. The conversation's own prompt says each turn is bounded so,
 and how it ends. A model without pricing cannot be reserved against
 and is refused while a limit is set.
+
+**Routing.** A conversation is routed as the configuration's `routing`
+(§15), `balanced` by default, until the human chooses another from
+Conversation → Routing (§4); the choice is logged as a `routing` event,
+kept in `meta` and put right from the log at the next open, as a model
+choice is, and it moves to no other conversation. Balanced sends the
+request as above, priced from the models list. Any other mode is
+routed as the review command's (§2), from one code path: the
+conversation process fetches the model's `/models/{id}/endpoints` on a
+thread of its own, so an interrupt ends the wait, and keeps what it
+found for 15 minutes for each model, mode and whether the turn would
+send an effort. The turn's limits and capabilities are those of the
+endpoints the mode may reach which take `tools`, a full turn's
+`max_tokens` and, where the turn would send an effort and any does,
+`reasoning`; its price is the dearest of every endpoint the mode may
+reach, whatever it takes, so that a narrower request, a wrap-up without
+tools or with a smaller `max_tokens`, stays within what was reserved.
+Each request then names the `:floor` or `:nitro` variant or sets
+`provider.sort` (`price`, `throughput`, `latency`), and sends that price
+as `provider.max_price`, which bounds the prompt, completion and
+per-request rates an endpoint may charge; cache-write and reasoning
+rates it does not bound are reserved at the dearest the mode reaches. A
+listing that cannot be fetched, has no eligible endpoint, or no price
+stops the turn, saying how to go back to balanced. A compaction's
+summary request (§14), a title and a classifier's request are sent
+unrouted, priced from the list. Once a conversation has chosen a
+routing, balanced included, it keeps it; the configuration's `routing`
+is only where one that never chose starts.
 
 The review command (§2) has no conversation and no day's ledger, which
 the window process alone keeps: default reviews fetch the models list and
@@ -6149,6 +6183,8 @@ default; `jev_threshold`'s is calibrated (§11):
   places; default 0.775
 - `jev_required`; default `true`
 - `reasoning_effort`
+- `routing`: one of `balanced`, `cheapest`, `floor`, `fastest`, `nitro`
+  and `latency` (§5, Routing); default `balanced`
 - `mode`: `auto` or `ask`; default `auto`
 - `data_collection`: `deny` or `allow`; default `deny`
 - `max_cost_per_turn`, `max_cost_per_conversation` and `max_cost_per_day`,
@@ -6249,7 +6285,9 @@ non-negative number of credits, or `none`. `model` and
 `reasoning_effort` are what every conversation starts with; the
 Conversation menu chooses another for one conversation, and a default
 model the window saves replaces `model` until the key is edited (§4);
-this file records neither. The key file is not a key of this file (§6).
+this file records neither. `routing` is likewise what every
+conversation starts with until Conversation → Routing chooses another
+(§5, Routing). The key file is not a key of this file (§6).
 
 **As built (templates).** `template` is read. A `name` is visible text
 of at most 64 bytes with no space at either end and nothing a card

@@ -6,8 +6,9 @@
 //! window routes its keys and the pointer to it and paints it after its
 //! frame. The controller chooses; the window carries the action out,
 //! through the same paths as the item's chord. The Conversation menu
-//! shows the open conversation's effort checked, so the window builds the
-//! menu again, at a new revision, from the state of the moment it opens.
+//! shows the open conversation's effort and routing checked, so the
+//! window builds the menu again, at a new revision, from the state of
+//! the moment it opens.
 //! A conversation's row has a context menu of its own (`row`), which the
 //! window opens in the same controller at a right press on the row or at
 //! `ROW_MENU` for the open conversation's, and puts the bar's back in
@@ -18,7 +19,7 @@ use td_ui::keys;
 use td_ui::menus::{self, Controller, Event, Fit, Item, Key, Kind, Model, Node};
 use td_ui::raster::Surface;
 
-use crate::config::EFFORTS;
+use crate::config::{EFFORTS, ROUTINGS};
 
 /// The bar's headers: File, Conversation, then Help.
 pub const LABELS: &[&str] = &["File", "Conversation", keys::BUTTON];
@@ -53,6 +54,8 @@ pub enum Action {
     Model,
     /// Choose the open conversation's reasoning effort.
     Effort(&'static str),
+    /// Choose the open conversation's routing (DESIGN.md §5, Routing).
+    Routing(&'static str),
     /// Show td-ui's key list, as `keys::CHORD` does: the window opens it
     /// when the live pointer or keyboard chose this, never the control
     /// socket (`App::input_live`).
@@ -110,6 +113,8 @@ pub const COMPACT: &str = "Compact conversation";
 pub const WORKSPACE: &str = "Workspace card\u{2026}";
 /// The Conversation menu's submenu of efforts.
 pub const EFFORT: &str = "Effort";
+/// The Conversation menu's submenu of routing modes.
+pub const ROUTING: &str = "Routing";
 /// The Conversation menu's item that chooses the default model.
 pub const DEFAULT_MODEL: &str = "Default model\u{2026}";
 /// The Conversation menu's item that asks to delete the open one.
@@ -144,6 +149,8 @@ pub struct State<'a> {
     /// The open conversation has a repository workspace.
     pub workspace: bool,
     pub effort: &'a str,
+    /// Its routing, one of `ROUTINGS`.
+    pub routing: &'a str,
     pub reasoning: bool,
     pub show_archived: bool,
     pub show_activity: bool,
@@ -206,6 +213,17 @@ pub fn menu(surface: Surface, state: State<'_>, revision: u64) -> Result<Menu, m
         parent: Some(effort),
         row: row(level, "", true, level == state.effort),
         item: Item::Action(Action::Effort(level)),
+    }));
+    let routing = nodes.len();
+    nodes.push(Node {
+        parent: Some(conversation),
+        row: row(ROUTING, "", state.open, false),
+        item: Item::Submenu,
+    });
+    nodes.extend(ROUTINGS.iter().map(|&mode| Node {
+        parent: Some(routing),
+        row: row(mode, "", true, mode == state.routing),
+        item: Item::Action(Action::Routing(mode)),
     }));
     nodes.push(Node {
         parent: Some(conversation),
@@ -369,6 +387,7 @@ mod tests {
         open: true,
         workspace: false,
         effort: "high",
+        routing: "balanced",
         reasoning: true,
         show_archived: false,
         show_activity: false,

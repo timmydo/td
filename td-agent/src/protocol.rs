@@ -124,6 +124,9 @@ pub enum Down {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// The human chose the conversation's routing (DESIGN.md §5,
+    /// Routing); none is the configuration's.
+    Route { routing: Option<String> },
     /// The human's answer to the cold-resume card of turn `turn`.
     Resumed { turn: u64, choice: Resumed },
     /// The human's decision on the card the conversation asked for call
@@ -841,6 +844,7 @@ impl Down {
                     ("effort".into(), optional(effort)),
                 ],
             ),
+            Self::Route { routing } => typed("route", vec![("routing".into(), optional(routing))]),
             Self::Resumed { turn, choice } => typed(
                 "resumed",
                 vec![
@@ -1095,6 +1099,13 @@ impl Down {
                     crate::config::effort(effort)?;
                 }
                 Ok(Self::Choose { model, effort })
+            }
+            Some("route") => {
+                let routing = maybe(&value, "routing")?;
+                if let Some(routing) = &routing {
+                    crate::config::routing(routing)?;
+                }
+                Ok(Self::Route { routing })
             }
             Some("user") => {
                 let delivery = string(&value, "delivery")?;
@@ -2179,6 +2190,10 @@ mod tests {
                 model: None,
                 effort: None,
             },
+            Down::Route {
+                routing: Some("nitro".into()),
+            },
+            Down::Route { routing: None },
             Down::Heads {
                 remote: "https://github.com/timmydo/td".into(),
                 bases: vec!["main".into(), "next".into()],

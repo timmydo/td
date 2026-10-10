@@ -442,6 +442,9 @@ pub enum Request {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// The open conversation's routing as the human chose it; none is the
+    /// default.
+    Route { routing: Option<String> },
 }
 
 /// What has the keyboard.
@@ -744,6 +747,12 @@ pub struct App {
     /// The choices asked for and not yet heard logged, oldest first: the
     /// next one builds on the last, though the process has not taken it.
     asked: VecDeque<(Option<String>, Option<String>)>,
+    /// The open conversation's routing as the human chose it, from its
+    /// log, none being `default_routing`; and the latest asked for and
+    /// not yet heard logged (DESIGN.md §5, Routing).
+    routing: Option<String>,
+    routing_asked: Option<Option<String>>,
+    default_routing: String,
     /// A prefix is in force, shown or said not to be, since the
     /// transcript was last cleared, so a later one replaces it.
     system_shown: bool,
@@ -911,6 +920,9 @@ impl App {
             offers: Vec::new(),
             choice: (None, None),
             asked: VecDeque::new(),
+            routing: None,
+            routing_asked: None,
+            default_routing: crate::config::DEFAULT_ROUTING.into(),
             system_shown: false,
             picker: None,
             notes: None,
@@ -1247,6 +1259,22 @@ impl App {
             .iter()
             .find(|o| o.id == model)
             .is_none_or(|o| o.reasoning)
+    }
+
+    /// The open conversation's routing: the latest asked for, else its
+    /// log's, else the configuration's.
+    pub fn routing(&self) -> &str {
+        self.routing_asked
+            .as_ref()
+            .unwrap_or(&self.routing)
+            .as_deref()
+            .unwrap_or(&self.default_routing)
+    }
+
+    /// The routing a conversation with none of its own takes.
+    pub fn set_default_routing(&mut self, routing: &str) {
+        self.default_routing = routing.to_string();
+        self.touch();
     }
 
     /// The models list as the picker offers it, and the configuration's
@@ -1847,6 +1875,8 @@ impl App {
         self.meter = Meter::default();
         self.choice = (None, None);
         self.asked.clear();
+        self.routing = None;
+        self.routing_asked = None;
         self.system_shown = false;
         self.streaming = None;
         self.undrawn = None;
@@ -2524,6 +2554,15 @@ impl App {
                 if self.todo_rows() != rows {
                     self.place();
                 }
+            }
+            Kind::Routing { routing } => {
+                if self.routing_asked.as_ref() == Some(&routing) {
+                    self.routing_asked = None;
+                }
+                self.routing = routing;
+                let said = format!("routing {}, from the next request", self.routing());
+                self.notice_message(&said);
+                self.touch();
             }
             Kind::Choice { model, effort } => {
                 self.choice = (model, effort);
@@ -3699,6 +3738,7 @@ impl App {
                 }
             }
             menu::Action::Effort(level) => self.choose(self.wanted().0, Some(level.to_string())),
+            menu::Action::Routing(mode) => self.route(mode),
             // The list is the window's: `input_live` reports the choice.
             menu::Action::Keys => self.keys_chosen = true,
             menu::Action::ShowArchived => self.toggle_archived(),
@@ -4090,6 +4130,7 @@ impl App {
             open: self.active.is_some(),
             workspace: self.repositories().is_some(),
             effort: self.effort(),
+            routing: self.routing(),
             reasoning: self.reasoning(model),
             show_archived: self.show_archived,
             show_activity: self.show_activity,
@@ -4114,6 +4155,17 @@ impl App {
             .back()
             .cloned()
             .unwrap_or_else(|| self.choice.clone())
+    }
+
+    /// Asks for the open conversation's routing to be `mode`.
+    fn route(&mut self, mode: &str) {
+        if self.active.is_none() {
+            return self.note("no conversation is open to choose for");
+        }
+        let routing = Some(mode.to_string());
+        self.routing_asked = Some(routing.clone());
+        self.requests.push(Request::Route { routing });
+        self.touch();
     }
 
     /// Asks for the open conversation's model and effort to be these.
@@ -8157,7 +8209,7 @@ pub mod tests {
             ..row(9, 1)
         });
         app.set_active(id(9));
-        const CHORDS: &[&str] = &["F10", "Right", "Down", "Down", "Return"];
+        const CHORDS: &[&str] = &["F10", "Right", "Down", "Down", "Down", "Return"];
         let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02x}")).collect() };
         let mut remote = crate::control::Remote { app: &mut app };
         for (n, chord) in CHORDS.iter().enumerate() {
@@ -9166,7 +9218,7 @@ pub mod tests {
             .filter(|n| n.row.checked)
             .map(|n| n.row.label)
             .collect();
-        assert_eq!(checked, ["high"]);
+        assert_eq!(checked, ["high", "balanced"]);
         key(&mut app, "Escape");
         // Conversation > Model... opens the picker on the conversation's
         // model; typing filters and Return chooses, the effort kept.
@@ -9218,6 +9270,47 @@ pub mod tests {
         app.set_active(id(2));
         assert!(app.picker().is_none());
         assert_eq!((app.model(), app.effort()), ("m/default", "medium"));
+    }
+
+    /// Conversation → Routing asks for the open conversation's routing,
+    /// checked at once and said when logged; the configuration's is
+    /// checked until one is chosen, and another conversation shows its
+    /// own.
+    #[test]
+    fn the_conversation_menu_chooses_the_routing() {
+        let mut app = app();
+        app.set_default_routing("cheapest");
+        assert_eq!(app.routing(), "cheapest");
+        app.menu_action(menu::Action::Routing("nitro"));
+        assert_eq!(
+            app.take_requests(),
+            [Request::Route {
+                routing: Some("nitro".into())
+            }]
+        );
+        assert_eq!(app.routing(), "nitro");
+        app.update(
+            at(
+                1,
+                Kind::Routing {
+                    routing: Some("nitro".into()),
+                },
+            ),
+            0,
+        );
+        assert!(text(&app).contains("routing nitro, from the next request"));
+        app.refresh_menu();
+        let checked: Vec<&str> = (0..)
+            .map_while(|n| app.menu.model().node(n).copied())
+            .filter(|n| n.row.checked)
+            .map(|n| n.row.label)
+            .collect();
+        assert!(
+            checked.contains(&"nitro") && !checked.contains(&"cheapest"),
+            "{checked:?}"
+        );
+        app.set_active(id(2));
+        assert_eq!(app.routing(), "cheapest");
     }
 
     /// Two choices made before the conversation logs the first: the
