@@ -2320,8 +2320,10 @@ Implement the remaining work as independently reviewable increments:
     128-anchor private bundles, one HTTPS listener and relay trust. Fresh
     Rust/native/RSS processes cover the two-generation lifecycle, unchanged
     third-slot refusal and stable replacement. Its explicit fifteen-session,
-    128 MiB configuration is fixture-only. Retained trust duplication still
-    requires accounting or reduction before service activation.
+    128 MiB configuration is fixture-only. Retained trust duplication remains
+    a gateway workload measurement/tuning question under DESIGN section 5,
+    not a prerequisite for the direct-only receiving profile. M23 owns
+    whole-service release measurements.
 
   - **M07e4i — decoded certificate-list refusal observations:** fresh
     Rust/native/RSS processes feed unexpected TLS 1.2 certificate lists with
@@ -2767,9 +2769,11 @@ retains one static configuration and checks Inbox and exact TLS bindings
 before readiness. Offline `store init` now creates a new store whose
 schema transaction also commits one account and its canonical Inbox, the
 store the runtime's startup Inbox check requires; process fixtures verify
-and reopen it. Serve activation, graceful operational control and complete
-crash/restart process fixtures remain M11 work; HTTPS and gateway serving
-are not enabled by this API.
+and reopen it. `serve --smtp-only` now activates this path with protected
+configuration, initialized storage and a separate ingress child. Its process
+fixture verifies accepted-mail survival after killing another DATA transfer.
+Graceful operational control and the complete release fault matrix remain
+separate; HTTPS and gateway serving are not enabled by this profile.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,
@@ -2997,7 +3001,8 @@ Its JSON reports copied source epoch, fresh destination epoch and completed
 current-data counts, or conservative invocation progress on failure. No
 artifact is automatically deleted. Successful restore does not start service,
 restore separate credentials/configuration or settle external SMTP outcomes.
-Repair, retained-history replay and service activation remain separate.
+Repair and retained-history replay remain separate; explicit direct receiving
+activation is now available through the independently invoked serve command.
 
 The native offline primitives now include consuming IndexStore::backup
 and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies
@@ -3568,3 +3573,16 @@ have evidence, the exact binaries/fixtures tested, and what remains unavailable.
 Avoid dates or completion marks copied ahead of implementation. The final v1
 report must link the conformance table, memory measurements, crash results,
 real td-mail integration evidence and tested migration/restore procedure.
+
+
+### Foreground direct receiving activation
+
+`serve --smtp-only --config PATH` now composes protected configuration,
+provisioned roots, initialized account/Inbox, cold quota reconciliation,
+disposable ingress recovery, direct IPv4 bindings and the fixed receiving
+workers. CONFIG.md owns command scope, readiness and default signal behavior;
+STORAGE.md owns the selected data/ingress layout. The child-process fixture
+proves accepted-mail recovery across termination during another DATA transfer.
+Next operational work is graceful shutdown and local status/control, followed
+by deployment packaging; HTTPS/JMAP, gateway, reload, ACME, outgoing delivery
+and file logging remain unimplemented activation paths.

@@ -44,6 +44,10 @@ formats are refused; no automatic migration or overwrite is provided.
 A separate ingress-only locked root holds LOCK and slot-00 through slot-63
 for disposable prepared bytes. It must never share the authoritative database
 root; the disposable ingress section below owns its cleanup contract.
+The `serve --smtp-only` profile selects `[paths] data` for the database
+and its separately provisioned `ingress/` child for this disposable root.
+Both locks remain held until process exit; offline store commands continue
+to name the data directory itself.
 
 ## 2. SQLite and resource policy
 
@@ -593,12 +597,13 @@ The existing admission::logical::Leases constructor consumes global
 quota::Usage counters, with no per-account quota dimension. The fence
 therefore retains only whole-store totals. It is for cold coordinator
 initialization, not a runtime admission loop. It has no automatic timeout/drop
-or worker-quiescence authority. The future coordinator must stop outstanding
+or worker-quiescence authority. The coordinator must stop outstanding
 workers and reconcile pending effects plus disposable usage before ledger
 initialization. Copied totals remain passive observations and may become
 stale after drop.
 The normal native work ceiling may refuse large stores; whole-store maximum
-resource qualification and service activation remain open.
+resource qualification remains release work; the direct receiving profile
+now performs this reconciliation before activation.
 
 After ending the read transaction, the fence also captures StoreFileUsage
 under the same mutex and original clock. The mandatory database and optional
@@ -1591,9 +1596,10 @@ Only successful SQLite COMMIT can authorize acknowledgement. Discarding an
 input after that commit cannot remove authoritative bytes. A coordinator
 chooses retry responsibility after rejection or indeterminate commit; the
 spool grants neither account authorization nor a durable acceptance receipt.
-The future ports::Store/BlobWriter/StagedBlob adapter, shared service quota
-coordination, listener activation and configured root provisioning remain
-separate. The low-level spool does not implement those ports or a CLI.
+The receiving coordinator supplies shared quotas and durable acceptance;
+`serve --smtp-only` activates it with the configured data/ingress roots.
+Directory provisioning remains the deployment's responsibility. The low-level
+spool does not implement the future general Store/BlobWriter/StagedBlob ports.
 
 ## 3. Metadata records
 
@@ -1990,8 +1996,11 @@ existing locator semantics or require an explicit format migration.
 Storage tests exercise actual SQLite snapshots, reopen, unsigned sequences,
 rollback, owning references, parent cycles, atomic body writes and snapshot reads after deletion.
 Native allocation/RSS qualification and complete crash/fault matrices remain
-required before service activation. Rust allocation evidence for pure MIME
-processing does not qualify SQLite or whole-service memory.
+v1 release evidence under DESIGN sections 5 and 15, not prerequisites for
+each bounded receiving increment. Each activation tests its changed
+correctness, refusal and lifecycle boundaries; the SMTP-only profile includes
+process-death recovery. Rust allocation evidence for pure MIME processing
+does not qualify SQLite or whole-service memory.
 
 Opening checks fixed schema/header state without a full-database scan. Full
 integrity validation is explicit bounded maintenance. Runtime commits use indexed deferred foreign-key enforcement instead of scanning

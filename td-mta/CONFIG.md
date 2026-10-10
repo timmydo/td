@@ -1747,3 +1747,63 @@ main thread under its RLIMIT_STACK, not the qualified control-worker
 mapping above; a later service worker running these stages keeps that
 256 KiB reservation and its own stack assessment. The scratch buffer is
 the stream's, reused for text decoding as M04b3b requires.
+
+
+## Foreground receiving profile
+
+`td-mta serve --smtp-only --config PATH` activates direct IPv4 SMTP
+receiving and STARTTLS into an initialized account store. The explicit
+profile flag is required: bare `serve` refuses with exit two. The complete
+configuration schema is unchanged, including its required HTTPS and relay
+settings. All referenced inputs are checked through the same single load as
+`config check`, but HTTPS and outbound delivery are inactive. Gateway,
+fixture, HTTP-01 and IPv6 SMTP listeners refuse before storage is opened.
+ACME-managed material remains unavailable. This profile has no reload,
+control socket, file logging, JMAP or outbound queue worker.
+
+Provision `[paths] data`, `runtime`, `logs`, and `data/ingress` as separate
+existing mode-0700 directories owned by the same dedicated non-root service
+UID. The ingress directory is beneath data; the three configured roots retain
+the schema's non-overlap rule. Run `store init --root DATA --account ID`
+once before serving. The database stays directly in DATA; no implicit
+initialization, migration or relocation occurs. Run the executable as that
+service UID; the safe-std stable-path deployment contract still applies.
+Root ownership checks do not verify the running process UID.
+
+Cold storage startup has a fixed 600-second deadline; native SQLite/kernel
+I/O retain their documented interruption limitations. Startup retains the
+database and ingress locks, opens SQLite with the
+configured read-view count, requires exactly the configured account and its
+Inbox, discards abandoned ingress inputs, and reconciles database quotas.
+Only this receiving profile's owners run; no auxiliary log/cache/sort usage
+is created or imported. Configured runtime/log roots are checked and retained
+but otherwise unused. Configured direct listeners bind only after cold
+storage setup. No client is accepted until the existing receiving runtime
+validates all settings and starts both fixed workers. The admitted direct
+certificate-chain validity window is checked before readiness, on every
+network scan and immediately before admitting a new session. Invalid UTC or
+a clock jump outside that window fails health and stops new admission;
+workers abandon queued work without a final reply. Already committed mail
+remains durable, and existing final replies retain their bounded allowance.
+The runtime reports a TLS failure. A supervisor
+may restart after an operator replaces expired material.
+
+One flushed JSON line reports `command: "serve"`, `status: "ready"`,
+`profile: "smtp-only"`, the number of SMTP listeners and false flags for
+`https`, `outbound`, `reload` and `signal_drain`. It is receiving readiness,
+not v1 whole-service health. Startup/runtime errors use the same redacted
+stage, fixed error code and optional target/detail shape as `config.check`,
+with command `serve` and exit one (invalid arguments: exit two). Failure to
+write readiness stops the workers before accepting clients. Output must be
+consumed by the supervisor; this is not a per-message logging channel.
+
+The process stays in the foreground. SIGTERM/SIGINT currently retain default
+termination behavior, without draining; SIGKILL likewise relies on SQLite
+recovery. A message followed by final SMTP 250 survives restart. Incomplete
+DATA may leave a disposable slot, which the next locked startup validates and
+removes. A disconnected sender must retry without final acceptance; a commit
+whose reply was lost can consequently be delivered again, as in normal SMTP.
+Graceful signal integration remains a separate increment needing the audited
+signal boundary. The local process fixture kills the server during a second
+DATA transfer after a first accepted message, restarts it, and independently
+verifies the surviving body and removal of the incomplete input.

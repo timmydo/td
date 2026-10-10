@@ -111,6 +111,7 @@ struct HttpsIdentity<'a> {
 }
 
 struct Policy {
+    receiving_validity: Option<(u64, u64)>,
     binding: Binding,
     configuration: Configuration,
 }
@@ -329,6 +330,22 @@ impl TlsPolicies {
             Configuration::Gateway(policy) => Ok(policy.fingerprint()),
             _ => Err(Error::Invalid),
         }
+    }
+
+    /// Recheck a direct receiving listener's admitted chain against current UTC.
+    /// This also gates plaintext SMTP, which never constructs a TLS session.
+    pub fn check_receiving_certificate(
+        lease: &GenerationLease<Self>,
+        id: TlsPolicyId,
+        utc_ms: i64,
+    ) -> Result<(), Error> {
+        let policy = Self::resolve(lease, id)?;
+        let (first, last) = policy.receiving_validity.ok_or(Error::Invalid)?;
+        let now = u64::try_from(utc_ms).map_err(|_| Error::Tls)? / 1000;
+        if now < first || now > last {
+            return Err(Error::Tls);
+        }
+        Ok(())
     }
 
     /// Reserve before native session construction. Wire arrays must already
@@ -681,6 +698,8 @@ fn build<R: Read>(
             continue;
         }
         let primary = identity(row.certificate.ok_or(Error::Invalid)?)?;
+        let receiving_validity =
+            (row.kind == listener::Kind::DirectSmtp).then(|| primary.validity());
         let native = match row.kind {
             listener::Kind::DirectSmtp => Configuration::Server(Arc::new(
                 ServerConfig::new(
@@ -771,6 +790,7 @@ fn build<R: Read>(
         push(
             &mut policies,
             Policy {
+                receiving_validity,
                 binding: listener_binding(row)?,
                 configuration: native,
             },
@@ -814,6 +834,7 @@ fn build<R: Read>(
             push(
                 &mut policies,
                 Policy {
+                    receiving_validity: None,
                     binding: listener_binding(row)?,
                     configuration: Configuration::Gateway(Box::new(native)),
                 },
@@ -847,6 +868,7 @@ fn append_clients<R: Read>(
     push(
         policies,
         Policy {
+            receiving_validity: None,
             binding: Binding::Relay {
                 host: owned(relay.host)?,
                 port: relay.port,
@@ -865,6 +887,7 @@ fn append_clients<R: Read>(
         push(
             policies,
             Policy {
+                receiving_validity: None,
                 binding: Binding::Acme {
                     host: owned(acme.directory.host())?,
                     port: acme.directory.port(),

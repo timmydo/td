@@ -1354,3 +1354,268 @@ fn config_check_refuses_malformed_arguments_before_file_access() {
     );
     assert_eq!(json.get("error").unwrap().as_str(), Some("input-path"));
 }
+
+struct ReceivingProcess {
+    child: std::process::Child,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for ReceivingProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+impl ReceivingProcess {
+    fn start(fixture: &ConfigFixture) -> Self {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["serve", "--smtp-only", "--config"])
+            .arg(fixture.path("td-mta.conf"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut line = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .unwrap();
+            let _ = send.send(line);
+        });
+        let process = Self {
+            child,
+            reader: Some(reader),
+        };
+        let line = receive
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        assert!(line.contains("\"status\":\"ready\""), "{line}");
+        assert!(line.contains("\"profile\":\"smtp-only\""), "{line}");
+        process
+    }
+}
+fn smtp_command(stream: &mut std::io::BufReader<std::net::TcpStream>, command: &[u8], code: &str) {
+    use std::io::{BufRead, Write};
+    stream.get_mut().write_all(command).unwrap();
+    loop {
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        assert!(line.starts_with(code), "{line:?}, expected {code}");
+        if line.as_bytes().get(3) == Some(&b' ') {
+            break;
+        }
+    }
+}
+#[test]
+fn serve_receives_and_recovers_after_process_death() {
+    if private_case("serve_receives_and_recovers_after_process_death") {
+        return;
+    }
+    use std::io::{BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    let fixture = ConfigFixture::new();
+    let runtime = Fixture::new();
+    let logs = Fixture::new();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.data.0.join("ingress"))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let source = fs::read_to_string(fixture.path("td-mta.conf"))
+        .unwrap()
+        .replace("127.0.0.1:2525", &address.to_string())
+        .replace(
+            "[paths]",
+            &format!(
+                "[paths]\nruntime = \"{}\"\nlogs = \"{}\"",
+                runtime.0.display(),
+                logs.0.display()
+            ),
+        );
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["store", "init", "--root"])
+        .arg(&fixture.data.0)
+        .args(["--account", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        .output()
+        .unwrap();
+    report_command(&output, 0, "store.init");
+    let refuses = |stage: &str, code: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["serve", "--smtp-only", "--config"])
+            .arg(fixture.path("td-mta.conf"))
+            .output()
+            .unwrap();
+        let report = report_command(&output, 1, "serve");
+        assert_eq!(report.get("stage").unwrap().as_str(), Some(stage));
+        assert_eq!(report.get("error").unwrap().as_str(), Some(code));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(fixture.data.0.to_str().unwrap()));
+    };
+    // Profile refusal precedes even attempting to take the occupied store lock.
+    let root = PrivateRoot::open(fixture.data.0.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    fixture.write(
+        "td-mta.conf",
+        source
+            .replace(&address.to_string(), &format!("[::1]:{}", address.port()))
+            .as_bytes(),
+        0o644,
+    );
+    refuses("listeners", "unsupported-listener");
+    drop(root);
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
+    fs::remove_dir(fixture.data.0.join("ingress")).unwrap();
+    refuses("spool-root", "root-policy-or-io");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(fixture.data.0.join("ingress"))
+        .unwrap();
+    fixture.write(
+        "td-mta.conf",
+        source
+            .replace(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cccccccccccccccccccccccccccccccc",
+            )
+            .as_bytes(),
+        0o644,
+    );
+    refuses("accounts", "configured-account-mismatch");
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
+    refuses("listen", "address-in-use");
+    drop(listener);
+    // Refuse public roots without claiming readiness or opening a listener.
+    fs::set_permissions(&logs.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["serve", "--smtp-only", "--config"])
+        .arg(fixture.path("td-mta.conf"))
+        .output()
+        .unwrap();
+    let report = report_command(&output, 1, "serve");
+    assert_eq!(report.get("stage").unwrap().as_str(), Some("log-root"));
+    fs::set_permissions(&logs.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let process = ReceivingProcess::start(&fixture);
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["serve", "--smtp-only", "--config"])
+        .arg(fixture.path("td-mta.conf"))
+        .output()
+        .unwrap();
+    let report = report_command(&output, 1, "serve");
+    assert_eq!(report.get("stage").unwrap().as_str(), Some("store-lock"));
+    let connect = || {
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        smtp_command(&mut stream, b"", "220");
+        smtp_command(&mut stream, b"EHLO sender.test\r\n", "250");
+        stream
+    };
+    let mut stream = connect();
+    smtp_command(&mut stream, b"MAIL FROM:<>\r\n", "250");
+    smtp_command(&mut stream, b"RCPT TO:<other@outside.test>\r\n", "550");
+    smtp_command(&mut stream, b"RCPT TO:<main@example.test>\r\n", "250");
+    smtp_command(&mut stream, b"DATA\r\n", "354");
+    smtp_command(
+        &mut stream,
+        b"Subject: process-recovery\r\n\r\naccepted-body\r\n.\r\n",
+        "250",
+    );
+    // A second, unfinished DATA owns a spool slot when the process dies.
+    smtp_command(&mut stream, b"MAIL FROM:<>\r\n", "250");
+    smtp_command(&mut stream, b"RCPT TO:<main@example.test>\r\n", "250");
+    smtp_command(&mut stream, b"DATA\r\n", "354");
+    stream
+        .get_mut()
+        .write_all(b"Subject: unfinished\r\n\r\nunaccepted-body\r\n")
+        .unwrap();
+    assert!(fs::read_dir(fixture.data.0.join("ingress"))
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("slot-")));
+    drop(process);
+    drop(stream);
+    let process = ReceivingProcess::start(&fixture);
+    assert_eq!(
+        fs::read_dir(fixture.data.0.join("ingress"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let mut stream = connect();
+    smtp_command(&mut stream, b"QUIT\r\n", "221");
+    drop(stream);
+    drop(process);
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["store", "verify", "--root"])
+        .arg(&fixture.data.0)
+        .arg("--all")
+        .output()
+        .unwrap();
+    let report = report_command(&output, 0, "store.verify");
+    assert_eq!(report.get("blobs").unwrap().as_u64(), Some(1));
+    // Inspect the reopened body through the typed store, never direct SQL.
+    let mut root = PrivateRoot::open(fixture.data.0.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let deadline = Deadline::after(clock.sample().unwrap().monotonic, 60_000).unwrap();
+    let store = IndexStore::open(&mut root, clock, 1, deadline).unwrap();
+    let mut view = store
+        .view(AccountId::from_bytes([0xaa; 16]), deadline)
+        .unwrap();
+    let mut key = [0; 128];
+    let mut value = [0; 65536];
+    let found = view
+        .next(Table::Blobs, None, &mut key, &mut value)
+        .unwrap()
+        .unwrap();
+    let (id, length) = match (found.key, found.row) {
+        (Key::Blob(id), Row::Blob(row)) => Some((id, row.length)),
+        _ => None,
+    }
+    .unwrap();
+    let mut bytes = vec![0; length as usize];
+    let mut body = view
+        .open_blob_input(&td_crypto::Provider, id, 32768)
+        .unwrap();
+    let mut used = 0;
+    while used < bytes.len() {
+        let n = body.read(&mut bytes[used..]).unwrap();
+        assert_ne!(n, 0);
+        used += n;
+    }
+    body.finish().unwrap();
+    assert!(bytes.ends_with(b"Subject: process-recovery\r\n\r\naccepted-body\r\n"));
+}
+
+#[test]
+fn serve_requires_explicit_receiving_profile() {
+    for args in [
+        vec!["serve"],
+        vec!["serve", "--config", "/absent"],
+        vec!["serve", "--smtp-only"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(args)
+            .output()
+            .unwrap();
+        report_command(&output, 2, "serve");
+    }
+}

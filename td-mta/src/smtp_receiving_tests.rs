@@ -32,6 +32,7 @@ struct ClockNow(
     AtomicBool,
     std::sync::atomic::AtomicU64,
     AtomicBool,
+    std::sync::atomic::AtomicI64,
 );
 impl Clock for ClockNow {
     fn sample(&self) -> Result<Time, Error> {
@@ -43,7 +44,7 @@ impl Clock for ClockNow {
             panic!("injected receiving main failure");
         }
         Ok(Time {
-            utc_ms: 1_800_000_000_000,
+            utc_ms: self.4.load(Ordering::Relaxed),
             monotonic: Tick(
                 u64::try_from(self.0.elapsed().as_millis()).unwrap()
                     + self.2.load(Ordering::Relaxed),
@@ -121,6 +122,10 @@ fn receiving_workers_deliver_beside_idle_peer_and_enforce_peer_limit() {
 fn receiving_workers_upgrade_real_tls_and_record_actual_peer_evidence() {
     run(Case::Tls);
 }
+#[test]
+fn receiving_certificate_expiry_stops_plaintext_admission() {
+    run(Case::ExpiredLive);
+}
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Case {
     Plain,
@@ -129,6 +134,9 @@ enum Case {
     WorkerFailure,
     MainFailure,
     MissingInbox,
+    ExpiredStartup,
+    ExpiredLive,
+    ReadyFailure,
     BadPool,
     BadSettings,
     DuplicateListener,
@@ -149,6 +157,8 @@ fn receiving_main_unwind_joins_workers_and_cleans_live_delivery() {
 #[test]
 fn receiving_startup_refuses_invalid_store_limits_and_bindings() {
     for case in [
+        Case::ExpiredStartup,
+        Case::ReadyFailure,
         Case::MissingInbox,
         Case::BadPool,
         Case::BadSettings,
@@ -179,6 +189,11 @@ fn run(case: Case) {
         AtomicBool::new(false),
         std::sync::atomic::AtomicU64::new(0),
         AtomicBool::new(false),
+        std::sync::atomic::AtomicI64::new(if case == Case::ExpiredStartup {
+            0
+        } else {
+            1_800_000_000_000
+        }),
     ));
     let resources = Limits {
         message_bytes: if case == Case::BadSettings {
@@ -286,6 +301,23 @@ fn run(case: Case) {
                 );
             }
             listeners.push(BoundListener::new(listener, row, &policies).unwrap());
+            if case == Case::Plain {
+                let id = TlsPolicies::bound_listener(&policies, row).unwrap();
+                let (first, last) = TlsPolicies::resolve(&policies, id)
+                    .unwrap()
+                    .receiving_validity
+                    .unwrap();
+                for utc in [first as i64 * 1000, last as i64 * 1000 + 999] {
+                    assert!(TlsPolicies::check_receiving_certificate(&policies, id, utc).is_ok());
+                }
+                for utc in [-1, first as i64 * 1000 - 1, (last as i64 + 1) * 1000] {
+                    assert!(matches!(
+                        TlsPolicies::check_receiving_certificate(&policies, id, utc),
+                        Err(Error::Tls)
+                    ));
+                }
+            }
+
             let receiving = Receiving {
                 coordinator: &coordinator,
                 spool: &spool,
@@ -302,13 +334,34 @@ fn run(case: Case) {
             let control = Control::default();
             if matches!(
                 case,
-                Case::MissingInbox
+                Case::ExpiredStartup
+                    | Case::ReadyFailure
+                    | Case::MissingInbox
                     | Case::BadPool
                     | Case::BadSettings
                     | Case::DuplicateListener
                     | Case::TotalLimit
             ) {
-                assert!(receiving.run(&control).is_err());
+                let mut called = false;
+                let result = receiving.run_with_ready(&control, || {
+                    called = true;
+                    assert!(case == Case::ReadyFailure);
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+                });
+                assert_eq!(called, case == Case::ReadyFailure);
+                if case == Case::ReadyFailure {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Io {
+                            kind: std::io::ErrorKind::BrokenPipe,
+                            ..
+                        })
+                    ));
+                } else if case == Case::ExpiredStartup {
+                    assert!(matches!(result, Err(Error::Tls)));
+                } else {
+                    assert!(result.is_err());
+                }
                 assert_eq!(control.state(), State::Failed);
                 return;
             }
@@ -333,6 +386,22 @@ fn run(case: Case) {
                 let mut excess =
                     TcpTransport::from_stream(TcpStream::connect(address).unwrap()).unwrap();
                 reply(&mut excess, b"421");
+                if case == Case::ExpiredLive {
+                    command(&mut active, b"EHLO sender.test\r\n", b"250");
+                    command(&mut active, b"MAIL FROM:<>\r\n", b"250");
+                    command(&mut active, b"RCPT TO:<main@example.test>\r\n", b"250");
+                    command(&mut active, b"DATA\r\n", b"354");
+                    assert_eq!(spool.status().unwrap().occupied_slots, 1);
+                    // Plaintext must fail closed without completing in-flight DATA.
+                    clock.4.store(4_102_444_800_000, Ordering::Relaxed);
+                    wait(|| control.state() == State::Failed);
+                    idle.abort();
+                    active.abort();
+                    clock.2.store(6000, Ordering::Relaxed);
+                    assert!(matches!(server.join().unwrap().unwrap(), Err(Error::Tls)));
+                    assert_eq!(spool.status().unwrap().occupied_slots, 0);
+                    return;
+                }
                 if matches!(case, Case::WorkerFailure | Case::MainFailure) {
                     command(&mut active, b"EHLO sender.test\r\n", b"250");
                     command(&mut active, b"MAIL FROM:<>\r\n", b"250");

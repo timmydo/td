@@ -310,11 +310,21 @@ fn buffer() -> Result<Wire, Error> {
 
 impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
     pub fn run(&self, control: &Control) -> Result<(), Error> {
+        self.run_with_ready(control, || Ok(()))
+    }
+
+    /// Announce readiness after startup checks and both workers start, before
+    /// accepting clients. A failed announcement stops and joins the workers.
+    pub fn run_with_ready(
+        &self,
+        control: &Control,
+        ready: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
         control
             .state
             .compare_exchange(0, 5, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::Conflict)?;
-        let result = self.run_inner(control);
+        let result = self.run_inner(control, ready);
         if result.is_err() {
             control.fail();
             return result;
@@ -327,7 +337,11 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
         }
     }
 
-    fn run_inner(&self, control: &Control) -> Result<(), Error> {
+    fn run_inner(
+        &self,
+        control: &Control,
+        ready: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let limits = self.resources.limits();
         if self.listeners.is_empty()
             || self.listeners.len() > crate::config::listener::MAX_LISTENERS
@@ -449,198 +463,249 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                 }
                 std::thread::park_timeout(SCAN);
             }
-            if started.load(Ordering::Acquire) == 2 && !control.stop.load(Ordering::Acquire) {
-                control.transition(1);
-            }
-            let mut cursor = 0;
-            let mut stopping = None;
-            let mut accept_after = Tick(0);
-            let result = (|| loop {
-                if storage.is_finished() || tls.is_finished() {
-                    control.fail();
-                    break Err(Error::WriterStopped);
+            let result = (|| {
+                if started.load(Ordering::Acquire) == 2 && !control.stop.load(Ordering::Acquire) {
+                    let utc_ms = self.clock.sample()?.utc_ms;
+                    for listener in self.listeners {
+                        TlsPolicies::check_receiving_certificate(
+                            self.policies,
+                            listener.policy,
+                            utc_ms,
+                        )?;
+                    }
+                    ready()?;
+                    control.transition(1);
                 }
-                let now = match self.clock.sample() {
-                    Ok(time) => time.monotonic,
-                    Err(error) => {
+                let mut cursor = 0;
+                let mut stopping = None;
+                let mut accept_after = Tick(0);
+                let mut certificate_failed = false;
+                loop {
+                    if storage.is_finished() || tls.is_finished() {
                         control.fail();
-                        break Err(error);
+                        break Err(Error::WriterStopped);
                     }
-                };
-                if control.stop.load(Ordering::Acquire) && stopping.is_none() {
-                    if control.state() != State::Failed {
-                        control.transition(2);
-                    }
-                    stopping = Some(after(now, 5)?);
-                }
-                let mut progress = false;
-                for offset in 0..total {
-                    let index = (cursor + offset) % total;
-                    let Some(cell) = slots.get(index) else {
-                        break;
-                    };
-                    let mut slot = match cell.try_lock() {
-                        Ok(slot) => slot,
-                        Err(TryLockError::WouldBlock) => continue,
-                        Err(TryLockError::Poisoned(_)) => {
+                    let now = match self.clock.sample() {
+                        Ok(time) => {
+                            if self.listeners.iter().any(|listener| {
+                                TlsPolicies::check_receiving_certificate(
+                                    self.policies,
+                                    listener.policy,
+                                    time.utc_ms,
+                                )
+                                .is_err()
+                            }) {
+                                // Fail closed: workers discard queued, uncommitted work.
+                                certificate_failed = true;
+                                control.fail();
+                            }
+                            time.monotonic
+                        }
+                        Err(error) => {
                             control.fail();
+                            break Err(error);
+                        }
+                    };
+                    if control.stop.load(Ordering::Acquire) && stopping.is_none() {
+                        if control.state() != State::Failed {
+                            control.transition(2);
+                        }
+                        stopping = Some(after(now, 5)?);
+                    }
+                    let mut progress = false;
+                    for offset in 0..total {
+                        let index = (cursor + offset) % total;
+                        let Some(cell) = slots.get(index) else {
+                            break;
+                        };
+                        let mut slot = match cell.try_lock() {
+                            Ok(slot) => slot,
+                            Err(TryLockError::WouldBlock) => continue,
+                            Err(TryLockError::Poisoned(_)) => {
+                                control.fail();
+                                continue;
+                            }
+                        };
+                        if matches!(slot.phase, Phase::Empty) {
+                            if let Some(entry) = occupied.get_mut(index) {
+                                *entry = None;
+                            }
                             continue;
                         }
-                    };
-                    if matches!(slot.phase, Phase::Empty) {
-                        if let Some(entry) = occupied.get_mut(index) {
-                            *entry = None;
-                        }
-                        continue;
-                    }
-                    let final_reply = slot.final_reply
-                        && slot
-                            .connection
-                            .as_ref()
-                            .and_then(|connection| connection.network().ok())
-                            .is_some_and(|network| {
-                                matches!(network.session().pending(), Pending::Reply { .. })
-                            });
-                    slot.final_reply = final_reply;
-                    if stopping.is_some_and(|deadline| deadline.expired(now)) && !final_reply {
-                        slot.phase = Phase::Retire;
-                    }
-                    if let Phase::Done = slot.phase {
-                        slot.phase = Phase::Network;
-                    }
-                    if let Phase::Retry { work, deadline, at } = slot.phase {
-                        if at <= now || deadline.expired(now) {
-                            slot.phase = Phase::Queued { work, deadline };
-                            progress = true;
-                        }
-                    }
-                    if matches!(slot.phase, Phase::Network) {
+                        let final_reply = slot.final_reply
+                            && slot
+                                .connection
+                                .as_ref()
+                                .and_then(|connection| connection.network().ok())
+                                .is_some_and(|network| {
+                                    matches!(network.session().pending(), Pending::Reply { .. })
+                                });
+                        slot.final_reply = final_reply;
                         if stopping.is_some_and(|deadline| deadline.expired(now)) && !final_reply {
                             slot.phase = Phase::Retire;
-                        } else {
-                            let turn = (|| {
-                                let connection = slot.connection()?;
-                                if stopping.is_some() {
-                                    let _ = connection
-                                        .network_mut()?
-                                        .service_unavailable(self.clock.as_ref());
-                                }
-                                connection.advance(self.clock.as_ref())
-                            })();
-                            match turn {
-                                Ok(Progress::Pending) => (),
-                                Ok(Progress::Advanced) => progress = true,
-                                Ok(Progress::Closed) | Err(_) => {
-                                    slot.phase = Phase::Retire;
-                                    progress = true;
-                                }
-                                Ok(Progress::Work) => {
-                                    let dispatched = self.dispatch(&mut slot, now);
-                                    if dispatched.is_err() {
-                                        slot.phase = Phase::Retire;
+                        }
+                        if let Phase::Done = slot.phase {
+                            slot.phase = Phase::Network;
+                        }
+                        if let Phase::Retry { work, deadline, at } = slot.phase {
+                            if at <= now || deadline.expired(now) {
+                                slot.phase = Phase::Queued { work, deadline };
+                                progress = true;
+                            }
+                        }
+                        if matches!(slot.phase, Phase::Network) {
+                            if stopping.is_some_and(|deadline| deadline.expired(now))
+                                && !final_reply
+                            {
+                                slot.phase = Phase::Retire;
+                            } else {
+                                let turn = (|| {
+                                    let connection = slot.connection()?;
+                                    if stopping.is_some() {
+                                        let _ = connection
+                                            .network_mut()?
+                                            .service_unavailable(self.clock.as_ref());
                                     }
-                                    progress = true;
+                                    connection.advance(self.clock.as_ref())
+                                })();
+                                match turn {
+                                    Ok(Progress::Pending) => (),
+                                    Ok(Progress::Advanced) => progress = true,
+                                    Ok(Progress::Closed) | Err(_) => {
+                                        slot.phase = Phase::Retire;
+                                        progress = true;
+                                    }
+                                    Ok(Progress::Work) => {
+                                        let dispatched = self.dispatch(&mut slot, now);
+                                        if dispatched.is_err() {
+                                            slot.phase = Phase::Retire;
+                                        }
+                                        progress = true;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                cursor = (cursor + 1) % total;
-                storage.thread().unpark();
-                tls.thread().unpark();
-                if stopping.is_some() && occupied.iter().all(Option::is_none) {
-                    break if control.state() == State::Failed {
-                        Err(Error::WriterStopped)
-                    } else {
-                        Ok(())
-                    };
-                }
-                if stopping.is_none()
-                    && !control.stop.load(Ordering::Acquire)
-                    && now >= accept_after
-                {
-                    for (index, listener) in self.listeners.iter().enumerate() {
-                        if control.stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        match listener.socket.accept() {
-                            Ok((socket, _)) => {
-                                progress = true;
-                                let mut transport = match TcpTransport::from_stream(socket) {
-                                    Ok(transport) => transport,
-                                    Err(_) => continue,
-                                };
-                                let peer = transport.peer_addr().ip();
-                                let count = occupied
-                                    .iter()
-                                    .flatten()
-                                    .filter(|(l, _)| *l == index)
-                                    .count();
-                                let peer_count = occupied
-                                    .iter()
-                                    .flatten()
-                                    .filter(|(_, p)| *p == peer)
-                                    .count();
-                                let local_peer = occupied
-                                    .iter()
-                                    .flatten()
-                                    .filter(|(l, p)| *l == index && *p == peer)
-                                    .count();
-                                if count >= listener.row.session_limit.unwrap_or(0)
-                                    || peer_count >= limits.smtp_per_peer
-                                    || local_peer >= listener.row.per_peer_limit.unwrap_or(0)
-                                {
-                                    let _ = transport.write(b"421 4.3.2 Service unavailable\r\n");
-                                    transport.abort();
-                                    continue;
-                                }
-                                let free = occupied
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, entry)| entry.is_none())
-                                    .find_map(|(index, _)| {
-                                        slots.get(index).and_then(|cell| {
-                                            cell.try_lock().ok().map(|slot| (index, slot))
+                    cursor = (cursor + 1) % total;
+                    storage.thread().unpark();
+                    tls.thread().unpark();
+                    if stopping.is_some() && occupied.iter().all(Option::is_none) {
+                        break if certificate_failed {
+                            Err(Error::Tls)
+                        } else if control.state() == State::Failed {
+                            Err(Error::WriterStopped)
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    if stopping.is_none()
+                        && !control.stop.load(Ordering::Acquire)
+                        && now >= accept_after
+                    {
+                        for (index, listener) in self.listeners.iter().enumerate() {
+                            if control.stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            match listener.socket.accept() {
+                                Ok((socket, _)) => {
+                                    progress = true;
+                                    let mut transport = match TcpTransport::from_stream(socket) {
+                                        Ok(transport) => transport,
+                                        Err(_) => continue,
+                                    };
+                                    if self
+                                        .clock
+                                        .sample()
+                                        .and_then(|time| {
+                                            TlsPolicies::check_receiving_certificate(
+                                                self.policies,
+                                                listener.policy,
+                                                time.utc_ms,
+                                            )
                                         })
-                                    });
-                                let Some((free, mut slot)) = free else {
-                                    let _ = transport.write(b"421 4.3.2 Service unavailable\r\n");
-                                    transport.abort();
-                                    continue;
-                                };
-                                let network = match Network::new(
-                                    self.routes,
-                                    self.settings(listener),
-                                    self.timeouts,
-                                    self.clock.as_ref(),
-                                ) {
-                                    Ok(network) => network,
-                                    Err(_) => {
+                                        .is_err()
+                                    {
+                                        let _ =
+                                            transport.write(b"421 4.3.2 Service unavailable\r\n");
+                                        transport.abort();
+                                        certificate_failed = true;
+                                        control.fail();
+                                        continue;
+                                    }
+                                    let peer = transport.peer_addr().ip();
+                                    let count = occupied
+                                        .iter()
+                                        .flatten()
+                                        .filter(|(l, _)| *l == index)
+                                        .count();
+                                    let peer_count = occupied
+                                        .iter()
+                                        .flatten()
+                                        .filter(|(_, p)| *p == peer)
+                                        .count();
+                                    let local_peer = occupied
+                                        .iter()
+                                        .flatten()
+                                        .filter(|(l, p)| *l == index && *p == peer)
+                                        .count();
+                                    if count >= listener.row.session_limit.unwrap_or(0)
+                                        || peer_count >= limits.smtp_per_peer
+                                        || local_peer >= listener.row.per_peer_limit.unwrap_or(0)
+                                    {
                                         let _ =
                                             transport.write(b"421 4.3.2 Service unavailable\r\n");
                                         transport.abort();
                                         continue;
                                     }
-                                };
-                                slot.connection = Some(Connection::Plain(network, transport));
-                                slot.listener = index;
-                                slot.peer = peer;
-                                slot.phase = Phase::Network;
-                                if let Some(entry) = occupied.get_mut(free) {
-                                    *entry = Some((index, peer));
+                                    let free = occupied
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, entry)| entry.is_none())
+                                        .find_map(|(index, _)| {
+                                            slots.get(index).and_then(|cell| {
+                                                cell.try_lock().ok().map(|slot| (index, slot))
+                                            })
+                                        });
+                                    let Some((free, mut slot)) = free else {
+                                        let _ =
+                                            transport.write(b"421 4.3.2 Service unavailable\r\n");
+                                        transport.abort();
+                                        continue;
+                                    };
+                                    let network = match Network::new(
+                                        self.routes,
+                                        self.settings(listener),
+                                        self.timeouts,
+                                        self.clock.as_ref(),
+                                    ) {
+                                        Ok(network) => network,
+                                        Err(_) => {
+                                            let _ = transport
+                                                .write(b"421 4.3.2 Service unavailable\r\n");
+                                            transport.abort();
+                                            continue;
+                                        }
+                                    };
+                                    slot.connection = Some(Connection::Plain(network, transport));
+                                    slot.listener = index;
+                                    slot.peer = peer;
+                                    slot.phase = Phase::Network;
+                                    if let Some(entry) = occupied.get_mut(free) {
+                                        *entry = Some((index, peer));
+                                    }
                                 }
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+                                Err(error) if retry_accept(&error) => {
+                                    accept_after = later(self.clock.as_ref(), 5)?;
+                                }
+                                Err(_) => control.fail(),
                             }
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-                            Err(error) if retry_accept(&error) => {
-                                accept_after = later(self.clock.as_ref(), 5)?;
-                            }
-                            Err(_) => control.fail(),
                         }
                     }
-                }
-                if !progress {
-                    std::thread::park_timeout(SCAN);
+                    if !progress {
+                        std::thread::park_timeout(SCAN);
+                    }
                 }
             })();
             finished.store(true, Ordering::Release);

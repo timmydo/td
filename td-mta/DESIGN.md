@@ -16,8 +16,9 @@ delivery adapter are implemented; transcript tests bind acceptance to
 reopened mail. A nonblocking receiving driver now connects session
 input, reply flushing, worker handoffs, deadlines and bounded closure to
 transports. Receiving STARTTLS now joins the driver to an actual TLS
-handshake. Listener activation and worker scheduling remain
-separate, with no advertised service capabilities.
+handshake. The foreground `serve --smtp-only` profile now activates direct IPv4
+SMTP with those fixed workers, protected configuration and existing
+account storage. CONFIG.md documents its explicit capability limits.
 
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
@@ -41,8 +42,8 @@ closed SQL, native heap/page ceilings and monotonic operation bounds constrain
 the core. [STORAGE.md](STORAGE.md) owns these implemented boundaries.
 The custom journal/checkpoint/replay engine has been removed atomically.
 Protocol authorization, full mutation policy, the full operational suite, native
-resource and complete crash/fault qualification, and service activation
-remain unimplemented.
+resource and complete crash/fault release qualification, and full service
+activation remain unimplemented. Direct SMTP activation is described below.
 Mailbox-parent, reference and recipient validators remain reusable. SQLite
 commits check final recipient coverage and queue-state aggregates for affected
 submissions under the original bounded transaction scope.
@@ -166,7 +167,8 @@ tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The packaging entry point supports `--version`, `--help`, `config check`
-of an operator file and its protected inputs (CONFIG.md), offline
+of an operator file and its protected inputs, foreground
+`serve --smtp-only` for direct IPv4 receiving (CONFIG.md), offline
 `store init` of a new store holding one account and its Inbox, offline
 `store verify` for an explicitly selected account or all accounts,
 stopped-database `backup`, and verified fresh-epoch `restore` to a fresh
@@ -1468,8 +1470,11 @@ combined report. The historical result retains the same separate physical,
 custody and activation requirements. SQLite recovery may read the full
 bounded WAL, and checkpoint may copy the entire bounded database in a
 synchronous native call. Neither promises interruption at the application
-deadline. Native resource and complete crash/fault qualification, domain
-mutation policy and service deployment remain activation requirements.
+deadline. Native resource and complete crash/fault qualification remain v1
+release requirements under sections 5 and 15. Incremental receiving activation does
+not require the complete release matrix; it must test its changed durability,
+admission and lifecycle boundaries. Full domain mutation policy and service
+deployment remain separate.
 
 ## 9. SMTP receiving and message representation
 
@@ -1492,8 +1497,8 @@ connect actual outcomes to the session and verify reopened mail. The
 receiving network driver additionally exercises real local TCP delivery
 and reopened storage. The direct receiving runtime described below
 connects these adapters with fixed workers on caller-bound listeners.
-Command-line service activation remains M11 work. The engine binds routing
-for its lifetime, accepts only configured recipients, retains accepted
+The `serve --smtp-only` command activates direct receiving. The engine binds
+routing for its lifetime, accepts only configured recipients, retains accepted
 envelope spellings, and exposes one account for one atomic delivery. It
 advertises SIZE, 8BITMIME and
 enhanced status codes; optional STARTTLS hands the original command to
@@ -1544,6 +1549,13 @@ not serve the configuration's HTTPS listener, enable gateway receiving
 or implement hot reload. A connection-specific direct
 adapter binds the real socket peer and actual negotiated TLS version;
 plaintext and TLS direct SMTP grant no remote identity authentication.
+The runtime checks each bound direct certificate chain's admitted UTC
+validity window before readiness, on every scan and before new-session
+admission. Failure stops new admissions and fails health; workers abandon
+queued work without a final reply. Committed mail remains durable and
+existing final replies retain their bounded allowance. The runtime reports
+a TLS failure. This gate also applies to
+plaintext SMTP, which would otherwise never construct a TLS session.
 
 One network loop visits bounded connection slots in rotating order. One
 fixed storage worker performs admission, streaming writes and publication;
@@ -1612,8 +1624,7 @@ connection and releases native state and handshake capacity on the
 worker; there is no plaintext fallback. Borrowed wire buffers are
 released and owned buffers are freed on refusal. A local real-TLS
 fixture exercises post-handshake EHLO reset and encrypted commands;
-worker queues, listener admission and service activation remain
-separate.
+the fixed receiving workers and `serve --smtp-only` now activate that path.
 
 Implement a bounded SMTP state machine with EHLO/HELO, MAIL, RCPT, DATA, RSET,
 NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise

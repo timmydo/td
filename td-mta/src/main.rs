@@ -1,4 +1,4 @@
-//! Offline initialization, verification, database backup/restore and packaging entry point.
+//! Operator commands and foreground SMTP receiving.
 #![forbid(unsafe_code)]
 
 use std::{
@@ -24,7 +24,9 @@ use td_mta::{
     tls_policy::{MaterialKind, TlsPolicies},
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nNo repair or serving commands are available.\n";
+mod serve;
+
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta serve --smtp-only --config PATH\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nServe requires an initialized data root, its private ingress/ subdirectory,\nand private runtime/log roots.\nIt receives direct IPv4 SMTP only; HTTPS, outbound delivery and reload are inactive.\nStop it through the supervisor; signals currently terminate without draining.\nNo repair command is available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -154,8 +156,12 @@ fn locked_root(
         stage: root_stage,
         code: "root-policy-or-io",
     })?;
+    lock_root(root, lock_stage)
+}
+
+fn lock_root(root: PrivateRoot, stage: &'static str) -> Result<LockedRoot, Failure> {
     root.try_lock().map_err(|error| Failure {
-        stage: lock_stage,
+        stage,
         code: match error {
             LockError::Busy => "busy",
             LockError::Policy => "lock-policy",
@@ -411,8 +417,23 @@ fn material_target(kind: MaterialKind) -> &'static str {
 
 /// Every stage a service start needs before touching the store: protected
 /// opening of the file and all references, structural load, text decoding,
-/// TLS provider construction and identity encoding. Returns distinct inputs.
+/// TLS provider construction and identity encoding, retained for activation.
+struct CheckedConfiguration {
+    resolved: materialize::ResolvedText,
+    prepared: td_mta::generations::PreparedGeneration<TlsPolicies>,
+    generations: GenerationSet<TlsPolicies>,
+    root: PrivateRoot,
+    inputs: usize,
+}
+
 fn config_check(path: &str) -> Result<usize, ConfigFailure> {
+    Ok(load_configuration(path, Arc::new(RuntimeClock::new()))?.inputs)
+}
+
+fn load_configuration(
+    path: &str,
+    clock: Arc<dyn Clock>,
+) -> Result<CheckedConfiguration, ConfigFailure> {
     let mut files = Inputs::new();
     let mut source = files
         .open(path, Role::Configuration)
@@ -445,7 +466,6 @@ fn config_check(path: &str) -> Result<usize, ConfigFailure> {
     files
         .bind(&root)
         .map_err(|error| config_failure("data-root", error.code()))?;
-    drop(root);
     let resolved = materialize::read_text(loaded, &mut scratch, |reference| {
         files.open(reference.path(), Role::of(reference.target()))
     })
@@ -461,12 +481,11 @@ fn config_check(path: &str) -> Result<usize, ConfigFailure> {
             ..config_failure(stage, code)
         }
     })?;
-    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     let tls_clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(clock)));
     let set = GenerationSet::<TlsPolicies>::at_startup();
     let reserved = set.reserve().map_err(|error| adapter("tls", error))?;
     let (mut refused, mut last) = (None, None);
-    // A check publishes nothing; the prepared tables are discarded below.
+    // Publication belongs to serve; config check drops the prepared tables.
     let prepared = TlsPolicies::prepare(reserved, &resolved, tls_clock, |request| {
         let target = material_target(request.kind());
         last = Some(target);
@@ -492,10 +511,15 @@ fn config_check(path: &str) -> Result<usize, ConfigFailure> {
             ..adapter("tls", error).into()
         })
     })?;
-    drop(prepared);
     preimage::write(&resolved, |_| Ok::<(), std::convert::Infallible>(()))
         .map_err(|error| config_failure("identities", error.name()))?;
-    Ok(files.count())
+    Ok(CheckedConfiguration {
+        resolved,
+        prepared,
+        generations: set,
+        root,
+        inputs: files.count(),
+    })
 }
 
 fn json_text(text: &str) -> String {
@@ -512,7 +536,18 @@ fn json_text(text: &str) -> String {
 }
 
 fn config_check_failure(output: &mut impl Write, error: ConfigFailure) -> io::Result<()> {
-    write!(output, "{{\"schema\":1,\"command\":\"config.check\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\"", error.failure.stage, error.failure.code)?;
+    configuration_failure(output, "config.check", error)
+}
+fn configuration_failure(
+    output: &mut impl Write,
+    command: &str,
+    error: ConfigFailure,
+) -> io::Result<()> {
+    write!(
+        output,
+        "{{\"schema\":1,\"command\":\"{command}\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\"",
+        error.failure.stage, error.failure.code
+    )?;
     if let Some(target) = error.target {
         write!(output, ",\"target\":\"{target}\"")?;
     }
@@ -672,6 +707,24 @@ fn run() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let first = args.next();
+    if first.as_deref() == Some(OsStr::new("serve")) {
+        let path = if args.next().as_deref() == Some(OsStr::new("--smtp-only")) {
+            config_arguments(args)
+        } else {
+            None
+        };
+        let result = path
+            .ok_or_else(|| config_failure("arguments", "invalid-arguments"))
+            .and_then(|path| serve::run(&path));
+        return match result {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(error) => {
+                let code = error.failure.exit_code();
+                configuration_failure(&mut io::stdout().lock(), "serve", error)?;
+                Ok(code)
+            }
+        };
+    }
     if first.as_deref() == Some(OsStr::new("restore")) {
         let Some(options) = copy_arguments(args) else {
             restore_failure(
