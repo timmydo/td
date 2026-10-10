@@ -76,20 +76,17 @@ const MODULES: &[(&str, &str)] = &[
     ),
     (
         "fido_cbor",
-        include_str!("../../../td-secret/src/fido_cbor.rs"),
+        include_str!("../../../td-fido/src/fido_cbor.rs"),
     ),
     (
         "fido_ctap",
-        include_str!("../../../td-secret/src/fido_ctap.rs"),
+        include_str!("../../../td-fido/src/fido_ctap.rs"),
     ),
     (
         "fido_enroll",
-        include_str!("../../../td-secret/src/fido_enroll.rs"),
+        include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),
-    (
-        "fido_hid",
-        include_str!("../../../td-secret/src/fido_hid.rs"),
-    ),
+    ("fido_hid", include_str!("../../../td-fido/src/fido_hid.rs")),
     (
         "fido_metadata",
         include_str!("../../../td-secret/src/fido_metadata.rs"),
@@ -159,6 +156,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-authd/src",
         "{src}/engine/src",
         "{src}/td-tpm/src",
+        "{src}/td-fido/src",
     ] {
         steps.push(Step::MkDir {
             path: directory.into(),
@@ -177,10 +175,10 @@ pub fn recipe() -> Recipe {
     for (name, source) in MODULES {
         steps.push(Step::WriteFile {
             path: match *name {
-                "fido_cbor" => "{src}/td-secret/src/fido_cbor.rs".into(),
-                "fido_ctap" => "{src}/td-secret/src/fido_ctap.rs".into(),
-                "fido_enroll" => "{src}/td-secret/src/fido_enroll.rs".into(),
-                "fido_hid" => "{src}/td-secret/src/fido_hid.rs".into(),
+                "fido_cbor" => "{src}/td-fido/src/fido_cbor.rs".into(),
+                "fido_ctap" => "{src}/td-fido/src/fido_ctap.rs".into(),
+                "fido_enroll" => "{src}/td-fido/src/fido_enroll.rs".into(),
+                "fido_hid" => "{src}/td-fido/src/fido_hid.rs".into(),
                 "fido_metadata" => "{src}/td-secret/src/fido_metadata.rs".into(),
                 "login_state" => "{src}/td-secret/src/login_state.rs".into(),
                 "tpm" => "{src}/td-secret/src/tpm.rs".into(),
@@ -207,6 +205,24 @@ pub fn recipe() -> Recipe {
         content: include_str!("../../../engine/src/sha256.rs").into(),
         exec: false,
     });
+    // td-secret's store crypto and store mount td-fido's HMAC-SHA256 and
+    // root admission by path.
+    for (path, content) in [
+        (
+            "{src}/td-fido/src/hmac.rs",
+            include_str!("../../../td-fido/src/hmac.rs"),
+        ),
+        (
+            "{src}/td-fido/src/root.rs",
+            include_str!("../../../td-fido/src/root.rs"),
+        ),
+    ] {
+        steps.push(Step::WriteFile {
+            path: path.into(),
+            content: content.into(),
+            exec: false,
+        });
+    }
     steps.push(Step::WriteFile {
         path: "{src}/td-tpm/src/lib.rs".into(),
         content: TPM_RS.into(),

@@ -105,6 +105,13 @@ device's size is a `seek`, and its sector size is a file under `/sys`;
 `td-install/DESIGN.md`'s D8 keeps it that way except for that one recorded
 surface.
 
+`td-fido` (td-fido/DESIGN.md), the FIDO2 client td-secret depends on by
+path, forbids `unsafe` crate-wide and is not on the roster. Increment 8a
+moved td-secret's CTAP codecs, PIN protocols, P-256, AES and hidraw
+transport with its worker there; none of it was ever part of §15, whose
+surface stays in td-secret unchanged, and the transport is std file I/O
+and sysfs reads with no hidraw ioctl.
+
 Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
 tier is planned to add no surface ("Unsafe and syscall surfaces" there).
 td-tpm's new commands are bytes over its safe file I/O, its session

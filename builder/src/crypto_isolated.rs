@@ -1311,8 +1311,8 @@ fn stage_sources(root: &Path, destination: &Path) -> Result<()> {
     }
     for (package, directory, names) in [
         ("engine", "src", &["sha256.rs"][..]),
-        ("td-secret", "src", &["fido_p256.rs"][..]),
-        ("td-secret", "tests", &["p256_vectors.txt"][..]),
+        ("td-fido", "src", &["fido_p256.rs"][..]),
+        ("td-fido", "tests", &["p256_vectors.txt"][..]),
     ] {
         for ancestor in [root.join(package), root.join(package).join(directory)] {
             if !fs::symlink_metadata(&ancestor)
@@ -3065,8 +3065,8 @@ mod tests {
         }
         for relative in [
             "engine/src/sha256.rs",
-            "td-secret/src/fido_p256.rs",
-            "td-secret/tests/p256_vectors.txt",
+            "td-fido/src/fido_p256.rs",
+            "td-fido/tests/p256_vectors.txt",
         ] {
             let input = root.join(relative);
             fs::create_dir_all(input.parent().unwrap()).unwrap();
@@ -3077,8 +3077,8 @@ mod tests {
         stage_sources(&root, &destination).unwrap();
         for relative in [
             "engine/src/sha256.rs",
-            "td-secret/src/fido_p256.rs",
-            "td-secret/tests/p256_vectors.txt",
+            "td-fido/src/fido_p256.rs",
+            "td-fido/tests/p256_vectors.txt",
         ] {
             assert_eq!(
                 fs::read(destination.join(relative)).unwrap(),
@@ -3086,27 +3086,27 @@ mod tests {
             );
         }
         assert!(!destination.join("engine/src/not-an-oracle.rs").exists());
-        fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
+        fs::remove_file(root.join("td-fido/tests/p256_vectors.txt")).unwrap();
         assert!(stage_sources(&root, &scratch.0.join("missing-oracle"))
             .unwrap_err()
             .starts_with("inspect oracle source:"));
         symlink(
             "../../engine/src/sha256.rs",
-            root.join("td-secret/tests/p256_vectors.txt"),
+            root.join("td-fido/tests/p256_vectors.txt"),
         )
         .unwrap();
         assert_eq!(
             stage_sources(&root, &scratch.0.join("linked-oracle")).unwrap_err(),
             "oracle sources must be regular files, not links"
         );
-        fs::remove_file(root.join("td-secret/tests/p256_vectors.txt")).unwrap();
-        fs::write(root.join("td-secret/tests/p256_vectors.txt"), "restored").unwrap();
+        fs::remove_file(root.join("td-fido/tests/p256_vectors.txt")).unwrap();
+        fs::write(root.join("td-fido/tests/p256_vectors.txt"), "restored").unwrap();
         for (index, relative) in [
             "engine",
             "engine/src",
-            "td-secret",
-            "td-secret/src",
-            "td-secret/tests",
+            "td-fido",
+            "td-fido/src",
+            "td-fido/tests",
         ]
         .iter()
         .enumerate()

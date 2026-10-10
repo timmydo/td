@@ -847,4 +847,111 @@ mod tests {
         assert_eq!(lowest_common(&[1, 2], &[2], &[1]), None);
         assert_eq!(lowest_common(&[1], &[1, 2], &[2]), None);
     }
+
+    /// End to end over td-fido's virtual authenticator: a key whose
+    /// hmac-secret output changes still signs a valid assertion, and the
+    /// record is what refuses it.
+    mod virtual_key {
+        use super::*;
+        use crate::fido_cbor::{self as cbor, Value};
+        use crate::fido_pin::{EnrolledCredential, HmacOutput, Pin};
+        use crate::fido_transaction::{
+            LoginAssertion, LoginCreation, LoginError, LoginPin, Transaction,
+        };
+        use crate::fido_virtual::{Config, Output, Script, Virtual};
+
+        const PIN: &[u8] = b"1234";
+        const SALT: [u8; 32] = [0x5a; 32];
+
+        fn entropy() -> impl FnMut(&mut [u8]) -> std::result::Result<(), String> {
+            let mut count = 0u32;
+            move |out| {
+                for chunk in out.chunks_mut(32) {
+                    count += 1;
+                    let bytes = crate::crypto::digest(&count.to_be_bytes());
+                    chunk.copy_from_slice(&bytes[..chunk.len()]);
+                }
+                Ok(())
+            }
+        }
+
+        fn key_of(cose: &[u8]) -> PublicKey {
+            let value = cbor::decode(cose).unwrap();
+            let coordinate = |key| -> [u8; 32] {
+                value
+                    .required(&Value::Negative(key))
+                    .unwrap()
+                    .bytes()
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            };
+            PublicKey::from_coordinates(&coordinate(1), &coordinate(2)).unwrap()
+        }
+
+        fn create(key: &Virtual) -> EnrolledCredential {
+            Transaction::new(key.link())
+                .unwrap()
+                .login_create(
+                    LoginCreation {
+                        user: [0x54; 32],
+                        salt: SALT,
+                        excluded: &[],
+                    },
+                    &mut |step, _| {
+                        let hash = match step {
+                            LoginPin::Creation => [1; 32],
+                            LoginPin::Proof(_) => [0xab; 32],
+                        };
+                        Ok((Pin::new(PIN.into())?, hash))
+                    },
+                    &mut entropy(),
+                )
+                .unwrap()
+        }
+
+        fn login(
+            key: &Virtual,
+            created: &EnrolledCredential,
+        ) -> std::result::Result<HmacOutput, LoginError> {
+            Transaction::new(key.link()).unwrap().login_assertion(
+                LoginAssertion {
+                    credential: created.id(),
+                    key: key_of(created.cose()),
+                    salt: SALT,
+                },
+                &mut |_, _| Ok((Pin::new(PIN.into())?, [0x11; 32])),
+                &mut entropy(),
+            )
+        }
+
+        #[test]
+        fn a_virtual_keys_wrong_secret_verifies_but_the_record_refuses_it() {
+            let key = Virtual::new(Config::default(), Some(PIN), "record");
+            let created = create(&key);
+            let output: [u8; 32] = created.output().bytes().try_into().unwrap();
+            let record = Record::enroll(
+                UID,
+                [7; 32],
+                VERSION,
+                vec![NewKey {
+                    credential: created.id().to_vec(),
+                    key: key_of(created.cose()),
+                    salt: SALT,
+                    output: &output,
+                }],
+            )
+            .unwrap();
+            let right: [u8; 32] = login(&key, &created).unwrap().bytes().try_into().unwrap();
+            assert_eq!(right, output);
+            assert!(record.check(created.id(), &right).unwrap());
+            key.script(Script {
+                output: Output::Wrong,
+                ..Script::default()
+            });
+            let wrong: [u8; 32] = login(&key, &created).unwrap().bytes().try_into().unwrap();
+            assert_ne!(wrong, output);
+            assert!(!record.check(created.id(), &wrong).unwrap());
+        }
+    }
 }

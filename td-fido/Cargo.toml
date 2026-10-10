@@ -1,20 +1,17 @@
 [package]
-name = "td-secret"
+name = "td-fido"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "td's local credential store and console writer"
+description = "td's dependency-free FIDO2 client: CTAP HID framing, CBOR, the CTAP codecs, PIN protocols, hmac-secret, P-256, AES and root hidraw admission"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
 
 [workspace]
 
-# The FIDO2 client its token operations run over (td-fido/DESIGN.md) and
-# the TPM 2.0 client its sealed-store formats run over.
-[dependencies]
-td-fido = { path = "../td-fido" }
-td-tpm = { path = "../td-tpm" }
+[lints.rust]
+unsafe_code = "forbid"
 
 [lints.clippy]
 unwrap_used = "deny"

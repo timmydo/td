@@ -47,10 +47,10 @@ const GY: Words = [
 ];
 
 /// Takes ownership even on refusal, so the candidate has the same drop policy.
-pub(super) struct SecretScalar(Box<[u8; 32]>);
+pub struct SecretScalar(Box<[u8; 32]>);
 
 impl SecretScalar {
-    pub(super) fn from_bytes(bytes: Box<[u8; 32]>) -> Result<Self, &'static str> {
+    pub fn from_bytes(bytes: Box<[u8; 32]>) -> Result<Self, &'static str> {
         let owner = Self(bytes);
         let mut words = decode(&owner.0);
         let valid = (zero_mask(&words) == 0) & (subtract(&words, &N).1 == 1);
@@ -62,7 +62,7 @@ impl SecretScalar {
         Ok(owner)
     }
 
-    pub(super) fn public_key(&self) -> Result<PublicKey, &'static str> {
+    pub fn public_key(&self) -> Result<PublicKey, &'static str> {
         Point::generator().multiply(&self.0).affine()
     }
 
@@ -103,13 +103,13 @@ impl Drop for SharedSecret {
 }
 
 /// A finite, canonical affine point on the fixed cofactor-one curve.
-pub(super) struct PublicKey {
+pub struct PublicKey {
     x: Field,
     y: Field,
 }
 
 impl PublicKey {
-    pub(super) fn from_coordinates(x: &[u8; 32], y: &[u8; 32]) -> Result<Self, &'static str> {
+    pub fn from_coordinates(x: &[u8; 32], y: &[u8; 32]) -> Result<Self, &'static str> {
         let x = Field::from_bytes(x)?;
         let y = Field::from_bytes(y)?;
         let rhs = x
@@ -123,7 +123,7 @@ impl PublicKey {
         Ok(Self { x, y })
     }
 
-    pub(super) fn coordinates(&self) -> ([u8; 32], [u8; 32]) {
+    pub fn coordinates(&self) -> ([u8; 32], [u8; 32]) {
         (self.x.bytes(), self.y.bytes())
     }
 

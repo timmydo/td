@@ -4,6 +4,91 @@ const LIB_RS: &str = include_str!("../../../td-secret/src/lib.rs");
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
 /// The TPM 2.0 client crate td-secret depends on (td-tpm/DESIGN.md).
 const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
+/// The FIDO2 client crate td-secret depends on (td-fido/DESIGN.md): its
+/// files, with the test-only authenticator side td-secret's tests compile
+/// by path and td-fido's own tests' vectors.
+const FIDO_FILES: &[(&str, &str)] = &[
+    (
+        "{src}/td-fido/src/lib.rs",
+        include_str!("../../../td-fido/src/lib.rs"),
+    ),
+    (
+        "{src}/td-fido/src/crypto.rs",
+        include_str!("../../../td-fido/src/crypto.rs"),
+    ),
+    (
+        "{src}/td-fido/src/hmac.rs",
+        include_str!("../../../td-fido/src/hmac.rs"),
+    ),
+    (
+        "{src}/td-fido/src/root.rs",
+        include_str!("../../../td-fido/src/root.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_aes.rs",
+        include_str!("../../../td-fido/src/fido_aes.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_cbor.rs",
+        include_str!("../../../td-fido/src/fido_cbor.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_ctap.rs",
+        include_str!("../../../td-fido/src/fido_ctap.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_device.rs",
+        include_str!("../../../td-fido/src/fido_device.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_enroll.rs",
+        include_str!("../../../td-fido/src/fido_enroll.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_fixtures.rs",
+        include_str!("../../../td-fido/src/fido_fixtures.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_hid.rs",
+        include_str!("../../../td-fido/src/fido_hid.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_p256.rs",
+        include_str!("../../../td-fido/src/fido_p256.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_pin.rs",
+        include_str!("../../../td-fido/src/fido_pin.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_transaction.rs",
+        include_str!("../../../td-fido/src/fido_transaction.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_virtual.rs",
+        include_str!("../../../td-fido/src/fido_virtual.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_virtual_tests.rs",
+        include_str!("../../../td-fido/src/fido_virtual_tests.rs"),
+    ),
+    (
+        "{src}/td-fido/tests/aes_vectors.txt",
+        include_str!("../../../td-fido/tests/aes_vectors.txt"),
+    ),
+    (
+        "{src}/td-fido/tests/login_ctap_vectors.txt",
+        include_str!("../../../td-fido/tests/login_ctap_vectors.txt"),
+    ),
+    (
+        "{src}/td-fido/tests/p256_vectors.txt",
+        include_str!("../../../td-fido/tests/p256_vectors.txt"),
+    ),
+    (
+        "{src}/td-fido/tests/pin_vectors.txt",
+        include_str!("../../../td-fido/tests/pin_vectors.txt"),
+    ),
+];
 const MODULES: &[(&str, &str)] = &[
     (
         "set_client",
@@ -37,44 +122,12 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-secret/src/portable.rs"),
     ),
     (
-        "fido_aes",
-        include_str!("../../../td-secret/src/fido_aes.rs"),
-    ),
-    (
-        "fido_cbor",
-        include_str!("../../../td-secret/src/fido_cbor.rs"),
-    ),
-    (
-        "fido_ctap",
-        include_str!("../../../td-secret/src/fido_ctap.rs"),
-    ),
-    (
         "fido_device",
         include_str!("../../../td-secret/src/fido_device.rs"),
     ),
     (
-        "fido_enroll",
-        include_str!("../../../td-secret/src/fido_enroll.rs"),
-    ),
-    (
-        "fido_hid",
-        include_str!("../../../td-secret/src/fido_hid.rs"),
-    ),
-    (
         "fido_metadata",
         include_str!("../../../td-secret/src/fido_metadata.rs"),
-    ),
-    (
-        "fido_p256",
-        include_str!("../../../td-secret/src/fido_p256.rs"),
-    ),
-    (
-        "fido_pin",
-        include_str!("../../../td-secret/src/fido_pin.rs"),
-    ),
-    (
-        "fido_transaction",
-        include_str!("../../../td-secret/src/fido_transaction.rs"),
     ),
     (
         "login_operation",
@@ -142,6 +195,8 @@ pub fn recipe() -> Recipe {
         "{src}/td-authd/tests",
         "{src}/engine/src",
         "{src}/td-tpm/src",
+        "{src}/td-fido/src",
+        "{src}/td-fido/tests",
         "{root}/test-deps",
     ] {
         steps.push(Step::MkDir {
@@ -151,11 +206,14 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
     });
-    for (path, content) in [
+    for &(path, content) in [
         ("{src}/td-secret/src/lib.rs", LIB_RS),
         ("{src}/td-secret/src/main.rs", MAIN_RS),
         ("{src}/td-tpm/src/lib.rs", TPM_RS),
-    ] {
+    ]
+    .iter()
+    .chain(FIDO_FILES)
+    {
         steps.push(Step::WriteFile {
             path: path.into(),
             content: content.into(),
@@ -223,32 +281,12 @@ pub fn recipe() -> Recipe {
             include_str!("../../../td-secret/tests/login_record_vectors.txt"),
         ),
         (
-            "{src}/td-secret/tests/login_ctap_vectors.txt",
-            include_str!("../../../td-secret/tests/login_ctap_vectors.txt"),
-        ),
-        (
-            "{src}/td-secret/tests/aes_vectors.txt",
-            include_str!("../../../td-secret/tests/aes_vectors.txt"),
-        ),
-        (
-            "{src}/td-secret/tests/p256_vectors.txt",
-            include_str!("../../../td-secret/tests/p256_vectors.txt"),
-        ),
-        (
-            "{src}/td-secret/tests/pin_vectors.txt",
-            include_str!("../../../td-secret/tests/pin_vectors.txt"),
-        ),
-        (
             "{src}/td-secret/tests/token_check_vectors.txt",
             include_str!("../../../td-secret/tests/token_check_vectors.txt"),
         ),
         (
             "{src}/td-secret/src/system_vm.rs",
             include_str!("../../../td-secret/src/system_vm.rs"),
-        ),
-        (
-            "{src}/td-secret/src/fido_virtual.rs",
-            include_str!("../../../td-secret/src/fido_virtual.rs"),
         ),
         (
             "{src}/td-secret/src/fido_uhid.rs",
@@ -302,34 +340,40 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
-    // td-tpm, the TPM client td-secret's sealed-store formats run over, with
-    // the shipped profile; the unwinding test harness links its own copy.
-    for (dir, profile) in [
-        ("{root}", &["-C", "opt-level=s", "-C", "panic=abort"][..]),
-        ("{root}/test-deps", &[][..]),
+    // td-tpm, the TPM client td-secret's sealed-store formats run over, and
+    // td-fido, the FIDO2 client its token operations run over, each with the
+    // shipped profile; the unwinding test harness links its own copies.
+    for (crate_name, source) in [
+        ("td_tpm", "{src}/td-tpm/src/lib.rs"),
+        ("td_fido", "{src}/td-fido/src/lib.rs"),
     ] {
-        let output = format!("{dir}/libtd_tpm.rlib");
-        let mut args = vec![
-            "--edition",
-            "2021",
-            "--crate-type",
-            "rlib",
-            "--crate-name",
-            "td_tpm",
-            "--target",
-            "x86_64-unknown-linux-gnu",
-            "-C",
-            "target-feature=+crt-static",
-            "-C",
-            "relocation-model=static",
-        ];
-        args.extend_from_slice(profile);
-        args.extend_from_slice(&["-o", &output, "{src}/td-tpm/src/lib.rs"]);
-        steps.push(
-            target_rustc("{src}", rustc, &args)
-                .env("PATH", &path)
-                .env("SOURCE_DATE_EPOCH", "1"),
-        );
+        for (dir, profile) in [
+            ("{root}", &["-C", "opt-level=s", "-C", "panic=abort"][..]),
+            ("{root}/test-deps", &[][..]),
+        ] {
+            let output = format!("{dir}/lib{crate_name}.rlib");
+            let mut args = vec![
+                "--edition",
+                "2021",
+                "--crate-type",
+                "rlib",
+                "--crate-name",
+                crate_name,
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-C",
+                "target-feature=+crt-static",
+                "-C",
+                "relocation-model=static",
+            ];
+            args.extend_from_slice(profile);
+            args.extend_from_slice(&["-o", &output, source]);
+            steps.push(
+                target_rustc("{src}", rustc, &args)
+                    .env("PATH", &path)
+                    .env("SOURCE_DATE_EPOCH", "1"),
+            );
+        }
     }
     // The library holds every module; the binary only calls its `run`.
     steps.push(
@@ -355,6 +399,8 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "--extern",
                 "td_tpm={root}/libtd_tpm.rlib",
+                "--extern",
+                "td_fido={root}/libtd_fido.rlib",
                 "-o",
                 "{root}/libtd_secret.rlib",
                 "{src}/td-secret/src/lib.rs",
@@ -418,6 +464,8 @@ pub fn recipe() -> Recipe {
                 "td_secret_tests",
                 "--extern",
                 "td_tpm={root}/test-deps/libtd_tpm.rlib",
+                "--extern",
+                "td_fido={root}/test-deps/libtd_fido.rlib",
                 "--target",
                 "x86_64-unknown-linux-gnu",
                 "-C",
@@ -441,38 +489,51 @@ pub fn recipe() -> Recipe {
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::run("{root}", &["{root}/secret-tests"]));
-    steps.push(
-        target_rustc(
-            "{src}",
-            rustc,
-            &[
-                "--edition",
-                "2021",
-                "--test",
-                "--crate-name",
-                "td_tpm_tests",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "relocation-model=static",
-                &linker,
-                "-L",
-                glib,
-                &lib_b,
-                &bin_b,
-                "-Clink-arg=-L{root}/eh",
-                "-Clink-arg=-static-libgcc",
-                "-o",
-                "{root}/tpm-tests",
-                "{src}/td-tpm/src/lib.rs",
-            ],
-        )
-        .env("PATH", &path)
-        .env("SOURCE_DATE_EPOCH", "1"),
-    );
-    steps.push(Step::run("{root}", &["{root}/tpm-tests"]));
+    for (crate_name, output, source) in [
+        (
+            "td_tpm_tests",
+            "{root}/tpm-tests",
+            "{src}/td-tpm/src/lib.rs",
+        ),
+        (
+            "td_fido_tests",
+            "{root}/fido-tests",
+            "{src}/td-fido/src/lib.rs",
+        ),
+    ] {
+        steps.push(
+            target_rustc(
+                "{src}",
+                rustc,
+                &[
+                    "--edition",
+                    "2021",
+                    "--test",
+                    "--crate-name",
+                    crate_name,
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-C",
+                    "target-feature=+crt-static",
+                    "-C",
+                    "relocation-model=static",
+                    &linker,
+                    "-L",
+                    glib,
+                    &lib_b,
+                    &bin_b,
+                    "-Clink-arg=-L{root}/eh",
+                    "-Clink-arg=-static-libgcc",
+                    "-o",
+                    output,
+                    source,
+                ],
+            )
+            .env("PATH", &path)
+            .env("SOURCE_DATE_EPOCH", "1"),
+        );
+        steps.push(Step::run("{root}", &[output]));
+    }
     steps.push(split_target_debug("{out}"));
     steps.push(Step::assert_static(&["{out}/bin/td-secret"]));
 

@@ -373,9 +373,10 @@ Any proposal to change this boundary requires a new explicit user decision.
 
 ### Implemented CTAP AES prerequisite
 
-`src/fido_aes.rs` supplies private AES-256-CBC encryption and decryption for
-one through eight 16-byte blocks. It accepts an explicit 32-byte key and
-16-byte IV and transforms the caller's buffer in place. Length admission
+`td-fido/src/fido_aes.rs` (td-fido/DESIGN.md) supplies AES-256-CBC
+encryption and decryption for one through eight 16-byte blocks. It
+accepts an explicit 32-byte key and 16-byte IV and transforms the
+caller's buffer in place. Length admission
 precedes key expansion and mutation; empty, partial-block and oversized
 inputs return an error without changing any input byte. The upper bound is
 a local resource policy, not a universal CTAP message-size claim.
@@ -415,15 +416,15 @@ Tests compare both directions against the NIST AES-256 block and
 check all 256 S-box values, and refuse every invalid length through the
 first two blocks beyond the bound. Ten independent OpenSSL 3.5.7 fixtures
 cover every admitted block count, zero and nonzero IVs, and all-zero/all-one
-inputs. `tests/aes_vectors.py` regenerates the public literals in
-`tests/aes_vectors.txt`; it is an optional host fixture tool and never a
-build or test dependency. Host and td-built tests consume only those
+inputs. `td-fido/tests/aes_vectors.py` regenerates the public literals
+in `td-fido/tests/aes_vectors.txt`; it is an optional host fixture tool
+and never a build or test dependency. Host and td-built tests consume only those
 committed literals. These are primitive tests, not PIN or YubiKey evidence.
 
 ### Implemented P-256 prerequisite
 
-`src/fido_p256.rs` supplies private P-256 public-key derivation, raw ECDH
-and ES256 verification. The private PIN flow below consumes it through the
+`td-fido/src/fido_p256.rs` supplies P-256 public-key derivation, raw
+ECDH and ES256 verification. The PIN flow below consumes it through the
 manual hardware diagnostic; there is no notebook consumer. Existing TPM-backed
 application assertions are unchanged. The
 curve is fixed to secp256r1/P-256 from
@@ -490,10 +491,11 @@ the shipped-compiler inspection gate before hardware integration. No
 cross-compiler timing, physical side-channel or cryptographic certification
 claim follows from these source-level schedules or test vectors.
 
-The ordinary and source-built suites consume `tests/p256_vectors.txt`:
-25 NIST ECCCDH cases, 15 NIST ES256 cases (three valid, twelve invalid),
-12 NIST public-key cases (four valid, four off-curve rejections, and four
-overwide rows refused by the fixed-width boundary before the primitive),
+The ordinary and source-built suites consume
+`td-fido/tests/p256_vectors.txt`: 25 NIST ECCCDH cases, 15 NIST ES256
+cases (three valid, twelve invalid), 12 NIST public-key cases (four
+valid, four off-curve rejections, and four overwide rows refused by the
+fixed-width boundary before the primitive),
 16 OpenSSL boundary and patterned-scalar ECDH cases, one leading-zero ECDH
 case, 68 Python integer arithmetic cases across
 p and n, an OpenSSL-verified valid signature with verification x above n,
@@ -502,10 +504,11 @@ Tests also pin opposite-s acceptance, scalar/coordinate range refusal,
 infinity rejection, equal/inverse points and scaled Jacobian coordinates.
 These are primitive oracles, not physical token or user-verification proof.
 
-`tests/p256_vectors.py` is an optional offline Python 3.12/OpenSSL 3.5.7
-fixture generator. It imports no td implementation, checks the archive
-SHA-256 values below, and never enters the build/test/runtime dependency
-closure. Its NIST inputs are public CAVP data, not CAVP validation:
+`td-fido/tests/p256_vectors.py` is an optional offline Python
+3.12/OpenSSL 3.5.7 fixture generator. It imports no td implementation,
+checks the archive SHA-256 values below, and never enters the
+build/test/runtime dependency closure. Its NIST inputs are public CAVP
+data, not CAVP validation:
 
 - [ECCCDH archive](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/components/ecccdhtestvectors.zip):
   `5fff092551f2d72e89a3d9362711878708f9a14b502f0dfae819649105b0ea39`.
@@ -514,8 +517,8 @@ closure. Its NIST inputs are public CAVP data, not CAVP validation:
 
 ### Implemented owned transaction runner
 
-`src/fido_transaction.rs` sequences one portable assertion or one creation
-plus a fresh proof through an owned, private `Channel` interface. Each
+`td-fido/src/fido_transaction.rs` sequences one portable assertion or
+one creation plus a fresh proof through an owned `Channel` interface. Each
 transaction fetches getInfo, negotiates the existing PIN profile, exchanges
 key agreement and PIN-token requests, then verifies the signed hmac-secret
 result. Enrollment uses separate creation and proof PIN inputs and retires
@@ -633,22 +636,23 @@ Physical model/firmware, independent primary/backup proofs and Guix access
 still require separate acceptance evidence.
 
 `tests/token_check_vectors.txt` supplies four independent complete command
-transcripts, generated by the optional host tool `tests/pin_vectors.py`
-with `--manual-check`. Tests reject signed wrong-secret and stale-counter
-responses and stop without retry at every exchange. Real pseudo-terminal
+transcripts, generated by the optional host tool
+`td-fido/tests/pin_vectors.py` with `--manual-check`. Tests reject
+signed wrong-secret and stale-counter responses and stop without retry
+at every exchange. Real pseudo-terminal
 fixtures check echo suppression, cancellation, timeout, invalid input,
 mode restoration and flushing pasted input beyond the PIN terminator.
 
 ### Implemented PIN-authorized hmac-secret assertion flow
 
-`src/fido_pin.rs` implements a private, safe-Rust protocol flow for an
+`td-fido/src/fido_pin.rs` implements a safe-Rust protocol flow for an
 already enrolled ES256 credential. It owns PIN handling, key agreement,
 PIN-token decryption, request authentication, signature verification and
 one-salt hmac-secret output. The enrollment codec below reuses this PIN
 exchange. It has no device, timer, prompt, persistent writer or public
 notebook API. It does not change the existing
 TPM-backed application assertion path. Response parsing is shared with that
-path; software verification uses the private P-256 implementation. Its
+path; software verification uses td-fido's P-256 implementation. Its
 private verification context retains a never-sent presence-only request
 for parser reuse; only the PIN-authorized request is exposed to transport.
 
@@ -741,20 +745,21 @@ claim. The eventual hardware consumer still requires the shipped-compiler
 assembly inspection gate described above. Fixtures do not establish physical
 user verification, token interoperability or production readiness.
 
-`tests/pin_vectors.py` independently constructs four public full transcripts
-with Python hashlib/hmac and OpenSSL 3.5.7 P-256/AES. It verifies every fixture
-signature with OpenSSL, including signed negative UV/presence/RP/extension
-cases. The ordinary and td-built suites consume only committed literals in
-`tests/pin_vectors.txt`; regeneration is optional, offline and never part of
-the dependency closure. Tests compare exact request bytes, KDFs and output,
-and refuse signed-byte mutations, truncations, malformed negotiation and
-key/token responses, size violations, and failed entropy at each stage.
+`td-fido/tests/pin_vectors.py` independently constructs four public full
+transcripts with Python hashlib/hmac and OpenSSL 3.5.7 P-256/AES. It
+verifies every fixture signature with OpenSSL, including signed negative
+UV/presence/RP/extension cases. The ordinary and td-built suites consume
+only committed literals in `td-fido/tests/pin_vectors.txt`; regeneration
+is optional, offline and never part of the dependency closure. Tests
+compare exact request bytes, KDFs and output, and refuse signed-byte
+mutations, truncations, malformed negotiation and key/token responses,
+size violations, and failed entropy at each stage.
 Negative-policy tests first verify each fixture signature independently of
 the policy parser, then assert its exact refusal reason.
 
 ### Implemented portable creation and proof codec
 
-The same private `src/fido_pin.rs` now supplies PIN-authorized
+The same `td-fido/src/fido_pin.rs` now supplies PIN-authorized
 makeCredential followed by a separate PIN-authorized hmac-secret proof.
 It shares key agreement, PIN-token admission and authentication with the
 assertion flow through typed operation state. Scoped tokens request only

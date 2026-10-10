@@ -298,6 +298,21 @@ impl<T: Transport> Client<T> {
     }
 }
 
+/// td-fido's CTAP assertion and enrollment codecs verify a signature
+/// through this public-only TPM verification.
+impl<T: Transport> super::fido_ctap::Es256Verifier for Client<T> {
+    fn verify_es256(
+        &mut self,
+        x: &[u8; 32],
+        y: &[u8; 32],
+        digest: &[u8; 32],
+        r: &[u8; 32],
+        s: &[u8; 32],
+    ) -> Result<(), String> {
+        Client::verify_es256(self, x, y, digest, r, s)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1374,5 +1389,214 @@ pub(crate) mod tests {
             .unseal_bound(&sealed, &QEMU_BINDING)
             .unwrap_err();
         assert!(error.starts_with("TPM command 0x157 refused:"), "{error}");
+    }
+}
+
+/// td-fido's codecs over this TPM verification, on the swtpm emulator:
+/// the independent OpenSSL assertion fixture both tests sign with.
+#[cfg(test)]
+mod assertions {
+    use super::super::fido_cbor::{self as cbor, Encoder, Value};
+    use super::super::fido_ctap::{AssertionRequest, Es256PublicKey, RP_ID};
+    use super::super::fido_enroll::{Info, MakeCredential};
+    use super::tests::Emulator;
+    use crate::crypto;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn cose() -> Vec<u8> {
+        hex(concat!(
+            "a5010203262001215820",
+            "ab8ace3ba858575dd060bf6e790f73982165b36abbfffb86cf0f5e032fafbb5a",
+            "225820552ef0c808cfa668e3012f4411fc0a3ad01a39d3a0fb158534721a8016b31553"
+        ))
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_assertion_binds_challenge_extensions_and_signature() {
+        // Independently signed using host OpenSSL 3.5.7; no private key or runtime dependency.
+        let key = Es256PublicKey::from_cose(&cose()).unwrap();
+        let client = hex("f3ad24f2731ea324507944e3ae1b9a172f14eaac6a57e004788390dc14a4c7ca");
+        let auth = hex("34e2ef54cd9003d2930734cfb0402ccab6a44dcb5024fc367878c413c78ce2dd8100000007a16b6372656450726f7465637401");
+        let signature = hex("3045022100fcd359f2e59ed2e63367ec882724beae6d78fd876d9208b9ec0900b4114aa98c02205c58e5c6d917e85e879fed77b43f0b73cf4394eb1caadb657855e362e541b4f7");
+        let client: [u8; 32] = client.try_into().unwrap();
+        let root = std::env::temp_dir().join(format!("td-ctap-oracle-{}", std::process::id()));
+        assert!(!root.exists());
+        let emulator = Emulator::start(&root);
+        let mut tpm = emulator.client();
+        let response = |auth: &[u8], sig: &[u8]| {
+            let mut out = Encoder::new();
+            out.head(5, 2).unwrap();
+            out.head(0, 2).unwrap();
+            out.bytes(auth).unwrap();
+            out.head(0, 3).unwrap();
+            out.bytes(sig).unwrap();
+            let mut bytes = vec![0];
+            bytes.extend(out.finish().unwrap());
+            bytes
+        };
+        let good = response(&auth, &signature);
+        let info = AssertionRequest::new(&[7], client, 1024)
+            .unwrap()
+            .verify(&good, &key, &mut tpm)
+            .unwrap();
+        assert_eq!(info.counter, 7);
+        let mut changed_client = client;
+        changed_client[0] ^= 1;
+        assert!(AssertionRequest::new(&[7], changed_client, 1024)
+            .unwrap()
+            .verify(&good, &key, &mut tpm)
+            .is_err());
+        let mut changed_extension = auth.clone();
+        *changed_extension.last_mut().unwrap() = 2;
+        let changed = response(&changed_extension, &signature);
+        assert!(AssertionRequest::new(&[7], client, 1024)
+            .unwrap()
+            .verify(&changed, &key, &mut tpm)
+            .is_err());
+        let mut changed_signature = signature;
+        *changed_signature.last_mut().unwrap() ^= 1;
+        let changed = response(&auth, &changed_signature);
+        assert!(AssertionRequest::new(&[7], client, 1024)
+            .unwrap()
+            .verify(&changed, &key, &mut tpm)
+            .is_err());
+        drop(tpm);
+        drop(emulator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn standard() -> Info {
+        let mut out = Encoder::new();
+        out.head(5, 4).unwrap();
+        out.head(0, 1).unwrap();
+        out.head(4, 1).unwrap();
+        out.text("FIDO_2_1").unwrap();
+        out.head(0, 3).unwrap();
+        out.bytes(&[0; 16]).unwrap();
+        out.head(0, 4).unwrap();
+        out.head(5, 0).unwrap();
+        out.head(0, 5).unwrap();
+        out.head(0, 1024).unwrap();
+        let mut bytes = vec![0];
+        bytes.extend(out.finish().unwrap());
+        Info::parse(&bytes).unwrap()
+    }
+
+    fn auth() -> Vec<u8> {
+        let mut data = crypto::digest(RP_ID.as_bytes()).to_vec();
+        data.push(0x41);
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(&[0; 16]);
+        data.extend_from_slice(&[0, 1, 7]);
+        data.extend(cose());
+        data
+    }
+
+    fn response(data: &[u8]) -> Vec<u8> {
+        let mut out = Encoder::new();
+        out.head(5, 3).unwrap();
+        out.head(0, 1).unwrap();
+        out.text("none").unwrap();
+        out.head(0, 2).unwrap();
+        out.bytes(data).unwrap();
+        out.head(0, 3).unwrap();
+        out.head(5, 0).unwrap();
+        let mut bytes = vec![0];
+        bytes.extend(out.finish().unwrap());
+        bytes
+    }
+
+    fn request() -> MakeCredential {
+        MakeCredential::primary(standard(), [1; 32], [2; 32]).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
+    fn emulator_enrollment_requires_fresh_proof_under_the_created_key() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "td-enrollment-oracle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!root.exists());
+        let _directory = Directory(root.clone());
+        let emulator = Emulator::start(&root);
+        let mut tpm = emulator.client();
+        let client: [u8; 32] =
+            hex("f3ad24f2731ea324507944e3ae1b9a172f14eaac6a57e004788390dc14a4c7ca")
+                .try_into()
+                .unwrap();
+        let auth_data = hex("34e2ef54cd9003d2930734cfb0402ccab6a44dcb5024fc367878c413c78ce2dd8100000007a16b6372656450726f7465637401");
+        let signature = hex("3045022100fcd359f2e59ed2e63367ec882724beae6d78fd876d9208b9ec0900b4114aa98c02205c58e5c6d917e85e879fed77b43f0b73cf4394eb1caadb657855e362e541b4f7");
+        let mut out = Encoder::new();
+        out.head(5, 2).unwrap();
+        out.head(0, 2).unwrap();
+        out.bytes(&auth_data).unwrap();
+        out.head(0, 3).unwrap();
+        out.bytes(&signature).unwrap();
+        let mut signed = vec![0];
+        signed.extend(out.finish().unwrap());
+        let made = response(&auth());
+        let proof = MakeCredential::primary(standard(), [1; 32], [2; 32])
+            .unwrap()
+            .proof(&made, client)
+            .unwrap();
+        assert_eq!(proof.bytes()[0], 2);
+        let enrolled = proof.verify(&signed, &mut tpm).unwrap();
+        assert_eq!(enrolled.id(), [7]);
+        assert_eq!(enrolled.cose(), cose());
+        let recovery = MakeCredential::recovery(standard(), [1; 32], [2; 32], &enrolled).unwrap();
+        let wire = cbor::decode(&recovery.bytes()[1..]).unwrap();
+        let Value::Array(exclude) = wire.required(&Value::Unsigned(5)).unwrap() else {
+            panic!("exclude list is not an array");
+        };
+        assert_eq!(
+            exclude[0]
+                .required(&Value::Text("id"))
+                .unwrap()
+                .bytes()
+                .unwrap(),
+            enrolled.id()
+        );
+        assert!(recovery.proof(&made, client).is_err());
+        let mut wrong_client = client;
+        wrong_client[0] ^= 1;
+        assert!(request()
+            .proof(&made, wrong_client)
+            .unwrap()
+            .verify(&signed, &mut tpm)
+            .is_err());
+        let mut wrong_key = auth();
+        *wrong_key.last_mut().unwrap() ^= 1;
+        assert!(request()
+            .proof(&response(&wrong_key), client)
+            .unwrap()
+            .verify(&signed, &mut tpm)
+            .is_err());
+        *signed.last_mut().unwrap() ^= 1;
+        assert!(request()
+            .proof(&made, client)
+            .unwrap()
+            .verify(&signed, &mut tpm)
+            .is_err());
     }
 }

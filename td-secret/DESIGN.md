@@ -251,18 +251,29 @@ atomic cutover removes the active legacy mechanism, not storage history.
 
 ## FIDO2 protocol prerequisites
 
-Planned, not current: `td-install/ENCRYPTION.md` increment 8 (8a)
-moves the CTAP code this section and PORTABLE.md describe (report
-framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
-AES, hidraw admission with its worker, and the test-only virtual
-authenticator) into the std-only sibling crate `td-fido`, which forbids
-`unsafe`, with no behaviour change, so that td-boot's selector can
-unlock a disk with a FIDO2 token and td-tpm can salt its sessions;
-td-secret keeps its stores, workers, records and its `unsafe` surface,
-and its tests and guests pass unchanged. The module names below then
-name td-fido's files. The dependency-free boundary PORTABLE.md states is
-unchanged. Increment 8b then requires `FIDO_2_1` and a no-PIN probe at
-login-key creation (TOKEN-LOGIN.md, "Token profile").
+The CTAP code this section and PORTABLE.md describe (report framing,
+CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256, AES,
+hidraw admission with its worker, and the test-only virtual
+authenticator) lives in the std-only sibling crate `td-fido`
+(td-fido/DESIGN.md), which forbids `unsafe`; `td-install/ENCRYPTION.md`
+increment 8a moved it there from this crate with no behaviour change,
+so that td-boot's selector can unlock a disk with a FIDO2 token and
+td-tpm can salt its sessions. td-secret depends on it by path and keeps
+its stores, workers, records and its `unsafe` surface: `fido_metadata.rs`
+(the TPM-sealed enrollment record), the TPM's ES256 verification the
+codecs call through td-fido's `Es256Verifier`, `fido_device.rs`'s
+`Worker` (the program and verbs td-fido's Session starts, below) with
+the guest tests, and `fido_uhid.rs`. Its store crypto's digest,
+HMAC-SHA256 and HKDF and its store's root admission are td-fido's
+`hmac.rs` and `root.rs`, compiled by path so td-firstboot and td-portal
+share them.
+The module names below name td-fido's files (`td-fido/src/`, with the
+vectors under `td-fido/tests/`) unless they say otherwise. Its tests
+compile td-fido's virtual authenticator and transcript fixtures by path
+(td-fido/DESIGN.md, "Test support"). The dependency-free boundary
+PORTABLE.md states is unchanged. Increment 8b then requires `FIDO_2_1`
+and a no-PIN probe at login-key creation (TOKEN-LOGIN.md, "Token
+profile").
 
 `fido_hid.rs` implements the 64-byte CTAP HID report profile from
 [CTAP 2.3 section 11.2](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html).
@@ -925,13 +936,14 @@ checks that it is a root-owned, root-group mode-0600 character device.
 Its FIDO report descriptor creates a kernel hidraw node with USB bus
 metadata. The normal bounded `Device::discover` and root-only admission
 checks select it without changing permissions or accepting alternate
-device paths. The fixture launches the source-built `/bin/td-secret
-hid-worker` and exercises the unchanged Session initialization and CBOR
-exchange. Production Session creation still uses `/proc/self/exe`; a
-test build's `Session::open` starts `/bin/td-secret` instead, since a
-test harness cannot serve the worker role, and a source test pins that
-choice to `cfg!(test)`. The UHID event code is `fido_uhid.rs`'s ("UHID
-binding").
+device paths. The fixture opens the production `Session::open`, which
+launches the source-built `/bin/td-secret hid-worker`, and exercises the
+unchanged Session initialization and CBOR exchange. td-fido's Session
+starts the program its consumer's `Program` names: td-secret's
+`fido_device::Worker` is `/proc/self/exe` in production and
+`/bin/td-secret` in a test build, since a test harness cannot serve the
+worker role, and a source test pins that choice to `cfg!(test)`. The
+UHID event code is `fido_uhid.rs`'s ("UHID binding").
 
 The assertion case exchanges a fresh HID initialization nonce and a
 fragmented CTAP request and response. Its known challenge, public key and
@@ -2074,12 +2086,12 @@ refuses signed backup flags, as a proof does.
 
 The notebook's bytes are unchanged: its creation passes `td personal
 vault`, and its committed transcripts pass as they were.
-`tests/login_ctap_vectors.py` derives the identify requests and
+`td-fido/tests/login_ctap_vectors.py` derives the identify requests and
 selections, the getPINRetries requests and replies and the login creation
 requests with Python's `hashlib` and `hmac` alone. It recomputes
 `pin_vectors.py`'s public creation seeds, so its creation rows differ
 from that file's only in the labels; the committed
-`tests/login_ctap_vectors.txt` is what the tests read.
+`td-fido/tests/login_ctap_vectors.txt` is what the tests read.
 
 ### Virtual authenticator
 

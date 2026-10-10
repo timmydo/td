@@ -7,36 +7,22 @@
 )]
 pub(super) mod sha256;
 
-pub fn digest(bytes: &[u8]) -> [u8; 32] {
-    let mut hash = sha256::Sha256::new();
-    hash.update(bytes);
-    hash.finalize()
-}
+/// td-fido's digest, HMAC-SHA256 and HKDF over the SHA-256 above
+/// (td-fido/DESIGN.md, "Shared HMAC-SHA256").
+#[path = "../../td-fido/src/hmac.rs"]
+#[allow(
+    dead_code,
+    reason = "the store calls digest and HKDF; only tests call `hmac`"
+)]
+mod sha256_hmac;
 
-pub(super) fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut normalized = [0u8; 64];
-    if key.len() > 64 {
-        let mut hash = sha256::Sha256::new();
-        hash.update(key);
-        for (out, byte) in normalized.iter_mut().zip(hash.finalize()) {
-            *out = byte;
-        }
-    } else {
-        for (out, byte) in normalized.iter_mut().zip(key) {
-            *out = *byte;
-        }
-    }
-    let mut inner = sha256::Sha256::new();
-    inner.update(&normalized.map(|byte| byte ^ 0x36));
-    inner.update(data);
-    let mut outer = sha256::Sha256::new();
-    outer.update(&normalized.map(|byte| byte ^ 0x5c));
-    outer.update(&inner.finalize());
-    let result = outer.finalize();
-    normalized.fill(0);
-    std::hint::black_box(&mut normalized);
-    result
-}
+pub use sha256_hmac::digest;
+pub(super) use sha256_hmac::hkdf;
+// td-secret's tests compile td-fido's virtual authenticator, which calls
+// `crypto::hmac`; td-firstboot's and td-portal's tests do not.
+#[cfg(test)]
+#[allow(unused_imports, reason = "only td-secret's tests call it")]
+pub(super) use sha256_hmac::hmac;
 
 #[allow(
     dead_code,
@@ -69,16 +55,6 @@ pub fn selftest() -> Result<(), String> {
 
 pub fn derive(master: &[u8; 32], app: &str) -> [u8; 32] {
     hkdf(master, b"td-secret/store/v1", app.as_bytes())
-}
-
-pub(super) fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
-    let mut prk = hmac(salt, ikm);
-    let mut input = info.to_vec();
-    input.push(1);
-    let result = hmac(&prk, &input);
-    prk.fill(0);
-    std::hint::black_box(&mut prk);
-    result
 }
 
 fn quarter([mut a, mut b, mut c, mut d]: [u32; 4]) -> [u32; 4] {

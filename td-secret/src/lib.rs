@@ -20,29 +20,10 @@ mod consent;
 #[allow(dead_code, reason = "the portal shares the authenticated store reader")]
 mod crypto;
 mod enrollment_operation;
-#[allow(dead_code, reason = "private CTAP AES and PIN protocol support")]
-mod fido_aes;
-#[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
-mod fido_cbor;
-#[allow(dead_code, reason = "shared CTAP enrollment and assertion codec")]
-mod fido_ctap;
-#[allow(dead_code, reason = "shared physical token transport")]
+#[allow(dead_code, reason = "td-fido's transport, with td-secret's worker")]
 mod fido_device;
-#[allow(
-    dead_code,
-    reason = "enrollment construction and verified assertion support"
-)]
-mod fido_enroll;
-#[allow(dead_code, reason = "shared FIDO2 framing and cancellation codec")]
-mod fido_hid;
 #[allow(dead_code, reason = "shared enrollment and recovery metadata")]
 mod fido_metadata;
-#[allow(dead_code, reason = "private P-256 and portable protocol support")]
-mod fido_p256;
-#[allow(dead_code, reason = "portable PIN protocol and manual token check")]
-mod fido_pin;
-#[allow(dead_code, reason = "private portable transaction runner")]
-mod fido_transaction;
 #[path = "../../td-firstboot/src/hostname.rs"]
 #[allow(dead_code, reason = "the shared consent's hostname rules")]
 mod hostname;
@@ -93,6 +74,10 @@ mod tpm;
 #[allow(dead_code, reason = "shared bounded D-Bus codec")]
 mod wire;
 mod write_operation;
+
+// td-fido's modules, by the names this crate's modules, and the files
+// td-firstboot and td-portal compile beside them, call them.
+use td_fido::{fido_ctap, fido_enroll, fido_hid, fido_p256, fido_pin, fido_transaction};
 
 /// The one SHA-256 copy, by the name the shared tier reader uses.
 use crypto::sha256;
@@ -218,11 +203,26 @@ fn parse_uid(value: &str) -> Result<u32, String> {
 #[allow(dead_code, reason = "PTY allocation for PIN terminal fixtures only")]
 mod terminal_fixture_sys;
 
+// td-fido's test-only authenticator side (td-fido/DESIGN.md, "Test
+// support"): the virtual authenticator and the transcript fixtures, over a
+// test copy of its P-256 that can sign. `fido_uhid` presents a virtual key
+// to the guest oracles here.
 #[cfg(test)]
-mod fido_virtual;
-
+use td_fido::{fido_aes, fido_cbor};
+#[cfg(test)]
+#[path = "../../td-fido/src/fido_fixtures.rs"]
+#[allow(dead_code, reason = "td-fido's own tests use the rest")]
+mod fido_fixtures;
 #[cfg(test)]
 mod fido_uhid;
+#[cfg(test)]
+#[path = "../../td-fido/src/fido_virtual.rs"]
+#[allow(dead_code, reason = "td-fido's own tests use the rest")]
+mod fido_virtual;
+#[cfg(test)]
+#[path = "../../td-fido/src/fido_p256.rs"]
+#[allow(dead_code, reason = "the virtual authenticator signs with this copy")]
+mod p256_signer;
 
 /// Valid descriptions of the operations the approval key confirms,
 /// consent tags 5 (`deploy-publish`), 11 and 12, for `owner`. td-secret
@@ -499,18 +499,23 @@ mod confinement {
             ("portable_notebook.rs", include_str!("portable_notebook.rs")),
             ("portable_pass.rs", include_str!("portable_pass.rs")),
             ("portable_store.rs", include_str!("portable_store.rs")),
-            ("fido_aes.rs", include_str!("fido_aes.rs")),
-            ("fido_cbor.rs", include_str!("fido_cbor.rs")),
-            ("fido_ctap.rs", include_str!("fido_ctap.rs")),
             ("fido_device.rs", include_str!("fido_device.rs")),
-            ("fido_enroll.rs", include_str!("fido_enroll.rs")),
-            ("fido_hid.rs", include_str!("fido_hid.rs")),
             ("fido_metadata.rs", include_str!("fido_metadata.rs")),
-            ("fido_p256.rs", include_str!("fido_p256.rs")),
-            ("fido_pin.rs", include_str!("fido_pin.rs")),
-            ("fido_transaction.rs", include_str!("fido_transaction.rs")),
-            ("fido_virtual.rs", include_str!("fido_virtual.rs")),
+            // td-fido's files this crate's tests compile by path; td-fido
+            // forbids unsafe code itself.
+            (
+                "fido_fixtures.rs",
+                include_str!("../../td-fido/src/fido_fixtures.rs"),
+            ),
+            (
+                "fido_p256.rs",
+                include_str!("../../td-fido/src/fido_p256.rs"),
+            ),
             ("fido_uhid.rs", include_str!("fido_uhid.rs")),
+            (
+                "fido_virtual.rs",
+                include_str!("../../td-fido/src/fido_virtual.rs"),
+            ),
             ("login_operation.rs", include_str!("login_operation.rs")),
             ("login_vm.rs", include_str!("login_vm.rs")),
             ("login_system_vm.rs", include_str!("login_system_vm.rs")),
@@ -668,18 +673,9 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "client.rs",
                 "crypto.rs",
                 "enrollment_operation.rs",
-                "fido_aes.rs",
-                "fido_cbor.rs",
-                "fido_ctap.rs",
                 "fido_device.rs",
-                "fido_enroll.rs",
-                "fido_hid.rs",
                 "fido_metadata.rs",
-                "fido_p256.rs",
-                "fido_pin.rs",
-                "fido_transaction.rs",
                 "fido_uhid.rs",
-                "fido_virtual.rs",
                 "lib.rs",
                 "login_operation.rs",
                 "login_record.rs",

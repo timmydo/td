@@ -418,10 +418,10 @@ The existing crypto smoke executable also runs the factory/comparison, accepted
 PKCS#8 forms/public-point answer, malformed/inconsistent-key refusal,
 generated-key/signature verification, output/retirement and shared-key cases.
 Its independent test-only oracles reuse exactly engine/src/sha256.rs,
-td-secret/src/fido_p256.rs and td-secret/tests/p256_vectors.txt. Stage these
+td-fido/src/fido_p256.rs and td-fido/tests/p256_vectors.txt. Stage these
 regular files at their original relative paths and include their bytes in the
 source digest. Missing files, symlinks and non-directory ancestors refuse the
-build. No other engine/td-secret file is staged and no Cargo dependency is
+build. No other engine/td-fido file is staged and no Cargo dependency is
 added. Neither oracle is compiled into the installed td-mta executable.
 
 The runtime separately runs the oracle's four SHA-256 known-answer cases and

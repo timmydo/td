@@ -13,7 +13,8 @@ const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 /// modules by relative `#[path]`, and the engine's sha256 through td-secret;
 /// the file chooser depends on the shared UI toolkit `td-ui` by path, which
 /// itself mounts the compositor's font and wire, and td-secret's sealed-store
-/// module runs over the TPM client crate `td-tpm`, also by path. Those sibling
+/// module runs over the TPM client crate `td-tpm`, also by path; its FIDO2
+/// codecs and HMAC-SHA256 are td-fido's files, by path. Those sibling
 /// trees are staged beside td-portal so cargo compiles exactly what the crate
 /// names. td-portal's dependencies are the roster siblings `td-ui` and
 /// `td-tpm`, so its lock lists only those and itself; the binary is linked
@@ -38,6 +39,7 @@ pub fn recipe() -> Recipe {
             "engine",
             "td-ui",
             "td-tpm",
+            "td-fido",
             "td-test-compositor",
         ])
         .native_inputs(&[
@@ -75,6 +77,7 @@ mod tests {
                 "engine".to_string(),
                 "td-ui".to_string(),
                 "td-tpm".to_string(),
+                "td-fido".to_string(),
                 "td-test-compositor".to_string(),
             ])
         );

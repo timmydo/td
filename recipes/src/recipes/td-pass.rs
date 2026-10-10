@@ -9,9 +9,10 @@ use crate::types::Recipe;
 /// and td-firstboot's principal loader by relative `#[path]`, and those reach
 /// td-authd's account file and engine's principal source, and td-secret's
 /// crypto mounts engine's SHA-256, so those trees are staged beside it, with
-/// td-tpm, the TPM client crate td-secret depends on by path. Its lock lists
-/// only td-pass, td-secret, td-tpm and td-ui, so the closure is std and
-/// the vendor set is empty; the binary is linked fully static. The image
+/// td-tpm and td-fido, the TPM and FIDO2 client crates td-secret depends on
+/// by path. Its lock lists only td-pass, td-secret, td-tpm, td-fido and
+/// td-ui, so the closure is std and the vendor set is empty; the binary is
+/// linked fully static. The image
 /// copies the complete output, debug companion included, and links
 /// `/bin/td-pass` to it, so the same executable can be carried to a foreign
 /// host; on td itself the window refuses until td mode is built.
@@ -28,6 +29,7 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "engine",
             "td-tpm",
+            "td-fido",
             "td-test-compositor",
         ])
         .native_inputs(&[
@@ -64,6 +66,7 @@ mod tests {
                     "td-firstboot",
                     "engine",
                     "td-tpm",
+                    "td-fido",
                     "td-test-compositor"
                 ]
                 .map(String::from)
@@ -82,18 +85,24 @@ mod tests {
     }
 
     /// The trees td-pass's build reads are exactly the ones staged: every
-    /// file the four compiled crates name by a literal `#[path]` or
+    /// file the five compiled crates name by a literal `#[path]` or
     /// `include` macro, test code included, and every file those name in
     /// turn, resolved against the naming file's directory, lies in
     /// td-pass or a staged tree, and every staged tree is reached.
     #[test]
     fn the_staged_trees_are_the_closure_its_files_name() {
-        let (mut trees, mounts) =
-            crate::source_closure::trees_named(&["td-pass", "td-secret", "td-tpm", "td-ui"]);
+        let (mut trees, mounts) = crate::source_closure::trees_named(&[
+            "td-pass",
+            "td-secret",
+            "td-tpm",
+            "td-fido",
+            "td-ui",
+        ]);
         assert!(mounts > 100, "{mounts}");
         trees.remove("td-pass");
         trees.insert("td-secret".to_owned());
         trees.insert("td-tpm".to_owned());
+        trees.insert("td-fido".to_owned());
         trees.insert("td-ui".to_owned());
         // The native harness: a dev-dependency, which cargo reads to
         // resolve the lock though no shipped file names it.

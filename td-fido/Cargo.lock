@@ -5,15 +5,3 @@ version = 4
 [[package]]
 name = "td-fido"
 version = "0.1.0"
-
-[[package]]
-name = "td-secret"
-version = "0.1.0"
-dependencies = [
- "td-fido",
- "td-tpm",
-]
-
-[[package]]
-name = "td-tpm"
-version = "0.1.0"

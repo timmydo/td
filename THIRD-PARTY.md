@@ -46,7 +46,7 @@ td-taskmgr); td-compositor embeds it and does not yet.
 | `td-busd/spec/*.conversation` | traffic recorded from dbus-daemon, dbus-send, dbus-monitor and busctl (elogind 255), including generated introspection XML; program output, none of it taken from their source | dbus; elogind | listed for their output, under AFL-2.1 OR GPL-2.0-or-later and LGPL-2.1-or-later |
 | `td-ui/spec/vt/libvterm-0.3.3.*` | generated from the libvterm 0.3.3 test suite | libvterm, Paul Evans | MIT (`td-ui/spec/vt/LICENSE.libvterm`) |
 | `td-ui/tests/fixtures/us.xkb`, `us-keys.tsv`, `us-types.tsv` | compiled from xkeyboard-config 2.44, and xkbcommon's reading of it | xkeyboard-config | MIT/X11 and HPND-style notices (`td-ui/tests/fixtures/XKB-COPYING`) |
-| `td-secret/tests/p256_vectors.txt` (its NIST rows; the rest are OpenSSL output), and the SP 800-38A vectors in `td-secret/src/fido_aes.rs`'s tests | test vectors from NIST's CAVP corpora and SP 800-38A | NIST | public domain (a US government work) |
+| `td-fido/tests/p256_vectors.txt` (its NIST rows; the rest are OpenSSL output), and the SP 800-38A vectors in `td-fido/src/fido_aes.rs`'s tests | test vectors from NIST's CAVP corpora and SP 800-38A | NIST | public domain (a US government work) |
 | `engine/tests/fixtures/flathub-*.hex` | OSTree objects captured from Flathub, the Firefox Flatpak's metadata among them | Flathub | each publisher's terms; small, mostly factual metadata |
 | `td-photo/tests/fixtures/nikon_ref.py` | test oracle, transcribed from dcraw 9.28's `nikon_load_raw` | dcraw, Copyright 1997-2018 by Dave Coffin | dcraw's terms (above) |
 

@@ -19,6 +19,8 @@ needs them:
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
+- For the shared FIDO2 client or SHA-256, HMAC and HKDF, read
+  `td-fido/DESIGN.md`.
 - For shared header lexical syntax, read `td-header/DESIGN.md`.
 - For shared Unicode normalization, read `td-nfc/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.

@@ -2,7 +2,7 @@
 
 const MAX_BYTES: usize = 128;
 
-pub(super) fn encrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
+pub fn encrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
     validate_length(bytes.len())?;
     let aes = Aes256::new(key);
     let mut previous = *iv;
@@ -14,7 +14,7 @@ pub(super) fn encrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result
     Ok(())
 }
 
-pub(super) fn decrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
+pub fn decrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
     validate_length(bytes.len())?;
     let aes = Aes256::new(key);
     let mut previous = *iv;

@@ -329,7 +329,7 @@ P-256 failure tests inject Rust unwinds at its private operation boundaries;
 they do not establish native allocation-failure or entropy-failure recovery.
 
 Tests use only existing repository crypto material: the engine SHA-256 and
-td-secret P-256 source/vector fixtures are compiled as test-only independent
+td-fido P-256 source/vector fixtures are compiled as test-only independent
 oracles for the native ES256 signer. Their own known-answer, valid/invalid
 signature and arithmetic cases
 qualify the oracle; generated signatures must verify against the message,
@@ -1123,7 +1123,7 @@ Future td-owned primitives replace the private backend within this same crate;
 they do not introduce another public mail dependency. The Rustls provider bridge
 also stays private here. Replacing AWS-LC still retains the Rustls TLS engine;
 it does not make the entire crate std-only. This crate owns the inventory of
-existing engine SHA/Ed25519 and td-secret P-256 implementations and their audit
+existing engine SHA/Ed25519 and td-fido P-256 implementations and their audit
 evidence before reusing any code. Reuse confers no unproven side-channel claim
 and does not migrate those consumers into this external-dependency crate.
 Cross-component primitive consolidation would require a separate design;

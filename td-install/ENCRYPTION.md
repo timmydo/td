@@ -1388,11 +1388,13 @@ read from sysfs) with its two-minute absolute deadline and independent
 watchdog. devtmpfs creates the nodes and the kernel already builds USB,
 xHCI, EHCI, HID, hidraw and USB HID in, so the selector loads no module
 and needs no new binary under D6. UHID is never on the boot path. The
-CTAP code td-secret, td-boot and td-tpm then share (report framing,
-CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256, AES and
-hidraw admission) moves into one std-only sibling crate, `td-fido`,
-which forbids `unsafe` (AGENTS.md principle 2); what needs `unsafe`
-stays in td-secret.
+CTAP code td-secret, td-boot, td-tpm and td-protector then share (report
+framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
+AES, HMAC-SHA256 and hidraw admission) moves into one std-only sibling
+crate, `td-fido`, which forbids `unsafe` (AGENTS.md principle 2); what
+needs `unsafe` stays in td-secret. td-protector takes td-fido's
+HMAC-SHA256; those four are td-fido's only dependents
+(td-fido/DESIGN.md, "Consumers").
 
 **Threat and limits.** FIDO2 release binds no measurement, and the
 salt is public in the header. Presenting a token and typing its PIN

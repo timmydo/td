@@ -366,7 +366,7 @@ pub(super) fn account_directory() -> Result<Directory, Error> {
 
 /// Exactly one connected token, or why not; this does not guess which of
 /// several is wanted.
-pub(super) fn choose(found: &[Device]) -> Result<Device, TokenError> {
+pub(super) fn choose<T: Copy>(found: &[T]) -> Result<T, TokenError> {
     match found {
         [device] => Ok(*device),
         [] => Err(TokenError::Unavailable),
@@ -601,13 +601,11 @@ mod tests {
 
     #[test]
     fn exactly_one_connected_token_is_chosen() {
-        let device = Device::synthetic;
-        assert!(choose(&[device(1)]).is_ok_and(|chosen| chosen == device(1)));
-        assert_eq!(choose(&[]).err(), Some(TokenError::Unavailable));
-        assert_eq!(
-            choose(&[device(1), device(2)]).err(),
-            Some(TokenError::Several)
-        );
+        // Discovered devices, as their indices: td-fido's Device has no
+        // constructor outside discovery.
+        assert!(choose(&[1u8]).is_ok_and(|chosen| chosen == 1));
+        assert_eq!(choose::<u8>(&[]).err(), Some(TokenError::Unavailable));
+        assert_eq!(choose(&[1u8, 2]).err(), Some(TokenError::Several));
     }
 
     // Walks from `root`'s parent, checking every directory from `root` on.

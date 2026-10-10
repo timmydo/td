@@ -453,7 +453,7 @@ No phase may use it.
 
 **Wire choices.** These bytes are fixed in td-secret
 (`td-secret/DESIGN.md`, "Login CTAP primitives") and pinned against the
-independent `td-secret/tests/login_ctap_vectors.py`:
+independent `td-fido/tests/login_ctap_vectors.py`:
 
 - Creation's labels are `td login` for the relying party's name and the
   user's name and display name, where the notebook uses `td personal

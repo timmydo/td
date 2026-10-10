@@ -36,7 +36,7 @@ impl Protocol {
         for (dst, src) in out.0.iter_mut().zip(&mac) {
             *dst = *src;
         }
-        td_tpm::zero(&mut mac);
+        crypto::zero(&mut mac);
         out
     }
 }
@@ -49,14 +49,14 @@ impl Secret {
 }
 impl Drop for Secret {
     fn drop(&mut self) {
-        td_tpm::zero(&mut self.0);
+        crypto::zero(&mut self.0);
     }
 }
 
 /// Initial profile accepts printable ASCII (already NFC), never rewrites a PIN.
-pub(super) struct Pin(Secret);
+pub struct Pin(Secret);
 impl Pin {
-    pub(super) fn new(bytes: Box<[u8]>) -> Result<Self, String> {
+    pub fn new(bytes: Box<[u8]>) -> Result<Self, String> {
         let pin = Self(Secret(bytes));
         if !(4..=63).contains(&pin.0 .0.len())
             || !pin.0 .0.iter().all(|byte| (0x20..=0x7e).contains(byte))
@@ -73,7 +73,7 @@ pub(super) const LOGIN_LABEL: &str = "td login";
 
 /// Login admission's typed capability refusals (TOKEN-LOGIN.md, "Token profile").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LoginRefusal {
+pub enum LoginRefusal {
     NoHmacSecret,
     AlwaysUv,
     /// No clientPin option: this key cannot hold a PIN.
@@ -370,8 +370,8 @@ pub(super) struct Intent {
 }
 impl Drop for Intent {
     fn drop(&mut self) {
-        td_tpm::zero(&mut self.challenge);
-        td_tpm::zero(&mut self.salt);
+        crypto::zero(&mut self.challenge);
+        crypto::zero(&mut self.salt);
     }
 }
 
@@ -453,7 +453,7 @@ impl<I: Operation> KeyRequest<I> {
         let mut hash = crypto::digest(&pin.0 .0);
         drop(pin);
         let encrypted = keys.encrypt(hash.get(..16).ok_or("PIN hash extent")?, entropy);
-        td_tpm::zero(&mut hash);
+        crypto::zero(&mut hash);
         let encrypted = encrypted?;
         let mut out = client_pin(
             self.profile.protocol,
@@ -582,12 +582,12 @@ pub(super) struct HmacRequest {
     bytes: Secret,
 }
 /// Only produced after the enrolled credential signs UP, UV and extension bytes.
-pub(super) struct HmacOutput {
+pub struct HmacOutput {
     secret: Secret,
-    pub(super) info: AssertionInfo,
+    pub info: AssertionInfo,
 }
 impl HmacOutput {
-    pub(super) fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.secret.0
     }
 }
@@ -633,8 +633,8 @@ pub(super) struct Creation {
 }
 impl Drop for Creation {
     fn drop(&mut self) {
-        td_tpm::zero(&mut self.challenge);
-        td_tpm::zero(&mut self.user);
+        crypto::zero(&mut self.challenge);
+        crypto::zero(&mut self.user);
     }
 }
 impl Operation for Creation {
@@ -1014,7 +1014,7 @@ struct Credential {
 }
 impl Drop for Credential {
     fn drop(&mut self) {
-        td_tpm::zero(&mut self.salt);
+        crypto::zero(&mut self.salt);
     }
 }
 /// Candidate identity stays attached to the exact proof request through every step.
@@ -1069,21 +1069,21 @@ impl EnrollmentProof<HmacRequest> {
     }
 }
 /// Backend-only evidence from one signed UV hmac-secret proof; no vault publication.
-pub(super) struct EnrolledCredential {
+pub struct EnrolledCredential {
     credential: Credential,
     output: HmacOutput,
 }
 impl EnrolledCredential {
-    pub(super) fn id(&self) -> &[u8] {
+    pub fn id(&self) -> &[u8] {
         &self.credential.id.0
     }
-    pub(super) fn cose(&self) -> &[u8] {
+    pub fn cose(&self) -> &[u8] {
         &self.credential.cose.0
     }
-    pub(super) fn salt(&self) -> &[u8; 32] {
+    pub fn salt(&self) -> &[u8; 32] {
         &self.credential.salt
     }
-    pub(super) fn output(&self) -> &HmacOutput {
+    pub fn output(&self) -> &HmacOutput {
         &self.output
     }
 }
@@ -1105,15 +1105,15 @@ impl Keys {
                 let mut hash = crypto::digest(shared);
                 keys.aes.0.copy_from_slice(&hash);
                 keys.hmac.0.copy_from_slice(&hash);
-                td_tpm::zero(&mut hash);
+                crypto::zero(&mut hash);
             }
             Protocol::Two => {
                 let mut aes = crypto::hkdf(shared, &[0; 32], b"CTAP2 AES key");
                 let mut hmac = crypto::hkdf(shared, &[0; 32], b"CTAP2 HMAC key");
                 keys.aes.0.copy_from_slice(&aes);
                 keys.hmac.0.copy_from_slice(&hmac);
-                td_tpm::zero(&mut aes);
-                td_tpm::zero(&mut hmac);
+                crypto::zero(&mut aes);
+                crypto::zero(&mut hmac);
             }
         }
         keys
@@ -1185,7 +1185,7 @@ fn fresh_scalar(
     for _ in 0..8 {
         let mut bytes = Box::new([0; 32]);
         if let Err(error) = entropy(bytes.as_mut()) {
-            td_tpm::zero(bytes.as_mut());
+            crypto::zero(bytes.as_mut());
             return Err(error);
         }
         if let Ok(private) = SecretScalar::from_bytes(bytes) {
@@ -2284,7 +2284,7 @@ mod tests {
             .is_err());
     }
 
-    use crate::fido_transaction::tests::{info_with, login_fixture, Extensions, Info};
+    use crate::fido_fixtures::{info_with, login_fixture, Extensions, Info};
 
     #[test]
     fn login_creation_differs_from_portable_only_in_its_labels() {

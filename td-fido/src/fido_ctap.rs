@@ -1,10 +1,24 @@
 //! CTAP assertion codec. The enrolled key and fresh challenge are caller authority.
 
 use super::fido_cbor::{self as cbor, Encoder, Value};
-use super::{crypto, fido_hid, tpm};
+use super::{crypto, fido_hid};
 
 pub const RP_ID: &str = "td.invalid";
 pub const MAX_CREDENTIAL_ID: usize = 1024;
+
+/// What verifies an ES256 signature over a SHA-256 digest under a
+/// public-only P-256 key `(x, y)`; td-secret's is its TPM. A verifier
+/// grants nothing: the codec decides what a verified assertion means.
+pub trait Es256Verifier {
+    fn verify_es256(
+        &mut self,
+        x: &[u8; 32],
+        y: &[u8; 32],
+        digest: &[u8; 32],
+        r: &[u8; 32],
+        s: &[u8; 32],
+    ) -> Result<(), String>;
+}
 
 /// A credential's public short name: the first four bytes of its SHA-256.
 pub fn fingerprint(credential: &[u8]) -> [u8; 4] {
@@ -29,7 +43,7 @@ impl Es256PublicKey {
         bytes
     }
 
-    /// Shape validation only; the TPM verifies curve membership during use.
+    /// Shape validation only; the verifier checks curve membership during use.
     pub fn from_cose(bytes: &[u8]) -> Result<Self, String> {
         let value = cbor::decode(bytes)?;
         if value.required(&Value::Unsigned(1))? != &Value::Unsigned(2)
@@ -125,14 +139,14 @@ impl AssertionRequest {
     }
 
     /// Consumes the request on success or failure; never releases store material.
-    pub fn verify<T: tpm::Transport>(
+    pub fn verify<V: Es256Verifier>(
         self,
         response: &[u8],
         key: &Es256PublicKey,
-        tpm: &mut tpm::Client<T>,
+        verifier: &mut V,
     ) -> Result<AssertionInfo, String> {
         let parsed = self.parse(response)?;
-        tpm.verify_es256(&key.x, &key.y, &parsed.digest, &parsed.r, &parsed.s)?;
+        verifier.verify_es256(&key.x, &key.y, &parsed.digest, &parsed.r, &parsed.s)?;
         Ok(parsed.info)
     }
 
@@ -613,75 +627,6 @@ mod tests {
         for size in 0..bytes.len() {
             assert!(Es256PublicKey::from_cose(&bytes[..size]).is_err());
         }
-    }
-
-    #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
-    fn emulator_assertion_binds_challenge_extensions_and_signature() {
-        fn hex(value: &str) -> Vec<u8> {
-            value
-                .as_bytes()
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-                .collect()
-        }
-        // Independently signed using host OpenSSL 3.5.7; no private key or runtime dependency.
-        let x = hex("ab8ace3ba858575dd060bf6e790f73982165b36abbfffb86cf0f5e032fafbb5a");
-        let y = hex("552ef0c808cfa668e3012f4411fc0a3ad01a39d3a0fb158534721a8016b31553");
-        let client = hex("f3ad24f2731ea324507944e3ae1b9a172f14eaac6a57e004788390dc14a4c7ca");
-        let auth = hex("34e2ef54cd9003d2930734cfb0402ccab6a44dcb5024fc367878c413c78ce2dd8100000007a16b6372656450726f7465637401");
-        let signature = hex("3045022100fcd359f2e59ed2e63367ec882724beae6d78fd876d9208b9ec0900b4114aa98c02205c58e5c6d917e85e879fed77b43f0b73cf4394eb1caadb657855e362e541b4f7");
-        let key = Es256PublicKey {
-            x: x.try_into().unwrap(),
-            y: y.try_into().unwrap(),
-        };
-        let client: [u8; 32] = client.try_into().unwrap();
-        let root = std::env::temp_dir().join(format!("td-ctap-oracle-{}", std::process::id()));
-        assert!(!root.exists());
-        let emulator = tpm::tests::Emulator::start(&root);
-        let mut tpm = emulator.client();
-        let response = |auth: &[u8], sig: &[u8]| {
-            let mut out = Encoder::new();
-            out.head(5, 2).unwrap();
-            out.head(0, 2).unwrap();
-            out.bytes(auth).unwrap();
-            out.head(0, 3).unwrap();
-            out.bytes(sig).unwrap();
-            let mut bytes = vec![0];
-            bytes.extend(out.finish().unwrap());
-            bytes
-        };
-        let good = response(&auth, &signature);
-        let info = AssertionRequest::new(&[7], client, 1024)
-            .unwrap()
-            .verify(&good, &key, &mut tpm)
-            .unwrap();
-        assert_eq!(info.counter, 7);
-        let mut changed_client = client;
-        changed_client[0] ^= 1;
-        assert!(AssertionRequest::new(&[7], changed_client, 1024)
-            .unwrap()
-            .verify(&good, &key, &mut tpm)
-            .is_err());
-        let mut changed_extension = auth.clone();
-        *changed_extension.last_mut().unwrap() = 2;
-        let changed = response(&changed_extension, &signature);
-        assert!(AssertionRequest::new(&[7], client, 1024)
-            .unwrap()
-            .verify(&changed, &key, &mut tpm)
-            .is_err());
-        let mut changed_signature = signature;
-        *changed_signature.last_mut().unwrap() ^= 1;
-        let changed = response(&auth, &changed_signature);
-        assert!(AssertionRequest::new(&[7], client, 1024)
-            .unwrap()
-            .verify(&changed, &key, &mut tpm)
-            .is_err());
-        drop(tpm);
-        drop(emulator);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

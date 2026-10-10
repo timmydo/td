@@ -1014,23 +1014,11 @@ fn read_field<'a>(bytes: &mut &'a [u8], max: usize) -> Result<&'a [u8], String> 
     take(bytes, size)
 }
 
-pub fn require_root() -> Result<(), String> {
-    let status = fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
-    check_root(&status)
-}
-
-fn check_root(status: &str) -> Result<(), String> {
-    let ids = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .ok_or("missing process credentials")?
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    if ids != ["0", "0", "0", "0"] {
-        return Err("TPM enrollment and release require the root console".into());
-    }
-    Ok(())
-}
+/// td-fido's root console admission, compiled by path so td-firstboot and
+/// td-portal, which compile this file without linking td-fido, share it.
+#[path = "../../td-fido/src/root.rs"]
+mod root;
+pub use root::require_root;
 
 fn check_swap_state(swaps: io::Result<String>) -> Result<(), String> {
     let swaps = match swaps {
@@ -1567,7 +1555,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("td-release-test-{}", std::process::id()));
         fs::DirBuilder::new().mode(0o755).create(&root).unwrap();
         let uid = fs::metadata(&root).unwrap().uid();
-        assert!(check_root("Uid:\t0\t0\t0\t0\n").is_ok());
+        assert!(root::check_root("Uid:\t0\t0\t0\t0\n").is_ok());
         assert!(check_core_limit("Max core file size        0 unlimited bytes\n").is_ok());
         for limits in [
             "",
@@ -1577,7 +1565,7 @@ mod tests {
             assert!(check_core_limit(limits).is_err());
         }
         for status in ["", "Uid: 1000 0 0 0", "Uid: 0 0 0", "Uid: 0 0 0 0 0"] {
-            assert!(check_root(status).is_err());
+            assert!(root::check_root(status).is_err());
         }
         let store = Store::open(&root.join("store"), uid, true).unwrap();
         store

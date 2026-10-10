@@ -21,25 +21,25 @@ mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
 mod cutover;
-#[path = "../../td-secret/src/fido_cbor.rs"]
+#[path = "../../td-fido/src/fido_cbor.rs"]
 #[allow(
     dead_code,
     reason = "shared token-protected store format and trusted release"
 )]
 mod fido_cbor;
-#[path = "../../td-secret/src/fido_ctap.rs"]
+#[path = "../../td-fido/src/fido_ctap.rs"]
 #[allow(
     dead_code,
     reason = "shared token-protected store format and trusted release"
 )]
 mod fido_ctap;
-#[path = "../../td-secret/src/fido_enroll.rs"]
+#[path = "../../td-fido/src/fido_enroll.rs"]
 #[allow(
     dead_code,
     reason = "shared token-protected store format and trusted release"
 )]
 mod fido_enroll;
-#[path = "../../td-secret/src/fido_hid.rs"]
+#[path = "../../td-fido/src/fido_hid.rs"]
 #[allow(
     dead_code,
     reason = "shared token-protected store format and trusted release"

@@ -152,7 +152,7 @@ mod tests {
     clippy::panic,
     clippy::indexing_slicing
 )]
-#[path = "../../td-secret/src/fido_p256.rs"]
+#[path = "../../td-fido/src/fido_p256.rs"]
 mod p256_oracle;
 
 #[cfg(test)]

@@ -519,6 +519,7 @@ mod tests {
                 "td-editor",
                 "td-encoding",
                 "td-fetch-client",
+                "td-fido",
                 "td-firstboot",
                 "td-fs",
                 "td-html",

@@ -385,6 +385,8 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-login/src", "recipes/src/recipes/td-login.rs"),
     ("td-netd/src", "recipes/src/recipes/td-netd.rs"),
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
+    ("td-fido/src", "recipes/src/recipes/td-secret.rs"),
+    ("td-fido/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-secret.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-boot.rs"),
@@ -4418,6 +4420,22 @@ fn manifest_path_dependencies(
     Ok((deps, dev))
 }
 
+/// The crates td-fido/DESIGN.md ("Consumers") lets depend on td-fido.
+const FIDO_DEPENDENTS: &[&str] = &["td-secret", "td-tpm", "td-protector", "td-boot"];
+
+/// Refuses a direct td-fido dependency from any other roster crate: a new
+/// dependent is an amendment to td-fido/DESIGN.md and this list.
+fn refuse_fido_dependent(krate: &str, dep: &str) -> Result<(), String> {
+    if dep == "td-fido" && !FIDO_DEPENDENTS.contains(&krate) {
+        return Err(format!(
+            "{krate}/Cargo.toml depends on td-fido, which only {} may \
+             (td-fido/DESIGN.md, \"Consumers\")",
+            FIDO_DEPENDENTS.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// A cargo config may not redirect a dependency behind the manifests' backs:
 /// a `paths` override substitutes a directory for a dependency by name, and
 /// `[patch]` or `[source]` tables replace what a name resolves to, all
@@ -4867,6 +4885,7 @@ pub(crate) fn dependency_free_locks(root: &Path) -> Result<Vec<(String, LockMemb
                     krate.name
                 ));
             }
+            refuse_fido_dependent(&krate.name, dep)?;
         }
     }
     for krate in &roster {
@@ -9110,7 +9129,6 @@ mod tests {
                 "td-authd",
                 "td-boot",
                 "td-compositor",
-                "td-crypto",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
@@ -9121,7 +9139,6 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
-                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -9144,15 +9161,16 @@ mod tests {
         // native cases make their commands three, as td-setup's are; td-dua,
         // td-news, td-review and td-term, toolkit consumers with no native
         // case, add two each.
-        // The test-only P-256 oracle connects td-secret to td-crypto and then
-        // td-mta, adding two commands each, and td-open, which mounts
-        // td-secret's descriptor module, adds two; the installation fixture,
+        // td-crypto's test-only P-256 oracle is td-fido's, which reads no
+        // compositor source, so td-crypto and td-mta are not readers here.
+        // td-open, which mounts td-secret's descriptor module, adds two;
+        // the installation fixture,
         // reading td-install's codecs, adds two, and td-init, whose
         // secret-line PTY test opens its terminal through td-ui, adds two;
         // td-boot, which includes td-init's console identity by `#[path]`,
         // and td-kexec and td-update, which read td-boot, add two each.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 76, "{comp:?}");
+        assert_eq!(comp.len(), 72, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9164,7 +9182,6 @@ mod tests {
                 "td-boot",
                 "td-busd",
                 "td-compositor",
-                "td-crypto",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
@@ -9175,7 +9192,6 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
-                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -9204,7 +9220,6 @@ mod tests {
                 "td-authd",
                 "td-boot",
                 "td-compositor",
-                "td-crypto",
                 "td-dua",
                 "td-editor",
                 "td-firstboot",
@@ -9215,7 +9230,6 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
-                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -11187,6 +11201,27 @@ mod tests {
                 "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n[dependencies]\n{dep} = {{ path = \"../{dep}\" }}\n"
             )).unwrap();
             assert!(dependency_free_locks(&temp).is_err_and(|e| e.contains("crypto")));
+        }
+    }
+
+    #[test]
+    fn only_the_named_crates_may_depend_on_td_fido() {
+        for krate in FIDO_DEPENDENTS {
+            assert_eq!(refuse_fido_dependent(krate, "td-fido"), Ok(()));
+        }
+        assert!(refuse_fido_dependent("td-pass", "td-secret").is_ok());
+        for krate in ["td-pass", "td-portal", "td-firstboot", "td-fidox"] {
+            assert!(refuse_fido_dependent(krate, "td-fido")
+                .is_err_and(|e| e.contains("td-fido/DESIGN.md")));
+        }
+        // The tree as committed passes.
+        let root = repo_root();
+        let roster = discover_gate_crates(&root).expect("the tree's gate roster");
+        assert!(roster.iter().any(|krate| krate.name == "td-fido"));
+        for krate in &roster {
+            for dep in &krate.path_dependencies {
+                assert_eq!(refuse_fido_dependent(&krate.name, dep), Ok(()));
+            }
         }
     }
 

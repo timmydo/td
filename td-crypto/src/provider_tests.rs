@@ -17,7 +17,7 @@ fn scalar_one() -> [u8; 32] {
     scalar
 }
 
-// Existing td-secret P-256 generator coordinates, with private scalar one.
+// Existing td-fido P-256 generator coordinates, with private scalar one.
 fn generator() -> [u8; 65] {
     hex(concat!(
         "04",

@@ -1,8 +1,8 @@
 //! Token capability negotiation and enrollment that requires proof of possession.
 
+use super::crypto;
 use super::fido_cbor::{self as cbor, Encoder, Value};
-use super::fido_ctap::{AssertionRequest, Es256PublicKey, MAX_CREDENTIAL_ID, RP_ID};
-use super::{crypto, tpm};
+use super::fido_ctap::{AssertionRequest, Es256PublicKey, Es256Verifier, MAX_CREDENTIAL_ID, RP_ID};
 
 pub const GET_INFO: &[u8] = &[4];
 
@@ -319,12 +319,12 @@ impl EnrollmentProof {
         self.request.bytes()
     }
 
-    pub fn verify<T: tpm::Transport>(
+    pub fn verify<V: Es256Verifier>(
         self,
         response: &[u8],
-        tpm: &mut tpm::Client<T>,
+        verifier: &mut V,
     ) -> Result<Credential, String> {
-        let info = self.request.verify(response, &self.key, tpm)?;
+        let info = self.request.verify(response, &self.key, verifier)?;
         if info.backup_eligible || info.backed_up {
             return Err("enrollment proof is not device-bound".into());
         }
@@ -332,7 +332,7 @@ impl EnrollmentProof {
     }
 }
 
-/// Constructed only after a fresh, TPM-verified assertion under the returned key.
+/// Constructed only after a fresh, verified assertion under the returned key.
 /// Persistence must bind these public bytes and the complete recovery policy.
 pub struct Credential {
     id: Vec<u8>,
@@ -613,83 +613,5 @@ mod tests {
         let mut wrong = auth();
         wrong[37] = 8;
         assert!(request(None).proof(&response(&wrong), [3; 32]).is_err());
-    }
-
-    #[test]
-    #[ignore = "requires explicitly supplied pinned host swtpm; never accesses hardware"]
-    fn emulator_enrollment_requires_fresh_proof_under_the_created_key() {
-        struct Directory(std::path::PathBuf);
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = std::env::temp_dir().join(format!(
-            "td-enrollment-oracle-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        assert!(!root.exists());
-        let _directory = Directory(root.clone());
-        let emulator = tpm::tests::Emulator::start(&root);
-        let mut tpm = emulator.client();
-        let client: [u8; 32] =
-            hex("f3ad24f2731ea324507944e3ae1b9a172f14eaac6a57e004788390dc14a4c7ca")
-                .try_into()
-                .unwrap();
-        let auth_data = hex("34e2ef54cd9003d2930734cfb0402ccab6a44dcb5024fc367878c413c78ce2dd8100000007a16b6372656450726f7465637401");
-        let signature = hex("3045022100fcd359f2e59ed2e63367ec882724beae6d78fd876d9208b9ec0900b4114aa98c02205c58e5c6d917e85e879fed77b43f0b73cf4394eb1caadb657855e362e541b4f7");
-        let mut out = Encoder::new();
-        out.head(5, 2).unwrap();
-        out.head(0, 2).unwrap();
-        out.bytes(&auth_data).unwrap();
-        out.head(0, 3).unwrap();
-        out.bytes(&signature).unwrap();
-        let mut signed = vec![0];
-        signed.extend(out.finish().unwrap());
-        let made = response(&auth());
-        let proof = MakeCredential::primary(standard(), [1; 32], [2; 32])
-            .unwrap()
-            .proof(&made, client)
-            .unwrap();
-        assert_eq!(proof.bytes()[0], 2);
-        let enrolled = proof.verify(&signed, &mut tpm).unwrap();
-        assert_eq!(enrolled.id(), [7]);
-        assert_eq!(enrolled.cose(), cose());
-        let recovery = MakeCredential::recovery(standard(), [1; 32], [2; 32], &enrolled).unwrap();
-        let wire = cbor::decode(&recovery.bytes()[1..]).unwrap();
-        let exclude = array(wire.required(&Value::Unsigned(5)).unwrap()).unwrap();
-        assert_eq!(
-            exclude[0]
-                .required(&Value::Text("id"))
-                .unwrap()
-                .bytes()
-                .unwrap(),
-            enrolled.id()
-        );
-        assert!(recovery.proof(&made, client).is_err());
-        let mut wrong_client = client;
-        wrong_client[0] ^= 1;
-        assert!(request(None)
-            .proof(&made, wrong_client)
-            .unwrap()
-            .verify(&signed, &mut tpm)
-            .is_err());
-        let mut wrong_key = auth();
-        *wrong_key.last_mut().unwrap() ^= 1;
-        assert!(request(None)
-            .proof(&response(&wrong_key), client)
-            .unwrap()
-            .verify(&signed, &mut tpm)
-            .is_err());
-        *signed.last_mut().unwrap() ^= 1;
-        assert!(request(None)
-            .proof(&made, client)
-            .unwrap()
-            .verify(&signed, &mut tpm)
-            .is_err());
     }
 }

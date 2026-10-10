@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "td-fido"
+version = "0.1.0"
+
+[[package]]
 name = "td-pass"
 version = "0.1.0"
 dependencies = [
@@ -15,6 +19,7 @@ dependencies = [
 name = "td-secret"
 version = "0.1.0"
 dependencies = [
+ "td-fido",
  "td-tpm",
 ]
 

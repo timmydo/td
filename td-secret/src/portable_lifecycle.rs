@@ -1099,7 +1099,7 @@ pub(in crate::portable) mod tests {
             }
         }
         fn secret(&self, index: usize, seed: &[u8; 32], salt: &[u8; 32]) -> Secret32 {
-            let mut secret = crypto::hmac(seed, salt);
+            let mut secret = td_fido::hmac_sha256(seed, &[salt]);
             if self.corrupt == Some(index) {
                 secret[0] ^= 1;
             }
@@ -1591,7 +1591,10 @@ pub(in crate::portable) mod tests {
         let seed = bench.tokens[0].credentials[0].seed;
         let salt = *old.unlock_hint(&id(&bench, 0)).unwrap().salt;
         let previous = old
-            .open(&id(&bench, 0), &Secret32(crypto::hmac(&seed, &salt)))
+            .open(
+                &id(&bench, 0),
+                &Secret32(td_fido::hmac_sha256(&seed, &[&salt])),
+            )
             .unwrap();
         assert!(previous.same_key(&added.opened));
     }
@@ -1684,7 +1687,7 @@ pub(in crate::portable) mod tests {
         let seed = bench.tokens[0].credentials[0].seed;
         let salt = *old.unlock_hint(&lost).unwrap().salt;
         let historical = old
-            .open(&lost, &Secret32(crypto::hmac(&seed, &salt)))
+            .open(&lost, &Secret32(td_fido::hmac_sha256(&seed, &[&salt])))
             .unwrap();
         assert!(!historical.same_key(&replacement.opened));
     }
@@ -2045,7 +2048,7 @@ pub(in crate::portable) mod tests {
 
     mod hardware {
         use super::*;
-        use crate::fido_transaction::tests::{assertion, enrollment, entropy, fixture, Script};
+        use crate::fido_fixtures::{assertion, enrollment, entropy, fixture, Script};
 
         const LABELS: [&str; 4] = ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"];
 

@@ -208,6 +208,12 @@ impl Drop for Encoder {
     }
 }
 
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Encoder {
     pub fn new() -> Self {
         Self(Vec::with_capacity(MAX_BYTES))
