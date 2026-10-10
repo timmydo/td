@@ -157,8 +157,8 @@ impl<'a> SlotPool<'a> {
     }
 
     /// Bounded scan of caller-specified slots. Exhaustion never wraps a ticket.
-    /// Returns Contended if another issuer races this one, without reserving a slot;
-    /// the scheduler retries on a later turn, never spins in this operation.
+    /// Returns Contended, without reserving a slot, only after other issuers win
+    /// every bounded attempt; the caller decides whether a later turn retries.
     pub fn acquire(&mut self) -> Result<SlotId, Error> {
         self.acquire_using(|| next_ticket(&NEXT_TICKET))
     }
@@ -223,16 +223,30 @@ impl Drop for SlotPool<'_> {
     }
 }
 
+/// A lost exchange means another issuer just took a ticket, so a fixed number
+/// of fresh attempts bounds the work without refusing ordinary overlap.
+const ISSUE_ATTEMPTS: usize = 64;
+
 fn next_ticket(counter: &AtomicU64) -> Result<NonZeroU64, Error> {
-    let current = counter.load(Ordering::Relaxed);
-    if current == 0 {
-        return Err(Error::GenerationExhausted);
+    // Zero is a wrapped counter; u64::MAX has no successor.
+    let successor = |current: u64| current.checked_add(1).filter(|_| current != 0);
+    let mut current = counter.load(Ordering::Relaxed);
+    for attempt in 1..=ISSUE_ATTEMPTS {
+        let next = successor(current).ok_or(Error::GenerationExhausted)?;
+        match counter.compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(ticket) => return NonZeroU64::new(ticket).ok_or(Error::GenerationExhausted),
+            Err(observed) => current = observed,
+        }
+        if attempt < ISSUE_ATTEMPTS {
+            std::hint::spin_loop();
+        }
     }
-    let next = current.checked_add(1).ok_or(Error::GenerationExhausted)?;
-    let ticket = counter
-        .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-        .map_err(|_| Error::Contended)?;
-    NonZeroU64::new(ticket).ok_or(Error::GenerationExhausted)
+    // A final lost exchange may have observed exhaustion, which is permanent.
+    Err(if successor(current).is_some() {
+        Error::Contended
+    } else {
+        Error::GenerationExhausted
+    })
 }
 
 #[cfg(test)]

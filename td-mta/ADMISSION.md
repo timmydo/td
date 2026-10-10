@@ -71,6 +71,12 @@ not disk authority. The helper does not grant filesystem or writer permission;
 M08 must couple its reservation to the writer and SQLite commit state.
 
 Group and part tokens validate the complete process-local slot generation.
+A reservation inherits the slot issuer's bounded Contended refusal
+(RESOURCES.md, M04a2), which reserves nothing. Before admission the
+receiving runtime retries it on a later bounded step; a refusal while
+publishing a commit fails that delivery job like any other refusal.
+Upload reservations and commits, checkpoints and expired-upload cleanup
+return it to their caller.
 A bounded extension increases a part's reservation without allocating another
 cell; writer state and all logical caps still apply.
 Initially zero amounts disable their positions for the lease lifetime; an

@@ -3447,10 +3447,13 @@ Queue backing cells include Option layout; the final scheduler must measure
 its actual entry types against the 32-byte reservation. SlotState uses at most
 eight bytes and SlotId at most sixteen on tested targets. IDs have a process-
 wide nonzero u64 generation, issued once and never reset when pools are dropped
-or rebuilt. Ticket issuance tries one atomic compare/exchange: contention
-returns a temporary error without reserving a slot, and exhaustion permanently
-refuses issuance before wraparound. Generations do not authorize account data
-and cannot be persisted or accepted from peers.
+or rebuilt. Ticket issuance makes at most 64 atomic compare/exchange
+attempts, each against the value the previous attempt observed; a lost
+attempt means another issuer took a ticket. Losing every attempt returns a
+temporary Contended error without reserving a slot, and exhaustion
+permanently refuses issuance before wraparound. Independent pools share the
+counter, including parallel tests' coordinators. Generations do not
+authorize account data and cannot be persisted or accepted from peers.
 
 These primitives add no worker, locks or payload ownership enforcement.
 A scheduler using these token primitives must use this lock protocol:
