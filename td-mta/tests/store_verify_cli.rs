@@ -33,11 +33,36 @@ const BLOB: BlobId = BlobId::from_bytes([3; 16]);
 const MARKER: &[u8] = b"td-mail-verify-selected-body-marker";
 const OTHER_MARKER: &[u8] = b"td-mail-verify-other-body-marker";
 
-// Re-execute each case under the existing capped, private filesystem fixture.
+// Only the portable test build selects the installed artifact path.
+fn portable() -> bool {
+    option_env!("TD_MTA_PORTABLE_CLI") == Some("1")
+}
+
+fn mail_binary() -> &'static str {
+    if portable() {
+        "/artifacts/td-mta"
+    } else {
+        env!("CARGO_BIN_EXE_td-mta")
+    }
+}
+
+// Host runs re-execute cases under the capped, private filesystem fixture.
 // Its default shared-write modes suit other crates; mail needs strict ancestors.
 fn private_case(name: &str) -> bool {
     const CHILD: &str = "TD_MAIL_VERIFY_PRIVATE_CASE";
-    if std::env::var(CHILD).ok().as_deref() == Some(name) {
+    if portable() || std::env::var(CHILD).ok().as_deref() == Some(name) {
+        if portable() {
+            let entries = |path| {
+                let mut names: Vec<_> = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            assert_eq!(entries("/"), ["artifacts", "dev", "proc", "tmp"]);
+            assert_eq!(entries("/artifacts"), ["td-mta", "td-mta-cli-smoke"]);
+        }
         let uid = fs::metadata("/proc/self").unwrap().uid();
         assert_ne!(uid, 0);
         assert_eq!(fs::metadata("/").unwrap().uid(), uid);
@@ -146,7 +171,7 @@ impl Fixture {
         store.checkpoint(deadline).unwrap();
     }
     fn command(&self, account: AccountId) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+        let mut command = Command::new(mail_binary());
         command
             .args(["store", "verify", "--root"])
             .arg(&self.0)
@@ -157,7 +182,7 @@ impl Fixture {
         self.command(account).output().unwrap()
     }
     fn backup_command(&self, destination: &Self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+        let mut command = Command::new(mail_binary());
         command
             .args(["backup", "--root"])
             .arg(&self.0)
@@ -334,23 +359,14 @@ fn malformed_options_are_rejected_before_store_access() {
         vec!["store", "verify"],
         vec!["store", "verify", "--account", "ABC"],
     ] {
-        let json = report(
-            &Command::new(env!("CARGO_BIN_EXE_td-mta"))
-                .args(args)
-                .output()
-                .unwrap(),
-            2,
-        );
+        let json = report(&Command::new(mail_binary()).args(args).output().unwrap(), 2);
         assert_eq!(
             json.get("error").unwrap().as_str(),
             Some("invalid-arguments")
         );
     }
     for args in [vec!["store"], vec!["store", "repair"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(args)
-            .output()
-            .unwrap();
+        let output = Command::new(mail_binary()).args(args).output().unwrap();
         let json = report_command(&output, 2, "store");
         assert_eq!(
             json.get("error").unwrap().as_str(),
@@ -517,7 +533,7 @@ fn backup_arguments_refuse_before_either_root_is_accessed() {
         assert!(!source.0.join("LOCK").exists());
         assert!(!destination.0.join("LOCK").exists());
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["backup", "--root"])
         .arg(&source.0)
         .output()
@@ -543,7 +559,7 @@ fn whole_database_verification_checks_every_account_before_success() {
     let fixture = Fixture::new();
     fixture.seed();
     let all = || {
-        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        Command::new(mail_binary())
             .args(["store", "verify", "--all", "--root"])
             .arg(&fixture.0)
             .args(["--timeout-seconds", "60"])
@@ -599,7 +615,7 @@ fn whole_database_verification_accepts_empty_and_refuses_invalid_selection() {
     }
     let fixture = Fixture::new();
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+        let mut command = Command::new(mail_binary());
         command.args(["store", "verify", "--root"]).arg(&fixture.0);
         command
     };
@@ -667,7 +683,7 @@ fn whole_database_verification_accepts_empty_and_refuses_invalid_selection() {
 }
 
 fn restore_command(source: &Fixture, destination: &Fixture) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+    let mut command = Command::new(mail_binary());
     command
         .args(["restore", "--root"])
         .arg(&source.0)
@@ -922,7 +938,7 @@ fn restore_refuses_bad_arguments_locks_and_root_policy_before_copying() {
 }
 
 fn init_command(root: &Fixture, account: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+    let mut command = Command::new(mail_binary());
     command
         .args(["store", "init", "--root"])
         .arg(&root.0)
@@ -981,7 +997,7 @@ fn init_creates_one_verifiable_account_inbox_and_never_replaces_it() {
         );
     }
     let all = report(
-        &Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        &Command::new(mail_binary())
             .args(["store", "verify", "--root"])
             .arg(&fixture.0)
             .arg("--all")
@@ -1049,7 +1065,7 @@ fn init_refuses_arguments_roots_and_locks_before_creation() {
         vec!["--root", "unused", "--all"],
         vec!["--root", "unused", "--account", "ABC"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        let output = Command::new(mail_binary())
             .args(["store", "init"])
             .args(args)
             .output()
@@ -1205,7 +1221,7 @@ certificate = "public"
         self.write("td-mta.conf", source.as_bytes(), 0o644);
     }
     fn check(&self, code: i32) -> td_json::Json {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        let output = Command::new(mail_binary())
             .args(["config", "check", "--config"])
             .arg(self.path("td-mta.conf"))
             .output()
@@ -1332,10 +1348,7 @@ fn config_check_refuses_malformed_arguments_before_file_access() {
         vec!["config", "check", "--config", "/a", "--config", "/b"],
         vec!["config", "show", "--config", "/a"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(args)
-            .output()
-            .unwrap();
+        let output = Command::new(mail_binary()).args(args).output().unwrap();
         let json = report_command(&output, 2, "config.check");
         assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
         assert_eq!(
@@ -1343,7 +1356,7 @@ fn config_check_refuses_malformed_arguments_before_file_access() {
             Some("invalid-arguments")
         );
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["config", "check", "--config", "relative.conf"])
         .output()
         .unwrap();
@@ -1371,7 +1384,7 @@ impl Drop for ReceivingProcess {
 impl ReceivingProcess {
     fn start(fixture: &ConfigFixture) -> Self {
         use std::io::BufRead;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        let mut child = Command::new(mail_binary())
             .args(["serve", "--smtp-only", "--config"])
             .arg(fixture.path("td-mta.conf"))
             .stdout(std::process::Stdio::piped())
@@ -1439,7 +1452,7 @@ fn serve_receives_and_recovers_after_process_death() {
             ),
         );
     fixture.write("td-mta.conf", source.as_bytes(), 0o644);
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["store", "init", "--root"])
         .arg(&fixture.data.0)
         .args(["--account", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
@@ -1447,7 +1460,7 @@ fn serve_receives_and_recovers_after_process_death() {
         .unwrap();
     report_command(&output, 0, "store.init");
     let refuses = |stage: &str, code: &str| {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        let output = Command::new(mail_binary())
             .args(["serve", "--smtp-only", "--config"])
             .arg(fixture.path("td-mta.conf"))
             .output()
@@ -1503,7 +1516,7 @@ fn serve_receives_and_recovers_after_process_death() {
     drop(listener);
     // Refuse public roots without claiming readiness or opening a listener.
     fs::set_permissions(&logs.0, fs::Permissions::from_mode(0o755)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["serve", "--smtp-only", "--config"])
         .arg(fixture.path("td-mta.conf"))
         .output()
@@ -1526,7 +1539,7 @@ fn serve_receives_and_recovers_after_process_death() {
     let process = ReceivingProcess::start(&fixture);
     assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o7777, 0o600);
     let status = || {
-        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        Command::new(mail_binary())
             .args(["status", "--json", "--runtime"])
             .arg(&runtime.0)
             .output()
@@ -1546,7 +1559,7 @@ fn serve_receives_and_recovers_after_process_death() {
     let report = report_command(&status(), 1, "status");
     assert_eq!(report.get("error").unwrap().as_str(), Some("socket-policy"));
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["serve", "--smtp-only", "--config"])
         .arg(fixture.path("td-mta.conf"))
         .output()
@@ -1605,7 +1618,7 @@ fn serve_receives_and_recovers_after_process_death() {
         1
     );
     let mut stream = connect();
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["stop", "--runtime"])
         .arg(&runtime.0)
         .output()
@@ -1659,7 +1672,7 @@ fn serve_receives_and_recovers_after_process_death() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("SENSITIVE"));
     fs::remove_file(&socket).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+    let output = Command::new(mail_binary())
         .args(["store", "verify", "--root"])
         .arg(&fixture.data.0)
         .arg("--all")
@@ -1710,10 +1723,7 @@ fn serve_requires_explicit_receiving_profile() {
         vec!["serve", "--config", "/absent"],
         vec!["serve", "--smtp-only"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(args)
-            .output()
-            .unwrap();
+        let output = Command::new(mail_binary()).args(args).output().unwrap();
         report_command(&output, 2, "serve");
     }
 }
@@ -1726,10 +1736,7 @@ fn control_requires_explicit_private_runtime_and_json_status() {
         ("stop", vec!["stop"]),
         ("stop", vec!["stop", "--runtime", "/a", "extra"]),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
-            .args(args)
-            .output()
-            .unwrap();
+        let output = Command::new(mail_binary()).args(args).output().unwrap();
         let report = report_command(&output, 2, command);
         assert_eq!(report.get("stage").unwrap().as_str(), Some("arguments"));
     }

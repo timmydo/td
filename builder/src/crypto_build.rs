@@ -180,6 +180,7 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
             .env("RUSTC_WORKSPACE_WRAPPER", "")
             .env("CARGO_ENCODED_RUSTFLAGS", "")
             .env_remove("TD_MTA_TEST_TLS_PEER")
+            .env_remove("TD_MTA_PORTABLE_CLI")
             .env(crate::stage0::target_linker_var(&host), &cc)
             .stdin(Stdio::null());
         // cc-rs recognizes target-specific spellings before plain CC/AR.

@@ -232,22 +232,51 @@ image's whole-closure profiling qualification. Debug information remains in
 the executables; distribution debug-companion integration is not claimed.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
-must select exactly one expected binary/test profile. All eight results must be
+must select exactly one expected binary/test profile. All nine results must be
 x86-64 static PIEs with an executable entry point and no ELF interpreter,
 DT_NEEDED or runtime search path. A second fresh namespace mounts only the
 result and static test supervisor, then runs the installed name's version command
 and each SHA-256, mail-format, PEM/identity/trust, entropy, provider-construction,
 TLS, mail clock/TCP/TLS transport and configuration-stack smoke case in its own
 process.
-It has no compiler, root-data file, loader or library mounts. Each runtime command has a
-30-second deadline; each Cargo command has a 20-minute deadline. Parsed Cargo
-stdout is limited to 8 MiB (graphs to 256 KiB); each JSON record is limited to
+Before those component probes, a separate namespace mounts only `td-mta`
+and the new `td-mta-cli-smoke` test executable. The latter is the existing
+`store_verify_cli` suite compiled with `TD_MTA_PORTABLE_CLI=1`: only this
+test binary selects `/artifacts/td-mta` instead of Cargo's build path.
+Production code has no environment override. The suite requires a non-root
+UID and owned private tmpfs ancestors, sets their strict modes, and checks
+the exact root and artifact directory inventories. The mounted paths contain
+only the two executables, private `/tmp`, minimal `/dev` and private `/proc`.
+No td helper is installed or mounted there; host-sandbox's builder init
+remains PID 1 and is visible through `/proc`. The outer test supervisor
+invokes host-sandbox and enforces a 120-second deadline and a 64 KiB
+collected-output limit, requires the complete 19-test unfiltered passing
+summary, and fails on timeout. Namespace teardown removes remaining processes.
+The ordinary host Cargo wrapper clears the portable compile-time switch.
+This runtime fixture does not apply the host test runner's data-memory cap.
+
+These process tests exercise protected config inputs, initialization,
+verification, backup/restore, direct SMTP acceptance and nonlocal refusal,
+kill during unfinished DATA, recovery of accepted mail and abandoned ingress,
+private status/stop and fixed error output against the exact retained
+executable. They use generated fixture configuration and locally generated TLS
+material, with private loopback and no deployment endpoint. The tests do not
+qualify a production supervisor, certificate renewal, STARTTLS delivery at
+the process boundary, full v1 operation or a distribution debug companion.
+Debug information still remains embedded as described above.
+
+The component-probe namespace has no compiler, root-data file, loader or
+library mounts. Ordinary component commands have a 30-second deadline;
+selected storage/resource probes below allow 300 seconds. The separate CLI
+suite has its cumulative 120-second externally supervised deadline. Each
+Cargo command has a 20-minute deadline. Parsed Cargo stdout is limited to
+8 MiB (graphs to 256 KiB); each JSON record is limited to
 256 KiB and 64 nesting levels. Logs on disk are temporary, not a streaming
 output quota. M07 owns native/TLS allocation and entropy-failure qualification;
 a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
-requires an exact regular-file output inventory: eight binaries and the inner
+requires an exact regular-file output inventory: nine binaries and the inner
 command record. It rejects output directory/file symlinks and additional files,
 then copies these checked inputs into a fresh private directory outside the
 compiler's writable mount. Only this directory receives host-written metadata
@@ -264,11 +293,14 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
   explicit registry/counter/per-thread-flag storage evidence and no service use.
 - `td-mta-rust-allocation-probe`: dedicated System-forwarding allocation
   qualification process; never an installed executable or service dependency.
-- `td-mta`: the installed executable name, currently only `--version`/`--help`;
-  all service arguments fail. It does not yet serve mail.
+- `td-mta`: the installed receiving-only executable. Its supported store,
+  configuration, `serve --smtp-only`, status and stop commands and remaining
+  service limits are documented in td-mta/CONFIG.md and STORAGE.md.
+- `td-mta-cli-smoke`: the existing store/configuration/receiver process suite,
+  selecting this exact `td-mta` under the separate fixture described above.
+  It is a test controller, never a service dependency.
 - `td-crypto-smoke`: separate qualification test executable, not a service
-  dependency. It exercises native code that the current packaging entry point
-  does not yet retain through a service caller.
+  dependency. It independently exercises the native backend and facade.
 - `td-mta-config-smoke`: integration test linked to the production td-mta
   library for the bounded configuration stack checks in td-mta/CONFIG.md.
   Generic loader/materializer/writer functions compile in the test crate;

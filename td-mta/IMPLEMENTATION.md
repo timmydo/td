@@ -3514,6 +3514,15 @@ fixtures and recover it. Signals/restarts and permission refusals are tested.
 Report source/bootstrap provenance accurately. Document x86-64 support and the
 remaining aarch64 validation work without introducing architecture assumptions.
 
+The first receiving-only packaging prerequisite reuses the existing portable
+musl driver to run the command-line suite against its exact retained `td-mta`
+binary, in a separate namespace without installed td helpers or shared
+libraries. The build supervisor's init remains PID 1 in that namespace.
+`td-crypto/PORTABLE.md` owns the build invocation and fixture boundary.
+This adds executable deployment evidence for the current SMTP-only profile;
+release packaging, its debug companion and supervisor/operator runbook remain
+separate work. It does not mark M24 or the full M25 release complete.
+
 ## Later increments
 
 These do not block v1 and must not be advertised before their own acceptance.

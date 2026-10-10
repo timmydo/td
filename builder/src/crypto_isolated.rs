@@ -8,6 +8,17 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
 const TARGET: &str = "x86_64-unknown-linux-musl";
+const BINARIES: &[&str] = &[
+    "td-mta",
+    "td-crypto-smoke",
+    "td-mta-cli-smoke",
+    "td-mta-config-smoke",
+    "td-mta-format-smoke",
+    "td-mta-transport-smoke",
+    "td-mta-rust-allocation-probe",
+    "td-mta-native-allocation-probe",
+    "td-mta-rss-probe",
+];
 const LIBRARIES: &str = "/lib64:/gcc-runtime:/zlib:/rust/lib";
 const NATIVE_FLAGS: &str = "-nostdinc -isystem /musl/include -isystem /cc/lib/gcc/x86_64-pc-linux-gnu/14.3.0/include -B/binutils/bin/ -march=x86-64 -mtune=generic -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root";
 
@@ -369,6 +380,18 @@ pub(crate) fn build_inner() -> Result<()> {
     command_record(&command, "mail-build", &mut receipt)?;
     let output = bounded_output(&mut command, "mail-build", 8 * 1024 * 1024, 1200)?;
     let mail = executable(&output, "td-mta", ArtifactKind::Installed)?;
+    let mut command = cargo("test", "td-mta");
+    command.args([
+        "--release",
+        "--test",
+        "store_verify_cli",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    command.env("TD_MTA_PORTABLE_CLI", "1");
+    command_record(&command, "mail-cli-build", &mut receipt)?;
+    let output = bounded_output(&mut command, "mail-cli-build", 8 * 1024 * 1024, 1200)?;
+    let cli = executable(&output, "store_verify_cli", ArtifactKind::IntegrationTest)?;
     let mut command = cargo("test", "td-crypto");
     command.args([
         "--release",
@@ -458,6 +481,7 @@ pub(crate) fn build_inner() -> Result<()> {
     let rss = executable(&output, "rss_probe", ArtifactKind::IntegrationTest)?;
     for (index, (binary, probe, native_probe)) in [
         (&mail, false, false),
+        (&cli, false, false),
         (&crypto, false, false),
         (&config, false, false),
         (&format, false, false),
@@ -486,6 +510,7 @@ pub(crate) fn build_inner() -> Result<()> {
     refuse_decoy(Path::new("/output"))?;
     fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
     copy_binary(&mail, Path::new("/output/artifacts/td-mta"))?;
+    copy_binary(&cli, Path::new("/output/artifacts/td-mta-cli-smoke"))?;
     copy_binary(&crypto, Path::new("/output/artifacts/td-crypto-smoke"))?;
     copy_binary(&config, Path::new("/output/artifacts/td-mta-config-smoke"))?;
     copy_binary(&format, Path::new("/output/artifacts/td-mta-format-smoke"))?;
@@ -1183,35 +1208,18 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         }
         names.insert(entry.file_name());
     }
-    let expected = [
-        "COMMANDS",
-        "td-mta",
-        "td-crypto-smoke",
-        "td-mta-config-smoke",
-        "td-mta-format-smoke",
-        "td-mta-transport-smoke",
-        "td-mta-rust-allocation-probe",
-        "td-mta-native-allocation-probe",
-        "td-mta-rss-probe",
-    ]
-    .map(std::ffi::OsString::from)
-    .into_iter()
-    .collect();
+    let expected = BINARIES
+        .iter()
+        .copied()
+        .chain(["COMMANDS"])
+        .map(std::ffi::OsString::from)
+        .collect();
     if names != expected {
         return Err("unexpected build artifact inventory".into());
     }
     let receipt = read_output(&source.join("COMMANDS"), "commands", 64 * 1024)?;
     fs::create_dir(destination).map_err(|e| format!("create private artifact directory: {e}"))?;
-    for name in [
-        "td-mta",
-        "td-crypto-smoke",
-        "td-mta-config-smoke",
-        "td-mta-format-smoke",
-        "td-mta-transport-smoke",
-        "td-mta-rust-allocation-probe",
-        "td-mta-native-allocation-probe",
-        "td-mta-rss-probe",
-    ] {
+    for name in BINARIES {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
     Ok(receipt)
@@ -1386,10 +1394,28 @@ fn stack_evidence(output: &str, prefix: &str, ceiling: usize) -> Result<usize> {
     Ok(bytes)
 }
 
+fn cli_evidence(output: &str) -> Result<()> {
+    let mut summaries = output
+        .lines()
+        .filter(|line| line.starts_with("test result:"));
+    let summary = summaries
+        .next()
+        .ok_or("portable CLI test summary missing")?;
+    if summaries.next().is_some()
+        || !summary.starts_with(
+            "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+        )
+    {
+        return Err("portable CLI suite did not pass all 19 tests".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn runtime_inner() -> Result<()> {
     require_namespace(&[
         "/artifacts/td-mta",
         "/artifacts/td-crypto-smoke",
+        "/artifacts/td-mta-cli-smoke",
         "/artifacts/td-mta-config-smoke",
         "/artifacts/td-mta-format-smoke",
         "/artifacts/td-mta-transport-smoke",
@@ -1398,6 +1424,39 @@ pub(crate) fn runtime_inner() -> Result<()> {
         "/artifacts/td-mta-rss-probe",
         "/output",
     ])?;
+    // Deadline enforcement stays outside the CLI namespace; its init is a helper.
+    let mut command = Command::new("/td-builder");
+    command
+        .args([
+            "host-sandbox",
+            "--store-item-at",
+            "/artifacts/td-mta",
+            "/artifacts/td-mta",
+            "--store-item-at",
+            "/artifacts/td-mta-cli-smoke",
+            "/artifacts/td-mta-cli-smoke",
+            "--",
+            "/artifacts/td-mta-cli-smoke",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("HOME", "/tmp/home")
+        .env("TMPDIR", "/output")
+        .stdin(Stdio::null());
+    crate::host_bin::arm_check_child(&mut command);
+    let started = Instant::now();
+    let output = bounded_output(&mut command, "mail-cli", 64 * 1024, 120).inspect_err(|_| {
+        if let Ok(log) = read_output(Path::new("/output/mail-cli.log"), "mail-cli", 64 * 1024) {
+            eprintln!("portable CLI failure:\n{log}");
+        }
+    })?;
+    cli_evidence(&output)?;
+    println!(
+        "portable CLI: all 19 store/configuration and receiving/recovery/control tests passed with no helper installed ({:.2}s, {} output bytes)",
+        started.elapsed().as_secs_f64(),
+        output.len()
+    );
     let mut command = Command::new("/artifacts/td-mta");
     command.arg("--version").env_clear().stdin(Stdio::null());
     crate::host_bin::arm_check_child(&mut command);
@@ -1984,16 +2043,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     )?;
     let artifacts = scratch.0.join("artifacts");
     receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    for binary in [
-        "td-mta",
-        "td-crypto-smoke",
-        "td-mta-config-smoke",
-        "td-mta-format-smoke",
-        "td-mta-transport-smoke",
-        "td-mta-rust-allocation-probe",
-        "td-mta-native-allocation-probe",
-        "td-mta-rss-probe",
-    ] {
+    for binary in BINARIES {
         qualify_binary(&artifacts.join(binary))?;
     }
     let runtime = vec![
@@ -2924,24 +2974,33 @@ mod tests {
     }
 
     #[test]
+    fn cli_summary_requires_complete_unfiltered_suite() {
+        let good = "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1s\n";
+        assert!(cli_evidence(good).is_ok());
+        for bad in [
+            String::new(),
+            good.replace("19 passed", "0 passed"),
+            good.replace("0 ignored", "1 ignored"),
+            good.replace("0 filtered out", "1 filtered out"),
+            good.replace("ok.", "FAILED."),
+            format!("{good}{good}"),
+        ] {
+            assert!(cli_evidence(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn host_collection_refuses_missing_outputs_links_extras_and_oversized_receipts() {
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
         let source = output.join("artifacts");
         fs::create_dir_all(&source).unwrap();
-        for name in [
-            "td-mta",
-            "td-crypto-smoke",
-            "td-mta-config-smoke",
-            "td-mta-format-smoke",
-            "td-mta-transport-smoke",
-            "td-mta-rust-allocation-probe",
-            "td-mta-native-allocation-probe",
-            "td-mta-rss-probe",
-            "COMMANDS",
-        ] {
+        for name in BINARIES.iter().copied().chain(["COMMANDS"]) {
             fs::write(source.join(name), name).unwrap();
         }
+        fs::remove_file(source.join("td-mta-cli-smoke")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-cli")).is_err());
+        fs::write(source.join("td-mta-cli-smoke"), b"td-mta-cli-smoke").unwrap();
         fs::remove_file(source.join("td-mta-format-smoke")).unwrap();
         assert!(collect_artifacts(&output, &scratch.0.join("missing-format")).is_err());
         fs::write(source.join("td-mta-format-smoke"), b"td-mta-format-smoke").unwrap();
