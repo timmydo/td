@@ -8,7 +8,7 @@ use crate::{
         row::Row,
         ObjectType, Sequence, Table,
     },
-    ids::{AccountId, BlobId, StoreEpoch},
+    ids::{AccountId, BlobId, MailboxId, StoreEpoch},
     ports::{
         self, Change, ChangeAction, ChangeCursor, ChangeRecord, ChangeStep, Clock, Deadline,
         Digest, Mutation, ReadView, Record, ViewIdentity,
@@ -455,6 +455,29 @@ impl<'r> IndexStore<'r> {
         views: usize,
         deadline: Deadline,
     ) -> Result<Self, ports::Error> {
+        Self::create_inner(root, epoch, None, clock, views, deadline)
+    }
+    /// Cold creation of a receiving store. The schema transaction also commits
+    /// `account` at sequence one with its canonical Inbox and Created change.
+    pub fn create_with_inbox(
+        root: &'r mut LockedRoot,
+        epoch: StoreEpoch,
+        account: AccountId,
+        inbox: MailboxId,
+        clock: Arc<dyn Clock>,
+        views: usize,
+        deadline: Deadline,
+    ) -> Result<Self, ports::Error> {
+        Self::create_inner(root, epoch, Some((account, inbox)), clock, views, deadline)
+    }
+    fn create_inner(
+        root: &'r mut LockedRoot,
+        epoch: StoreEpoch,
+        bootstrap: Option<(AccountId, MailboxId)>,
+        clock: Arc<dyn Clock>,
+        views: usize,
+        deadline: Deadline,
+    ) -> Result<Self, ports::Error> {
         if !(1..=8).contains(&views) {
             return Err(ports::Error::Invalid);
         }
@@ -493,6 +516,9 @@ impl<'r> IndexStore<'r> {
                 [epoch.as_bytes().as_slice()],
             )
             .map_err(sql)?;
+            if let Some((account, inbox)) = bootstrap {
+                bootstrap_inbox(db, account, inbox)?;
+            }
             db.pragma_update(None, "application_id", APP_ID)
                 .map_err(sql)?;
             db.pragma_update(None, "user_version", 5).map_err(sql)?;
@@ -999,29 +1025,7 @@ impl<'r> IndexStore<'r> {
                     native.run(|db| relational::delete(db, account, key))?;
                 }
                 Value::Change(change) => {
-                    if change.kind == ObjectType::Identity {
-                        return Err(ports::Error::Invalid);
-                    }
-                    let action = match change.action {
-                        ChangeAction::Created => 1,
-                        ChangeAction::Updated => 2,
-                        ChangeAction::Destroyed => 3,
-                    };
-                    native.run(|db| {
-                        db.execute(
-                            "INSERT INTO changes VALUES(?1,?2,?3,?4,?5,?6)",
-                            params![
-                                account.as_bytes().as_slice(),
-                                next.number().to_be_bytes().as_slice(),
-                                ordinal as i64,
-                                change.kind.tag(),
-                                action,
-                                change.id.as_slice()
-                            ],
-                        )
-                        .map_err(sql)?;
-                        Ok(())
-                    })?;
+                    native.run(|db| record_change(db, account, next, ordinal, change))?;
                 }
             }
         }
@@ -1815,8 +1819,72 @@ fn reserve_wal(root: &LockedRoot) -> Result<(), ports::Error> {
     Ok(())
 }
 
+fn record_change(
+    db: &Connection,
+    account: AccountId,
+    sequence: Sequence,
+    ordinal: usize,
+    change: Change,
+) -> Result<(), ports::Error> {
+    if change.kind == ObjectType::Identity {
+        return Err(ports::Error::Invalid);
+    }
+    let action = match change.action {
+        ChangeAction::Created => 1,
+        ChangeAction::Updated => 2,
+        ChangeAction::Destroyed => 3,
+    };
+    db.execute(
+        "INSERT INTO changes VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            account.as_bytes().as_slice(),
+            sequence.number().to_be_bytes().as_slice(),
+            i64::try_from(ordinal).map_err(|_| ports::Error::Capacity)?,
+            change.kind.tag(),
+            action,
+            change.id.as_slice()
+        ],
+    )
+    .map_err(sql)?;
+    Ok(())
+}
+
+/// The rows a validated commit of `[put Inbox, Created change]` at sequence
+/// one writes for a fresh account; a test pins that equivalence.
+fn bootstrap_inbox(
+    db: &Connection,
+    account: AccountId,
+    inbox: MailboxId,
+) -> Result<(), ports::Error> {
+    let first = Sequence::from_u64(1);
+    db.execute(
+        "INSERT INTO accounts VALUES(?1,?2,?3)",
+        params![
+            account.as_bytes().as_slice(),
+            first.number().to_be_bytes().as_slice(),
+            0u64.to_be_bytes().as_slice()
+        ],
+    )
+    .map_err(sql)?;
+    relational::put(db, account, Key::Mailbox(inbox), Row::Mailbox(INBOX), first)?;
+    let change = Change {
+        kind: ObjectType::Mailbox,
+        id: *inbox.as_bytes(),
+        action: ChangeAction::Created,
+    };
+    record_change(db, account, first, 1, change)
+}
+
+const INBOX: format::row::MailboxRow<'static> = format::row::MailboxRow {
+    name: "Inbox",
+    parent: None,
+    role: Some("inbox"),
+    sort_order: 0,
+    subscribed: true,
+};
+
 fn change_key(change: Change) -> Result<Key<'static>, ports::Error> {
-    use crate::ids::{EmailId, MailboxId, SubmissionId, ThreadId};
+    use crate::ids::{EmailId, SubmissionId, ThreadId};
     match change.kind {
         ObjectType::Mailbox => Ok(Key::Mailbox(MailboxId::from_bytes(change.id))),
         ObjectType::Thread => Ok(Key::Thread(ThreadId::from_bytes(change.id))),
@@ -1927,6 +1995,108 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.account_ids(deadline()), Err(ports::Error::Capacity));
+    }
+
+    #[test]
+    fn inbox_bootstrap_writes_exactly_a_validated_first_commit() {
+        const INBOX_ID: MailboxId = MailboxId::from_bytes([3; 16]);
+        const EPOCH: StoreEpoch = StoreEpoch::from_bytes([9; 16]);
+        fn rows(store: &IndexStore<'_>) -> Vec<String> {
+            let writer = store.writer.lock().unwrap();
+            writer.native.begin_work(deadline()).unwrap();
+            writer
+                .native
+                .run(|db| {
+                    let mut names = db
+                        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                        .map_err(sql)?;
+                    let names: Vec<String> = names
+                        .query_map([], |row| row.get(0))
+                        .map_err(sql)?
+                        .collect::<Result<_, _>>()
+                        .map_err(sql)?;
+                    let mut rows = Vec::new();
+                    for name in names {
+                        let mut statement =
+                            db.prepare(&format!("SELECT * FROM {name}")).map_err(sql)?;
+                        let columns = statement.column_count();
+                        let mut cursor = statement.query([]).map_err(sql)?;
+                        while let Some(row) = cursor.next().map_err(sql)? {
+                            let values: Vec<rusqlite::types::Value> = (0..columns)
+                                .map(|i| row.get(i))
+                                .collect::<Result<_, _>>()
+                                .map_err(sql)?;
+                            rows.push(format!("{name}{values:?}"));
+                        }
+                    }
+                    Ok(rows)
+                })
+                .unwrap()
+        }
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let bootstrapped = Fixture::new();
+        let mut root = bootstrapped.locked();
+        let store = IndexStore::create_with_inbox(
+            &mut root,
+            EPOCH,
+            ACCOUNT,
+            INBOX_ID,
+            clock.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        let view = store.view(ACCOUNT, deadline()).unwrap();
+        assert_eq!(view.identity().committed_sequence, Sequence::from_u64(1));
+        assert_eq!(view.identity().history_floor, Sequence::default());
+        drop(view);
+        let actual = rows(&store);
+        drop(store);
+        drop(root);
+        let committed = Fixture::new();
+        let mut other = committed.locked();
+        let store = IndexStore::create(&mut other, EPOCH, clock, 1, deadline()).unwrap();
+        store.create_account(ACCOUNT, deadline()).unwrap();
+        let inbox = encode(Row::Mailbox(INBOX));
+        let next = store
+            .commit(
+                &td_crypto::Provider,
+                CommitRequest {
+                    account: ACCOUNT,
+                    epoch: EPOCH,
+                    expected: Sequence::default(),
+                    utc_ms: 0,
+                    deadline: deadline(),
+                },
+                &[
+                    Operation::put(Table::Mailboxes, INBOX_ID.as_bytes(), &inbox).unwrap(),
+                    Operation::change(
+                        ObjectType::Mailbox,
+                        ChangeAction::Created,
+                        INBOX_ID.as_bytes(),
+                    ),
+                ],
+                &mut [],
+            )
+            .unwrap();
+        assert_eq!(next, Sequence::from_u64(1));
+        let expected = rows(&store);
+        assert_eq!(actual, expected);
+        for table in ["accounts", "mailboxes", "changes"] {
+            assert_eq!(
+                actual.iter().filter(|row| row.starts_with(table)).count(),
+                1,
+                "{actual:?}"
+            );
+        }
+        drop(store);
+        drop(other);
+        // Both identities survive reopen under the ordinary validator.
+        let mut root = bootstrapped.locked();
+        let store =
+            IndexStore::open(&mut root, Arc::new(Timer(AtomicU64::new(1))), 1, deadline()).unwrap();
+        assert_eq!(store.account_ids(deadline()).unwrap(), vec![ACCOUNT]);
+        assert_eq!(rows(&store), expected);
     }
 
     #[test]

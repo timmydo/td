@@ -165,9 +165,10 @@ its tests in one named child directory. The previous nested response module
 tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
-The packaging entry point supports `--version`, `--help`, and offline
-`store verify` for an explicitly selected account or all accounts, and
-stopped-database `backup` and verified fresh-epoch `restore` to a fresh
+The packaging entry point supports `--version`, `--help`, offline
+`store init` of a new store holding one account and its Inbox, offline
+`store verify` for an explicitly selected account or all accounts,
+stopped-database `backup`, and verified fresh-epoch `restore` to a fresh
 destination. STORAGE.md owns their scope and machine-readable results. Other commands arrive with their implementations.
 Its direct
 dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-json`, `td-mime`
@@ -1348,6 +1349,7 @@ Planned commands, with stable JSON output and exit codes:
 | `queue retry ID`, `queue cancel ID` | Named, transactional operation; never repeat accepted recipients |
 | `device create`, `device revoke ID` | Local credential administration |
 | `store layout`, `store inspect`, `store changes`, `store export` | Bounded read-only decoding/export under local administrator authority |
+| `store init` | Offline creation of a new store with one account and its Inbox; never replaces a store |
 | `store verify`, `store repair` | Read-only verification; explicit offline repair with a manifest |
 | `backup`, `restore`, `migrate` | Bounded, resumable tools using the storage contract |
 

@@ -2170,6 +2170,21 @@ locked, first try opening it with a fresh startup scope. Inspect and remove
 only an incomplete new database and its SQLite sidecars before retrying
 creation.
 Never apply this reset to a valid database with authoritative bodies.
+
+`IndexStore::create_with_inbox` is the same cold creation with one
+provisioned account. Inside the schema transaction, before the
+application ID and version are written, it inserts the account at
+sequence one with history floor zero, the canonical Inbox mailbox (name
+`Inbox`, role `inbox`, no parent, sort order zero, subscribed) changed
+at sequence one, and that mailbox's Created change at operation ordinal
+one (zero-based, after the put). These are exactly the rows a validated
+first commit of `[put Inbox, Created change]` writes for a freshly
+created account; a native test compares every table of both stores. A
+committed database therefore never holds the account without its Inbox.
+The caller supplies the epoch and Inbox ID. Creation remains exclusive
+and not crash-atomic as stated above; plain `create` is unchanged and
+provisions no account.
+
 The bundled SQLite compile retains upstream optional modules; closed runtime
 queries expose none as an API. Runtime version admission requires 3.53.2.
 
@@ -2254,6 +2269,56 @@ one fence, deadline and finite VM allowance; resource, clock or I/O refusal
 cannot grant completion. Selected body pins independently check length and
 digest.
 
+## Offline store initialization command
+
+`td-mta store init --root PATH --account ID [--timeout-seconds N]`
+creates a new receiving store for one canonical AccountId in an existing
+private root. It accepts the same strict root, account and timeout
+options as selected-account verification; `--all` and every malformed,
+duplicate, unknown or non-UTF-8 option refuse with exit two before root
+access. Run stopped as a local administrator under the same
+dedicated-owner and stable-path rules as verification. The root directory
+is never created, and no existing database or sidecar is replaced.
+
+One RuntimeClock and absolute deadline cover the command, defaulting to
+600 seconds. Before touching the root, `SystemEntropy::try_new` draws a
+fresh 16-byte store epoch and a fresh 16-byte Inbox MailboxId; there is
+no weak fallback. The command then acquires the cooperative root lock,
+calls `IndexStore::create_with_inbox` with one reader view, checkpoints,
+and closes the engine before writing its result. The account ID should
+be the account the serving configuration routes to; initialization does
+not read configuration, so that match is not checked here.
+
+Schema-1 JSON success has `command: "store.init"`, `status: "ok"`,
+canonical `account`, `epoch` and `inbox`, `sequence: 1` and
+`service_ready: false`. It certifies a durable new database holding that
+account and Inbox, not serving readiness, configuration, credentials or
+TLS material. Failure has a fixed `stage`, a fixed `error` code and
+`progress`. `unstarted` means this invocation created no database: it
+stopped at `arguments`, `clock`, `entropy`, `root` or `lock`, or at
+`create` with `error: "exists"`, which creation's exclusive open of the
+database file reports before any other file effect. Acquiring the lock
+may still have created LOCK. `uncertain` means creation (stage `create`)
+was called and refused otherwise; that includes an existing SQLite
+sidecar or legacy FORMAT entry (`invalid`), refused before any file is
+created, but the command does not distinguish those from a failure that
+left an incomplete or complete new database. `created` means the database
+committed and only the final checkpoint failed. No failure deletes
+anything; follow the creation recovery rule above, opening with a fresh
+scope before removing only an incomplete new database. Exit codes are as
+for verification. An output failure exits one even after a durable
+creation; a repeated init then refuses with `exists`, and `store verify
+--account` reports the created store.
+
+Process fixtures initialize a real root, reopen it natively to check the
+epoch, the single account at sequence one and the exact Inbox row, then
+verify it with `store verify --all` and `--account`. Repeated
+initialization for the same or another account refuses at `create` with
+`exists` and `unstarted`, leaving the database bytes and epoch
+unchanged. Invalid selection and options, occupied locks and root policy
+refuse before creation without leaving a database.
+
+
 ## Offline verification command
 
 `td-mta store verify --root PATH --account ID [--timeout-seconds N]`
@@ -2308,7 +2373,8 @@ limitations specified above; this option is not a process wall-time guarantee.
 
 Each recognized `store` invocation emits one schema-1 JSON line to stdout.
 Missing or unsupported store subcommands report `command: "store"` and
-invalid usage; accepted verification dispatch reports `store.verify`.
+invalid usage; accepted verification dispatch reports `store.verify` and
+initialization dispatch `store.init`.
 Success has `command: "store.verify"`, `status: "ok"`, `scope: "account"`,
 `physical_integrity: true`, canonical `account` and `epoch`, `sequence`,
 `history_floor`, metadata `checked_at_ms`, `metadata_rows`, `mailboxes`,

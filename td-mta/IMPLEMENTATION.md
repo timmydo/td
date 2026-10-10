@@ -2761,9 +2761,12 @@ completion slots, queued deadlines and observable readiness/shutdown/failure.
 Local fixtures cover durable plaintext and TLS receiving beside an idle
 peer, overload, failed TLS slot reuse and worker failure. The runtime
 retains one static configuration and checks Inbox and exact TLS bindings
-before readiness. Command-line initialization and serve activation, graceful
-operational control and complete crash/restart process fixtures remain M11
-work; HTTPS and gateway serving are not enabled by this API.
+before readiness. Offline `store init` now creates a new store whose
+schema transaction also commits one account and its canonical Inbox, the
+store the runtime's startup Inbox check requires; process fixtures verify
+and reopen it. Serve activation, graceful operational control and complete
+crash/restart process fixtures remain M11 work; HTTPS and gateway serving
+are not enabled by this API.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,
@@ -2936,9 +2939,10 @@ atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
 M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
 unavailable until their owning increment lands; M19 supplies shared CLI wiring.
-The standalone offline `store verify`, database `backup` and `restore`
-commands below have landed independently and require no serving runtime or
-control socket.
+The standalone offline `store init`, `store verify`, database `backup`
+and `restore` commands have landed independently and require no serving
+runtime or control socket. STORAGE.md specifies `store init`; M11 records
+why it exists.
 
 **Acceptance:** unauthorized socket access fails by filesystem policy; stale
 IDs and concurrent controls cannot duplicate delivery. Health reports disk,

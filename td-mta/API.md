@@ -6981,6 +6981,19 @@ maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
 meters do not measure SQLite copying. Full integrity maintenance refuses a
 stopped writer; new view capture and commits return Busy during its scan.
 
+### Offline receiving store initialization
+
+`IndexStore::create_with_inbox(root, epoch, account, inbox, clock, views,
+deadline)` takes the same arguments as `create` plus one AccountId and the
+Inbox MailboxId. One schema transaction commits the account at sequence
+one, its canonical Inbox and the mailbox's Created change, so no committed
+store holds that account without an Inbox. The caller supplies the account
+it routes to and draws the epoch and Inbox ID from entropy. `create` keeps
+its existing empty-store behavior. The installed `store init` command
+composes this with a fresh SystemEntropy epoch and Inbox ID; STORAGE.md
+owns its rows, failure progress and output. It grants no serving,
+configuration or credential setup.
+
 ### Offline account enumeration and verification
 
 `IndexStore::account_ids(deadline: Deadline) -> Result<Vec<AccountId>, Error>`

@@ -1,4 +1,4 @@
-//! Offline verification, database backup/restore and packaging entry point.
+//! Offline initialization, verification, database backup/restore and packaging entry point.
 #![forbid(unsafe_code)]
 
 use std::{
@@ -10,17 +10,17 @@ use std::{
 use td_mta::{
     account_checks::CompleteChecks,
     clock::RuntimeClock,
-    ids::{AccountId, StoreEpoch},
+    ids::{AccountId, MailboxId, StoreEpoch},
     limits::SQLITE_DATABASE_BYTES,
     metadata_sweep,
-    ports::{self, Clock, Deadline},
+    ports::{self, Clock, Deadline, Entropy as _},
     store_fs::{
         AccountCheckError, AccountCheckLimits, BackupError, BackupReceipt, BodyCheckLimits,
         IndexStore, LockError, LockedRoot, PrivateRoot,
     },
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nNo repair or serving commands are available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nNo repair or serving commands are available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -277,6 +277,79 @@ fn restore_failure(output: &mut impl Write, error: RestoreFailure) -> io::Result
     writeln!(output, "{{\"schema\":1,\"command\":\"restore\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"progress\":\"{}\"}}", error.failure.stage, error.failure.code, error.progress)
 }
 
+struct InitReceipt {
+    account: AccountId,
+    epoch: StoreEpoch,
+    inbox: MailboxId,
+}
+
+struct InitFailure {
+    failure: Failure,
+    progress: &'static str,
+}
+impl From<Failure> for InitFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            progress: "unstarted",
+        }
+    }
+}
+
+fn init(options: Verify) -> Result<InitReceipt, InitFailure> {
+    let Selection::Account(account) = options.selection else {
+        return Err(Failure {
+            stage: "arguments",
+            code: "invalid-arguments",
+        }
+        .into());
+    };
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let deadline = scope(clock.as_ref(), options.timeout_ms)?;
+    // Both identities exist before the root is touched.
+    let (mut epoch, mut inbox) = ([0; 16], [0; 16]);
+    td_crypto::SystemEntropy::try_new()
+        .and_then(|mut entropy| {
+            entropy.fill(&mut epoch)?;
+            entropy.fill(&mut inbox)
+        })
+        .map_err(|error| adapter("entropy", error.into()))?;
+    let (epoch, inbox) = (StoreEpoch::from_bytes(epoch), MailboxId::from_bytes(inbox));
+    let mut root = locked_root(&options.root, "root", "lock")?;
+    let store = IndexStore::create_with_inbox(&mut root, epoch, account, inbox, clock, 1, deadline)
+        .map_err(|error| match error {
+            // The exclusive database open is creation's first file effect.
+            ports::Error::Io {
+                kind: io::ErrorKind::AlreadyExists,
+                ..
+            } => InitFailure {
+                failure: Failure {
+                    stage: "create",
+                    code: "exists",
+                },
+                progress: "unstarted",
+            },
+            error => InitFailure {
+                failure: adapter("create", error),
+                progress: "uncertain",
+            },
+        })?;
+    store.checkpoint(deadline).map_err(|error| InitFailure {
+        failure: adapter("checkpoint", error),
+        progress: "created",
+    })?;
+    drop(store);
+    Ok(InitReceipt {
+        account,
+        epoch,
+        inbox,
+    })
+}
+
+fn init_failure(output: &mut impl Write, error: InitFailure) -> io::Result<()> {
+    writeln!(output, "{{\"schema\":1,\"command\":\"store.init\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"progress\":\"{}\"}}", error.failure.stage, error.failure.code, error.progress)
+}
+
 fn verify(options: Verify) -> Result<Verification, Failure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     verify_with_clock(options, clock)
@@ -477,7 +550,32 @@ fn run() -> io::Result<ExitCode> {
         };
     }
     if first.as_deref() == Some(OsStr::new("store")) {
-        if args.next().as_deref() != Some(OsStr::new("verify")) {
+        let subcommand = args.next();
+        if subcommand.as_deref() == Some(OsStr::new("init")) {
+            let Some(options) = arguments(args) else {
+                init_failure(
+                    &mut io::stdout().lock(),
+                    Failure {
+                        stage: "arguments",
+                        code: "invalid-arguments",
+                    }
+                    .into(),
+                )?;
+                return Ok(ExitCode::from(2));
+            };
+            return match init(options) {
+                Ok(receipt) => {
+                    writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"store.init\",\"status\":\"ok\",\"account\":\"{}\",\"epoch\":\"{}\",\"inbox\":\"{}\",\"sequence\":1,\"service_ready\":false}}", receipt.account, receipt.epoch, receipt.inbox)?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(error) => {
+                    let code = error.failure.exit_code();
+                    init_failure(&mut io::stdout().lock(), error)?;
+                    Ok(code)
+                }
+            };
+        }
+        if subcommand.as_deref() != Some(OsStr::new("verify")) {
             failure(
                 &mut io::stdout().lock(),
                 "store",

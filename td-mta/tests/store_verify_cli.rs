@@ -17,11 +17,12 @@ use std::{
 use td_mta::{
     clock::RuntimeClock,
     format::{
+        key::Key,
         operation::Operation,
-        row::{BlobRow, Row},
+        row::{BlobRow, MailboxRow, Row},
         Sequence, Table,
     },
-    ids::{AccountId, BlobId, StoreEpoch},
+    ids::{AccountId, BlobId, MailboxId, StoreEpoch},
     ports::{Clock, Crypto, Deadline, Digest, ReadView},
     store_fs::{BlobSource, CommitRequest, IndexStore, PrivateRoot},
 };
@@ -918,4 +919,178 @@ fn restore_refuses_bad_arguments_locks_and_root_policy_before_copying() {
     );
     assert_eq!(fs::read(source.0.join("metadata.sqlite3")).unwrap(), before);
     report(&source.verify(ACCOUNT), 0);
+}
+
+fn init_command(root: &Fixture, account: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+    command
+        .args(["store", "init", "--root"])
+        .arg(&root.0)
+        .args(["--account", account]);
+    command
+}
+
+#[test]
+fn init_creates_one_verifiable_account_inbox_and_never_replaces_it() {
+    if private_case("init_creates_one_verifiable_account_inbox_and_never_replaces_it") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let account = ACCOUNT.to_string();
+    let output = init_command(&fixture, &account)
+        .args(["--timeout-seconds", "60"])
+        .output()
+        .unwrap();
+    let json = report_command(&output, 0, "store.init");
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert_eq!(
+        json.get("account").unwrap().as_str(),
+        Some(account.as_str())
+    );
+    assert_eq!(json.get("sequence").unwrap().as_u64(), Some(1));
+    assert_eq!(json.get("service_ready"), Some(&td_json::Json::Bool(false)));
+    let epoch = StoreEpoch::parse(json.get("epoch").unwrap().as_str().unwrap()).unwrap();
+    let inbox = MailboxId::parse(json.get("inbox").unwrap().as_str().unwrap()).unwrap();
+    assert_ne!(epoch.as_bytes(), inbox.as_bytes());
+    let database = fixture.0.join("metadata.sqlite3");
+    assert_eq!(fs::metadata(&database).unwrap().mode() & 0o7777, 0o600);
+    {
+        let mut root = PrivateRoot::open(fixture.0.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+        let deadline = Deadline::after(clock.sample().unwrap().monotonic, 60_000).unwrap();
+        let store = IndexStore::open(&mut root, clock, 1, deadline).unwrap();
+        assert_eq!(store.epoch(), epoch);
+        assert_eq!(store.account_ids(deadline).unwrap(), vec![ACCOUNT]);
+        let mut view = store.view(ACCOUNT, deadline).unwrap();
+        assert_eq!(view.identity().committed_sequence, Sequence::from_u64(1));
+        let mut value = [0; 256];
+        let (row, changed) = view.get(Key::Mailbox(inbox), &mut value).unwrap().unwrap();
+        assert_eq!(changed, Sequence::from_u64(1));
+        assert_eq!(
+            row,
+            Row::Mailbox(MailboxRow {
+                name: "Inbox",
+                parent: None,
+                role: Some("inbox"),
+                sort_order: 0,
+                subscribed: true,
+            })
+        );
+    }
+    let all = report(
+        &Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["store", "verify", "--root"])
+            .arg(&fixture.0)
+            .arg("--all")
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(all.get("epoch"), json.get("epoch"));
+    for (field, expected) in [("accounts", 1), ("mailboxes", 1), ("blobs", 0)] {
+        assert_eq!(all.get(field).unwrap().as_u64(), Some(expected), "{field}");
+    }
+    let selected = report(&fixture.verify(ACCOUNT), 0);
+    assert_eq!(selected.get("sequence").unwrap().as_u64(), Some(1));
+    assert_eq!(selected.get("mailboxes").unwrap().as_u64(), Some(1));
+    let before = fs::read(&database).unwrap();
+    for other in [account.clone(), OTHER.to_string()] {
+        let refused = report_command(
+            &init_command(&fixture, &other).output().unwrap(),
+            1,
+            "store.init",
+        );
+        assert_eq!(refused.get("stage").unwrap().as_str(), Some("create"));
+        assert_eq!(refused.get("error").unwrap().as_str(), Some("exists"));
+        assert_eq!(refused.get("progress").unwrap().as_str(), Some("unstarted"));
+        assert!(refused.get("epoch").is_none());
+    }
+    assert_eq!(fs::read(&database).unwrap(), before);
+    let reverified = report(&fixture.verify(ACCOUNT), 0);
+    assert_eq!(reverified.get("epoch"), json.get("epoch"));
+    assert_eq!(
+        report(&fixture.verify(OTHER), 1)
+            .get("error")
+            .unwrap()
+            .as_str(),
+        Some("not-found")
+    );
+}
+
+#[test]
+fn init_refuses_arguments_roots_and_locks_before_creation() {
+    if private_case("init_refuses_arguments_roots_and_locks_before_creation") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let account = ACCOUNT.to_string();
+    let database = fixture.0.join("metadata.sqlite3");
+    for extra in [
+        vec!["--all"],
+        vec!["--account", "duplicate"],
+        vec!["--timeout-seconds", "0"],
+        vec!["--timeout-seconds", "18446744073709551615"],
+        vec!["--unknown", "x"],
+    ] {
+        let output = init_command(&fixture, &account)
+            .args(extra)
+            .output()
+            .unwrap();
+        let json = report_command(&output, 2, "store.init");
+        assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
+        assert_eq!(json.get("progress").unwrap().as_str(), Some("unstarted"));
+        assert!(!fixture.0.join("LOCK").exists());
+    }
+    for args in [
+        vec!["--root", "unused"],
+        vec!["--root", "unused", "--all"],
+        vec!["--root", "unused", "--account", "ABC"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["store", "init"])
+            .args(args)
+            .output()
+            .unwrap();
+        let json = report_command(&output, 2, "store.init");
+        assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
+        assert_eq!(
+            json.get("error").unwrap().as_str(),
+            Some("invalid-arguments")
+        );
+        assert_eq!(json.get("progress").unwrap().as_str(), Some("unstarted"));
+    }
+    let held = PrivateRoot::open(fixture.0.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let json = report_command(
+        &init_command(&fixture, &account).output().unwrap(),
+        1,
+        "store.init",
+    );
+    assert_eq!(json.get("stage").unwrap().as_str(), Some("lock"));
+    assert_eq!(json.get("error").unwrap().as_str(), Some("busy"));
+    assert_eq!(json.get("progress").unwrap().as_str(), Some("unstarted"));
+    drop(held);
+    assert!(!database.exists());
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let json = report_command(
+        &init_command(&fixture, &account).output().unwrap(),
+        1,
+        "store.init",
+    );
+    assert_eq!(json.get("stage").unwrap().as_str(), Some("root"));
+    assert_eq!(json.get("progress").unwrap().as_str(), Some("unstarted"));
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!database.exists());
+    let json = report_command(
+        &init_command(&fixture, &account).output().unwrap(),
+        0,
+        "store.init",
+    );
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert!(database.exists());
 }
