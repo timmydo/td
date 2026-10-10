@@ -959,6 +959,9 @@ impl Parser<'_> {
     fn object(&mut self) -> Result<Json, ParseError> {
         self.bump(); // {
         let mut o: Vec<(String, Json)> = Vec::new();
+        // Past a few keys, a set: a scan of the Vec at each key would be
+        // quadratic, seconds for one hostile line.
+        let mut keys: Option<std::collections::HashSet<String>> = None;
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.bump();
@@ -979,7 +982,14 @@ impl Parser<'_> {
             let v = self.value()?;
             // `Obj` is an ordered Vec whose `get` takes the first match, so a
             // duplicate key would silently pick a winner. Reject it instead.
-            if o.iter().any(|(existing, _)| *existing == k) {
+            if keys.is_none() && o.len() >= SCANNED_KEYS {
+                keys = Some(o.iter().map(|(existing, _)| existing.clone()).collect());
+            }
+            let duplicate = match &mut keys {
+                Some(keys) => !keys.insert(k.clone()),
+                None => o.iter().any(|(existing, _)| *existing == k),
+            };
+            if duplicate {
                 return Err(ParseError {
                     offset: key_at,
                     message: format!("duplicate object key `{k}'"),
@@ -999,6 +1009,9 @@ impl Parser<'_> {
         }
     }
 }
+
+/// The keys an object's duplicate check scans before it keeps a set.
+const SCANNED_KEYS: usize = 32;
 
 /// True iff `lex` is a well-formed JSON number (RFC 8259):
 /// `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`.
@@ -1439,6 +1452,48 @@ mod tests {
         assert!(parse(r#"{"a":{"b":1,"b":2}}"#).is_err());
         assert!(parse(r#"{"a":1,"b":2,"a":3}"#).is_err());
         assert!(parse(r#"{"a":1,"b":2}"#).is_ok());
+    }
+
+    /// Past the keys it scans, the check keeps a set: a duplicate found
+    /// on the last key scanned, on the key that builds the set and on
+    /// later ones, of an early key, of the keys either side of the switch
+    /// and of a late one, is still refused, with its offset; and a wide
+    /// object of distinct keys, which a scan per key would take seconds
+    /// over, parses whole and in order.
+    #[test]
+    fn rejects_duplicates_in_a_wide_object() {
+        let wide = |n: usize, again: Option<usize>| {
+            let mut keys: Vec<String> = (0..n).map(|i| format!("\"k{i}\":{i}")).collect();
+            if let Some(i) = again {
+                keys.push(format!("\"k{i}\":0"));
+            }
+            format!("{{{}}}", keys.join(","))
+        };
+        let last = SCANNED_KEYS - 1;
+        for (n, again) in [
+            (last, 0),
+            (last, last - 1),
+            (SCANNED_KEYS, 0),
+            (SCANNED_KEYS, last),
+            (40, 0),
+            (40, last),
+            (40, SCANNED_KEYS),
+            (40, 39),
+        ] {
+            let text = wide(n, Some(again));
+            let e = parse(&text).unwrap_err();
+            assert!(e.to_string().contains(&format!("`k{again}'")), "{e}");
+            assert_eq!(e.offset, text.rfind(&format!("\"k{again}\"")).unwrap());
+        }
+        let n = 100_000;
+        let value = parse(&wide(n, None)).unwrap();
+        let Json::Obj(members) = &value else {
+            panic!("{value:?}")
+        };
+        assert_eq!(members.len(), n);
+        for (i, (key, _)) in members.iter().enumerate() {
+            assert_eq!(*key, format!("k{i}"));
+        }
     }
 
     #[test]
