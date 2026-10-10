@@ -10,6 +10,7 @@
 # source changes. Hand-editing a row is self-defeating: the runner
 # re-derives from the pins every run and reds on disagreement.
 bash-mesboot-source 0w2mkw1b4ll6wfq48nsmp9l13b3za98g-bash-mesboot-source
+bc-x86-64-self-source 3a3f0g1d72nj8ga5qx7zln483cb0pai1-bc-x86-64-self-source
 binutils-244-source 8xzd2kk7j2pj9fhkmab3ajhgpmccgidj-binutils-244-source
 binutils-mesboot-source 455cqqkkwpx94h5km91l46wldq80dgyl-binutils-mesboot-source
 bison-mesboot-source 091gccsyc4qcsnk4r6p99mqkk259f3ar-bison-mesboot-source

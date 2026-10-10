@@ -25,6 +25,16 @@ const PINS: &[PinDef] = &[
         file: "bash-2.05b.tar.gz",
     },
     PinDef {
+        key: "bc-x86-64-self-source",
+        aliases: &[],
+        // GNU bc 1.08.2, build-only, for the kernel's timeconst.bc. The
+        // tarball's detached signature verifies against the GNU keyring (Ken
+        // Pizzini, 325B54E4653F935A25CF32BDA186278D426A38E9).
+        url: "https://ftp.gnu.org/gnu/bc/bc-1.08.2.tar.gz",
+        sha256: "ae470fec429775653e042015edc928d07c8c3b2fc59765172a330d3d87785f86",
+        file: "bc-1.08.2.tar.gz",
+    },
+    PinDef {
         key: "binutils-mesboot-source",
         aliases: &[],
         url: "https://ftp.gnu.org/gnu/binutils/binutils-2.20.1a.tar.bz2",
@@ -823,8 +833,9 @@ mod tests {
         // Fonts v3.5.1 JetBrains Mono release ten pinned upstream data pins:
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
-        // gawk 5.4.1 is the build-only awk after rust-toolchain.
-        assert_eq!(all().len(), 79);
+        // gawk 5.4.1 is the build-only awk after rust-toolchain, and bc 1.08.2
+        // the build-only bc for the kernel's timeconst.bc.
+        assert_eq!(all().len(), 80);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice
