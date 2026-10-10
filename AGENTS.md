@@ -333,7 +333,10 @@ boundaries are:
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
 verifies that every touched path ends in `.md`. Other unavailable-reviewer
-waivers require a reason and the human approver named in the trailer.
+waivers require a reason and the human approver named in the trailer. A
+cross-model CLI that refuses for spent quota is replaced, without a
+waiver, by a capped `td-agent review` of the same family, recorded with
+`Review-fallback:` (`DEVELOPMENT.md`, Quota fallback).
 
 Commit messages are the durable review record. Put rationale, design
 decisions, findings and dispositions, and verified-red evidence there. Hard

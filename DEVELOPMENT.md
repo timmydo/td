@@ -951,13 +951,61 @@ When Codex is the acting agent, run the newest Opus at xhigh:
 git show HEAD | claude -p --model opus --effort xhigh "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
 ```
 
+## Quota fallback
+
+When the cross-model CLI refuses because its subscription quota is spent
+(it exits non-zero and says it hit a usage, rate or quota limit), review
+the same commit with `td-agent review` through OpenRouter instead, as the
+same model family, capped at $1. This needs no human approval. Do not use
+it for any other failure: a CLI that is missing, crashes or times out is
+an unavailable reviewer, which needs a waiver. With Claude acting:
+
+```text
+td-agent review --repo . --commit HEAD --model openai/gpt-6.1-sol \
+  --effort high --max-cost 1 > /tmp/fallback-review.md
+```
+
+With Codex acting, use the newest Opus on OpenRouter, with half the
+default completion allowance so that it fits the cap:
+
+```text
+td-agent review --repo . --commit HEAD --model anthropic/claude-opus-5.5 \
+  --effort high --max-tokens 16384 --max-cost 1 > /tmp/fallback-review.md
+```
+
+Admission reserves each request's whole completion allowance at the
+model's output price, so an expensive model may not fit the cap at all:
+`openai/gpt-6-astra` is refused before its first request. A refusal of
+that kind costs nothing and says what the request would reserve; choose
+a cheaper model of the same family, or a smaller `--max-tokens`.
+
+Treat the result like the CLI's review. It counts only with exit status
+zero and a `REVIEWING` first line naming the exact commit. Record it in
+place of the CLI's trailer, beside a `Review-fallback:` trailer that names
+the CLI it replaced and quotes its refusal:
+
+```text
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-fallback: codex — You've hit your usage limit
+```
+
+`ready` and td-review accept a `td-agent/<model>` review only beside one
+such trailer, and only in the cross-model slot: not for the acting
+model's own CLI, not for a CLI that also reviewed or was waived, and not
+for Agy, which has no fallback (an Agy refusal is an unavailable
+reviewer). The quoted refusal must contain `quota`, `usage limit`, `rate
+limit`, `limit reached` or `hit your limit` (with `-` and `_` read as
+spaces). The model must be the replaced CLI's family: GPT for Codex,
+Claude for the Claude CLI.
+
 ## Diagnostic reviews through td-agent
 
 `td-agent review` can review an exact commit through OpenRouter, with a
 disposable sparse checkout and confined tools. It is useful for evaluating
 models and inspecting their sessions. It does not change the reviewer
-roster above: substituting it for a required CLI needs the human approval
-and durable record required for an unavailable reviewer.
+roster above: outside the quota fallback, substituting it for a required
+CLI needs the human approval and durable record required for an
+unavailable reviewer.
 
 On a host, use the CLI installed by `./install-apps`, with its fetch
 service and helpers. From the worktree, a small review can start with:
@@ -1109,7 +1157,9 @@ Use the identities that actually reviewed. `td-builder ready` requires a
 `Checks:`. It compares model families so the acting model cannot review itself
 through a second frontend. For a Codex-acting review, the subagent trailer is
 `Reviewed-by: subagent/gpt-6-sol`; a generic or inherited model identity does
-not satisfy the roster.
+not satisfy the roster. A quota fallback records
+`Reviewed-by: td-agent/<model>` and `Review-fallback: <cli> — <refusal>` in
+place of the CLI's trailer (§ Quota fallback).
 
 The trailer block must close the message, with no text below it and no wrapped
 trailers.

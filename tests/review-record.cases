@@ -244,3 +244,84 @@ Reviewed-by: subagent/opus-4.8
 Reviewed-by: codex/some-new-thing
 Reviewed-by: agy/gemini-3.1-pro
 Checks: affected-checks --committed-only (green)
+
+case fallback-for-codex ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: codex — You've hit your usage limit
+Checks: affected-checks --committed-only (green)
+
+case fallback-for-claude ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/gpt-5.6-sol
+Reviewed-by: td-agent/anthropic/claude-opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: claude — 5-hour limit reached
+Checks: affected-checks --committed-only (green)
+
+case fallback-unrecorded not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case fallback-not-quota not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: codex — CLI crashed
+Checks: affected-checks --committed-only (green)
+
+case fallback-third-family not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/google/gemini-3.1-pro
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: codex — usage limit reached
+Checks: affected-checks --committed-only (green)
+
+case fallback-acting-cli not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/anthropic/claude-sonnet-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: claude — usage limit reached
+Checks: affected-checks --committed-only (green)
+
+case fallback-for-agy not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: td-agent/google/gemini-3.1-pro
+Review-fallback: agy — usage limit reached
+Checks: affected-checks --committed-only (green)
+
+case fallback-and-waiver not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: agy/gemini-3.1-pro
+Review-fallback: codex — usage limit reached
+Review-waiver: codex — CLI unavailable, approved by tester
+Checks: affected-checks --committed-only (green)
+
+case fallback-waived not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Review-waiver: td-agent — down, approved by tester
+Checks: affected-checks --committed-only (green)

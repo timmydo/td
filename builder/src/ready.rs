@@ -33,6 +33,12 @@ pub const CLI_REVIEWERS: &[&str] = &["agy", "claude", "codex"];
 /// so "any two of three" would accept a Codex agent reviewed by Codex and
 /// Claude, no Agy, which the roster does not allow.
 const SHARED_CLI: &str = "agy";
+/// The cross-model slot's stand-in when its CLI refuses for quota: a
+/// `td-agent review` through OpenRouter, `Reviewed-by: td-agent/<model>`,
+/// counted only beside the `Review-fallback: <cli> — <why>` that says which
+/// CLI it replaced (DEVELOPMENT.md, `Quota fallback`). Not a roster entry:
+/// it cannot be waived and cannot fill the Agy slot.
+pub const FALLBACK: &str = "td-agent";
 /// The one waiver that stands in for all three, and only on a commit whose every
 /// path is documentation — a claim this checks rather than believes.
 pub const DOCS_ONLY: &str = "docs-only";
@@ -47,6 +53,9 @@ pub struct Record {
     pub reviewers: Vec<(String, String)>,
     /// `Review-waiver:` subjects paired with the reason given.
     pub waivers: Vec<(String, String)>,
+    /// `Review-fallback:` subjects, the CLI a td-agent review replaced, paired
+    /// with the reason given.
+    pub fallbacks: Vec<(String, String)>,
     pub checks: Option<String>,
     /// Trailers of ours that did not parse — reported, never ignored.
     pub malformed: Vec<String>,
@@ -71,7 +80,7 @@ fn is_trailer_line(line: &str) -> bool {
 fn is_record_line(line: &str) -> bool {
     is_trailer_line(line)
         && line.split_once(':').is_some_and(|(key, _)| {
-            ["reviewed-by", "review-waiver", "checks"]
+            ["reviewed-by", "review-waiver", "review-fallback", "checks"]
                 .iter()
                 .any(|k| key.eq_ignore_ascii_case(k))
         })
@@ -151,6 +160,15 @@ pub fn parse_record(message: &str) -> Record {
                     rec.waivers.push((subject, reason));
                 }
             }
+            "review-fallback" => {
+                let (subject, reason) = split_waiver(value);
+                if subject.is_empty() {
+                    rec.malformed
+                        .push("`Review-fallback:` names no reviewer".to_string());
+                } else {
+                    rec.fallbacks.push((subject, reason));
+                }
+            }
             "checks" if !value.is_empty() => rec.checks = Some(value.to_string()),
             _ => {}
         }
@@ -179,6 +197,39 @@ fn known_reviewer(name: &str) -> bool {
 /// not enough: `claude-opus-4.8` and `opus-4.8` are the same model, and that is
 /// the spelling an agent naturally writes for its own subagent.
 const MODELS: &[&str] = &["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
+
+/// The families each cross-model CLI reviews as. A td-agent review standing
+/// in for one must share them: the fallback replaces the CLI's quota, not
+/// its model, so the slot's second opinion stays that family's.
+fn cli_families(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "codex" => &["gpt"],
+        "claude" => &["opus", "sonnet", "haiku", "fable"],
+        _ => &[],
+    }
+}
+
+/// What a quoted quota refusal says, Codex's ("usage limit") and the Claude
+/// CLI's ("limit reached", "hit your limit") among them. A crash, a missing
+/// CLI or a timeout is an unavailable reviewer and needs a human's waiver.
+const QUOTA_WORDS: &[&str] = &[
+    "quota",
+    "usage limit",
+    "rate limit",
+    "limit reached",
+    "hit your limit",
+];
+
+/// Matched with `-` and `_` read as spaces, so `rate_limit_exceeded` and
+/// `5-hour limit reached`, quoted as printed, are found.
+fn quota_refusal(reason: &str) -> bool {
+    let spaced: String = reason
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect();
+    QUOTA_WORDS.iter().any(|w| spaced.contains(w))
+}
 
 fn family(model: &str) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
@@ -239,8 +290,82 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         ));
     }
 
+    // The CLIs whose slot is the cross-model one, the only slot a fallback
+    // may fill.
+    let others: Vec<&str> = CLI_REVIEWERS
+        .iter()
+        .copied()
+        .filter(|c| *c != SHARED_CLI)
+        .collect();
+    let reviewed = |who: &str| rec.reviewers.iter().any(|(t, _)| t == who);
+    let stand_in = rec
+        .reviewers
+        .iter()
+        .find(|(t, _)| t == FALLBACK)
+        .map(|(_, m)| m.as_str());
+    let acting = rec
+        .reviewers
+        .iter()
+        .find(|(t, _)| t == SUBAGENT)
+        .and_then(|(_, m)| family(m));
+    // The CLI a well-formed fallback stands in for; nothing otherwise.
+    let mut stands_for: Option<&str> = None;
+    match rec.fallbacks.as_slice() {
+        [] if reviewed(FALLBACK) => out.push(format!(
+            "a {FALLBACK} review stands in for a CLI only beside \
+             `Review-fallback: <cli> — <why>`"
+        )),
+        [] => {}
+        [(subject, reason)] => {
+            let families = cli_families(subject);
+            if !others.contains(&subject.as_str()) {
+                out.push(format!(
+                    "falls back from '{subject}', not the cross-model CLI ({})",
+                    others.join(" or ")
+                ));
+            } else if !quota_refusal(reason) {
+                out.push(format!(
+                    "fallback from '{subject}' does not quote a quota refusal ({}) — \
+                     any other failure is an unavailable reviewer, which needs a waiver",
+                    QUOTA_WORDS.join(", ")
+                ));
+            } else if reviewed(subject) {
+                out.push(format!(
+                    "falls back from '{subject}', which reviewed it as well"
+                ));
+            } else if rec.waivers.iter().any(|(s, _)| s == subject) {
+                out.push(format!("falls back from '{subject}' and waives it as well"));
+            } else if acting.is_some_and(|a| families.contains(&a)) {
+                out.push(format!(
+                    "falls back from '{subject}', the acting model's own CLI — the \
+                     cross-model slot is the other family's"
+                ));
+            } else if let Some(model) = stand_in {
+                if family(model).is_some_and(|f| families.contains(&f)) {
+                    stands_for = Some(subject.as_str());
+                } else {
+                    out.push(format!(
+                        "the {FALLBACK} review is {model}, not {subject}'s model family ({}) \
+                         — a fallback replaces the CLI's quota, not its model",
+                        families.join("/")
+                    ));
+                }
+            }
+            if !reviewed(FALLBACK) {
+                out.push(format!(
+                    "falls back from '{subject}' but records no \
+                     `Reviewed-by: {FALLBACK}/<model>`"
+                ));
+            }
+        }
+        more => out.push(format!(
+            "{} fallbacks at once — one td-agent review replaces one CLI",
+            more.len()
+        )),
+    }
+
     for (tool, model) in &rec.reviewers {
-        if !known_reviewer(tool) {
+        if !known_reviewer(tool) && tool != FALLBACK {
             out.push(format!("unknown reviewer '{tool}'"));
         } else if family(model).is_none() {
             out.push(format!(
@@ -279,21 +404,19 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         // model reviewing its own work through a second front end, which is the
         // exact blind spot the cross-model rule exists to cover. A waived slot
         // has no model to compare, and its reason is the record.
-        let acting = model_of(SUBAGENT).and_then(family);
-        let others: Vec<&str> = CLI_REVIEWERS
-            .iter()
-            .copied()
-            .filter(|c| *c != SHARED_CLI)
-            .collect();
+        // A CLI's review, or the td-agent review a fallback with a reason says
+        // replaced it; the family rule binds the stand-in as it binds the CLI.
+        let review_of =
+            |c: &str| model_of(c).or_else(|| stand_in.filter(|_| stands_for == Some(c)));
         // An unrecognised model counts as NOT cross-model: it was reported just
         // above, and a spelling nothing can compare must not settle the check.
-        let cross = others.iter().any(|c| match model_of(c) {
+        let cross = others.iter().any(|c| match review_of(c) {
             Some(m) => family(m).is_some_and(|f| acting.is_none_or(|a| f != a)),
             None => waived(c),
         });
         if !cross {
             let named = others.join(" or ");
-            match others.iter().find_map(|c| model_of(c)) {
+            match others.iter().find_map(|c| review_of(c)) {
                 Some(m) => out.push(format!(
                     "the {named} review is {m}, the model that reviewed it as subagent — \
                      the second opinion must be the model that is not acting"
@@ -801,6 +924,107 @@ Checks: affected-checks --committed-only (green)
         let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
                  Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
         assert!(probs(m).is_empty());
+    }
+
+    /// A td-agent review fills the cross-model slot only with the
+    /// `Review-fallback:` that says which CLI refused, and the family rule
+    /// binds it as it binds that CLI.
+    #[test]
+    fn a_td_agent_review_stands_in_for_the_cross_model_cli_on_record() {
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
+                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-fallback: codex — usage limit reached\nChecks: g\n";
+        assert!(probs(m).is_empty(), "{:?}", probs(m));
+
+        // Unrecorded, it is no cross-model review.
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
+                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
+        let p = probs(m);
+        assert!(p.iter().any(|s| s.contains("only beside")), "{p:?}");
+        assert!(
+            p.iter().any(|s| s.starts_with("no cross-model review")),
+            "{p:?}"
+        );
+
+        // Without a reason, or for anything but quota, likewise: a crash is
+        // an unavailable reviewer, which only a human may waive.
+        for fallback in ["codex", "codex — CLI crashed"] {
+            let m = format!(
+                "s\n\nReviewed-by: subagent/opus-4.8\n\
+                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\nReview-fallback: {fallback}\nChecks: g\n"
+            );
+            let p = probs(&m);
+            assert!(p.iter().any(|s| s.contains("quota refusal")), "{p:?}");
+            assert!(
+                p.iter().any(|s| s.starts_with("no cross-model review")),
+                "{p:?}"
+            );
+        }
+
+        // A stand-in from a third family is not Codex's second opinion,
+        // even where it differs from the acting model.
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
+                 Reviewed-by: td-agent/google/gemini-3.1-pro\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-fallback: codex — usage limit reached\nChecks: g\n";
+        let p = probs(m);
+        assert!(
+            p.iter().any(|s| s.contains("not codex's model family")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter().any(|s| s.starts_with("no cross-model review")),
+            "{p:?}"
+        );
+
+        // With Codex acting, the Claude CLI's stand-in is Claude's family,
+        // and the acting model through OpenRouter is not.
+        let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\n\
+                 Reviewed-by: td-agent/anthropic/claude-opus-4.8\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-fallback: claude — rate limit reached\nChecks: g\n";
+        assert!(probs(m).is_empty(), "{:?}", probs(m));
+        let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\n\
+                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-fallback: claude — rate limit reached\nChecks: g\n";
+        let p = probs(m);
+        assert!(
+            p.iter().any(|s| s.contains("not claude's model family")),
+            "{p:?}"
+        );
+        assert!(
+            p.iter().any(|s| s.starts_with("no cross-model review")),
+            "{p:?}"
+        );
+
+        // Agy's slot is not the fallback's.
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
+                 Reviewed-by: td-agent/google/gemini-3.1-pro\n\
+                 Review-fallback: agy — usage limit reached\nChecks: g\n";
+        let p = probs(m);
+        assert!(
+            p.iter().any(|s| s.contains("not the cross-model CLI")),
+            "{p:?}"
+        );
+        assert!(p.iter().any(|s| s.starts_with("no agy review")), "{p:?}");
+
+        // A fallback with no td-agent review, or from a CLI that reviewed.
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-fallback: codex — usage limit reached\nChecks: g\n";
+        let p = probs(m);
+        assert!(p.iter().any(|s| s.contains("records no")), "{p:?}");
+        assert!(p.iter().any(|s| s.contains("reviewed it as well")), "{p:?}");
+
+        // It cannot be waived: it is no roster entry.
+        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
+                 Reviewed-by: agy/gemini-3.1-pro\n\
+                 Review-waiver: td-agent — down, approved by Timmy\nChecks: g\n";
+        assert!(probs(m).iter().any(|s| s.contains("unknown reviewer")));
     }
 
     /// The same model spelled differently is still the same model. Each of

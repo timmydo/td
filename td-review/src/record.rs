@@ -18,6 +18,10 @@ const CLI_REVIEWERS: [&str; 3] = ["agy", "claude", "codex"];
 const SHARED_CLI: &str = "agy";
 /// The waiver standing in for all three, on a commit whose every path is docs.
 const DOCS_ONLY: &str = "docs-only";
+/// A cross-model CLI's stand-in when it refuses for quota: a `td-agent
+/// review`, counted only beside the `Review-fallback:` naming the CLI it
+/// replaced. Not a roster entry: it cannot be waived or fill Agy's slot.
+const FALLBACK: &str = "td-agent";
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Record {
@@ -25,6 +29,8 @@ pub struct Record {
     /// beside `claude/opus-4.8` is one model behind two front ends.
     pub reviewers: Vec<(String, String)>,
     pub waivers: Vec<(String, String)>,
+    /// `Review-fallback:` subjects, the CLI a td-agent review replaced.
+    pub fallbacks: Vec<(String, String)>,
     pub checks: Option<String>,
     pub malformed: Vec<String>,
 }
@@ -82,7 +88,7 @@ fn is_trailer_line(line: &str) -> bool {
 fn is_record_line(line: &str) -> bool {
     is_trailer_line(line)
         && line.split_once(':').is_some_and(|(key, _)| {
-            ["reviewed-by", "review-waiver", "checks"]
+            ["reviewed-by", "review-waiver", "review-fallback", "checks"]
                 .iter()
                 .any(|k| key.eq_ignore_ascii_case(k))
         })
@@ -154,6 +160,15 @@ pub fn parse(message: &str) -> Record {
                     rec.waivers.push((subject, reason));
                 }
             }
+            "review-fallback" => {
+                let (subject, reason) = split_waiver(value);
+                if subject.is_empty() {
+                    rec.malformed
+                        .push("`Review-fallback:` names no reviewer".to_string());
+                } else {
+                    rec.fallbacks.push((subject, reason));
+                }
+            }
             "checks" if !value.is_empty() => rec.checks = Some(value.to_string()),
             _ => {}
         }
@@ -190,6 +205,39 @@ fn family(model: &str) -> Option<&'static str> {
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|token| token == *m)
     })
+}
+
+/// The families each cross-model CLI reviews as. A td-agent review standing
+/// in for one must share them: the fallback replaces the CLI's quota, not
+/// its model, so the slot's second opinion stays that family's.
+fn cli_families(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "codex" => &["gpt"],
+        "claude" => &["opus", "sonnet", "haiku", "fable"],
+        _ => &[],
+    }
+}
+
+/// What a quoted quota refusal says, Codex's ("usage limit") and the Claude
+/// CLI's ("limit reached", "hit your limit") among them. A crash, a missing
+/// CLI or a timeout is an unavailable reviewer and needs a human's waiver.
+const QUOTA_WORDS: &[&str] = &[
+    "quota",
+    "usage limit",
+    "rate limit",
+    "limit reached",
+    "hit your limit",
+];
+
+/// Matched with `-` and `_` read as spaces, so `rate_limit_exceeded` and
+/// `5-hour limit reached`, quoted as printed, are found.
+fn quota_refusal(reason: &str) -> bool {
+    let spaced: String = reason
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
+        .collect();
+    QUOTA_WORDS.iter().any(|w| spaced.contains(w))
 }
 
 /// Everything wrong with one commit's record; empty means it may land.
@@ -239,8 +287,82 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         ));
     }
 
+    // The CLIs whose slot is the cross-model one, the only slot a fallback
+    // may fill.
+    let others: Vec<&str> = CLI_REVIEWERS
+        .iter()
+        .copied()
+        .filter(|c| *c != SHARED_CLI)
+        .collect();
+    let reviewed = |who: &str| rec.reviewers.iter().any(|(t, _)| t == who);
+    let stand_in = rec
+        .reviewers
+        .iter()
+        .find(|(t, _)| t == FALLBACK)
+        .map(|(_, m)| m.as_str());
+    let acting = rec
+        .reviewers
+        .iter()
+        .find(|(t, _)| t == SUBAGENT)
+        .and_then(|(_, m)| family(m));
+    // The CLI a well-formed fallback stands in for; nothing otherwise.
+    let mut stands_for: Option<&str> = None;
+    match rec.fallbacks.as_slice() {
+        [] if reviewed(FALLBACK) => out.push(format!(
+            "a {FALLBACK} review stands in for a CLI only beside \
+             `Review-fallback: <cli> — <why>`"
+        )),
+        [] => {}
+        [(subject, reason)] => {
+            let families = cli_families(subject);
+            if !others.contains(&subject.as_str()) {
+                out.push(format!(
+                    "falls back from '{subject}', not the cross-model CLI ({})",
+                    others.join(" or ")
+                ));
+            } else if !quota_refusal(reason) {
+                out.push(format!(
+                    "fallback from '{subject}' does not quote a quota refusal ({}) — \
+                     any other failure is an unavailable reviewer, which needs a waiver",
+                    QUOTA_WORDS.join(", ")
+                ));
+            } else if reviewed(subject) {
+                out.push(format!(
+                    "falls back from '{subject}', which reviewed it as well"
+                ));
+            } else if rec.waivers.iter().any(|(s, _)| s == subject) {
+                out.push(format!("falls back from '{subject}' and waives it as well"));
+            } else if acting.is_some_and(|a| families.contains(&a)) {
+                out.push(format!(
+                    "falls back from '{subject}', the acting model's own CLI — the \
+                     cross-model slot is the other family's"
+                ));
+            } else if let Some(model) = stand_in {
+                if family(model).is_some_and(|f| families.contains(&f)) {
+                    stands_for = Some(subject.as_str());
+                } else {
+                    out.push(format!(
+                        "the {FALLBACK} review is {model}, not {subject}'s model family ({}) \
+                         — a fallback replaces the CLI's quota, not its model",
+                        families.join("/")
+                    ));
+                }
+            }
+            if !reviewed(FALLBACK) {
+                out.push(format!(
+                    "falls back from '{subject}' but records no \
+                     `Reviewed-by: {FALLBACK}/<model>`"
+                ));
+            }
+        }
+        more => out.push(format!(
+            "{} fallbacks at once — one td-agent review replaces one CLI",
+            more.len()
+        )),
+    }
+
     for (tool, model) in &rec.reviewers {
-        if !known_reviewer(tool) {
+        if !known_reviewer(tool) && tool != FALLBACK {
             out.push(format!("unknown reviewer '{tool}'"));
         } else if family(model).is_none() {
             out.push(format!(
@@ -275,21 +397,19 @@ pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
         // The remaining slot is the model that is NOT acting: comparing tools
         // alone would accept one model reviewing its own work through a second
         // front end, which is the blind spot the rule exists to cover.
-        let acting = model_of(SUBAGENT).and_then(family);
-        let others: Vec<&str> = CLI_REVIEWERS
-            .iter()
-            .copied()
-            .filter(|c| *c != SHARED_CLI)
-            .collect();
+        // A CLI's review, or the td-agent review a fallback with a reason says
+        // replaced it; the family rule binds the stand-in as it binds the CLI.
+        let review_of =
+            |c: &str| model_of(c).or_else(|| stand_in.filter(|_| stands_for == Some(c)));
         // An unrecognised model counts as NOT cross-model: it was reported just
         // above, and a spelling nothing can compare must not settle the check.
-        let cross = others.iter().any(|c| match model_of(c) {
+        let cross = others.iter().any(|c| match review_of(c) {
             Some(m) => family(m).is_some_and(|f| acting.is_none_or(|a| f != a)),
             None => waived(c),
         });
         if !cross {
             let named = others.join(" or ");
-            match others.iter().find_map(|c| model_of(c)) {
+            match others.iter().find_map(|c| review_of(c)) {
                 Some(m) => out.push(format!(
                     "the {named} review is {m}, the model that reviewed it as subagent — \
                      the second opinion must be the model that is not acting"
