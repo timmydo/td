@@ -41,9 +41,18 @@ pub const MAX_LINKS: usize = 32;
 const MAX_LINK_HOST: usize = 255;
 pub const MAX_LINK_WHY: usize = 1024;
 /// A binary frame's first byte, which no JSON text begins with, and its
-/// one kind: a link's bytes.
+/// kinds: a link's bytes, and a `serve` call's input.
 const BINARY: u8 = 0;
 const BINARY_BYTES: u8 = 1;
+const BINARY_INPUT: u8 = 2;
+/// The most bytes of one `Input`, and the most a `serve` call's input
+/// runs ahead of its `Took` (DESIGN.md §12, MCP servers), as a link's.
+pub const INPUT_CHUNK: usize = LINK_CHUNK;
+pub const INPUT_WINDOW: u64 = LINK_WINDOW;
+/// A `serve` call's bounds: its arguments, and the bytes of each and of
+/// its program.
+pub const MAX_SERVE_ARGS: usize = 64;
+pub const MAX_SERVE_WORD: usize = 4096;
 
 /// A tool call, as the tool host performs it (§12).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +121,16 @@ pub enum Call {
         script: String,
         paths: Vec<String>,
         extended: bool,
+    },
+    /// A program run with piped standard input, `program` and `args` as
+    /// they are, no shell between: an MCP server (DESIGN.md §12, MCP
+    /// servers). Its input comes as `Input` frames and ends with `Close`;
+    /// its output goes up as raw bytes and its standard error as text,
+    /// and it is answered when it ends.
+    Serve {
+        program: String,
+        args: Vec<String>,
+        workdir: Option<String>,
     },
 }
 
@@ -316,6 +335,16 @@ pub enum Down {
     },
     /// A link's: `Opened`, `Refused`, `Bytes`, `Shut` or `Took`.
     Link(Link),
+    /// Bytes for `serve` call `id`'s standard input, at most
+    /// `INPUT_CHUNK`, within `INPUT_WINDOW` of what it `Took`.
+    Input {
+        id: u64,
+        data: Vec<u8>,
+    },
+    /// `serve` call `id`'s standard input ends.
+    Close {
+        id: u64,
+    },
 }
 
 /// What a call came to.
@@ -348,6 +377,8 @@ pub enum Up {
     },
     /// A link's: `Open`, `Bytes`, `Shut` or `Took`.
     Link(Link),
+    /// `serve` call `id`'s program was given `bytes` more of its input.
+    Took { id: u64, bytes: u64 },
 }
 
 fn opt_str(value: Option<&str>) -> Json {
@@ -392,6 +423,7 @@ impl Call {
             Self::Background { .. } => "background",
             Self::Grep { .. } => "grep",
             Self::Sed { .. } => "sed",
+            Self::Serve { .. } => "serve",
         }
     }
 
@@ -507,6 +539,18 @@ impl Call {
                 ),
                 ("extended", Json::Bool(*extended)),
             ]),
+            Self::Serve {
+                program,
+                args,
+                workdir,
+            } => member(vec![
+                ("program", Json::Str(program.clone())),
+                (
+                    "args",
+                    Json::Arr(args.iter().map(|a| Json::Str(a.clone())).collect()),
+                ),
+                ("workdir", opt_str(workdir.as_deref())),
+            ]),
         }
     }
 
@@ -611,6 +655,44 @@ impl Call {
                     .collect::<Result<_, _>>()?,
                 extended: flag("extended"),
             },
+            "serve" => {
+                let word = |word: &str| {
+                    if word.is_empty() || word.len() > MAX_SERVE_WORD || word.contains('\0') {
+                        Err(format!(
+                            "{tool}: a word is empty, past {MAX_SERVE_WORD} bytes or holds a NUL"
+                        ))
+                    } else {
+                        Ok(word.to_string())
+                    }
+                };
+                let words = args
+                    .get("args")
+                    .and_then(Json::as_arr)
+                    .ok_or_else(|| format!("{tool}: no `args`"))?;
+                if words.len() > MAX_SERVE_ARGS {
+                    return Err(format!("{tool}: more than {MAX_SERVE_ARGS} arguments"));
+                }
+                Self::Serve {
+                    program: word(&text("program")?)?,
+                    args: words
+                        .iter()
+                        .map(|a| {
+                            a.as_str()
+                                .ok_or_else(|| format!("{tool}: an argument is not a string"))
+                                .and_then(|a| {
+                                    // An argument may be empty; only the
+                                    // program may not.
+                                    if a.is_empty() {
+                                        Ok(String::new())
+                                    } else {
+                                        word(a)
+                                    }
+                                })
+                        })
+                        .collect::<Result<_, _>>()?,
+                    workdir: maybe("workdir")?,
+                }
+            }
             other => return Err(format!("no tool {other:?}")),
         })
     }
@@ -633,12 +715,35 @@ impl Down {
             ]),
             Self::Cancel { id } => Json::Obj(vec![("cancel".into(), Json::Num(id.to_string()))]),
             Self::Link(link) => return link.encode(),
+            Self::Input { id, data } => {
+                let mut bytes = Vec::with_capacity(data.len().saturating_add(10));
+                bytes.push(BINARY);
+                bytes.push(BINARY_INPUT);
+                bytes.extend_from_slice(&id.to_be_bytes());
+                bytes.extend_from_slice(data);
+                return bytes;
+            }
+            Self::Close { id } => Json::Obj(vec![("close".into(), Json::from(*id))]),
         };
         json.to_string().into_bytes()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.first() == Some(&BINARY) {
+            if bytes.get(1) == Some(&BINARY_INPUT) {
+                let (Some(id), Some(data)) = (bytes.get(2..10), bytes.get(10..)) else {
+                    return Err("an input frame with no call".into());
+                };
+                if data.is_empty() || data.len() > INPUT_CHUNK {
+                    return Err(format!("an input frame's bytes are 1 to {INPUT_CHUNK}"));
+                }
+                let mut call = [0u8; 8];
+                call.copy_from_slice(id);
+                return Ok(Self::Input {
+                    id: u64::from_be_bytes(call),
+                    data: data.to_vec(),
+                });
+            }
             return Link::decode_binary(bytes).map(Self::Link);
         }
         let value = td_json::parse_slice(bytes).map_err(|e| e.to_string())?;
@@ -651,6 +756,11 @@ impl Down {
         if value.get("cancel").is_some() {
             return Ok(Self::Cancel {
                 id: id_of(&value, "cancel")?,
+            });
+        }
+        if value.get("close").is_some() {
+            return Ok(Self::Close {
+                id: id_of(&value, "close")?,
             });
         }
         let id = id_of(&value, "call")?;
@@ -720,6 +830,10 @@ impl Up {
                 Json::Obj(pairs)
             }
             Self::Link(link) => return link.encode(),
+            Self::Took { id, bytes } => Json::Obj(vec![
+                ("took".into(), Json::from(*id)),
+                ("bytes".into(), Json::from(*bytes)),
+            ]),
         };
         json.to_string().into_bytes()
     }
@@ -739,6 +853,12 @@ impl Up {
             };
         }
         let text = |name: &str| value.get(name).and_then(Json::as_str).map(String::from);
+        if value.get("took").is_some() {
+            return Ok(Self::Took {
+                id: id_of(&value, "took")?,
+                bytes: id_of(&value, "bytes")?,
+            });
+        }
         if value.get("output_raw").is_some() {
             let hex = value
                 .get("hex")
@@ -799,6 +919,10 @@ pub struct Client {
     replies: Receiver<Result<Up, String>>,
     next: u64,
     open: BTreeSet<u64>,
+    /// Each `serve` call's input sent and not yet `Took`, from its call
+    /// until its input closes or it ends; the reader thread lowers it as
+    /// each `Took` arrives, behind whatever replies came before it.
+    unread: Arc<Mutex<std::collections::BTreeMap<u64, u64>>>,
     child: Option<Child>,
     /// A jailed host's spec, removed with it, and the tail of td-jail's
     /// own diagnostics (crate::jail).
@@ -833,6 +957,8 @@ impl Client {
         // Bounded, so a tool host that floods is held at the pipe, not in
         // this process's memory.
         let (send, replies) = mpsc::sync_channel(REPLY_QUEUE);
+        let unread: Arc<Mutex<std::collections::BTreeMap<u64, u64>>> = Arc::default();
+        let took = Arc::clone(&unread);
         std::thread::spawn(move || {
             loop {
                 let reply = match frame::read(&mut reader) {
@@ -850,6 +976,18 @@ impl Client {
                         links.up(link);
                         continue;
                     }
+                    // Nor is a serve call's credit, which frees its input
+                    // as it arrives. One for a call whose input closed, or
+                    // that ended (its writer is the tool host's to let go
+                    // later), finds no entry and is nothing.
+                    Ok(Up::Took { id, bytes }) => {
+                        if let Ok(mut unread) = took.lock() {
+                            if let Some(left) = unread.get_mut(&id) {
+                                *left = left.saturating_sub(bytes);
+                            }
+                        }
+                        continue;
+                    }
                     other => other,
                 };
                 if send.send(reply).is_err() {
@@ -863,6 +1001,7 @@ impl Client {
             replies,
             next: 1,
             open: BTreeSet::new(),
+            unread,
             child: None,
             spec: None,
             diagnostic: None,
@@ -941,15 +1080,74 @@ impl Client {
     pub fn call(&mut self, call: Call) -> Result<u64, String> {
         let id = self.next;
         self.next = self.next.saturating_add(1);
+        let serve = matches!(call, Call::Serve { .. });
         let sent = self.write(&Down::Call { id, call }.encode());
         sent.map_err(|e| self.failed(format!("the tool host: {e}")))?;
         self.open.insert(id);
+        if serve {
+            if let Ok(mut unread) = self.unread.lock() {
+                unread.insert(id, 0);
+            }
+        }
         Ok(id)
     }
 
     /// Asks for call `id` to end early.
     pub fn cancel(&mut self, id: u64) -> Result<(), String> {
         let sent = self.write(&Down::Cancel { id }.encode());
+        sent.map_err(|e| self.failed(format!("the tool host: {e}")))
+    }
+
+    /// Sends as much of `data` to `serve` call `id`'s input as its window
+    /// has room for: how many bytes went, none while the program has not
+    /// taken what it was given (DESIGN.md §12, MCP servers). It never
+    /// waits for credit, only, as every frame does, for the pipe; the rest
+    /// is the caller's to send once replies are read, since a `Took` comes
+    /// behind the replies before it. Refused for a call that is not a
+    /// running `serve` call with its input open.
+    pub fn input(&mut self, id: u64, data: &[u8]) -> Result<usize, String> {
+        let mut sent = 0;
+        while sent < data.len() {
+            let piece = {
+                let mut unread = self
+                    .unread
+                    .lock()
+                    .map_err(|_| "the input's credit is broken")?;
+                let Some(left) = unread.get_mut(&id).filter(|_| self.open.contains(&id)) else {
+                    return Err(format!("call {id} is no serve call with its input open"));
+                };
+                let room = INPUT_WINDOW.saturating_sub(*left);
+                let rest = data.get(sent..).unwrap_or_default();
+                let size = rest
+                    .len()
+                    .min(INPUT_CHUNK)
+                    .min(usize::try_from(room).unwrap_or(INPUT_CHUNK));
+                *left = left.saturating_add(size as u64);
+                rest.get(..size).unwrap_or_default().to_vec()
+            };
+            if piece.is_empty() {
+                break;
+            }
+            let size = piece.len();
+            let written = self.write(&Down::Input { id, data: piece }.encode());
+            written.map_err(|e| self.failed(format!("the tool host: {e}")))?;
+            sent += size;
+        }
+        Ok(sent)
+    }
+
+    /// Ends `serve` call `id`'s input; no more is taken for it.
+    pub fn close_input(&mut self, id: u64) -> Result<(), String> {
+        let open = self
+            .unread
+            .lock()
+            .ok()
+            .and_then(|mut unread| unread.remove(&id))
+            .is_some();
+        if !open || !self.open.contains(&id) {
+            return Err(format!("call {id} is no serve call with its input open"));
+        }
+        let sent = self.write(&Down::Close { id }.encode());
         sent.map_err(|e| self.failed(format!("the tool host: {e}")))
     }
 
@@ -982,6 +1180,12 @@ impl Client {
                     continue
                 }
                 Ok(Up::Done { id, .. }) if !self.open.remove(&id) => continue,
+                Ok(Up::Done { id, .. }) => {
+                    if let Ok(mut unread) = self.unread.lock() {
+                        unread.remove(&id);
+                    }
+                    return Some(reply);
+                }
                 Err(e) => return Some(Err(self.failed(e))),
                 other => return Some(other),
             }
@@ -1018,7 +1222,7 @@ impl Drop for Client {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
     /// Every link frame crosses whole, each in its direction, a link's
@@ -1132,6 +1336,131 @@ mod tests {
         credit.close();
         assert_eq!(told.recv_timeout(Duration::from_secs(5)), Ok(false));
         assert!(!credit.take(0));
+    }
+
+    /// A `serve` call, its input, its input's end and its credit cross
+    /// each its way, the input as a binary frame; the wrong direction's,
+    /// input past `INPUT_CHUNK` or none, and a call past its bounds are
+    /// refused (DESIGN.md §12, MCP servers).
+    #[test]
+    fn serve_frames_round_trip_each_its_way() {
+        let call = Call::Serve {
+            program: "/bin/server".into(),
+            args: vec!["--stdio".into(), String::new()],
+            workdir: Some("/w".into()),
+        };
+        assert_eq!(Call::decode(call.tool(), &call.args()).unwrap(), call);
+        let downs = [
+            Down::Call { id: 3, call },
+            Down::Input {
+                id: u64::MAX,
+                data: b"{\"jsonrpc\":\"2.0\"}\n".to_vec(),
+            },
+            Down::Close { id: 3 },
+        ];
+        for down in downs {
+            assert_eq!(Down::decode(&down.encode()).unwrap(), down);
+        }
+        let input = Down::Input {
+            id: 3,
+            data: vec![b'x'],
+        }
+        .encode();
+        assert_eq!(input.first(), Some(&BINARY));
+        assert!(Up::decode(&input).is_err());
+        let up = Up::Took { id: 3, bytes: 9 };
+        assert_eq!(Up::decode(&up.encode()).unwrap(), up);
+        assert!(Down::decode(&up.encode()).is_err());
+        for data in [Vec::new(), vec![b'x'; INPUT_CHUNK + 1]] {
+            let mut frame = vec![BINARY, BINARY_INPUT];
+            frame.extend_from_slice(&3u64.to_be_bytes());
+            frame.extend_from_slice(&data);
+            assert!(Down::decode(&frame).is_err());
+        }
+        let serve = |program: &str, args: Vec<String>| Down::Call {
+            id: 1,
+            call: Call::Serve {
+                program: program.into(),
+                args,
+                workdir: None,
+            },
+        };
+        for bad in [
+            serve("", Vec::new()),
+            serve("a\0b", Vec::new()),
+            serve(&"p".repeat(MAX_SERVE_WORD + 1), Vec::new()),
+            serve("p", vec!["a".into(); MAX_SERVE_ARGS + 1]),
+            serve("p", vec!["a".repeat(MAX_SERVE_WORD + 1)]),
+        ] {
+            assert!(Down::decode(&bad.encode()).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A serve call's input goes as far as its window, without waiting,
+    /// and the rest once the tool host says the program took it; input
+    /// to no call in flight is refused.
+    #[test]
+    fn input_goes_as_far_as_its_window() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = Client::over(ours.try_clone().unwrap(), ours);
+        let mut host_side = theirs.try_clone().unwrap();
+        // The host's side read from the start, as a tool host reads.
+        let (frames, downs) = mpsc::channel();
+        let mut reader = theirs;
+        std::thread::spawn(move || {
+            while let Ok(Some(bytes)) = frame::read(&mut reader) {
+                if frames.send(Down::decode(&bytes).unwrap()).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = client
+            .call(Call::Serve {
+                program: "p".into(),
+                args: Vec::new(),
+                workdir: None,
+            })
+            .unwrap();
+        assert!(client.input(id + 1, b"x").is_err());
+        let data = vec![b'x'; INPUT_WINDOW as usize + 10];
+        assert_eq!(client.input(id, &data).unwrap(), INPUT_WINDOW as usize);
+        assert_eq!(client.input(id, b"more").unwrap(), 0);
+        // The host's account of what the program took frees that much,
+        // though nobody reads the client's replies.
+        // Room short of a chunk sends what fits.
+        frame::write(&mut host_side, &Up::Took { id, bytes: 100 }.encode()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = 0;
+        while sent == 0 && Instant::now() < deadline {
+            sent = client.input(id, &data).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(sent, 100);
+        client.close_input(id).unwrap();
+        // No more goes once the input is closed, nor to a call that is
+        // no serve call.
+        assert!(client.input(id, b"x").is_err());
+        assert!(client.close_input(id).is_err());
+        let shell = client
+            .call(Call::Shell {
+                command: "true".into(),
+                timeout_ms: None,
+                workdir: None,
+            })
+            .unwrap();
+        assert!(client.input(shell, b"x").is_err());
+        // What the host read: the call, its input whole and in order, and
+        // the end of it.
+        let mut read = 0;
+        loop {
+            match downs.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Down::Input { id: of, data } if of == id => read += data.len(),
+                Down::Close { id: of } if of == id => break,
+                Down::Call { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(read, INPUT_WINDOW as usize + 100);
     }
 
     #[test]

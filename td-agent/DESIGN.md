@@ -5690,6 +5690,29 @@ resources, prompts, sampling, roots, elicitation, progress shown, a row
 per server in the window with its own kill and restart, and MCP tools
 for sub-agents.
 
+**As built (MCP, the tool host's `serve`).** `serve {program, args,
+workdir?}` runs the program as given, no shell between, with a
+command's environment: the program and each argument at most 4 KiB
+with no NUL, at most 64 arguments, the program not empty. Its card
+quotes, as `sh` would, a word that is empty or holds whitespace, a
+quote or a backslash. Its input comes as binary frames of kind 2 (`[0, 2, id as 8
+bytes big-endian, bytes]`, 1 to 32 KiB) and ends with `{"close": id}`;
+the tool host hands each piece to a thread of the call's own, which
+writes it, and the call answers `{"took": id, "bytes": n}` for it from
+its own thread, for what can no longer be written too, so neither a
+program gone nor a descendant that keeps the input and never reads
+holds a sender, the tool host's end, or anything but that one thread.
+The conversation's client sends to a running `serve` call whose input
+is open, at most 256 KiB past what was taken: `input` never waits for
+credit, only, as every frame does, for the pipe, and says how much
+went. A `took` frees room as the client's reader thread reaches it,
+behind the replies before it, so whoever sends must keep reading
+replies. Standard output goes up as raw bytes and standard error as
+text, both waiting for room; after the program ends, what is left is
+read until its pipes close or are quiet for 300 ms, for at most a
+minute; a cancel ends that reading too, and one that ends the program
+reads none of what is left. Nothing uses it yet.
+
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
 offered after the conversation tools to a conversation with a workspace;

@@ -4092,7 +4092,10 @@ impl Session {
                 // A link's frame goes to its links, never here.
                 None
                 | Some(Ok(
-                    host::Up::Output { .. } | host::Up::RawOutput { .. } | host::Up::Link(_),
+                    host::Up::Output { .. }
+                    | host::Up::RawOutput { .. }
+                    | host::Up::Link(_)
+                    | host::Up::Took { .. },
                 )) => {}
                 // The instance is gone, and with it the call.
                 Some(Err(why)) => return failed(why),
@@ -7508,9 +7511,9 @@ fn unready(
         | host::Call::Write { path, .. }
         | host::Call::Edit { path, .. } => vec![Some(path.as_str())],
         host::Call::Glob { path, .. } | host::Call::Grep { path, .. } => vec![path.as_deref()],
-        host::Call::Shell { workdir, .. } | host::Call::Background { workdir, .. } => {
-            vec![workdir.as_deref()]
-        }
+        host::Call::Shell { workdir, .. }
+        | host::Call::Background { workdir, .. }
+        | host::Call::Serve { workdir, .. } => vec![workdir.as_deref()],
         host::Call::Sed { paths, .. } => paths.iter().map(|path| Some(path.as_str())).collect(),
         // A patch the grammar refuses is the tool host's to say why.
         host::Call::Patch { patch, .. } => {

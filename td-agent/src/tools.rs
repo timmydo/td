@@ -1653,6 +1653,21 @@ pub fn visible(line: &str) -> String {
     out
 }
 
+/// `word` as one word of an argv shown on a card: single-quoted as `sh`
+/// would read it when it is empty or holds what would end or bend a
+/// word, so two argvs never look alike.
+fn quoted_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 /// The card that asks the human whether `call` may run (DESIGN.md §11):
 /// its title and the exact action, line by line, what it runs before the
 /// lists it runs over.
@@ -1697,6 +1712,24 @@ pub fn card(call: &Call) -> (String, Vec<String>) {
             ));
             card.text("", command, PART_LINES * 2);
             "Run a command in the background"
+        }
+        Call::Serve {
+            program,
+            args,
+            workdir,
+        } => {
+            card.line(format!(
+                "In {}, until td-agent ends it, in a jail of its own:",
+                workdir
+                    .as_deref()
+                    .map_or("the workspace".to_string(), visible)
+            ));
+            let words: Vec<String> = std::iter::once(program)
+                .chain(args)
+                .map(|w| quoted_word(w))
+                .collect();
+            card.text("", &words.join(" "), PART_LINES * 2);
+            "Start a program"
         }
         Call::Write { path, content, .. } => {
             card.line(format!(
@@ -2833,6 +2866,28 @@ mod tests {
             expected: None,
         });
         assert!(lines.contains(&"+ the new text".to_string()), "{lines:?}");
+    }
+
+    /// A served program's argv is shown so that two never look alike: a
+    /// word that is empty or holds a space or a quote is quoted.
+    #[test]
+    fn a_serve_cards_words_are_told_apart() {
+        let (title, lines) = card(&Call::Serve {
+            program: "npx".into(),
+            args: vec!["a b".into(), String::new(), "it's".into(), "-y".into()],
+            workdir: None,
+        });
+        assert_eq!(title, "Start a program");
+        assert!(
+            lines.contains(&"npx 'a b' '' 'it'\\''s' -y".to_string()),
+            "{lines:?}"
+        );
+        let (_, apart) = card(&Call::Serve {
+            program: "npx".into(),
+            args: vec!["a".into(), "b".into()],
+            workdir: None,
+        });
+        assert!(apart.contains(&"npx a b".to_string()), "{apart:?}");
     }
 
     /// Nothing that looks like a space, or like nothing, passes for one:

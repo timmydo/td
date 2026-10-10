@@ -94,6 +94,25 @@ impl Config {
 /// The calls running, by id, each with its cancel flag.
 type Running = Arc<Mutex<BTreeMap<u64, Arc<AtomicBool>>>>;
 
+/// Each running `serve` call's input, by id, until its input closes or
+/// it ends. Unbounded, since the conversation sends at most
+/// `host::INPUT_WINDOW` past what the program took.
+type Inputs = Arc<Mutex<BTreeMap<u64, mpsc::Sender<Vec<u8>>>>>;
+
+/// Lets a `serve` call's input go when its thread ends, a panic included.
+struct Forget {
+    inputs: Inputs,
+    id: u64,
+}
+
+impl Drop for Forget {
+    fn drop(&mut self) {
+        if let Ok(mut inputs) = self.inputs.lock() {
+            inputs.remove(&self.id);
+        }
+    }
+}
+
 /// The most frames waiting for the writer. Foreground display updates
 /// may be dropped; background and review output waits for room. Review
 /// deadlines also run in the controller, which can tear down the jail.
@@ -174,6 +193,7 @@ pub fn serve(
         })
         .map_err(|e| format!("the tool host's writer: {e}"))?;
     let running: Running = Arc::new(Mutex::new(BTreeMap::new()));
+    let inputs: Inputs = Arc::new(Mutex::new(BTreeMap::new()));
     let config = Arc::new(config);
     let mut threads = Vec::new();
     let ended = loop {
@@ -191,6 +211,18 @@ pub fn serve(
             Ok(Down::Cancel { id }) => {
                 if let Some(flag) = running.lock().ok().and_then(|r| r.get(&id).cloned()) {
                     flag.store(true, Ordering::Relaxed);
+                }
+            }
+            // Handed to the call's own writer, never written here, so a
+            // program that stops reading holds up nothing else.
+            Ok(Down::Input { id, data }) => {
+                if let Some(input) = inputs.lock().ok().and_then(|i| i.get(&id).cloned()) {
+                    let _ = input.send(data);
+                }
+            }
+            Ok(Down::Close { id }) => {
+                if let Ok(mut inputs) = inputs.lock() {
+                    inputs.remove(&id);
                 }
             }
             Ok(Down::Call { id, call }) => {
@@ -221,6 +253,18 @@ pub fn serve(
                     outcome: None,
                 };
                 let config = config.clone();
+                // A serve call's input is open before any of it can come.
+                let input = match call {
+                    Call::Serve { .. } => {
+                        let (send, receive) = mpsc::channel();
+                        if let Ok(mut inputs) = inputs.lock() {
+                            inputs.insert(id, send);
+                        }
+                        Some(receive)
+                    }
+                    _ => None,
+                };
+                let let_go = inputs.clone();
                 // A thread the system refuses drops `finish` unrun, which
                 // answers the call as failed.
                 // A background call's output is all kept (DESIGN.md §12),
@@ -229,6 +273,12 @@ pub fn serve(
                 let whole = matches!(call, Call::Background { .. });
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let live = finish.outbox.clone();
+                    if let Some(input) = input {
+                        // Its input let go however the call ends.
+                        let _forget = Forget { inputs: let_go, id };
+                        finish.end(serve_program(&call, &config, &flag, input, id, &live));
+                        return;
+                    }
                     if matches!(call, Call::ReviewShell { .. }) {
                         // Review traces need every byte; bounded queues apply
                         // backpressure rather than dropping display updates.
@@ -256,8 +306,13 @@ pub fn serve(
                         }
                     }));
                 });
-                if let Ok(thread) = spawned {
-                    threads.push(thread);
+                match spawned {
+                    Ok(thread) => threads.push(thread),
+                    Err(_) => {
+                        if let Ok(mut inputs) = inputs.lock() {
+                            inputs.remove(&id);
+                        }
+                    }
                 }
                 threads.retain(|thread| !thread.is_finished());
             }
@@ -284,6 +339,9 @@ pub fn serve(
         }
     };
     cancel_all(&running);
+    if let Ok(mut inputs) = inputs.lock() {
+        inputs.clear();
+    }
     for thread in threads {
         let _ = thread.join();
     }
@@ -301,6 +359,73 @@ fn cancel_all(running: &Running) {
             flag.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Runs a `serve` call (DESIGN.md §12, MCP servers): its input from
+/// `input`, each piece's taking said; its output as raw bytes and its
+/// standard error as text, each waiting for room in `live` rather than
+/// dropped, since a lost piece would break the program's protocol.
+fn serve_program(
+    call: &Call,
+    config: &Config,
+    cancel: &AtomicBool,
+    input: mpsc::Receiver<Vec<u8>>,
+    id: u64,
+    live: &SyncSender<Up>,
+) -> Result<Done, String> {
+    let Call::Serve {
+        program,
+        args,
+        workdir,
+    } = call
+    else {
+        return Err("not a serve call".into());
+    };
+    let dir = match workdir {
+        Some(dir) => config.path(dir, "workdir")?,
+        None => config.first("workdir")?,
+    };
+    if !dir.is_dir() {
+        return Err(format!("`workdir` {} is not a directory", dir.display()));
+    }
+    let mut errors = Vec::new();
+    let exit = shell::serve(
+        shell::program(program, args, &dir, config.proxy),
+        cancel,
+        input,
+        &mut |bytes| {
+            let _ = live.send(Up::Took { id, bytes });
+        },
+        &mut |stream, piece| match stream {
+            shell::Stream::Output => {
+                for bytes in piece.chunks(OUTPUT_CHUNK) {
+                    let _ = live.send(Up::RawOutput {
+                        id,
+                        bytes: bytes.to_vec(),
+                    });
+                }
+            }
+            shell::Stream::Errors => {
+                errors.extend_from_slice(piece);
+                emit(&mut errors, false, &mut |text| {
+                    let _ = live.send(Up::Output { id, text });
+                });
+            }
+        },
+    )?;
+    emit(&mut errors, true, &mut |text| {
+        let _ = live.send(Up::Output { id, text });
+    });
+    let mut text = exit.status();
+    if exit.cut {
+        text.push_str(shell::CUT_NOTE);
+    }
+    Ok(Done {
+        text,
+        kept: None,
+        digest: None,
+        digests: Vec::new(),
+    })
 }
 
 /// Performs one call, giving `live` its process's output as it comes.
@@ -535,6 +660,7 @@ fn act(
                 digests: Vec::new(),
             })
         }
+        Call::Serve { .. } => Err("a serve call is run with its input".into()),
         Call::Grep {
             pattern,
             path,
@@ -765,6 +891,179 @@ mod tests {
         };
         assert_eq!(bytes, 8_000_000);
         assert_eq!(ended.unwrap().text, "exit status 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A served program's replies, standard error and end, read until it
+    /// ends or `deadline`.
+    fn served(client: &mut Client, id: u64, deadline: Instant) -> (Vec<u8>, String, Done) {
+        let (mut output, mut errors) = (Vec::new(), String::new());
+        loop {
+            assert!(Instant::now() < deadline, "{} bytes so far", output.len());
+            match client.next_reply(Duration::from_millis(50)) {
+                Some(Ok(Up::RawOutput { id: of, bytes })) if of == id => {
+                    output.extend_from_slice(&bytes)
+                }
+                Some(Ok(Up::Output { id: of, text })) if of == id => errors.push_str(&text),
+                Some(Ok(Up::Done { id: of, outcome })) if of == id => {
+                    return (output, errors, outcome.unwrap())
+                }
+                Some(Err(why)) => panic!("{why}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A served program reads its input line by line as it comes, its
+    /// output and standard error kept apart, and ends when its input
+    /// does (DESIGN.md §12, MCP servers).
+    #[test]
+    fn a_served_program_reads_its_input_and_ends_with_it() {
+        let dir = scratch("serve");
+        let mut client = host(vec![dir.clone()]);
+        let id = client
+            .call(Call::Serve {
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "while read l; do echo \"got:$l\"; echo \"err:$l\" >&2; done; echo bye".into(),
+                ],
+                workdir: None,
+            })
+            .unwrap();
+        assert_eq!(client.input(id, b"one\n").unwrap(), 4);
+        // An answer to the first line before the second is sent.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut output = Vec::new();
+        while !output.ends_with(b"got:one\n") {
+            assert!(Instant::now() < deadline);
+            if let Some(Ok(Up::RawOutput { bytes, .. })) =
+                client.next_reply(Duration::from_millis(50))
+            {
+                output.extend_from_slice(&bytes);
+            }
+        }
+        assert_eq!(client.input(id, b"two\n").unwrap(), 4);
+        client.close_input(id).unwrap();
+        let (rest, errors, done) = served(&mut client, id, deadline);
+        output.extend_from_slice(&rest);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "got:one\ngot:two\nbye\n"
+        );
+        assert!(errors.ends_with("err:two\n"), "{errors}");
+        assert_eq!(done.text, "exit status 0");
+        // Input to a call that ended is refused.
+        assert!(client.input(id, b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// More input than one window goes through as the program takes it,
+    /// every byte and in order.
+    #[test]
+    fn a_served_programs_input_flows_past_its_window() {
+        let dir = scratch("serve-window");
+        let mut client = host(vec![dir.clone()]);
+        let id = client
+            .call(Call::Serve {
+                program: "wc".into(),
+                args: vec!["-c".into()],
+                workdir: None,
+            })
+            .unwrap();
+        let data = vec![b'x'; 1024 * 1024];
+        let mut sent = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while sent < data.len() {
+            assert!(Instant::now() < deadline, "{sent} bytes sent");
+            let went = client.input(id, data.get(sent..).unwrap()).unwrap();
+            if went == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sent += went;
+        }
+        client.close_input(id).unwrap();
+        let (output, _, done) = served(&mut client, id, deadline);
+        assert_eq!(String::from_utf8(output).unwrap().trim(), "1048576");
+        assert_eq!(done.text, "exit status 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Input to a program that closed its input is taken all the same,
+    /// so the sender is never held at its window by a pipe nobody reads.
+    #[test]
+    fn input_past_a_closed_input_is_still_taken() {
+        let dir = scratch("serve-closed");
+        let mut client = host(vec![dir.clone()]);
+        let id = client
+            .call(Call::Serve {
+                program: "sh".into(),
+                args: vec!["-c".into(), "exec 0<&-; sleep 6; echo ended".into()],
+                workdir: None,
+            })
+            .unwrap();
+        let data = vec![b'x'; 3 * crate::host::INPUT_WINDOW as usize];
+        let mut went = 0;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while went < data.len() {
+            assert!(Instant::now() < deadline, "{went} bytes went");
+            went += client.input(id, data.get(went..).unwrap()).unwrap();
+            if let Some(Ok(Up::Done { .. })) = client.next_reply(Duration::from_millis(20)) {
+                panic!("it ended with {went} bytes sent");
+            }
+        }
+        client.close_input(id).unwrap();
+        let (output, _, done) = served(&mut client, id, Instant::now() + Duration::from_secs(20));
+        assert_eq!(output, b"ended\n");
+        assert_eq!(done.text, "exit status 0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program that never reads its input holds up nothing else: its
+    /// window fills and no more is sent, another call is answered, and a
+    /// cancel ends it at once.
+    #[test]
+    fn a_program_that_reads_nothing_holds_up_nothing() {
+        let dir = scratch("serve-stuck");
+        let mut client = host(vec![dir.clone()]);
+        let stuck = client
+            .call(Call::Serve {
+                program: "sleep".into(),
+                args: vec!["60".into()],
+                workdir: None,
+            })
+            .unwrap();
+        // What the pipe holds before the program would have to read is
+        // taken, so a little more than one window goes; then nothing.
+        let window = crate::host::INPUT_WINDOW as usize;
+        let data = vec![b'x'; 4 * window];
+        let mut went = 0;
+        let mut idle = 0;
+        while idle < 5 {
+            let sent = client.input(stuck, &data).unwrap();
+            went += sent;
+            idle = if sent == 0 { idle + 1 } else { 0 };
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            (window..=window + 128 * 1024).contains(&went),
+            "{went} bytes went"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(client.input(stuck, &data).unwrap(), 0);
+        let quick = client
+            .call(Call::Shell {
+                command: "echo here".into(),
+                timeout_ms: None,
+                workdir: None,
+            })
+            .unwrap();
+        let started = Instant::now();
+        assert!(done(&mut client, quick).unwrap().text.contains("here"));
+        client.cancel(stuck).unwrap();
+        let ended = done(&mut client, stuck).unwrap();
+        assert!(ended.text.starts_with("interrupted"), "{}", ended.text);
+        assert!(started.elapsed() < Duration::from_secs(20));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

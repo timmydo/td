@@ -378,6 +378,163 @@ pub fn shell(command: &str, workdir: &Path, proxy: bool) -> Command {
     sh
 }
 
+/// A `serve` call's program: `program` with `args` in `workdir`, no
+/// shell between, with a command's environment and the proxy's when
+/// `proxy` says this instance serves one (DESIGN.md §12, MCP servers).
+pub fn program(program: &str, args: &[String], workdir: &Path, proxy: bool) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(workdir)
+        .env_clear()
+        .envs(environment());
+    if proxy {
+        command.envs(crate::proxy::environment());
+    }
+    command
+}
+
+/// Which of a served program's streams a piece came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stream {
+    Output,
+    Errors,
+}
+
+/// Runs `command` with piped standard input until it ends or `cancel` is
+/// set. A thread of its own writes each piece `input` brings to its
+/// input and closes the input when `input` ends, so a program that stops
+/// reading holds up that thread alone; each piece's taking is told to
+/// `took` here, on the caller's thread, so a writer held forever by a
+/// descendant that keeps the input and never reads holds nothing of the
+/// caller's. Each piece of its output and standard error goes to `sink`
+/// as it comes; after it ends, what is left is read until the pipes are
+/// quiet for `DRAIN`, for at most `MAX_LINGER`, or until `cancel`.
+pub fn serve(
+    mut command: Command,
+    cancel: &AtomicBool,
+    input: mpsc::Receiver<Vec<u8>>,
+    took: &mut dyn FnMut(u64),
+    sink: &mut dyn FnMut(Stream, &[u8]),
+) -> Result<Exit, String> {
+    let started = Instant::now();
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("{}: {e}", command.get_program().to_string_lossy()))?;
+    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (Some(mut stdin), Some(stdout), Some(stderr)) = pipes else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("the program's pipes were not made".into());
+    };
+    let (taken, takings) = mpsc::channel::<u64>();
+    // Not joined: it ends when `input` does, which outlives this call
+    // only until the tool host lets the call's input go, or, held in a
+    // write by a descendant that never reads, when that descendant goes.
+    let writing = std::thread::Builder::new().spawn(move || {
+        let mut broken = false;
+        for piece in input {
+            if !broken {
+                broken = std::io::Write::write_all(&mut stdin, &piece).is_err();
+            }
+            // Taken even when the program is gone, so the sender is never
+            // held at its window by a pipe nobody reads.
+            if taken.send(piece.len() as u64).is_err() {
+                broken = true;
+            }
+        }
+    });
+    let (chunks, from_pipes) = mpsc::sync_channel::<(Stream, Vec<u8>)>(PIPE_QUEUE);
+    let mut readers = Vec::new();
+    for (stream, mut pipe) in [
+        (Stream::Output, Box::new(stdout) as Box<dyn Read + Send>),
+        (Stream::Errors, Box::new(stderr)),
+    ] {
+        let chunks = chunks.clone();
+        readers.push(std::thread::Builder::new().spawn(move || {
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let piece = buffer.get(..n).unwrap_or_default().to_vec();
+                        if chunks.send((stream, piece)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    drop(chunks);
+    if writing.is_err() || readers.iter().any(Result::is_err) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("a thread for the program's pipes".into());
+    }
+    let mut stopped = None;
+    let mut status = None;
+    let mut ended_at: Option<Instant> = None;
+    // When the pipes last brought output.
+    let mut heard = started;
+    let mut open = true;
+    let cut = loop {
+        // Told once a pass, so at most a tick late: ample for a server's
+        // requests, and a ceiling of about a window a tick.
+        while let Ok(bytes) = takings.try_recv() {
+            took(bytes);
+        }
+        if let Some(at) = ended_at {
+            let lingered = at.elapsed() >= MAX_LINGER;
+            let quiet = at.max(heard).elapsed() >= DRAIN;
+            if !open || quiet || lingered || cancel.load(Ordering::Relaxed) {
+                break open && lingered;
+            }
+        } else if let Some(exited) = match child.try_wait() {
+            Ok(exited) => exited,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting: {e}"));
+            }
+        } {
+            status = Some(exited);
+            ended_at = Some(Instant::now());
+        } else if cancel.load(Ordering::Relaxed) {
+            stopped = Some(Stopped::Cancelled);
+            let _ = child.kill();
+            status = Some(child.wait().map_err(|e| format!("waiting: {e}"))?);
+            ended_at = Some(Instant::now());
+        }
+        if !open {
+            std::thread::sleep(TICK);
+            continue;
+        }
+        match from_pipes.recv_timeout(TICK) {
+            Ok((stream, piece)) => {
+                sink(stream, &piece);
+                heard = Instant::now();
+            }
+            Err(RecvTimeoutError::Disconnected) => open = false,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    };
+    let status = status.ok_or("the process's status was not read")?;
+    Ok(Exit {
+        code: status.code(),
+        signal: status.signal(),
+        stopped,
+        output: Kept::new(0, 0),
+        elapsed: started.elapsed(),
+        timeout: Duration::ZERO,
+        cut,
+    })
+}
+
 /// A `shell` call's timeout: the default when none is given, refused past
 /// the most.
 pub fn timeout(ms: Option<u64>) -> Result<Duration, String> {
