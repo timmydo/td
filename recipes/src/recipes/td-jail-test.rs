@@ -1,5 +1,6 @@
 use crate::ladder::{
-    post_bootstrap_path, POST_BOOTSTRAP_SH, TD_FIREFOX_BOOT_MARKER, TD_JAIL_TRANSITION_MARKER,
+    job_pids, post_rust_inputs, post_rust_tool_farm, POST_RUST_SH, TD_FIREFOX_BOOT_MARKER,
+    TD_JAIL_TRANSITION_MARKER,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 use td_engine::application::ApplicationProvenance;
@@ -102,13 +103,14 @@ pub fn recipe() -> Recipe {
     let busd = "{in:td-busd}/bin/td-busd";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let probe = "{in:td-jail-seccomp-probe}/bin/td-jail-seccomp-probe";
-    let mut steps = Vec::new();
+    let bg = job_pids();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-jail' >&2; exit 1; }}; \
@@ -122,7 +124,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     for path in [
@@ -154,12 +156,18 @@ pub fn recipe() -> Recipe {
             "/home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/files/bin"
                 .into(),
     });
+    // The surrogate's runtime: static td-sh as /bin/sh and static td-util for
+    // its mv, since /td/store, where uutils' interpreter lives, is not mounted
+    // inside the jail.
     steps.push(Step::CopyFiles {
-        files: vec!["{in:busybox-x86-64}/bin/busybox".into()],
+        files: vec![
+            "{in:td-sh}/bin/td-sh".into(),
+            "{in:td-util}/bin/td-util".into(),
+        ],
         dest: "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/bin".into(),
     });
     steps.push(Step::Symlink {
-        target: "busybox".into(),
+        target: "td-sh".into(),
         link: "/home/td-jail-host/packages/00000000000000000000000000000000-freedesktop-platform-25-08-25.08/files/bin/sh".into(),
     });
     for (path, content) in [
@@ -195,7 +203,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "/home/td-jail-host/packages/00000000000000000000000000000000-firefox-154.0/files/bin/firefox".into(),
         content: format!(
-            "#!/bin/sh\nset -eu\nTMPDIR=$XDG_CACHE_HOME/tmp\nexport TMPDIR\n[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ] || exit 81\nfor path in /bin /lib /lib64 /sbin; do [ -L \"$path\" ] || exit 82; done\n[ -x /bin/sh ] || exit 83\n[ -d \"$TMPDIR\" ] || exit 84\n[ -w \"$TMPDIR\" ] || exit 85\nif /bin/busybox mv /run/flatpak /run/flatpak-replaced 2>/dev/null; then exit 86; fi\nif /bin/busybox mv /run/flatpak/pulse /run/flatpak/pulse-replaced 2>/dev/null; then exit 87; fi\nprintf '%s\\n' '{HOST_FIREFOX_MARKER}' >\"$XDG_RUNTIME_DIR/td-app/dynamic-ready\" || exit 88\n"
+            "#!/bin/sh\nset -eu\nTMPDIR=$XDG_CACHE_HOME/tmp\nexport TMPDIR\n[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ] || exit 81\nfor path in /bin /lib /lib64 /sbin; do [ -L \"$path\" ] || exit 82; done\n[ -x /bin/sh ] || exit 83\n[ -d \"$TMPDIR\" ] || exit 84\n[ -w \"$TMPDIR\" ] || exit 85\n/bin/td-util mkdir \"$TMPDIR/mv-control\" || exit 89\n/bin/td-util mv \"$TMPDIR/mv-control\" \"$TMPDIR/mv-control-moved\" || exit 89\n[ -d \"$TMPDIR/mv-control-moved\" ] || exit 89\nif /bin/td-util mv /run/flatpak /run/flatpak-replaced 2>/dev/null; then exit 86; fi\nif /bin/td-util mv /run/flatpak/pulse /run/flatpak/pulse-replaced 2>/dev/null; then exit 87; fi\nprintf '%s\\n' '{HOST_FIREFOX_MARKER}' >\"$XDG_RUNTIME_DIR/td-app/dynamic-ready\" || exit 88\n"
         ),
         exec: true,
     });
@@ -218,24 +226,26 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "chmod 0700 /home/td-jail-host/runtime || exit 1; \
                      mkdir -p /mnt/td-jail-fixture-pictures /var || exit 1; \
                      printf '%s\\n' td-jail-file-grant-v1 >/var/td-jail-fixture-file || exit 1; \
-                     '{busd}' run --socket /home/td-jail-host/runtime/bus >/home/td-jail-host/bus.log 2>&1 & b=$!; \
-                     '{busd}' run --socket /home/td-jail-host/runtime/wayland-test >/home/td-jail-host/wayland.log 2>&1 & w=$!; \
-                     '{busd}' run --socket /home/td-jail-host/runtime/pulse/native >/home/td-jail-host/pulse.log 2>&1 & a=$!; \
+                     {bg}bg '{{root}}/bus.pid' '{busd}' run --socket /home/td-jail-host/runtime/bus >/home/td-jail-host/bus.log 2>&1; bj=$!; \
+                     bg '{{root}}/wayland.pid' '{busd}' run --socket /home/td-jail-host/runtime/wayland-test >/home/td-jail-host/wayland.log 2>&1; wj=$!; \
+                     bg '{{root}}/pulse.pid' '{busd}' run --socket /home/td-jail-host/runtime/pulse/native >/home/td-jail-host/pulse.log 2>&1; aj=$!; \
+                     b=$(pid_of '{{root}}/bus.pid'); w=$(pid_of '{{root}}/wayland.pid'); a=$(pid_of '{{root}}/pulse.pid'); \
+                     [ -n \"$b\" ] && [ -n \"$w\" ] && [ -n \"$a\" ] || {{ kill $b $w $a 2>/dev/null; echo 'a td-busd authority never published its pid' >&2; exit 1; }}; \
                      n=0; while {{ [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; }} && [ \"$n\" -lt 10 ]; do n=$((n+1)); sleep 1; done; \
-                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; then kill \"$b\" \"$w\" \"$a\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
+                     if [ ! -S /home/td-jail-host/runtime/bus ] || [ ! -S /home/td-jail-host/runtime/wayland-test ] || [ ! -S /home/td-jail-host/runtime/pulse/native ]; then kill \"$b\" \"$w\" \"$a\" 2>/dev/null || :; wait \"$bj\" 2>/dev/null || :; wait \"$wj\" 2>/dev/null || :; wait \"$aj\" 2>/dev/null || :; echo 'td-jail host authorities did not become ready' >&2; exit 1; fi; \
                      o=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest 2>&1); s=$?; \
                      c=0; cp /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/shared-spec /home/td-jail-host/packages/00000000000000000000000000000000-td-jail-fixture-0.1/spec || c=$?; \
                      p=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf {} selftest --shared-network 2>&1); t=$?; \
                      f=$(XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox 2>&1); u=$?; \
-                     kill \"$a\" 2>/dev/null || :; wait \"$a\" 2>/dev/null || :; \
+                     kill \"$a\" 2>/dev/null || :; wait \"$aj\" 2>/dev/null || :; \
                      XDG_RUNTIME_DIR=/home/td-jail-host/runtime WAYLAND_DISPLAY=wayland-test '{bin}' --host /home/td-jail-host/etc/td-app-host.conf firefox >/home/td-jail-host/stale-pulse.log 2>&1 && v=0 || v=$?; \
-                     kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$b\" 2>/dev/null || :; wait \"$w\" 2>/dev/null || :; \
+                     kill \"$b\" \"$w\" 2>/dev/null || :; wait \"$bj\" 2>/dev/null || :; wait \"$wj\" 2>/dev/null || :; \
                      [ \"$s\" -eq 0 ] || {{ echo \"td-jail host fixture failed: $o\" >&2; exit 1; }}; \
                      [ \"$c\" -eq 0 ] || {{ echo 'td-jail host shared spec could not replace the isolated spec' >&2; exit 1; }}; \
                      [ \"$t\" -eq 0 ] || {{ echo \"td-jail host shared-network fixture failed: $p\" >&2; exit 1; }}; \
@@ -254,32 +264,30 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
-                    "exec 9</proc/self/status; \
-                     o=$(TD_JAIL_TEST_LEAK_FD=1 '{bin}' --probe-transition 2>&1) || {{ exec 9<&-; echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
-                     exec 9<&-; \
+                    "o=$(TD_JAIL_TEST_LEAK_FD=1 '{bin}' --probe-transition 2>&1) || {{ echo \"td-jail namespace transition probe failed: $o\" >&2; exit 1; }}; \
                      [ \"$o\" = '{TD_JAIL_TRANSITION_MARKER} pid=1' ] || {{ echo \"td-jail transition returned the wrong proof: $o\" >&2; exit 1; }}; \
                      '{bin}' >/dev/null 2>&1 && {{ echo 'td-jail accepted a bare internal invocation' >&2; exit 1; }}; :"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "'{bin}' --internal-write-seccomp-filter >'{{root}}/filter.bpf' || {{ echo 'td-jail could not export its compiled seccomp filter' >&2; exit 1; }}; \
@@ -287,7 +295,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -305,15 +313,19 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     Recipe::mesboot("td-jail-test", "1.0")
-        .native_inputs(&[
-            "td-jail",
-            "td-busd",
-            "td-compositor",
-            "td-jail-seccomp-probe",
-            "ca-certificates",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-        ])
+        // post_rust_inputs adds the tool farm's providers, td-sh and td-util
+        // among them, which the surrogate's runtime also carries.
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &[
+                "td-jail",
+                "td-busd",
+                "td-compositor",
+                "td-jail-seccomp-probe",
+                "ca-certificates",
+                "binutils-x86-64-self",
+            ],
+        ))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
@@ -352,6 +364,14 @@ mod tests {
             .contains("[Context]\nshared=network\nsockets=wayland\n"));
     }
 
+    /// The surrogate's rename control, in order: it must pass before the
+    /// two refusals mean anything.
+    const CONTROL_THEN_REFUSALS: &str = "/bin/td-util mkdir \"$TMPDIR/mv-control\" || exit 89\n\
+        /bin/td-util mv \"$TMPDIR/mv-control\" \"$TMPDIR/mv-control-moved\" || exit 89\n\
+        [ -d \"$TMPDIR/mv-control-moved\" ] || exit 89\n\
+        if /bin/td-util mv /run/flatpak /run/flatpak-replaced 2>/dev/null; then exit 86; fi\n\
+        if /bin/td-util mv /run/flatpak/pulse /run/flatpak/pulse-replaced 2>/dev/null; then exit 87; fi\n";
+
     #[test]
     fn host_fixture_uses_the_exact_firefox_runtime_contract() {
         let host = host_fixture().expect("host fixture");
@@ -375,15 +395,25 @@ mod tests {
                 if path.ends_with("firefox-154.0/files/bin/firefox")
                     && content.starts_with("#!/bin/sh\n")
                     && content.contains("[ \"$LD_LIBRARY_PATH\" = /app/lib:/app/lib/firefox ]")
-                    && content.contains("mv /run/flatpak /run/flatpak-replaced")
-                    && content.contains("mv /run/flatpak/pulse /run/flatpak/pulse-replaced")
+                    && content.contains(CONTROL_THEN_REFUSALS)
                     && content.contains(HOST_FIREFOX_MARKER)
         )));
         assert!(recipe.steps.iter().flatten().any(|step| matches!(
             step,
             crate::types::Step::Symlink { target, link }
-                if target == "busybox" && link.ends_with("/files/bin/sh")
+                if target == "td-sh" && link.ends_with("/files/bin/sh")
         )));
+        assert!(recipe.steps.iter().flatten().any(|step| matches!(
+            step,
+            crate::types::Step::CopyFiles { files, dest }
+                if dest.ends_with("freedesktop-platform-25-08-25.08/files/bin")
+                    && files == &["{in:td-sh}/bin/td-sh", "{in:td-util}/bin/td-util"]
+        )));
+        let inputs = recipe.native_inputs.as_deref().unwrap_or_default();
+        assert!(!inputs.iter().any(|input| input == "busybox-x86-64"));
+        for provider in ["td-sh", "td-util"] {
+            assert!(inputs.iter().any(|input| input == provider));
+        }
         assert!(recipe.steps.iter().flatten().any(|step| matches!(
             step,
             crate::types::Step::Run { argv, .. }

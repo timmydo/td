@@ -1749,9 +1749,9 @@ opening the proof pipe. The
 ownership of an arbitrary inherited descriptor, while leaving one open
 would preserve an old-root handle across `pivot_root`. An iterator's
 already-closed directory descriptor is the sole tolerated `EBADF`.
-The build-host recipe leaks a real caller fd 9. Target `td-sh` cannot
-forward virtual descriptors above 2, so the target oracle instead asks
-the probe to open `/proc/self/status`, transfer its live descriptor with
+`td-sh`, which runs both the build-host recipe and the target oracle,
+cannot forward virtual descriptors above 2, so each instead asks the
+probe to open `/proc/self/status`, transfer its live descriptor with
 safe `IntoRawFd`, verify that it is above stderr, and feed it through the
 same sweep before stage 2 proves that only stdio survived.
 

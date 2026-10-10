@@ -1630,10 +1630,12 @@ mode-0700
 `$XDG_CACHE_HOME/tmp`, which the Firefox wrapper selects as `TMPDIR`.
 
 The permanent host acceptance test compiles Firefox's real declaration,
-permissions and runtime policy, then launches a source-built static BusyBox
-surrogate under that exact spec through the real td-jail namespace, mount,
-broker-registration and seccomp path. The surrogate enters through `/bin/sh`,
-checks the loader environment, all four aliases and cache tmp, and writes a
+permissions and runtime policy, then launches a source-built surrogate, a
+script run by static td-sh with static td-util beside it, under that exact
+spec through the real td-jail namespace, mount, broker-registration and
+seccomp path. The surrogate enters through `/bin/sh`, checks the loader
+environment, all four aliases and cache tmp, proves cache tmp takes a rename
+before it shows the Pulse policy's fixed ancestors refuse one, and writes a
 marker through the private volatile runtime bind. It does not execute imported
 Firefox bytes as a recipe tool.
 

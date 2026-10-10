@@ -1,20 +1,5 @@
-use crate::ladder::{post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
+use crate::ladder::{job_pids, post_rust_inputs, post_rust_tool_farm, POST_RUST_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
-
-/// td-sh runs `&` on a thread, so its `$!` names that JOB, not a process
-/// (td-sh/src/jobs.rs): `kill $!` finds no such process, and a shell joins
-/// its jobs before it exits. A leg that signals what it started has the
-/// process publish its own pid instead. `bg FILE CMD...` starts CMD as a job
-/// whose process writes `$$` to FILE and then execs CMD, so the pid is CMD's;
-/// `pid_of FILE` waits up to 30s for it. Signal the pid, `wait` the job.
-fn job_pids() -> String {
-    format!(
-        "publish='echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\" && shift && exec \"$@\"'; \
-         bg() {{ rm -f \"$1\"; '{POST_RUST_SH}' -c \"$publish\" bg \"$@\" & }}; \
-         pid_of() {{ i=0; while [ ! -s \"$1\" ]; do [ $i -lt 300 ] || return 1; \
-         i=$((i+1)); sleep 0.1; done; cat \"$1\"; }}; "
-    )
-}
 
 // td-svc-test: build-shape AND behavioural validation of the service supervisor.
 //
