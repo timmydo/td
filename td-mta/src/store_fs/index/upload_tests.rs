@@ -494,7 +494,7 @@ fn forgotten_upload_keeps_its_quota_without_blocking_other_jobs_or_maintenance()
                 .unwrap();
             assert_eq!(spool.status().unwrap().occupied_slots, 2);
             other.discard().unwrap();
-            assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+            assert_eq!(checkpoint(coordinator, deadline()).unwrap().outcome, Ok(()));
             assert_eq!(
                 coordinator
                     .state
@@ -825,7 +825,7 @@ fn maintenance_checkpoints_and_reconciles_files_without_changing_logical_usage()
     fixture(|coordinator, spool, _, _, _| {
         assert!(coordinator.used(Kind::WalBytes).unwrap() > 0);
         let before_database = coordinator.used(Kind::DatabaseBytes).unwrap();
-        let result = coordinator.checkpoint(deadline()).unwrap();
+        let result = checkpoint(coordinator, deadline()).unwrap();
         assert_eq!(result.outcome, Ok(()));
         assert!(!result.admission_stopped);
         let CommitFileUsage::Measured(files) = result.files else {
@@ -852,7 +852,7 @@ fn maintenance_checkpoints_and_reconciles_files_without_changing_logical_usage()
         assert_eq!(result.outcome, Ok(Sequence::from_u64(2)));
         drop(upload);
         assert!(coordinator.used(Kind::WalBytes).unwrap() > 0);
-        assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+        assert_eq!(checkpoint(coordinator, deadline()).unwrap().outcome, Ok(()));
         assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
         assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
         assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 8);
@@ -904,7 +904,7 @@ fn separate_maintenance_recovers_known_commit_but_refuses_indeterminate_commit()
                 assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), MAX_WAL_BYTES);
                 assert!(matches!(result.outcome, Err(CommitError::Indeterminate(_))));
                 assert!(matches!(
-                    coordinator.checkpoint(later),
+                    checkpoint(coordinator, later),
                     Err(UploadError::Store(ports::Error::WriterStopped))
                 ));
                 assert!(coordinator.admission_stopped());
@@ -912,12 +912,16 @@ fn separate_maintenance_recovers_known_commit_but_refuses_indeterminate_commit()
             }
             assert_eq!(result.outcome, Ok(Sequence::from_u64(2)));
             assert!(matches!(
-                coordinator.checkpoint(deadline()),
+                checkpoint(coordinator, deadline()),
                 Err(UploadError::Store(ports::Error::Deadline))
             ));
             assert!(coordinator.admission_stopped());
-            *clock.1.lock().unwrap() = [200, 200, 200, 300].into();
-            let early = coordinator.checkpoint(later).unwrap();
+            let early = retry_checkpoint(|| {
+                // Admission contention must not consume the native-timeout script.
+                *clock.1.lock().unwrap() = [200, 200, 200, 300].into();
+                coordinator.checkpoint(later)
+            })
+            .unwrap();
             assert_eq!(early.outcome, Err(ports::Error::Deadline));
             assert_eq!(early.files, CommitFileUsage::Unchanged);
             assert!(early.admission_stopped);
@@ -930,7 +934,7 @@ fn separate_maintenance_recovers_known_commit_but_refuses_indeterminate_commit()
                         Authorization::Allow
                     }
                 })).unwrap();
-            let refused = coordinator.checkpoint(later).unwrap();
+            let refused = checkpoint(coordinator, later).unwrap();
             assert!(refused.outcome.is_err());
             assert!(matches!(refused.files, CommitFileUsage::Measured(_)));
             assert!(refused.admission_stopped);
@@ -939,7 +943,7 @@ fn separate_maintenance_recovers_known_commit_but_refuses_indeterminate_commit()
                 .unwrap()
                 .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
                 .unwrap();
-            let maintenance = coordinator.checkpoint(later).unwrap();
+            let maintenance = checkpoint(coordinator, later).unwrap();
             assert_eq!(maintenance.outcome, Ok(()));
             assert!(!maintenance.admission_stopped);
             let CommitFileUsage::Measured(files) = maintenance.files else {
@@ -979,7 +983,7 @@ fn maintenance_timeout_stays_conservative_until_a_separate_successful_measuremen
                 }
                 Authorization::Allow
             })).unwrap();
-        let result = coordinator.checkpoint(deadline()).unwrap();
+        let result = checkpoint(coordinator, deadline()).unwrap();
         assert_eq!(result.outcome, Err(ports::Error::Deadline));
         assert_eq!(
             result.files,
@@ -996,9 +1000,7 @@ fn maintenance_timeout_stays_conservative_until_a_separate_successful_measuremen
             .unwrap()
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
             .unwrap();
-        let result = coordinator
-            .checkpoint(Deadline::after(Tick(100), 100).unwrap())
-            .unwrap();
+        let result = checkpoint(coordinator, Deadline::after(Tick(100), 100).unwrap()).unwrap();
         assert_eq!(result.outcome, Ok(()));
         assert!(!result.admission_stopped);
         assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
@@ -1040,7 +1042,7 @@ fn maintenance_after_timed_out_rollback_preserves_logical_quota_for_a_new_upload
             .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
             .unwrap();
         let later = Deadline::after(Tick(100), 100).unwrap();
-        assert_eq!(coordinator.checkpoint(later).unwrap().outcome, Ok(()));
+        assert_eq!(checkpoint(coordinator, later).unwrap().outcome, Ok(()));
         assert!(!coordinator.admission_stopped());
         assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
         assert_eq!(
@@ -1079,12 +1081,12 @@ fn maintenance_after_timed_out_rollback_preserves_logical_quota_for_a_new_upload
 fn maintenance_cannot_clear_a_stopped_native_writer() {
     fixture(|coordinator, _, _, _, _| {
         lock(&coordinator.store.writer).unwrap().stopped = true;
-        let result = coordinator.checkpoint(deadline()).unwrap();
+        let result = checkpoint(coordinator, deadline()).unwrap();
         assert_eq!(result.outcome, Err(ports::Error::WriterStopped));
         assert_eq!(result.files, CommitFileUsage::Unchanged);
         assert!(result.admission_stopped);
         assert!(matches!(
-            coordinator.checkpoint(deadline()),
+            checkpoint(coordinator, deadline()),
             Err(UploadError::Store(ports::Error::WriterStopped))
         ));
         None
@@ -1393,7 +1395,7 @@ fn upload_retirement_preserves_known_and_indeterminate_outcomes_after_deadline()
                 if deny {
                     assert!(matches!(result.outcome, Err(CommitError::Indeterminate(_))));
                     assert!(matches!(
-                        coordinator.checkpoint(later),
+                        checkpoint(coordinator, later),
                         Err(UploadError::Store(ports::Error::WriterStopped))
                     ));
                 } else {
@@ -1404,7 +1406,7 @@ fn upload_retirement_preserves_known_and_indeterminate_outcomes_after_deadline()
                             body_removed: true
                         })
                     );
-                    let maintenance = coordinator.checkpoint(later).unwrap();
+                    let maintenance = checkpoint(coordinator, later).unwrap();
                     assert_eq!(maintenance.outcome, Ok(()));
                     assert!(!maintenance.admission_stopped);
                     assert!(coordinator
@@ -1556,7 +1558,7 @@ fn simultaneous_uploads_keep_independent_quota_and_leave_a_publication_cell() {
                 coordinator.state.lock().unwrap().ledger.available_cells(),
                 1
             );
-            assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+            assert_eq!(checkpoint(coordinator, deadline()).unwrap().outcome, Ok(()));
             second.write(b"body").unwrap();
             second.prepare().unwrap();
             let id = second.id();
@@ -1779,7 +1781,7 @@ fn poisoned_coordination_refuses_admission_and_cleanup_does_not_panic() {
                 Err(UploadError::Store(ports::Error::WriterStopped))
             ));
             assert!(matches!(
-                coordinator.checkpoint(deadline()),
+                checkpoint(coordinator, deadline()),
                 Err(UploadError::Store(ports::Error::WriterStopped))
             ));
             drop(upload);
@@ -1922,4 +1924,28 @@ fn spool_creation_releases_coordination_and_failure_cancels_only_its_reservation
             },
         );
     }
+}
+
+// A racing process-local ticket issue refuses before checkpoint effects.
+// Keep the test's original deadline and preserve every other result.
+fn checkpoint<P>(
+    coordinator: &StoreCoordinator<'_, '_, P>,
+    deadline: Deadline,
+) -> Result<UploadMaintenance, UploadError> {
+    retry_checkpoint(|| coordinator.checkpoint(deadline))
+}
+fn retry_checkpoint(
+    mut attempt: impl FnMut() -> Result<UploadMaintenance, UploadError>,
+) -> Result<UploadMaintenance, UploadError> {
+    for _ in 0..1000 {
+        match attempt() {
+            Err(UploadError::Ledger(logical::Error::Slot(crate::ownership::Error::Contended))) => {
+                std::thread::yield_now()
+            }
+            result => return result,
+        }
+    }
+    Err(UploadError::Ledger(logical::Error::Slot(
+        crate::ownership::Error::Contended,
+    )))
 }
