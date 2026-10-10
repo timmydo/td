@@ -28,14 +28,5 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         non_blocking: false,
-        script: r##"
-echo ">> bootstrap-mes: the structured Rust mes recipe builds GNU Mes (mes-m2) and proves it evaluates Scheme, guix-free + reproducible (source-bootstrap brick 2)"
-set -euo pipefail; \
-. tests/cache-lib.sh; export TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; load_stage0; tb="$TB"; \
-case "$tb" in *.td-build-cache/stage0/*) : ;; *) echo "FAIL: td-builder is not the bootstrapped stage0 ($tb)" >&2; exit 1 ;; esac; \
-test -x "$tb" || { echo "ERROR: could not build td-builder" >&2; exit 1; }; \
-TD_RECIPE_EVAL=`"${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}" recipe-eval-place "$PWD/.td-build-cache/recipe-eval"` || exit $?; export TD_RECIPE_EVAL; \
-"$tb" bootstrap-recipe mes
-"##,
     }
 }

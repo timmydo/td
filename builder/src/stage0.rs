@@ -43,7 +43,7 @@
 //!   static AND smoke-run (a broken/absent musl std links nothing) before use.
 //!
 //! - `stage0_place` — the ONE entry point every stage0 consumer goes through
-//!   (cache-lib's load_stage0, the check prelude, td-recipe-eval's
+//!   (the gate bodies' PlacedStage0, the check prelude, td-recipe-eval's
 //!   check-runner, gate 171): memoized on a `tree-fingerprint` of the builder
 //!   source (BASEDIR/.stage0-meta records fingerprint + placed path), locked
 //!   against concurrent placers sharing BASEDIR, and the stage0 places ITSELF
@@ -1201,9 +1201,9 @@ fn report_evaluator_log_tail(path: &Path) {
 }
 
 /// Keep `recipe-eval-path` naming the binary the memo just served. The tool
-/// build and memo-hit paths both maintain it because cache-lib's
-/// `load_recipe_eval` and `resolve_recipe_eval` both read the sentinel, not the
-/// memo, so a hit that left it absent or stale would send them elsewhere.
+/// build and memo-hit paths both maintain it because the check loop
+/// (check_loop.rs) reads the sentinel, not the memo, so a hit that left it
+/// absent or stale would send it elsewhere.
 fn ensure_recipe_eval_sentinel(base: &Path, bin: &str) -> Result<(), String> {
     let sentinel = base.join("recipe-eval-path");
     if std::fs::read_to_string(&sentinel).is_ok_and(|t| t.trim() == bin) {

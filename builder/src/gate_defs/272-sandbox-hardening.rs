@@ -20,7 +20,7 @@
 //! one whose failure can go unread.
 //!
 //! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::sandbox_hardening`;
-//! `script: ""` marks it native, so the runner execs `td-builder gate-body sandbox-hardening`.
+//! the runner execs `td-builder gate-body sandbox-hardening`.
 
 use crate::gates::{GateDef, Pool};
 
@@ -32,6 +32,5 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         non_blocking: true,
-        script: "",
     }
 }

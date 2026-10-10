@@ -6,7 +6,7 @@
 //! Heavy: builds the guix-free stage0 td-builder + runs a rootless userns (like store-ns 386).
 //!
 //! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::store_native_profile`;
-//! `script: ""` marks it native, so the runner execs `td-builder gate-body store-native-profile`.
+//! the runner execs `td-builder gate-body store-native-profile`.
 
 use crate::gates::{GateDef, Pool};
 
@@ -18,6 +18,5 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         non_blocking: false,
-        script: "",
     }
 }

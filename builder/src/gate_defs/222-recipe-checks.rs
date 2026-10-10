@@ -14,6 +14,5 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         non_blocking: true,
-        script: "",
     }
 }

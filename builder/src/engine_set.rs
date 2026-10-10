@@ -54,7 +54,6 @@ pub const HOST_ONLY: &[&str] = &[
     "crypto_portable.rs",
     "gate_bodies.rs",
     "gate_defs/",
-    "gate_lint.rs",
     "gate_timing.rs",
     "gates.rs",
     "host_run.rs",
@@ -82,6 +81,7 @@ pub const HOST_ONLY_VERBS: &[&str] = &[
     "install-fonts",
     "main-integration",
     "ready",
+    "stage0-place-without-guix",
     // argv0 applets the isolated crypto build binds into its own sandbox.
     "td-crypto-decoy",
     "td-crypto-host-linker",

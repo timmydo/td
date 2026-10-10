@@ -1,18 +1,17 @@
 //! gate_bodies.rs — typed Rust gate bodies (#318 axis 3): the `td-builder
-//! gate-body <name>` subcommand that replaces a gate's bash `script` field.
+//! gate-body <name>` subcommand that runs every gate, the build-recipes node
+//! included. No gate carries shell.
 //!
-//! A gate whose `GateDef.script` is EMPTY is "native": the gate runner
-//! (`gates.rs::run_gate`) execs `<current_exe> gate-body <name>` in the exact
-//! same memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA), its own
-//! process group, and TD_GATE_SPECS env) it uses for
-//! shell gates. `current_exe` is the stage0 td-builder in the loop (the
-//! prelude execs `<stage0> … gate-run`), so a native body gets `tb` = its own
-//! binary for free — no `load_stage0` shell dance for the td-builder under test.
+//! The gate runner (`gates.rs::run_gate`) execs `<current_exe> gate-body
+//! <name>` in a memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA),
+//! its own process group, and TD_GATE_SPECS env). `current_exe` is the stage0
+//! td-builder in the loop (the prelude execs `<stage0> … gate-run`), so a body
+//! gets `tb` = its own binary for free; a body that needs the placement as the
+//! old shell gates' `load_stage0` resolved it uses `PlacedStage0`.
 //!
-//! The registry is `is_native` + the `cli` match below (one place, not a
-//! GateDef field, so the other bash gates are untouched). `load()` asserts
-//! empty-script ⟺ `is_native`, so a typo (empty script with no body, or a body
-//! whose gate still carries bash) is a load-time error, never a silent no-op.
+//! The registry is `is_native` + the `cli` match below (one place). `load()`
+//! refuses a gate def with no registered body, so a typo is a load-time error,
+//! never a silent no-op.
 //!
 //! The store-* cluster shares `store_subject`: a typed synthetic output with a
 //! valid td-assembled `.drv` and a two-path runtime closure staged into a
@@ -32,8 +31,7 @@ pub fn is_native(name: &str) -> bool {
     NATIVE.contains(&name)
 }
 
-/// The native gate names. Adding a typed gate: add its name here + a `cli` arm
-/// + set the gate_defs file's `script: ""`.
+/// The native gate names. Adding a gate: add its name here + a `cli` arm.
 const NATIVE: &[&str] = &[
     "store-add",
     "store-add-tree",
@@ -50,9 +48,23 @@ const NATIVE: &[&str] = &[
     "sandbox-hardening",
     "toolchain-input-addressed",
     "toolchain-x86_64-input-addressed",
+    "build-recipes",
+    "stage0-cold-start",
+    "cargo-test",
+    "daemon-budget",
+    "bootstrap-seed",
+    "bootstrap-mes",
+    "bootstrap-x86_64-toolchain-store-native",
+    "bootstrap-x86_64-native-gcc-store-native",
+    "bootstrap-x86_64-self-gcc-store-native",
 ];
 
 use td_engine::exit::UNPROVISIONED_TAG;
+
+/// A child's own exit 69, passed through as the body's exit without td's
+/// provisioning sentinel: gate-run tolerates it only if the child printed that
+/// sentinel itself, as it did when the shell gates `exec`'d the child.
+const CHILD_EXIT_69_TAG: &str = "CHILD-EXIT-69: ";
 
 /// `td-builder gate-body <name>` — run one native gate body.
 pub fn cli(name: &str) -> ExitCode {
@@ -79,6 +91,27 @@ pub fn cli(name: &str) -> ExitCode {
         "sandbox-hardening" => sandbox_hardening(&root),
         "toolchain-input-addressed" => toolchain_input_addressed(&root),
         "toolchain-x86_64-input-addressed" => toolchain_x86_64_input_addressed(&root),
+        "build-recipes" => build_recipes(&root),
+        "stage0-cold-start" => stage0_cold_start(&root),
+        "cargo-test" => cargo_test(&root),
+        "daemon-budget" => daemon_budget(&root),
+        "bootstrap-seed" => bootstrap_seed(&root),
+        "bootstrap-mes" => bootstrap_mes(&root),
+        "bootstrap-x86_64-toolchain-store-native" => recipe_check_gate(
+            &root,
+            "gcc-x86-64-stage2-test",
+            "build the x86_64 cross toolchain recipe graph and assert its output",
+        ),
+        "bootstrap-x86_64-native-gcc-store-native" => recipe_check_gate(
+            &root,
+            "gcc-x86-64-native-test",
+            "build the native x86_64 gcc recipe graph and assert its output",
+        ),
+        "bootstrap-x86_64-self-gcc-store-native" => recipe_check_gate(
+            &root,
+            "gcc-x86-64-self-test",
+            "rebuild gcc with the native recipe output and assert self-hosting",
+        ),
         other => Err(format!("gate-body: unknown native gate `{other}`")),
     };
     match res {
@@ -91,6 +124,9 @@ pub fn cli(name: &str) -> ExitCode {
             if let Some(rest) = e.strip_prefix(UNPROVISIONED_TAG) {
                 eprintln!("gate-body {name}: unprovisioned — {rest}");
                 td_engine::exit::unprovisioned_exit()
+            } else if let Some(rest) = e.strip_prefix(CHILD_EXIT_69_TAG) {
+                eprintln!("{rest}");
+                ExitCode::from(td_engine::exit::EXIT_UNPROVISIONED as u8)
             } else {
                 eprintln!("{e}");
                 ExitCode::FAILURE
@@ -103,7 +139,7 @@ pub fn cli(name: &str) -> ExitCode {
 
 /// The td-builder under test: this process's own binary. In the loop the runner
 /// (`gate-run`) IS the stage0 td-builder, so `current_exe` is the stage0
-/// placement — the same binary the bash gates resolve via `load_stage0`.
+/// placement — the same binary the old shell gates resolved via `load_stage0`.
 fn tb() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot resolve td-builder (current_exe): {e}"))
 }
@@ -209,7 +245,7 @@ struct CheckList<'a> {
 }
 
 /// `run_out`, plus extra env vars set on the child (inheriting the rest of the
-/// current environment — never `env -i`, matching the bash gates' bare
+/// current environment — never `env -i`, matching the old shell gates' bare
 /// `VAR=val cmd` prefix form).
 fn run_out_env(
     program: &str,
@@ -394,7 +430,7 @@ fn fresh_scratch(root: &Path, name: &str) -> Result<PathBuf, String> {
 /// names the canonical placement `cb`, giving TB = `<BASE>/store/<cb>/bin/
 /// td-builder` and the builder-of-record triple TD_BUILDER_PATH=`cb`,
 /// TD_BUILDER_STORE=`<BASE>/store`, TD_BUILDER_DB=`<BASE>/builder.db`. Reading
-/// the memo PER GATE (as the bash gates' `load_stage0` did) keeps the daemon's
+/// the memo PER GATE (as the old shell gates' `load_stage0` did) keeps the daemon's
 /// builder-of-record consistent with builder.db even when a concurrent
 /// re-provision replaced the placement mid-run (the #309 staleness).
 struct Stage0 {
@@ -402,7 +438,7 @@ struct Stage0 {
 }
 
 fn stage0_from_memo(root: &Path) -> Result<Stage0, String> {
-    // The bash gates hardcoded `TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"`
+    // The old shell gates hardcoded `TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"`
     // before load_stage0 — same here (no env indirection).
     let base = root.join(".td-build-cache/stage0");
     let meta = base.join(".stage0-meta");
@@ -4319,6 +4355,704 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// --- the former shell gates and the build-recipes prelude ----------------------
+
+/// The stage0 td-builder placed as the shell gates' `load_stage0` placed it,
+/// with the builder-of-record triple its children read.
+struct PlacedStage0 {
+    tb: PathBuf,
+    path: String,
+    store: String,
+    db: String,
+}
+
+impl PlacedStage0 {
+    fn place(root: &Path) -> Result<Self, String> {
+        let base = root.join(".td-build-cache/stage0");
+        let path = crate::stage0::stage0_place(root, &base).map_err(|e| {
+            if e.starts_with(UNPROVISIONED_TAG) {
+                e
+            } else {
+                format!("FAIL: td-builder stage0-place could not place a stage0 td-builder: {e}")
+            }
+        })?;
+        let tb = base
+            .join("store")
+            .join(base_of(&path))
+            .join("bin/td-builder");
+        if !is_executable_file(&tb) {
+            return Err(format!(
+                "FAIL: stage0 td-builder not executable at {}",
+                tb.display()
+            ));
+        }
+        Ok(Self {
+            tb,
+            path,
+            store: path_str(&base.join("store"))?,
+            db: path_str(&base.join("builder.db"))?,
+        })
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.tb);
+        command
+            .env("TD_BUILDER_PATH", &self.path)
+            .env("TD_BUILDER_STORE", &self.store)
+            .env("TD_BUILDER_DB", &self.db);
+        command
+    }
+}
+
+/// Run `command` on the gate's own streams, as the shell gates' `exec` did. A
+/// child's exit 69 is the body's exit 69, which stays a tolerated skip only
+/// where the child printed td's provisioning sentinel, because gate-run asks
+/// for both.
+fn run_streamed(mut command: Command, ctx: &str) -> Result<(), String> {
+    command.stdin(Stdio::null());
+    let status = crate::spawn::past_a_busy_program(|| command.status())
+        .map_err(|e| format!("FAIL: {ctx}: cannot spawn: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let msg = format!("FAIL: {ctx}: exited {status}");
+    if status.code() == Some(td_engine::exit::EXIT_UNPROVISIONED) {
+        return Err(format!("{CHILD_EXIT_69_TAG}{msg}"));
+    }
+    Err(msg)
+}
+
+/// td-recipe-eval placed from the current recipes source, as the shell gates'
+/// `recipe-eval-place` did.
+fn placed_recipe_eval(root: &Path) -> Result<String, String> {
+    crate::stage0::recipe_eval_place(root, &root.join(".td-build-cache/recipe-eval")).map_err(|e| {
+        if e.starts_with(UNPROVISIONED_TAG) {
+            e
+        } else {
+            format!("ERROR: could not build td's Rust recipe evaluator (recipes/ crate): {e}")
+        }
+    })
+}
+
+/// The build phase's prelude: place the stage0 td-builder and td-recipe-eval,
+/// which the build_gate store primitives reuse. There is no corpus to pre-build,
+/// so a spec reaching it is an error.
+fn build_recipes(root: &Path) -> Result<(), String> {
+    println!(
+        ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) + \
+         td-recipe-eval, GUIX-FREE"
+    );
+    let specs = std::env::var("TD_BUILD_SPECS").map_err(|_| {
+        String::from("FAIL: the gate runner passes TD_BUILD_SPECS (empty = prelude only)")
+    })?;
+    let s0 = PlacedStage0::place(root)?;
+    println!(
+        ">> builds run on the td-bootstrapped stage0 td-builder ({}) — compiled from source \
+         with the environment's rust",
+        s0.path
+    );
+    let eval = placed_recipe_eval(root)?;
+    println!(">> recipes EVALUATE with td's OWN Rust td-recipe-eval ({eval})");
+    if specs.split_whitespace().next().is_some() {
+        return Err(format!(
+            "ERROR: build-recipes got specs ({specs}) but the guix-seeded corpus retired — no \
+             spec-carrying gate should remain"
+        ));
+    }
+    println!(
+        "PASS: build-recipes — guix-free prelude: stage0 td-builder placed (env rust) + \
+         td-recipe-eval built; the store primitives build their subjects in-gate."
+    );
+    Ok(())
+}
+
+/// `td-builder bootstrap-recipe <which>` on the placed stage0, with an
+/// evaluator placed from the current source whatever TD_RECIPE_EVAL names.
+fn bootstrap_recipe(root: &Path, which: &str) -> Result<(), String> {
+    let s0 = PlacedStage0::place(root)?;
+    let eval = placed_recipe_eval(root)?;
+    let mut command = s0.command();
+    command
+        .args(["bootstrap-recipe", which])
+        .env("TD_RECIPE_EVAL", &eval);
+    run_streamed(command, &format!("td-builder bootstrap-recipe {which}"))
+}
+
+fn bootstrap_seed(root: &Path) -> Result<(), String> {
+    println!(
+        ">> bootstrap-seed: the structured Rust seed recipe builds the first stage0 artifacts \
+         with guix off env — self-reproducing, working, reproducible (source-bootstrap brick 0)"
+    );
+    bootstrap_recipe(root, "seed")
+}
+
+fn bootstrap_mes(root: &Path) -> Result<(), String> {
+    println!(
+        ">> bootstrap-mes: the structured Rust mes recipe builds GNU Mes (mes-m2) and proves it \
+         evaluates Scheme, guix-free + reproducible (source-bootstrap brick 2)"
+    );
+    bootstrap_recipe(root, "mes")
+}
+
+/// A gate that is only the runner's entry point for one recipe check, on an
+/// executable TD_RECIPE_EVAL or else an evaluator placed from the source.
+fn recipe_check_gate(root: &Path, spec: &str, what: &str) -> Result<(), String> {
+    println!(">> recipe-check {spec}: {what}");
+    let eval = match std::env::var("TD_RECIPE_EVAL") {
+        Ok(named) if !named.is_empty() && is_executable_file(Path::new(&named)) => named,
+        _ => placed_recipe_eval(root)?,
+    };
+    let mut command = Command::new(&eval);
+    command
+        .args(["check-run", spec, "1"])
+        .env("TD_RECIPE_EVAL", &eval);
+    run_streamed(command, &format!("td-recipe-eval check-run {spec} 1"))
+}
+
+/// The daemon under test and its scratch, stopped and removed however the
+/// gate ends.
+struct BudgetDaemon {
+    child: std::process::Child,
+    scratch: PathBuf,
+}
+
+impl Drop for BudgetDaemon {
+    fn drop(&mut self) {
+        // A SHUTDOWN request ends a healthy daemon; give it a moment so the kill
+        // (and its audit record) is only for one that did not stop.
+        for _ in 0..25 {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            let _ = std::fs::remove_dir_all(&self.scratch);
+            return;
+        }
+        let _ = crate::sys::kill_child_recorded(
+            &mut self.child,
+            "daemon-budget: stop the daemon under test",
+        );
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.scratch);
+    }
+}
+
+fn daemon_budget(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    println!(
+        ">> daemon-budget: the shared build daemon caps concurrent workers across independent \
+         submitters"
+    );
+    let s0 = PlacedStage0::place(root)?;
+    let scratch = fresh_scratch(root, ".daemon-budget-scratch")?;
+    let d = scratch.join("d");
+    mkdirp(&d)?;
+    let sock = scratch.join("sock");
+    let sock_s = path_str(&sock)?;
+    let log = scratch.join("daemon.log");
+    let log_s = path_str(&log)?;
+    let budget = "2";
+    let out = std::fs::File::create(&log).map_err(|e| format!("FAIL: create {log_s}: {e}"))?;
+    let err = out
+        .try_clone()
+        .map_err(|e| format!("FAIL: clone {log_s}: {e}"))?;
+    let mut command = s0.command();
+    command
+        .arg("daemon")
+        .arg(&sock)
+        .arg(scratch.join("unused-store-db"))
+        .arg(&d)
+        .env("TD_DAEMON_TEST_BUDGET", budget)
+        .env("TD_DAEMON_TEST_SLEEP_MS", "400")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    let child = crate::spawn::past_a_busy_program(|| command.spawn())
+        .map_err(|e| format!("FAIL: cannot spawn the daemon: {e}"))?;
+    let daemon = BudgetDaemon {
+        child,
+        scratch: scratch.clone(),
+    };
+    let daemon_log = || std::fs::read_to_string(&log).unwrap_or_default();
+    let is_socket = || {
+        std::fs::symlink_metadata(&sock)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+    };
+    for _ in 0..50 {
+        if is_socket() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if !is_socket() {
+        return Err(format!(
+            "FAIL: daemon socket never appeared\n{}",
+            daemon_log()
+        ));
+    }
+    let mut probes = Vec::new();
+    for i in 1..=6 {
+        let mut probe = s0.command();
+        probe
+            .args(["daemon-budget-probe", &sock_s, &i.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(child) = crate::spawn::past_a_busy_program(|| probe.spawn()) {
+            probes.push(child);
+        }
+    }
+    for mut probe in probes {
+        let _ = probe.wait();
+    }
+    let stats = tb_out(
+        &s0.tb,
+        &["daemon-budget-check", &log_s, budget],
+        "daemon-budget-check",
+    )
+    .map_err(|_| {
+        format!(
+            "FAIL: daemon did not honor its test worker budget {budget}\n{}",
+            daemon_log()
+        )
+    })?;
+    println!("  [DURABLE behavioral] {stats} — the cap holds across submitters");
+    let _ = tb_ok(&s0.tb, &["daemon-request", &sock_s, "SHUTDOWN"]);
+    drop(daemon);
+    println!(
+        "PASS: daemon-budget — the shared build daemon caps concurrent workers at {budget} across \
+         independent submitters."
+    );
+    Ok(())
+}
+
+/// Split one `gate-crates cargo-cmds` line into argv. The lines hold bare words
+/// and single-quoted words only (`shell_quote` refuses a path with a quote);
+/// anything else a shell would interpret is refused rather than guessed at.
+fn gate_command_words(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    for c in line.chars() {
+        if quoted {
+            if c == '\'' {
+                quoted = false;
+            } else {
+                word.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                quoted = true;
+                started = true;
+            }
+            ' ' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            '"' | '\\' | '$' | '`' | ';' | '&' | '|' | '<' | '>' | '(' | ')' | '*' | '?' | '{'
+            | '}' | '!' | '[' | '#' | '~' | '\t' | '\n' => {
+                return Err(format!(
+                    "FAIL: cargo command `{line}` needs a shell (`{c}`)"
+                ));
+            }
+            other => {
+                word.push(other);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return Err(format!("FAIL: cargo command `{line}` has an open quote"));
+    }
+    if started {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return Err(String::from("FAIL: an empty cargo command"));
+    }
+    Ok(words)
+}
+
+/// Run `words` with stdout and stderr merged into one pipe, copied both to the
+/// gate log and to `log`, as `2>&1 | tee` did.
+fn run_teed(
+    words: &[String],
+    envs: &[(&str, &str)],
+    log: &mut std::fs::File,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let (program, args) = words
+        .split_first()
+        .ok_or_else(|| String::from("FAIL: an empty cargo command"))?;
+    let (mut reader, writer) =
+        std::io::pipe().map_err(|e| format!("FAIL: pipe for {program}: {e}"))?;
+    let writer_err = writer
+        .try_clone()
+        .map_err(|e| format!("FAIL: pipe for {program}: {e}"))?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(writer_err);
+    for (k, v) in envs {
+        command.env(k, v);
+    }
+    let mut child = crate::spawn::past_a_busy_program(|| command.spawn())
+        .map_err(|e| format!("FAIL: cannot spawn {program}: {e}"))?;
+    // The parent's copies of the write end go with `command`, so the read
+    // below ends when the child and its descendants close theirs.
+    drop(command);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut stdout = std::io::stdout();
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("FAIL: reading {program}'s output: {e}")),
+        };
+        let chunk = buf.get(..n).unwrap_or_default();
+        let _ = stdout.write_all(chunk);
+        log.write_all(chunk)
+            .map_err(|e| format!("FAIL: writing the cargo-test log: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("FAIL: waiting on {program}: {e}"))?;
+    if !status.success() {
+        return Err(format!("FAIL: `{}` exited {status}", words.join(" ")));
+    }
+    Ok(())
+}
+
+fn cargo_test(root: &Path) -> Result<(), String> {
+    println!(
+        ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over \
+         indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free \
+         toolchain (td-builder provision-{{rust,cc}})"
+    );
+    let td = tb()?;
+    let mut locks = Command::new(&td);
+    locks.args(["gate-crates", "locks"]);
+    run_streamed(locks, "td-builder gate-crates locks")?;
+    let rustpath = tb_out(&td, &["provision-rust"], "provision-rust")?;
+    let ccpath = tb_out(&td, &["provision-cc"], "provision-cc")?;
+    let scratch = fresh_scratch(root, ".cargo-test-scratch")?;
+    let home = scratch.join("home");
+    let target = scratch.join("target");
+    mkdirp(&home)?;
+    mkdirp(&target)?;
+    let log_path = scratch.join("out.log");
+    let mut log = std::fs::File::create(&log_path)
+        .map_err(|e| format!("FAIL: create {}: {e}", log_path.display()))?;
+    let cmds = crate::affected::gate_cargo_cmds(root).map_err(|e| format!("FAIL: {e}"))?;
+    let names = crate::affected::gate_crate_names(root)
+        .map_err(|e| format!("FAIL: {e}"))?
+        .join(", ");
+    let path = match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{rustpath}:{ccpath}:{p}"),
+        _ => format!("{rustpath}:{ccpath}"),
+    };
+    let home_s = path_str(&home)?;
+    let target_s = path_str(&target)?;
+    let envs = [
+        ("PATH", path.as_str()),
+        ("CARGO_HOME", home_s.as_str()),
+        ("CARGO_TARGET_DIR", target_s.as_str()),
+    ];
+    for line in &cmds {
+        run_teed(&gate_command_words(line)?, &envs, &mut log)?;
+    }
+    drop(log);
+    let bytes =
+        std::fs::read(&log_path).map_err(|e| format!("FAIL: read {}: {e}", log_path.display()))?;
+    if !crate::cargo_test_reported_nonzero_tests(&String::from_utf8_lossy(&bytes)) {
+        return Err("ERROR: cargo test reported no passing tests (vacuous run?)".into());
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    println!(
+        "PASS: cargo-test — the engine workspace (builder + recipes + engine) and {names} \
+         satisfy their named dependency policies and lint clean; their unit tests pass \
+         (guix-free toolchain)."
+    );
+    Ok(())
+}
+
+/// `td-builder stage0-place-without-guix EMPTY DEST`: in a private user and
+/// mount namespace of its own, hide /var/guix behind the empty EMPTY, then place
+/// a stage0 into DEST. The mount dies with the namespace, so the verb cannot
+/// hide a host's /var/guix. A setup failure is exit 9, which the gate reports
+/// as such.
+pub fn stage0_place_without_guix(args: &[String]) -> ExitCode {
+    let (Some(empty), Some(dest), None) = (args.get(2), args.get(3), args.get(4)) else {
+        eprintln!("usage: td-builder stage0-place-without-guix EMPTY DEST");
+        return ExitCode::from(2);
+    };
+    let empty = empty.as_str();
+    let hide = || -> Result<(), String> {
+        crate::enter_private_userns()?;
+        std::fs::create_dir_all("/var/guix").map_err(|e| format!("mkdir /var/guix: {e}"))?;
+        let src = std::ffi::CString::new(empty).map_err(|e| format!("{empty}: {e}"))?;
+        let dest_c = std::ffi::CString::new("/var/guix").map_err(|e| e.to_string())?;
+        crate::sys::mount(Some(&src), &dest_c, None, crate::sys::MS_BIND, None)
+            .map_err(|e| format!("bind-mount {empty} on /var/guix: {e}"))?;
+        let mut entries =
+            std::fs::read_dir("/var/guix").map_err(|e| format!("read /var/guix: {e}"))?;
+        if entries.next().is_some() {
+            return Err("cold leg: /var/guix not hidden".into());
+        }
+        Ok(())
+    };
+    if let Err(e) = hide() {
+        eprintln!("td-builder: stage0-place-without-guix: {e}");
+        return ExitCode::from(9);
+    }
+    let placed = std::env::current_dir()
+        .map_err(|e| format!("getcwd: {e}"))
+        .and_then(|root| crate::stage0::stage0_place(&root, Path::new(dest)));
+    match placed {
+        Ok(cb) => {
+            println!("{cb}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if let Some(rest) = e.strip_prefix(UNPROVISIONED_TAG) {
+                eprintln!("td-builder: stage0-place-without-guix: unprovisioned — {rest}");
+                td_engine::exit::unprovisioned_exit()
+            } else {
+                eprintln!("td-builder: stage0-place-without-guix: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// `tb store-closure DB PATH`, its nonempty lines sorted.
+fn closure_lines(tb: &Path, db: &str, path: &str) -> Result<Vec<String>, String> {
+    let out = tb_out(tb, &["store-closure", db, path], "store-closure")?;
+    Ok(sorted_lines(&out)
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+fn stage0_cold_start(root: &Path) -> Result<(), String> {
+    println!(
+        ">> stage0-cold-start: a COLD stage0 placement works with guix state HIDDEN — same \
+         path, same SELF-ONLY closure as the warm guix-host placement; an absent seed dir \
+         places with no refs, a broken seed dir errors loudly (#313)"
+    );
+    // A leftover cold placement would let the cold leg reuse its memo, so the
+    // scratch must really be gone, not merely attempted.
+    let scratch = root.join(".td-build-cache/stage0-cold-start");
+    if scratch.exists() {
+        let _ = chmod_r_uw(&scratch);
+        std::fs::remove_dir_all(&scratch)
+            .map_err(|e| format!("FAIL: cannot clear {}: {e}", scratch.display()))?;
+    }
+    mkdirp(&scratch)?;
+    let at = |name: &str| path_str(&scratch.join(name));
+    mkdirp(&scratch.join("empty"))?;
+
+    println!(">> warm leg (baseline): place the shared stage0 as every stage0 consumer does");
+    let warm = PlacedStage0::place(root).map_err(|e| {
+        if e.starts_with(UNPROVISIONED_TAG) {
+            e
+        } else {
+            format!("warm stage0 provisioning did not complete: {e}")
+        }
+    })?;
+    let tbw = &warm.tb;
+
+    println!(
+        ">> cold leg (the feature): fresh cache, /var/guix bind-mounted EMPTY in a private \
+         mount ns — the placement must need no guix db"
+    );
+    let cold = scratch.join("cold");
+    let cold_s = path_str(&cold)?;
+    let empty_s = at("empty")?;
+    let mut command = Command::new(tbw);
+    command
+        .args(["stage0-place-without-guix", &empty_s, &cold_s])
+        .stdin(Stdio::null());
+    let out = crate::spawn::past_a_busy_program(|| command.output())
+        .map_err(|e| format!("FAIL: cannot spawn the cold leg: {e}"))?;
+    let cold_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    eprint!("{cold_err}");
+    if !out.status.success() {
+        let msg = format!(
+            "cold stage0 placement with /var/guix hidden did not complete ({}): 69 = no \
+             toolchain reachable in the jail (skipped); other = the guix-less cold start is \
+             broken (#313)",
+            out.status
+        );
+        return Err(tag_if_unprovisioned(&out.status, &cold_err, msg));
+    }
+    let cbc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if warm.path != cbc {
+        return Err(format!(
+            "FAIL: cold placement {cbc} != warm placement {} — provenance drift",
+            warm.path
+        ));
+    }
+    let tbc = cold
+        .join("store")
+        .join(base_of(&cbc))
+        .join("bin/td-builder");
+    let sent = run_out(&path_str(&tbc)?, &[], "the cold-placed stage0's sentinel")?;
+    if sent != "td-builder 0.1.0 ok" {
+        return Err(format!("FAIL: cold-placed stage0 sentinel was '{sent}'"));
+    }
+    println!("  [DURABLE behavioral] the cold-placed stage0 runs its sentinel ({cbc})");
+    let cl_cold = closure_lines(&tbc, &path_str(&cold.join("builder.db"))?, &cbc)?;
+    let cl_warm = closure_lines(tbw, &warm.db, &warm.path)?;
+    if cl_cold != cl_warm {
+        let only_warm: Vec<&String> = cl_warm.iter().filter(|l| !cl_cold.contains(l)).collect();
+        let only_cold: Vec<&String> = cl_cold.iter().filter(|l| !cl_warm.contains(l)).collect();
+        return Err(format!(
+            "FAIL: cold closure differs from warm closure (provenance drift): only warm \
+             {only_warm:?}, only cold {only_cold:?}"
+        ));
+    }
+    if cl_cold.len() != 1 {
+        return Err(format!(
+            "FAIL: cold closure is not self-only ({} paths) — the musl-static stage0 builder \
+             must record ONLY itself; an external ref means it linked dynamically and would \
+             leak a host runtime lib dir into the sandbox (re #469)\n{}",
+            cl_cold.len(),
+            cl_cold.join("\n")
+        ));
+    }
+    if cl_cold.first() != Some(&cbc) {
+        return Err(format!(
+            "FAIL: the single cold-closure path is not the canonical builder {cbc}\n{}",
+            cl_cold.join("\n")
+        ));
+    }
+    println!(
+        "  [DURABLE no-drift] cold (guix state hidden) and warm closures are IDENTICAL and \
+         SELF-ONLY (exactly the canonical builder path, no external ref) — the musl-static \
+         link keeps every host runtime lib dir out of the sandbox (re #469)"
+    );
+
+    println!(">> guix-less arm: an ABSENT seed dir (no /gnu/store at all) must still place, with a self-only closure");
+    mkdirp(&scratch.join("probe/bin"))?;
+    writef(
+        &scratch.join("probe/bin/tool"),
+        "no store refs in this tree\n",
+    )?;
+    let add =
+        |name: &str, tree: &str, store: &str, db: &str, seed: &str| -> Result<String, String> {
+            tb_out(
+                tbw,
+                &[
+                    "store-add-builder",
+                    name,
+                    &at(tree)?,
+                    &at(store)?,
+                    &at(db)?,
+                    &at(seed)?,
+                ],
+                "store-add-builder",
+            )
+        };
+    let pa = add("probe-0.1.0", "probe", "pstore-a", "pa.db", "ABSENT").map_err(|e| {
+        format!("FAIL: store-add-builder with an absent seed dir failed — the truly-guix-less arm is broken (#313): {e}")
+    })?;
+    let pan = closure_lines(tbw, &at("pa.db")?, &pa)?.len();
+    if pan != 1 {
+        return Err(format!(
+            "FAIL: absent-seed-dir placement recorded {pan} closure paths, expected 1 (self only)"
+        ));
+    }
+    println!("  [DURABLE guix-less arm] absent seed dir: placement succeeds, closure is self-only");
+
+    println!(
+        ">> idempotent re-placement: re-placing into a store that ALREADY holds the \
+         content-addressed path must succeed at the same path, not EEXIST"
+    );
+    let pa2 = add("probe-0.1.0", "probe", "pstore-a", "pa2.db", "ABSENT").map_err(|e| {
+        format!("FAIL: re-placing an already-present content-addressed builder failed — store-add-builder is not idempotent, so a warm re-run cannot place the stage0: {e}")
+    })?;
+    if pa2 != pa {
+        return Err(format!(
+            "FAIL: re-placement returned {pa2}, expected the same content-addressed path {pa}"
+        ));
+    }
+    println!("  [DURABLE idempotent re-intern] re-placing the same tree into the same store succeeds at the same path");
+
+    println!(
+        ">> fail-loud arm: a PRESENT-but-unreadable seed dir (a regular file, not a directory) \
+         must ERROR — a broken seed must not silently place a refless builder (#313 fail-open guard)"
+    );
+    let notadir = at("notadir")?;
+    writef(Path::new(&notadir), "not a store directory\n")?;
+    let mut refused = Command::new(tbw);
+    refused
+        .args(["store-add-builder", "probe-0.1.0", &at("probe")?])
+        .args([&at("pstore-f")?, &at("pf.db")?, &notadir])
+        .stdin(Stdio::null());
+    let out = crate::spawn::past_a_busy_program(|| refused.output())
+        .map_err(|e| format!("FAIL: cannot spawn store-add-builder: {e}"))?;
+    if out.status.success() {
+        return Err("FAIL: store-add-builder ACCEPTED a non-directory seed store — a broken seed silently placed a refless builder (fail-open)".into());
+    }
+    let pf_err = String::from_utf8_lossy(&out.stderr);
+    if !pf_err.contains(&notadir) {
+        return Err(format!(
+            "FAIL: store-add-builder errored but did not name the bad seed store:\n{pf_err}"
+        ));
+    }
+    println!("  [DURABLE fail-loud] a non-directory seed store errors loudly, naming the bad path (not a silent refless placement)");
+
+    println!(
+        ">> self-discrimination: the readdir candidate source is load-bearing — a probe \
+         embedding a SYNTHETIC store path records NO ref with the seed dir absent, and DOES \
+         record it when a controlled seed dir holding the matching entry is passed"
+    );
+    // A hash part in the scanner's alphabet (scan.rs BASE32_CHARS), which has
+    // no e, o, u or t: one outside it can never be found.
+    let g = at("seed/0123456789abcdfghijklmnpqrsvwxyz-fakeref-1.0")?;
+    mkdirp(Path::new(&g))?;
+    mkdirp(&scratch.join("probe2/bin"))?;
+    writef(&scratch.join("probe2/bin/tool"), &g)?;
+    let pb0 = add("probe2-0.1.0", "probe2", "pstore-b0", "pb0.db", "ABSENT")?;
+    let pbn = closure_lines(tbw, &at("pb0.db")?, &pb0)?.len();
+    if pbn != 1 {
+        return Err(format!(
+            "FAIL: absent-seed-dir scan found {pbn} paths for the embedded-ref probe, expected 1 (no candidates, no refs)"
+        ));
+    }
+    let pb = add("probe2-0.1.0", "probe2", "pstore-b", "pb.db", "seed")?;
+    if !closure_lines(tbw, &at("pb.db")?, &pb)?.contains(&g) {
+        return Err(format!(
+            "FAIL: the embedded ref {g} was NOT found by the controlled seed-dir readdir scan — the candidate source is broken"
+        ));
+    }
+    println!("  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; controlled seed dir → the embedded synthetic ref recorded");
+    let _ = chmod_r_uw(&scratch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    println!(
+        "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted \
+         empty, a cold stage0 placement runs at the SAME canonical path with the SAME \
+         SELF-ONLY builder.db closure as the warm placement (re #469). The reference scan stays \
+         load-bearing (a synthetic store path is recorded ONLY when a controlled seed dir \
+         holding the matching entry is passed); an absent seed dir still places self-only; \
+         re-placing an already-present tree is idempotent; and a non-directory seed dir errors \
+         loudly. The guix-less cold start (#313) is unblocked."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4971,6 +5705,59 @@ mod tests {
         }
         // A non-native name must not claim to be native.
         assert!(!is_native("definitely-not-a-gate"));
+    }
+
+    /// A child's exit 69 is passed through untagged: the body must not print
+    /// td's provisioning sentinel for it, or a bare 69 from an evaluator would
+    /// satisfy gate-run's two-part skip test.
+    #[test]
+    fn a_childs_exit_69_is_passed_through_without_the_sentinel_tag() {
+        let exit = |code: &str| {
+            let mut command = Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            run_streamed(command, "probe")
+        };
+        let skipped = exit("69").unwrap_err();
+        assert!(skipped.starts_with(CHILD_EXIT_69_TAG), "{skipped}");
+        assert!(!skipped.contains(UNPROVISIONED_TAG), "{skipped}");
+        let failed = exit("3").unwrap_err();
+        assert!(failed.starts_with("FAIL: probe"), "{failed}");
+        assert!(exit("0").is_ok());
+    }
+
+    #[test]
+    fn gate_command_words_split_the_derived_cargo_commands() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let cmds = crate::affected::gate_cargo_cmds(root).unwrap();
+        assert!(!cmds.is_empty());
+        for line in &cmds {
+            let words = gate_command_words(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert!(words.len() >= 2, "{line}: {words:?}");
+            assert!(words.iter().all(|w| !w.contains('\'')), "{line}: {words:?}");
+        }
+        assert_eq!(
+            gate_command_words("cargo test --config 'env.X.value=\"1\"'").unwrap(),
+            ["cargo", "test", "--config", "env.X.value=\"1\""]
+        );
+        assert_eq!(
+            gate_command_words("'/a b/td-builder'  gate-crates names").unwrap(),
+            ["/a b/td-builder", "gate-crates", "names"]
+        );
+        assert_eq!(gate_command_words("x ''").unwrap(), ["x", ""]);
+        for refused in [
+            "cargo test; rm -rf x",
+            "cargo $HOME",
+            "cargo 'open",
+            "cargo test | tee log",
+            "cargo \"x\"",
+            "cargo *",
+            "cargo a{b,c}",
+            "cargo !x",
+            "",
+            "   ",
+        ] {
+            assert!(gate_command_words(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

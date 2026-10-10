@@ -25,15 +25,5 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         non_blocking: true,
-        script: r##"
-echo ">> recipe-check gcc-x86-64-stage2-test: build the x86_64 cross toolchain recipe graph and assert its output"
-: "${TD_RECIPE_EVAL:=}"
-if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
-  # `|| exit $?`: a 69 is a tolerated skip; a dropped status leaves
-  # TD_RECIPE_EVAL empty and the exec below reds 126 (busybox ash).
-  TD_RECIPE_EVAL=$("${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}" recipe-eval-place "$PWD/.td-build-cache/recipe-eval") || exit $?
-fi
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2-test 1
-"##,
     }
 }

@@ -95,8 +95,9 @@
 //! entering the sandbox; no Cargo registry fetch is available here.
 //! Scratch CARGO_HOME/CARGO_TARGET_DIR live in .cargo-test-scratch/ at the repo ROOT — OUTSIDE
 //! the crate dirs, so they cannot perturb the td-builder/td-recipe package source hashes.
-//! `set -e` inside the shell + pipefail keep a FAILED clippy or test from being greened by the
-//! `tee`, and the `test result: ok. <N> passed` (N>=1) assertion rejects a vacuous 0-test run.
+//! Each command's status is checked before the next runs, so copying its output into the log
+//! cannot green a FAILED clippy or test, and the `test result: ok. <N> passed` (N>=1)
+//! assertion rejects a vacuous 0-test run.
 //! The build-engine smoke tier (`check-engine`) is JUST this — compile the engine,
 //! lint it, and run its unit tests, ~2-4 min, no from-source builds. Anything that
 //! builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it
@@ -123,33 +124,11 @@ pub fn gate() -> GateDef {
         // bash (and no guix lock) is bound here anymore.
         //
         // In the guix-free loop sandbox no toolchain is reachable, so
-        // provision-{rust,cc} exit EXIT_UNPROVISIONED (69) (propagated by the
-        // `|| exit $?` below) and the gate degrades to a tolerated Unprovisioned
+        // provision-{rust,cc} exit EXIT_UNPROVISIONED (69) (passed through as
+        // the body's own exit) and the gate degrades to a tolerated Unprovisioned
         // SKIP — even as an explicit goal. A real clippy/test failure exits
         // non-69 and still REDs; the blocking host-side cargo-test preflight
         // (affected-checks --run) is the authoritative from-source enforcement.
         non_blocking: false,
-        script: r##"
-	echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (td-builder provision-{rust,cc})"
-	set -euo pipefail; \
-	td="${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}"; \
-	"$td" gate-crates locks || exit $?; \
-rustpath=`"$td" provision-rust` || exit $?; \
-ccpath=`"$td" provision-cc` || exit $?; \
-scratch="$PWD/.cargo-test-scratch"; \
-rm -rf "$scratch"; mkdir -p "$scratch/home" "$scratch/target"; \
-log="$scratch/out.log"; \
-cmds=`"$td" gate-crates cargo-cmds` || exit $?; \
-names=`"$td" gate-crates names` || exit $?; \
-PATH="$rustpath:$ccpath:$PATH" \
-CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
-	  sh -c "set -e
-$cmds" 2>&1 | tee "$log"; \
-	"$td" text cargo-test-ok "$log" || \
-	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
-rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine) and $names satisfy their named dependency policies and lint clean; their unit tests pass (guix-free toolchain)."
-
-"##,
     }
 }

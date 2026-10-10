@@ -42,13 +42,8 @@ mod native_tests;
 #[cfg(test)]
 mod engine_set;
 mod erofs;
-// The comment-splice static guard (#300) is exercised only by its own `#[test]`
-// (the cargo-test tier) — gate it to test builds so it adds no dead-code surface
-// to the release binary or the clippy pass.
 mod gate_bodies;
 mod gate_inputs;
-#[cfg(test)]
-mod gate_lint;
 mod gate_timing;
 mod gates;
 use td_engine::gzip;
@@ -165,16 +160,6 @@ fn nar_hash_size_path(path: &Path) -> Result<(String, u64), std::io::Error> {
     ))
 }
 
-fn read_arg_bytes(path: &str) -> Result<Vec<u8>, String> {
-    if path == "-" {
-        let mut buf = Vec::new();
-        let mut stdin = std::io::stdin();
-        std::io::Read::read_to_end(&mut stdin, &mut buf).map_err(|e| format!("read stdin: {e}"))?;
-        return Ok(buf);
-    }
-    std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
-}
-
 fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -182,30 +167,18 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-fn first_line_with_prefix(text: &str, prefix: &str) -> Option<String> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(prefix).map(str::to_string))
-}
-
-fn last_line_with_prefix(text: &str, prefix: &str) -> Option<String> {
-    text.lines()
-        .rev()
-        .filter_map(|line| line.strip_prefix(prefix).map(str::to_string))
-        .next()
-}
-
-fn first_line_containing(text: &str, needle: &str) -> Option<String> {
-    text.lines()
-        .find(|line| line.contains(needle))
-        .map(str::to_string)
-}
-
-fn count_line_exact(text: &str, needle: &str) -> usize {
-    text.lines().filter(|line| *line == needle).count()
-}
-
-fn count_nonempty_lines(text: &str) -> usize {
-    text.lines().filter(|line| !line.is_empty()).count()
+/// Enter a fresh user and mount namespace, mapped to root, whose mount tree is
+/// private, so a mount made in it never propagates to the host — `unshare -m`'s
+/// actual behaviour, not merely a fresh mount-namespace id.
+fn enter_private_userns() -> Result<(), String> {
+    let host_uid = sys::getuid();
+    let host_gid = sys::getgid();
+    sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS)
+        .map_err(|e| format!("unshare(NEWUSER|NEWNS): {e}"))?;
+    sandbox::map_userns_id(host_uid, host_gid, 0, 0).map_err(|e| format!("map_userns_id: {e}"))?;
+    let root_c = CString::new("/").map_err(|e| e.to_string())?;
+    sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
+        .map_err(|e| format!("mount(/ private): {e}"))
 }
 
 fn cargo_test_reported_nonzero_tests(text: &str) -> bool {
@@ -226,139 +199,6 @@ fn cargo_test_reported_nonzero_tests(text: &str) -> bool {
         };
         tail.starts_with(" passed") && num_s.parse::<u64>().is_ok_and(|n| n > 0)
     })
-}
-
-fn contains_gcc_lib_ref(text: &str) -> bool {
-    text.lines()
-        .any(|line| line.contains("-gcc-") && line.contains("-lib"))
-}
-
-fn text_cli(args: &[String]) -> ExitCode {
-    let fail = |msg: &str| {
-        eprintln!("td-builder: text: {msg}");
-        ExitCode::FAILURE
-    };
-    match args {
-        [op, needle, file] if op == "contains" => match read_arg_bytes(file) {
-            Ok(bytes) if bytes_contains(&bytes, needle.as_bytes()) => ExitCode::SUCCESS,
-            Ok(_) => ExitCode::FAILURE,
-            Err(e) => fail(&e),
-        },
-        [op, needle, file] if op == "not-contains" => match read_arg_bytes(file) {
-            Ok(bytes) if !bytes_contains(&bytes, needle.as_bytes()) => ExitCode::SUCCESS,
-            Ok(_) => ExitCode::FAILURE,
-            Err(e) => fail(&e),
-        },
-        [op, needle, file] if op == "line-exact" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if text.lines().any(|line| line == needle) {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        [op, needle, file] if op == "count-line-exact" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                println!("{}", count_line_exact(&text, needle));
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e),
-        },
-        [op, file] if op == "count-nonempty" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                println!("{}", count_nonempty_lines(&text));
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e),
-        },
-        [op, prefix, file] if op == "extract-prefix" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                match first_line_with_prefix(&text, prefix) {
-                    Some(v) => {
-                        println!("{v}");
-                        ExitCode::SUCCESS
-                    }
-                    None => ExitCode::FAILURE,
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        [op, prefix, file] if op == "extract-prefix-last" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                match last_line_with_prefix(&text, prefix) {
-                    Some(v) => {
-                        println!("{v}");
-                        ExitCode::SUCCESS
-                    }
-                    None => ExitCode::FAILURE,
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        [op, needle, file] if op == "extract-containing" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                match first_line_containing(&text, needle) {
-                    Some(v) => {
-                        println!("{v}");
-                        ExitCode::SUCCESS
-                    }
-                    None => ExitCode::FAILURE,
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        [op, file] if op == "sha256" => match sha256::sha256_file(Path::new(file)) {
-            Ok(h) => {
-                println!("{h}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&format!("sha256 {file}: {e}")),
-        },
-        [op, file] if op == "cargo-test-ok" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if cargo_test_reported_nonzero_tests(&text) {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        [op, file] if op == "contains-gcc-lib" => match read_arg_bytes(file) {
-            Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if contains_gcc_lib_ref(&text) {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            Err(e) => fail(&e),
-        },
-        _ => {
-            eprintln!("usage: td-builder text contains NEEDLE FILE|-");
-            eprintln!("       td-builder text not-contains NEEDLE FILE|-");
-            eprintln!("       td-builder text line-exact LINE FILE|-");
-            eprintln!("       td-builder text count-line-exact LINE FILE|-");
-            eprintln!("       td-builder text count-nonempty FILE|-");
-            eprintln!("       td-builder text extract-prefix PREFIX FILE|-");
-            eprintln!("       td-builder text extract-prefix-last PREFIX FILE|-");
-            eprintln!("       td-builder text extract-containing NEEDLE FILE|-");
-            eprintln!("       td-builder text sha256 FILE");
-            eprintln!("       td-builder text cargo-test-ok FILE");
-            eprintln!("       td-builder text contains-gcc-lib FILE");
-            ExitCode::from(2)
-        }
-    }
 }
 
 fn collect_regular_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -9696,8 +9536,7 @@ fn main() -> ExitCode {
         // check` execs it there). See builder/src/gates.rs.
         Some("gate-run") => gates::cli(args.get(2..).unwrap_or(&[])),
         // gate-body <name> — run one NATIVE (typed-Rust) gate body (#318 axis 3).
-        // The runner execs this in place of `bash -c <script>` for a gate whose
-        // GateDef.script is empty; see builder/src/gate_bodies.rs.
+        // The runner execs this for every gate; see builder/src/gate_bodies.rs.
         Some("gate-body") if args.len() == 3 => gate_bodies::cli(&args[2]),
         // check [GOAL...] — the loop's HOST PRELUDE (the old shell check.sh,
         // ported): guards, stage0 + toolchain provisioning, warms, the shared
@@ -9708,10 +9547,6 @@ fn main() -> ExitCode {
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
         Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
-        // Narrow td-owned replacements for the loop's pre-userland sed/grep/find
-        // assertions and manifest shuffling. These are intentionally typed, not a
-        // general regex tool clone.
-        Some("text") => text_cli(args.get(2..).unwrap_or(&[])),
         Some("gate-crates") => affected::gate_crates_cli(args.get(2..).unwrap_or(&[])),
         Some("lock") => lock_cli(args.get(2..).unwrap_or(&[])),
         Some("files") => match args.get(2..).filter(|rest| !rest.is_empty()) {
@@ -11557,6 +11392,8 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // stage0-cold-start's cold leg; it enters its own private namespace.
+        Some("stage0-place-without-guix") => gate_bodies::stage0_place_without_guix(&args),
         // The generic `build DRV CLOSURE SCRATCH` and `realize DRV STORE-DIR SCRATCH`
         // arms are DELETED (re #469 typed origins): both took their entire staging
         // manifest from the caller-writable TD_EXTRA_DBS env — self-issued authority
@@ -12762,10 +12599,10 @@ fn main() -> ExitCode {
         }
         // td-builder userns-private -- CMD ARGS... — a private mount+user namespace
         // over the CURRENT root: no pivot_root, no fresh tmpfs, no bind allowlist.
-        // The native replacement for the util-linux `unshare -rm` CLI a gate body
-        // used to shell out to (gate 171 stage0-cold-start's cold leg: it needs the
-        // WHOLE host filesystem visible minus one path hidden by a private bind
-        // mount — the opposite shape from host-sandbox/store-ns, which both pivot
+        // The native replacement for the util-linux `unshare -rm` CLI (gate 171's
+        // cold leg enters the same namespace through enter_private_userns): the
+        // WHOLE host filesystem stays visible, and a private bind mount can hide
+        // one path — the opposite shape from host-sandbox/store-ns, which both pivot
         // into a FRESH root with an explicit bind allowlist). Maps to ROOT (uid/gid
         // 0), matching `-r`/`--map-root-user`: the namespace creator holds full
         // capabilities inside it regardless of the mapped id, so the raw mount(2)
@@ -12781,19 +12618,7 @@ fn main() -> ExitCode {
             // command (which replaces the process and never returns here on success)
             // or by producing an error — there is no success value to carry.
             let run = || -> Result<std::convert::Infallible, String> {
-                let host_uid = sys::getuid();
-                let host_gid = sys::getgid();
-                sys::unshare(sys::CLONE_NEWUSER | sys::CLONE_NEWNS)
-                    .map_err(|e| format!("unshare(NEWUSER|NEWNS): {e}"))?;
-                sandbox::map_userns_id(host_uid, host_gid, 0, 0)
-                    .map_err(|e| format!("map_userns_id: {e}"))?;
-                // Make the root mount tree private so a nested mount (e.g. the
-                // caller's `mount --bind ... /var/guix`) never propagates to the
-                // host — `unshare -m`'s actual behavior, not merely a fresh
-                // mount-namespace id.
-                let root_c = CString::new("/").map_err(|e| e.to_string())?;
-                sys::mount(None, &root_c, None, sys::MS_REC | sys::MS_PRIVATE, None)
-                    .map_err(|e| format!("mount(/ private): {e}"))?;
+                enter_private_userns()?;
                 let err = Command::new(&cmd).args(&cmd_args).exec();
                 Err(format!("exec {cmd}: {err}"))
             };
@@ -12874,7 +12699,6 @@ fn main() -> ExitCode {
             eprintln!("       td-builder check [GOAL...]             # lazy per-user memory host + sandboxed gate ladder");
             eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
             eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
-            eprintln!("       td-builder text <op> ...               # typed text assertions/extraction for loop scripts");
             eprintln!("       td-builder lock <op> ...               # typed lock path extraction/rewrites");
             eprintln!("       td-builder gate-crates <op> ...        # the derived crate roster gate 325 runs");
             eprintln!("       td-builder engine-fingerprint          # the engine-source digest the evaluator keys its memos on");
@@ -13303,22 +13127,7 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
     }
 
     #[test]
-    fn loop_text_helpers_extract_and_count() {
-        let text = "alpha\nDRV=/tmp/a.drv\nSTEP gcc /td/store/gcc\nSTEP gcc /td/store/gcc2\n\n";
-        assert_eq!(
-            first_line_with_prefix(text, "DRV="),
-            Some("/tmp/a.drv".to_string())
-        );
-        assert_eq!(
-            last_line_with_prefix(text, "STEP gcc "),
-            Some("/td/store/gcc2".to_string())
-        );
-        assert_eq!(
-            first_line_containing(text, "store/gcc"),
-            Some("STEP gcc /td/store/gcc".to_string())
-        );
-        assert_eq!(count_line_exact(text, "alpha"), 1);
-        assert_eq!(count_nonempty_lines(text), 4);
+    fn cargo_test_needs_a_nonzero_passing_count() {
         assert!(cargo_test_reported_nonzero_tests(
             "test result: ok. 12 passed; 0 failed"
         ));

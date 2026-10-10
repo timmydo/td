@@ -27,7 +27,7 @@
 use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
-// `gate_bodies::store_register`; `script: ""` marks it native, so the runner execs
+// `gate_bodies::store_register`; the runner execs
 // `td-builder gate-body store-register` (as the stage0) under the same memory wrapper.
 pub fn gate() -> GateDef {
     GateDef {
@@ -37,6 +37,5 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         non_blocking: false,
-        script: "",
     }
 }

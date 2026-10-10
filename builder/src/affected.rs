@@ -914,7 +914,7 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
-        // It feeds the corpus build path (cache-lib emits via td-recipe-eval) — so a
+        // It feeds the build path (the gates emit via td-recipe-eval) — so a
         // catalog change can affect ANY built package. Run recipe-rs (self-consistency
         // + manifest sync) and the package build gates. (spec-diff retired with the
         // museum tier; the guix-dependence census retired with the guix-oracle gates.)
@@ -996,12 +996,11 @@ fn map_path(root: &Path, roster: &Result<Vec<GateCrate>, String>, p: &str, sel: 
         return;
     }
 
-    // tests/build-recipes.sh IS the build phase (the former Makefile build-recipes
-    // recipe, run by the gate runner) — a change to it affects every build gate,
-    // exactly like the build-phase helpers below. (tests/stage0-builder.sh is a
-    // tombstone: the placement logic became builder/src/stage0.rs — `td-builder
-    // stage0-place`, re #469; the deleting diff still routes to the build gates
-    // that consume the placement.)
+    // Tombstones of the build phase: tests/build-recipes.sh and its helper
+    // tests/cache-lib.sh became gate_bodies.rs's build-recipes body and
+    // PlacedStage0, and tests/stage0-builder.sh became builder/src/stage0.rs
+    // (`td-builder stage0-place`, re #469). A diff touching them still routes
+    // to the build gates that consume the placement.
     if pattern_matches(
         "tests/build-recipes.sh|tests/cache-lib.sh|tests/stage0-builder.sh",
         p,
@@ -2338,8 +2337,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         }
     }
 
-    // Every BUILD_GATE is selected by the build-phase arm (build-recipes is the
-    // phase itself; cache-lib is its helper).
+    // Every BUILD_GATE is selected by the build phase's tombstones.
     for bg in build_gates(root) {
         assert_target!("tests/build-recipes.sh", &bg);
         assert_target!("tests/cache-lib.sh", &bg);

@@ -9678,8 +9678,8 @@ Two are gone; the third is a standing instruction:
    lints. The last copy is gone too: `builder/src/gate_defs/325-cargo-test.rs`
    spelled the set out four times over — a lock check, a clippy line, a
    test line and a closing sentence per crate — and was three crates
-   stale (`td-jail`, `td-portal`, `td-profiler`). Its script now asks
-   `td-builder gate-crates` for the same derivation, so both tiers read
+   stale (`td-jail`, `td-portal`, `td-profiler`). Its body now takes the
+   same derivation `td-builder gate-crates` prints, so both tiers read
    one roster and "adding a crate edits nothing central" is true of the
    whole tree. A crate whose in-sandbox suite differs from the host
    preflight's declares `gate-test-args` beside `test-args`. td-review

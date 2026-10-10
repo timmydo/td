@@ -188,7 +188,7 @@ fn guard_netns_probe() -> Result<(), String> {
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
 /// workstream E #294) and return $TB — a direct `stage0::stage0_place` call
 /// (no ambient host sh anywhere in setup, re #469). The base default matches
-/// cache-lib's load_stage0, so the prelude and the gates share one placement.
+/// the gate bodies' PlacedStage0, so the prelude and the gates share one placement.
 fn provision_stage0(root: &Path) -> Result<String, String> {
     let base = match std::env::var("TD_STAGE0_BASE") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),

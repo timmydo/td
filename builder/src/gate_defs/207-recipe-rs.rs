@@ -19,8 +19,8 @@
 //! Native (typed-Rust) gate body (#318 axis 3, tests/* deletion): formerly
 //! tests/recipe-rs.sh (deleted); its self-consistency assertions now live as `#[test]`s
 //! in the `recipes` crate itself (not reimplemented here), and `gate_bodies::recipe_rs`
-//! just drives cargo + a thin CLI smoke of the release binary. `script: ""` marks this
-//! gate native, so the runner execs `td-builder gate-body recipe-rs`.
+//! just drives cargo + a thin CLI smoke of the release binary. The runner execs
+//! `td-builder gate-body recipe-rs`.
 
 use crate::gates::{GateDef, Pool};
 
@@ -37,6 +37,5 @@ pub fn gate() -> GateDef {
         // run). A real compile/lint failure exits non-69 and still REDs; the
         // host-side cargo-test preflight is the blocking from-source enforcement.
         non_blocking: false,
-        script: "",
     }
 }

@@ -27,17 +27,9 @@
 //! mk/gates/*.mk fragments carried, and the compiler enforces the structure a
 //! parser used to check — a malformed gate is a build error, never a mis-run.
 //!
-//! A GateDef's `script` is PLAIN POSIX SHELL (no make escaping), executed as
-//! one `sh -c` with cwd = repo root — inside the loop sandbox `sh` is the
-//! td-built busybox ash, so no bashisms. One deliberate extension: gate
-//! bodies rely on `set -o pipefail` (POSIX.1-2024, not in older POSIX sh) to
-//! keep a red left of a pipe from being greened by the right side — safe
-//! because the interpreter is not "whatever sh" but the PINNED busybox
-//! (1.37.0) ash the loop itself built, which supports it; a shell without
-//! pipefail errors on the `set` line (fail-closed), never mis-greens.
-//! (The remaining deferred corpus/seed gates
-//! realize their guix-built seed by calling host `guix` directly — the seed
-//! bytes retire last per the north star / #412.) Output is buffered per gate
+//! Every gate body is typed Rust, run as `td-builder gate-body <name>` with
+//! cwd = repo root (gate_bodies.rs); no gate carries shell. Output is
+//! buffered per gate
 //! (`--output-sync=target`
 //! parity), first red stops new gates while running ones drain, and timing
 //! events keep the exact per-gate START/END line format the native report
@@ -97,8 +89,6 @@ pub struct GateDef {
     /// capability not every runner can satisfy, so a host that cannot is not
     /// blocked by them while a host that can still covers them normally.
     pub non_blocking: bool,
-    /// The gate body: plain POSIX shell, run as one `sh -c` from the repo root.
-    pub script: &'static str,
 }
 
 mod registry {
@@ -109,7 +99,9 @@ mod registry {
 struct Gate {
     name: String,
     pools: Vec<Pool>,
-    /// The plain-shell body (everything after `run:`), executed as one `sh -c`.
+    /// Empty for every real gate, whose body is `td-builder gate-body <name>`
+    /// (gate_bodies.rs). Only the scheduler tests' synthetic gates carry a
+    /// shell body, run as one `sh -c`.
     body: String,
     /// Ordering prerequisites (gate names). All gates are phony, so make's old
     /// normal-vs-order-only (`|`) distinction collapses to "runs before".
@@ -188,22 +180,14 @@ fn load() -> Result<GateSet, String> {
         if def.pools.is_empty() {
             return Err(format!("gate-run: gate `{}` is in no pool", def.name));
         }
-        // Empty script ⟺ native (typed-Rust) gate (#318 axis 3): a native gate
-        // carries no shell and is run via `td-builder gate-body <name>`; a shell
-        // gate must carry a script. Mismatch either way is a load-time error, so
-        // a typo (empty script with no registered body, or a body-registered
-        // gate that still ships shell) can never silently no-op.
-        let native = crate::gate_bodies::is_native(def.name);
-        if def.script.trim().is_empty() != native {
-            return Err(if native {
-                format!(
-                    "gate-run: native gate `{}` must have an empty script (its body is \
-                     gate_bodies.rs)",
-                    def.name
-                )
-            } else {
-                format!("gate-run: gate `{}` has an empty script", def.name)
-            });
+        // Every gate body is typed Rust run as `td-builder gate-body <name>`; a
+        // def with no registered body is a load-time error, so it can never
+        // silently no-op.
+        if !crate::gate_bodies::is_native(def.name) {
+            return Err(format!(
+                "gate-run: gate `{}` has no body in gate_bodies.rs",
+                def.name
+            ));
         }
         for w in def.needs.iter().chain(def.specs) {
             if !valid_word(w) {
@@ -221,7 +205,7 @@ fn load() -> Result<GateSet, String> {
         gates.push(Gate {
             name: def.name.to_string(),
             pools: def.pools.to_vec(),
-            body: def.script.to_string(),
+            body: String::new(),
             deps: def.needs.iter().map(|d| d.to_string()).collect(),
             extra_env: Vec::new(),
             specs: def.specs.iter().map(|s| s.to_string()).collect(),
@@ -270,7 +254,7 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
     let br = Gate {
         name: BUILD_RECIPES.to_string(),
         pools: Vec::new(),
-        body: "sh tests/build-recipes.sh".to_string(),
+        body: String::new(),
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
@@ -435,9 +419,9 @@ fn explicit_goal_indices(set: &GateSet, goals: &[String]) -> HashSet<usize> {
 /// reproduces it exactly). The full `check` goal and an explicit
 /// `build-recipes` goal keep the whole pool. The body always runs even with
 /// ZERO scoped specs: build-recipes is also the build-gate PRELUDE (the
-/// stage0-seed realize + the td-recipe-eval build that `load_recipe_eval`
-/// fails-fast without) — only the per-spec pre-build scopes down
-/// (tests/build-recipes.sh tolerates an empty list).
+/// stage0 placement + the td-recipe-eval build the build gates rely on) —
+/// only the per-spec pre-build scopes down
+/// (the build-recipes body tolerates an empty list).
 fn scope_build_recipes(set: &mut GateSet, selected: &HashSet<usize>, goals: &[String]) {
     if goals.iter().any(|g| g == "check" || g == BUILD_RECIPES) {
         return;
@@ -1070,8 +1054,15 @@ fn run_gate(
                 self_exe.display().to_string(),
                 vec!["gate-body".to_string(), g.name.clone()],
             )
-        } else {
+        } else if cfg!(test) {
             ("sh".to_string(), vec!["-c".to_string(), body])
+        } else {
+            let _ = writeln!(
+                logf,
+                "gate-run: FAIL: gate {}: a shell body outside the scheduler tests",
+                g.name
+            );
+            return Outcome::Failed;
         };
         #[cfg(not(test))]
         let mut cmd = {
@@ -2414,64 +2405,6 @@ mod tests {
         }
     }
 
-    /// Every compiled gate_def that resolves the evaluator must propagate that
-    /// step's exit status. It exits 69 with the unprovisioned sentinel when no
-    /// toolchain is reachable in the jail, and run_gate reads exactly that as a
-    /// tolerated SKIP; a command substitution that drops the status leaves
-    /// TD_RECIPE_EVAL empty, so the gate execs an empty name and dies 126 under
-    /// the jail's busybox ash — RED where the contract says skip.
-    ///
-    /// The rule is unconditional, with no `set -e` exemption: whether errexit is
-    /// in force at the call is not decidable from the line (a later `set +e`, a
-    /// `||` context, or a subshell all suspend it). Scope is the compiled
-    /// registry — the synthesized build-recipes node's body is not covered here.
-    ///
-    /// Both spellings are checked so the rule cannot go vacuous: the gates route
-    /// through `recipe-eval-place` now, and a future one reaching for the tool
-    /// script directly must still propagate.
-    #[test]
-    fn a_gate_that_builds_the_evaluator_propagates_its_exit_status() {
-        let mut resolvers = std::collections::BTreeSet::new();
-        for (stem, def) in defs() {
-            for line in def.script.lines() {
-                // A comment naming the verb is prose, not an invocation: auditing
-                // one would fail on a sentence, and counting one would let a real
-                // resolution go missing under the floor below.
-                if line.trim_start().starts_with('#') {
-                    continue;
-                }
-                // EVERY occurrence is audited, not just the first, and each is
-                // judged on its own command — these scripts put several
-                // `;`-separated commands on one physical line, so neither an
-                // earlier command's `|| exit $?` nor a later one may vouch for it.
-                for tok in ["recipe-eval-place", "recipe-eval-tool.sh"] {
-                    for (at, _) in line.match_indices(tok) {
-                        let rest = line.get(at + tok.len()..).unwrap_or("");
-                        let cmd = rest.split_once(';').map_or(rest, |(c, _)| c);
-                        resolvers.insert(stem);
-                        assert!(
-                            cmd.contains("|| exit $?"),
-                            "src/gate_defs/{stem}.rs resolves td-recipe-eval without \
-                             propagating its exit status:\n    {}\nA 69 (unprovisioned) then \
-                             reds the gate instead of skipping it. Add `|| exit $?` — `set -e` \
-                             does not count.",
-                            line.trim()
-                        );
-                    }
-                }
-            }
-        }
-        // The ladder gates that resolve an evaluator are 360/364/414/422/426.
-        // Counted by STEM, so no amount of prose in one gate can stand in for
-        // another that stopped resolving — the rule cannot quietly go vacuous.
-        assert!(
-            resolvers.len() >= 5,
-            "only {} gate defs resolve td-recipe-eval ({resolvers:?}); the rule is guarding \
-             less than it was written for",
-            resolvers.len()
-        );
-    }
-
     #[test]
     fn registry_loads_and_holds_the_gate_ladder() {
         // The registry is compiled in, so this runs EVERYWHERE cargo test runs —
@@ -2532,63 +2465,15 @@ mod tests {
                 def.name
             );
         }
-        // Every bash body is non-empty plain bash (no make-isms survived
-        // conversion). A NATIVE (typed-Rust) gate (#318 axis 3) legitimately has
-        // an empty body — it runs via `td-builder gate-body <name>` — so it is
-        // asserted empty-and-registered instead (the empty ⟺ is_native pairing
-        // that `load` enforces).
+        // Every gate, the build-recipes node included, is native: an empty
+        // body and a registered `td-builder gate-body <name>`.
         for g in &set.gates {
-            if crate::gate_bodies::is_native(&g.name) {
-                assert!(
-                    g.body.trim().is_empty(),
-                    "{} is native but carries bash",
-                    g.name
-                );
-                continue;
-            }
-            assert!(!g.body.trim().is_empty(), "{} has an empty body", g.name);
-            assert!(!g.body.contains("$(CURDIR)"), "{} kept a make var", g.name);
-            assert!(!g.body.contains("$$"), "{} kept make $$ escaping", g.name);
+            assert!(
+                crate::gate_bodies::is_native(&g.name) && g.body.is_empty(),
+                "{} is not a native gate",
+                g.name
+            );
         }
-    }
-
-    /// Every `check-run` a gate body spells must match the CURRENT argv:
-    /// `check-run STEM [INDEX]`. The retired `[pr|daily|all]` scope word sat
-    /// BEFORE the index, so a body left holding it passes a non-numeric string
-    /// where the index goes. `parse_index` rejects that (fail-closed), but only
-    /// once a provisioned in-jail run reaches the gate — which is exactly the
-    /// slow, host-dependent feedback this catches at `cargo test` instead.
-    #[test]
-    fn gate_bodies_spell_check_run_with_the_current_argv() {
-        let set = load().unwrap();
-        let mut seen = 0usize;
-        for g in &set.gates {
-            for line in g.body.lines() {
-                let Some((_, rest)) = line.split_once("check-run ") else {
-                    continue;
-                };
-                seen += 1;
-                let args: Vec<&str> = rest.split_whitespace().collect();
-                // STEM then an optional 1-based INDEX — nothing else.
-                assert!(
-                    args.len() <= 2,
-                    "{}: `check-run {rest}` passes more than STEM [INDEX] \
-                     (the retired scope word?)",
-                    g.name
-                );
-                if let Some(index) = args.get(1) {
-                    assert!(
-                        index.parse::<usize>().is_ok_and(|n| n > 0),
-                        "{}: `check-run {rest}` — `{index}` is not a 1-based index",
-                        g.name
-                    );
-                }
-            }
-        }
-        assert!(
-            seen >= 3,
-            "expected the x86_64 gate bodies to drive check-run"
-        );
     }
 
     /// `check` is the ONE behavioral tier — it selects every gate in a pool
@@ -2642,8 +2527,8 @@ mod tests {
         };
         // The guix-seeded corpus (the only spec-carrying gates) retired, so build_specs
         // is empty and scoping is a no-op — the point now is that the build-recipes
-        // PRELUDE body (stage0 seed + td-recipe-eval; load_recipe_eval fails-fast without
-        // its sentinel) still runs for a build_gate selection, never no-op'd.
+        // PRELUDE body (stage0 placement + td-recipe-eval) still runs for a
+        // build_gate selection, never no-op'd.
         let mut set = load().unwrap();
         assert!(
             set.build_specs.is_empty(),
@@ -2655,7 +2540,7 @@ mod tests {
         assert_eq!(br_specs(&set), "");
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(
-            br.body.contains("build-recipes.sh"),
+            br.body.is_empty() && crate::gate_bodies::is_native(BUILD_RECIPES),
             "the prelude body must survive scoping"
         );
     }

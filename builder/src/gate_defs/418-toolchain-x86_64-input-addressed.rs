@@ -16,8 +16,7 @@
 //! ~90-min toolchain build, NOT a BUILD_GATE.
 //!
 //! Native (#318 axis 3): the gate body is typed Rust in
-//! `gate_bodies::toolchain_x86_64_input_addressed`; `script: ""` marks it native, so the runner
-//! execs `td-builder gate-body toolchain-x86_64-input-addressed`.
+//! `gate_bodies::toolchain_x86_64_input_addressed`; the runner execs `td-builder gate-body toolchain-x86_64-input-addressed`.
 
 use crate::gates::{GateDef, Pool};
 
@@ -32,6 +31,5 @@ pub fn gate() -> GateDef {
         // from PATH in the body (gate_bodies::busybox_pkg_dir) — no declared
         // guix-lock input.
         non_blocking: false,
-        script: "",
     }
 }
