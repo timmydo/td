@@ -186,10 +186,12 @@ fn guard_netns_probe() -> Result<(), String> {
 }
 
 /// Provision the guix-free stage0 td-builder (the loop-container provider,
-/// workstream E #294) and return $TB — a direct `stage0::stage0_place` call
-/// (no ambient host sh anywhere in setup, re #469). The base default matches
-/// the gate bodies' PlacedStage0, so the prelude and the gates share one placement.
-fn provision_stage0(root: &Path) -> Result<String, String> {
+/// workstream E #294) and return $TB with the canonical store path its package
+/// was hashed for (stage0_place's answer, on a memo hit too) — a direct
+/// `stage0::stage0_place` call (no ambient host sh anywhere in setup, re #469).
+/// The base default matches the gate bodies' PlacedStage0, so the prelude and
+/// the gates share one placement.
+fn provision_stage0(root: &Path) -> Result<(String, String), String> {
     let base = match std::env::var("TD_STAGE0_BASE") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => root.join(".td-build-cache/stage0"),
@@ -206,7 +208,7 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
     if !tb.is_file() {
         return Err(fatal("stage0 provisioning returned no usable $TB"));
     }
-    Ok(tb.display().to_string())
+    Ok((tb.display().to_string(), cb))
 }
 
 /// td's own store prefix — where the loop userland's items are hashed for and
@@ -593,10 +595,34 @@ fn resolve_recipe_eval_bin(root: &Path) -> Result<String, CheckError> {
     )))
 }
 
+/// The stage0 td-builder as a loop store item: its placement, bound read-only
+/// at the canonical /td/store path it was placed for. Static and
+/// self-contained, it is the fixture the own-root and sandbox gates run. A
+/// placement hashed for another store (a host `TD_STORE_DIR`) is refused
+/// rather than bound at a path it was not hashed for.
+fn stage0_item(tb: &str, canonical: &str) -> Result<(String, String), String> {
+    let pkg = Path::new(tb)
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| fatal(&format!("no stage0 package dir above {tb}")))?;
+    let base = pkg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| fatal(&format!("no stage0 package name for {}", pkg.display())))?;
+    let dest = format!("{TD_STORE_DIR}/{base}");
+    if canonical != dest {
+        return Err(fatal(&format!(
+            "the stage0 td-builder was placed for {canonical}, not {dest}; the loop binds \
+             it only at the path it was hashed for"
+        )));
+    }
+    Ok((pkg.display().to_string(), dest))
+}
+
 /// Copy a tree preserving file modes and symlinks AS symlinks — the userland
 /// items are busybox applet farms (symlinks at the busybox binary) whose links
 /// must survive the copy byte-identically.
-fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
     let md = std::fs::symlink_metadata(src).map_err(|e| format!("stat {}: {e}", src.display()))?;
     let ft = md.file_type();
     if ft.is_symlink() {
@@ -1509,7 +1535,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         )
     });
 
-    let tb = provision_stage0(&root)?;
+    let (tb, stage0_canon) = provision_stage0(&root)?;
     // Place the EVALUATOR here too, for the same reason as stage0: the gates run
     // in the sandbox, which has no toolchain, so a build inside it cannot
     // succeed. Seeding the memo out here is what lets a warm tree reuse it in
@@ -1635,7 +1661,8 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
         s("--expose-cwd"),
         s("--no-daemon"),
     ]);
-    for (src, dest) in &ul.items {
+    let stage0 = stage0_item(&tb, &stage0_canon)?;
+    for (src, dest) in ul.items.iter().chain(std::iter::once(&stage0)) {
         argv.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
     argv.extend([s("--"), tb, s("gate-run")]);
@@ -1738,7 +1765,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     if !root.join("tests").is_dir() {
         return Err(fatal("run from the repo root (tests/ not found)"));
     }
-    let tb = provision_stage0(&root).map_err(|e| {
+    let (tb, stage0_canon) = provision_stage0(&root).map_err(|e| {
         format!("check-rung: FATAL: could not provision the guix-free stage0 td-builder for the sandbox ({e})")
     })?;
     // check-rung is a dev helper, not the loop: it does not branch on the
@@ -1755,7 +1782,8 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     let mut cmd = Command::new(&tb);
     let mut sandbox_args: Vec<String> =
         vec![s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")];
-    for (src, dest) in &ul.items {
+    let stage0 = stage0_item(&tb, &stage0_canon)?;
+    for (src, dest) in ul.items.iter().chain(std::iter::once(&stage0)) {
         sandbox_args.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
     sandbox_args.extend([s("--"), s("sh")]);

@@ -2632,7 +2632,7 @@ fn copy_tree_keeping_times(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// `chmod -R u+w`: every file and directory under `root` owner-writable,
 /// symlinks left alone.
-fn make_tree_writable(root: &Path) -> Result<(), String> {
+pub(crate) fn make_tree_writable(root: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(root).map_err(|e| format!("stat {}: {e}", root.display()))?;
     if meta.file_type().is_symlink() {
         return Ok(());

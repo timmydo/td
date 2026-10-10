@@ -11392,6 +11392,8 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // The programs the own-root and sandbox gates run inside their roots.
+        Some("gate-probe") => gate_bodies::gate_probe(&args),
         // stage0-cold-start's cold leg; it enters its own private namespace.
         Some("stage0-place-without-guix") => gate_bodies::stage0_place_without_guix(&args),
         // The generic `build DRV CLOSURE SCRATCH` and `realize DRV STORE-DIR SCRATCH`

@@ -286,31 +286,15 @@ fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// `cp -a src dst` — faithful tree staging (perms/symlinks/times), the same
-/// tool the shell used, so staged bytes have identical NAR-relevant properties.
-fn cp_a(src: &Path, dst: &Path) -> Result<(), String> {
-    let (s, d) = (path_str(src)?, path_str(dst)?);
-    let st = Command::new("cp")
-        .args(["-a", &s, &d])
-        .status()
-        .map_err(|e| format!("FAIL: cannot spawn cp: {e}"))?;
-    if !st.success() {
-        return Err(format!("FAIL: cp -a {s} {d} exited {st}"));
-    }
-    Ok(())
+/// A faithful copy of a staged tree: types, symlinks and modes, all a NAR
+/// records. Rust, as everything the gates run is: the loop has no `cp`.
+fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    crate::check_loop::copy_tree_preserving(src, dst).map_err(|e| format!("FAIL: {e}"))
 }
 
-/// `chmod -R u+w dir` — make a staged store writable (as the shell did).
-fn chmod_r_uw(dir: &Path) -> Result<(), String> {
-    let d = path_str(dir)?;
-    let st = Command::new("chmod")
-        .args(["-R", "u+w", &d])
-        .status()
-        .map_err(|e| format!("FAIL: cannot spawn chmod: {e}"))?;
-    if !st.success() {
-        return Err(format!("FAIL: chmod -R u+w {d} exited {st}"));
-    }
-    Ok(())
+/// `chmod -R u+w`: make a staged store writable, so it can be removed.
+fn make_writable(dir: &Path) -> Result<(), String> {
+    crate::build::make_tree_writable(dir).map_err(|e| format!("FAIL: {e}"))
 }
 
 /// Corrupt a store file: `chmod u+w f; printf 'X' >> f` (the verify gates'
@@ -415,7 +399,7 @@ fn file_mode(p: &Path) -> Result<u32, String> {
 fn fresh_scratch(root: &Path, name: &str) -> Result<PathBuf, String> {
     let scratch = root.join(name);
     if scratch.exists() {
-        let _ = chmod_r_uw(&scratch); // staged stores are read-only; make removable
+        let _ = make_writable(&scratch); // staged stores are read-only; make removable
         let _ = std::fs::remove_dir_all(&scratch);
     }
     std::fs::create_dir_all(&scratch)
@@ -568,7 +552,7 @@ fn store_subject(_s0: &Stage0, _root: &Path, scratch: &Path) -> Result<Subject, 
     std::fs::write(&local_drv, drv_content)
         .map_err(|e| format!("FAIL: write synthetic .drv {}: {e}", local_drv.display()))?;
 
-    chmod_r_uw(&subj_store)
+    make_writable(&subj_store)
         .map_err(|e| format!("FAIL: could not make the staged store writable\n{e}"))?;
     let subj_root = path_str(&subj_root_path)?;
     let mut members: Vec<String> = vec![subj_root.clone(), dep_s];
@@ -834,7 +818,7 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
 
     // [DISCRIMINATION] a single-byte append and an exec-bit flip each MOVE the path.
     let tree_c = scratch.join("tree_c");
-    cp_a(&fx, &tree_c)?;
+    copy_tree(&fx, &tree_c)?;
     corrupt_append(&tree_c.join("file.txt"))?; // append moves content
     let pc = intern(&tree_c, "store_c", "td_c.db")?;
     if pc == p1 {
@@ -860,7 +844,7 @@ fn store_add_tree(root: &Path) -> Result<(), String> {
         ));
     }
     let tree_x = scratch.join("tree_x");
-    cp_a(&fx, &tree_x)?;
+    copy_tree(&fx, &tree_x)?;
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(
@@ -1661,29 +1645,24 @@ fn store_ns(root: &Path) -> Result<(), String> {
     );
     let work = fresh_scratch(root, ".store-ns-scratch")?;
 
-    // A static package to run from /td/store: the loop's td-built busybox.
-    let bs = busybox_pkg_dir()?;
+    // A static package to run from /td/store: the stage0 td-builder's item.
+    let bs = stage0_package()?;
     let bs_s = path_str(&bs)?;
 
     // The user's /td/store: place the static package at <store>/<base>.
     let store = work.join("td-store");
     std::fs::create_dir_all(&store).map_err(|e| format!("FAIL: mkdir {}: {e}", store.display()))?;
     let base = base_of(&bs_s);
-    cp_a(&bs, &store.join(&base))?;
-    chmod_r_uw(&store)?;
+    copy_tree(&bs, &store.join(&base))?;
+    make_writable(&store)?;
     println!(
         "   placed {base} into the td-owned store {}",
         store.display()
     );
 
     // Run inside the own-root store-ns (rootless): /td/store = store, /gnu/store
-    // absent. `$(( ))` proves a LIVE interpreter ran, not a stub echoing bytes.
-    let inner = format!(
-        "[ -d /td/store ] && echo TDSTORE-OK\n\
-         [ -d /td/store/{base}/bin ] && echo PKG-AT-TDSTORE\n\
-         [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT\n\
-         echo \"RAN:$(( 40 + 2 ))\"\n"
-    );
+    // absent. The probe computes RAN:42 as it runs, so a stub echoing bytes
+    // cannot pass.
     let store_s = path_str(&store)?;
     let out = tb_out(
         &tb,
@@ -1691,9 +1670,11 @@ fn store_ns(root: &Path) -> Result<(), String> {
             "store-ns",
             &store_s,
             "--",
-            &format!("/td/store/{base}/bin/sh"),
-            "-c",
-            &inner,
+            &format!("/td/store/{base}/bin/td-builder"),
+            "gate-probe",
+            "own-root",
+            "--package",
+            &base,
         ],
         "store-ns run",
     )?;
@@ -1726,7 +1707,7 @@ fn store_ns(root: &Path) -> Result<(), String> {
          the local guix install"
     );
 
-    let _ = chmod_r_uw(&work);
+    let _ = make_writable(&work);
     let _ = std::fs::remove_dir_all(&work);
     println!(
         "PASS: td owns its own root with its own store at /td/store — a static package runs from \
@@ -2887,28 +2868,6 @@ fn writef(p: &Path, data: &str) -> Result<(), String> {
     std::fs::write(p, data).map_err(|e| format!("FAIL: write {}: {e}", p.display()))
 }
 
-/// `readlink -f $(command -v BIN)` — the first executable `bin` on PATH,
-/// canonicalized. Resolves the absolute binary ourselves (Command's PATH search
-/// uses the CURRENT process env, not a child override).
-fn which_canon(bin: &str) -> Option<PathBuf> {
-    which_path(bin).and_then(|p| std::fs::canonicalize(p).ok())
-}
-
-/// PATH lookup WITHOUT canonicalizing: the entry as the caller would exec it.
-/// Multi-call userlands (a symlink farm at one binary) dispatch on argv[0], so
-/// a probe must exec THIS path — canonicalizing first would erase the program
-/// name. Which layout provides a program is the userland's business, never
-/// assumed here.
-fn which_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .find(|dir| {
-            let p = dir.join(bin);
-            p.is_file() && file_mode(&p).ok().is_some_and(|m| m & 0o111 != 0)
-        })
-        .map(|dir| dir.join(bin))
-}
-
 /// The store root `/td/store` of a `/<first>/store/...` path (the shell's
 /// `store_root_for`): take the first path component and append `/store`, then
 /// confirm the path is actually under it.
@@ -2924,26 +2883,57 @@ fn store_root_for(p: &str) -> Result<String, String> {
     Ok(root)
 }
 
-/// The loop's td-built busybox package dir — the guix-free static shell already
-/// on the gate's PATH (the same one `sandbox_hardening` resolves), the store-ns
-/// gates' runnable static fixture now that the guix bash-static lock is retired.
-/// `which_path` keeps the bound /td/store path (an applet symlink dispatches on
-/// argv[0], so we must NOT canonicalize it to `busybox`); its parent's parent is
-/// the package dir. `store_root_for` rejects a host `/bin/sh` — loud, not silent.
-fn busybox_pkg_dir() -> Result<PathBuf, String> {
-    let sh_bound = which_path("sh")
-        .ok_or_else(|| String::from("FAIL: no busybox `sh` on PATH (loop userland)"))?;
-    let sh_bound_s = path_str(&sh_bound)?;
-    let bs = sh_bound
+/// The stage0 td-builder's store item: a static, self-contained package (musl,
+/// with the self-only closure stage0-cold-start proves) that runs with nothing
+/// but itself, the own-root and sandbox gates' fixture. Inside the loop it is
+/// the item the loop binds read-only at its canonical /td/store path; a body run
+/// outside the loop takes the placement it runs from. A td-builder that is not
+/// a placed store item (a cargo `target/` build) has no package to offer.
+fn stage0_package() -> Result<PathBuf, String> {
+    let tb = tb()?;
+    let pkg = tb
         .parent()
+        .filter(|bin| bin.file_name().is_some_and(|n| n == "bin"))
         .and_then(Path::parent)
-        .ok_or_else(|| format!("FAIL: no package dir above {sh_bound_s}"))?
-        .to_path_buf();
-    store_root_for(&path_str(&bs)?)?;
-    if !is_executable_file(&bs.join("bin/sh")) {
-        return Err(format!("FAIL: no static busybox `sh` at {}", bs.display()));
+        .ok_or_else(|| {
+            format!(
+                "FAIL: {} is not a placed store item's bin/td-builder",
+                tb.display()
+            )
+        })?;
+    let base = pkg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_store_base(n))
+        .ok_or_else(|| format!("FAIL: {} is not a placed store item", pkg.display()))?;
+    let bound = Path::new("/td/store").join(base);
+    if is_executable_file(&bound.join("bin/td-builder")) {
+        return Ok(bound);
     }
-    Ok(bs)
+    Ok(pkg.to_path_buf())
+}
+
+/// `HASH-NAME` with a 32-character nix-base32 hash: a store item's base name.
+fn is_store_base(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes
+        .get(..32)
+        .is_some_and(|hash| hash.iter().all(|b| crate::store::BASE32.contains(b)))
+        && bytes.get(32) == Some(&b'-')
+        && bytes.len() > 33
+}
+
+/// The stage0 item as the loop binds it at /td/store, required: the sandbox
+/// legs measure that bind.
+fn bound_stage0_item() -> Result<PathBuf, String> {
+    let item = stage0_package()?;
+    if !item.starts_with("/td/store") {
+        return Err(format!(
+            "FAIL: the loop binds no stage0 item at /td/store (the placement is {})",
+            item.display()
+        ));
+    }
+    Ok(item)
 }
 
 /// `cmdline` bytes with NULs read as SPACES, or `None` for a zombie — whose
@@ -2995,19 +2985,19 @@ fn scan_marker_procs(marker: &str) -> usize {
         .count()
 }
 
-/// Count the LEAF `sleep <marker>` processes, matched on the WHOLE argv rather
+/// Count the LEAF `<leaf> <marker>` processes, matched on the WHOLE argv rather
 /// than on a substring of it.
 ///
 /// The marker is in the argv of the top `td-builder host-sandbox`, of the
-/// PID-namespace parent that waits on PID 1, and of the inner `sh` — all three
-/// carry the command string that names it. A readiness test counting anything
-/// that merely CONTAINS the marker is therefore satisfied before `sh` has
-/// forked either sleep. These two are the tree's leaves: when both exist, it
-/// is up.
-fn scan_sleep_procs(sleep_exec: &str, marker: &str) -> usize {
+/// PID-namespace parent that waits on PID 1, and of the inner sleep-tree — all
+/// three carry the command that names it. A readiness test counting anything
+/// that merely CONTAINS the marker is therefore satisfied before the tree has
+/// forked either leaf. These two are the tree's leaves: when both exist, it is
+/// up.
+fn scan_leaf_procs(leaf: &str, marker: &str) -> usize {
     // The trailing space is load-bearing: cmdline NUL-TERMINATES every
     // argument, so the cooked form ends with one.
-    let want = format!("{sleep_exec} {marker} ");
+    let want = format!("{leaf} {marker} ");
     proc_cmdlines()
         .iter()
         .filter(|(_, c)| c.as_slice() == want.as_bytes())
@@ -3286,10 +3276,10 @@ fn check_pinned_sync(
 }
 
 /// The [behavioral]+[structural] leg shared by both input-addressed gates: place
-/// the busybox fixture at the arch-keyed input-addressed /td/store path and run
-/// it in the store-ns own-root with /gnu/store ABSENT. `name_stem` is the
-/// input-addressed name (`busybox-static` / `busybox-static-x86_64`).
-fn run_input_addressed_shell(
+/// the stage0 fixture at the arch-keyed input-addressed /td/store path and run
+/// its own-root probe with /gnu/store ABSENT. `name_stem` is the
+/// input-addressed name (`stage0-static` / `stage0-static-x86_64`).
+fn run_input_addressed_probe(
     tb: &Path,
     work: &Path,
     bs: &str,
@@ -3319,10 +3309,10 @@ fn run_input_addressed_shell(
             "FAIL: {name_stem} not input-addressed at /td/store: {runp}"
         ));
     }
-    if !is_executable_file(&store.join(base_of(&runp)).join("bin/sh")) {
+    if !is_executable_file(&store.join(base_of(&runp)).join("bin/td-builder")) {
         return Err(format!("FAIL: interned {name_stem} missing physically"));
     }
-    let run_bin = format!("{runp}/bin/sh");
+    let run_bin = format!("{runp}/bin/td-builder");
     let out = tb_out(
         tb,
         &[
@@ -3330,8 +3320,8 @@ fn run_input_addressed_shell(
             &store_s,
             "--",
             &run_bin,
-            "-c",
-            "[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo \"RAN:$(( 40 + 2 ))\"",
+            "gate-probe",
+            "own-root",
         ],
         "store-ns run from the input-addressed path",
     )?;
@@ -3368,9 +3358,14 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
     let work = fresh_scratch(root, ".store-native-profile-scratch")?;
 
-    // A real multi-entry static package: the loop's td-built busybox.
-    let bs = busybox_pkg_dir()?;
-    let bs_s = path_str(&bs)?;
+    // A multi-entry static package: the stage0 td-builder's item plus a
+    // relative link to it, the shape of a multicall's applet links.
+    let fixture = work.join("fixture");
+    copy_tree(&stage0_package()?, &fixture)?;
+    make_writable(&fixture)?;
+    std::os::unix::fs::symlink("td-builder", fixture.join("bin/td-builder-probe"))
+        .map_err(|e| format!("FAIL: link the fixture's second entry: {e}"))?;
+    let bs_s = path_str(&fixture)?;
 
     // Intern it at the LOGICAL /td/store; bytes land physically under `store`.
     let store = work.join("td-store");
@@ -3381,24 +3376,24 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
         &tb,
         &[
             "store-add-recursive",
-            "busybox-x86-64",
+            "gate-fixture",
             &bs_s,
             &store_s,
             &db_s,
         ],
         &[("TD_STORE_DIR", "/td/store")],
-        "store-add-recursive busybox-x86-64",
+        "store-add-recursive gate-fixture",
     )?;
-    if !(pkg.starts_with("/td/store/") && pkg.ends_with("-busybox-x86-64")) {
+    if !(pkg.starts_with("/td/store/") && pkg.ends_with("-gate-fixture")) {
         return Err(format!(
-            "FAIL: busybox not content-addressed at /td/store: {pkg}"
+            "FAIL: the fixture is not content-addressed at /td/store: {pkg}"
         ));
     }
     let physpkg = store.join(base_of(&pkg));
     let physpkg_s = path_str(&physpkg)?;
-    if !is_executable_file(&physpkg.join("bin/busybox")) {
+    if !is_executable_file(&physpkg.join("bin/td-builder")) {
         return Err(format!(
-            "FAIL: interned busybox missing physically at {}",
+            "FAIL: the interned fixture is missing physically at {}",
             physpkg.display()
         ));
     }
@@ -3413,43 +3408,42 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
         "profile --store-native",
     )?;
 
-    // [structural] the profile entries are LOGICAL /td/store symlinks. busybox
-    // provides `sh` (an applet symlink) alongside the `busybox` multiplexer;
-    // check both retarget logically.
-    for t in ["sh", "busybox"] {
+    // [structural] the profile entries are LOGICAL /td/store symlinks: the
+    // binary and the link to it both retarget logically.
+    for t in ["td-builder", "td-builder-probe"] {
         let link = prof.join("bin").join(t);
         let tgt =
             std::fs::read_link(&link).map_err(|_| format!("FAIL: no profile entry for {t}"))?;
         let tgt_s = tgt.to_string_lossy();
-        let want = format!("-busybox-x86-64/bin/{t}");
+        let want = format!("-gate-fixture/bin/{t}");
         if !(tgt_s.starts_with("/td/store/") && tgt_s.ends_with(&want)) {
             return Err(format!(
                 "FAIL: profile/bin/{t} is not a logical /td/store link (got: {tgt_s})"
             ));
         }
     }
-    println!("   [structural] profile entries (sh, busybox) are logical /td/store symlinks");
+    println!(
+        "   [structural] profile entries (td-builder, td-builder-probe) are logical /td/store \
+         symlinks"
+    );
 
-    // Run the profiled tools in the own-root via a probe FILE bound in the store
-    // (no nested quoting between the outer capture and the inner script).
-    // `$(( ))` proves a LIVE interpreter ran, not a stub echoing bytes.
-    let probe = store.join("probe.sh");
-    writef(
-        &probe,
-        "export PATH=/td/store/profile/bin\n\
-         [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT\n\
-         case \"$(command -v sh)\" in /td/store/profile/bin/sh) echo SH-VIA-PROFILE ;; esac\n\
-         case \"$(command -v busybox)\" in /td/store/profile/bin/busybox) echo BUSYBOX-VIA-PROFILE ;; esac\n\
-         sh -c 'echo \"SH-RAN:$(( 40 + 2 ))\"'\n",
-    )?;
+    // Run the profiled td-builder in the own-root: it resolves both entries on
+    // the profile's bin as a PATH lookup would and computes RAN:42 as it runs.
     let out = tb_out(
         &tb,
         &[
             "store-ns",
             &store_s,
             "--",
-            "/td/store/profile/bin/sh",
-            "/td/store/probe.sh",
+            "/td/store/profile/bin/td-builder",
+            "gate-probe",
+            "own-root",
+            "--path",
+            "/td/store/profile/bin",
+            "--resolve",
+            "td-builder",
+            "--resolve",
+            "td-builder-probe",
         ],
         "store-ns profile run",
     )?;
@@ -3458,14 +3452,15 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     }
 
     let has = |s: &str| out.lines().any(|l| l == s);
-    if !has("SH-VIA-PROFILE") {
-        return Err("FAIL: sh did not resolve via /td/store/profile/bin".into());
+    for t in ["td-builder", "td-builder-probe"] {
+        if !has(&format!("RESOLVED {t} /td/store/profile/bin/{t}")) {
+            return Err(format!(
+                "FAIL: {t} did not resolve via /td/store/profile/bin"
+            ));
+        }
     }
-    if !has("BUSYBOX-VIA-PROFILE") {
-        return Err("FAIL: busybox did not resolve via /td/store/profile/bin".into());
-    }
-    if !has("SH-RAN:42") {
-        return Err("FAIL: the profiled sh did not run from /td/store".into());
+    if !has("RAN:42") {
+        return Err("FAIL: the profiled td-builder did not run from /td/store".into());
     }
     println!(
         "   [behavioral] the profiled tools resolve via /td/store/profile/bin and RUN from /td/store"
@@ -3479,7 +3474,7 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
         "   [structural] /gnu/store is ABSENT in the own-root (unmixed from the guix install)"
     );
 
-    let _ = chmod_r_uw(&work);
+    let _ = make_writable(&work);
     let _ = std::fs::remove_dir_all(&work);
     println!(
         "PASS: store-native-profile — td-builder profile --store-native builds a profile of \
@@ -3495,17 +3490,14 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
 /// (`td-builder host-sandbox`) exposes only a MINIMAL /dev (no host device leak),
 /// REAPS its inner tree when the top td-builder is killed (PR_SET_PDEATHSIG),
 /// and exposes the store INPUT-ONLY (per-item read-only binds, never a whole
-/// store directory: /td/store holds exactly the loop's provisioned td-built
-/// userland items, the declared seed store holds the bounded seed-lock closure,
-/// and a bound item rejects writes).
-/// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox
-/// under the td-built userland. The probes resolve their programs (`sh`,
-/// `sleep`) from PATH like any consumer and bind the store item(s) those
-/// entries canonicalize into — NOTHING here assumes which package provides
-/// them (a multi-call farm today, discrete binaries tomorrow): the PATH entry
-/// itself is exec'd, so argv[0] keeps the program name and any layout
-/// dispatches correctly. The nested td-builder's processes are visible in this
-/// PID namespace, so a /proc cmdline scan confirms they are gone after the kill.
+/// store directory: /td/store holds exactly the loop's bound items, and a bound
+/// item rejects writes).
+/// Port of tests/sandbox-hardening.sh (gate 272). Runs INSIDE the loop sandbox.
+/// The probes are the stage0 td-builder's `gate-probe` verbs, run from the
+/// store item the loop binds read-only at /td/store; static and
+/// self-contained, it needs nothing else bound. The nested td-builder's
+/// processes are visible in this PID namespace, so a /proc cmdline scan
+/// confirms they are gone after the kill.
 fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     println!(
         ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak), \
@@ -3514,63 +3506,22 @@ fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     let tb = tb()?;
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
 
-    // Resolve the probes' programs from PATH — exec paths are the PATH
-    // entries themselves (argv[0] keeps the program name), bind targets are
-    // the store item(s) they canonicalize into. Derived per program; if a
-    // future userland provides sh and sleep from different packages, both
-    // items are bound.
-    let sh_exec = which_path("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
-    let sh_exec_s = path_str(&sh_exec)?;
-    let sh_canon = which_canon("sh").ok_or_else(|| String::from("FAIL: no sh on PATH"))?;
-    let sh_canon_s = path_str(&sh_canon)?;
-    let sleep_exec = which_path("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
-    let sleep_exec_s = path_str(&sleep_exec)?;
-    let sleep_canon = which_canon("sleep").ok_or_else(|| String::from("FAIL: no sleep on PATH"))?;
-    let sleep_canon_s = path_str(&sleep_canon)?;
-    let sroot = store_root_for(&sh_canon_s)?;
-    let item_of = |canon: &str| -> Result<String, String> {
-        Path::new(canon)
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| format!("FAIL: no package root above {canon}"))
-            .and_then(path_str)
-    };
-    let sh_item_s = item_of(&sh_canon_s)?;
-    let sh_item = Path::new(&sh_item_s);
-    let sleep_item_s = item_of(&sleep_canon_s)?;
-    // The exec paths must live inside the bound items — a PATH entry outside
-    // any store item would exec on the host but not in the nested sandbox.
-    for (exec, canon, item) in [
-        (&sh_exec_s, &sh_canon_s, &sh_item_s),
-        (&sleep_exec_s, &sleep_canon_s, &sleep_item_s),
-    ] {
-        if !exec.starts_with(&format!("{item}/")) && !canon.starts_with(&format!("{item}/")) {
-            return Err(format!(
-                "FAIL: {exec} (-> {canon}) is not inside its own store item {item}"
-            ));
-        }
-    }
-    let mut bind_flags: Vec<&str> = vec!["--store-item", &sh_item_s];
-    if sleep_item_s != sh_item_s {
-        bind_flags.push("--store-item");
-        bind_flags.push(&sleep_item_s);
-    }
+    // The probes run from the stage0 item the loop binds read-only; the nested
+    // sandboxes bind that one item, the per-item input-only model the loop
+    // itself uses.
+    let item = bound_stage0_item()?;
+    let item_s = path_str(&item)?;
+    let exec_s = path_str(&item.join("bin/td-builder"))?;
+    let sroot = store_root_for(&exec_s)?;
+    let leaf = format!("{exec_s} gate-probe park");
+    let bind_flags: Vec<&str> = vec!["--store-item", &item_s];
 
     // (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input
-    // absent. The nested sandbox binds ONLY the probes' own item(s) — the
-    // same per-item input-only model the loop itself uses.
+    // absent.
     println!(">> (A) minimal /dev: standard nodes present, host kmsg/kvm/disks/mem/input absent");
-    let dev_probe = "\
-[ -e /dev/null ] && [ -w /dev/null ]    || { echo \"  no writable /dev/null\";   exit 11; }
-[ -e /dev/zero ] && [ -e /dev/urandom ] || { echo \"  missing /dev/zero|urandom\"; exit 12; }
-for leak in kmsg kvm mem sda sdb nvme0n1 input/event0; do
-  [ -e \"/dev/$leak\" ] && { echo \"  LEAK: /dev/$leak is reachable\"; exit 21; }
-done
-exit 0
-";
     let mut dev_args: Vec<&str> = vec!["host-sandbox"];
     dev_args.extend_from_slice(&bind_flags);
-    dev_args.extend_from_slice(&["--", &sh_exec_s, "-c", dev_probe]);
+    dev_args.extend_from_slice(&["--", &exec_s, "gate-probe", "dev"]);
     tb_out(
         &tb,
         &dev_args,
@@ -3579,23 +3530,22 @@ exit 0
     println!("   /dev exposes the standard nodes; kmsg/kvm/mem/disks/input are absent");
 
     // (C) input-only store exposure: the loop sandbox binds store ITEMS, never
-    // a store directory. /td/store holds exactly the provisioned userland
-    // items (a handful); the seed store holds the seed-lock closure (a few
-    // dozen to a few hundred) — never a whole host store (hundreds of
-    // thousands of entries). And a bound item is READ-ONLY (its ro-remount is
-    // load-bearing, sandbox::Bind), so a write into a bound package must
-    // fail. Probed directly — this body already runs inside the loop sandbox.
+    // a store directory, so /td/store holds a handful of items — never a whole
+    // host store (hundreds of thousands of entries). And a bound item is
+    // READ-ONLY (its ro-remount is load-bearing, sandbox::Bind), so a write
+    // into it must fail. Probed directly — this body already runs inside the
+    // loop sandbox.
     println!(">> (C) input-only store: bounded item counts, items read-only");
     let entries = std::fs::read_dir(&sroot)
         .map_err(|e| format!("FAIL: cannot read {sroot}: {e}"))?
         .count();
     if entries == 0 || entries > 4096 {
         return Err(format!(
-            "FAIL: {sroot} exposes {entries} entries — expected the loop's provisioned \
-             userland items, not a whole-store bind"
+            "FAIL: {sroot} exposes {entries} entries — expected the loop's bound items, \
+             not a whole-store bind"
         ));
     }
-    let probe = sh_item.join(".td-ro-probe");
+    let probe = item.join(".td-ro-probe");
     if std::fs::File::create(&probe).is_ok() {
         let _ = std::fs::remove_file(&probe);
         return Err(format!(
@@ -3603,14 +3553,13 @@ exit 0
             probe.display()
         ));
     }
-    println!("   {sroot} exposes {entries} bound items; the sh package rejects writes");
+    println!("   {sroot} exposes {entries} bound items; the stage0 item rejects writes");
     // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
     println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
     // A distinctive token carried in every inner cmdline. It doubles as the sleep
     // duration, so it must be a large integer (≈ sleeps forever); derive it from
     // this process's pid (unique in this PID namespace, no RNG needed).
     let marker = (1_000_000u64 + u64::from(std::process::id()) % 1_000_000).to_string();
-    let inner = format!("{sleep_exec_s} {marker} & {sleep_exec_s} {marker} & wait");
     // Start from a clean slate. The marker is derived from a pid, and pids are
     // small and RECYCLED inside the loop sandbox, so a previous run of this
     // gate can have leaked a process carrying THIS run's marker — which makes
@@ -3635,7 +3584,7 @@ exit 0
     }
     let mut reap_args: Vec<&str> = vec!["host-sandbox"];
     reap_args.extend_from_slice(&bind_flags);
-    reap_args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
+    reap_args.extend_from_slice(&["--", &exec_s, "gate-probe", "sleep-tree", &marker]);
     let mut probe = Command::new(&tb);
     probe
         .args(&reap_args)
@@ -3649,24 +3598,24 @@ exit 0
     // The tree is UP when both leaf sleeps exist. Four processes above them
     // carry the marker in their own argv — the top td-builder, the PID-ns
     // parent that waits on PID 1, PID 1 itself (a fork of that parent that
-    // stays behind as init), and `sh` — so a count of marker-BEARING
-    // processes reaches 2 before `sh` has forked either leaf, and killing
+    // stays behind as init), and the sleep-tree — so a count of marker-BEARING
+    // processes reaches 2 before the tree has forked either leaf, and killing
     // there tests the sandbox mid-construction rather than once it is up.
     const LEAVES: usize = 2;
     for _ in 0..100 {
-        if scan_sleep_procs(&sleep_exec_s, &marker) == LEAVES {
+        if scan_leaf_procs(&leaf, &marker) == LEAVES {
             break;
         }
         std::thread::sleep(poll);
     }
-    let leaves = scan_sleep_procs(&sleep_exec_s, &marker);
+    let leaves = scan_leaf_procs(&leaf, &marker);
     let before = scan_marker_procs(&marker);
     println!("   inner procs carrying the marker before kill: {before} ({leaves} leaf sleeps)");
     if leaves != LEAVES {
         // Name what IS up and what was looked for: a leaf count stuck at zero
         // is equally "nothing started" and "the matcher does not match", and
         // the argv it wants is the only way to tell those apart.
-        println!("   wanted leaf argv: {sleep_exec_s} {marker} ");
+        println!("   wanted leaf argv: {leaf} {marker} ");
         for line in marker_cmdlines(&marker) {
             println!("   up: {line}");
         }
@@ -3789,10 +3738,9 @@ exit 0
                 "FAIL: {stale} process(es) already carry marker={marker} before cycle {i}"
             ));
         }
-        let inner = format!("{sleep_exec_s} {marker} & {sleep_exec_s} {marker} & wait");
         let mut args: Vec<&str> = vec!["host-sandbox"];
         args.extend_from_slice(&bind_flags);
-        args.extend_from_slice(&["--", &sh_exec_s, "-c", &inner]);
+        args.extend_from_slice(&["--", &exec_s, "gate-probe", "sleep-tree", &marker]);
         let mut probe = Command::new(&tb);
         probe
             .args(&args)
@@ -4131,11 +4079,11 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [behavioral]+[structural] a real binary at an input-addressed path RUNS.
-    let bs = busybox_pkg_dir()?;
+    let bs = stage0_package()?;
     let bs_s = path_str(&bs)?;
-    run_input_addressed_shell(&tb, &work, &bs_s, &k1, "busybox-static")?;
+    run_input_addressed_probe(&tb, &work, &bs_s, &k1, "stage0-static")?;
 
-    let _ = chmod_r_uw(&work);
+    let _ = make_writable(&work);
     let _ = std::fs::remove_dir_all(&work);
     println!(
         "PASS: toolchain-input-addressed — the /td/store modern toolchain has a STABLE \
@@ -4338,11 +4286,11 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [behavioral]+[structural] a real binary at the x86_64-keyed path RUNS.
-    let bs = busybox_pkg_dir()?;
+    let bs = stage0_package()?;
     let bs_s = path_str(&bs)?;
-    run_input_addressed_shell(&tb, &work, &bs_s, &kx, "busybox-static-x86_64")?;
+    run_input_addressed_probe(&tb, &work, &bs_s, &kx, "stage0-static-x86_64")?;
 
-    let _ = chmod_r_uw(&work);
+    let _ = make_writable(&work);
     let _ = std::fs::remove_dir_all(&work);
     println!(
         "PASS: toolchain-x86_64-input-addressed — the x86_64 /td/store toolchain has a STABLE \
@@ -4855,7 +4803,7 @@ fn stage0_cold_start(root: &Path) -> Result<(), String> {
     // scratch must really be gone, not merely attempted.
     let scratch = root.join(".td-build-cache/stage0-cold-start");
     if scratch.exists() {
-        let _ = chmod_r_uw(&scratch);
+        let _ = make_writable(&scratch);
         std::fs::remove_dir_all(&scratch)
             .map_err(|e| format!("FAIL: cannot clear {}: {e}", scratch.display()))?;
     }
@@ -5039,7 +4987,7 @@ fn stage0_cold_start(root: &Path) -> Result<(), String> {
         ));
     }
     println!("  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; controlled seed dir → the embedded synthetic ref recorded");
-    let _ = chmod_r_uw(&scratch);
+    let _ = make_writable(&scratch);
     let _ = std::fs::remove_dir_all(&scratch);
     println!(
         "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted \
@@ -5053,9 +5001,176 @@ fn stage0_cold_start(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// --- gate-probe: what the own-root and sandbox gates run inside their roots ----
+
+/// `td-builder gate-probe <probe> ...` — the programs the own-root and sandbox
+/// gates run inside the roots they build, where BusyBox's sh once ran their
+/// scripts. The stage0 td-builder is static with a self-only closure, so it
+/// runs with nothing but its own store item bound.
+pub fn gate_probe(args: &[String]) -> ExitCode {
+    let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+    match rest.as_slice() {
+        ["own-root", opts @ ..] => own_root_probe(opts),
+        ["dev"] => dev_probe(),
+        ["sleep-tree", marker] => sleep_tree(args.first(), marker),
+        ["park", secs] => park(secs),
+        _ => {
+            eprintln!(
+                "usage: td-builder gate-probe own-root [--package BASE] [--path DIRS] \
+                 [--resolve NAME]...\n       td-builder gate-probe dev\n       \
+                 td-builder gate-probe sleep-tree MARKER\n       td-builder gate-probe park SECONDS"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// What a root looks like from inside: /td/store present, the named package at
+/// /td/store/BASE, /gnu/store absent, each NAME found on the `:`-joined DIRS as
+/// a PATH lookup would find it, and RAN:42 computed as the probe runs.
+fn own_root_probe(opts: &[&str]) -> ExitCode {
+    let mut package = None;
+    let mut path = None;
+    let mut resolve = Vec::new();
+    let mut it = opts.iter();
+    while let Some(opt) = it.next() {
+        match (*opt, it.next()) {
+            ("--package", Some(v)) => package = Some(*v),
+            ("--path", Some(v)) => path = Some(*v),
+            ("--resolve", Some(v)) => resolve.push(*v),
+            _ => {
+                eprintln!("td-builder gate-probe own-root: bad option {opt}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if !resolve.is_empty() && path.is_none() {
+        eprintln!("td-builder gate-probe own-root: --resolve needs --path");
+        return ExitCode::from(2);
+    }
+    if Path::new("/td/store").is_dir() {
+        println!("TDSTORE-OK");
+    }
+    if let Some(base) = package {
+        if Path::new("/td/store").join(base).join("bin").is_dir() {
+            println!("PKG-AT-TDSTORE");
+        }
+    }
+    if Path::new("/gnu/store").exists() {
+        println!("GNU-PRESENT");
+    } else {
+        println!("GNU-ABSENT");
+    }
+    for name in resolve {
+        let found = path.unwrap_or_default().split(':').find_map(|dir| {
+            let candidate = Path::new(dir).join(name);
+            is_executable_file(&candidate).then_some(candidate)
+        });
+        if let Some(found) = found {
+            println!("RESOLVED {name} {}", found.display());
+        }
+    }
+    let (a, b) = (std::hint::black_box(40u32), std::hint::black_box(2u32));
+    println!("RAN:{}", a + b);
+    ExitCode::SUCCESS
+}
+
+/// The minimal-/dev assertion: the standard nodes present, host kmsg, kvm,
+/// memory, disks and input absent. Exit 11, 12 or 21 names the failed check.
+fn dev_probe() -> ExitCode {
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .is_err()
+    {
+        println!("  no writable /dev/null");
+        return ExitCode::from(11);
+    }
+    if !Path::new("/dev/zero").exists() || !Path::new("/dev/urandom").exists() {
+        println!("  missing /dev/zero|urandom");
+        return ExitCode::from(12);
+    }
+    for leak in [
+        "kmsg",
+        "kvm",
+        "mem",
+        "sda",
+        "sdb",
+        "nvme0n1",
+        "input/event0",
+    ] {
+        if Path::new("/dev").join(leak).exists() {
+            println!("  LEAK: /dev/{leak} is reachable");
+            return ExitCode::from(21);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Two `gate-probe park MARKER` leaves under this process, waited on: the tree
+/// the reaping legs kill. Each leaf is spawned through this process's own argv0,
+/// so the legs know the exact leaf argv to wait for.
+fn sleep_tree(argv0: Option<&String>, marker: &str) -> ExitCode {
+    let Some(exe) = argv0 else {
+        return ExitCode::from(2);
+    };
+    let mut leaves = Vec::new();
+    for _ in 0..2 {
+        let mut leaf = Command::new(exe);
+        leaf.args(["gate-probe", "park", marker])
+            .stdin(Stdio::null());
+        match leaf.spawn() {
+            Ok(child) => leaves.push(child),
+            Err(e) => {
+                eprintln!("td-builder gate-probe sleep-tree: spawn {exe}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    for mut leaf in leaves {
+        let _ = leaf.wait();
+    }
+    ExitCode::SUCCESS
+}
+
+/// Sleep SECONDS: a reaping leaf.
+fn park(secs: &str) -> ExitCode {
+    match secs.parse::<u64>() {
+        Ok(n) => {
+            std::thread::sleep(std::time::Duration::from_secs(n));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("td-builder gate-probe park: {secs}: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_base_is_a_base32_hash_dash_name() {
+        assert!(is_store_base(
+            "ina0rnnj9nzqwpgwm1yam7a4ixk1gp7n-td-builder-0.1.0"
+        ));
+        assert!(!is_store_base("target"));
+        assert!(!is_store_base("ina0rnnj9nzqwpgwm1yam7a4ixk1gp7n-"));
+        assert!(!is_store_base("ina0rnnj9nzqwpgwm1yam7a4ixk1gp7n"));
+        // `e` is outside nix-base32.
+        assert!(!is_store_base(
+            "ena0rnnj9nzqwpgwm1yam7a4ixk1gp7n-td-builder"
+        ));
+        assert!(!is_store_base(
+            "ina0rnnj9nzqwpgwm1yam7a4ixk1gp7nxtd-builder"
+        ));
+        // A multibyte character across byte 32 is refused, not split.
+        assert!(!is_store_base(
+            "ina0rnnj9nzqwpgwm1yam7a4ixk1gp7\u{e9}-td-builder"
+        ));
+    }
 
     /// The readiness test turns on matching a WHOLE argv, and on one byte of
     /// it: `/proc/<pid>/cmdline` NUL-TERMINATES every argument, so cooked it

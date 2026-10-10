@@ -24,9 +24,8 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // The runnable static fixture is the loop's td-built busybox, resolved
-        // from PATH in the body (gate_bodies::busybox_pkg_dir) — no declared
-        // guix-lock input.
+        // The runnable static fixture is the stage0 td-builder's own store
+        // item (gate_bodies::stage0_package) — no declared input.
         non_blocking: false,
     }
 }

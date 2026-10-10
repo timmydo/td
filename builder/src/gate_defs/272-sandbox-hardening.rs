@@ -13,6 +13,8 @@
 //! the tree is still being built, which is where PID 1 has been forked but has
 //! not yet armed. Unlike the others this SAMPLES a race rather than deciding
 //! one: a red means the window is open, a green does not prove it shut.
+//! The probes are the stage0 td-builder's `gate-probe` verbs, run from the
+//! item the loop binds read-only at /td/store.
 //! Heavy (a td-builder compile + nested-sandbox probes), in the heavy pool.
 //!
 //! `non_blocking`, which matters most for (D): a red here is tolerated by the

@@ -34,7 +34,7 @@ pub fn store_dir() -> String {
 }
 
 /// The nix store-path base-32 alphabet (omits e, o, u, t).
-const BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+pub(crate) const BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// nix base-32 of a digest, low-bit-first, MSB char first — the exact order
 /// printHash32 emits (n from nrChars-1 down to 0).
