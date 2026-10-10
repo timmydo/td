@@ -850,11 +850,33 @@ impl Session {
     ) -> Result<String, String> {
         let saved = self.saved.as_ref().map_err(Clone::clone)?;
         let next = with_template(&self.configured, saved, template.clone(), replacing)?;
-        if let (Ok(places), Ok(data)) = (&self.places, &self.data) {
-            let id = Id::random()?;
-            workspace::plan(&template, &id, data, &places.root, self.client.shared.len())?;
+        // Workspaces find their template by name: a new name that
+        // conversations of an earlier template still carry would hand
+        // them this one's folders and network.
+        if replacing != Some(template.name.as_str()) {
+            let orphans = orphans(&self.state.list().0, &template.name);
+            if orphans > 0 {
+                return Err(format!(
+                    "{orphans} conversation(s) made from an earlier template named {:?} are kept, and would take this one's shared folders and network; choose another name, or delete them first",
+                    template.name
+                ));
+            }
         }
-        self.keep_templates(next)?;
+        // Only the template saved is admitted again, so saving one never
+        // changes what another's workspaces reach.
+        let (own, refused) = own_shared(&template, self.places.as_ref().ok());
+        if let (Ok(places), Ok(data)) = (&self.places, &self.data) {
+            if !template.repos.is_empty() {
+                let shared = own.as_ref().map_or(self.client.shared.len(), Vec::len);
+                let id = Id::random()?;
+                workspace::plan(&template, &id, data, &places.root, shared)?;
+            }
+        }
+        self.keep_templates(next, Some((template.name.as_str(), own)))?;
+        let refused = match refused.as_slice() {
+            [] => String::new(),
+            notes => format!("; its workspaces are not given: {}", notes.join("; ")),
+        };
         Ok(match replacing {
             Some(old) if old != template.name => format!(
                 "the template {old:?} is now {:?}; workspaces made from it are kept, and bind the shared directories and reach the network no more",
@@ -862,7 +884,7 @@ impl Session {
             ),
             Some(_) => format!("the template {:?} is saved", template.name),
             None => format!("the template {:?} is saved; File \u{2192} New conversation\u{2026} lists it", template.name),
-        })
+        } + &refused)
     }
 
     /// Removes the template made in the window named `name`.
@@ -872,7 +894,7 @@ impl Session {
             return Err(format!("no template made in the window is named {name:?}"));
         }
         let next = saved.iter().filter(|t| t.name != name).cloned().collect();
-        self.keep_templates(next)?;
+        self.keep_templates(next, None)?;
         Ok(format!(
             "the template {name:?} is removed; workspaces made from it are kept, and bind the shared directories and reach the network no more"
         ))
@@ -880,12 +902,34 @@ impl Session {
 
     /// `saved` written as the templates file, then the chooser's list, the
     /// edit list and every conversation's shared directories made anew
-    /// from it; refused, nothing changes.
-    fn keep_templates(&mut self, saved: Vec<Template>) -> Result<(), String> {
+    /// from it: `admitted`'s template its admitted list, every other its
+    /// entry as held, never re-admitted; refused, nothing changes.
+    fn keep_templates(
+        &mut self,
+        saved: Vec<Template>,
+        admitted: Option<(&str, Option<Vec<crate::workspace::Shared>>)>,
+    ) -> Result<(), String> {
         let (templates, _) = merged_templates(&self.configured, &saved);
         let mut client = self.client.clone();
-        client.template_shared =
-            template_shared(&client.template_shared, &self.configured, &templates);
+        let held = &self.client.template_shared;
+        client.template_shared = template_shared(
+            &client.template_shared,
+            &self.configured,
+            &templates,
+            |template| match &admitted {
+                Some((name, own)) if *name == template.name => Some(TemplateShared {
+                    name: template.name.clone(),
+                    shared: own.clone(),
+                    network: template.network,
+                }),
+                // Every other as held, or none, binding nothing and
+                // reaching no network, when start withheld the lists.
+                _ => held
+                    .iter()
+                    .find(|entry| entry.name == template.name)
+                    .cloned(),
+            },
+        );
         if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
             return Err(
                 "the templates' shared directories and network policies would be too many to hand to conversations"
@@ -2540,17 +2584,14 @@ pub fn run(
         Ok(places) => {
             let (shared, mut notes) = workspace::admit_shared(&config.shared(&places.home), places);
             // A template's own list, admitted as the top-level one is; one
-            // made in the window has none, and takes the top level's.
+            // that names none takes the top level's.
             for template in &templates {
-                let shared = template.shared(&places.home).map(|own| {
-                    let (admitted, refused) = workspace::admit_shared(&own, places);
-                    notes.extend(
-                        refused
-                            .into_iter()
-                            .map(|note| format!("template {:?}: {note}", template.name)),
-                    );
-                    admitted
-                });
+                let (shared, refused) = own_shared(template, Some(places));
+                notes.extend(
+                    refused
+                        .into_iter()
+                        .map(|note| format!("template {:?}: {note}", template.name)),
+                );
                 client.template_shared.push(TemplateShared {
                     name: template.name.clone(),
                     shared,
@@ -2796,13 +2837,46 @@ fn with_template(
     Ok(next)
 }
 
-/// Each listed template's shared directories for the conversations: a
-/// configured one's as `held` has them, one made in the window's the
-/// top level's (`None`).
+/// `template`'s own shared directories admitted (DESIGN.md §8,
+/// Admission), with why each refused one is, or none when it names none;
+/// without `places`, where no workspace is made, an empty list, never
+/// the top level's.
+fn own_shared(
+    template: &Template,
+    places: Option<&Places>,
+) -> (Option<Vec<crate::workspace::Shared>>, Vec<String>) {
+    match (places, template.shared.is_some()) {
+        (_, false) => (None, Vec::new()),
+        (None, true) => (Some(Vec::new()), Vec::new()),
+        (Some(places), true) => {
+            let (admitted, refused) =
+                workspace::admit_shared(&template.shared(&places.home).unwrap_or_default(), places);
+            (Some(admitted), refused)
+        }
+    }
+}
+
+/// How many conversations' workspaces name the template `name`.
+fn orphans(metas: &[crate::store::Meta], name: &str) -> usize {
+    metas
+        .iter()
+        .filter(|meta| match &meta.workspace {
+            Some(Workspace::Template(of)) => of == name,
+            Some(Workspace::Repositories(repositories)) => repositories.template == name,
+            _ => false,
+        })
+        .count()
+}
+
+/// Each listed template's shared directories and network for the
+/// conversations: a configured one's as `held` has them, one made in the
+/// window's as `entry` gives it, or none, when its workspaces bind
+/// nothing and reach no network.
 fn template_shared(
     held: &[TemplateShared],
     configured: &[Template],
     listed: &[Template],
+    entry: impl FnMut(&Template) -> Option<TemplateShared>,
 ) -> Vec<TemplateShared> {
     let mut shared: Vec<TemplateShared> = held
         .iter()
@@ -2813,11 +2887,7 @@ fn template_shared(
         listed
             .iter()
             .filter(|template| !configured.iter().any(|t| t.name == template.name))
-            .map(|template| TemplateShared {
-                name: template.name.clone(),
-                shared: None,
-                network: template.network,
-            }),
+            .filter_map(entry),
     );
     shared
 }
@@ -2980,8 +3050,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
         as_staged, default_model, ended_pushes, forget_rules, held, local_remote, merged_templates,
-        names, pushing_entry, reached, refetched, remember, remember_crossing, set_mode,
-        template_shared, with_template, Client, TemplateShared,
+        names, orphans, own_shared, pushing_entry, reached, refetched, remember, remember_crossing,
+        set_mode, template_shared, with_template, Client, TemplateShared,
     };
     use crate::protocol::Down;
     use crate::workspace::Workspace;
@@ -3155,13 +3225,27 @@ mod tests {
                 network: None,
             },
         ];
-        let listed = [template("td"), template("mail")];
-        let shared = template_shared(&held, &configured, &listed);
-        let entries: Vec<(&str, bool)> = shared
+        let mut own_folder = template("own");
+        own_folder.shared = Some(Vec::new());
+        let listed = [template("td"), template("mail"), own_folder];
+        let listed = [listed.as_slice(), &[template("gone")]].concat();
+        let shared = template_shared(&held, &configured, &listed, |t| {
+            (t.name != "gone").then(|| TemplateShared {
+                name: t.name.clone(),
+                shared: t.shared.as_ref().map(|_| {
+                    vec![crate::workspace::Shared {
+                        path: "/admitted".into(),
+                        write: false,
+                    }]
+                }),
+                network: t.network,
+            })
+        });
+        let entries: Vec<(&str, Option<usize>)> = shared
             .iter()
-            .map(|entry| (entry.name.as_str(), entry.shared.is_some()))
+            .map(|entry| (entry.name.as_str(), entry.shared.as_ref().map(Vec::len)))
             .collect();
-        assert_eq!(entries, [("td", true), ("mail", false)]);
+        assert_eq!(entries, [("td", Some(0)), ("mail", None), ("own", Some(1))]);
     }
 
     /// The chooser lists the configuration's templates, then those made
@@ -3182,6 +3266,90 @@ mod tests {
         assert_eq!(names, ["td", "notes", "own"]);
         assert_eq!(clashes.len(), 1);
         assert!(clashes.first().unwrap().contains("\"TD\""), "{clashes:?}");
+    }
+
+    /// A template's own shared folders are admitted as the configured
+    /// ones are: one that resolves is bound at its real path, one that
+    /// does not is said and left out, and one whose every folder is
+    /// refused binds nothing, never the top level's; one naming none
+    /// takes the top level's, and without places nothing is admitted.
+    #[test]
+    fn a_templates_own_folders_are_admitted_and_never_widen() {
+        let scratch = crate::store::tests::Scratch::new("own-shared");
+        let root = std::fs::canonicalize(scratch.state().root()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        let places = crate::workspace::Places {
+            home: home.clone(),
+            state: root.join("state"),
+            root: home.join("td-agent"),
+            ..crate::workspace::Places::default()
+        };
+        let shared = |path: &str, write: bool| crate::workspace::Shared {
+            path: path.into(),
+            write,
+        };
+        let template = |own: Option<Vec<crate::workspace::Shared>>| crate::config::Template {
+            network: None,
+            name: "own".into(),
+            repos: Vec::new(),
+            shared: own,
+        };
+        let (admitted, refused) = own_shared(
+            &template(Some(vec![shared("~/notes", true), shared("~/gone", false)])),
+            Some(&places),
+        );
+        assert_eq!(
+            admitted,
+            Some(vec![crate::workspace::Shared {
+                path: home.join("notes"),
+                write: true
+            }])
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused.first().unwrap().contains("gone"), "{refused:?}");
+        let (admitted, refused) = own_shared(
+            &template(Some(vec![shared("~/gone", false)])),
+            Some(&places),
+        );
+        assert_eq!((admitted, refused.len()), (Some(Vec::new()), 1));
+        assert_eq!(
+            own_shared(&template(None), Some(&places)),
+            (None, Vec::new())
+        );
+        assert_eq!(
+            own_shared(&template(Some(vec![shared("~/notes", false)])), None),
+            (Some(Vec::new()), Vec::new())
+        );
+    }
+
+    /// Conversations whose workspace names a template, by the exact name
+    /// it is found by, are counted; others are not.
+    #[test]
+    fn orphaned_workspaces_are_counted_by_their_templates_name() {
+        let meta = |workspace: Option<Workspace>| crate::store::Meta {
+            id: crate::store::Id::random().unwrap(),
+            role: crate::store::Role::Conversation,
+            title: String::new(),
+            created: 0,
+            paused: false,
+            model: None,
+            effort: None,
+            workspace,
+            archived: false,
+            prepared: Vec::new(),
+            removed: false,
+            tracked: Vec::new(),
+        };
+        let metas = [
+            meta(Some(Workspace::Template("Notes".into()))),
+            meta(Some(Workspace::Template("other".into()))),
+            meta(Some(Workspace::Scratch)),
+            meta(None),
+        ];
+        assert_eq!(orphans(&metas, "Notes"), 1);
+        assert_eq!(orphans(&metas, "notes"), 0);
+        assert_eq!(orphans(&metas, "td"), 0);
     }
 
     /// A local remote is fetched and pushed only where no workspace

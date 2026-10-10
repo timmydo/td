@@ -2382,8 +2382,9 @@ creates nothing.
   template that names no repository makes an Empty workspace with its
   own shared directories.
 - **A template made in the window** is listed by its name after the
-  configured ones, and is one as a configured template is but for naming
-  no shared directories of its own: its workspaces bind the configured
+  configured ones, and is one as a configured template is: it may name
+  no repository, making an Empty workspace, and its own shared
+  directories, which its workspaces bind in place of the configured
   `shared` list.
 
 Choosing is the decision: no card follows it but a remote's admission
@@ -2394,12 +2395,18 @@ which can be sent at once. Two workspaces made from one template work
 on branches of the same name, each in a repository of its own (below),
 and a push names the remote branch it writes (§9).
 
-**Templates made in the window.** The human makes a repository template
-without editing the configuration, which td-agent never writes: File →
+**Templates made in the window.** The human makes a template without
+editing the configuration, which td-agent never writes: File →
 `New template…`, or the chooser's `New template…` row, opens a dialog of
 td-ui's entries asking a name, a remote, a base, a branch and,
-optionally, sparse paths parted by spaces and a network policy (§10),
-and Save checks them as
+optionally, sparse paths parted by spaces, a network policy (§10) and
+shared folders. With the remote left empty the template names no
+repository and its workspace is a scratch directory, as Empty's is,
+the base, branch and sparse paths unread; the shared folders are paths
+parted by spaces, each absolute or under `~`, read-only unless it ends
+`:rw`, at most 16, and empty for the configured `shared` list (so a
+path holding whitespace or a control character, or a read-only one
+ending `:rw`, cannot be named there). Save checks them as
 preparing the template would (the remote parsed as §7 admits one, the
 base a branch name, the branch one a push could name, each sparse path
 one the checkout's cone takes, and the template planned as its workspace
@@ -2410,18 +2417,28 @@ first conversation asking as any does. Directory… over a git repository,
 which it refuses (§8), opens the same dialog with that repository's path
 as the remote. File → `Edit template…` lists the templates made in the
 window and opens one in the dialog, its fields its first repository's,
-where Save replaces it, its other repositories kept, and Remove,
-confirmed, removes it. A template saved takes the top-level shared
-directories from then on; one removed or renamed leaves its workspaces
-as they are but for those, which they bind no more, so a removal never
-widens what a workspace reaches. They are kept in the state directory's
-`templates` file, a JSON list of each template's name, its network
-policy when it names one, and its repositories, with no other key,
-rewritten whole from the file's own list, never from
-the chooser's, and read back as written; one past 64, a name a template
-in the file has, ASCII case aside, a built-in's name, a template with no
-repository or more than a workspace takes, or one its plan refuses is
-refused. Save in the window also refuses a name a configured template
+or the remote empty for one naming none, where Save replaces it, its
+other repositories kept (emptying the remote of one naming others is
+refused), and Remove, confirmed, removes it. A template saved takes its
+own shared folders, admitted as the configured ones are at the start
+(§8, Admission) and each refused one said with the save, or the
+top-level list when it names none, from then on; only the template
+saved is admitted again, every other keeping the list admitted for it,
+so saving or removing one never changes what another's workspaces
+reach. One removed or renamed leaves its workspaces as they are but for
+those, which they bind no more, so a removal never widens what a
+workspace reaches; and since a workspace finds its template by name, a
+name that conversations made from an earlier template still carry is
+refused, until they are deleted, rather than handing them the new
+template's folders and network. They are kept
+in the state directory's `templates` file, a JSON list of each
+template's name, its network policy and shared folders when it names
+them, and its repositories, with no other key, rewritten whole from the
+file's own list, never from the chooser's, and read back as written;
+one past 64, a name a template in the file has, ASCII case aside, a
+built-in's name, a template with more repositories than a workspace
+takes, shared folders the dialog would not read back as written, or one
+its plan refuses is refused. Save in the window also refuses a name a configured template
 has. A file td-agent would not have written is set aside at start, said,
 and listed as none, or, when it cannot be moved, none is saved until it
 is mended; a template in the file named as a configured one is said, not
@@ -2433,21 +2450,25 @@ repository as above, the remote recorded as `Remote::url` gives it and
 the sparse paths through `repo::cone`; `config::templates_json` and
 `templates_from_json` write and read the file, the latter refusing a key
 td-agent does not write, a template whose remote is not so recorded, and
-one `workspace::plan` refuses when planned with a placeholder id under
-paths of 257 bytes and no shared directories;
-`StateDir::load_templates`, `save_templates`, which refuses what would
-not read back as written, and `set_templates_aside`; and the window
-lists them after the configuration's (`merged_templates`), each taking
-the top-level shared directories (a `template_shared` entry of `None`).
+one naming repositories that `workspace::plan` refuses when planned
+with a placeholder id under paths of 257 bytes and no shared
+directories, and shared folders `config::shared_field` would not read
+back from `shared_text`; `StateDir::load_templates`, `save_templates`,
+which refuses what would not read back as written, and
+`set_templates_aside`; and the window lists them after the
+configuration's (`merged_templates`), each with its own shared
+directories admitted, or the top-level ones (a `template_shared` entry
+of `None`) when it names none.
 
 **As built (templates made in the window, the dialog).**
 `templatedialog::TemplateDialog` is composed as the key dialog is, from
 td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
 its label, `chrome::Buttons` and td-ui's confirmation, centred and at
-most 72 cells wide: a title, what it does, the six fields (name;
-remote; base, `main` at first; branch, `agent` at first; sparse paths;
-network, `off`, `allowlist` or `open`, any case, or empty for the
-settings' `network`),
+most 72 cells wide: a title, what it does, the seven fields (name;
+remote, empty for a scratch workspace; base, `main` at first; branch,
+`agent` at first; sparse paths; network, `off`, `allowlist` or `open`,
+any case, or empty for the settings' `network`; shared folders,
+`config::shared_field`'s),
 two rows for a refusal, and Cancel and Save, with Remove between them
 for a template being edited. `Tab`/`Down` and `S-Tab`/`Up` move round
 the fields and buttons; `Return` saves from a field and presses a
@@ -2467,16 +2488,19 @@ refusal and moving the keyboard to its field (the remote's for a
 recorded remote too long), and then asks the window, which refuses a
 name a configured template or another made in the window has, ASCII case
 aside, a 65th template, and one `workspace::plan` refuses where its
-workspaces would be made with the top-level shared directories (without
+workspaces would be made with its shared directories (without
 the jail or a data directory, where none can be made, the file's own
 check alone), saying why in the dialog; else it writes the file and
 closes the dialog with a note. Remove is asked on a confirmation first.
 The window keeps the configured templates and the file's list apart,
 rewrites the file from the latter, and gives each conversation the
-shared directories anew: a configured template's as admitted at start,
-one made in the window `None`, even when start withheld every template's
-list as too long to hand over, since `None` adds nothing to the setup
-frame but the name. File's two items, the chooser's last row `New
+shared directories and network anew: a configured template's as
+admitted at start, the one saved its own admitted then (`None` when it
+names none), and each other made in the window its entry exactly as
+held, so one held with none, start having withheld every template's
+list as too long to hand over, still binds nothing and reaches no
+network; a save that would make the lists too long to hand over is
+refused. File's two items, the chooser's last row `New
 template…` (meta `make one`), whose name no template may take, and
 Directory… over a repository (`workspace::repository_remote`: the work
 tree's top, or a bare repository) open the dialog; Edit template… opens
@@ -2488,7 +2512,8 @@ has opened meanwhile, the note names the repository and File → New
 template… instead. The driven actions gain `new-template` and
 `edit-template`, which have no chord, and the state gains `template`:
 `none`, or the part the dialog's keyboard is on (`name`, `remote`,
-`base`, `branch`, `sparse`, `network`, `cancel`, `remove`, `save`, or
+`base`, `branch`, `sparse`, `network`, `shared`, `cancel`, `remove`,
+`save`, or
 `confirm`); a dialog given input through them saves nothing (§10, As
 built (the policy)), so through the seam they open, cancel and remove.
 

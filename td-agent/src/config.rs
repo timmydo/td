@@ -1212,9 +1212,58 @@ pub fn checked_repo(
 
 /// The most sparse paths a template made in the window names.
 pub const MAX_SPARSE: usize = 64;
+/// The most shared directories a template made in the window names.
+pub const MAX_TEMPLATE_SHARED: usize = 16;
 
-/// Templates made in the window as their file holds them: a name and its
-/// repositories each, the shared directories always the top level's.
+/// A template's shared directories as the dialog's field gives them:
+/// paths parted by spaces, each absolute or under `~`, read-only unless
+/// it ends `:rw`, with no control character, which the field cannot
+/// show; none when the field is empty, so its workspaces bind the
+/// top-level list.
+pub fn shared_field(text: &str) -> Result<Option<Vec<Shared>>, String> {
+    if text.contains(char::is_control) {
+        return Err("a shared folder's path holds a control character".into());
+    }
+    let mut shared: Vec<Shared> = Vec::new();
+    for word in text.split_whitespace() {
+        if shared.len() == MAX_TEMPLATE_SHARED {
+            return Err(format!("at most {MAX_TEMPLATE_SHARED} shared folders"));
+        }
+        let (path, write) = match word.strip_suffix(":rw") {
+            Some(path) => (path, true),
+            None => (word, false),
+        };
+        let path = configured_path("shared", path).map_err(|_| {
+            format!("a shared folder is an absolute path or one under `~`, ending `:rw` to let it be written, not {word:?}")
+        })?;
+        if shared.iter().any(|s| s.path == path) {
+            return Err(format!("{} is named twice", path.display()));
+        }
+        shared.push(Shared { path, write });
+    }
+    Ok((!shared.is_empty()).then_some(shared))
+}
+
+/// `shared_field`'s text for `shared`, back.
+pub fn shared_text(shared: Option<&[Shared]>) -> String {
+    shared
+        .unwrap_or_default()
+        .iter()
+        .map(|shared| {
+            let path = shared.path.display();
+            if shared.write {
+                format!("{path}:rw")
+            } else {
+                path.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Templates made in the window as their file holds them: a name, its
+/// network policy and shared directories when it names its own, and its
+/// repositories, none for a scratch workspace's.
 pub fn templates_json(templates: &[Template]) -> Json {
     Json::Arr(
         templates
@@ -1224,6 +1273,25 @@ pub fn templates_json(templates: &[Template]) -> Json {
                 // Only a template given one names a network policy.
                 if let Some(network) = template.network {
                     fields.push(("network".into(), Json::Str(network.name().into())));
+                }
+                if let Some(shared) = &template.shared {
+                    fields.push((
+                        "shared".into(),
+                        Json::Arr(
+                            shared
+                                .iter()
+                                .map(|shared| {
+                                    Json::Obj(vec![
+                                        (
+                                            "path".into(),
+                                            Json::Str(shared.path.display().to_string()),
+                                        ),
+                                        ("write".into(), Json::Bool(shared.write)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ));
                 }
                 fields.push((
                     "repos".into(),
@@ -1270,10 +1338,13 @@ const CHECK_PATH: usize = 256;
 
 /// `templates_json`'s value back, each template checked as one made in
 /// the window is: at most `MAX_TEMPLATES`, each named once, ASCII case
-/// aside, its keys only those td-agent writes, and planned as a
-/// workspace would be (`workspace::plan`), shared directories aside.
+/// aside, its keys only those td-agent writes, its shared directories
+/// as `shared_field` takes them, and one naming repositories planned as
+/// a workspace would be (`workspace::plan`), shared directories aside.
 pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
     let wrong = "not a list of templates, each a name and its repositories";
+    let wrong_shared =
+        "a template's shared directories are a list, each a path and whether it may be written";
     let items = value.as_arr().ok_or(wrong)?;
     if items.len() > MAX_TEMPLATES {
         return Err(format!("more than {MAX_TEMPLATES} templates"));
@@ -1282,7 +1353,7 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
     let id = crate::store::Id::parse(&"0".repeat(32)).ok_or("no placeholder id")?;
     let place = std::path::PathBuf::from(format!("/{}", "x".repeat(CHECK_PATH)));
     for item in items {
-        if !only_keys(item, &["name", "network", "repos"]) {
+        if !only_keys(item, &["name", "network", "shared", "repos"]) {
             return Err(wrong.into());
         }
         let network = match item.get("network") {
@@ -1298,10 +1369,51 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
         if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
             return Err(format!("two templates are named {name:?}"));
         }
+        let shared = match item.get("shared") {
+            None => None,
+            Some(list) => {
+                let list = list.as_arr().ok_or(wrong_shared)?;
+                if list.len() > MAX_TEMPLATE_SHARED {
+                    return Err(format!(
+                        "template {name:?} shares more than {MAX_TEMPLATE_SHARED} directories"
+                    ));
+                }
+                let shared = list
+                    .iter()
+                    .map(|entry| {
+                        if !only_keys(entry, &["path", "write"]) {
+                            return Err(wrong_shared.to_string());
+                        }
+                        let path = entry
+                            .get("path")
+                            .and_then(Json::as_str)
+                            .ok_or(wrong_shared)?;
+                        let write = entry
+                            .get("write")
+                            .and_then(Json::as_bool)
+                            .ok_or(wrong_shared)?;
+                        Ok(Shared {
+                            path: configured_path("shared", path)?,
+                            write,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(|e| format!("template {name:?}: {e}"))?;
+                // As the dialog would take them, so the file reads back
+                // as written.
+                let text = shared_text(Some(&shared));
+                if shared_field(&text).ok().flatten().as_ref() != Some(&shared) {
+                    return Err(format!(
+                        "template {name:?}: shared directories the dialog would not take"
+                    ));
+                }
+                Some(shared)
+            }
+        };
         let repos = item.get("repos").and_then(Json::as_arr).ok_or(wrong)?;
-        if repos.is_empty() || repos.len() > crate::workspace::MAX_ENTRIES {
+        if repos.len() > crate::workspace::MAX_ENTRIES {
             return Err(format!(
-                "template {name:?} has no repository, or more than {}",
+                "template {name:?} has more than {} repositories",
                 crate::workspace::MAX_ENTRIES
             ));
         }
@@ -1340,9 +1452,11 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
             network,
             name,
             repos,
-            shared: None,
+            shared,
         };
-        crate::workspace::plan(&template, &id, &place, &place, 0)?;
+        if !template.repos.is_empty() {
+            crate::workspace::plan(&template, &id, &place, &place, 0)?;
+        }
         templates.push(template);
     }
     Ok(templates)
@@ -2107,6 +2221,109 @@ mod tests {
             .contains("off, allowlist or open"));
     }
 
+    /// The dialog's shared folders: paths parted by spaces, read-only
+    /// unless one ends `:rw`, each absolute or under `~`, none named twice
+    /// and at most `MAX_TEMPLATE_SHARED`; an empty field is none, so the
+    /// top-level list; and the text reads back as it was given.
+    #[test]
+    fn a_templates_shared_folders_are_parsed_from_the_dialog() {
+        assert_eq!(shared_field("  ").unwrap(), None);
+        let shared = shared_field("~/notes  /srv/out:rw").unwrap().unwrap();
+        assert_eq!(
+            shared,
+            [
+                Shared {
+                    path: "~/notes".into(),
+                    write: false
+                },
+                Shared {
+                    path: "/srv/out".into(),
+                    write: true
+                }
+            ]
+        );
+        assert_eq!(shared_text(Some(&shared)), "~/notes /srv/out:rw");
+        assert_eq!(shared_text(None), "");
+        for (text, why) in [
+            ("notes", "absolute path"),
+            ("~/a ~/a:rw", "named twice"),
+            ("~/a\u{1b}b", "control character"),
+            (":rw", "absolute path"),
+        ] {
+            let e = shared_field(text).unwrap_err();
+            assert!(e.contains(why), "{text}: {e}");
+        }
+        let many = vec!["/x"; MAX_TEMPLATE_SHARED + 1]
+            .iter()
+            .enumerate()
+            .map(|(n, p)| format!("{p}{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(shared_field(&many).unwrap_err().contains("at most"));
+    }
+
+    /// A template made in the window may name no repository, making a
+    /// scratch workspace, and may name its own shared folders, which its
+    /// file keeps; folders the dialog would not take back as written are
+    /// refused, as is a list past its bound.
+    #[test]
+    fn a_scratch_template_made_in_the_window_keeps_its_shared_folders() {
+        let templates = vec![
+            Template {
+                network: Some(Network::Off),
+                name: "system".into(),
+                repos: Vec::new(),
+                shared: Some(vec![Shared {
+                    path: "~/notes".into(),
+                    write: true,
+                }]),
+            },
+            Template {
+                network: None,
+                name: "plain".into(),
+                repos: Vec::new(),
+                shared: None,
+            },
+        ];
+        let written = templates_json(&templates);
+        assert_eq!(templates_from_json(&written).unwrap(), templates);
+        assert!(
+            !written.to_string().contains(r#""name":"plain","shared""#),
+            "{written}"
+        );
+        for (from, to, why) in [
+            (r#""~/notes""#, r#""notes""#, "absolute path"),
+            (r#""~/notes""#, r#""~/my notes""#, "dialog would not take"),
+            (
+                r#""write":true"#,
+                r#""write":1"#,
+                "whether it may be written",
+            ),
+            (
+                r#""write":true"#,
+                r#""write":true,"x":1"#,
+                "whether it may be written",
+            ),
+        ] {
+            let wrong = td_json::parse(&written.to_string().replacen(from, to, 1)).unwrap();
+            let e = templates_from_json(&wrong).unwrap_err();
+            assert!(e.contains(why), "{to}: {e}");
+        }
+        let many = Template {
+            shared: Some(
+                (0..=MAX_TEMPLATE_SHARED)
+                    .map(|n| Shared {
+                        path: format!("/x{n}").into(),
+                        write: false,
+                    })
+                    .collect(),
+            ),
+            ..templates.first().unwrap().clone()
+        };
+        let e = templates_from_json(&templates_json(&[many])).unwrap_err();
+        assert!(e.contains("more than 16"), "{e}");
+    }
+
     /// A template made in the window is checked as preparing it would
     /// check it, its remote recorded as td-agent records one, and reads
     /// back from its file as written; a file td-agent would not have
@@ -2209,13 +2426,6 @@ mod tests {
             (one("Empty", "file:///srv/td"), "no template may be named"),
             (one(" td", "file:///srv/td"), "visible text"),
             (Json::Str("x".into()), "not a list"),
-            (
-                Json::Arr(vec![Json::Obj(vec![
-                    ("name".into(), Json::Str("td".into())),
-                    ("repos".into(), Json::Arr(Vec::new())),
-                ])]),
-                "no repository",
-            ),
         ] {
             let e = templates_from_json(&value).unwrap_err();
             assert!(e.contains(why), "{why}: {e}");
@@ -2249,7 +2459,7 @@ mod tests {
         let mut extra = one("td", "file:///srv/td");
         if let Json::Arr(items) = &mut extra {
             if let Some(Json::Obj(fields)) = items.first_mut() {
-                fields.push(("shared".into(), Json::Arr(Vec::new())));
+                fields.push(("since".into(), Json::Arr(Vec::new())));
             }
         }
         assert!(templates_from_json(&extra)

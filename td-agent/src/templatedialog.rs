@@ -1,6 +1,6 @@
 //! The dialog File → New template… and Edit template… open (DESIGN.md §7,
 //! Templates made in the window): a modal panel over the window holding a
-//! title, what the dialog does, six td-ui entries (`entry_model`, painted
+//! title, what the dialog does, seven td-ui entries (`entry_model`, painted
 //! by `chrome::TextEntry`), each under its label, a line for why the
 //! template is refused, and td-ui's buttons: Cancel and Save, and Remove
 //! between them for a template being edited, which td-ui's confirmation
@@ -35,7 +35,7 @@ const EDIT_BUTTONS: &[&str] = &["Cancel", "Remove", "Save"];
 const FIELDS: &[(&str, &str, usize)] = &[
     ("Name", "td", crate::config::MAX_TEMPLATE_NAME),
     (
-        "Remote: a URL, or a local repository's absolute path",
+        "Remote: a URL or repository's absolute path; empty for a scratch folder",
         "/srv/git/td",
         crate::git::MAX_TEXT,
     ),
@@ -59,15 +59,26 @@ const FIELDS: &[(&str, &str, usize)] = &[
         "off, allowlist or open",
         NETWORK_BYTES,
     ),
+    (
+        "Shared folders, parted by spaces, :rw to let one be written",
+        "~/notes ~/out:rw",
+        SHARED_BYTES,
+    ),
 ];
-/// The name, remote, base, branch, sparse paths' and network's fields,
-/// by place.
+/// How many fields the dialog has.
+const FIELD_COUNT: usize = FIELDS.len();
+/// The name, remote, base, branch, sparse paths', network's and shared
+/// folders' fields, by place.
 const NAME: usize = 0;
 const REMOTE: usize = 1;
 const BASE: usize = 2;
 const BRANCH: usize = 3;
 const SPARSE: usize = 4;
 const NETWORK: usize = 5;
+const SHARED: usize = 6;
+/// The most bytes the shared folders' field takes: every folder a
+/// template may name at the longest path, each with `:rw` and a space.
+const SHARED_BYTES: usize = crate::config::MAX_TEMPLATE_SHARED * (crate::config::MAX_NAME + 4);
 /// The most bytes the network's field takes.
 const NETWORK_BYTES: usize = 16;
 /// The most bytes the sparse paths' field takes: past a workspace
@@ -101,7 +112,8 @@ impl Part {
             Self::Field(BASE) => "base",
             Self::Field(BRANCH) => "branch",
             Self::Field(SPARSE) => "sparse",
-            Self::Field(_) => "network",
+            Self::Field(NETWORK) => "network",
+            Self::Field(_) => "shared",
             Self::Cancel => "cancel",
             Self::Remove => "remove",
             Self::Save => "save",
@@ -138,8 +150,8 @@ struct Layout {
     /// The explanation's first row; each line is a `ROW` under the last.
     lines: Rect,
     /// Each field's label row, then its entry.
-    labels: [Rect; 6],
-    entries: [TextEntry; 6],
+    labels: [Rect; FIELD_COUNT],
+    entries: [TextEntry; FIELD_COUNT],
     message: Rect,
     buttons: Buttons<'static>,
 }
@@ -199,40 +211,50 @@ impl TemplateDialog {
     pub fn new_template(surface: Surface, remote: Option<&str>) -> Result<Self, String> {
         Self::open(
             surface,
-            ["", remote.unwrap_or(""), "main", "agent", "", ""],
+            ["", remote.unwrap_or(""), "main", "agent", "", "", ""],
             None,
         )
     }
 
-    /// `template`'s dialog, its fields its first repository's, to save in
-    /// its place or remove.
+    /// `template`'s dialog, its fields its first repository's, or a
+    /// scratch template's with the remote empty, to save in its place or
+    /// remove.
     pub fn edit(surface: Surface, template: Template) -> Result<Self, String> {
-        let first = template
-            .repos
-            .first()
-            .cloned()
-            .ok_or_else(|| format!("the template {:?} names no repository", template.name))?;
-        let sparse = first
-            .sparse
-            .as_deref()
-            .map(|paths| paths.join(" "))
-            .unwrap_or_default();
+        let (remote, base, branch, sparse) = match template.repos.first() {
+            Some(first) => (
+                first.remote.as_str(),
+                first.base.as_str(),
+                first.branch.as_str(),
+                first
+                    .sparse
+                    .as_deref()
+                    .map(|paths| paths.join(" "))
+                    .unwrap_or_default(),
+            ),
+            None => ("", "main", "agent", String::new()),
+        };
         let network = template.network.map_or("", crate::config::Network::name);
+        let shared = crate::config::shared_text(template.shared.as_deref());
         Self::open(
             surface,
             [
                 &template.name,
-                &first.remote,
-                &first.base,
-                &first.branch,
+                remote,
+                base,
+                branch,
                 &sparse,
                 network,
+                &shared,
             ],
             Some(template.clone()),
         )
     }
 
-    fn open(surface: Surface, texts: [&str; 6], editing: Option<Template>) -> Result<Self, String> {
+    fn open(
+        surface: Surface,
+        texts: [&str; FIELD_COUNT],
+        editing: Option<Template>,
+    ) -> Result<Self, String> {
         let mut entries = Vec::with_capacity(FIELDS.len());
         for ((label, _, limit), text) in FIELDS.iter().zip(texts) {
             let mut entry = EntryModel::new(*limit).map_err(|e| format!("{label}: {e}"))?;
@@ -245,9 +267,9 @@ impl TemplateDialog {
             .as_ref()
             .map_or(0, |template| template.repos.len().saturating_sub(1));
         let explanation = match &editing {
-            None => "A repository template: each conversation made from it works on a worktree of its own of the remote, on the branch, from the base. Return saves, Tab moves, Escape cancels.".to_string(),
-            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it keep their worktrees, and their conversations take its network policy at once."),
-            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it keep their worktrees, and their conversations take its network policy at once.".to_string(),
+            None => "Each conversation made from it works on a worktree of its own of the remote, on the branch, from the base, or in a scratch folder with no remote, and reaches the shared folders. Return saves, Tab moves, Escape cancels.".to_string(),
+            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it keep their worktrees, and their conversations take its network policy and shared folders at once."),
+            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it keep their worktrees, and their conversations take its network policy and shared folders at once.".to_string(),
         };
         let mut dialog = Self {
             sparse_opened: texts[SPARSE].to_string(),
@@ -295,7 +317,7 @@ impl TemplateDialog {
     }
 
     /// The text of field `at`: name, remote, base, branch, sparse paths,
-    /// network.
+    /// network, shared folders.
     pub fn text(&self, at: usize) -> &str {
         self.entries.get(at).map_or("", EntryModel::text)
     }
@@ -391,6 +413,10 @@ impl TemplateDialog {
                 },
             )
         };
+        let mut entries = [entry(0)?; FIELD_COUNT];
+        for (at, slot) in entries.iter_mut().enumerate().skip(1) {
+            *slot = entry(at as i64)?;
+        }
         Some(Layout {
             rect: Rect {
                 x,
@@ -400,15 +426,8 @@ impl TemplateDialog {
             },
             title: band(0),
             lines: band(1),
-            labels: [label(0), label(1), label(2), label(3), label(4), label(5)],
-            entries: [
-                entry(0)?,
-                entry(1)?,
-                entry(2)?,
-                entry(3)?,
-                entry(4)?,
-                entry(5)?,
-            ],
+            labels: std::array::from_fn(|at| label(at as i64)),
+            entries,
             message: Rect {
                 height: (message_rows * row) as u32,
                 ..band(1 + lines + 2 * fields)
@@ -490,17 +509,70 @@ impl TemplateDialog {
             Ok(name) => name,
             Err(why) => return self.refuse(NAME, why),
         };
-        let remote = text(REMOTE);
-        if let Err(why) = crate::git::Remote::parse(&remote) {
-            return self.refuse(REMOTE, why);
+        let (remote, network, shared) = (text(REMOTE), text(NETWORK), text(SHARED));
+        let others: Vec<crate::config::Repo> = self
+            .editing
+            .as_ref()
+            .and_then(|editing| editing.repos.get(1..))
+            .unwrap_or_default()
+            .to_vec();
+        // No remote is a scratch folder's template: base, branch and
+        // sparse paths have nothing to name.
+        let repos = if remote.is_empty() {
+            if !others.is_empty() {
+                return self.refuse(
+                    REMOTE,
+                    "the template names other repositories, which keep the first",
+                );
+            }
+            Vec::new()
+        } else {
+            match self.first_repo(&remote) {
+                Ok(repo) => std::iter::once(repo).chain(others).collect(),
+                Err(reply) => return reply,
+            }
+        };
+        let network = match network.to_ascii_lowercase().as_str() {
+            "" => None,
+            named => match crate::config::Network::parse(named) {
+                Some(network) => Some(network),
+                None => {
+                    return self.refuse(
+                        NETWORK,
+                        "the network is off, allowlist or open, or none for your settings'",
+                    )
+                }
+            },
+        };
+        let shared = match crate::config::shared_field(&shared) {
+            Ok(shared) => shared,
+            Err(why) => return self.refuse(SHARED, why),
+        };
+        Reply::Save {
+            template: Template {
+                network,
+                name,
+                repos,
+                shared,
+            },
+            replacing: self.editing().map(str::to_string),
+        }
+    }
+
+    /// The first repository the fields name, `remote` given: checked as
+    /// preparing it would, else the refusal of the first field at fault.
+    fn first_repo(&mut self, remote: &str) -> Result<crate::config::Repo, Reply> {
+        let text = |at: usize| self.text(at).trim().to_string();
+        if let Err(why) = crate::git::Remote::parse(remote) {
+            return Err(self.refuse(REMOTE, why));
         }
         let base = text(BASE);
         if let Err(why) = crate::git::branch_name(&base) {
-            return self.refuse(BASE, format!("the base: {why}"));
+            return Err(self.refuse(BASE, format!("the base: {why}")));
         }
         let branch = text(BRANCH);
         if let Err(why) = crate::git::push_branch(&branch) {
-            return self.refuse(BRANCH, format!("the branch: {why}"));
+            return Err(self.refuse(BRANCH, format!("the branch: {why}")));
         }
         // Unchanged, the paths stay as they were: one holding a space, or
         // none at all rather than the whole tree, reads back the same.
@@ -519,35 +591,10 @@ impl TemplateDialog {
         });
         // What is left to refuse is the sparse paths', but for a remote
         // too long once recorded.
-        let repo = match crate::config::checked_repo(&remote, &base, &branch, sparse) {
-            Ok(repo) => repo,
-            Err(why) if why.contains("sparse") => return self.refuse(SPARSE, why),
-            Err(why) => return self.refuse(REMOTE, why),
-        };
-        let network = match text(NETWORK).to_ascii_lowercase().as_str() {
-            "" => None,
-            named => match crate::config::Network::parse(named) {
-                Some(network) => Some(network),
-                None => {
-                    return self.refuse(
-                        NETWORK,
-                        "the network is off, allowlist or open, or none for your settings'",
-                    )
-                }
-            },
-        };
-        let mut repos = vec![repo];
-        if let Some(editing) = &self.editing {
-            repos.extend(editing.repos.iter().skip(1).cloned());
-        }
-        Reply::Save {
-            template: Template {
-                network,
-                name,
-                repos,
-                shared: None,
-            },
-            replacing: self.editing().map(str::to_string),
+        match crate::config::checked_repo(remote, &base, &branch, sparse) {
+            Ok(repo) => Ok(repo),
+            Err(why) if why.contains("sparse") => Err(self.refuse(SPARSE, why)),
+            Err(why) => Err(self.refuse(REMOTE, why)),
         }
     }
 
@@ -964,9 +1011,10 @@ mod tests {
                 dialog.text(2),
                 dialog.text(3),
                 dialog.text(4),
-                dialog.text(5)
+                dialog.text(5),
+                dialog.text(6)
             ],
-            ["", "/srv/git/td", "main", "agent", "", ""]
+            ["", "/srv/git/td", "main", "agent", "", "", ""]
         );
         assert_eq!(
             dialog.key("Return", false, &mut NoClipboard),
@@ -1047,6 +1095,38 @@ mod tests {
             panic!("not saved");
         };
         assert_eq!(template.network, Some(crate::config::Network::Open));
+        // The shared folders: paths, `:rw` to let one be written. A
+        // refusal is the first field's at fault, in the fields' order.
+        dialog.key("Tab", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "shared");
+        typed(&mut dialog, "notes");
+        dialog.key("S-Tab", false, &mut NoClipboard);
+        dialog.key("S-Tab", false, &mut NoClipboard);
+        dialog.key("S-Tab", false, &mut NoClipboard);
+        dialog.key("S-Tab", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "base");
+        clear(&mut dialog);
+        typed(&mut dialog, "-bad");
+        dialog.key("Return", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "base");
+        clear(&mut dialog);
+        typed(&mut dialog, "main");
+        dialog.key("Return", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "shared");
+        assert!(
+            dialog.message().unwrap().contains("absolute path"),
+            "{:?}",
+            dialog.message()
+        );
+        clear(&mut dialog);
+        typed(&mut dialog, "~/notes /srv/out:rw");
+        let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
+            panic!("not saved");
+        };
+        assert_eq!(
+            template.shared,
+            crate::config::shared_field("~/notes /srv/out:rw").unwrap()
+        );
         // Escape cancels, from anywhere; Tab goes round the buttons.
         for _ in 0..2 {
             dialog.key("Tab", false, &mut NoClipboard);
@@ -1055,6 +1135,59 @@ mod tests {
         dialog.key("Tab", false, &mut NoClipboard);
         assert_eq!(dialog.part(), "name");
         assert_eq!(dialog.key("Escape", false, &mut NoClipboard), Reply::Closed);
+    }
+
+    /// With no remote the template makes a scratch workspace: base,
+    /// branch and sparse paths are not asked about, and it saves with no
+    /// repository and its shared folders; edited, it opens with the
+    /// remote empty and its folders as typed. One naming other
+    /// repositories keeps its first.
+    #[test]
+    fn a_template_with_no_remote_is_a_scratch_folders() {
+        let mut dialog = TemplateDialog::new_template(surface(), None).unwrap();
+        typed(&mut dialog, "system");
+        for _ in 0..6 {
+            dialog.key("Tab", false, &mut NoClipboard);
+        }
+        assert_eq!(dialog.part(), "shared");
+        typed(&mut dialog, "~/notes:rw");
+        let Reply::Save {
+            template,
+            replacing,
+        } = dialog.key("Return", false, &mut NoClipboard)
+        else {
+            panic!("not saved");
+        };
+        assert_eq!(replacing, None);
+        assert!(template.repos.is_empty());
+        assert_eq!(
+            template.shared,
+            crate::config::shared_field("~/notes:rw").unwrap()
+        );
+        let mut edited = TemplateDialog::edit(surface(), template.clone()).unwrap();
+        assert_eq!([edited.text(1), edited.text(6)], ["", "~/notes:rw"]);
+        assert_eq!(
+            edited.key("Return", false, &mut NoClipboard),
+            Reply::Save {
+                template: template.clone(),
+                replacing: Some("system".into()),
+            }
+        );
+        let repo = crate::config::checked_repo("/srv/git/td", "main", "agent", None).unwrap();
+        let two = Template {
+            repos: vec![repo.clone(), repo],
+            ..template
+        };
+        let mut edited = TemplateDialog::edit(surface(), two).unwrap();
+        edited.key("Tab", false, &mut NoClipboard);
+        clear(&mut edited);
+        edited.key("Return", false, &mut NoClipboard);
+        assert_eq!(edited.part(), "remote");
+        assert!(
+            edited.message().unwrap().contains("other repositories"),
+            "{:?}",
+            edited.message()
+        );
     }
 
     /// An edited template's dialog holds its first repository; Save puts
@@ -1089,7 +1222,7 @@ mod tests {
         assert_eq!(saved.repos[0].base, "next");
         assert_eq!(saved.repos[1], second);
         // Remove: asked, cancelled, kept; asked, confirmed, removed.
-        for _ in 0..5 {
+        for _ in 0..6 {
             dialog.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(dialog.part(), "remove");
@@ -1108,7 +1241,7 @@ mod tests {
         );
         // A new template's dialog has no Remove.
         let mut new = TemplateDialog::new_template(surface(), None).unwrap();
-        for _ in 0..7 {
+        for _ in 0..8 {
             new.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(new.part(), "save");

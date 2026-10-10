@@ -4828,7 +4828,14 @@ impl App {
         let rows: Vec<(String, String)> = self
             .saved_templates
             .iter()
-            .map(|template| (template.name.clone(), "repositories".to_string()))
+            .map(|template| {
+                let kind = if template.repos.is_empty() {
+                    "scratch"
+                } else {
+                    "repositories"
+                };
+                (template.name.clone(), kind.to_string())
+            })
             .collect();
         let opened = Picker::templates(
             self.surface,
@@ -8789,7 +8796,7 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         assert_eq!(app.template_dialog().unwrap().editing(), Some("td"));
         assert!(text(&app).contains("Edit template"));
-        for _ in 0..7 {
+        for _ in 0..8 {
             key_live(&mut app, "Tab");
         }
         assert_eq!(app.template_dialog().unwrap().part(), "remove");
