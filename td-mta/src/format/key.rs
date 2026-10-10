@@ -77,6 +77,36 @@ impl<'a> Key<'a> {
         }
     }
 
+    /// Orders logical fields, independently of their transient encoding.
+    pub fn compare(self, other: Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Blob(a), Self::Blob(b)) | (Self::Lease(a), Self::Lease(b)) => a.cmp(&b),
+            (Self::Mailbox(a), Self::Mailbox(b)) => a.cmp(&b),
+            (Self::Email(a), Self::Email(b)) => a.cmp(&b),
+            (Self::Thread(a), Self::Thread(b)) => a.cmp(&b),
+            (Self::Submission(a), Self::Submission(b)) => a.cmp(&b),
+            (Self::Membership(a, b), Self::Membership(c, d)) => (a, b).cmp(&(c, d)),
+            (Self::Keyword(a, b), Self::Keyword(c, d)) => (a, b).cmp(&(c, d)),
+            (Self::ThreadAnchor(a, b), Self::ThreadAnchor(c, d)) => (a, b).cmp(&(c, d)),
+            (Self::Recipient(a, b), Self::Recipient(c, d)) => (a, b).cmp(&(c, d)),
+            (
+                Self::Import {
+                    instance: a,
+                    kind: b,
+                    account: c,
+                    object: d,
+                },
+                Self::Import {
+                    instance: e,
+                    kind: f,
+                    account: g,
+                    object: h,
+                },
+            ) => (a, b.tag(), c, d).cmp(&(e, f.tag(), g, h)),
+            _ => self.table().tag().cmp(&other.table().tag()),
+        }
+    }
+
     /// Checks the complete key; individual import-ID bounds alone are insufficient.
     pub fn encoded_len(self) -> Result<usize, Error> {
         let len = match self {
@@ -216,6 +246,62 @@ impl<'a> Key<'a> {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_order_ignores_framing_and_compares_each_field() {
+        let email = EmailId::from_bytes([1; 16]);
+        let later = EmailId::from_bytes([2; 16]);
+        for (a, b) in [
+            (
+                Key::Membership(email, MailboxId::from_bytes([1; 16])),
+                Key::Membership(email, MailboxId::from_bytes([2; 16])),
+            ),
+            (Key::Keyword(email, "aa"), Key::Keyword(email, "z")),
+            (Key::Keyword(email, "z"), Key::Keyword(later, "a")),
+            (
+                Key::Blob(BlobId::from_bytes([255; 16])),
+                Key::Mailbox(MailboxId::from_bytes([0; 16])),
+            ),
+            (
+                Key::ThreadAnchor("aa", later),
+                Key::ThreadAnchor("z", email),
+            ),
+            (
+                Key::ThreadAnchor("a", later),
+                Key::ThreadAnchor("aa", email),
+            ),
+            (Key::ThreadAnchor("é", later), Key::ThreadAnchor("ê", email)),
+            (
+                Key::ThreadAnchor("same", email),
+                Key::ThreadAnchor("same", later),
+            ),
+            (
+                Key::Recipient(SubmissionId::from_bytes([1; 16]), 255),
+                Key::Recipient(SubmissionId::from_bytes([1; 16]), 256),
+            ),
+        ] {
+            assert!(a.compare(b).is_lt());
+            assert!(b.compare(a).is_gt());
+            assert!(a.compare(a).is_eq());
+        }
+        let import = |kind, account, object| Key::Import {
+            instance: InstanceId::from_bytes([1; 16]),
+            kind,
+            account,
+            object,
+        };
+        let ordered = [
+            import(SourceKind::Mailbox, b"z".as_slice(), b"z".as_slice()),
+            import(SourceKind::Email, b"aa", b"z"),
+            import(SourceKind::Email, b"z", b"a"),
+            import(SourceKind::Email, b"z", b"a\0"),
+            import(SourceKind::Email, b"z", b"aa"),
+            import(SourceKind::Email, b"z", b"z"),
+        ];
+        for pair in ordered.windows(2) {
+            assert!(pair[0].compare(pair[1]).is_lt());
+        }
+    }
 
     #[test]
     fn all_table_keys_have_canonical_encodings() -> Result<(), Error> {

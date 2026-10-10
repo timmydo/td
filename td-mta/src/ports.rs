@@ -208,7 +208,7 @@ pub trait ReadView: Send + Sync {
         key: Key<'_>,
         value: &'a mut [u8],
     ) -> Result<Option<(Row<'a>, Sequence)>, Error>;
-    /// Strictly after the encoded key (or first); ascending canonical key order.
+    /// Strictly after the decoded cursor (or first); ascending Key::compare order.
     fn next<'a>(
         &mut self,
         table: Table,

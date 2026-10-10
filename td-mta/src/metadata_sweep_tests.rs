@@ -149,8 +149,8 @@ impl ReadView for View {
             .rows
             .iter()
             .filter(|r| r.row.table() == table)
-            .filter(|r| after.is_none_or(|a| encoded(r.key).as_slice() > a))
-            .min_by_key(|r| encoded(r.key));
+            .filter(|r| after.is_none_or(|a| Key::decode(table, a).unwrap().compare(r.key).is_lt()))
+            .min_by(|a, b| a.key.compare(b.key));
         let Some(record) = record else {
             return Ok(None);
         };

@@ -114,13 +114,11 @@ CREATE TABLE thread_anchors(
     account BLOB NOT NULL CHECK(length(account)=16),
     message_id TEXT COLLATE BINARY NOT NULL CHECK(length(CAST(message_id AS BLOB)) BETWEEN 1 AND 1004),
     email_id BLOB NOT NULL CHECK(length(email_id)=16),
-    key_length_order INTEGER GENERATED ALWAYS AS (((length(CAST(message_id AS BLOB))%256)*256+(length(CAST(message_id AS BLOB))/256))) VIRTUAL,
     changed BLOB NOT NULL CHECK(length(changed)=8),
     PRIMARY KEY(account,message_id,email_id),
     FOREIGN KEY(account) REFERENCES accounts(id),
     FOREIGN KEY(account,email_id) REFERENCES emails(account,id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX anchors_order ON thread_anchors(account,key_length_order,message_id,email_id);
 CREATE INDEX anchors_email ON thread_anchors(account,email_id);
 CREATE TABLE submissions(
     account BLOB NOT NULL CHECK(length(account)=16),
@@ -189,15 +187,12 @@ CREATE TABLE imports(
     local_object BLOB NOT NULL CHECK(length(local_object)=16),
     historical_blob BLOB CHECK(historical_blob IS NULL OR length(historical_blob)=16),
     source_digest BLOB NOT NULL CHECK(length(source_digest)=32),
-    account_length_order INTEGER GENERATED ALWAYS AS (((length(source_account)%256)*256+(length(source_account)/256))) VIRTUAL,
-    object_length_order INTEGER GENERATED ALWAYS AS (((length(source_object)%256)*256+(length(source_object)/256))) VIRTUAL,
     changed BLOB NOT NULL CHECK(length(changed)=8),
     CHECK(length(source_account)+length(source_object)<=999),
     CHECK((source_kind=3)=(historical_blob IS NOT NULL)),
     PRIMARY KEY(account,source_instance,source_kind,source_account,source_object),
     FOREIGN KEY(account) REFERENCES accounts(id)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX imports_order ON imports(account,source_instance,source_kind,account_length_order,source_account,object_length_order,source_object);
 CREATE TABLE changes(
     account BLOB NOT NULL CHECK(length(account)=16),
     sequence BLOB NOT NULL CHECK(length(sequence)=8),
@@ -318,23 +313,21 @@ const THREADS: Queries = Queries {
 };
 
 const THREADANCHORS: Queries = Queries {
-
-get: concat!(
-    "SELECT message_id,email_id,",
-    "changed FROM thread_anchors WHERE account=?1 AND message_id=?2 AND email_id=?3",
-),
-first: concat!(
-    "SELECT message_id,email_id,",
-    "changed FROM thread_anchors WHERE account=?1 ORDER BY key_length_order,",
-    "message_id,email_id LIMIT 1",
-),
-next: concat!(
-    "SELECT message_id,email_id,changed FROM thread_anchors WHERE account=?1 AND (key_length_order,",
-    "message_id,email_id)>(?4,?2,?3) ORDER BY key_length_order,",
-    "message_id,email_id LIMIT 1",
-),
-delete: "DELETE FROM thread_anchors WHERE account=?1 AND message_id=?2 AND email_id=?3",
-
+    get: concat!(
+        "SELECT message_id,email_id,",
+        "changed FROM thread_anchors WHERE account=?1 AND message_id=?2 AND email_id=?3",
+    ),
+    first: concat!(
+        "SELECT message_id,email_id,",
+        "changed FROM thread_anchors WHERE account=?1 ORDER BY ",
+        "message_id,email_id LIMIT 1",
+    ),
+    next: concat!(
+        "SELECT message_id,email_id,changed FROM thread_anchors WHERE account=?1 AND (",
+        "message_id,email_id)>(?2,?3) ORDER BY ",
+        "message_id,email_id LIMIT 1",
+    ),
+    delete: "DELETE FROM thread_anchors WHERE account=?1 AND message_id=?2 AND email_id=?3",
 };
 
 const SUBMISSIONS: Queries = Queries {
@@ -405,14 +398,14 @@ get: concat!(
 first: concat!(
     "SELECT source_instance,source_kind,source_account,source_object,local_object,historical_blob,",
     "source_digest,changed FROM imports WHERE account=?1 ORDER BY source_instance,source_kind,",
-    "account_length_order,source_account,object_length_order,source_object LIMIT 1",
+    "source_account,source_object LIMIT 1",
 ),
 next: concat!(
     "SELECT source_instance,source_kind,source_account,source_object,local_object,historical_blob,",
     "source_digest,changed FROM imports WHERE account=?1 AND (source_instance,source_kind,",
-    "account_length_order,source_account,object_length_order,source_object)>(?2,?3,?6,?4,?7,",
-    "?5) ORDER BY source_instance,source_kind,account_length_order,source_account,",
-    "object_length_order,source_object LIMIT 1",
+    "source_account,source_object)>(?2,?3,?4,",
+    "?5) ORDER BY source_instance,source_kind,source_account,",
+    "source_object LIMIT 1",
 ),
 delete: "DELETE FROM imports WHERE account=?1 AND source_instance=?2 AND source_kind=?3 AND source_account=?4 AND source_object=?5",
 

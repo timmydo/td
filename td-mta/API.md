@@ -6582,8 +6582,10 @@ activated by it.
 view captures a real SQLite WAL read transaction under the writer mutex.
 ViewIdentity contains account, epoch, committed_sequence and history_floor.
 Later commits remain invisible. get and next decode bounded typed rows into
-caller buffers; next follows strictly increasing encoded keys. Missing rows
-return None; insufficient buffers return Capacity. Bad rows return Corrupt.
+caller buffers; next follows strictly increasing decoded `Key::compare`
+order. The cursor encoding transports the fields without determining their
+order. Missing rows return None; insufficient buffers return Capacity.
+Bad rows return Corrupt.
 Detached rows borrow the caller buffers and confer no body or view ownership.
 
 next_change reads the native kind/sequence/operation index through the

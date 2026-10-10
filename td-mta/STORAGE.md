@@ -34,7 +34,7 @@ SQLite uses its bundled Unix VFS; td-owned Rust adds no direct syscall
 or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
 extra hard link or oversized file refuses startup. Creation refuses
 preexisting database/WAL/SHM paths. Application ID, exact schema version
-2, closed schema and 4096-byte pages are checked before accepting the
+3, closed schema and 4096-byte pages are checked before accepting the
 store. Full integrity_check, foreign_key_check, per-Email anchor
 cardinality and complete blob chunk geometry are explicit
 validate_integrity maintenance, not an opening scan. SQLite validates
@@ -1541,9 +1541,10 @@ separate. The low-level spool does not implement those ports or a CLI.
 Each domain has an explicit table and typed columns, with account-scoped
 primary keys and native foreign keys. IDs use exact 16-byte BLOB columns;
 ordinary metadata is TEXT or INTEGER, not an opaque encoded value. Logical
-ReadView key ordering remains FORMAT.md's unsigned byte order. Anchor/import
-length-rank indexes preserve its little-endian length-prefix order without
-storing encoded shadow keys. No table is loaded in full into RAM.
+ReadView ordering follows decoded key fields as specified by FORMAT.md.
+Anchor/import scans seek their native primary-key tuples directly; transient
+length prefixes do not enter the schema or its indexes. No table is loaded
+in full into RAM.
 
 | Table | Key | Authoritative value |
 | --- | --- | --- |

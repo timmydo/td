@@ -21,15 +21,10 @@ fn format_error(error: format::Error) -> ports::Error {
         _ => ports::Error::Corrupt,
     }
 }
-fn length_order(length: usize) -> Result<i64, ports::Error> {
-    let length = i64::try_from(length).map_err(|_| ports::Error::Invalid)?;
-    Ok((length % 256) * 256 + length / 256)
-}
 fn bind_key(
     statement: &mut Statement<'_>,
     account: AccountId,
     key: Key<'_>,
-    ordered: bool,
 ) -> Result<(), ports::Error> {
     statement
         .raw_bind_parameter(1, account.as_bytes().as_slice())
@@ -69,11 +64,6 @@ fn bind_key(
             statement
                 .raw_bind_parameter(3, email.as_bytes().as_slice())
                 .map_err(sql)?;
-            if ordered {
-                statement
-                    .raw_bind_parameter(4, length_order(message.len())?)
-                    .map_err(sql)?;
-            }
         }
         Key::Recipient(submission, ordinal) => {
             statement
@@ -93,14 +83,6 @@ fn bind_key(
             statement.raw_bind_parameter(3, kind.tag()).map_err(sql)?;
             statement.raw_bind_parameter(4, account).map_err(sql)?;
             statement.raw_bind_parameter(5, object).map_err(sql)?;
-            if ordered {
-                statement
-                    .raw_bind_parameter(6, length_order(account.len())?)
-                    .map_err(sql)?;
-                statement
-                    .raw_bind_parameter(7, length_order(object.len())?)
-                    .map_err(sql)?;
-            }
         }
     }
     Ok(())
@@ -114,7 +96,7 @@ pub(super) fn delete(
     let mut statement = db
         .prepare(schema::queries(key.table()).delete)
         .map_err(sql)?;
-    bind_key(&mut statement, account, key, false)?;
+    bind_key(&mut statement, account, key)?;
     statement.raw_execute().map_err(sql)?;
     Ok(())
 }
@@ -126,7 +108,7 @@ pub(super) fn get(
 ) -> Result<Option<(usize, Sequence)>, ports::Error> {
     key.validate_local().map_err(|_| ports::Error::Invalid)?;
     let mut statement = db.prepare(schema::queries(key.table()).get).map_err(sql)?;
-    bind_key(&mut statement, account, key, false)?;
+    bind_key(&mut statement, account, key)?;
     let mut rows = statement.raw_query();
     let Some(row) = rows.next().map_err(sql)? else {
         return Ok(None);
@@ -159,7 +141,7 @@ pub(super) fn next(
     if let Some(after) = after {
         let after = Key::decode(table, after).map_err(|_| ports::Error::Invalid)?;
         after.validate_local().map_err(|_| ports::Error::Invalid)?;
-        bind_key(&mut statement, account, after, true)?;
+        bind_key(&mut statement, account, after)?;
     } else {
         statement
             .raw_bind_parameter(1, account.as_bytes().as_slice())
@@ -671,7 +653,7 @@ mod tests {
         );
     }
     #[test]
-    fn length_prefixed_keys_enumerate_in_original_unsigned_byte_order() {
+    fn length_prefixed_keys_enumerate_in_logical_field_order() {
         let db = database();
         populate(&db);
         let changed = Sequence::from_u64(2);
@@ -706,7 +688,11 @@ mod tests {
             }
         }
         for (table, mut expected) in [(Table::ThreadAnchors, anchors), (Table::Imports, imports)] {
-            expected.sort();
+            expected.sort_by(|a, b| {
+                Key::decode(table, a)
+                    .unwrap()
+                    .compare(Key::decode(table, b).unwrap())
+            });
             let mut previous: Option<Vec<u8>> = None;
             for expected in expected {
                 let mut key = [0; 1024];
@@ -735,6 +721,37 @@ mod tests {
             .unwrap()
             .is_none());
         }
+    }
+    #[test]
+    fn imports_seek_the_complete_native_tuple() {
+        let db = database();
+        let query = format!(
+            "EXPLAIN QUERY PLAN {}",
+            schema::queries(Table::Imports).next
+        );
+        let mut statement = db.prepare(&query).unwrap();
+        bind_key(
+            &mut statement,
+            ACCOUNT,
+            Key::Import {
+                instance: InstanceId::from_bytes([11; 16]),
+                kind: SourceKind::Email,
+                account: b"source",
+                object: b"object",
+            },
+        )
+        .unwrap();
+        let mut rows = statement.raw_query();
+        let mut complete_seek = false;
+        while let Some(row) = rows.next().unwrap() {
+            let detail: String = row.get(3).unwrap();
+            assert!(!detail.contains("TEMP B-TREE"));
+            complete_seek |= detail.contains("PRIMARY KEY")
+                && detail.contains(
+                    "(source_instance,source_kind,source_account,source_object)>(?,?,?,?)",
+                );
+        }
+        assert!(complete_seek, "import cursor must seek the entire tuple");
     }
     #[test]
     fn same_length_anchors_seek_the_complete_index_key() {
@@ -778,15 +795,14 @@ mod tests {
             &mut statement,
             ACCOUNT,
             Key::ThreadAnchor("00001500@example.test", EMAIL),
-            true,
         )
         .unwrap();
         let mut rows = statement.raw_query();
         let mut complete_seek = false;
         while let Some(row) = rows.next().unwrap() {
             let detail: String = row.get(3).unwrap();
-            complete_seek |= detail.contains("anchors_order")
-                && detail.contains("(key_length_order,message_id,email_id)>(?,?,?)");
+            complete_seek |=
+                detail.contains("PRIMARY KEY") && detail.contains("(message_id,email_id)>(?,?)");
         }
         assert!(complete_seek, "anchor cursor must seek the entire tuple");
         drop(rows);
@@ -815,7 +831,10 @@ mod tests {
                 break;
             };
             if let Some(previous) = previous.as_ref() {
-                assert!(previous.as_slice() < &key[..length]);
+                assert!(Key::decode(Table::ThreadAnchors, previous)
+                    .unwrap()
+                    .compare(Key::decode(Table::ThreadAnchors, &key[..length]).unwrap())
+                    .is_lt());
             }
             previous = Some(key[..length].to_vec());
             count += 1;

@@ -45,7 +45,10 @@ and does not prove that a referenced row exists.
 
 Table tags are u16. An application operation identifies the logical table;
 the primary-key bytes do not contain another table tag. Keys are unique and
-sorted by unsigned bytewise comparison of their complete encoded form.
+sorted lexicographically by their decoded fields, in the listed order.
+IDs and strings compare by unsigned bytes; kind tags and recipient ordinals
+compare numerically. Length prefixes frame fields but never determine order.
+`Key::compare` implements this order, including for encoded scan cursors.
 Logical ordering uses `Table::tag()`, never Rust enum declaration order.
 
 | Tag | Logical table | Key bytes, in order | Exact / maximum bytes |
@@ -77,9 +80,9 @@ IDs are reported, never silently truncated or replaced with a digest.
 Keyword raw bytes are capped at 255. A shorter nonempty keyword key is another
 well-formed key, not evidence of a truncated record; the SQLite record extent supplies that evidence. Header-ID keys use the parsed bytes specified
 in STORAGE section 3; framing does not implement the header parser. Length
-prefixes remain little-endian even in keys. Their byte order is canonical,
-not a promise of semantic lexical string order; ordered queries use their own
-comparators. Recipient ordinals are the only big-endian numeric key field.
+prefixes remain little-endian even in keys. Their byte order is canonical
+serialization, independent of the logical field ordering used by store
+scans. Recipient ordinals are the only big-endian numeric key field.
 
 ### Key and scalar oracles
 

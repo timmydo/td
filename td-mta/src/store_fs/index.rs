@@ -461,7 +461,7 @@ impl<'r> IndexStore<'r> {
             .map_err(sql)?;
             db.pragma_update(None, "application_id", APP_ID)
                 .map_err(sql)?;
-            db.pragma_update(None, "user_version", 2).map_err(sql)?;
+            db.pragma_update(None, "user_version", 3).map_err(sql)?;
             db.execute_batch("COMMIT").map_err(sql)
         })?;
         root.root.directory.file.sync_all()?;
@@ -515,7 +515,7 @@ impl<'r> IndexStore<'r> {
             let page_size: i64 = db
                 .pragma_query_value(None, "page_size", |row| row.get(0))
                 .map_err(sql)?;
-            if app != APP_ID || version != 2 || mode != "wal" || page_size != PAGE_BYTES as i64 {
+            if app != APP_ID || version != 3 || mode != "wal" || page_size != PAGE_BYTES as i64 {
                 return Err(ports::Error::Corrupt);
             }
             let expected = SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty());
@@ -3158,6 +3158,32 @@ mod tests {
                 .unwrap(),
             ChangeStep::Complete
         );
+    }
+    #[test]
+    fn startup_refuses_previous_schema_version() {
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let timer = Arc::new(Timer(AtomicU64::new(1)));
+        let store = IndexStore::create(
+            &mut root,
+            StoreEpoch::from_bytes([9; 16]),
+            timer.clone(),
+            1,
+            deadline(),
+        )
+        .unwrap();
+        store
+            .writer
+            .lock()
+            .unwrap()
+            .native
+            .run(|db| db.pragma_update(None, "user_version", 2).map_err(sql))
+            .unwrap();
+        drop(store);
+        assert!(matches!(
+            IndexStore::open(&mut root, timer, 1, deadline()),
+            Err(ports::Error::Corrupt)
+        ));
     }
     #[test]
     fn startup_refuses_unknown_schema_and_dangling_sidecars() {

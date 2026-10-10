@@ -140,10 +140,16 @@ impl Sweep {
         let encoded = encoded
             .get(..len)
             .ok_or(Error::Format(format::Error::Limit))?;
-        if after.is_some_and(|prior| prior >= encoded) {
-            return Err(Error::Format(format::Error::InvalidValue));
-        }
         let source = Key::decode(table, encoded).map_err(Error::Format)?;
+        if let Some(prior) = after {
+            if !Key::decode(table, prior)
+                .map_err(Error::Format)?
+                .compare(source)
+                .is_lt()
+            {
+                return Err(Error::Format(format::Error::InvalidValue));
+            }
+        }
         let mut check = ReferenceCheck::new(
             self.identity,
             source,
@@ -390,7 +396,15 @@ pub(crate) mod tests {
                     continue;
                 }
                 let n = record.key.encode(key).map_err(|_| ports::Error::Capacity)?;
-                if !self.repeat && !descending && after.is_some_and(|prior| prior >= &key[..n]) {
+                if !self.repeat
+                    && !descending
+                    && after.is_some_and(|prior| {
+                        !Key::decode(table, prior)
+                            .unwrap()
+                            .compare(record.key)
+                            .is_lt()
+                    })
+                {
                     continue;
                 }
                 let v = record
@@ -406,6 +420,30 @@ pub(crate) mod tests {
             Ok(None)
         }
     }
+    #[test]
+    fn anchor_scan_accepts_logical_order_that_reverses_encoded_lengths() {
+        let mut view = View::new();
+        view.rows[4] = record(
+            Key::ThreadAnchor("aa@example.test", EMAIL),
+            Row::ThreadAnchor,
+        );
+        view.rows[6] = record(Key::ThreadAnchor("z", EMAIL), Row::ThreadAnchor);
+        let mut sweep = Sweep::new(identity(), 100, 7);
+        let mut key = [0; 1024];
+        let mut value = [0; 512];
+        let mut complete = false;
+        for _ in 0..40 {
+            if matches!(
+                sweep.advance(&mut view, &mut key, &mut value).unwrap(),
+                Step::Complete
+            ) {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete);
+    }
+
     pub(crate) fn probe() {
         for empty in [false, true] {
             let mut view = View::new();
