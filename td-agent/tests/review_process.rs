@@ -588,6 +588,42 @@ fn diff_only_trace_keeps_rate_limit_and_malformed_response_bytes() {
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     assert_eq!(raw, [limited, malformed].concat());
+    let summary = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(summary.get("requests").and_then(Json::as_u64), Some(1));
+    assert_eq!(
+        summary.get("request_attempts").and_then(Json::as_u64),
+        Some(2)
+    );
+    assert_eq!(
+        summary.get("retry_attempts").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("unresolved_attempts").and_then(Json::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("response_bytes").and_then(Json::as_u64),
+        Some(raw.len() as u64)
+    );
+    assert_eq!(
+        summary
+            .get_path(&["http_status_counts", "429"])
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get_path(&["http_status_counts", "200"])
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get_path(&["finished_attempt_ms", "samples"])
+            .and_then(Json::as_u64),
+        Some(2)
+    );
     assert!(logs[0].contains("retry_wait_ms"));
     assert!(logs[0].contains("request_error"));
     assert!(logs[0]

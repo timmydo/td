@@ -1,14 +1,140 @@
 //! Read-only summaries of retained review traces, including incomplete sessions.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use td_json::Json;
 
 const LINE_LIMIT: u64 = 64 * 1024 * 1024;
 
+#[derive(Default)]
+struct Timing {
+    samples: u64,
+    total: u64,
+    min: Option<u64>,
+    max: u64,
+}
+
+impl Timing {
+    fn note(&mut self, start: Option<u64>, end: Option<u64>) {
+        if let Some(duration) = start
+            .zip(end)
+            .and_then(|(start, end)| end.checked_sub(start))
+        {
+            self.samples = self.samples.saturating_add(1);
+            self.total = self.total.saturating_add(duration);
+            self.min = Some(self.min.map_or(duration, |min| min.min(duration)));
+            self.max = self.max.max(duration);
+        }
+    }
+
+    fn json(&self) -> Json {
+        if self.samples == 0 {
+            return Json::Null;
+        }
+        Json::Obj(vec![
+            ("samples".into(), Json::from(self.samples)),
+            ("total".into(), Json::from(self.total)),
+            ("min".into(), self.min.map_or(Json::Null, Json::from)),
+            ("max".into(), Json::from(self.max)),
+        ])
+    }
+}
+
+#[derive(Default)]
+struct Transport {
+    observed: bool,
+    bytes_seen: bool,
+    wait_seen: bool,
+    attempts: u64,
+    retries: u64,
+    finished: u64,
+    wait_ms: u64,
+    bytes: u64,
+    statuses: BTreeMap<u64, u64>,
+    active: Option<Option<u64>>,
+    headers_seen: bool,
+    headers: Timing,
+    duration: Timing,
+}
+
+impl Transport {
+    fn event(&mut self, kind: &str, data: &Json, elapsed: Option<u64>) -> Result<(), String> {
+        match kind {
+            "request_attempt" => {
+                self.observed = true;
+                self.attempts = self.attempts.saturating_add(1);
+                self.retries = self
+                    .retries
+                    .saturating_add(u64::from(data.as_u64().is_some_and(|n| n > 0)));
+                self.active = Some(elapsed);
+                self.headers_seen = false;
+            }
+            "response_headers" if self.active.is_some() && !self.headers_seen => {
+                self.headers.note(self.active.flatten(), elapsed);
+                self.headers_seen = true;
+            }
+            "response_status" => {
+                let status = data
+                    .as_u64()
+                    .filter(|n| u16::try_from(*n).is_ok())
+                    .ok_or("review trace has an invalid HTTP status")?;
+                let count = self.statuses.entry(status).or_default();
+                *count = count.saturating_add(1);
+            }
+            "response_bytes_hex" => {
+                let hex = data
+                    .as_str()
+                    .ok_or("review trace response bytes are not hex text")?;
+                if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("review trace response bytes are invalid hex".into());
+                }
+                self.bytes_seen = true;
+                self.bytes = self.bytes.saturating_add((hex.len() / 2) as u64);
+            }
+            "retry_wait_ms" => {
+                self.wait_seen = true;
+                self.wait_ms = self.wait_ms.saturating_add(
+                    data.as_u64()
+                        .ok_or("review trace retry wait is not milliseconds")?,
+                );
+            }
+            "completion" | "request_error" => {
+                if let Some(start) = self.active.take() {
+                    self.finished = self.finished.saturating_add(1);
+                    self.duration.note(start, elapsed);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn count(&self, value: u64) -> Json {
+        if self.observed {
+            Json::from(value)
+        } else {
+            Json::Null
+        }
+    }
+
+    fn statuses(&self) -> Json {
+        if !self.observed && self.statuses.is_empty() {
+            return Json::Null;
+        }
+        Json::Obj(
+            self.statuses
+                .iter()
+                .map(|(status, count)| (status.to_string(), Json::from(*count)))
+                .collect(),
+        )
+    }
+}
+
 pub fn summarize(input: impl Read) -> Result<Json, String> {
     let mut input = BufReader::new(input);
     let mut sequence = 0u64;
     let mut requests = 0u64;
+    let mut transport = Transport::default();
     let mut tools = 0u64;
     let mut repeated = 0u64;
     let mut shortened = 0u64;
@@ -65,6 +191,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             .and_then(Json::as_str)
             .ok_or("review trace has no kind")?;
         let data = event.get("data").ok_or("review trace has no data")?;
+        transport.event(kind, data, event.get("elapsed_ms").and_then(Json::as_u64))?;
         let count = |key| data.get(key).and_then(Json::as_u64).unwrap_or(0);
         match kind {
             "start" if data.get("version").and_then(Json::as_u64) != Some(1) => {
@@ -164,6 +291,34 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
         ("cleanup".into(), cleanup.unwrap_or(Json::Null)),
         ("elapsed_ms".into(), Json::from(last_elapsed)),
         ("requests".into(), Json::from(requests)),
+        (
+            "request_attempts".into(),
+            transport.count(transport.attempts),
+        ),
+        ("retry_attempts".into(), transport.count(transport.retries)),
+        (
+            "unresolved_attempts".into(),
+            transport.count(transport.attempts.saturating_sub(transport.finished)),
+        ),
+        (
+            "retry_wait_ms".into(),
+            if transport.wait_seen {
+                Json::from(transport.wait_ms)
+            } else {
+                transport.count(transport.wait_ms)
+            },
+        ),
+        (
+            "response_bytes".into(),
+            if transport.bytes_seen {
+                Json::from(transport.bytes)
+            } else {
+                transport.count(transport.bytes)
+            },
+        ),
+        ("http_status_counts".into(), transport.statuses()),
+        ("response_header_ms".into(), transport.headers.json()),
+        ("finished_attempt_ms".into(), transport.duration.json()),
         ("cost_reports".into(), Json::from(cost_reports)),
         ("reported_cost".into(), Json::from(reported)),
         (
@@ -229,6 +384,153 @@ pub fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    fn trace(events: &[(u64, &str, Json)]) -> String {
+        events
+            .iter()
+            .enumerate()
+            .map(|(sequence, (elapsed, kind, data))| {
+                Json::Obj(vec![
+                    ("sequence".into(), Json::from(sequence as u64)),
+                    ("elapsed_ms".into(), Json::from(*elapsed)),
+                    ("kind".into(), Json::Str((*kind).into())),
+                    ("data".into(), data.clone()),
+                ])
+                .to_string()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retries_and_interrupted_attempts_have_separate_transport_metrics() {
+        let input = trace(&[
+            (0, "request_body", Json::Str("{}".into())),
+            (10, "request_attempt", Json::from(0u64)),
+            (14, "response_headers", Json::Arr(vec![])),
+            (14, "response_status", Json::from(429u64)),
+            (16, "response_bytes_hex", Json::Str("00ff".into())),
+            (20, "request_error", Json::Str("rate limited".into())),
+            (20, "retry_wait_ms", Json::from(50u64)),
+            (70, "request_attempt", Json::from(1u64)),
+            (76, "response_headers", Json::Arr(vec![])),
+            (76, "response_status", Json::from(200u64)),
+            (79, "response_bytes_hex", Json::Str("c3a9".into())),
+            (100, "completion", Json::Obj(vec![])),
+            (101, "request_body", Json::Str("{}".into())),
+            (102, "request_attempt", Json::from(0u64)),
+        ]);
+        let result = summarize(input.as_bytes()).unwrap();
+        assert_eq!(result.get("requests").and_then(Json::as_u64), Some(2));
+        assert_eq!(
+            result.get("request_attempts").and_then(Json::as_u64),
+            Some(3)
+        );
+        assert_eq!(result.get("retry_attempts").and_then(Json::as_u64), Some(1));
+        assert_eq!(
+            result.get("unresolved_attempts").and_then(Json::as_u64),
+            Some(1)
+        );
+        assert_eq!(result.get("retry_wait_ms").and_then(Json::as_u64), Some(50));
+        assert_eq!(result.get("response_bytes").and_then(Json::as_u64), Some(4));
+        assert_eq!(
+            result
+                .get_path(&["http_status_counts", "429"])
+                .and_then(Json::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .get_path(&["http_status_counts", "200"])
+                .and_then(Json::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .get_path(&["response_header_ms", "total"])
+                .and_then(Json::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            result
+                .get_path(&["finished_attempt_ms", "total"])
+                .and_then(Json::as_u64),
+            Some(40)
+        );
+        assert_eq!(
+            result
+                .get_path(&["finished_attempt_ms", "samples"])
+                .and_then(Json::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            result
+                .get_path(&["finished_attempt_ms", "min"])
+                .and_then(Json::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            result
+                .get_path(&["finished_attempt_ms", "max"])
+                .and_then(Json::as_u64),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn missing_transport_instrumentation_is_unknown_and_invalid_hex_is_refused() {
+        let result = summarize(trace(&[(0, "completion", Json::Null)]).as_bytes()).unwrap();
+        for field in [
+            "request_attempts",
+            "retry_attempts",
+            "unresolved_attempts",
+            "retry_wait_ms",
+            "response_bytes",
+            "response_header_ms",
+            "finished_attempt_ms",
+            "http_status_counts",
+        ] {
+            assert_eq!(result.get(field), Some(&Json::Null));
+        }
+        for invalid in ["0", "zz", "é"] {
+            let input = trace(&[(0, "response_bytes_hex", Json::Str(invalid.into()))]);
+            assert!(summarize(input.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn status_counts_accept_every_code_the_u16_writer_can_emit() {
+        let input = trace(&[
+            (0, "response_status", Json::from(0u64)),
+            (1, "response_status", Json::from(999u64)),
+            (2, "response_status", Json::from(u16::MAX as u64)),
+        ]);
+        let result = summarize(input.as_bytes()).unwrap();
+        for status in ["0", "999", "65535"] {
+            assert_eq!(
+                result
+                    .get_path(&["http_status_counts", status])
+                    .and_then(Json::as_u64),
+                Some(1)
+            );
+        }
+        assert_eq!(result.get("request_attempts"), Some(&Json::Null));
+    }
+
+    #[test]
+    fn invalid_status_and_retry_wait_records_are_refused() {
+        for value in [
+            Json::Null,
+            Json::Str("999".into()),
+            Json::Num("-1".into()),
+            Json::from(65536u64),
+        ] {
+            assert!(summarize(trace(&[(0, "response_status", value)]).as_bytes()).is_err());
+        }
+        for value in [Json::Null, Json::Str("10".into()), Json::Num("-1".into())] {
+            assert!(summarize(trace(&[(0, "retry_wait_ms", value)]).as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn incomplete_trace_retains_reported_and_reserved_costs_separately() {
         let input = concat!(

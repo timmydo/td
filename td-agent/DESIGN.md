@@ -337,14 +337,31 @@ remaining budget, cache request, effective tool arguments, repetitions, elapsed
 time, command exit status, signal, timeout/interruption and unsuccessful-process
 flags, raw/retained/model-visible byte counts, shortening
 and artifact paths. Normalized usage includes cached and cache-write tokens;
-raw replies preserve additional provider fields. `td-agent review-log FILE`
-summarizes complete or interrupted traces without modifying them, distinguishes
-reported from accounted cost, and reports unrecorded token fields as null. The shared usage parser
-defaults absent provider counts to zero in normalized completions; raw replies
-remain the authority for distinguishing absent counts from reported zero. Tool metric record counts identify older traces lacking these fields;
-peak context is null when unrecorded. Summaries retain at most 32 request errors
-and count all of them. Monetary values remain pico-dollars. This command cannot
-recover a provider charge from a response that never arrived.
+raw replies preserve additional provider fields. `td-agent review-log
+FILE` summarizes complete or interrupted traces without modifying them,
+distinguishes reported from accounted cost, and reports unrecorded token
+fields as null. The shared usage parser defaults absent provider counts
+to zero in normalized completions; raw replies remain the authority for
+distinguishing absent counts from reported zero. Tool metric record
+counts identify older traces lacking these fields; peak context is null
+when unrecorded. Summaries retain at most 32 request errors and count
+all of them. Monetary values remain pico-dollars. Transport summaries
+separately count logical requests and wire attempts (including retries),
+unresolved attempts, HTTP statuses, response bytes and requested retry
+waits. Attempt duration and response-header latency report measured
+samples, total, minimum and maximum in milliseconds using monotonic
+record timestamps; finished-attempt duration excludes retry waits. An
+attempt without a completion or request-error record is unresolved, not
+inferred successful or failed. This includes connection failures that
+end the run before a request-error record is written; a terminal run
+failure alone does not supply an attempt duration. Missing transport
+records or timing samples produce null, not zero. Invalid response hex,
+non-integer retry waits and status values outside the writer's u16 range
+are refused; nonstandard codes such as 999 are retained. These are
+harness observations, not provider billing or network-only timings; log
+writes, parser work and diff-only stdout backpressure are included. This
+command cannot recover a provider charge from a response that never
+arrived.
 
 The terminal `end` record reports success or failure; normal repository
 loop exits also record budget totals and cleanup. Records are written
