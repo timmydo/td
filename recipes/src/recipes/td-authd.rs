@@ -107,6 +107,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/login_status.rs"),
     ),
     (
+        "src/revocation.rs",
+        include_str!("../../../td-authd/src/revocation.rs"),
+    ),
+    (
+        "tests/revocation.rs",
+        include_str!("../../../td-authd/tests/revocation.rs"),
+    ),
+    (
         "tests/login_status.rs",
         include_str!("../../../td-authd/tests/login_status.rs"),
     ),
@@ -251,6 +259,12 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-firstboot/src/saved.rs",
             include_str!("../../../td-firstboot/src/saved.rs"),
+        ),
+        // The cutover record's bytes and the publication firstboot's
+        // renders share with the revocation's record write.
+        (
+            "{src}/td-firstboot/src/cutover.rs",
+            include_str!("../../../td-firstboot/src/cutover.rs"),
         ),
         (
             "{src}/td-secret/src/login_state.rs",

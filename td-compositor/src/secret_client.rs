@@ -1060,6 +1060,8 @@ pub(crate) struct Client {
     /// cue to read the login state again (`1a`).
     login_ended: bool,
     inspection: Option<Inspection>,
+    /// The revocation byte of root's last `1a`.
+    revocation: crate::authority::Revocation,
     /// The check before a PIN field opens.
     memory: fn() -> Result<(), String>,
 }
@@ -1071,6 +1073,7 @@ impl Default for Client {
             login: None,
             login_ended: false,
             inspection: None,
+            revocation: crate::authority::Revocation::Settled,
             memory: protected_memory,
         }
     }
@@ -1101,6 +1104,27 @@ impl Client {
         std::mem::take(&mut self.login_ended)
     }
 
+    /// Root's last `1a` revocation byte. While it reads `02` no request
+    /// that takes the operation slot is sent, a continuation included,
+    /// since root refuses one as a protocol violation while it restarts
+    /// the machine after a failed revocation (td-authd/DESIGN.md,
+    /// amendment 7): the attempt shows that notice instead.
+    pub fn set_revocation(&mut self, revocation: crate::authority::Revocation) {
+        self.revocation = revocation;
+    }
+
+    /// `Some` while root restarts: the attempt shows that notice, or
+    /// nothing once it is no longer active, and no request is sent.
+    fn restarting(&self, attempt: &Attempt) -> Option<Result<(), String>> {
+        (self.revocation == crate::authority::Revocation::Restarting).then(|| {
+            if attempt.active() {
+                attempt.notice(Notice::Restarting)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
     pub fn start(&mut self, wire: &mut impl Exchange, attempt: Arc<Attempt>) -> Result<(), String> {
         if !attempt.active() {
             return Ok(());
@@ -1124,6 +1148,9 @@ impl Client {
         attempt: Arc<Attempt>,
         selection: LoginSelection,
     ) -> Result<(), String> {
+        if let Some(shown) = self.restarting(&attempt) {
+            return shown;
+        }
         let response = wire.exchange(&selection.request()?)?;
         let nonce = match response.as_slice() {
             [0x9b, 0] => return attempt.notice(Notice::NotAvailable),
@@ -1274,6 +1301,9 @@ impl Client {
         attempt: Arc<Attempt>,
         begin: bool,
     ) -> Result<(), String> {
+        if let Some(shown) = self.restarting(&attempt) {
+            return shown;
+        }
         if wire.exchange(&[0x17])? != [0x97] {
             return Err("invalid store inspection start".into());
         }
@@ -1284,6 +1314,9 @@ impl Client {
     fn begin(&mut self, wire: &mut impl Exchange, attempt: Arc<Attempt>) -> Result<(), String> {
         if !attempt.active() {
             return Ok(());
+        }
+        if let Some(shown) = self.restarting(&attempt) {
+            return shown;
         }
         let response = wire.exchange(&attempt.selection.request()?)?;
         if attempt.selection == Selection::Write && response == [0x98, 0] {
@@ -5277,5 +5310,97 @@ mod tests {
         let store = Screen::new();
         assert!(store.attempt.commit());
         assert!(!store.attempt.unlock_committed());
+    }
+
+    /// While root's last `1a` reads `02`, no selection sends anything: each
+    /// would take the slot. It shows the restart notice instead; every
+    /// other revocation byte starts the attempt as before.
+    #[test]
+    fn no_selection_is_sent_while_root_restarts_after_a_failed_revocation() {
+        use crate::authority::Revocation;
+        let restarting = || {
+            [
+                Screen::new(),
+                enrollment_screen(Recovery::SecondToken),
+                Screen::login(LoginSelection::Unlock),
+                Screen::login(LoginSelection::Add),
+            ]
+        };
+        for screen in restarting() {
+            let mut client = Client::default();
+            client.set_revocation(Revocation::Restarting);
+            let mut wire = wire(Vec::new());
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            assert!(wire.calls.is_empty());
+            assert_eq!(screen.shown(), Some(Notice::Restarting));
+            assert!(client.pending.is_none() && client.inspection.is_none());
+            assert!(client.login.is_none());
+        }
+        // An attempt no longer active is dropped silently.
+        let screen = Screen::new();
+        screen.attempt.cancel();
+        let mut idle = wire(Vec::new());
+        let mut client = Client::default();
+        client.set_revocation(Revocation::Restarting);
+        client
+            .start(&mut idle, Arc::clone(&screen.attempt))
+            .unwrap();
+        assert!(idle.calls.is_empty());
+        for revocation in [Revocation::Settled, Revocation::Pending, Revocation::Held] {
+            let screen = enrollment_screen(Recovery::SecondToken);
+            let mut client = Client::default();
+            client.set_revocation(revocation);
+            let mut wire = wire(vec![vec![0x97]]);
+            client
+                .start(&mut wire, Arc::clone(&screen.attempt))
+                .unwrap();
+            assert_eq!(wire.calls, [vec![0x17]], "{revocation:?}");
+        }
+    }
+
+    /// The continuations take the slot too: an enrollment's begin after
+    /// its inspection, and the new inspection after a failed enrollment,
+    /// are not sent once `02` reads.
+    #[test]
+    fn no_continuation_takes_the_slot_while_root_restarts() {
+        use crate::authority::Revocation;
+        let screen = enrollment_screen(Recovery::SecondToken);
+        let mut root = wire(vec![vec![0x97], vec![0x91, 9, 0]]);
+        let mut client = Client::default();
+        client
+            .start(&mut root, Arc::clone(&screen.attempt))
+            .unwrap();
+        client.set_revocation(Revocation::Restarting);
+        client.tick(&mut root).unwrap();
+        assert_eq!(root.calls, [vec![0x17], vec![0x11]]);
+        assert_eq!(screen.shown(), Some(Notice::Restarting));
+        assert!(client.pending.is_none() && client.inspection.is_none());
+
+        let screen = enrollment_screen(Recovery::SecondToken);
+        let initial = enrollment(Recovery::SecondToken, Enrollment::CreatePrimary);
+        let mut root = wire(vec![
+            vec![0x97],
+            vec![0x91, 9, 0],
+            description(&[0x92], &initial),
+            description(&[0x91, 7], &initial),
+        ]);
+        let mut client = Client::default();
+        client
+            .start(&mut root, Arc::clone(&screen.attempt))
+            .unwrap();
+        client.tick(&mut root).unwrap();
+        client.set_revocation(Revocation::Restarting);
+        client.tick(&mut root).unwrap();
+        assert_eq!(
+            root.calls
+                .iter()
+                .filter(|call| call.first() == Some(&0x17))
+                .count(),
+            1
+        );
+        assert_eq!(screen.shown(), Some(Notice::Restarting));
+        assert!(client.pending.is_none() && client.inspection.is_none());
     }
 }

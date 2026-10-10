@@ -20,6 +20,7 @@ mod application_state;
 mod credentials;
 #[path = "../../td-secret/src/crypto.rs"]
 mod crypto;
+mod cutover;
 #[path = "../../td-secret/src/fido_cbor.rs"]
 #[allow(
     dead_code,
@@ -296,7 +297,7 @@ fn usage() -> String {
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
          td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n",
         policy = ssh_render::POLICY,
-        record = ssh_render::RECORD,
+        record = cutover::RECORD,
     )
 }
 
@@ -322,7 +323,7 @@ fn run_with_primary(
             ssh_render::boot_render(
                 &root,
                 primary.name(),
-                Path::new(ssh_render::BOOT_ID),
+                Path::new(cutover::BOOT_ID),
                 login_state::Owner::ROOT,
             )
             .map_err(Failure::Failed)?;

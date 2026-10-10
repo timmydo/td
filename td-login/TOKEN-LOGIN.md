@@ -89,14 +89,21 @@ act on the state, and only where a record or an invalid directory
 exists, but for increment 4's live exceptions ("Increments"): on every
 paired machine `Super+l` is consumed and the menu shows `L`, which
 answers `NO LOGIN KEYS ENROLLED` while unenrolled. Of increment 5, A1
-and A2 have landed and are live on every machine without acting on the
+to A3 have landed and are live on every machine without acting on the
 state: `sshd`'s unit stops its whole leaf (`stop=leaf`,
 `td-svc/DESIGN.md` §4), so a stop, restart or shutdown of `sshd` ends
-its OpenSSH sessions; and at every boot firstboot publishes its SSH
-render by rename and writes the cutover record
-(`/run/td-login-cutover`, `td-authd/DESIGN.md` amendment 7) naming the
-form it rendered. A2's in-boot `td-firstboot render-ssh-policy` exists,
-but nothing runs it before A3. Nothing else below is implemented. Until
+its OpenSSH sessions; at every boot firstboot publishes its SSH render
+by rename and writes the cutover record (`/run/td-login-cutover`,
+`td-authd/DESIGN.md` amendment 7) naming the form it rendered; and
+td-authd checks that record at every generation's first `1a` and after
+every login operation. Where the reduced state differs it cuts over:
+`td-firstboot render-ssh-policy`, the greeter's line handed back,
+`sshd` and `greeter` restarted and the record written, or on failure
+the guarded reboot. On a stock machine the record names the unenrolled
+state, so the check changes nothing; only damage to the directory or
+the record within a boot cuts over. The compositor polls `1a` while a
+revocation is pending and shows a failure's notice on its lock surface
+and attention screen. Nothing else below is implemented. Until
 the increments at the end land, `THREAT-MODEL.md` §3 is the complete
 current behaviour: the installed account logs in automatically, and a
 machine with neither a record nor an invalid directory, as every stock
@@ -1787,11 +1794,11 @@ and the oracle that shows it.
      - The new fixed verb `td-firstboot render-ssh-policy` takes no
        operand. It renders under `/` for a running boot, publishes the
        policy the same way, and prints the form it published. It writes
-       no record, and is inert until A3 runs it.
+       no record; A3's cutover runs it.
 
      A2 amends `THREAT-MODEL.md` §1's render and serialization
      statements to match.
-   - A3, td-authd's revocation and reboot guard, amendment 7 as stated
+   - A3, landed: td-authd's revocation and reboot guard, amendment 7 as stated
      there: the check and when it runs, the cutover beside the operation
      slot, the line's hand-back, `9a`'s revocation byte, the reboot and
      the guard. The compositor decodes the byte, polls `1a` every 250 ms
@@ -1803,11 +1810,14 @@ and the oracle that shows it.
      Host child fixtures with a scripted td-svc cover the host-fixture
      items of the failure injection listed above. Its guest items, the
      authority killed between publication and restart and the cut
-     followed by a boot, are A5's. `qemu-login-system`'s seed phase replaces
-     its own `stop greeter` with a cutover: after seeding, a restarted
-     pair finds the record and the state different. It ends the
-     logged-in serial session and an open SSH session, and leaves the
-     enforced form and a greeter that refuses.
+     followed by a boot, are A5's. `qemu-login-system`'s seed phase ends
+     its serial session with a cutover rather than its own `stop
+     greeter`: the greeter is stopped only while the unenrolled screens
+     need the line the host answers on, then started again, and after
+     seeding a restarted pair finds the record and the state different.
+     The cutover ends the logged-in serial session and an open SSH
+     session, and leaves the enforced form, the record naming it and a
+     greeter that refuses.
    - A4, the disclosures' approval key, inert in production:
      - Only a disclosure step carries the key. That is the first step
        of a first enrollment (its first `connect`), and the first step

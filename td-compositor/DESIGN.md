@@ -6147,8 +6147,12 @@ place, `(height - 248) / 2`, wherever the whole block, the last row's
 foot included, fits below it, so the boot oracles' rows do not move (on
 1280x800 the title at 276, the notice at 312 and `I` at 456); only an
 output too short for that moves the block up, as little as makes it
-fit. A row wider than the output's columns, its width less 48 over the
-scaled advance, wraps at a space; a row that fits is drawn as it is.
+fit. Rows that cannot all fit at that pitch even from the top close up
+to the output's height, never closer than the glyph's height and one
+scaled pixel: only the menu with a failed revocation's notice on 320x200
+needs it ("Session lock and login-key entry", the revocation). A row
+wider than the output's columns, its width less 48 over the scaled
+advance, wraps at a space; a row that fits is drawn as it is.
 
 The attempt's lifetime is td-authd's ceiling for the selected operation
 (`login_ceiling`: 120 seconds for an unlock, a removal and a one-key
@@ -6554,7 +6558,7 @@ excluded from every selection, confirmation and field below.
      after Prepare's answer, before the first repaint, and an enrolled
      or unavailable answer locks then. It sends `1a` again after every
      login operation's end and every 250 ms while the answer reads could
-     not be read. The requests and their polling are implemented
+     not be read or its revocation byte reads pending (`01`). The requests and their polling are implemented
      (increment 4's C3): the authority worker asks after the secret
      client reports a login operation's end, whatever the end, and
      waits for work no longer than the next poll; the answer feeds `D`
@@ -6563,7 +6567,7 @@ excluded from every selection, confirmation and field below.
      the username under td-authd's `primary_account` rule and the
      hostname empty or under td-firstboot's `Hostname::parse`, both
      compiled from those files behind the `auth/` `cfg_attr` pair and
-     kept for the rows; any other answer, a nonzero revocation byte
+     kept for the rows; any other answer, a revocation byte past `03`
      included, ends the paired generation. Implemented in C7: the
      generation's first paint is the production lock entry ("The lock
      surface" above), and the source pin there names its one caller.
@@ -6574,6 +6578,28 @@ excluded from every selection, confirmation and field below.
      starts locked when the state
      is enrolled or unavailable. A `1a` answer never locks an unlocked
      session (TOKEN-LOGIN.md, "Session lock").
+   - **The revocation.** Implemented (TOKEN-LOGIN.md increment 5's
+     A3; `td-authd/DESIGN.md` amendment 7). The answer keeps its
+     revocation byte, `00` settled, `01` pending, `02` failed and
+     restarting, `03` held. `02` shows `A CONSOLE OR SSH SESSION COULD
+     NOT BE CLOSED: RESTARTING` and `03` `SESSION REVOCATION FAILED AFTER
+     A RESTART`: on the lock surface as its last row, below the state's,
+     and on the attention screen below its padded rows and above its
+     last, so no row the boot oracles read moves, and once only where
+     the screen's own notice already says it. A later answer that
+     changes the notice repaints whichever is on glass, never over a
+     presented prompt. While the last answer reads `02` the worker sends
+     no request that takes root's operation slot, which root then
+     refuses as a protocol violation: neither a selection's first
+     request nor a continuation, an enrollment's begin after its
+     inspection or the new inspection after a failed enrollment. The
+     worker gives the secret client each answer's byte before it starts
+     or ticks anything, and the lifetime shows the restart notice
+     instead (`Notice::Restarting`) and selects nothing more. An answer
+     read `01` up to 250 ms before a
+     selection whose request reaches root after the failure still ends
+     the generation, as amendment 7 states for any such request; the
+     next generation's check repeats the cutover.
    - **Rows.** Implemented (C7). Above the state's rows the lock surface
      draws the `1a` answer's hostname, then its username, both uppercase
      in the chrome font; with a one-row hostname, on 1280x800 the

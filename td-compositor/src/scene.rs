@@ -876,6 +876,9 @@ pub struct Scene {
     locked: bool,
     /// The lock surface's rows, which follow root's latest `1a` answer.
     lock_rows: Vec<String>,
+    /// A failed revocation's notice from that answer, which the attention
+    /// screen also shows.
+    revocation: Option<&'static str>,
     /// Root's hostname intake as the authority worker last read it, which
     /// the menu's `H` row shows from when the screen opens.
     hostnames: crate::authority::Hostnames,
@@ -925,6 +928,7 @@ impl Scene {
             attention_field: None,
             locked: false,
             lock_rows: crate::attention::lock_rows(None),
+            revocation: None,
             hostnames: crate::authority::Hostnames::default(),
             attention_unlocked: false,
             status: String::new(),
@@ -3250,6 +3254,14 @@ impl Scene {
         changed
     }
 
+    /// The attention screen's revocation notice from now on; whether it
+    /// changed.
+    pub(crate) fn set_revocation(&mut self, notice: Option<&'static str>) -> bool {
+        let changed = self.revocation != notice;
+        self.revocation = notice;
+        changed
+    }
+
     /// Leaves the lock surface from the attention lifetime opened on it.
     pub(crate) fn unlock(&mut self) {
         self.attention_unlocked = self.attention && self.locked;
@@ -3407,6 +3419,7 @@ impl Scene {
                 self.attention_draining,
                 self.attention_unlocked,
                 self.attention_notice,
+                self.revocation,
             );
         } else if self.locked {
             crate::attention::paint_lock(frame, width, height, stride, &self.lock_rows);

@@ -2102,7 +2102,10 @@ increment 4's C10b onward carries the tier marker, so on such a machine
 it admits a marked deployment that reads the record's version (any
 marked one while the record cannot be read) and refuses one built
 before C10b, which carries none; nothing enrolls before increment 5.
-Revocation (7) is not implemented.
+Revocation (7) is implemented and live (TOKEN-LOGIN.md increment 5's
+A3, `revocation.rs`): every generation's first `1a` checks the record,
+and on a stock boot firstboot's record names the unenrolled state, so
+the check changes nothing.
 [`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md) owns the planned
 login-key tier. "Session lock" there is the compositor's display and
 input lock; it is unrelated to this document's secret-session statuses
@@ -2116,9 +2119,8 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    unenrolled, enrolled, or unavailable with its typed cause, as
    TOKEN-LOGIN.md defines them ("Login-key operation supervision" below
    gives the bytes). The answer also carries the revocation status of
-   amendment 7, reserved as `00` until increment 5's A3, which
-   defines `00` settled, `01` pending, `02` failed and restarting and
-   `03` held. Only td-authd
+   amendment 7: `00` settled, `01` pending, `02` failed and restarting
+   and `03` held. Only td-authd
    decides that a session unlocks: on a login unlock's observed success.
 
    An enrolled answer also carries the record's slot count and each
@@ -2287,13 +2289,25 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
    It is root:root mode 0600, published by renaming a temporary
    `/run/td-login-cutover.tmp`, which the writer opens with
-   `O_CREAT|O_EXCL|O_NOFOLLOW` after removing a stale one.
+   `O_CREAT|O_EXCL|O_NOFOLLOW` after removing a stale one. Every writer
+   holds the exclusive lock on the persistent `/run/td-login-cutover.lock`
+   from before that removal to after the rename, a lock file it opens
+   only as a single-link root:root mode-0600 regular file, so writers
+   never interleave. Both writers run one source for the bytes and this
+   publication, `td-firstboot/src/cutover.rs`, which td-authd compiles
+   by its reviewed path.
    - Firstboot writes it in stage 1, under `/sysroot`, right after
      publishing its boot-time render, naming the form it rendered. A
      failure to write it fails that step, which stops boot as a failed
      render does.
-   - Root writes it only after a cutover is observed complete, naming
-     the form `render-ssh-policy` reported publishing.
+   - Root removes it, under the same lock, as every cutover's first
+     step, and writes it only after a cutover is observed complete,
+     naming the form `render-ssh-policy` reported publishing. So a
+     cutover interrupted at any point, or whose record cannot be
+     written, leaves no record: a stale one could otherwise name the
+     very state the login state returned to while the console and SSH
+     were brought to another, and the next check would skip the
+     revocation. A record that cannot be removed fails the revocation.
    - Root reads it with `O_NOFOLLOW|O_NONBLOCK` and requires a regular
      file, one link, root:root, mode 0600, at most 128 bytes and that
      exact grammar. Anything else, an absent record included, reads as
@@ -2320,14 +2334,17 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    **Beside the slot.** A cutover does not take the one operation slot,
    so no request meets it as busy, and a login operation, an inspection
    or an elevation may run beside it. A check that falls due while a
-   cutover runs is taken again in the same `tick` that settles it, so no
-   `00` is reported between the two, and a state that changed meanwhile
-   converges to the newer state. The cutover is a nonblocking state
-   machine that `tick` advances; `1a` reports it pending (`01`) until it
-   settles. Generation teardown abandons a cutover in flight without
-   writing the record, so the next generation's check repeats it.
+   cutover runs is taken in the same `tick` that settles or holds it, so
+   no `00` or `03` is reported between the two, and a state that changed
+   meanwhile converges to the newer state; a failure that owes a reboot
+   drops it, since the reboot enforces whatever state it would find. The
+   cutover is a nonblocking state machine that `tick` advances; `1a`
+   reports it pending (`01`) until it settles. Generation teardown
+   abandons a cutover in flight without writing the record, killing its
+   render or td-svc client, so the next generation's check repeats it.
 
    **The cutover:**
+   - It removes the record (**The record**), before anything else.
    - It renders the SSH policy through the fixed root subcommand
      `td-firstboot render-ssh-policy` (TOKEN-LOGIN.md increment 5's
      A2). That verb applies firstboot's account validation, publishes
@@ -2356,25 +2373,48 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
      - An absent node is skipped, since no session can hold it.
      - A node of any other type, or a failed change or read-back, is a
        failed revocation.
-   - It asks td-svc, over its existing control socket, to restart `sshd`
-     and `greeter`, issuing both requests before polling either so their
-     TERM waits overlap. It names no other unit, and bounds each control
-     exchange at two seconds.
-   - It polls `status` for each unit until the unit has left `stopping`
-     and runs a new leader. Leaving `stopping` means, for `greeter`, that
-     its `tty=` containment is empty; for `sshd`, that its whole service
-     leaf is (`td-svc/DESIGN.md`, `stop=leaf`). A new leader is a pid
-     different from the leader recorded before the request, whose
-     `/proc` start time is later than the request. Each unit must finish
-     within 30 seconds of its request, longer than the default 10-second
-     `stop-timeout` plus KILL observation even under emulation.
+   - It asks td-svc to restart `sshd` and `greeter`, issuing both
+     requests before polling either so their TERM waits overlap. It
+     names no other unit.
+   - Each control exchange, `restart NAME` or `status NAME`, is a
+     `/bin/td-svc` client child launched as the render is: empty
+     environment, `/` as its working directory, its reply read through a
+     256-byte bound, reaped without blocking, and killed at its bound.
+     td-svc serves one connection at a time, and its client and server
+     each wait 10 seconds for an answer (`td-svc/src/control.rs`,
+     `REPLY_TIMEOUT`), so a busy supervisor says so only after 10
+     seconds, which a shorter bound would never see. The bound is 12
+     seconds: past those 10, by which the client's own timeout or the
+     server's busy reply is reached and the client exits, with two
+     seconds for its start and its reply.
+   - It polls `status` for each unit every 250 milliseconds until the
+     unit has left `stopping` and runs a new leader. Leaving `stopping`
+     means, for `greeter`, that its `tty=` containment is empty; for
+     `sshd`, that its whole service leaf is (`td-svc/DESIGN.md`,
+     `stop=leaf`). A new leader is a pid different from the leader
+     recorded before the request, whose `/proc` start time is later than
+     the request. Both units are `restart=always`, so after the request
+     `failed` with a retry pending and `held` are td-svc's restart
+     backoff, and `down` a start still to come: each is polled until a
+     new leader runs or the deadline passes. Only `stopped`, an
+     operator's standing stop, fails the revocation at once.
+   - Each unit must finish within 30 seconds of its request: longer
+     than one exchange and its retry (24 seconds), and than the default
+     10-second `stop-timeout` plus KILL observation even under
+     emulation. The deadline is checked before any reply is accepted,
+     so a reply readable only after it fails the unit.
    - Only then does it write the record and settle (`00`).
 
-   One transient td-svc failure (a refused connection or a busy reply) is
-   retried once. A failed revocation, never only a warning, is any of:
+   One transient td-svc failure, a busy reply or a client that exits
+   having printed nothing (its own timeout, or no supervisor to
+   connect to), is retried once. A failed revocation, never only a
+   warning, is any of:
    - a refusal after that retry;
    - a failed render;
    - a failed hand-back;
+   - a record that cannot be removed;
+   - a unit `stopped` after its request;
+   - a client still running at its 12-second bound;
    - a teardown still pending at its deadline.
 
    On a failed revocation:
@@ -2382,7 +2422,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    - The compositor shows `A CONSOLE OR SSH SESSION COULD NOT BE CLOSED:
      RESTARTING` on its lock surface and attention screen.
    - Root asks td-svc for an orderly `reboot` through `/bin/td-svc
-     reboot`, as td-install requests one, waiting at most ten seconds.
+     reboot`, as td-install requests one: a client child bounded and
+     retried once after a transient failure exactly as a control
+     exchange is.
      The reboot's boot ordering then enforces the boundary: firstboot
      renders the enforced form before `sshd` and the greeter start.
    - Root makes that request only once no operation holds the slot, so a
@@ -2392,6 +2434,17 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
      one that arrives is a protocol violation that ends the generation.
    - If that request fails too, the authority ends its generation, and
      the next generation's check repeats the cutover.
+   - If td-authd ends the generation while the reboot is owed and td-svc
+     has not accepted it, teardown requests it once the slot, its
+     operation and its inspection, is reaped, or waits for a request
+     already made, no longer than the request's bound and its one
+     retry's; a refusal is logged, and the next generation's check
+     repeats the cutover. A slot that could not be reaped requests no
+     reboot: the guard stands, and the next failure in that boot holds.
+     This covers only the generations td-authd itself ends: if the
+     compositor dies first, pair-run SIGKILLs td-authd, no teardown
+     runs, the guard stands, and a second failure in that boot holds
+     likewise.
 
    **Reboot guard.** Before requesting an automatic reboot, root writes the
    current boot ID to the durable root-owned mode-0600
@@ -2404,8 +2457,50 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    attention screen as `SESSION REVOCATION FAILED AFTER A RESTART`. If the
    guard itself cannot be written, for example because the directory is
    damaged, root likewise holds without rebooting and shows the same
-   notice; it never reboots unguarded. At most one automatic reboot
-   therefore separates two successful checks.
+   notice; it never reboots unguarded. Root walks the guard's directory
+   without following a link, holds it, and creates the guard through it
+   only when the shared predicate's directory check passes on the held
+   descriptor (root:root, mode 0700, its rule for the login directory);
+   a directory that fails it is unwritable. At
+   most one automatic reboot therefore separates two successful checks.
+
+   **As implemented (A3).** `revocation.rs` holds the state machine;
+   `session.rs` begins checks and ticks it from every request's `tick`,
+   `1a`'s included, and refuses a request that takes the slot (`17`,
+   `18`, `19`, `12`, `16`, `1b`, `1d`, `1e`) while `02` reads. The
+   render, each control exchange and the reboot request are the bounded
+   helper launch of amendment 1's helper, reading standard output
+   instead; a control client's output is read whatever its exit, since
+   td-svc's client prints a refusal and then exits unsuccessfully.
+   Where the text above leaves a choice:
+   - Each unit's leader is read with `status` before either restart is
+     requested. A new leader's start time, `/proc/PID/stat` field 22, is
+     compared with `/proc/uptime` read just before its request, both in
+     USER_HZ (100) ticks on the boot clock, so "later" is at tick
+     granularity: a start in the request's own tick counts.
+   - A transient failure is td-svc's two busy replies (its loop did not
+     answer in time, or is not accepting requests), or a client that
+     exits unsuccessfully having printed nothing: its own reply timeout,
+     or a connection it could not make, which its standard error alone
+     tells apart. Each exchange, and the reboot request, retries once.
+     Any other `error:` reply, a reply past 256 bytes, a client root
+     killed at its bound, or a reply that is not exactly a status line,
+     a `NAME: ...` acknowledgement or one of `reboot`'s two acceptances,
+     is a refusal: a client still running past the bound is not a busy
+     supervisor.
+   - A record that cannot be written after a completed cutover is logged
+     and the status still settles: the sessions are already closed, and
+     the next check repeats the cutover.
+   - Teardown kills a render or control client in flight and reaps it
+     within one second, then leaves it to the launch's nonblocking drop,
+     for the drop's reason: a child the kernel cannot kill must not wedge
+     td-authd. An owed reboot's request is awaited to its bound and its
+     retry's instead, since killing it could lose the reboot.
+   - The guard is created directly with `O_CREAT|O_EXCL|O_NOFOLLOW`, so
+     any existing entry under its name, of any type, holds. A successful
+     check removes a guard whose contents are not exactly this boot's ID
+     and a newline, and keeps every guard while the boot ID cannot be
+     read.
 8. **Update consent (4).** On an enrolled or unavailable machine, request
    19 refuses, before any presentation, a queued deployment that does not
    carry the login-key tier marker or, when the record on disk is
@@ -2509,7 +2604,7 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
-| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1), or from TOKEN-LOGIN.md increment 5's A3 `00` to `03` (amendment 7) |
+| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` to `03` (amendments 1 and 7) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
@@ -2517,9 +2612,8 @@ argument. The paired requests are:
 needs nor takes the operation slot. The compositor admits only an answer
 of exactly that shape, with a username under `primary_account`'s rules
 and a hostname empty or under `Hostname::parse`'s; anything else, a
-revocation byte other than `00` included until increment 5's A3 defines
-`01` to `03`, is a
-protocol violation that ends the paired generation.
+revocation byte past `03` included, is a protocol violation that ends
+the paired generation.
 
 `1b` needs completed preparation and an empty operation slot, as `12`
 does, or it ends the generation. The login operation then holds the

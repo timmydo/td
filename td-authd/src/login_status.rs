@@ -1,6 +1,7 @@
 //! Request `1a`: the human's login state, with root's cache of it
 //! (td-authd/DESIGN.md, login-state amendment 1).
 
+use crate::cutover::Reduced;
 use crate::hostname;
 use crate::inspection::Inspection;
 use std::fs::File;
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
     dead_code,
     reason = "the shared login-state predicate also serves firstboot and the record store"
 )]
-mod login_state;
+pub(crate) mod login_state;
 
 use login_state::{Cause, Owner};
 
@@ -84,7 +85,7 @@ impl State {
 }
 
 /// The helper's launch: the production one, or a test's.
-type Helper = Box<dyn FnMut(u32) -> Result<Inspection, String>>;
+pub(crate) type Helper = Box<dyn FnMut(u32) -> Result<Inspection, String>>;
 
 pub(crate) struct Status {
     owner: u32,
@@ -147,9 +148,20 @@ impl Status {
         self.stale = true;
     }
 
-    /// The `9a` answer. A live boot is unenrolled without any read, so the
-    /// live medium never locks.
-    pub fn answer(&mut self, live: bool) -> Result<Vec<u8>, String> {
+    /// The reduced state the revocation compares with its record
+    /// (amendment 7): the shared predicate's directory-and-name check
+    /// alone, never the helper, so a valid directory without the record
+    /// name is unenrolled and anything else enforced.
+    pub fn reduced(&self) -> Reduced {
+        match login_state::state_as(&self.root, self.directory_owner, self.owner) {
+            login_state::State::Unenrolled => Reduced::Unenrolled,
+            login_state::State::Enrolled | login_state::State::Unavailable(_) => Reduced::Enforced,
+        }
+    }
+
+    /// The `9a` answer, ending in `revocation`'s byte. A live boot is
+    /// unenrolled without any read, so the live medium never locks.
+    pub fn answer(&mut self, live: bool, revocation: u8) -> Result<Vec<u8>, String> {
         let state = if live {
             State::Unenrolled
         } else {
@@ -163,8 +175,7 @@ impl Status {
         let hostname = self.hostname();
         answer.push(u8::try_from(hostname.len()).map_err(|_| "hostname overflow")?);
         answer.extend_from_slice(hostname.as_bytes());
-        // Revocation (amendment 7) is reserved until increment 5.
-        answer.push(0);
+        answer.push(revocation);
         Ok(answer)
     }
 

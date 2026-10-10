@@ -267,7 +267,8 @@ The planned TPM-free login-key tier (`td-login/TOKEN-LOGIN.md`; nothing
 in production enrolls yet, and its pieces are inert but for firstboot's
 login directory and the cutover record it writes at every boot, the
 login state root reports, the key-management screen's refusals, and
-the update, console and SSH refusals and the compositor's locked start, `Super+l` and attention `L`, which act only
+the update, console and SSH refusals, td-authd's console and SSH
+cutover against that record, and the compositor's locked start, `Super+l` and attention `L`, which act only
 once a key is enrolled or the login directory is not valid, though every
 paired session consumes `Super+l` and shows `L`; `sshd`'s unit stopping
 its whole leaf (`stop=leaf`) is live on every machine) lets the installed

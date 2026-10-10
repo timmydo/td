@@ -1,6 +1,8 @@
 //! Bounded read-only inspection after root paired-session admission: the
 //! application store's state (request `17`), and the login record's for
-//! request `1a` (td-authd/DESIGN.md, login-state amendment 1).
+//! request `1a` (td-authd/DESIGN.md, login-state amendment 1). The same
+//! bounded launch serves the revocation's two root helpers (amendment 7),
+//! which print their one-line result on standard output instead.
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
@@ -17,6 +19,20 @@ const STORE_RESULT: usize = 2;
 const LOGIN_RESULT: usize = 36;
 /// How often a synchronous wait looks at the helper again.
 const WAIT_STEP: Duration = Duration::from_millis(2);
+/// One read's buffer: every helper's result bound is below it.
+const READ_SIZE: usize = 512;
+
+/// A helper's output and whether it exited successfully, once its run is
+/// over: `None` while it runs, `Some(None)` when nothing can be read.
+pub type Outcome<T> = Option<Option<(T, bool)>>;
+
+/// The descriptor a helper writes its result to: its stdin socket, as
+/// td-secret's helpers do, or its stdout.
+#[derive(Clone, Copy)]
+enum Writes {
+    Stdin,
+    Stdout,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum State {
@@ -63,6 +79,9 @@ pub(crate) struct Inspection {
     eof: bool,
     deadline: Instant,
     failed: bool,
+    /// The helper exited unsuccessfully: `answered` still reports what it
+    /// wrote, every other reader nothing.
+    exit_failed: bool,
     /// The deadline, not the helper, ended the run.
     missed: bool,
     terminal: Option<Event>,
@@ -79,7 +98,7 @@ impl Inspection {
         }
         let mut command = Command::new("/bin/td-secret");
         command.args(["inspect-store", "--uid", &owner.to_string()]);
-        Self::spawn(command, STORE_RESULT)
+        Self::spawn(command, STORE_RESULT, LIFETIME, Writes::Stdin)
     }
 
     /// The login record's read-only helper, which request `1a` runs only
@@ -90,20 +109,40 @@ impl Inspection {
         }
         let mut command = Command::new("/bin/td-secret");
         command.args(["inspect-login", "--uid", &owner.to_string()]);
-        Self::spawn(command, LOGIN_RESULT)
+        Self::spawn(command, LOGIN_RESULT, LIFETIME, Writes::Stdin)
     }
 
-    fn spawn(mut command: Command, limit: usize) -> Result<Self, String> {
+    /// A fixed root helper whose result is at most `limit` bytes on its
+    /// standard output, observed within `lifetime`: the revocation's
+    /// render and reboot request, read with `finished`.
+    pub fn printing(command: Command, limit: usize, lifetime: Duration) -> Result<Self, String> {
+        Self::spawn(command, limit, lifetime, Writes::Stdout)
+    }
+
+    fn spawn(
+        mut command: Command,
+        limit: usize,
+        lifetime: Duration,
+        writes: Writes,
+    ) -> Result<Self, String> {
+        if limit >= READ_SIZE {
+            return Err("helper result bound overflow".into());
+        }
         let deadline = Instant::now()
-            .checked_add(LIFETIME)
+            .checked_add(lifetime)
             .ok_or("inspection deadline overflow")?;
         let (parent, output) = UnixStream::pair().map_err(|e| e.to_string())?;
         parent.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let output = Stdio::from(OwnedFd::from(output));
+        let (stdin, stdout) = match writes {
+            Writes::Stdin => (output, Stdio::null()),
+            Writes::Stdout => (Stdio::null(), output),
+        };
         let child = command
             .env_clear()
             .current_dir("/")
-            .stdin(Stdio::from(OwnedFd::from(output)))
-            .stdout(Stdio::null())
+            .stdin(stdin)
+            .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("start inspection: {e}"))?;
@@ -115,6 +154,7 @@ impl Inspection {
             eof: false,
             deadline,
             failed: false,
+            exit_failed: false,
             missed: false,
             terminal: None,
             stop: Child::kill,
@@ -135,7 +175,7 @@ impl Inspection {
         let wire = self.wire.as_mut().ok_or("missing inspection endpoint")?;
         // One read per tick, including interruptions; at most one byte past
         // the limit in total, which refuses.
-        let mut buffer = [0; LOGIN_RESULT + 1];
+        let mut buffer = [0; READ_SIZE];
         let remaining = self
             .limit
             .checked_add(1)
@@ -163,6 +203,14 @@ impl Inspection {
     /// runs; then its bytes, only after EOF and a successful exit, each
     /// observed before the deadline, or `Some(None)` for anything else.
     fn result(&mut self) -> Result<Option<Option<&[u8]>>, String> {
+        let outcome = self.outcome(false)?;
+        Ok(outcome.map(|output| output.and_then(|(bytes, success)| success.then_some(bytes))))
+    }
+
+    /// `result`, and with `failed_output` a helper that exited unsuccessfully
+    /// is answered too, with its bytes and `false`, once its EOF is seen
+    /// before the deadline as a successful one's must be.
+    fn outcome(&mut self, failed_output: bool) -> Result<Outcome<&[u8]>, String> {
         if !self.failed {
             let expired = Instant::now() >= self.deadline;
             if expired || self.receive().is_err() {
@@ -180,9 +228,10 @@ impl Inspection {
                 return Ok(None);
             };
             self.child = None;
-            if !status.success() {
-                self.failed = true;
-            }
+            self.exit_failed = !status.success();
+        }
+        if self.exit_failed && !failed_output {
+            self.failed = true;
         }
         // Even successful exit is insufficient until bounded output and EOF
         // are observed. A retained descendant endpoint cannot stall the caller.
@@ -194,7 +243,27 @@ impl Inspection {
             self.missed = true;
         }
         self.wire = None;
-        Ok(Some((!self.failed).then_some(self.bytes.as_slice())))
+        let success = !self.exit_failed;
+        Ok(Some(
+            (!self.failed).then_some((self.bytes.as_slice(), success)),
+        ))
+    }
+
+    /// A printing helper's output whatever its exit, never blocking: `None`
+    /// while it runs, then its bytes and whether it exited successfully,
+    /// both observed before its deadline, or `Some(None)` for anything else,
+    /// `missed` saying whether the deadline was what ended it.
+    pub fn answered(&mut self) -> Result<Outcome<Vec<u8>>, String> {
+        Ok(self
+            .outcome(true)?
+            .map(|output| output.map(|(bytes, success)| (bytes.to_vec(), success))))
+    }
+
+    /// A printing helper's whole result, never blocking: `None` while it
+    /// runs, then its bytes after EOF and a successful exit, each observed
+    /// before its deadline, or `Some(None)` for anything else.
+    pub fn finished(&mut self) -> Result<Option<Option<Vec<u8>>>, String> {
+        Ok(self.result()?.map(|result| result.map(<[u8]>::to_vec)))
     }
 
     pub fn poll(&mut self) -> Result<Event, String> {
@@ -255,6 +324,22 @@ impl Inspection {
                 self.child = None;
                 true
             }
+        }
+    }
+
+    /// Generation teardown's end of a revocation helper: killed, then
+    /// reaped if the kernel collects it within `bound`, and otherwise left
+    /// to `Drop`'s nonblocking collection, for `Drop`'s reason: a helper
+    /// the kernel cannot kill must not wedge td-authd.
+    pub fn reap_within(mut self, bound: Duration) {
+        self.wire = None;
+        let _ = self.kill();
+        let end = Instant::now().checked_add(bound);
+        while !self.reaped() {
+            if end.is_none_or(|end| Instant::now() >= end) {
+                return;
+            }
+            std::thread::sleep(WAIT_STEP);
         }
     }
 

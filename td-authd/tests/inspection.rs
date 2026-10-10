@@ -45,6 +45,24 @@ fn child() {
             .write_all(&[&[0x1a, 1, 2, 1][..], &[0xa1; 4]].concat())
             .unwrap(),
         HELD => std::thread::sleep(Duration::from_secs(3)),
+        PRINTS => {
+            let mut header = [0; 3];
+            wire.read_exact(&mut header).unwrap();
+            let [code, hang, length] = header;
+            let mut bytes = vec![0; usize::from(length)];
+            wire.read_exact(&mut bytes).unwrap();
+            let cwd = std::env::current_dir().unwrap();
+            if std::env::vars_os().next().is_some() || cwd != std::path::Path::new("/") {
+                std::process::exit(9);
+            }
+            wire.write_all(&bytes).unwrap();
+            if hang != 0 {
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            if code != 0 {
+                std::process::exit(code.into());
+            }
+        }
         _ => panic!("unknown fixture"),
     }
 }
@@ -60,6 +78,10 @@ pub(crate) const LOGIN_LATER: u8 = 16;
 pub(crate) const STALLED: u8 = 8;
 /// Writes nothing and outlives a short deadline, then exits; `stuck`'s.
 const HELD: u8 = 15;
+/// Exits 9 unless its environment is empty and it runs in `/`; then
+/// writes the bytes `printed` sends and exits with its code or outlives
+/// every deadline.
+const PRINTS: u8 = 17;
 
 pub(crate) fn fixture(selector: u8) -> Inspection {
     with_limit(selector, STORE_RESULT)
@@ -91,14 +113,24 @@ pub(crate) fn release(inspection: &mut Inspection) {
     inspection.stop = Child::kill;
 }
 
+/// The helper's pid while it is unreaped.
+pub(crate) fn pid(inspection: &Inspection) -> Option<u32> {
+    inspection.child.as_ref().map(Child::id)
+}
+
 fn alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-fn with_limit(selector: u8, limit: usize) -> Inspection {
+fn child_command() -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args(["--exact", "inspection::tests::child", "--ignored"]);
-    let mut inspection = Inspection::spawn(command, limit).unwrap();
+    command
+}
+
+fn with_limit(selector: u8, limit: usize) -> Inspection {
+    let mut inspection =
+        Inspection::spawn(child_command(), limit, LIFETIME, Writes::Stdin).unwrap();
     inspection
         .wire
         .as_mut()
@@ -165,6 +197,7 @@ fn complete_bytes_alone_and_an_open_endpoint_never_report_state() {
         eof: false,
         deadline: Instant::now() + LIFETIME,
         failed: false,
+        exit_failed: false,
         missed: false,
         terminal: None,
         stop: Child::kill,
@@ -178,10 +211,16 @@ fn complete_bytes_alone_and_an_open_endpoint_never_report_state() {
 fn production_factory_refuses_wrong_owner_missing_binary_and_missing_reply() {
     assert!(Inspection::start(1001).is_err());
     assert!(Inspection::login(1001).is_err());
-    assert!(Inspection::spawn(Command::new("/missing-inspection-fixture"), STORE_RESULT).is_err());
+    assert!(Inspection::spawn(
+        Command::new("/missing-inspection-fixture"),
+        STORE_RESULT,
+        LIFETIME,
+        Writes::Stdin
+    )
+    .is_err());
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args(["--list"]);
-    let mut operation = Inspection::spawn(command, STORE_RESULT).unwrap();
+    let mut operation = Inspection::spawn(command, STORE_RESULT, LIFETIME, Writes::Stdin).unwrap();
     assert_eq!(finish(&mut operation), Event::Unavailable);
     assert!(operation.child.is_none());
 }
@@ -271,4 +310,107 @@ fn dropping_a_stuck_helper_never_waits_for_it() {
         let dropped = started.elapsed();
         assert!(dropped < Duration::from_secs(1), "{dropped:?}");
     }
+}
+
+/// A helper standing in for one that prints its result, as the
+/// revocation's render and reboot request do: libtest's own report
+/// occupies a fixture's standard output, so this one writes `bytes` to
+/// its wire, then exits `code`, or outlives every deadline if `hang`.
+pub(crate) fn printed(
+    bytes: &[u8],
+    code: u8,
+    hang: bool,
+    limit: usize,
+    lifetime: Duration,
+) -> Result<Inspection, String> {
+    let mut inspection = Inspection::spawn(child_command(), limit, lifetime, Writes::Stdin)?;
+    let length = u8::try_from(bytes.len()).map_err(|e| e.to_string())?;
+    let header = [PRINTS, code, u8::from(hang), length];
+    inspection
+        .wire
+        .as_mut()
+        .ok_or("no wire")?
+        .write_all(&[&header[..], bytes].concat())
+        .map_err(|e| e.to_string())?;
+    Ok(inspection)
+}
+
+/// `printing` reads the helper's standard output, under the same bound,
+/// empty environment and working directory as every helper: libtest's
+/// listing of one test is a fixed line on standard output.
+#[test]
+fn a_printing_helpers_result_is_its_standard_output() {
+    let listing = b"inspection::tests::child: test\n";
+    let list = || {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--list",
+            "--format",
+            "terse",
+            "--exact",
+            "inspection::tests::child",
+            "--ignored",
+        ]);
+        command
+    };
+    let finished = |mut helper: Inspection| {
+        let until = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(result) = helper.finished().unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let helper = Inspection::printing(list(), listing.len(), LIFETIME).unwrap();
+    assert_eq!(finished(helper), Some(listing.to_vec()));
+    let helper = Inspection::printing(list(), listing.len() - 1, LIFETIME).unwrap();
+    assert_eq!(finished(helper), None, "one byte past the bound");
+    // Its stdin is not the wire: the stdin fixture's selector never
+    // arrives, and it writes nothing.
+    let helper = Inspection::printing(child_command(), 2, LIFETIME).unwrap();
+    assert_eq!(finished(helper), None);
+    // The fixture's checks: an empty environment and `/`.
+    let helper = printed(b"x\n", 0, false, 2, LIFETIME).unwrap();
+    assert_eq!(finished(helper), Some(b"x\n".to_vec()));
+    assert!(Inspection::printing(list(), READ_SIZE, LIFETIME).is_err());
+}
+
+/// `answered` reports a failed exit's output with its failure, which
+/// `finished` never does; a helper the deadline ended is no answer, and
+/// says it missed.
+#[test]
+fn an_answer_carries_a_failed_exits_output() {
+    let answered = |mut helper: Inspection| {
+        let until = Instant::now() + Duration::from_secs(4);
+        loop {
+            if let Some(result) = helper.answered().unwrap() {
+                return (result, helper.missed());
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let helper = printed(b"error: no\n", 1, false, 16, LIFETIME).unwrap();
+    assert_eq!(
+        answered(helper),
+        (Some((b"error: no\n".to_vec(), false)), false)
+    );
+    let helper = printed(b"", 1, false, 16, LIFETIME).unwrap();
+    assert_eq!(answered(helper), (Some((Vec::new(), false)), false));
+    let helper = printed(b"ok\n", 0, false, 16, LIFETIME).unwrap();
+    assert_eq!(answered(helper), (Some((b"ok\n".to_vec(), true)), false));
+    let helper = printed(b"x\n", 0, true, 16, Duration::from_millis(300)).unwrap();
+    assert_eq!(answered(helper), (None, true));
+    let mut helper = printed(b"error: no\n", 1, false, 16, LIFETIME).unwrap();
+    let until = Instant::now() + Duration::from_secs(4);
+    let result = loop {
+        if let Some(result) = helper.finished().unwrap() {
+            break result;
+        }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(result, None);
 }

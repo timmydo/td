@@ -263,8 +263,9 @@ fn login_system_checks(install: Check<'_>) -> Vec<Screen<'_>> {
 /// What one phase's console must show beside its screens: its pass line,
 /// QEMU's clean exit, and boot health behind the lock; the serial
 /// greeter's one refusal line and no shell on every boot but the
-/// unenrolled seed's, which logs in; and rootcheck's login directory
-/// marker on every boot but a damaged directory's.
+/// unenrolled seed's, which logs in and, once its cutover restarts the
+/// greeter on the enrolled record, refuses once; and rootcheck's login
+/// directory marker on every boot but a damaged directory's.
 fn phase_result(result: &BootResult, phase: &str) -> Result<(), String> {
     let lines = |wanted: &str| {
         result
@@ -292,8 +293,11 @@ fn phase_result(result: &BootResult, phase: &str) -> Result<(), String> {
             "the serial greeter printed its refusal {refusals} times and greeted {greeted}, \
              not once and never"
         )
-    } else if !enrolled && (refusals != 0 || !greeted) {
-        "the unenrolled seed's serial greeter did not log in".into()
+    } else if !enrolled && (refusals != 1 || !greeted) {
+        format!(
+            "the seed's serial greeter greeted {greeted} and printed its refusal \
+             {refusals} times, not logging in and then refusing once after the cutover"
+        )
     } else if result.evidence.login_directory != directory {
         format!(
             "rootcheck's login directory marker was {}, not {directory}",
@@ -457,7 +461,7 @@ mod tests {
         }
         assert_eq!(
             fixture::login_system_screens("seed"),
-            ["blank-unlocked", "desktop"]
+            ["blank-unlocked", "desktop", "locked"]
         );
         let test = fixture::LOGIN_SYSTEM_TEST
             .strip_prefix("login_operation::tests::vm::system::")

@@ -5914,6 +5914,40 @@ mod tests {
             })
     }
 
+    /// td-authd's revocation (td-authd/DESIGN.md, amendment 7) hands back
+    /// the greeter's line and restarts exactly the units serving console
+    /// and SSH logins: the line is the greeter unit's `tty=`, and each
+    /// unit it restarts exists here.
+    #[test]
+    fn the_revocation_hands_back_the_greeters_line_and_restarts_real_units() {
+        const REVOCATION: &str = include_str!("../../../td-authd/src/revocation.rs");
+        let tty = unit_key("greeter", "tty").expect("the greeter unit has a tty");
+        assert_eq!(
+            REVOCATION
+                .matches(&format!("\nconst LINE: &str = \"/dev/{tty}\";\n"))
+                .count(),
+            1,
+            "td-authd's revocation must hand back the greeter's line /dev/{tty}"
+        );
+        assert_eq!(
+            REVOCATION
+                .matches("\nconst UNITS: &[&str] = &[\"sshd\", \"greeter\"];\n")
+                .count(),
+            1
+        );
+        let names: Vec<String> = parse_td_svc_conf()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for unit in ["sshd", "greeter"] {
+            assert!(names.iter().any(|name| name == unit), "no {unit} unit");
+        }
+        // The guard lives in the login directory firstboot creates.
+        assert!(
+            REVOCATION.contains("\nconst GUARD: &str = \"/var/lib/td/login/cutover-reboot\";\n")
+        );
+    }
+
     /// td-secret's login worker relies on td-svc to serialize it across
     /// td-authd processes (td-secret/DESIGN.md, "Login-key worker"): only
     /// one unit runs the serving authority, the pair-exec unit whose leaf

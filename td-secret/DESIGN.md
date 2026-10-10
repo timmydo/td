@@ -2912,7 +2912,7 @@ asks for a screen, since its getty flushes the line's input first.
 
 | Phase | The boot |
 | --- | --- |
-| `seed` | unenrolled, with `inspect-login` failing: once the serial greeter has logged in it is stopped, so no shell reads ttyS0, then `blank-unlocked`, holding no lock pixel, and `desktop`; the ordinary SSH form, root's loopback key admitted; then two persistent keys enrolled through the worker with the production retained read, the first alone and the second added across a gated swap, and the record copied aside |
+| `seed` | unenrolled, with `inspect-login` failing and the boot's cutover record naming the unenrolled state: once the serial greeter has logged in it is stopped, so no shell reads ttyS0, then `blank-unlocked`, holding no lock pixel, and `desktop`; the ordinary SSH form, root's loopback key refused; then the greeter started and logged in again and an SSH session opened as the primary account; two persistent keys enrolled through the worker with the production retained read, the first alone and the second added across a gated swap, and the record copied aside; last the cutover (TOKEN-LOGIN.md increment 5's A3): the pair restarted finds the enrolled state and the unenrolled record, and both sessions end, the record names the enforced form for this boot, no reboot guard exists, ttyS0 is root's, the greeter parks refusing, `locked`, and the enforced SSH form |
 | `locked` | locked from the first frame and still locked once the terminal is ready; boot health completes and the enforced SSH form refuses root and admits the primary; unlocks with each key, relocks by `Super+l` and by the menu's `L`; three queued updates; a killed compositor; the pair restarted with the helper failing; an unlock; last, suspend to RAM |
 | `damaged-CAUSE` | locked with the cause's rows; the chord shows them and no login worker lives for a second after it or after Escape, nor is one started at all; enforced SSH; then the documented recovery |
 | `repaired-CAUSE` | locked as enrolled, the record the copy; enforced SSH; then the next cause's damage, if any |
@@ -2986,7 +2986,8 @@ screen is forgiven only when QEMU has already exited, or exits within
 deployment, boot health's success marker, rootcheck's login directory
 marker except on a damaged directory's boots, and the serial greeter's
 exact refusal line once with no greeting on every boot but `seed`,
-whose greeter logs in. This proves the tier's locked boot, unlocks,
+whose greeter logs in and, once the cutover restarts it on the
+enrolled record, prints the refusal line once. This proves the tier's locked boot, unlocks,
 relocks and refusals on the full system in QEMU. It does not show
 `Super+l` or `L` on an unavailable session, or request 19's admission
 while the state could not be read. The keys and keyboard are UHID

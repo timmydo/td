@@ -3045,6 +3045,7 @@ impl Runtime {
         if let Some(rows) = latest.as_ref().or(connected) {
             self.scene
                 .set_lock_rows(crate::attention::lock_rows(Some(rows)));
+            self.scene.set_revocation(rows.revocation().notice());
         }
         if self.attention_enabled && connected.is_some_and(crate::authority::Answer::locks) {
             self.scene.lock();
@@ -3052,13 +3053,22 @@ impl Runtime {
         self.repaint()
     }
 
-    /// Root's latest `1a` answer: the lock surface's rows follow it, and
-    /// one on glass is repainted. An answer never locks or unlocks.
+    /// Root's latest `1a` answer: the lock surface's rows and the
+    /// attention screen's revocation notice follow it, and whichever is on
+    /// glass is repainted. An answer never locks or unlocks.
     pub(crate) fn follow_login(&mut self, login: &crate::authority::Answer) -> Result<(), String> {
         let changed = self
             .scene
             .set_lock_rows(crate::attention::lock_rows(Some(login)));
-        if changed && self.scene.locked() && !self.scene.attention_visible() {
+        let revocation = self.scene.set_revocation(login.revocation().notice());
+        // A presented prompt is never repainted for it: the notice shows
+        // on the screen's own rows, not over a consent's.
+        let shown = if self.scene.attention_visible() {
+            revocation && self.scene.attention_request().is_none()
+        } else {
+            changed && self.scene.locked()
+        };
+        if shown {
             self.owed_damage = Damage::Whole;
             return self.repaint();
         }
@@ -16178,6 +16188,72 @@ mod tests {
             assert!(!runtime.session_locked());
         }
         assert!(*frames.lock().unwrap() == [ordinary()]);
+    }
+
+    /// `9a`'s `02` and `03` notices follow each answer: on the lock surface
+    /// with its rows, and on an open attention screen below its rows, which
+    /// a change repaints; neither locks nor unlocks.
+    #[test]
+    fn a_failed_revocations_notice_follows_the_answers() {
+        let revoked = |state: &[u8], byte: u8| {
+            let login = crate::authority::Login::default();
+            login
+                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop", &[byte]].concat())
+                .unwrap();
+            login.current().unwrap()
+        };
+        let first = login(&[1, 1, 7, 7, 7, 7]);
+        let (mut runtime, frames) = recorded(true);
+        runtime
+            .first_paint(first.current().as_ref(), Some(&first))
+            .unwrap();
+        for byte in [1, 2, 3, 0] {
+            let answer = revoked(&[1, 1, 7, 7, 7, 7], byte);
+            runtime.follow_login(&answer).unwrap();
+            assert!(runtime.session_locked());
+            assert!(*frames.lock().unwrap().last().unwrap() == lock_surface(Some(&answer)));
+        }
+        // An unlocked session's attention screen shows it below its rows.
+        let unenrolled = login(&[0]);
+        let (mut runtime, frames) = recorded(true);
+        runtime
+            .first_paint(unenrolled.current().as_ref(), Some(&unenrolled))
+            .unwrap();
+        let origin = crate::input::test_origin();
+        runtime.attention(&origin, true).unwrap();
+        let menu = |revocation: Option<&str>| {
+            let mut frame = vec![0; 3200 * 600];
+            crate::attention::paint(
+                &mut frame,
+                800,
+                600,
+                3200,
+                false,
+                false,
+                crate::attention::Notice::default(),
+                revocation,
+            );
+            frame
+        };
+        assert!(*frames.lock().unwrap().last().unwrap() == menu(None));
+        for (byte, notice) in [
+            (2, Some(crate::attention::RESTARTING_NOTICE)),
+            (3, Some(crate::attention::HELD_NOTICE)),
+        ] {
+            runtime.follow_login(&revoked(&[0], byte)).unwrap();
+            assert!(!runtime.session_locked());
+            assert!(*frames.lock().unwrap().last().unwrap() == menu(notice));
+        }
+        // Unchanged, or pending, the screen is not painted again.
+        let painted = frames.lock().unwrap().len();
+        runtime.follow_login(&revoked(&[0], 3)).unwrap();
+        assert_eq!(frames.lock().unwrap().len(), painted);
+        runtime.follow_login(&revoked(&[0], 1)).unwrap();
+        assert!(*frames.lock().unwrap().last().unwrap() == menu(None));
+        runtime.follow_login(&revoked(&[0], 0)).unwrap();
+        assert_eq!(frames.lock().unwrap().len(), painted + 1);
+        runtime.attention(&origin, false).unwrap();
+        assert!(!runtime.session_locked());
     }
 
     /// The decision is the answer at connect's alone: an unreadable state

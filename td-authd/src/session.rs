@@ -39,6 +39,22 @@ pub(crate) enum Request {
 }
 
 impl Request {
+    /// Whether it may start an operation in the one slot, which no request
+    /// may while a failed revocation restarts the machine (amendment 7).
+    fn takes_slot(&self) -> bool {
+        matches!(
+            self,
+            Self::Inspect
+                | Self::Write
+                | Self::Install
+                | Self::Begin(_)
+                | Self::Enroll(_)
+                | Self::Login(_)
+                | Self::Rollback
+                | Self::Hostname
+        )
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         match bytes {
             [0x10] => Ok(Self::Prepare),
@@ -270,6 +286,10 @@ pub(crate) struct Session {
     inspection: Option<Inspection>,
     inspection_event: Option<InspectionEvent>,
     login_state: crate::login_status::Status,
+    /// None on a live boot, which runs no check.
+    revocation: Option<crate::revocation::Revocation>,
+    /// Whether the generation's first `1a` began its check.
+    checked: bool,
 }
 
 impl Session {
@@ -296,6 +316,8 @@ impl Session {
             inspection: None,
             inspection_event: None,
             login_state: crate::login_status::Status::new(owner, username)?,
+            revocation: Some(crate::revocation::Revocation::new()),
+            checked: false,
         })
     }
 
@@ -308,6 +330,7 @@ impl Session {
             // A live boot installs disks, never updates itself.
             if crate::disk_install::live_boot()? {
                 self.setup = Some(crate::disk_install::Intake::bind(self.owner)?);
+                self.revocation = None;
             } else {
                 self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
                 self.hostnames = Some(crate::set_hostname::Intake::bind(self.owner)?);
@@ -337,6 +360,14 @@ impl Session {
         cleanup: impl FnOnce(u32) -> Command,
         begin: impl FnOnce(u32, Start) -> Result<Unlock, String>,
     ) -> Result<Vec<u8>, String> {
+        if request.takes_slot()
+            && self
+                .revocation
+                .as_ref()
+                .is_some_and(crate::revocation::Revocation::restarting)
+        {
+            return Err("a request for the slot while a failed revocation restarts".into());
+        }
         match request {
             Request::Prepare => {
                 if self.activated {
@@ -368,8 +399,20 @@ impl Session {
                     .map_or_else(|| vec![0x9f, 0, 0], |intake| intake.state()))
             }
             // Beside any operation, which it neither needs nor takes. Only
-            // a live boot binds the setup intake.
-            Request::LoginState if self.prepared => self.login_state.answer(self.setup.is_some()),
+            // a live boot binds the setup intake. The generation's first
+            // begins its revocation check before it answers.
+            Request::LoginState if self.prepared => {
+                self.tick()?;
+                if !self.checked {
+                    self.checked = true;
+                    self.check_revocation();
+                }
+                let revocation = self
+                    .revocation
+                    .as_ref()
+                    .map_or(0, |revocation| revocation.status().byte());
+                self.login_state.answer(self.setup.is_some(), revocation)
+            }
             Request::LoginState => Err("login state before session preparation".into()),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
@@ -790,7 +833,32 @@ impl Session {
             self.inspection_event = Some(inspection.poll()?);
         }
         self.login_state.tick();
+        let slot_free = self.operation.is_none() && self.inspection.is_none();
+        if let Some(revocation) = &mut self.revocation {
+            let status = &self.login_state;
+            revocation.tick(slot_free, || status.reduced())?;
+        }
         Ok(())
+    }
+
+    /// A cutover in flight is abandoned without its record, so the next
+    /// generation's check repeats it; a failure's owed reboot is requested
+    /// only once the slot, its operation and inspection, is `reaped`.
+    fn abandon_revocation(&mut self, reaped: bool) {
+        if let Some(revocation) = &mut self.revocation {
+            revocation.abandon(reaped);
+        }
+    }
+
+    /// Amendment 7's check against the reduced state, never on a live
+    /// boot, which root answers unenrolled by fiat.
+    fn check_revocation(&mut self) {
+        if self.setup.is_some() {
+            return;
+        }
+        if let Some(revocation) = &mut self.revocation {
+            revocation.check(self.login_state.reduced());
+        }
     }
 
     fn reply(&mut self) -> Result<Vec<u8>, String> {
@@ -862,12 +930,15 @@ impl Session {
                 }
                 self.renaming = false;
             }
-            // However it ended, the next `1a` reads the login state afresh.
-            if matches!(operation, Active::Login(_)) {
-                self.login_state.operation_ended();
-            }
+            // However it ended, the next `1a` reads the login state afresh,
+            // and the revocation check begins before this status is sent.
+            let login = matches!(operation, Active::Login(_));
             self.operation = None;
             self.event = None;
+            if login {
+                self.login_state.operation_ended();
+                self.check_revocation();
+            }
         }
         Ok(answer)
     }
@@ -879,12 +950,16 @@ impl Session {
 
     fn close_with(&mut self, command: impl FnOnce(u32) -> Command) -> Result<(), String> {
         if !self.activated {
+            self.abandon_revocation(true);
             return Ok(());
         }
         if let Some(operation) = self.operation.take() {
             // The prior operation may retain a fatal cleanup result. Only
             // proven child death, not replaying that result, permits relocking.
-            operation.reap_for_teardown()?;
+            if let Err(why) = operation.reap_for_teardown() {
+                self.abandon_revocation(false);
+                return Err(why);
+            }
         }
         self.intake = None;
         self.installations = None;
@@ -895,6 +970,7 @@ impl Session {
         if let Some(inspection) = self.inspection.take() {
             inspection.reap_for_teardown();
         }
+        self.abandon_revocation(true);
         self.inspection_event = None;
         // Dropping pending generation cleanup also reaps before replacement.
         self.cleanup = None;

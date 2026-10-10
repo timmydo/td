@@ -44,6 +44,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "mount_sys.rs",
             "portal_files.rs",
             "primary_account.rs",
+            "revocation.rs",
             "rollback.rs",
             "secret_intake.rs",
             "secret_request.rs",
@@ -86,6 +87,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
         ("primary_account.rs", 0),
+        ("revocation.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -115,6 +117,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "login.rs"
                     | "rollback.rs"
                     | "session.rs"
+                    | "revocation.rs"
                     | "inspection.rs"
                     | "application_shell.rs"
                     | "shell_channel.rs"
@@ -192,7 +195,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                 .next()
                 .unwrap()
         ),
-        0xccbc4c8905ecac0b,
+        0x80211204b12d9166,
         "read-only store controller changed"
     );
     let inspection = include_str!("../src/inspection.rs")
@@ -544,6 +547,109 @@ fn the_production_source_and_raw_boundary_are_closed() {
         "remove_dir",
     ] {
         assert!(!shared.contains(forbidden), "saved.rs: {forbidden}");
+    }
+    // Amendment 7: two fixed root helpers, td-svc's control socket, the
+    // line's hand-back and the record through firstboot's one shared
+    // publication; production's deadlines only from the constants.
+    let revocation = include_str!("../src/revocation.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(fingerprint(revocation), REVOCATION_FINGERPRINT);
+    assert_eq!(revocation.matches("Command::new(").count(), 3);
+    for pin in [
+        "let mut command = Command::new(\"/bin/td-firstboot\");\n                command.arg(\"render-ssh-policy\");\n                Inspection::printing(command, RENDER_OUTPUT, RENDER_TIME)\n",
+        "let mut command = Command::new(\"/bin/td-svc\");\n                command.arg(\"reboot\");\n                Inspection::printing(command, REPLY_OUTPUT, EXCHANGE_TIME)\n",
+        // Each control exchange: a td-svc client child naming a fixed verb
+        // and one of the fixed units.
+        "control: Box::new(|verb, unit| {\n                let mut command = Command::new(\"/bin/td-svc\");\n                command.args([verb.word(), unit]);\n                Inspection::printing(command, REPLY_OUTPUT, EXCHANGE_TIME)\n",
+        "control: Box<dyn Fn(Verb, &'static str) -> Result<Inspection, String>>,",
+        "            Self::Status => \"status\",\n            Self::Restart => \"restart\",\n",
+        "const REPLY_OUTPUT: usize = 256;",
+        "const POLL_STEP: Duration = Duration::from_millis(250);",
+        "const TEARDOWN_REAP: Duration = Duration::from_secs(1);",
+        "const RENDER_OUTPUT: usize = 16;",
+        "const LINE: &str = \"/dev/ttyS0\";",
+        "const GUARD: &str = \"/var/lib/td/login/cutover-reboot\";",
+        "const UNITS: &[&str] = &[\"sshd\", \"greeter\"];",
+        "const RENDER_TIME: Duration = Duration::from_secs(10);",
+        "const EXCHANGE_TIME: Duration = Duration::from_secs(12);",
+        "const UNIT_TIME: Duration = Duration::from_secs(30);",
+        "unit_time: UNIT_TIME,",
+        "record: Path::new(\"/\").join(cutover::RECORD),",
+        "uid: 0,\n            gid: 0,",
+    ] {
+        assert_eq!(revocation.matches(pin).count(), 1, "revocation.rs: {pin}");
+    }
+    for (needle, count) in [
+        ("Self {\n            record: ", 1),
+        ("Self::with_host(", 1),
+        ("cutover::publish(", 1),
+        ("cutover::remove(", 1),
+        ("Directory::open(", 1),
+        ("(self.host.control)", 0),
+        ("(host.control)(verb, name)", 1),
+        ("(self.host.reboot)()", 2),
+        ("(host.reboot)()", 1),
+        ("lchown(", 1),
+        ("set_permissions(", 2),
+        ("remove_file(", 1),
+        ("Inspection::printing(", 3),
+        ("create_new(true)", 1),
+    ] {
+        assert_eq!(
+            revocation.matches(needle).count(),
+            count,
+            "revocation.rs: {needle}"
+        );
+    }
+    for forbidden in [
+        "unsafe",
+        ".spawn(",
+        "#[path",
+        "include",
+        "remove_dir",
+        "rename(",
+        "UnixStream",
+    ] {
+        assert!(
+            !revocation.contains(forbidden),
+            "revocation.rs: {forbidden}"
+        );
+    }
+    let session = include_str!("../src/session.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        session
+            .matches("revocation: Some(crate::revocation::Revocation::new()),")
+            .count(),
+        1
+    );
+    assert_eq!(session.matches("self.revocation = None;").count(), 1);
+    // The shared record bytes and publication, one reviewed copy.
+    assert_eq!(
+        include_str!("../src/main.rs")
+            .matches("#[path = \"../../td-firstboot/src/cutover.rs\"]\nmod cutover;\n")
+            .count(),
+        1
+    );
+    let cutover = include_str!("../../td-firstboot/src/cutover.rs");
+    assert_eq!(
+        fingerprint(cutover),
+        SHARED_CUTOVER_FINGERPRINT,
+        "shared cutover record and publication changed: reconcile td-firstboot and this pin"
+    );
+    for forbidden in [
+        "unsafe",
+        "Command",
+        "spawn",
+        "#[path",
+        "include",
+        "remove_dir",
+    ] {
+        assert!(!cutover.contains(forbidden), "cutover.rs: {forbidden}");
     }
     let table = include_str!("../src/elevation.rs")
         .split("#[cfg(test)]")
@@ -914,13 +1020,13 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LOGIN_STATE_FINGERPRINT: u64 = 0xf7d4c1e582d5ed83;
+const LOGIN_STATE_FINGERPRINT: u64 = 0x03208484ef5eb14d;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x82d5e067ac0d3cb6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
-const MAIN_FINGERPRINT: u64 = 0x135c5f3446a5e962;
-const SESSION_FINGERPRINT: u64 = 0x76c8a7eb107a7ec4;
+const MAIN_FINGERPRINT: u64 = 0xb0adcdeec79e50ac;
+const SESSION_FINGERPRINT: u64 = 0x8fd83ef1314188f9;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
@@ -933,5 +1039,7 @@ const ELEVATION_FINGERPRINT: u64 = 0x3a8baf08764bbaaf;
 const SET_HOSTNAME_FINGERPRINT: u64 = 0x739785d15e0c7fa8;
 const BACKOFF_FINGERPRINT: u64 = 0x2749dbb039baaa3a;
 const SHARED_SAVED_FINGERPRINT: u64 = 0x181983faf45559fa;
+const REVOCATION_FINGERPRINT: u64 = 0x6ebf36645809c24d;
+const SHARED_CUTOVER_FINGERPRINT: u64 = 0x358939aac41ef40a;
 const DISK_INSTALL_FINGERPRINT: u64 = 0x4dffa721ec6b8471;
 const CONSENT_CODEC_FINGERPRINT: u64 = 0x19d3fcff02c2bb2a;

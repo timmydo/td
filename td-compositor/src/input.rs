@@ -11679,6 +11679,7 @@ mod tests {
             true,
             true,
             crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+            None,
         );
         assert!(seat.glass() == drained);
         assert_eq!(seat.runtime.lock().unwrap().keyboard_snapshot().focus, None);
@@ -12438,6 +12439,7 @@ mod tests {
             true,
             false,
             crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+            None,
         );
         assert!(seat.glass() == drained);
         feed(&mut pointer, KEY_RELEASE, 71);
@@ -12581,6 +12583,7 @@ mod tests {
             true,
             false,
             crate::attention::Notice::Login(&["SESSION UNLOCKED"]),
+            None,
         );
         assert!(seat.glass() == drained);
         feed(&mut pointer, KEY_RELEASE, 71);
@@ -13671,6 +13674,7 @@ mod tests {
             true,
             false,
             crate::attention::Notice::default(),
+            None,
         );
         drained
     }

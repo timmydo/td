@@ -54,6 +54,12 @@ const UPDATE_READY: &str = " is ready. Press Ctrl+Alt+Escape, then I to review i
 const UPDATE_BACKING_OFF: &str = "the installation queue is backing off after unapproved requests";
 /// td-authd's backoff file; its update row counts each admitted request.
 const BACKOFF: &str = "/var/lib/td/authd/backoff";
+/// The cutover record firstboot and td-authd publish, and td-authd's
+/// reboot guard (td-authd/DESIGN.md, amendment 7).
+const CUTOVER: &str = "/run/td-login-cutover";
+const REBOOT_GUARD: &str = "/var/lib/td/login/cutover-reboot";
+/// The open SSH session's remote command's operand, which names it.
+const SESSION_SLEEP: &str = "4321";
 
 fn phase() -> &'static str {
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
@@ -234,6 +240,29 @@ fn login_shell() -> Option<u32> {
         .map(|shell| shell.pid)
 }
 
+/// Waits for the serial greeter's login shell to stay idle for two
+/// seconds, and returns it.
+fn idle_login_shell() -> u32 {
+    let mut idle = None;
+    system_wait("the serial greeter's idle login shell", || {
+        let shell = login_shell();
+        match (shell, idle) {
+            (Some(pid), Some((seen, since))) if pid == seen => {
+                Instant::now().duration_since(since) >= Duration::from_secs(2)
+            }
+            (Some(pid), _) => {
+                idle = Some((pid, Instant::now()));
+                false
+            }
+            (None, _) => {
+                idle = None;
+                false
+            }
+        }
+    });
+    idle.unwrap().0
+}
+
 fn parked_greeter() -> u32 {
     system_wait("the serial greeter's td-login", || greeter().is_some());
     let pid = greeter().unwrap();
@@ -349,8 +378,8 @@ fn unlock(host: &mut Host, keyboard: &mut Keyboard, key: &Virtual) {
 }
 
 /// `ssh` to `user` on loopback with `identity`, as root or as the primary
-/// account, `-v` when `verbose`.
-fn ssh_output(as_primary: bool, user: &str, identity: &str, verbose: bool) -> Output {
+/// account, `-v` when `verbose`: the remote command still to add.
+fn ssh_command(as_primary: bool, user: &str, identity: &str, verbose: bool) -> Command {
     let mut command = if as_primary {
         let mut command = Command::new("/bin/td-login");
         command.args(["exec-as", "tester", "--", "/bin/ssh"]);
@@ -374,10 +403,17 @@ fn ssh_output(as_primary: bool, user: &str, identity: &str, verbose: bool) -> Ou
             "ConnectTimeout=10",
         ])
         .arg(format!("{user}@127.0.0.1"))
-        .args(["/bin/echo", SSH_REPLY])
         .env_clear()
         .stdin(Stdio::null());
-    let output = command.output().unwrap();
+    command
+}
+
+/// `ssh_command`'s run of `echo`.
+fn ssh_output(as_primary: bool, user: &str, identity: &str, verbose: bool) -> Output {
+    let output = ssh_command(as_primary, user, identity, verbose)
+        .args(["/bin/echo", SSH_REPLY])
+        .output()
+        .unwrap();
     eprintln!(
         "ssh as {user}: {} {}",
         output.status,
@@ -612,6 +648,71 @@ fn seed_record() {
         .unwrap();
     copy.write_all(&fs::read(record_path()).unwrap()).unwrap();
     copy.sync_all().unwrap();
+}
+
+/// The cutover record for this boot naming `form`.
+fn cutover_record(form: &str) -> String {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    format!("td-login-cutover-v1\n{boot}{form}\n")
+}
+
+/// The open SSH session's remote command, while it runs.
+fn remote_session() -> Option<u32> {
+    processes()
+        .iter()
+        .find(|process| runs(process, "sleep", SESSION_SLEEP))
+        .map(|process| process.pid)
+}
+
+/// The seed's cutover (TOKEN-LOGIN.md increment 5's A3): with the serial
+/// greeter's session logged in again and an SSH session open as the
+/// primary account, the record is enrolled and the pair restarted. Its
+/// authority's first `1a` finds the reduced state enforced and the boot's
+/// record unenrolled, so it renders the enforced form, hands the line
+/// back, restarts `sshd` and `greeter` and records the form. Both sessions
+/// end, the greeter that replaces the serial one refuses, and the lock
+/// surface shows no failure.
+fn cutover(host: &mut Host) {
+    service(&["start", "greeter"]);
+    let shell = idle_login_shell();
+    let mut session = ssh_command(true, "tester", "/run/td-ssh-selftest", false)
+        .args(["/bin/sleep", SESSION_SLEEP])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    system_wait("the open SSH session", || {
+        assert!(
+            session.try_wait().unwrap().is_none(),
+            "the SSH session ended"
+        );
+        remote_session().is_some()
+    });
+    seed_record();
+    assert_eq!(
+        fs::read_to_string(CUTOVER).unwrap(),
+        cutover_record("unenrolled")
+    );
+    service(&["restart", "wayland"]);
+    system_wait("the serial session ended", || {
+        !Path::new(&format!("/proc/{shell}")).exists()
+    });
+    system_wait("the SSH session ended", || {
+        remote_session().is_none() && session.try_wait().unwrap().is_some()
+    });
+    system_wait("the enforced record", || {
+        fs::read_to_string(CUTOVER).ok() == Some(cutover_record("enforced"))
+    });
+    assert!(!Path::new(REBOOT_GUARD).exists(), "a failed revocation");
+    let line = fs::metadata("/dev/ttyS0").unwrap();
+    assert_eq!((line.uid(), line.gid()), (0, 0), "ttyS0 handed back");
+    parked_greeter();
+    assert_eq!(login_shell(), None, "a serial shell after the cutover");
+    // The serial session's leader exiting hung up every descriptor open
+    // on its controlling terminal, the host's among them: open it again.
+    *host = Host::open();
+    host.screen("locked", &[]);
+    sshd(true);
 }
 
 /// Leaves `damage` for the next boot, as other code on the machine could.
@@ -962,28 +1063,18 @@ fn qemu_login_system_locks_unlocks_and_refuses_on_a_full_system() {
     assert!(Device::discover().unwrap().is_empty());
     if phase == "seed" {
         // Unenrolled, with the state helper failing: root reads no record,
-        // so td-authd runs no helper and the session starts unlocked.
+        // so td-authd runs no helper and the session starts unlocked. The
+        // boot's record names that state, so root's check changes nothing.
         assert!(matches!(state(), State::Unenrolled));
+        assert_eq!(
+            fs::read_to_string(CUTOVER).unwrap(),
+            cutover_record("unenrolled")
+        );
         let failing = Recorder::mount(true);
         // The serial greeter logged in, and its shell would read the
-        // host's answers: once it has, the greeter is stopped.
-        let mut idle = None;
-        system_wait("the serial greeter's idle login shell", || {
-            let shell = login_shell();
-            match (shell, idle) {
-                (Some(pid), Some((seen, since))) if pid == seen => {
-                    Instant::now().duration_since(since) >= Duration::from_secs(2)
-                }
-                (Some(pid), _) => {
-                    idle = Some((pid, Instant::now()));
-                    false
-                }
-                (None, _) => {
-                    idle = None;
-                    false
-                }
-            }
-        });
+        // host's answers: once it has, the greeter is stopped until the
+        // cutover.
+        idle_login_shell();
         service(&["stop", "greeter"]);
         system_wait("ttyS0 released", || serial().is_none());
         let mut host = Host::open();
@@ -1003,7 +1094,7 @@ fn qemu_login_system_locks_unlocks_and_refuses_on_a_full_system() {
             .count();
         assert_eq!(helpers, 1, "td-authd ran the state helper unenrolled");
         failing.unmount();
-        seed_record();
+        cutover(&mut host);
         return;
     }
     let ids = enrolled_or_damaged(phase);

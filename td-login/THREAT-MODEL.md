@@ -76,9 +76,11 @@ policy's remaining bytes are compiled from the shared source used by the
 realized OpenSSH recipe test. The daemon requires this configuration file
 explicitly; there is no optional include or fallback configuration. A
 failed validation, boot ID read, or either write stops boot before user
-processes. Within a boot, `td-firstboot render-ssh-policy` publishes the
-same way and writes no record; its failure is td-authd's failed revocation
-(amendment 7), not a boot stop. Publication is serialized by the account
+processes. Within a boot, `td-firstboot render-ssh-policy`, which td-authd
+runs as a cutover's first step, publishes the same way and writes no
+record; td-authd writes the record through the same publication once the
+cutover is complete. The render's failure is td-authd's failed
+revocation (amendment 7), not a boot stop. Publication is serialized by the account
 tables' read-only binds, from `prepare-primary-profile` to shutdown; by an
 exclusive lock on a persistent root-only mode-0600 file beside the target
 (`/run/td-sshd.conf.lock`, `/run/td-login-cutover.lock`), held from
@@ -463,8 +465,12 @@ otherwise no-ops. A greeter must therefore use `login-primary`:
 `build_autologin` has no `login -f` fallback for a non-primary autologin
 account, refuses the build for one, and `system_def_is_self_consistent`
 requires the autologin account to be the primary one. A console session
-started before enrollment does not survive it; TOKEN-LOGIN.md's
-"Cutover" owns how. The stock image never contains a record and
+started before enrollment does not survive it: td-authd's cutover
+(`td-authd/DESIGN.md` amendment 7) hands this line back to root and
+restarts the greeter, whose stop ends every process holding the line as
+its controlling terminal, and `sshd`, whose stop ends its whole leaf,
+before it records the enforced form; a revocation that fails reboots
+once, guarded, or holds. TOKEN-LOGIN.md's "Cutover" owns how. The stock image never contains a record and
 firstboot ensures the directory at every boot, so its console behaviour
 and the table above stand; the refusal acts only where a record or an
 invalid directory exists. Since TOKEN-LOGIN.md's increment 4 (C7) the

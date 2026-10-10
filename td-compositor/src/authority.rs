@@ -46,7 +46,8 @@ const VERSION: &[u8] = b"TDLA003\n";
 const CAPACITY: usize = 16;
 const QUEUE_CAPACITY: usize = 1;
 const TICK: Duration = Duration::from_millis(250);
-/// How often `1a` is asked again while the state could not be read.
+/// How often `1a` is asked again while the state could not be read or a
+/// revocation is pending.
 const LOGIN_POLL: Duration = Duration::from_millis(250);
 /// TOKEN-LOGIN.md's failure kind for a state that could not be read.
 const UNREADABLE: u8 = 0x0c;
@@ -78,21 +79,59 @@ pub(crate) enum LoginState {
     Unavailable(u8),
 }
 
-/// Root's `1a` answer: the login state, and the primary username and
-/// hostname the lock surface draws above the state's rows.
+/// `9a`'s revocation byte (td-authd/DESIGN.md, amendment 7): whether the
+/// console and SSH were brought to the reduced login state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Revocation {
+    /// `00`: they were, or no check runs, as on the live medium.
+    Settled,
+    /// `01`: a cutover runs; `1a` is asked again every 250 ms.
+    Pending,
+    /// `02`: it failed and root restarts the machine; no request that
+    /// takes the operation slot is sent.
+    Restarting,
+    /// `03`: it failed again after an automatic restart, or root could not
+    /// guard one, so root holds without restarting.
+    Held,
+}
+
+impl Revocation {
+    fn decode(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Settled),
+            1 => Some(Self::Pending),
+            2 => Some(Self::Restarting),
+            3 => Some(Self::Held),
+            _ => None,
+        }
+    }
+
+    /// The notice the lock surface and the attention screen show, if any.
+    pub(crate) fn notice(self) -> Option<&'static str> {
+        match self {
+            Self::Restarting => Some(crate::attention::RESTARTING_NOTICE),
+            Self::Held => Some(crate::attention::HELD_NOTICE),
+            Self::Settled | Self::Pending => None,
+        }
+    }
+}
+
+/// Root's `1a` answer: the login state, the primary username and hostname
+/// the lock surface draws above the state's rows, and the revocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Answer {
     state: LoginState,
     username: String,
     /// Empty where root sent none.
     hostname: String,
+    revocation: Revocation,
 }
 
 impl Answer {
     /// Exactly `9a`'s shape, or a protocol violation that ends the paired
     /// generation: a state, an enrolled list or a cause; a primary account
     /// name; an empty hostname or one under td-firstboot's rules; and the
-    /// revocation byte, which is `00` until increment 5 defines another.
+    /// revocation byte, `00` to `03`.
     fn decode(answer: &[u8]) -> Result<Self, String> {
         let invalid = || "invalid login state answer".to_string();
         let [0x9a, state, rest @ ..] = answer else {
@@ -126,7 +165,11 @@ impl Answer {
             .ok_or_else(invalid)?;
         let username = std::str::from_utf8(username).map_err(|_| invalid())?;
         let host = std::str::from_utf8(host).map_err(|_| invalid())?;
-        if rest != [0] || primary_account::validate_name(username).is_err() {
+        let [revocation] = rest else {
+            return Err(invalid());
+        };
+        let revocation = Revocation::decode(*revocation).ok_or_else(invalid)?;
+        if primary_account::validate_name(username).is_err() {
             return Err(invalid());
         }
         let hostname = if host.is_empty() {
@@ -141,6 +184,7 @@ impl Answer {
             state,
             username: username.to_string(),
             hostname,
+            revocation,
         })
     }
 
@@ -154,6 +198,10 @@ impl Answer {
 
     pub(crate) fn hostname(&self) -> &str {
         &self.hostname
+    }
+
+    pub(crate) fn revocation(&self) -> Revocation {
+        self.revocation
     }
 
     /// Whether a generation starts locked on this answer: enrolled or
@@ -297,10 +345,13 @@ impl Hostnames {
 
 /// When the worker asks `1a`: at connect, after every login operation's
 /// end, and every 250 ms while the state could not be read, so a transient
-/// helper failure resolves without a reboot.
+/// helper failure resolves without a reboot, or while a revocation is
+/// pending, so its outcome is shown and a failure's refusal of the slot
+/// is known.
 struct LoginPoll {
     login: Login,
-    /// When to ask again; none unless the state could not be read.
+    /// When to ask again; none unless the state could not be read or a
+    /// revocation is pending.
     next: Option<Instant>,
 }
 
@@ -311,7 +362,9 @@ impl LoginPoll {
 
     fn read(&mut self, wire: &mut impl Exchange) -> Result<Answer, String> {
         let answer = Answer::decode(&wire.exchange(&[0x1a])?)?;
-        self.next = if answer.state == LoginState::Unavailable(UNREADABLE) {
+        self.next = if answer.state == LoginState::Unavailable(UNREADABLE)
+            || answer.revocation == Revocation::Pending
+        {
             Some(
                 Instant::now()
                     .checked_add(LOGIN_POLL)
@@ -335,6 +388,13 @@ impl LoginPoll {
             return self.read(wire).map(drop);
         }
         Ok(())
+    }
+
+    /// The last answer's revocation; settled before the first.
+    fn revocation(&self) -> Revocation {
+        self.login
+            .current()
+            .map_or(Revocation::Settled, |answer| answer.revocation)
     }
 
     /// How long the worker may wait for work before it is due.
@@ -681,7 +741,9 @@ fn worker(
     let mut processes = Processes::new();
     let mut secrets = crate::secret_client::Client::default();
     loop {
-        match receive.recv_timeout(login.wait()) {
+        let work = receive.recv_timeout(login.wait());
+        secrets.set_revocation(login.revocation());
+        match work {
             Ok(Work::Secret(attempt)) => secrets.start(&mut wire, attempt)?,
             Ok(Work::Program(terminal)) => {
                 if let Some(error) = processes.start(&mut wire, terminal)? {
@@ -757,7 +819,18 @@ mod tests {
 
     /// `9a` for `state`, with a primary name and a hostname.
     fn login_state(state: &[u8]) -> Vec<u8> {
-        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat()
+        revoked(state, 0)
+    }
+
+    /// `9a` for `state` with the revocation byte `revocation`.
+    fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
+        [
+            &[0x9a][..],
+            state,
+            b"\x06tester\x09td-laptop",
+            &[revocation],
+        ]
+        .concat()
     }
 
     fn keys(count: u8) -> Vec<u8> {
@@ -838,10 +911,12 @@ mod tests {
             // Lengths that overrun the answer.
             b"\x9a\x00\x07tester".to_vec(),
             b"\x9a\x00\x06tester\x09td".to_vec(),
-            // The revocation byte: missing, nonzero, or followed by more.
+            // The revocation byte: missing, past `03`, or followed by more.
             b"\x9a\x00\x06tester\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x01".to_vec(),
+            b"\x9a\x00\x06tester\x00\x04".to_vec(),
+            b"\x9a\x00\x06tester\x00\xff".to_vec(),
             b"\x9a\x00\x06tester\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x02\x00".to_vec(),
         ];
         for answer in refused {
             assert!(decode(&answer).is_err(), "{answer:02x?}");
@@ -933,11 +1008,7 @@ mod tests {
         let mut unprepared = wire(vec![vec![0x90], vec![0x91, 0]]);
         assert!(open_session(&mut unprepared, &Login::default()).is_err());
         assert!(!unprepared.requests.contains(&vec![0x1a]));
-        for answer in [
-            vec![0x9a],
-            [&login_state(&[0])[..login_state(&[0]).len() - 1], &[1]].concat(),
-            vec![0x91, 2],
-        ] {
+        for answer in [vec![0x9a], revoked(&[0], 4), vec![0x91, 2]] {
             let login = Login::default();
             let mut refused = wire(vec![vec![0x90], vec![0x91, 2], answer]);
             assert!(open_session(&mut refused, &login).is_err());
@@ -981,6 +1052,72 @@ mod tests {
             poll.read(&mut w).unwrap();
             assert_eq!(poll.next, None);
         }
+    }
+
+    /// The revocation byte, each of `00` to `03` with every state, is kept
+    /// with the answer; `02` and `03` carry their notices.
+    #[test]
+    fn each_revocation_byte_is_kept_with_its_notice() {
+        for (byte, revocation, notice) in [
+            (0, Revocation::Settled, None),
+            (1, Revocation::Pending, None),
+            (
+                2,
+                Revocation::Restarting,
+                Some("A CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING"),
+            ),
+            (
+                3,
+                Revocation::Held,
+                Some("SESSION REVOCATION FAILED AFTER A RESTART"),
+            ),
+        ] {
+            for state in [vec![0], keys(2), vec![2, UNREADABLE]] {
+                let answer = Answer::decode(&revoked(&state, byte)).unwrap();
+                assert_eq!(answer.revocation(), revocation);
+                assert_eq!(answer.revocation().notice(), notice);
+                assert_eq!(
+                    answer.state(),
+                    Answer::decode(&login_state(&state)).unwrap().state()
+                );
+            }
+        }
+    }
+
+    /// `01` is asked again every 250 ms until it settles, fails or holds;
+    /// `02` and `03` are final for the generation and are not polled.
+    #[test]
+    fn a_pending_revocation_is_asked_again_every_250_ms_until_it_resolves() {
+        let login = Login::default();
+        let mut poll = LoginPoll::new(login.clone());
+        let mut client = crate::secret_client::Client::default();
+        assert_eq!(poll.revocation(), Revocation::Settled);
+        let mut w = wire(vec![revoked(&[0], 1)]);
+        poll.read(&mut w).unwrap();
+        assert_eq!(poll.revocation(), Revocation::Pending);
+        let due = poll.next.unwrap();
+        assert!(due > Instant::now() && due <= Instant::now() + LOGIN_POLL);
+        assert!(poll.wait() <= LOGIN_POLL);
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(w.requests.len(), 1, "not yet due");
+        for (byte, polled) in [(1, true), (0, false), (1, true), (2, false)] {
+            poll.next = Some(Instant::now());
+            w.answers.push_back(revoked(&[0], byte));
+            poll.follow(&mut w, &mut client).unwrap();
+            assert_eq!(poll.next.is_some(), polled, "{byte}");
+        }
+        assert_eq!(poll.revocation(), Revocation::Restarting);
+        assert_eq!(poll.wait(), TICK);
+        poll.follow(&mut w, &mut client).unwrap();
+        assert_eq!(w.requests.len(), 5);
+        // Held, and an enrolled state, poll no more either.
+        w.answers.push_back(revoked(&keys(1), 3));
+        poll.read(&mut w).unwrap();
+        assert_eq!((poll.next, poll.revocation()), (None, Revocation::Held));
+        // An unreadable state polls whatever the byte.
+        w.answers.push_back(revoked(&[2, UNREADABLE], 3));
+        poll.read(&mut w).unwrap();
+        assert!(poll.next.is_some());
     }
 
     #[test]

@@ -10,6 +10,10 @@ mod channel;
     reason = "immutable trusted-prompt contract; authority consumer follows"
 )]
 mod consent;
+// The cutover record's bytes and the root-only publication firstboot's
+// renders share: one reviewed copy (amendment 7).
+#[path = "../../td-firstboot/src/cutover.rs"]
+mod cutover;
 mod deployment;
 mod disk_install;
 mod elevation;
@@ -33,6 +37,7 @@ mod login_tier;
 mod mount_sys;
 mod portal_files;
 mod primary_account;
+mod revocation;
 mod rollback;
 // The saved hostname's bounded read and synced write, and the synced write
 // the backoff file shares: td-firstboot's provisioning source.

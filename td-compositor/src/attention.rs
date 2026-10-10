@@ -51,6 +51,9 @@ pub(crate) enum Notice {
     Login(&'static [&'static str]),
     /// A write whose outcome is uncertain, then its kind's rows.
     Uncertain(&'static [&'static str]),
+    /// Root restarts the machine after a failed revocation, so no
+    /// selection is sent (td-authd/DESIGN.md, amendment 7).
+    Restarting,
 }
 
 impl Default for Notice {
@@ -352,6 +355,12 @@ fn ink(font: &crate::font::Font, text: &str, scale: usize) -> Result<Vec<(usize,
     Ok(ink)
 }
 
+/// `9a`'s `02` and `03` (td-authd/DESIGN.md, amendment 7), on the lock
+/// surface and the attention screen.
+pub(crate) const RESTARTING_NOTICE: &str =
+    "A CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING";
+pub(crate) const HELD_NOTICE: &str = "SESSION REVOCATION FAILED AFTER A RESTART";
+
 /// What a committed device-bound disk installation shows before attention
 /// closes by itself: its recovery key is shown and typed back in td-setup.
 pub(crate) const RETURNING_NOTICE: &str = "INSTALLING - RETURNING TO SETUP FOR THE RECOVERY KEY";
@@ -359,7 +368,10 @@ pub(crate) const RETURNING_NOTICE: &str = "INSTALLING - RETURNING TO SETUP FOR T
 /// Display-only pixels: ordinary scene rendering never calls this painter.
 /// A lifetime that left the lock surface keeps its success notice while
 /// held input drains: that drain cancels nothing. Nor does the close after
-/// a committed device-bound installation's returning notice.
+/// a committed device-bound installation's returning notice. `revocation`
+/// is a failed revocation's notice, drawn below the padded rows, so the
+/// menu's keep their places, unless the notice already says it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     frame: &mut [u8],
     width: usize,
@@ -368,6 +380,7 @@ pub(crate) fn paint(
     draining: bool,
     unlocked: bool,
     notice: Notice,
+    revocation: Option<&str>,
 ) {
     let bounds = (0, 0, width, height);
     ui::fill(frame, width, height, stride, bounds, [0x28, 0x20, 0x18, 0]);
@@ -381,6 +394,9 @@ pub(crate) fn paint(
     // The menu's rows keep their places, and the last row stays below them.
     if rows.len() < MENU_ROWS {
         rows.resize(MENU_ROWS, String::new());
+    }
+    if let Some(text) = revocation.filter(|text| !rows.iter().any(|row| row == text)) {
+        rows.push(text.into());
     }
     rows.push(
         if draining {
@@ -398,7 +414,8 @@ const UNLOCK_ROWS: &[&str] = &["PRESS CTRL+ALT+ESC TO UNLOCK"];
 
 /// The lock surface's rows for root's `1a` answer (td-login/TOKEN-LOGIN.md,
 /// "Session lock"): its hostname, unless empty, and username, uppercase,
-/// then `LOCKED` and the state's rows. With no answer, `LOCKED` alone.
+/// then `LOCKED`, the state's rows and a failed revocation's notice. With
+/// no answer, `LOCKED` alone.
 pub(crate) fn lock_rows(answer: Option<&crate::authority::Answer>) -> Vec<String> {
     use crate::authority::LoginState;
     use crate::secret_client::login_failure;
@@ -421,6 +438,7 @@ pub(crate) fn lock_rows(answer: Option<&crate::authority::Answer>) -> Vec<String
                 .iter()
                 .map(|row| String::from(*row)),
         )
+        .chain(answer.revocation().notice().map(String::from))
         .collect()
 }
 
@@ -458,12 +476,22 @@ fn draw_rows(
 ) {
     let bounds = (0, 0, width, height);
     let rows: Vec<String> = rows.iter().flat_map(|row| wrap(row, columns)).collect();
+    let glyph = ui::GLYPH_HEIGHT * scale;
     let pitch = 18 * scale;
+    // Rows that cannot all fit at the usual pitch close up rather than run
+    // off the output: the menu with a failed revocation's notice on the
+    // smallest output is the one screen that needs it.
+    let gaps = rows.len().saturating_sub(1);
+    let pitch = if gaps > 0 && gaps.saturating_mul(pitch).saturating_add(glyph) > height {
+        (height.saturating_sub(glyph) / gaps).max(glyph.saturating_add(scale))
+    } else {
+        pitch
+    };
     let block = rows
         .len()
         .saturating_sub(1)
         .saturating_mul(pitch)
-        .saturating_add(ui::GLYPH_HEIGHT * scale);
+        .saturating_add(glyph);
     let top = rows_top(height, block);
     for (index, text) in rows.iter().enumerate() {
         ui::draw_text_clipped(
@@ -574,6 +602,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::LoginKeys => "LOGIN KEYS",
         Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
+        Notice::Restarting => RESTARTING_NOTICE,
         Notice::Login(rows) => return rows.iter().map(|row| String::from(*row)).collect(),
         Notice::Removing { keys, chosen } => {
             let named: Vec<String> = (1..=keys)
@@ -725,7 +754,16 @@ mod tests {
         );
         let painted = |draining: bool, notice: Notice| {
             let mut frame = vec![0; 1280 * 800 * 4];
-            paint(&mut frame, 1280, 800, 1280 * 4, draining, false, notice);
+            paint(
+                &mut frame,
+                1280,
+                800,
+                1280 * 4,
+                draining,
+                false,
+                notice,
+                None,
+            );
             frame
         };
         assert_ne!(
@@ -911,6 +949,7 @@ mod tests {
                 false,
                 false,
                 Notice::default(),
+                None,
             );
             let mut expected = vec![0; stride * height];
             let bounds = (0, 0, width, height);
@@ -1063,7 +1102,9 @@ mod tests {
                     }
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
-                    paint(&mut frame, width, height, stride, draining, false, *notice);
+                    paint(
+                        &mut frame, width, height, stride, draining, false, *notice, None,
+                    );
                     assert!(
                         frame == unchanged(width, height, draining, *notice),
                         "{width}x{height} {notice:?}"
@@ -1125,20 +1166,27 @@ mod tests {
         Notice::Login(&["A RETAINED SYSTEM CANNOT READ KEYS"]),
         Notice::Login(&["THE OPERATION FAILED"]),
         Notice::Uncertain(&["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"]),
+        Notice::Restarting,
     ];
 
     /// Every screen's rows, wrapped where the output needs it, inside the
     /// output from 24 pixels in, at the smallest output a prompt takes and
-    /// at the oracles'. A row that fits is drawn as it is.
+    /// at the oracles'. A row that fits is drawn as it is. A failed
+    /// revocation's notice beneath any of them fits too.
     #[test]
     fn every_screen_fits_the_output_it_is_drawn_on() {
         for (width, height) in [(320, 200), (799, 600), (800, 600), (1280, 800)] {
             let (scale, columns) = layout(width, height);
-            for draining in [false, true] {
+            for (draining, revocation) in [false, true].into_iter().flat_map(|draining| {
+                [None, Some(RESTARTING_NOTICE), Some(HELD_NOTICE)]
+                    .map(|revocation| (draining, revocation))
+            }) {
                 for notice in screens() {
                     let stride = width * 4;
                     let mut frame = vec![0; stride * height];
-                    paint(&mut frame, width, height, stride, draining, false, notice);
+                    paint(
+                        &mut frame, width, height, stride, draining, false, notice, revocation,
+                    );
                     // The painted extent: inked rows and columns.
                     let ink = |x: usize, y: usize| frame[y * stride + x * 4] == 0xff;
                     let lowest = (0..height)
@@ -1234,7 +1282,16 @@ mod tests {
         let (width, height, stride) = (1280, 800, 1280 * 4);
         let notice = Notice::Login(&["SESSION UNLOCKED"]);
         let mut painted = vec![0x55; stride * height];
-        paint(&mut painted, width, height, stride, true, true, notice);
+        paint(
+            &mut painted,
+            width,
+            height,
+            stride,
+            true,
+            true,
+            notice,
+            None,
+        );
         let mut expected = vec![0; stride * height];
         let bounds = (0, 0, width, height);
         ui::fill(
@@ -1265,14 +1322,183 @@ mod tests {
         }
         assert!(painted == expected);
         let mut ordinary = vec![0; stride * height];
-        paint(&mut painted, width, height, stride, false, true, notice);
-        paint(&mut ordinary, width, height, stride, false, false, notice);
+        paint(
+            &mut painted,
+            width,
+            height,
+            stride,
+            false,
+            true,
+            notice,
+            None,
+        );
+        paint(
+            &mut ordinary,
+            width,
+            height,
+            stride,
+            false,
+            false,
+            notice,
+            None,
+        );
         assert!(painted == ordinary);
+    }
+
+    /// `9a`'s `02` and `03` notices are drawn on the attention screen
+    /// below the padded rows and above the last one, so no row the boot
+    /// oracles read moves; the restart notice is drawn once where the
+    /// screen already says it.
+    #[test]
+    fn a_failed_revocations_notice_is_drawn_below_rows_it_does_not_move() {
+        let (width, height, stride) = (1280, 800, 1280 * 4);
+        let expected = |rows: &[(usize, &str)]| {
+            let mut frame = vec![0; stride * height];
+            let bounds = (0, 0, width, height);
+            ui::fill(
+                &mut frame,
+                width,
+                height,
+                stride,
+                bounds,
+                [0x28, 0x20, 0x18, 0],
+            );
+            for (row, text) in rows {
+                ui::draw_text_clipped(
+                    &mut frame,
+                    width,
+                    height,
+                    stride,
+                    24,
+                    276 + row * 36,
+                    2,
+                    text,
+                    [0xff, 0xff, 0xff, 0],
+                    bounds,
+                );
+            }
+            frame
+        };
+        for text in [RESTARTING_NOTICE, HELD_NOTICE] {
+            let mut painted = vec![0; stride * height];
+            paint(
+                &mut painted,
+                width,
+                height,
+                stride,
+                false,
+                false,
+                Notice::Pending,
+                Some(text),
+            );
+            assert!(
+                painted
+                    == expected(&[
+                        (0, "TD SECURE ATTENTION"),
+                        (1, "PREPARING REQUEST"),
+                        (7, text),
+                        (8, "ESC TO RETURN"),
+                    ]),
+                "{text}"
+            );
+            let menu = Notice::default();
+            paint(
+                &mut painted,
+                width,
+                height,
+                stride,
+                false,
+                false,
+                menu,
+                Some(text),
+            );
+            let mut rows: Vec<(usize, String)> = std::iter::once("TD SECURE ATTENTION".into())
+                .chain(notice_rows(menu))
+                .enumerate()
+                .collect();
+            assert_eq!(rows[5], (5, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
+            rows.push((10, text.into()));
+            rows.push((11, "ESC TO RETURN".into()));
+            let rows: Vec<(usize, &str)> =
+                rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
+            assert!(painted == expected(&rows), "menu {text}");
+        }
+        let mut once = vec![0; stride * height];
+        let mut plain = vec![0; stride * height];
+        let notice = Notice::Restarting;
+        paint(
+            &mut once,
+            width,
+            height,
+            stride,
+            false,
+            false,
+            notice,
+            Some(RESTARTING_NOTICE),
+        );
+        paint(
+            &mut plain, width, height, stride, false, false, notice, None,
+        );
+        assert!(once == plain);
+        assert!(
+            plain
+                == expected(&[
+                    (0, "TD SECURE ATTENTION"),
+                    (1, RESTARTING_NOTICE),
+                    (7, "ESC TO RETURN"),
+                ])
+        );
+        // The menu with the restart notice on the smallest output closes
+        // its rows up rather than lose the last one off the bottom.
+        let (width, height, stride) = (320, 200, 320 * 4);
+        let mut small = vec![0; stride * height];
+        paint(
+            &mut small,
+            width,
+            height,
+            stride,
+            false,
+            false,
+            Notice::default(),
+            Some(RESTARTING_NOTICE),
+        );
+        let inked = |y: usize| (0..width).any(|x| small[y * stride + x * 4] == 0xff);
+        assert!(inked(0) && (190..200).any(inked));
+    }
+
+    /// The lock surface's rows end in `02`'s or `03`'s notice; `00` and
+    /// `01` add nothing.
+    #[test]
+    fn the_lock_rows_end_in_a_failed_revocations_notice() {
+        let base = lock_rows(Some(&answer(&[0], "td-laptop")));
+        for (byte, notice) in [
+            (0, None),
+            (1, None),
+            (2, Some(RESTARTING_NOTICE)),
+            (3, Some(HELD_NOTICE)),
+        ] {
+            let rows = lock_rows(Some(&revoked(&[0], "td-laptop", byte)));
+            assert_eq!(rows[..base.len()], base[..], "{byte}");
+            assert_eq!(rows.get(base.len()).map(String::as_str), notice, "{byte}");
+            assert!(rows.len() <= base.len() + 1);
+        }
+        assert_eq!(wrap(RESTARTING_NOTICE, 45).len(), 2);
+        assert_eq!(wrap(RESTARTING_NOTICE, 62).len(), 1);
+        assert_eq!(wrap(HELD_NOTICE, 45).len(), 1);
+        assert!(RESTARTING_NOTICE
+            .bytes()
+            .chain(HELD_NOTICE.bytes())
+            .all(ui::is_mapped));
     }
 
     /// Root's `9a` for `state`, for the primary `tester`, as the worker
     /// keeps it.
     fn answer(state: &[u8], hostname: &str) -> crate::authority::Answer {
+        revoked(state, hostname, 0)
+    }
+
+    /// The same with the revocation byte `revocation`.
+    fn revoked(state: &[u8], hostname: &str, revocation: u8) -> crate::authority::Answer {
         let login = crate::authority::Login::default();
         let host = u8::try_from(hostname.len()).unwrap();
         let bytes = [
@@ -1281,7 +1507,7 @@ mod tests {
             b"\x06tester",
             &[host],
             hostname.as_bytes(),
-            &[0],
+            &[revocation],
         ]
         .concat();
         login.answer(&bytes).unwrap();

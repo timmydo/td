@@ -2,32 +2,25 @@
 //! (td-login/TOKEN-LOGIN.md, "SSH" and increment 5's A2). The record's
 //! bytes, writers and reader are td-authd/DESIGN.md amendment 7's.
 //!
-//! Both verbs publish through `publish`: a fixed-name temporary beside
-//! the target, created exclusively without following a link, written,
-//! synced and renamed into place, so `sshd` never reads a partial policy
-//! and td-authd never reads a partial record.
+//! Both verbs publish through `cutover::publish`, which td-authd shares
+//! for its own record write: a fixed-name temporary beside the target,
+//! created exclusively without following a link, written, synced and
+//! renamed into place, so `sshd` never reads a partial policy and td-authd
+//! never reads a partial record.
 
-use crate::principals::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
+use crate::cutover::{self, BootId, Reduced};
 use crate::{login_state, principals, ssh_policy};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The policy `sshd` requires (`-f`), relative to the root rendered under.
 pub(crate) const POLICY: &str = "run/td-sshd.conf";
-/// The volatile record naming the state the console and SSH were last
-/// brought to, relative to the root.
-pub(crate) const RECORD: &str = "run/td-login-cutover";
-/// The running kernel's boot ID, whatever root is rendered under.
-pub(crate) const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
-const RECORD_VERSION: &str = "td-login-cutover-v1";
 
 /// The reduced login state a form serves, which the record and
 /// `render-ssh-policy`'s output name.
-pub(crate) fn word(form: ssh_policy::Form) -> &'static str {
+pub(crate) fn reduced(form: ssh_policy::Form) -> Reduced {
     match form {
-        ssh_policy::Form::Ordinary => "unenrolled",
-        ssh_policy::Form::Enforced => "enforced",
+        ssh_policy::Form::Ordinary => Reduced::Unenrolled,
+        ssh_policy::Form::Enforced => Reduced::Enforced,
     }
 }
 
@@ -51,45 +44,6 @@ pub(crate) fn selected(root: &Path, owner: login_state::Owner) -> ssh_policy::Fo
     ))
 }
 
-/// A validated boot ID: 36 bytes of lowercase hex with hyphens where a
-/// UUID's text form has them.
-struct BootId(String);
-
-impl BootId {
-    fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let shaped = bytes.len() == 36
-            && bytes.iter().enumerate().all(|(at, byte)| {
-                if matches!(at, 8 | 13 | 18 | 23) {
-                    *byte == b'-'
-                } else {
-                    byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
-                }
-            });
-        match std::str::from_utf8(bytes) {
-            Ok(text) if shaped => Ok(Self(text.to_owned())),
-            _ => Err("the boot ID is not 36 bytes of lowercase UUID text".into()),
-        }
-    }
-
-    /// The ID `path` holds as one newline-terminated line.
-    fn read(path: &Path) -> Result<Self, String> {
-        let mut bytes = Vec::with_capacity(38);
-        std::fs::File::open(path)
-            .and_then(|file| file.take(38).read_to_end(&mut bytes))
-            .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let line = bytes
-            .strip_suffix(b"\n")
-            .ok_or_else(|| format!("{} is not one newline-terminated line", path.display()))?;
-        Self::parse(line)
-    }
-}
-
-/// The record's exact bytes: version, boot ID and the form's word, each
-/// newline-terminated.
-fn record(boot: &BootId, form: ssh_policy::Form) -> String {
-    format!("{RECORD_VERSION}\n{}\n{}\n", boot.0, word(form))
-}
-
 /// Stage 1's render: the policy for `primary` in the form `root`'s login
 /// state selects, published under `root`, then the record naming that
 /// form for the boot `boot_id` names. The ID is read and checked first,
@@ -102,7 +56,12 @@ pub(crate) fn boot_render(
 ) -> Result<ssh_policy::Form, String> {
     let boot = BootId::read(boot_id)?;
     let form = publish_policy(root, primary, owner)?;
-    publish(&root.join(RECORD), record(&boot, form).as_bytes(), owner)?;
+    cutover::publish(
+        &root.join(cutover::RECORD),
+        cutover::record(&boot, reduced(form)).as_bytes(),
+        owner.uid,
+        owner.gid,
+    )?;
     Ok(form)
 }
 
@@ -113,7 +72,7 @@ pub(crate) fn running_render(
     primary: &str,
     owner: login_state::Owner,
 ) -> Result<String, String> {
-    publish_policy(root, primary, owner).map(|form| format!("{}\n", word(form)))
+    publish_policy(root, primary, owner).map(|form| format!("{}\n", reduced(form).word()))
 }
 
 fn publish_policy(
@@ -122,131 +81,26 @@ fn publish_policy(
     owner: login_state::Owner,
 ) -> Result<ssh_policy::Form, String> {
     let form = selected(root, owner);
-    publish(
+    cutover::publish(
         &root.join(POLICY),
         ssh_policy::config(primary, form).as_bytes(),
-        owner,
+        owner.uid,
+        owner.gid,
     )?;
     Ok(form)
-}
-
-/// The fixed temporary beside `path`.
-fn temporary(path: &Path) -> PathBuf {
-    beside(path, ".tmp")
-}
-
-fn beside(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// Opens, creating it if absent, the persistent lock file beside `path`
-/// and takes its exclusive lock, which the kernel drops if the process
-/// dies. It must be a single-link regular file of `owner`, mode 0600, so
-/// only that owner can hold it: an account that could open the lock could
-/// stall every render.
-fn lock(path: &Path, owner: login_state::Owner) -> std::io::Result<std::fs::File> {
-    let lock = beside(path, ".lock");
-    let named = |error: std::io::Error| {
-        std::io::Error::new(error.kind(), format!("{}: {error}", lock.display()))
-    };
-    let open = |create: bool| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(create)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-            .open(&lock)
-    };
-    // A new file takes the owner and mode here, so neither a setgid parent nor
-    // the umask can leave one the check below refuses forever; an existing one
-    // is checked, never repaired.
-    let file = match open(true) {
-        Ok(file) => {
-            std::os::unix::fs::fchown(&file, Some(owner.uid), Some(owner.gid)).map_err(named)?;
-            file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                .map_err(named)?;
-            file
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            open(false).map_err(named)?
-        }
-        Err(error) => return Err(named(error)),
-    };
-    let meta = file.metadata().map_err(named)?;
-    if !meta.file_type().is_file()
-        || (meta.uid(), meta.gid()) != (owner.uid, owner.gid)
-        || meta.mode() & 0o7777 != 0o600
-        || meta.nlink() != 1
-    {
-        return Err(std::io::Error::other(format!(
-            "{} is not a single-link {}:{} mode-0600 regular file",
-            lock.display(),
-            owner.uid,
-            owner.gid
-        )));
-    }
-    file.lock().map_err(named)?;
-    Ok(file)
-}
-
-/// Publishes `bytes` at `path`, `owner`'s and mode 0600, through the
-/// fixed temporary: a stale one is unlinked, never followed, and the new
-/// one is created with `O_CREAT|O_EXCL|O_NOFOLLOW`. Owner and mode are set
-/// through its descriptor before the file and then its directory are
-/// synced around the rename, which replaces whatever entry `path` names
-/// without following it. The whole sequence holds the lock beside `path`,
-/// so an overlapping publisher cannot unlink this one's temporary or
-/// rename it half written.
-fn publish(path: &Path, bytes: &[u8], owner: login_state::Owner) -> Result<(), String> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| format!("{} has no directory", path.display()))?;
-    let temporary = temporary(path);
-    let write = || -> std::io::Result<()> {
-        let parent = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(O_DIRECTORY | O_NOFOLLOW)
-            .open(directory)?;
-        let _held = lock(path, owner)?;
-        match std::fs::remove_file(&temporary) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        let mut file = create(&temporary)?;
-        std::os::unix::fs::fchown(&file, Some(owner.uid), Some(owner.gid))?;
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        parent.sync_all()
-    };
-    write().map_err(|error| {
-        format!(
-            "publish {} through {}: {error}",
-            path.display(),
-            temporary.display()
-        )
-    })
-}
-
-fn create(temporary: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(O_NOFOLLOW)
-        .open(temporary)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+    use crate::cutover::{beside, create, lock, temporary, BOOT_ID, RECORD};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
+
+    fn publish(path: &Path, bytes: &[u8], owner: login_state::Owner) -> Result<(), String> {
+        cutover::publish(path, bytes, owner.uid, owner.gid)
+    }
 
     const ID: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
 
@@ -440,7 +294,7 @@ mod tests {
         let root = Root::new();
         let target = root.root.join(POLICY);
         let owner = root.owner;
-        let held = lock(&target, owner).unwrap();
+        let held = lock(&target, owner.uid, owner.gid).unwrap();
         let publisher = {
             let target = target.clone();
             std::thread::spawn(move || publish(&target, b"policy", owner))

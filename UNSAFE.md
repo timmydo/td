@@ -2893,6 +2893,32 @@ call, the backoff's write before admission, the order of consume, clear
 and write, and the absence of any other process, descriptor or write
 API. No instruction, syscall, option or allowance is added.
 
+### Revocation
+
+`td-authd/src/revocation.rs` (`td-authd/DESIGN.md` amendment 7) is a
+safe std consumer that touches neither raw module and receives or sends
+no descriptor. It reads the cutover record and the boot ID through std
+with fixed `O_NOFOLLOW` and `O_NONBLOCK` flags, and `/proc/uptime` and
+a leader's `/proc/PID/stat` through std. It writes the record only
+through `td-firstboot/src/cutover.rs`, compiled by `#[path]`: std's
+lock-file open, `fchown`, permissions and `File::lock`, removal of a
+leftover temporary, create-new temporary, sync and rename, and the
+record's removal under the same lock. The reboot guard's directory is
+walked and held by the shared login-state predicate's `Directory`; the
+guard is a std create-new file with `O_NOFOLLOW` through that held
+directory, `fchown`, permissions and syncs of it and its directory, and
+std's removal. The line's hand-back is std's `symlink_metadata`,
+`lchown` and path-based `set_permissions`. Its fixed children,
+`/bin/td-firstboot render-ssh-policy`, `/bin/td-svc reboot` and each
+control exchange's `/bin/td-svc status|restart sshd|greeter`, start
+through `inspection.rs`'s bounded launch with an empty environment, cwd
+`/` and a socketpair end as stdout, where the existing helpers have it
+as stdin; that choice, a failed exit's output reported to its caller,
+and a teardown reap bounded in time are the launch's only changes.
+Confinement tests pin the source, the shared file, every argv, path and
+deadline, and the counts of each write and process API. No instruction,
+syscall, option or allowance is added.
+
 ### Claude shell terminal boundary
 
 The Claude shell launcher is another unprivileged consumer of the unchanged

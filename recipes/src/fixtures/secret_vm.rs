@@ -287,7 +287,8 @@ const UNLOCK: &[&str] = &[
 pub fn login_system_screens(phase: &str) -> Vec<&'static str> {
     let mut screens = Vec::new();
     if phase == "seed" {
-        screens.extend(["blank-unlocked", "desktop"]);
+        // The cutover's restarted pair locks on the enrolled record.
+        screens.extend(["blank-unlocked", "desktop", "locked"]);
     } else if phase == "locked" {
         screens.extend(["blank", "locked", "locked"]);
         screens.extend(UNLOCK);

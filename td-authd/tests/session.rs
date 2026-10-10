@@ -34,6 +34,14 @@ fn unexpected_begin(_: u32, _: Start) -> Result<Unlock, String> {
     panic!("operation began before admission")
 }
 
+/// A session whose revocation check never runs: the tests that are not
+/// about revocation (`revoking` below is).
+fn quiet() -> Session {
+    let mut session = Session::new(1000, "tester").unwrap();
+    session.revocation = None;
+    session
+}
+
 fn prepare(session: &mut Session) {
     assert_eq!(
         session
@@ -150,7 +158,7 @@ fn wire_parser_refuses_ambiguity_and_arbitrary_arguments() {
 #[test]
 fn cleanup_must_finish_before_any_operation_and_prepare_is_single_use() {
     assert!(Session::new(1001, "tester").is_err());
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 0]);
     assert!(session
         .answer_with(
@@ -169,7 +177,7 @@ fn cleanup_must_finish_before_any_operation_and_prepare_is_single_use() {
 #[test]
 fn failed_or_stalled_cleanup_never_admits_an_operation() {
     for name in ["failing_cleanup_child", "stalled_cleanup_child"] {
-        let mut session = Session::new(1000, "tester").unwrap();
+        let mut session = quiet();
         session
             .answer_with(Request::Prepare, |_| fixture(name), unexpected_begin)
             .unwrap();
@@ -226,7 +234,7 @@ fn rollback_admits_by_table_then_selectors_before_any_description() {
     use crate::rollback::tests::volume;
     let (a, b) = ("a".repeat(64), "b".repeat(64));
     let pair = volume(&a, &b);
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     assert_eq!(Request::decode(&[0x1d]).unwrap(), Request::Rollback);
     assert!(Request::decode(&[0x1d, 0]).is_err());
     // Not yet prepared: the slot is not free.
@@ -330,7 +338,7 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
     use crate::elevation::Table;
     use crate::set_hostname::tests::{submit_as, Fixture};
     let fixture = Fixture::new("td");
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     assert_eq!(Request::decode(&[0x1e]).unwrap(), Request::Hostname);
     assert_eq!(Request::decode(&[0x1f]).unwrap(), Request::HostnameState);
     assert!(Request::decode(&[0x1e, 0]).is_err());
@@ -518,7 +526,7 @@ fn a_hostname_change_is_admitted_by_the_table_then_described_then_saved_once() {
 
 #[test]
 fn one_operation_retains_its_bound_description_until_terminal_delivery() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     let response = session
         .answer_with(
@@ -572,7 +580,7 @@ fn one_operation_retains_its_bound_description_until_terminal_delivery() {
 
 #[test]
 fn missing_cleanup_cannot_be_retried_as_a_fresh_prepare() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     assert!(session
         .answer_with(
             Request::Prepare,
@@ -618,7 +626,7 @@ fn root_session_preparation_failure_and_generation_exit_relock() {
         std::os::unix::fs::fchown(fs::File::open(key).unwrap(), Some(991), Some(991)).unwrap();
     };
     seed();
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -667,7 +675,7 @@ fn silent_unlock_child() {
 
 #[test]
 fn generation_cleanup_runs_after_an_internal_cleanup_error() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -702,7 +710,7 @@ fn generation_cleanup_runs_after_an_internal_cleanup_error() {
 
 #[test]
 fn generation_exit_reaps_a_live_worker_before_cleanup() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -742,7 +750,7 @@ fn cleanup_requires_timely_observation_and_preserves_its_failure() {
 
 #[test]
 fn generation_exit_cleans_an_unpolled_completion() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     session
         .answer_with(Request::Begin(Role::Recovery), cleanup_command, |_, _| {
@@ -841,7 +849,7 @@ fn paired_enrollment_fixes_recovery_and_returns_each_required_presentation() {
     for (flag, recovery) in [(0, Recovery::Unrecoverable), (1, Recovery::SecondToken)] {
         let start = Request::decode(&[0x16, flag]).unwrap();
         assert_eq!(start, Request::Enroll(recovery));
-        let mut session = Session::new(1000, "tester").unwrap();
+        let mut session = quiet();
         assert!(session
             .answer_with(start, cleanup_command, unexpected_begin)
             .is_err());
@@ -906,7 +914,7 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
     for stale in [false, true] {
         let recovery = Recovery::Unrecoverable;
         let initial = enrollment_description(recovery, Enrollment::CreatePrimary);
-        let mut session = Session::new(1000, "tester").unwrap();
+        let mut session = quiet();
         prepare(&mut session);
         session
             .answer_with(Request::Enroll(recovery), cleanup_command, |_, _| {
@@ -940,7 +948,7 @@ fn invalid_enrollment_receipts_require_generation_teardown() {
 fn inspection_requires_idle_preparation_and_retains_its_result_until_poll() {
     assert_eq!(Request::decode(&[0x17]).unwrap(), Request::Inspect);
     assert!(Request::decode(&[0x17, 0]).is_err());
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     let start = |_| Ok(crate::inspection::tests::fixture(3));
     assert!(session.inspect_with(start).is_err());
     prepare(&mut session);
@@ -1029,7 +1037,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
         fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600)).unwrap();
         std::os::unix::fs::chown(path.join(name), Some(991), Some(991)).unwrap();
     }
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -1060,7 +1068,7 @@ fn root_inspection_observes_file_state_without_publishing_or_repairing() {
 
 /// A prepared session on a live boot, serving through a fake service.
 fn live_session() -> (Session, UnixStream) {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     let (setup, mut service) = crate::disk_install::tests::served();
     session.setup = Some(setup);
@@ -1288,7 +1296,7 @@ fn login_requests_have_one_encoding_and_a_pin_never_prints() {
 #[test]
 fn a_login_unlock_runs_through_the_paired_session() {
     use crate::consent::LoginStep;
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "unlock");
     let identify = login_step(2, LoginStep::Identify);
@@ -1335,7 +1343,7 @@ fn a_login_unlock_runs_through_the_paired_session() {
 #[test]
 fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
     use crate::consent::LoginStep;
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     // Refused from the baseline: no description, then idle.
     begin_login(&mut session, Selection::Add, "baseline-eight");
@@ -1377,7 +1385,7 @@ fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
     assert!(session
         .answer(Request::Pin(Box::new(unlock), Pin::new(b"1234").unwrap()))
         .is_err());
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "stall-pin");
     login_pin_step(&mut session);
@@ -1386,7 +1394,7 @@ fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
 
 #[test]
 fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "stall-pin");
     let unlock = login_pin_step(&mut session);
@@ -1412,7 +1420,7 @@ fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
 
 #[test]
 fn production_refuses_login_writes_before_any_worker_starts() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     for selection in [
         Selection::Enroll(1),
@@ -1443,7 +1451,7 @@ fn production_refuses_login_writes_before_any_worker_starts() {
 
 #[test]
 fn a_login_operation_occupies_the_one_operation_slot() {
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     assert!(session
         .begin_login(Selection::Unlock, true, |_, _| panic!("unprepared"))
         .is_err());
@@ -1480,7 +1488,7 @@ fn a_login_operation_occupies_the_one_operation_slot() {
         .unwrap();
     assert!(session.operation.is_none());
     // And a secret operation keeps a login out.
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     prepare(&mut session);
     session.operation = Some(Active::Secret(Box::new(
         Unlock::fixture(description(), fixture("silent_unlock_child")).unwrap(),
@@ -1499,7 +1507,7 @@ fn login_state_needs_preparation_but_never_the_operation_slot() {
     assert_eq!(Request::decode(&[0x1a]).unwrap(), Request::LoginState);
     assert!(Request::decode(&[0x1a, 0]).is_err());
     let root = Root::new();
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(never());
     assert!(session.answer(Request::LoginState).is_err());
     let unenrolled = answer(&[0], "td-laptop");
@@ -1522,7 +1530,7 @@ fn a_login_operations_end_refreshes_the_cached_state() {
     let root = Root::new();
     root.enroll();
     let (helper, runs) = counting(LOGIN_TWO);
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(helper);
     prepare(&mut session);
     let enrolled = answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
@@ -1637,7 +1645,7 @@ fn an_update_that_cannot_read_the_record_is_refused_before_any_description() {
             Machine::DirectoryDamaged => root.damage(),
             _ => root.enroll(),
         }
-        let mut session = Session::new(1000, "tester").unwrap();
+        let mut session = quiet();
         session.login_state = root.status(helper);
         prepare(&mut session);
         let update = Fixture::marked(tier);
@@ -1685,7 +1693,7 @@ fn a_marker_read_past_its_budget_refuses_inside_the_channels_receive() {
     use crate::login_status::tests::{counting, Root};
     let root = Root::new();
     root.enroll();
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(counting(LOGIN_TWO).0);
     prepare(&mut session);
     // A marker this record admits, read with its budget already spent:
@@ -1712,7 +1720,7 @@ fn an_updates_fresh_read_refreshes_the_cached_state() {
     let root = Root::new();
     root.enroll();
     let (helper, runs) = counting(LOGIN_TWO);
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(helper);
     prepare(&mut session);
     let enrolled = answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
@@ -1731,7 +1739,7 @@ fn an_updates_fresh_read_refreshes_the_cached_state() {
     let root = Root::new();
     root.enroll();
     let (helper, runs) = counting(LOGIN_TWO);
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(helper);
     prepare(&mut session);
     assert_eq!(session.answer(Request::LoginState).unwrap(), enrolled);
@@ -1764,7 +1772,7 @@ fn root_login_supervision_meets_the_production_worker() {
         .is_some_and(|ids| ids.split_whitespace().collect::<Vec<_>>() == ["0"; 4]));
     let directory = Path::new("/var/lib/td/login");
     assert!(!directory.exists());
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.answer(Request::Prepare).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while session.answer(Request::Poll).unwrap() != [0x91, 2] {
@@ -1836,7 +1844,7 @@ fn an_update_needs_the_deploy_publish_row_before_any_description() {
     use crate::elevation::Table;
     use crate::login_status::tests::{never, Root};
     let root = Root::new();
-    let mut session = Session::new(1000, "tester").unwrap();
+    let mut session = quiet();
     session.login_state = root.status(never());
     prepare(&mut session);
     let update = Fixture::new();
@@ -1861,5 +1869,316 @@ fn an_update_needs_the_deploy_publish_row_before_any_description() {
         .digits()
         .iter()
         .all(|digit| (b'2'..=b'9').contains(digit)));
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// A session whose login state reads under `root` with `helper` and whose
+/// revocation runs on `machine`, its render printing `form`.
+fn revoking(
+    root: &crate::login_status::tests::Root,
+    helper: crate::login_status::Helper,
+    machine: &crate::revocation::tests::Machine,
+    form: &str,
+) -> Session {
+    let mut session = quiet();
+    session.login_state = root.status(helper);
+    session.revocation = Some(machine.revocation(form));
+    session
+}
+
+/// `9a` for `state` on the test root, ending in `revocation`.
+fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
+    let mut answer = crate::login_status::tests::answer(state, "td-laptop");
+    *answer.last_mut().unwrap() = revocation;
+    answer
+}
+
+/// Asks `1a` until its revocation byte is `byte`.
+fn login_state_until(session: &mut Session, byte: u8) -> Vec<u8> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let answer = session.answer(Request::LoginState).unwrap();
+        if answer.last() == Some(&byte) {
+            return answer;
+        }
+        assert!(Instant::now() < until, "revocation byte never {byte}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The generation's first `1a` computes the reduced state, begins the
+/// check and then answers, already `01`; the cutover runs beside the
+/// slot, and later `1a`s advance it to `00` without a second check.
+#[test]
+fn the_first_login_state_begins_the_check_before_it_answers() {
+    use crate::cutover::Reduced;
+    use crate::login_status::tests::{never, Root};
+    use crate::revocation::tests::{Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    machine.record(ID, Reduced::Enforced);
+    let svc = machine.svc(Behavior::default());
+    let mut session = revoking(&root, never(), &machine, "unenrolled");
+    assert!(session.answer(Request::LoginState).is_err());
+    prepare(&mut session);
+    for _ in 0..5 {
+        session.answer(Request::Poll).unwrap();
+    }
+    assert_eq!(machine.renders(), 0, "a check before the first 1a");
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[0], 1)
+    );
+    // Beside the slot: a login operation begins while it runs.
+    begin_login(&mut session, Selection::Unlock, "silent");
+    assert_eq!(login_state_until(&mut session, 0), revoked(&[0], 0));
+    assert_eq!(
+        machine.recorded().unwrap(),
+        format!("td-login-cutover-v1\n{ID}\nunenrolled\n")
+    );
+    assert_eq!(machine.renders(), 1);
+    assert!(matches!(session.operation, Some(Active::Login(_))));
+    for _ in 0..5 {
+        assert_eq!(
+            session.answer(Request::LoginState).unwrap(),
+            revoked(&[0], 0)
+        );
+    }
+    assert_eq!(machine.renders(), 1);
+    assert!(svc.requests().contains(&"restart greeter".to_string()));
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// A login operation's end begins the check before its terminal status
+/// is delivered, so the `1a` after that status already reads `01`.
+#[test]
+fn a_login_operations_end_begins_the_check_before_its_status() {
+    use crate::cutover::Reduced;
+    use crate::inspection::tests::LOGIN_TWO;
+    use crate::login_status::tests::{counting, Root};
+    use crate::revocation::tests::{Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    machine.record(ID, Reduced::Unenrolled);
+    let _svc = machine.svc(Behavior::default());
+    let mut session = revoking(&root, counting(LOGIN_TWO).0, &machine, "enforced");
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[0], 0)
+    );
+    begin_login(&mut session, Selection::Unlock, "baseline-none");
+    root.enroll();
+    assert_eq!(machine.renders(), 0, "a check before the operation ended");
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x09, 0]);
+    assert_eq!(
+        session.revocation.as_ref().unwrap().status(),
+        crate::revocation::Status::Pending
+    );
+    let enrolled = [&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat();
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&enrolled, 1)
+    );
+    assert_eq!(login_state_until(&mut session, 0), revoked(&enrolled, 0));
+    assert_eq!(
+        machine.recorded().unwrap(),
+        format!("td-login-cutover-v1\n{ID}\nenforced\n")
+    );
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// The reduced state is the predicate's alone: an unenrolled machine
+/// whose helper fails runs no helper and no cutover, and a record name
+/// the failing helper cannot read is enforced, not a cutover either.
+#[test]
+fn a_failing_state_helper_never_causes_a_cutover() {
+    use crate::cutover::Reduced;
+    use crate::inspection::tests::LOGIN_FAILED;
+    use crate::login_status::tests::{counting, Root};
+    use crate::revocation::tests::{Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    let svc = machine.svc(Behavior::default());
+    machine.record(ID, Reduced::Unenrolled);
+    let (helper, runs) = counting(LOGIN_FAILED);
+    let mut session = revoking(&root, helper, &machine, "enforced");
+    prepare(&mut session);
+    for _ in 0..3 {
+        assert_eq!(
+            session.answer(Request::LoginState).unwrap(),
+            revoked(&[0], 0)
+        );
+    }
+    assert_eq!(runs.get(), 0);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+    root.enroll();
+    machine.record(ID, Reduced::Enforced);
+    let (helper, runs) = counting(LOGIN_FAILED);
+    let mut session = revoking(&root, helper, &machine, "unenrolled");
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[2, 0x0c], 0)
+    );
+    assert_eq!(runs.get(), 1);
+    assert_eq!(machine.renders(), 0);
+    assert!(svc.requests().is_empty());
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// A failed revocation reads `02`; every request that takes the slot is
+/// then a protocol violation; the reboot is requested only once the
+/// login operation holding the slot has delivered its end, and once.
+#[test]
+fn a_failed_revocation_refuses_the_slot_and_reboots_once_it_is_free() {
+    use crate::cutover::Reduced;
+    use crate::login_status::tests::{never, Root};
+    use crate::revocation::tests::{Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    machine.record(ID, Reduced::Enforced);
+    let _svc = machine.svc(Behavior {
+        refuse_greeter: true,
+        ..Behavior::default()
+    });
+    let mut session = revoking(&root, never(), &machine, "unenrolled");
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Unlock, "silent");
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[0], 1)
+    );
+    assert_eq!(login_state_until(&mut session, 2), revoked(&[0], 2));
+    assert_eq!(
+        std::fs::read_to_string(machine.guard()).unwrap(),
+        format!("{ID}\n")
+    );
+    for _ in 0..20 {
+        session.answer(Request::Poll).unwrap();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(machine.reboots(), 0, "a reboot beside the login operation");
+    for request in [
+        Request::Inspect,
+        Request::Write,
+        Request::Install,
+        Request::Rollback,
+        Request::Hostname,
+        Request::Begin(Role::Primary),
+        Request::Enroll(Recovery::SecondToken),
+        Request::Login(Selection::Unlock),
+        Request::Login(Selection::Enroll(1)),
+    ] {
+        let refused = session.answer(request).unwrap_err();
+        assert!(refused.contains("revocation"), "{refused}");
+    }
+    assert!(matches!(session.operation, Some(Active::Login(_))));
+    // The operation's own requests are not the slot's.
+    assert_eq!(
+        session.answer(Request::Cancel([42; 32])).unwrap(),
+        [0x95, 0]
+    );
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x80, 0]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while machine.reboots() == 0 {
+        session.answer(Request::Poll).unwrap();
+        assert!(Instant::now() < until, "no reboot request");
+        thread::sleep(Duration::from_millis(2));
+    }
+    for _ in 0..50 {
+        assert_eq!(
+            session.answer(Request::LoginState).unwrap(),
+            revoked(&[0], 2)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(machine.reboots(), 1);
+    assert_eq!(machine.recorded(), None, "removed as the cutover began");
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// A reboot request td-svc does not accept ends the generation.
+#[test]
+fn a_refused_reboot_request_ends_the_generation() {
+    use crate::cutover::Reduced;
+    use crate::login_status::tests::{never, Root};
+    use crate::revocation::tests::{prints, Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    machine.record(ID, Reduced::Enforced);
+    let _svc = machine.svc(Behavior {
+        refuse_greeter: true,
+        ..Behavior::default()
+    });
+    let mut session = quiet();
+    session.login_state = root.status(never());
+    session.revocation =
+        Some(machine.revocation_with(prints("unenrolled\n"), prints("error: refused\n").exits(1)));
+    prepare(&mut session);
+    let until = Instant::now() + Duration::from_secs(10);
+    let error = loop {
+        match session.answer(Request::LoginState) {
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+        assert!(Instant::now() < until, "the generation lived on");
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert!(error.contains("reboot"), "{error}");
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// A live boot runs no check, whatever its record says.
+#[test]
+fn a_live_session_runs_no_revocation_check() {
+    use crate::cutover::Reduced;
+    use crate::login_status::tests::{never, Root};
+    use crate::revocation::tests::{Machine, OTHER};
+    let root = Root::new();
+    root.enroll();
+    let machine = Machine::new();
+    machine.record(OTHER, Reduced::Unenrolled);
+    let (mut session, _service) = live_session();
+    session.login_state = root.status(never());
+    session.revocation = Some(machine.revocation("enforced"));
+    for _ in 0..3 {
+        assert_eq!(
+            session.answer(Request::LoginState).unwrap(),
+            revoked(&[0], 0)
+        );
+    }
+    assert_eq!(machine.renders(), 0);
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// Teardown abandons a cutover in flight without its record, so the next
+/// generation's first `1a` begins it again.
+#[test]
+fn teardown_abandons_the_cutover_and_the_next_generation_repeats_it() {
+    use crate::cutover::Reduced;
+    use crate::login_status::tests::{never, Root};
+    use crate::revocation::tests::{accepted, prints, Behavior, Machine, ID};
+    let root = Root::new();
+    let machine = Machine::new();
+    machine.record(ID, Reduced::Enforced);
+    let _svc = machine.svc(Behavior::default());
+    let mut session = quiet();
+    session.login_state = root.status(never());
+    session.revocation = Some(machine.revocation_with(prints("").hangs(), accepted()));
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[0], 1)
+    );
+    session.close_with(|_| fixture("cleanup_child")).unwrap();
+    assert_eq!(machine.recorded(), None);
+    let mut session = revoking(&root, never(), &machine, "unenrolled");
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        revoked(&[0], 1)
+    );
+    assert_eq!(login_state_until(&mut session, 0), revoked(&[0], 0));
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }
