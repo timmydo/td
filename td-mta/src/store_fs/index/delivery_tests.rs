@@ -56,8 +56,8 @@ impl UploadAuthorization for DevicePolicy {
     }
 }
 
-struct Policy(Arc<Mutex<bool>>);
-struct Guard<'a>(MutexGuard<'a, bool>);
+struct Policy(Arc<Mutex<bool>>, IpAddr);
+struct Guard<'a>(MutexGuard<'a, bool>, IpAddr);
 impl DeliveryGuard for Guard<'_> {
     fn access(&self) -> Access {
         assert!(*self.0);
@@ -69,7 +69,7 @@ impl DeliveryGuard for Guard<'_> {
     }
     fn peer(&self) -> DeliveryPeer<'_> {
         DeliveryPeer {
-            peer: "192.0.2.7".parse().unwrap(),
+            peer: self.1,
             tls: ReceiptTls::Plain,
             gateway: None,
         }
@@ -82,7 +82,7 @@ impl DeliveryAuthorization for Policy {
         if !*state || account != ACCOUNT {
             return Err(ports::Error::Forbidden);
         }
-        Ok(Guard(state))
+        Ok(Guard(state, self.1))
     }
 }
 struct Random(u8);
@@ -120,6 +120,20 @@ fn fixture(
 fn fixture_with_limits(
     maximum: usize,
     headers: usize,
+    run: impl for<'r, 'a, 's> FnOnce(
+        &mut StoreCoordinator<'r, 'a, DevicePolicy>,
+        &'s IngressSpool<'r>,
+        &Policy,
+        &Arc<Timer>,
+        &Routing<'_>,
+    ) -> Vec<Expected>,
+) {
+    fixture_with_peer(maximum, headers, "192.0.2.7".parse().unwrap(), run)
+}
+fn fixture_with_peer(
+    maximum: usize,
+    headers: usize,
+    peer: IpAddr,
     run: impl for<'r, 'a, 's> FnOnce(
         &mut StoreCoordinator<'r, 'a, DevicePolicy>,
         &'s IngressSpool<'r>,
@@ -199,7 +213,7 @@ fn fixture_with_limits(
         deadline(),
     )
     .unwrap();
-    let policy = Policy(Arc::new(Mutex::new(true)));
+    let policy = Policy(Arc::new(Mutex::new(true)), peer);
     let mut text = [0; 1024];
     let mut domains = [DomainSlot::EMPTY; 1];
     let mut aliases = [AliasSlot::EMPTY; 2];
@@ -239,7 +253,7 @@ fn fixture_with_limits(
         let EmailOrigin::Smtp(receipt) = email.origin else {
             panic!("receipt")
         };
-        assert_eq!(receipt.peer, "192.0.2.7".parse::<IpAddr>().unwrap());
+        assert_eq!(receipt.peer, peer);
         assert_eq!(receipt.reverse_path, "");
         assert_eq!(
             receipt
@@ -270,7 +284,7 @@ fn fixture_with_limits(
             used += n;
         }
         body.finish().unwrap();
-        let prefix = format!("Return-Path: <>\r\nReceived: from sender.test ([192.0.2.7])\r\n\tby mx.example.test with ESMTP id {};\r\n\t1 Jan 1970 00:00:00 +0000\r\n", result.email);
+        let prefix = format!("Return-Path: <>\r\nReceived: from sender.test ([{peer}])\r\n\tby mx.example.test with ESMTP id {};\r\n\t1 Jan 1970 00:00:00 +0000\r\n", result.email);
         assert_eq!(
             &bytes[..used],
             format!("{prefix}{}", expected.tail).as_bytes()
@@ -1475,5 +1489,149 @@ fn delivery_spool_creation_runs_outside_coordination_and_rolls_back_failure() {
             assert_eq!(spool.status().unwrap().occupied_slots, 0);
             Vec::new()
         });
+    }
+}
+
+#[test]
+fn real_tcp_delivery_acknowledges_only_recoverable_mail() {
+    use crate::{
+        smtp_network::{Network, Progress},
+        transport::TcpTransport,
+    };
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+    fn reply(reader: &mut BufReader<TcpStream>, code: &str) {
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            assert!(line.starts_with(code), "{line}");
+            if line.as_bytes()[3] != b'-' {
+                break;
+            }
+        }
+    }
+    for late in [None, Some(1800001), Some(3600001)] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut transport = TcpTransport::from_stream(server).unwrap();
+        let peer = transport.peer_addr().ip();
+        fixture_with_peer(
+            MAXIMUM,
+            8192,
+            peer,
+            |coordinator, spool, policy, clock, routes| {
+                std::thread::scope(|scope| {
+                    let client = scope.spawn(move || {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut reader = BufReader::new(client);
+                        reply(&mut reader, "220");
+                        for (command, code) in [
+                            ("EHLO sender.test\r\n", "250"),
+                            ("MAIL FROM:<> BODY=8BITMIME\r\n", "250"),
+                            ("RCPT TO:<Alice@example.test>\r\n", "250"),
+                            ("RCPT TO:<alias@example.test>\r\n", "250"),
+                            ("DATA\r\n", "354"),
+                            ("Subject: socket\r\n\r\n..dot\r\n.\r\n", "250"),
+                        ] {
+                            reader.get_mut().write_all(command.as_bytes()).unwrap();
+                            reply(&mut reader, code);
+                        }
+                        if late == Some(3600001) {
+                            reply(&mut reader, "421");
+                        } else {
+                            reader.get_mut().write_all(b"QUIT\r\n").unwrap();
+                            reply(&mut reader, "221");
+                        }
+                        reader.get_mut().shutdown(Shutdown::Write).unwrap();
+                        let mut line = String::new();
+                        assert_eq!(reader.read_line(&mut line).unwrap(), 0);
+                    });
+                    let resources = Limits::default().plan().unwrap();
+                    let plan = crate::admission::timers::NetworkLimits::default()
+                        .plan(
+                            &DiskLimits::default()
+                                .plan(
+                                    &resources,
+                                    WorkLimits::default(),
+                                    ViewMode::OnlineBackground,
+                                )
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    let mut network = Network::new(
+                        routes,
+                        Settings {
+                            hostname: "mx.example.test",
+                            message_bytes: MAXIMUM,
+                            trace_bytes: smtp_trace_allowance("mx.example.test").unwrap(),
+                            recipients: 100,
+                            starttls: false,
+                        },
+                        &plan,
+                        clock.as_ref(),
+                    )
+                    .unwrap();
+                    let mut random = Random(30);
+                    let mut delivery = None;
+                    let mut expected = Vec::new();
+                    let stop = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        assert!(Instant::now() < stop);
+                        match network.advance(&mut transport, clock.as_ref()).unwrap() {
+                            Progress::Pending => std::thread::sleep(Duration::from_millis(1)),
+                            Progress::Advanced => (),
+                            Progress::Closed => break,
+                            Progress::Work => match network.session().pending() {
+                                Pending::BeginData { .. } => {
+                                    let job = coordinator
+                                        .reserve_delivery(
+                                            &td_crypto::Provider,
+                                            &mut random,
+                                            spool,
+                                            policy,
+                                            network.session(),
+                                            request(),
+                                        )
+                                        .unwrap();
+                                    delivery = Some(job);
+                                    network.data_ready(Ok(()), clock.as_ref()).unwrap();
+                                }
+                                Pending::Data(bytes) => {
+                                    delivery.as_mut().unwrap().write(bytes).unwrap();
+                                    network.data_written(Ok(()), clock.as_ref()).unwrap();
+                                }
+                                Pending::Commit => {
+                                    let mut job = delivery.take().unwrap();
+                                    job.prepare().unwrap();
+                                    let result = job.commit().unwrap();
+                                    assert!(result.outcome.is_ok());
+                                    if let Some(tick) = late {
+                                        clock.0.store(tick, Ordering::Relaxed);
+                                    }
+                                    network.committed(result.outcome, clock.as_ref()).unwrap();
+                                    expected.push(Expected {
+                                        result,
+                                        tail: "Subject: socket\r\n\r\n.dot\r\n".into(),
+                                    });
+                                }
+                                other => panic!("unexpected worker request {other:?}"),
+                            },
+                        }
+                    }
+                    client.join().unwrap();
+                    assert_eq!(expected.len(), 1);
+                    expected
+                })
+            },
+        );
     }
 }

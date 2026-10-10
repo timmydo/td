@@ -535,3 +535,22 @@ fn pending_debug_never_formats_the_raw_message_bytes() {
         assert_eq!(format!("{:?}", s.pending()), "Data(<redacted>)");
     });
 }
+
+#[test]
+fn accepted_mail_limit_survives_rset_ehlo_and_tls_reset() {
+    fixture(|routes| {
+        let mut s = session(routes);
+        command(&mut s, "EHLO sender.test\r\n", "250-");
+        for n in 0..100 {
+            command(&mut s, "MAIL FROM:<>\r\n", "250 ");
+            command(&mut s, "RSET\r\n", "250 ");
+            if n == 49 {
+                assert_eq!(s.feed(b"STARTTLS\r\n").unwrap(), 10);
+                s.tls_established().unwrap();
+                command(&mut s, "EHLO after.test\r\n", "250-");
+            }
+        }
+        command(&mut s, "MAIL FROM:<>\r\n", "421 ");
+        assert_eq!(s.pending(), Pending::Closed);
+    });
+}

@@ -2698,8 +2698,9 @@ Header overflow is a permanent 552; resource/storage refusal is temporary;
 indeterminate publication closes without final acceptance. Stored-message
 reservations include format-derived trace room excluded from incoming SIZE.
 Remaining: the runtime must bind receiving authorization to actual sockets,
-TLS evidence and current gateway policy, drive deadlines and bounded
-transport close/drain, and connect actual handshake success to SMTP reset.
+TLS evidence and current gateway policy, schedule the bounded transport
+driver alongside storage workers, and connect actual handshake success
+to SMTP reset.
 The coordinator admits concurrent receiving/upload jobs with independent
 spools and serializes only admission, publication and accounting. Fair
 runtime scheduling remains required before listener activation.
@@ -2730,7 +2731,22 @@ its sequence under the commit lock. Checkpoint and expiry maintenance run
 beside idle ingress. Native tests cover worker
 progress beside an idle sender, current thread-anchor selection, independent
 quota release, physical completion capacity and uncertainty/poison refusal.
-Live transport scheduling and listener activation remain unimplemented.
+The receiving network driver owns a session and performs bounded
+nonblocking transport/parser turns. It preserves buffered tails over
+typed worker handoffs, handles partial writes and flush completion,
+applies idle/DATA/connection deadlines, and bounds close/drain. Worker
+execution pauses client-idle timing. Known final DATA results and legal
+expiry notices get a bounded finishing allowance without extending
+mutation leases. The session enforces 100 accepted MAIL commands across
+resets. A native local TCP fixture connects this driver to durable Inbox
+delivery and reopen verification, including delayed completion after
+DATA/session expiry. The fixture drives storage synchronously and does
+not prove worker scheduling. Scripted cases cover backpressure,
+handoffs, timer boundaries, EOF, clock regression, transport faults,
+stalled shutdown and STARTTLS plaintext refusal. Actual TLS
+handoff/reset, bounded worker dispatch, peer admission, readiness and
+listener activation remain unimplemented. Those integrations form the
+next M11 increment.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,

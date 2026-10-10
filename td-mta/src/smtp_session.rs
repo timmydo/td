@@ -42,8 +42,9 @@ pub struct Envelope {
 /// The driver must finish this operation before supplying more input. A Reply
 /// remains pending until its entire wire image is flushed, including the banner.
 /// For close replies the runtime must use a bounded transport drain/close after
-/// flushing, without parsing discarded input, so unread DATA does not erase the
-/// refusal through a TCP reset. This engine performs no transport shutdown.
+/// flushing, without parsing discarded input. This is best effort: bounded
+/// draining cannot guarantee refusal receipt or prevent every TCP reset.
+/// This engine performs no transport shutdown.
 #[derive(Eq, PartialEq)]
 pub enum Pending<'a> {
     Input,
@@ -117,6 +118,7 @@ pub struct Session<'a> {
     tls: bool,
     envelope: Option<Envelope>,
     recipient_bytes: usize,
+    transactions: u64,
 }
 impl<'a> Session<'a> {
     pub fn new(routes: &'a Routing<'a>, settings: Settings<'a>) -> Result<Self, Error> {
@@ -146,6 +148,7 @@ impl<'a> Session<'a> {
             tls: false,
             envelope: None,
             recipient_bytes: 0,
+            transactions: 0,
         })
     }
     pub(crate) fn delivery_context(&self) -> Result<(&Settings<'a>, &Envelope, bool), Error> {
@@ -537,6 +540,10 @@ impl<'a> Session<'a> {
             self.respond("552 5.3.4 Message too large\r\n", Next::Command);
             return Ok(());
         }
+        if self.transactions >= crate::admission::timers::CONNECTION_OPERATIONS {
+            self.respond("421 4.3.2 Transaction limit reached\r\n", Next::Closed);
+            return Ok(());
+        }
         let mut recipients = Vec::new();
         recipients
             .try_reserve(self.settings.recipients)
@@ -549,6 +556,7 @@ impl<'a> Session<'a> {
             eight_bit: body.unwrap_or(false),
             declared_bytes: size,
         });
+        self.transactions += 1;
         self.respond("250 2.1.0 Sender accepted\r\n", Next::Command);
         Ok(())
     }
