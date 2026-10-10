@@ -118,9 +118,10 @@ reimplemented (§12). It is zone-one source: not a foreign payload, not a
 plugin host, and not a client of any td-run server (principle 5).
 
 Out of scope for the first increments, each a later reviewed addition: an
-MCP client, web search, a provider dialect other than OpenAI Chat
-Completions, images, plugins, and any socket listening outside a jail's
-own loopback.
+MCP client (planned, §12, MCP servers: servers are commands in the jail,
+never loaded into td-agent), web search, a provider dialect other than
+OpenAI Chat Completions, images, plugins, and any socket listening
+outside a jail's own loopback.
 
 ## 2. Processes and trust
 
@@ -537,12 +538,13 @@ restarted window process cannot start a second writer while an old
 conversation process is still exiting; it runs the rules and the
 classifier of §11; and it starts every jail instance the conversation
 uses, on a host and on td alike (§8): its own file-tool
-instance, `shell`, `grep`, `sed`, background and maintenance
-instances, forks included. Workspace maintenance that no turn asks for
-(the periodic remote-tracking update, the counts `conversations` shows,
-the check before archiving or deleting, §7) runs in the workspace's own
-conversation process; when that conversation has no process, the window
-process starts one for the purpose, without the key, and it exits when
+instance, `shell`, `grep`, `sed`, background, MCP server (§12) and
+maintenance instances, forks included. Workspace maintenance that no
+turn asks for (the periodic remote-tracking update, the counts
+`conversations` shows, the check before archiving or deleting, §7)
+runs in the workspace's own conversation process; when that
+conversation has no process, the window process starts one for the
+purpose, without the key, and it exits when
 the work is done; if the human opens the conversation meanwhile, the
 window process hands that process the key and it goes on as the
 conversation's process. A card goes up the socketpair as a request and
@@ -2317,7 +2319,12 @@ ones and read as false. New events:
 - `todo`: the whole list as written, marked `cleared` when the human
   cleared it.
 - `pause`: the human paused or resumed the conversation.
-- `approval`: the decision on a call, by whom (`human`; `td-agent` when
+- `mcp` (planned, §12, MCP servers): an MCP server's start, with its
+  command, protocol version, tools as the prefix carries them and what
+  was left out, or naming the last such listing it equals; or its
+  failure, with its standard error's tail.
+- `approval`: the decision on a call, or on an MCP server's connection,
+  naming its `mcp` start (§12), by whom (`human`; `td-agent` when
   a card was withdrawn; from increment 13, `rule` when a rule refused or
   allowed it, `mode` when `auto` mode ran it, and `classifier` when the
   classifier allowed it or, outcome `ask`, gave it to the human), and
@@ -3220,7 +3227,9 @@ down with every process in it when its entry exits or its stage 1 dies,
 so a timeout or an interruption, which kills the instance, also ends
 every descendant, and nothing a foreground command started can go on
 changing the workspace after its call has returned; only a background
-process (§12) outlives its call, and only until it is killed. td-agent
+process (§12) outlives its call, and only until it is killed, and an
+MCP server (§12, MCP servers) is no call's, living at most as long as
+its conversation process. td-agent
 needs no process-group signalling of its own to get this.
 
 The instance must also die with the conversation process that launched
@@ -4585,6 +4594,8 @@ flag lets injected text lower its own bar.
 | listing, reading, waiting on and killing own background processes | run | run |
 | history of its own conversation; `conversations` | run | run |
 | file edits, sed, shell (background and local commits included) inside the jail | human | run |
+| an MCP server's tool (§12, MCP servers), whatever it claims of itself | human | run |
+| an MCP server's connection its policy and rules would ask about (§12) | human | human |
 | reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
 | `schedules`, `cancel_schedule` of the schedules delivering to it | run | run |
@@ -5473,7 +5484,211 @@ the provider returned it as text. The stubs and summaries compaction
 writes name the sequence numbers they replace, so a model can recover
 what a summary dropped.
 
-Planned later: an MCP stdio client.
+**MCP servers.** A template of the configuration file may name MCP
+servers (§15, `template.mcp`): programs that speak the Model Context
+Protocol's stdio transport, newline-delimited JSON-RPC 2.0 on standard
+input and output, whose tools the conversation then offers to its model
+beside its own. td-agent is the client only. It lists and calls tools
+and declares no client capability, so it gives no server roots, sampling
+or elicitation, and it uses no server's resources or prompts. It listens
+on no socket and uses no other transport. A server is a command in the
+jail, never loaded into td-agent: td-agent is no plugin host (§1).
+
+*Where they run.* Each server runs in a jail instance of its own, a
+`workspace` instance with the workspace's mounts, policy and proxy
+exactly as a background `shell`'s (§8, §10), so what it reads, writes
+and reaches is what the model's own commands could. Its program is
+whatever the jail can run: one the jail's `PATH` finds or one a worktree
+or shared directory holds, never a td artifact and never outside the
+jail. Package runners that fetch and run code at start (`npx`, `uvx`)
+fail under the jail's `noexec` home (§8) whatever the network, and npm's
+registry is off the default allowlist (§10). The template is the
+person's standing decision to run `command` there, as `system` is the
+person's decision to give the system view: no card asks at a start. What
+the program runs is workspace content the model can change, so a server
+is as trusted as any command the model could run, and no more. A server
+is refused in an unconfined workspace (§8; no template makes one).
+
+Its standard input is a new channel of the tool host. A `serve` call
+starts the program with piped standard input, standard output and
+standard error. The conversation process sends its input as binary
+frames beside a link's (`input`, and `close` for end of input), which a
+writer thread of the call's own writes, under a window of credit as a
+link's bytes are (§10), so a server that stops reading its input never
+holds up the tool host's reader, a cancel or the server's own links. Its
+output comes back as raw bytes and its standard error as text, each
+waiting for room as a background call's output does, never dropped, and
+td-agent keeps the last 2 KiB of the standard error from what arrives,
+so a server torn down for a hang still has its tail. Its environment is
+a command's (§12, `shell`), proxy variables included where the policy
+has a proxy, and no other variable reaches it. Launched on the
+conversation's main thread as every instance is, each server's client
+goes to a thread of its own, as a background process's does, which
+always drains its output, answers its requests and parses its lines,
+whether or not a turn runs.
+
+*Lifetime.* A conversation process starts its template's servers at the
+first turn that finds the workspace ready (a repository workspace's
+worktrees prepared), never while it merely replays its log, and ends
+them when it exits. A server keeps no process alive as a background
+process does (§2), so a conversation retired after a turn (§2) ends its
+servers with it, and what a server held (a browser session, say) does
+not outlive the process. A turn waits for a server's listing only the
+first time it is started in the conversation, while none of its listings
+is logged, for at most the start's 30 seconds (*The protocol*, below),
+an interrupt ending the wait; a first start that failed logs no listing,
+so the next turn, within the restarts allowed (*Failures*), waits again;
+after that a turn never waits for a start, and offers the tools last
+logged (*The prefix*, below). A call to a server not yet up waits for
+it within the call's timeout. A change to the workspace's mounts or
+policy (a worktree made ready, shared directories, the network policy)
+restarts each server at the next turn, which is not counted as a
+failure's restart. A change to the template's `mcp` takes effect at the
+next turn: a server no longer named is ended and its tools dropped, one
+changed is restarted. Ending a server closes its input, waits two
+seconds and tears its instance down.
+
+*The protocol.* td-agent reads standard output as lines of at most
+1 MiB, a trailing carriage return dropped, each one JSON-RPC 2.0 message;
+a longer line, one that is not JSON, a batch, or a message that is not
+JSON-RPC 2.0, ends the server as failed. It sends `initialize` (protocol
+version `2025-06-18`, no capabilities, client info `td-agent` and its
+version) and accepts a reply naming `2024-11-05`, `2025-03-26`,
+`2025-06-18` or `2025-11-25`, all of which carry the methods td-agent
+uses unchanged, ending the server for any other; then
+`notifications/initialized`; then `tools/list`, following `nextCursor`
+for at most 8 pages, what lies past them left out and said. The server's
+`instructions` are not used. A request from the server is answered:
+`ping` with an empty result, anything else with error -32601, method not
+found. Its notifications are dropped, but for
+`notifications/tools/list_changed`, which has the tools listed again
+before the next turn, at most once a turn and at most 8 times in a
+process's life, after which its listing is kept as it is until the
+process starts again, said in its record. `initialize` and the listing
+together have 30 seconds; a timeout there ends the server, since
+`initialize` cannot be cancelled. A call has its server's `timeout`
+(default 120 seconds, at most 600); an interrupt or a timeout sends
+`notifications/cancelled` for the request and stops waiting, and the
+call is answered that it was cancelled and its effect is unknown. A
+reply to a request td-agent stopped waiting for is dropped; a server
+with more than 8 such requests unanswered is ended.
+
+*Its tools.* Each listed tool is offered as `mcp__SERVER__TOOL`: the
+server's `name`, which has no `_`, so the first `__` after `mcp__`
+splits it from the tool's unambiguously, and the tool's, which must be 1
+to 41 bytes of ASCII letters, digits, `_` and `-` (so a name is at most
+64, as every tool name must be). A template's `tools` for a server, when
+it names any, keeps only those. A tool whose name does not fit (a `.`
+included, which a newer protocol allows), repeats another's, or whose
+`inputSchema` is not a JSON object with `"type": "object"`, is left out
+and said in the server's record. Its description is made visible (§11,
+`<U+XXXX>`) and then cut to 2 KiB; its schema is re-encoded, a top-level
+`$schema` member dropped, and is at most 16 KiB. Every server's tools
+together are at most 128 tools and 128 KiB as the prefix carries them,
+the later servers' and tools' left out and said; and the prefix with
+them must fit one log line at the store's worst case beside the
+instructions and skills it carries (§13), or the servers' tools are left
+out, last server first, and said. Only `name`, `description` and
+`inputSchema` are used: `title`, `outputSchema` and `annotations` are
+not, and a server's `readOnlyHint` lowers no bar, since it is the
+server's own claim (§11). A description is the server's text, which
+reaches the model as a tool's definition: the prompt says the MCP tools'
+definitions and results are a program's in the workspace, data as a
+file's are, and never the person's. Arguments go to the server as the
+model wrote them, within `MAX_ARGUMENTS`, unchecked against the schema,
+which is the server's to check.
+
+*The prefix.* A server's listing is logged as an `mcp` event (§6): the
+server, its command, its protocol version, its tools exactly as the
+prefix carries them, and what was left out. A start whose listing equals
+the last one logged for that server and command logs a short `mcp` event
+naming it, so a conversation retired after each turn does not log its
+tools at every wake. A failed start or a server's failure is logged as a
+failed `mcp` event, with its standard error's tail and no tools. The
+prefix's MCP tools follow the conversation's own: for each server the
+template names, in its order, the tools of its last logged listing for
+that server and command, unless a failure of that server is logged after
+it. Only a failure drops a server's tools: a server ended by its
+process's exit, or restarted for a change of mounts, policy or template,
+logs no failure, and its last listing stands until its next start lists
+again. They are fixed when a turn starts, so a turn's requests share one
+prefix, and the next turn's is new (§13) at one cache miss when they
+changed, as a skill's change does; each prefix is rebuilt from the log
+by its logged `prefix` event, as every prefix is (§6, §13). A call names
+a tool of the prefix its turn was sent with; one whose server has since
+ended is answered so. Sub-agents (`task`) are offered no MCP tool. A
+provider that refuses a request whose prefix carries MCP tools (an HTTP
+400) would refuse every turn's, so the turn's error says the servers'
+tools may be why and names them.
+
+*Approval.* A call is opaque: td-agent cannot see what it does, only
+that the server runs in the workspace's jail. It is decided as a `shell`
+call is (§11): a card in `ask` mode, naming the server, its command and
+the tool, with the arguments as indented JSON on the card's lines, cut
+as a card's text is; run in `auto` mode. Rules name it `mcp SERVER
+[TOOL]`. A deny or an ask may name the server alone; an allow must name
+a tool, as a network allow names a destination: `allow mcp github
+list_issues`. Its "always" offers the server and tool, and says that
+what an allow lets the tool do is whatever the server's program,
+workspace content the model can change, makes of it, as broad as `allow
+shell python` (§11). Server names are the template's, so an allow is per
+workspace as every allow is, and one survives a change of the server's
+`command`, which is the person's. A repository's own rules may deny or
+ask, as for every tool; they bind calls and not what a server runs
+within one, as they bind a command's arguments and not what it runs
+(§11). The repeated-call guard counts an MCP call as any other.
+
+*Its connections.* A server's connections belong to no call: it may
+connect while it starts, between turns, or during any call. Its instance
+is linked to its `mcp` start, not to a call. A connection the policy and
+the rules let through runs as a command's would (§10); one that would be
+asked of the person waits on a card of its own, `Let MCP server NAME
+(COMMAND) connect to HOST:PORT?`, the person's in both modes, since the
+classifier has no command of the model's to judge. A server's connection
+never joins a command's card, nor a command's a server's, and two
+servers' never share one. The answer holds for that server's instance
+until it ends and is logged as an approval naming the `mcp` event; its
+"always" answers are `network` rules as a command's card's are. While a
+server's connection waits on a card, its start's clock is stopped. A
+server's loopback is its own namespace's (§19, Background servers), so
+it cannot reach a server the model started, nor the model's commands it.
+
+*Results.* A result's `content` items become the call's text in order,
+joined by blank lines: `text` as it is, a `resource` with `text` as that
+text, a `resource_link` as its URI, and any other item (an image, audio,
+a resource of bytes) as a line saying what td-agent did not show; with
+no content, `structuredContent` encoded. `isError` makes it an error
+result; a JSON-RPC error makes one naming its code and message. The text
+is cut as a `shell` call's output is, to a head and a tail (§12), and
+kept in the log as a `shell` call's is. It reaches the model as a tool
+result, which is data (§13), never as the person's words.
+
+*Failures.* A server that cannot be started, fails `initialize` or
+`tools/list`, breaks the protocol, or exits while its process runs, is
+logged as failed with its tail, and its tools leave the next turn's
+prefix. A notification tells the conversation, labelled `[td-agent's
+news of this conversation's MCP servers, not from the person]`, which
+the prompt names (§13), its reason quoted as a repository's failure's is
+(§3): one line, every control named, cut to 1,000 characters; it wakes
+nothing, so the model learns at its next turn that the tools went and
+why, and the window shows it under the conversation's notes; a failure
+the same as the last one told for that server is not told again. A
+server that failed is started again at the next turn, at most twice in a
+process's life, its tools listed afresh; then not until the process
+starts again.
+
+*Credentials.* None is given to a server. One the person places in a
+directory the workspace binds is the model's too, readable by any
+command and sent wherever the policy reaches, and makes its host a
+publication channel, as §10 says of an injected token, past the
+protected branches and scan of a push (§9). A server that needs one to
+reach a service is therefore out of scope until td-agent has a way to
+hand it one that no command of the model's can read.
+
+Out of scope here: credentials (above), HTTP and other transports,
+resources, prompts, sampling, roots, elicitation, progress shown, a row
+per server in the window with its own kill and restart, and MCP tools
+for sub-agents.
 
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
@@ -5881,7 +6096,10 @@ paragraph.
    This follows Codex's open base prompt and the published structure of
    Claude Code's. An Empty workspace swaps the coding sections for a
    shorter assistant section.
-2. **Tool definitions.**
+2. **Tool definitions**, td-agent's own, then those of the template's
+   MCP servers (§12, MCP servers); where there are any, the environment
+   block says their definitions and results are a program's in the
+   workspace, data as a file's are, and names the label of their news.
 3. **The environment block:** the workspace's name and worktrees with their
    branches and bases, the shared directories, the network policy, the OS,
    and the conversation's creation date. It holds for the whole
@@ -6312,6 +6530,17 @@ default; `jev_threshold`'s is calibrated (§11):
   - `system`: `true` gives its conversations `system_status`, which
     reads every process's CPU and memory use and command line outside
     the jail (§8, System view); default `false`
+  - `mcp` (planned): MCP servers for its conversations (§12, MCP
+    servers), at most 4, only in a template of this file, never one
+    made in the window; an array of tables each with a `name`, 1 to 16
+    lowercase ASCII letters, digits and `-`, starting with a letter and
+    unique in the template; a `command`, the program and its
+    arguments, 1 to 64 strings of at most 4 KiB with no control
+    character, the program an absolute path or a name the jail's
+    `PATH` finds; an optional `tools`, the only tools of it to offer,
+    each name 1 to 41 bytes of ASCII letters, digits, `_` and `-`, one
+    the server does not list said in its record; and an optional
+    `timeout`, a call's whole seconds, default 120, at most 600
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is
@@ -6530,7 +6759,7 @@ kind. td-agent's position on its features:
 | LSP diagnostics and formatters after edits | not adopted for now; opencode itself turned both off by default |
 | Custom commands | adopted, as the person's files beside the configuration (§15) |
 | Skills | adopted, as the person's files beside the configuration, read by `skill` (§12) |
-| MCP | later (§12) |
+| MCP | stdio servers' tools, planned (§12, MCP servers) |
 
 ## 17. Testing
 
@@ -7320,7 +7549,33 @@ in parallel with it.
 After these: resource limits (§8), a loopback shared by
 a conversation's instances (§19), the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
-dialect. `web_fetch`, `question`, `task`'s sub-agents, schedules,
+dialect. The MCP client (§12, MCP servers) comes in four steps, each
+one commit:
+
+- **The tool host's `serve`.** The call that starts a program with
+  piped standard input, the binary `input` and `close` frames written
+  by the call's own thread under a window of credit, its output and
+  standard error waiting for room; tested in the tool host and over a
+  socketpair through `host::Client`, used by nothing yet.
+- **The protocol.** The client side in its own module: line framing
+  and its bounds, `initialize`, `tools/list` and its pages, `tools/call`
+  and its results, the server's requests and notifications, timeouts,
+  cancelling and abandoned replies, and the tools checked, cut and
+  encoded as offered; tested against a server in the test over pipes.
+- **Configuration and rules.** `template.mcp` read and checked and
+  carried to the conversation in its template settings, refused in a
+  template made in the window; a conversation made from a template
+  that names servers refused until the next step, as one naming
+  repositories was before increment 11 (§7); `mcp SERVER [TOOL]` in
+  the rules grammar, the person's file and a repository's.
+- **Servers and their tools.** Each server started in its instance of
+  its own, its client on a thread of its own, logged as `mcp` events,
+  restarted as allowed and on a change of mounts, policy or template;
+  its connections' cards; its tools in the prefix and the prompt's line
+  on them; `mcp__SERVER__TOOL` calls dispatched with their cards,
+  rules and results; failures told as notifications; tested with a
+  fake server in the test and, jailed, with a small stdio server run
+  by `sh`. `web_fetch`, `question`, `task`'s sub-agents, schedules,
 skills, the person's commands and `/review` are built (§3, §12, §15).
 
 ## 19. Open questions
