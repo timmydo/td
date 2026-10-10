@@ -1,14 +1,17 @@
 //! Initial foreground receiving profile. All authority comes from one protected
 //! configuration load and retained store/spool locks.
 use super::{
-    adapter, config_failure, load_configuration, lock_root, scope, CheckedConfiguration,
-    ConfigFailure,
+    adapter, config_failure, control::Endpoint, load_configuration, lock_root, scope,
+    CheckedConfiguration, ConfigFailure,
 };
 use std::{
     io::{self, Write},
     net::TcpListener,
     os::unix::fs::MetadataExt,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use td_mta::{
     admission::logical::Cell,
@@ -40,14 +43,11 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
         .metadata()
         .map_err(|_| config_failure("data-root", "io"))?
         .uid();
-    // These roots remain reserved for later control and logging adapters.
-    let _runtime = same_owner_root(
-        globals
-            .runtime()
-            .map_err(|_| config_failure("configuration", "invariant"))?,
-        owner,
-        "runtime-root",
-    )?;
+    let runtime_path = globals
+        .runtime()
+        .map_err(|_| config_failure("configuration", "invariant"))?;
+    super::control::check_runtime_path(runtime_path)?;
+    let runtime = same_owner_root(runtime_path, owner, "runtime-root")?;
     let _logs = same_owner_root(
         globals
             .logs()
@@ -185,9 +185,32 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
                 listeners: &listeners,
                 clock: Arc::clone(&clock),
             };
-            receiving
-                .run_with_ready(&Control::default(), || announce(listeners.len()))
-                .map_err(|error| adapter("receiving", error).into())
+            let endpoint = Endpoint::bind(runtime, runtime_path)?;
+            let control = Control::default();
+            let finished = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let worker = std::thread::Builder::new()
+                    .name("smtp-control".into())
+                    .spawn_scoped(scope, || {
+                        let result = std::panic::catch_unwind(|| endpoint.run(&control, &finished));
+                        if !matches!(result, Ok(Ok(()))) {
+                            control.stop();
+                        }
+                        result
+                    })
+                    .map_err(|_| config_failure("control", "worker-start"))?;
+                let finish = ControlFinish(&finished);
+                let result = receiving
+                    .run_with_ready(&control, || announce(listeners.len()))
+                    .map_err(|error| ConfigFailure::from(adapter("receiving", error)));
+                drop(finish);
+                let joined = worker.join();
+                result?;
+                match joined {
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    _ => Err(config_failure("control", "worker-stopped")),
+                }
+            })
         })
         .map_err(|_| config_failure("configuration", "invariant"))?
 }
@@ -214,4 +237,11 @@ fn announce(listeners: usize) -> Result<(), ports::Error> {
     writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"smtp-only\",\"smtp_listeners\":{listeners},\"https\":false,\"outbound\":false,\"reload\":false,\"signal_drain\":false}}")?;
     output.flush()?;
     Ok(())
+}
+
+struct ControlFinish<'a>(&'a AtomicBool);
+impl Drop for ControlFinish<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }

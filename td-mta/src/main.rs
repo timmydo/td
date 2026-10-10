@@ -24,9 +24,10 @@ use td_mta::{
     tls_policy::{MaterialKind, TlsPolicies},
 };
 
+mod control;
 mod serve;
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta serve --smtp-only --config PATH\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nServe requires an initialized data root, its private ingress/ subdirectory,\nand private runtime/log roots.\nIt receives direct IPv4 SMTP only; HTTPS, outbound delivery and reload are inactive.\nStop it through the supervisor; signals currently terminate without draining.\nNo repair command is available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta serve --smtp-only --config PATH\n       td-mta status --json --runtime PATH\n       td-mta stop --runtime PATH\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nServe requires an initialized data root, its private ingress/ subdirectory,\nand private runtime/log roots.\nIt receives direct IPv4 SMTP only; HTTPS, outbound delivery and reload are inactive.\nStop requests orderly shutdown through its private control socket.\nSignals currently terminate without draining.\nNo repair command is available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -707,6 +708,40 @@ fn run() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let first = args.next();
+    if matches!(first.as_deref(), Some(value) if value == OsStr::new("status") || value == OsStr::new("stop"))
+    {
+        let stop = first.as_deref() == Some(OsStr::new("stop"));
+        let command = if stop { "stop" } else { "status" };
+        let runtime = (|| {
+            if !stop && args.next().as_deref() != Some(OsStr::new("--json")) {
+                return None;
+            }
+            if args.next().as_deref() != Some(OsStr::new("--runtime")) {
+                return None;
+            }
+            let path = args.next()?.into_string().ok()?;
+            args.next().is_none().then_some(path)
+        })();
+        let result = runtime
+            .ok_or_else(|| config_failure("arguments", "invalid-arguments"))
+            .and_then(|path| control::request(&path, stop));
+        return match result {
+            Ok(state) => {
+                let mut output = io::stdout().lock();
+                if stop {
+                    writeln!(output, "{{\"schema\":1,\"command\":\"stop\",\"status\":\"requested\",\"profile\":\"smtp-only\"}}")?;
+                } else {
+                    writeln!(output, "{{\"schema\":1,\"command\":\"status\",\"status\":\"ok\",\"profile\":\"smtp-only\",\"state\":\"{state}\",\"ready\":{}}}", state == "ready")?;
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let code = error.failure.exit_code();
+                configuration_failure(&mut io::stdout().lock(), command, error)?;
+                Ok(code)
+            }
+        };
+    }
     if first.as_deref() == Some(OsStr::new("serve")) {
         let path = if args.next().as_deref() == Some(OsStr::new("--smtp-only")) {
             config_arguments(args)

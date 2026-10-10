@@ -1759,7 +1759,7 @@ settings. All referenced inputs are checked through the same single load as
 `config check`, but HTTPS and outbound delivery are inactive. Gateway,
 fixture, HTTP-01 and IPv6 SMTP listeners refuse before storage is opened.
 ACME-managed material remains unavailable. This profile has no reload,
-control socket, file logging, JMAP or outbound queue worker.
+file logging, JMAP or outbound queue worker.
 
 Provision `[paths] data`, `runtime`, `logs`, and `data/ingress` as separate
 existing mode-0700 directories owned by the same dedicated non-root service
@@ -1776,8 +1776,10 @@ database and ingress locks, opens SQLite with the
 configured read-view count, requires exactly the configured account and its
 Inbox, discards abandoned ingress inputs, and reconciles database quotas.
 Only this receiving profile's owners run; no auxiliary log/cache/sort usage
-is created or imported. Configured runtime/log roots are checked and retained
-but otherwise unused. Configured direct listeners bind only after cold
+is created or imported. The runtime root holds the private control endpoint
+below; the
+log root is checked and retained but otherwise unused. Configured direct
+listeners bind only after cold
 storage setup. No client is accepted until the existing receiving runtime
 validates all settings and starts both fixed workers. The admitted direct
 certificate-chain validity window is checked before readiness, on every
@@ -1807,3 +1809,68 @@ Graceful signal integration remains a separate increment needing the audited
 signal boundary. The local process fixture kills the server during a second
 DATA transfer after a first accepted message, restarts it, and independently
 verifies the surviving body and removal of the incomplete input.
+
+### Local receiver control
+
+`td-mta status --json --runtime PATH` queries the foreground receiver.
+`td-mta stop --runtime PATH` requests its existing orderly shutdown. PATH is
+`[paths] runtime`; neither command loads configuration or certificates, so an
+operator can still query or stop a receiver after its configuration changes.
+Both commands require the same private-root policy as serve. Run them as the
+service user. The directory permissions establish local authority; there is
+no network administration listener or authorization inferred from SMTP.
+
+The runtime root may contain at most 89 UTF-8 bytes, leaving room for the
+socket basename and terminator in Linux's 108-byte Unix socket address.
+Serve checks this profile-specific limit before storage recovery; the general
+config checker does not apply it. Status and stop enforce the same limit.
+Serve holds runtime/LOCK and binds runtime/smtp-control.sock mode 0600 before
+announcing readiness. Startup removes a stale socket only after taking that
+lock and only if its type and owner match. A regular file, symlink or foreign
+socket owner refuses unchanged. Clean teardown removes only the socket inode
+this process bound. Setup arms that inode cleanup before setting permissions
+and nonblocking mode. If even the first post-bind metadata read fails, the
+unidentified socket remains for the next locked startup to recover safely.
+Namespace changes during service are unsupported, as for
+the existing private store roots. Clients verify socket type, owner and mode.
+
+One additional fixed worker serves one local request at a time. Requests and
+replies fit 16 bytes; the private wire protocol accepts only STATUS followed
+by LF or STOP followed by LF, then the client closes its write half. The
+server reads through that EOF before acting, so trailing bytes cannot change
+meaning with stream fragmentation. Malformed requests never stop the receiver.
+Each accepted exchange shares one two-second read/write deadline. A slow
+local client can make queued control clients time out, but cannot delay SMTP
+or storage workers. The fixed control worker polls every 100 milliseconds;
+local connection aborts retry, and transient descriptor/memory pressure backs
+off accepts for five seconds without stopping mail service. This worker is
+in addition to smtp_receiving's two storage/TLS workers; it has no per-client
+threads and makes no new whole-service resource claim.
+Client socket connection uses the local kernel's connect behavior; after
+connection its complete request/reply exchange has the same deadline.
+
+Status returns schema-1 command JSON with command status, status ok, profile
+smtp-only, state starting/ready/stopping/stopped/failed and a ready boolean.
+The endpoint starts after cold storage recovery, so status and stop are not
+available during that phase. An absent/refused endpoint reports not-running;
+other I/O failures remain io. There is a brief starting-to-ready transition
+after the readiness line, which observers may poll. These are receiving
+lifecycle observations, not the full v1 health snapshot,
+queue metrics or proof that the next delivery can be admitted. Unimplemented
+metrics are not reported as zero. Successful queries exit zero regardless
+of the observed lifecycle; fixed redacted errors exit one and malformed
+arguments exit two. OBSERVABILITY.md's version-1 health envelope remains a
+separate future service status surface.
+
+Stop returns schema-1 command JSON with command stop, status requested and
+profile smtp-only. Acknowledgement means the stop flag was set, not that all
+work or disk I/O has finished. The receiver stops new admissions, gives
+existing sessions its five-second protocol allowance, and joins its workers.
+Already committed replies retain their final-reply allowance. A native store
+operation already executing can delay the join; this is not a hard wall-clock
+process-exit promise. A control worker failure also requests shutdown and
+makes serve exit with a redacted failure. Main teardown signals and joins the
+control worker, including during unwinding. Default signal behavior is
+unchanged. The process fixture queries status, recovers a stale socket after
+kill, requests stop with a connected SMTP client, observes 421, and verifies
+clean process exit, socket cleanup and durable accepted mail.

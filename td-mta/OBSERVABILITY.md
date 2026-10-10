@@ -287,3 +287,12 @@ including invalid disk sets, inconsistent metrics and capacity errors. Offline
 administrative commands may use their existing output scratch. Runtime
 aggregation, cache ownership and synchronization remain M19; these helpers do
 not establish a functioning health endpoint or measured service RSS.
+
+## Initial receiving lifecycle command
+
+The SMTP-only foreground profile has a separate schema-1 operator command
+response for `status --json --runtime PATH`, specified in CONFIG.md. It
+reports only the receiving Control lifecycle and explicitly names that
+profile. It does not emit the full health envelope above, claim whole-service
+readiness, or fabricate unavailable counters. Full status aggregation and
+cached publication remain M19.

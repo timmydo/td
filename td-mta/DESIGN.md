@@ -1345,7 +1345,8 @@ Planned commands, with stable JSON output and exit codes:
 | `config check` | Offline syntax, references, permission, and resource validation; implemented for file inputs, no ACME state |
 | `config show --redacted` | Effective values, defaults, and configuration generation |
 | `serve` | Foreground service, no daemonization |
-| `status --json`, `doctor --json` | Health, bounds, certificates, storage, queue; no mutation |
+| `status --json`, `doctor --json` | Full health planned; current status requires --runtime and reports SMTP-only lifecycle |
+| `stop --runtime PATH` | Request orderly shutdown through the private receiving control socket |
 | `dns-plan` | Expected records and MTA-STS policy; no DNS changes |
 | `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |
 | `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
@@ -1357,7 +1358,9 @@ Planned commands, with stable JSON output and exit codes:
 | `backup`, `restore`, `migrate` | Bounded, resumable tools using the storage contract |
 
 Online mutations go through a private Unix control socket and the single
-writer. The socket directory's permissions establish administrator authority;
+writer. The SMTP-only profile implements status and stop in CONFIG.md; broader
+service control remains planned. The socket directory's permissions establish
+administrator authority;
 there is no public administration HTTP API. Offline mutating commands require
 the exclusive store lock. Readiness checks do not contact Migadu or a CA.
 `doctor` network probes, if later added, require an explicit opt-in and cannot

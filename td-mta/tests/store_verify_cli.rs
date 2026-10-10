@@ -5,7 +5,7 @@ use std::{
     fs,
     os::unix::{
         ffi::OsStringExt,
-        fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
     },
     path::PathBuf,
     process::{Command, Output},
@@ -1457,6 +1457,15 @@ fn serve_receives_and_recovers_after_process_death() {
         assert_eq!(report.get("error").unwrap().as_str(), Some(code));
         assert!(!String::from_utf8_lossy(&output.stdout).contains(fixture.data.0.to_str().unwrap()));
     };
+    fixture.write(
+        "td-mta.conf",
+        source
+            .replace(runtime.0.to_str().unwrap(), &format!("/{}", "r".repeat(90)))
+            .as_bytes(),
+        0o644,
+    );
+    refuses("control", "socket-path-too-long");
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
     // Profile refusal precedes even attempting to take the occupied store lock.
     let root = PrivateRoot::open(fixture.data.0.to_str().unwrap())
         .unwrap()
@@ -1502,7 +1511,41 @@ fn serve_receives_and_recovers_after_process_death() {
     let report = report_command(&output, 1, "serve");
     assert_eq!(report.get("stage").unwrap().as_str(), Some("log-root"));
     fs::set_permissions(&logs.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = runtime.0.join("smtp-control.sock");
+    fs::write(&socket, b"do not replace").unwrap();
+    refuses("control", "socket-policy");
+    assert_eq!(fs::read(&socket).unwrap(), b"do not replace");
+    fs::remove_file(&socket).unwrap();
+    std::os::unix::fs::symlink("missing", &socket).unwrap();
+    refuses("control", "socket-policy");
+    assert!(fs::symlink_metadata(&socket)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    fs::remove_file(&socket).unwrap();
     let process = ReceivingProcess::start(&fixture);
+    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o7777, 0o600);
+    let status = || {
+        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["status", "--json", "--runtime"])
+            .arg(&runtime.0)
+            .output()
+            .unwrap()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let report = report_command(&status(), 0, "status");
+        if report.get("state").unwrap().as_str() == Some("ready") {
+            break;
+        }
+        assert_eq!(report.get("state").unwrap().as_str(), Some("starting"));
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o644)).unwrap();
+    let report = report_command(&status(), 1, "status");
+    assert_eq!(report.get("error").unwrap().as_str(), Some("socket-policy"));
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
         .args(["serve", "--smtp-only", "--config"])
         .arg(fixture.path("td-mta.conf"))
@@ -1549,8 +1592,12 @@ fn serve_receives_and_recovers_after_process_death() {
             .to_string_lossy()
             .starts_with("slot-")));
     drop(process);
+    assert!(fs::symlink_metadata(&socket)
+        .unwrap()
+        .file_type()
+        .is_socket());
     drop(stream);
-    let process = ReceivingProcess::start(&fixture);
+    let mut process = ReceivingProcess::start(&fixture);
     assert_eq!(
         fs::read_dir(fixture.data.0.join("ingress"))
             .unwrap()
@@ -1558,9 +1605,60 @@ fn serve_receives_and_recovers_after_process_death() {
         1
     );
     let mut stream = connect();
-    smtp_command(&mut stream, b"QUIT\r\n", "221");
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["stop", "--runtime"])
+        .arg(&runtime.0)
+        .output()
+        .unwrap();
+    let report = report_command(&output, 0, "stop");
+    assert_eq!(report.get("status").unwrap().as_str(), Some("requested"));
+    smtp_command(&mut stream, b"", "421");
     drop(stream);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = process.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!socket.exists());
     drop(process);
+    let report = report_command(&status(), 1, "status");
+    assert_eq!(report.get("error").unwrap().as_str(), Some("not-running"));
+    // A same-owner bogus endpoint cannot make the client echo arbitrary data.
+    let fake = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    fake.set_nonblocking(true).unwrap();
+    let responder = std::thread::spawn(move || {
+        use std::io::Read;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let (mut peer, _) = loop {
+            match fake.accept() {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result.unwrap(),
+            }
+        };
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut request = Vec::new();
+        peer.read_to_end(&mut request).unwrap();
+        assert_eq!(request, b"STATUS\n");
+        peer.write_all(b"SENSITIVE\n").unwrap();
+    });
+    let output = status();
+    responder.join().unwrap();
+    let report = report_command(&output, 1, "status");
+    assert_eq!(
+        report.get("error").unwrap().as_str(),
+        Some("invalid-response")
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("SENSITIVE"));
+    fs::remove_file(&socket).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
         .args(["store", "verify", "--root"])
         .arg(&fixture.data.0)
@@ -1617,5 +1715,22 @@ fn serve_requires_explicit_receiving_profile() {
             .output()
             .unwrap();
         report_command(&output, 2, "serve");
+    }
+}
+
+#[test]
+fn control_requires_explicit_private_runtime_and_json_status() {
+    for (command, args) in [
+        ("status", vec!["status"]),
+        ("status", vec!["status", "--runtime", "/absent"]),
+        ("stop", vec!["stop"]),
+        ("stop", vec!["stop", "--runtime", "/a", "extra"]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(args)
+            .output()
+            .unwrap();
+        let report = report_command(&output, 2, command);
+        assert_eq!(report.get("stage").unwrap().as_str(), Some("arguments"));
     }
 }

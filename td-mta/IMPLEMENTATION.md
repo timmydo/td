@@ -3583,6 +3583,9 @@ disposable ingress recovery, direct IPv4 bindings and the fixed receiving
 workers. CONFIG.md owns command scope, readiness and default signal behavior;
 STORAGE.md owns the selected data/ingress layout. The child-process fixture
 proves accepted-mail recovery across termination during another DATA transfer.
-Next operational work is graceful shutdown and local status/control, followed
-by deployment packaging; HTTPS/JMAP, gateway, reload, ACME, outgoing delivery
+The private runtime socket now reports receiving lifecycle and requests
+orderly stop; process tests cover its authority/refusal and kill/restart
+cleanup. Signal integration and full health aggregation remain separate.
+Next operational work is deployment packaging; HTTPS/JMAP, gateway, reload,
+ACME, outgoing delivery
 and file logging remain unimplemented activation paths.
