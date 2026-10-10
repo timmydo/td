@@ -355,6 +355,9 @@ pub enum Request {
     /// Compact the open conversation, with a focus for its summary
     /// (DESIGN.md §14).
     Compact(Option<String>),
+    /// Review a revision of the open conversation's workspace
+    /// (DESIGN.md §15, `/review`).
+    Review(String),
     /// A schedule command from the composer (DESIGN.md §3).
     Schedule(crate::schedule::Command),
     /// The person's command `name` with its arguments, sent as their
@@ -718,6 +721,9 @@ pub struct App {
     /// transcript, and each started turn's and its user message's.
     messages: Vec<(u64, usize)>,
     turns: Vec<(u64, u64)>,
+    /// The started effects that are `/review`s, of no message as a
+    /// compaction is (DESIGN.md §15, `/review`).
+    reviews: Vec<u64>,
     /// Each message that came of a request, and so has a Debug button:
     /// the request's sequence number and the message's index.
     exchanges: Vec<(u64, usize)>,
@@ -909,6 +915,7 @@ impl App {
             messages: Vec::new(),
             exchanges: Vec::new(),
             turns: Vec::new(),
+            reviews: Vec::new(),
             last_seq: 0,
             background_turns: Vec::new(),
             meter: Meter::default(),
@@ -1871,6 +1878,7 @@ impl App {
         self.messages.clear();
         self.exchanges.clear();
         self.turns.clear();
+        self.reviews.clear();
         self.last_seq = 0;
         self.meter = Meter::default();
         self.choice = (None, None);
@@ -2140,13 +2148,16 @@ impl App {
                 }
             }
             Kind::Started { effect, of } => {
-                // A compaction is of no message the transcript shows: 0,
-                // which no event is.
+                // A compaction or a review is of no message the transcript
+                // shows: 0, which no event is.
                 let of = match effect {
                     crate::store::Effect::Turn => of,
-                    crate::store::Effect::Compact => 0,
+                    crate::store::Effect::Compact | crate::store::Effect::Review => 0,
                 };
                 self.turns.push((event.seq, of));
+                if effect == crate::store::Effect::Review {
+                    self.reviews.push(event.seq);
+                }
                 // A compaction leaves a failed turn's retry as it was.
                 if of != 0 {
                     self.meter.retry = false;
@@ -2209,14 +2220,21 @@ impl App {
                 // not says why here.
                 let said = outcome == "replied"
                     || outcome == "no model"
-                    || (compaction && outcome == "compacted");
+                    || (compaction && outcome == "compacted")
+                    || (self.reviews.contains(&started) && outcome.starts_with("reviewed "));
                 if !said {
                     let text = if retry {
                         format!("{outcome}\nC-r asks again.")
                     } else {
                         outcome
                     };
-                    let effect = if compaction { "compaction" } else { "turn" };
+                    let effect = if self.reviews.contains(&started) {
+                        "review"
+                    } else if compaction {
+                        "compaction"
+                    } else {
+                        "turn"
+                    };
                     let pushed = Message::new("td-agent")
                         .and_then(|m| m.status(effect, Tone::Neutral))
                         .and_then(|m| m.text(&text))
@@ -2448,6 +2466,25 @@ impl App {
                     .and_then(|m| self.push_message(m));
                 if let Err(e) = pushed {
                     self.note(format!("the transcript refused a sub-agent: {e}"));
+                }
+            }
+            // A review the person asked for, which the model reads as a
+            // review, not as their words (DESIGN.md §15, `/review`).
+            Kind::Review {
+                revision,
+                model,
+                text,
+                ..
+            } => {
+                let pushed = Message::new("review")
+                    .and_then(|m| {
+                        m.status(&format!("{model}'s review of {revision}"), Tone::Neutral)
+                    })
+                    .and_then(|m| m.text(&text))
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                if let Err(e) = pushed {
+                    self.note(format!("the transcript refused a review: {e}"));
                 }
             }
             Kind::Title { .. } | Kind::ToolCall { .. } => {}
@@ -3446,6 +3483,26 @@ impl App {
             self.composer.fresh();
             self.apply_focus();
             self.compact(focus);
+            return;
+        }
+        // So is `/review` (DESIGN.md §15, `/review`).
+        if let Some(revision) = crate::commands::review(&text) {
+            let revision = match revision {
+                Ok(revision) => revision,
+                Err(why) => {
+                    self.note(why);
+                    return;
+                }
+            };
+            if self.active.is_none() {
+                self.note("no conversation is open");
+                return;
+            }
+            self.composer.fresh();
+            self.apply_focus();
+            self.requests.push(Request::Review(revision.clone()));
+            self.note(format!("reviewing {revision}"));
+            self.touch();
             return;
         }
         self.composer.fresh();
@@ -5940,6 +5997,37 @@ pub mod tests {
         assert_eq!(app.take_requests(), [Request::Compact(None)]);
     }
 
+    /// `/review` asks the open conversation for a review, of HEAD unless
+    /// it names a revision; one that is not a revision's word is said
+    /// and kept in the composer, as is any with none open.
+    #[test]
+    fn review_is_asked_from_the_composer() {
+        let surface = Surface::new(1024, 640, Scale::default()).unwrap();
+        let mut bare = App::new(surface, None, Mode::Auto).unwrap();
+        assert!(bare.composer.insert("/review").unwrap());
+        key(&mut bare, "Return");
+        assert!(bare.take_requests().is_empty());
+        assert_eq!(bare.composed(), "/review");
+        let mut app = app();
+        app.add_row(row(9, 1));
+        app.set_active(id(9));
+        assert!(app.composer.insert("/review").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Review("HEAD".into())]);
+        assert_eq!(app.composed(), "");
+        assert!(app.composer.insert("/review HEAD~1").unwrap());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Review("HEAD~1".into())]);
+        assert!(app.composer.insert("/review --repo=/etc").unwrap());
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), "/review --repo=/etc");
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("/review takes one revision")));
+    }
+
     /// The schedule commands are the human's, asked of the session, not
     /// sent; a malformed one is said and kept in the composer (§3).
     #[test]
@@ -5984,14 +6072,14 @@ pub mod tests {
         let mut app = app();
         app.add_row(row(9, 1));
         app.set_active(id(9));
-        assert!(app.composer.insert("/review PR 12").unwrap());
+        assert!(app.composer.insert("/triage PR 12").unwrap());
         key(&mut app, "Return");
         assert_eq!(
             app.take_requests(),
             [Request::Command {
-                name: "review".into(),
+                name: "triage".into(),
                 args: "PR 12".into(),
-                typed: "/review PR 12".into(),
+                typed: "/triage PR 12".into(),
             }]
         );
         assert_eq!(app.composed(), "");
@@ -6014,7 +6102,7 @@ pub mod tests {
             .log
             .last()
             .is_some_and(|n| n.contains("there are no commands")));
-        app.show_commands(&[("review".into(), "Review the PR.".into())], 1);
+        app.show_commands(&[("triage".into(), "Triage the PR.".into())], 1);
         assert!(app.notes.is_some());
         app.notes = None;
         assert!(app.composer.insert("/skills").unwrap());
@@ -6673,6 +6761,65 @@ pub mod tests {
         app.ask(card(5));
         app.withdraw(&id(1), Some(5));
         assert!(app.confirm().is_none() && app.cards().is_empty());
+    }
+
+    /// A `/review` shows its text under the reviewer's name, and nothing
+    /// more when it reviewed; one that did not says why under "review",
+    /// never as a compaction's or a turn's.
+    #[test]
+    fn a_review_shows_its_text_or_why_it_did_not() {
+        let mut app = app();
+        let review = || Kind::Started {
+            effect: crate::store::Effect::Review,
+            of: 0,
+        };
+        app.update(at(1, review()), 0);
+        app.update(
+            at(
+                2,
+                Kind::Review {
+                    request: 1,
+                    revision: "HEAD".into(),
+                    model: "a/model".into(),
+                    text: "REVIEWING: x\nNo findings.".into(),
+                },
+            ),
+            0,
+        );
+        app.update(
+            at(
+                3,
+                Kind::Finished {
+                    started: 1,
+                    outcome: "reviewed HEAD with a/model for $0.0100".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 1, "{}", text(&app));
+        let shown = text(&app);
+        assert!(shown.contains("a/model's review of HEAD"), "{shown}");
+        assert!(shown.contains("No findings."), "{shown}");
+        app.update(at(4, review()), 0);
+        app.update(
+            at(
+                5,
+                Kind::Finished {
+                    started: 4,
+                    outcome: "the review of HEAD did not run: why".into(),
+                    retry: false,
+                },
+            ),
+            0,
+        );
+        assert_eq!(app.transcript().len(), 2);
+        let shown = text(&app);
+        assert!(shown.contains("did not run: why"), "{shown}");
+        assert!(
+            shown.contains("review") && !shown.contains("compaction") && !shown.contains("turn"),
+            "{shown}"
+        );
     }
 
     /// The human's compaction marks no message running or unanswered,

@@ -69,6 +69,8 @@ use crate::wake;
 use crate::workspace::{Entry, Workspace};
 
 // `task`'s sub-agent, a child of this module for its private session.
+#[path = "reviewing.rs"]
+mod reviewing;
 #[path = "subagent.rs"]
 mod subagent;
 
@@ -1149,6 +1151,7 @@ impl Session {
                 Down::Pause { paused } => self.pause(paused)?,
                 Down::ClearTodo => self.clear_todo()?,
                 Down::Compact { focus } => self.compact(focus)?,
+                Down::Review { revision } => self.review(revision)?,
                 Down::Kill { number } => self.killed_by_person(number),
                 Down::Choose { model, effort } => self.choose(model, effort)?,
                 Down::Route { routing } => self.route(routing)?,
@@ -7720,6 +7723,40 @@ fn export(state: &Path, id: &Id, entry: &Entry, base: &str, pack: &Path) -> Resu
         id: entry.id.clone(),
         checkout: entry.checkout.clone(),
         branch: entry.branch.clone(),
+        base: base.to_string(),
+    };
+    crate::jail::export(
+        &programs,
+        &policy,
+        &dir.join("specs"),
+        &task,
+        crate::repo::EXPORT_TASK_TIME,
+        pack,
+    )
+}
+
+/// Exports `revision` as `entry`'s worktree resolves it, from `base`,
+/// the store's commit of its base, as a pack to the new file `pack`, in
+/// a maintenance instance: the commit a `/review` stages (DESIGN.md §15).
+fn export_revision(
+    state: &Path,
+    id: &Id,
+    entry: &Entry,
+    revision: &str,
+    base: &str,
+    pack: &Path,
+) -> Result<String, String> {
+    let programs = crate::jail::Programs::from_env()?;
+    let git = crate::repo::host_git()?;
+    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
+    let policy =
+        crate::workspace::maintenance(&dir, &[entry]).ok_or("no worktree to export from")?;
+    let task = crate::repo::Task::ExportRevision {
+        git,
+        repository: entry.repository.clone(),
+        id: entry.id.clone(),
+        checkout: entry.checkout.clone(),
+        revision: revision.to_string(),
         base: base.to_string(),
     };
     crate::jail::export(

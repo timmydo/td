@@ -131,6 +131,7 @@ fn kind(event: &Event) -> &'static str {
         Kind::Prefix { .. } => "prefix",
         Kind::Task { .. } => "task",
         Kind::TaskNote { .. } => "task_note",
+        Kind::Review { .. } => "review",
         Kind::Request { .. } => "request",
         Kind::Assistant { .. } => "assistant",
         Kind::Usage { .. } => "usage",
@@ -183,6 +184,10 @@ pub fn render(event: &Event) -> String {
             effect: Effect::Compact,
             ..
         } => "the person compacted the conversation".to_string(),
+        Kind::Started {
+            effect: Effect::Review,
+            ..
+        } => "the person asked for a review with /review".to_string(),
         Kind::Finished {
             started, outcome, ..
         } => format!("#{started} ended: {outcome}"),
@@ -199,6 +204,12 @@ pub fn render(event: &Event) -> String {
             "a {agent} sub-agent began on {model}, for the call at #{call}, asked:\n{prompt}"
         ),
         Kind::TaskNote { task, text } => format!("td-agent told the sub-agent at #{task}:\n{text}"),
+        Kind::Review {
+            revision,
+            model,
+            text,
+            ..
+        } => format!("{model}'s review of {revision}, which the person asked for:\n{text}"),
         Kind::Request {
             turn,
             purpose,

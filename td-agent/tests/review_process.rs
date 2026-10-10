@@ -12,6 +12,7 @@
 mod mock_fetch;
 
 use std::fs::{self, DirBuilder};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -451,6 +452,131 @@ fn tools_read_only_source_write_scratch_expand_sparse_and_cleanup() {
     assert!(trace.lines().last().unwrap().contains("\"success\":true"));
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("session log "));
+}
+
+/// A repository staged as `/review` stages one: bare, holding only the
+/// reviewed commit's own objects and borrowing the rest from a store
+/// through its alternates. Its checkout and its tools reach what only
+/// the store holds.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_staged_repository_borrows_its_stores_objects() {
+    let fixture = Fixture::new();
+    let git = |dir: &Path, args: &[&str], input: Option<&[u8]>| {
+        let mut child = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.unwrap_or_default()).unwrap();
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    let source = fixture.source.clone();
+    let store = fixture.root.join("store.git");
+    let staged = fixture.root.join("review.git");
+    git(
+        &fixture.root,
+        &["init", "--quiet", "--bare", "store.git"],
+        None,
+    );
+    git(
+        &source,
+        &[
+            "push",
+            "--quiet",
+            store.to_str().unwrap(),
+            "HEAD~1:refs/heads/main",
+        ],
+        None,
+    );
+    git(
+        &fixture.root,
+        &["init", "--quiet", "--bare", "review.git"],
+        None,
+    );
+    fs::write(
+        staged.join("objects/info/alternates"),
+        format!("{}\n", store.join("objects").display()),
+    )
+    .unwrap();
+    let pack = git(
+        &source,
+        &["pack-objects", "--stdout", "--revs", "--quiet"],
+        Some(format!("{}\n^HEAD~1\n", fixture.commit).as_bytes()),
+    );
+    git(&staged, &["index-pack", "--strict", "--stdin"], Some(&pack));
+    // The base's file is the store's alone.
+    let blob = String::from_utf8(git(&source, &["rev-parse", "HEAD:dep/data"], None)).unwrap();
+    assert!(!staged
+        .join("objects")
+        .join(&blob[..2])
+        .join(blob[2..].trim())
+        .exists());
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "expand_sparse",
+                Json::Obj(vec![(
+                    "paths".into(),
+                    Json::Arr(vec![Json::Str("dep".into())]),
+                )]),
+            ),
+            tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str("cat dep/data source-only; git log --format=%s".into()),
+                )]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = Command::new(PROGRAM)
+        .args(["review", "--repo"])
+        .arg(&staged)
+        .args(["--commit", &fixture.commit])
+        .args([
+            "--model",
+            MODEL,
+            "--max-tokens",
+            "4096",
+            "--max-cost",
+            "0.02",
+        ])
+        .env("XDG_CONFIG_HOME", &fixture.config)
+        .env("XDG_STATE_HOME", fixture.root.join("state"))
+        .env("XDG_RUNTIME_DIR", mock.runtime())
+        .env("TD_AGENT_TEST_KEY_ROOT", &fixture.root)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    let said = requests[3].text();
+    assert!(said.contains("DEPENDENCY"), "{said}");
+    assert!(said.contains("ORIGINAL REVIEWED"), "{said}");
+    assert!(said.contains("fixture base"), "{said}");
+    fixture.no_workspaces();
 }
 
 #[test]

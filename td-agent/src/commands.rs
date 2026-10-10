@@ -16,6 +16,7 @@ const ARGUMENTS: &str = "$ARGUMENTS";
 const BUILT_IN: &[&str] = &[
     "commands",
     "compact",
+    "review",
     "schedule",
     "schedules",
     "skills",
@@ -49,6 +50,47 @@ pub fn name_ok(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The most bytes of a revision `/review` names.
+pub const MAX_REVISION: usize = 256;
+
+/// The revision `/review [REVISION]` names, HEAD when none, when `text`
+/// is that command (DESIGN.md §15, `/review`): one word of what git
+/// revisions are written with, never starting with `-`, so it is never
+/// taken for an option.
+pub fn review(text: &str) -> Option<Result<String, String>> {
+    let rest = text.trim().strip_prefix("/review")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let revision = rest.trim();
+    if revision.is_empty() {
+        return Some(Ok("HEAD".into()));
+    }
+    Some(
+        self::revision(revision).map(str::to_string).map_err(|_| {
+            format!(
+                "/review takes one revision of at most {MAX_REVISION} bytes, such as HEAD or a commit's hash, not starting with -"
+            )
+        }),
+    )
+}
+
+/// `word` when it is a revision `/review` takes: at most `MAX_REVISION`
+/// bytes of what git revisions are written with, never starting with
+/// `-`, so it is never taken for an option.
+pub fn revision(word: &str) -> Result<&str, String> {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || b"._/~^@{}:-".contains(&b);
+    if !word.is_empty()
+        && word.len() <= MAX_REVISION
+        && !word.starts_with('-')
+        && word.bytes().all(allowed)
+    {
+        Ok(word)
+    } else {
+        Err(format!("{word:?} is not a revision /review takes"))
+    }
 }
 
 /// What `text` asks, when it starts with `/` and a name a command could
@@ -232,6 +274,35 @@ fn first_line(text: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// `/review` names one revision, HEAD by default; what could be
+    /// taken for an option, or is not a revision's word, is refused, and
+    /// a longer name is no `/review`.
+    #[test]
+    fn review_names_one_revision_head_by_default() {
+        assert_eq!(review("/review"), Some(Ok("HEAD".into())));
+        assert_eq!(review("  /review  "), Some(Ok("HEAD".into())));
+        assert_eq!(review("/review HEAD~2"), Some(Ok("HEAD~2".into())));
+        assert_eq!(
+            review("/review origin/main@{1}"),
+            Some(Ok("origin/main@{1}".into()))
+        );
+        for refused in [
+            "/review --repo=/etc",
+            "/review -n",
+            "/review HEAD main",
+            "/review a;b",
+            "/review $(x)",
+        ] {
+            assert!(matches!(review(refused), Some(Err(_))), "{refused}");
+        }
+        let long = format!("/review {}", "a".repeat(MAX_REVISION + 1));
+        assert!(matches!(review(&long), Some(Err(_))));
+        assert_eq!(review("/reviews"), None);
+        assert_eq!(review("review"), None);
+        // The composer's own: never looked up as the person's command.
+        assert_eq!(typed("/review HEAD"), None);
+    }
 
     #[test]
     fn a_command_is_a_slash_and_a_name_not_the_composers_own() {

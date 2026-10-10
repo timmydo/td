@@ -101,10 +101,10 @@ struct Running {
     /// Its background processes running, by its log: none survives it,
     /// so it is kept while any runs (DESIGN.md §12).
     background: u32,
-    /// Compactions asked of it and not yet heard started: a turn under
-    /// way when one was asked may end first, so it is kept until they
-    /// are (DESIGN.md §14).
-    compacting: u32,
+    /// Compactions and reviews asked of it and not yet heard started: a
+    /// turn under way when one was asked may end first, so it is kept
+    /// until they are (DESIGN.md §14; §15, `/review`).
+    asked: u32,
     /// The last event its log replayed: a compaction's start no later
     /// is one from before, not one asked of it.
     replayed: u64,
@@ -121,7 +121,7 @@ impl Running {
             || self.waking
             || !self.preparing.is_empty()
             || self.background > 0
-            || self.compacting > 0
+            || self.asked > 0
             || !self.pending.is_empty()
             || !self.deliveries.is_empty()
     }
@@ -243,7 +243,7 @@ impl Supervisor {
             busy: None,
             preparing: Vec::new(),
             background: 0,
-            compacting: 0,
+            asked: 0,
             replayed: 0,
             resuming: false,
             waking: false,
@@ -456,7 +456,7 @@ impl Supervisor {
             busy: None,
             preparing: Vec::new(),
             background: 0,
-            compacting: 0,
+            asked: 0,
             replayed: 0,
             resuming: false,
             waking: false,
@@ -583,7 +583,22 @@ impl Supervisor {
             let _ = running.writer.shutdown(std::net::Shutdown::Both);
         }
         // Kept from now, whatever turn ends first, until its `started`.
-        running.compacting = running.compacting.saturating_add(1);
+        running.asked = running.asked.saturating_add(1);
+        Ok(())
+    }
+
+    /// Asks the open conversation for a review of `revision` of its
+    /// workspace, as the human did (DESIGN.md §15, `/review`).
+    pub fn review(&mut self, revision: String) -> Result<(), String> {
+        let running = self.opened().ok_or("no conversation is open")?;
+        if running.failed {
+            return Err("the conversation's process failed; open it again to restart it".into());
+        }
+        if frame::write(&mut running.writer, &Down::Review { revision }.encode()).is_err() {
+            let _ = running.writer.shutdown(std::net::Shutdown::Both);
+        }
+        // Kept from now, as a compaction is, until its `started`.
+        running.asked = running.asked.saturating_add(1);
         Ok(())
     }
 
@@ -687,7 +702,7 @@ impl Supervisor {
             running.busy = None;
             running.waking = false;
             // What it was asked to compact went with it.
-            running.compacting = 0;
+            running.asked = 0;
             // Its background processes went with its process.
             running.background = 0;
             if running.restarts >= MAX_RESTARTS {
@@ -829,12 +844,12 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                             // Logged after any turn it starts, whose start
                             // has marked the child busy.
                             Kind::Pause { paused: false } => running.resuming = false,
-                            // A turn's, or the human's compaction's.
+                            // A turn's, or the human's compaction's or review's.
                             Kind::Started { effect, .. } => {
                                 running.busy = Some(event.seq);
                                 running.waking = false;
-                                if effect == Effect::Compact && event.seq > running.replayed {
-                                    running.compacting = running.compacting.saturating_sub(1);
+                                if effect != Effect::Turn && event.seq > running.replayed {
+                                    running.asked = running.asked.saturating_sub(1);
                                 }
                             }
                             Kind::Finished { started, .. } | Kind::Interrupted { started }

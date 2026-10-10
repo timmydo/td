@@ -481,6 +481,17 @@ pub enum Task {
         branch: String,
         base: String,
     },
+    /// As `Export`, of `revision` as the worktree resolves it, its HEAD
+    /// the worktree's: the commit a `/review` asks for (DESIGN.md §15,
+    /// `/review`), whose objects the store lacks.
+    ExportRevision {
+        git: PathBuf,
+        repository: PathBuf,
+        id: String,
+        checkout: PathBuf,
+        revision: String,
+        base: String,
+    },
 }
 
 /// A survey's answer, read back outside the instance: what the
@@ -615,6 +626,22 @@ impl Task {
                 branch.into(),
                 base.into(),
             ],
+            Self::ExportRevision {
+                git,
+                repository,
+                id,
+                checkout,
+                revision,
+                base,
+            } => vec![
+                "export-revision".into(),
+                git.into(),
+                repository.into(),
+                id.into(),
+                checkout.into(),
+                revision.into(),
+                base.into(),
+            ],
         }
     }
 
@@ -633,6 +660,19 @@ impl Task {
                 Ok(Self::Sparse {
                     git: absolute(git)?, repository: absolute(repository)?, id: worktree_id(id)?.into(),
                     checkout: absolute(checkout)?, base: base.clone(), paths: paths.to_vec(),
+                })
+            }
+            [word, git, repository, id, checkout, revision, base] if word == "export-revision" => {
+                if !git::object_id(base) {
+                    return Err(format!("{base:?} is not a full commit id"));
+                }
+                Ok(Self::ExportRevision {
+                    git: absolute(git)?,
+                    repository: absolute(repository)?,
+                    id: worktree_id(id)?.into(),
+                    checkout: absolute(checkout)?,
+                    revision: crate::commands::revision(revision)?.to_string(),
+                    base: base.clone(),
                 })
             }
             [word, git, repository, id, checkout, branch, base]
@@ -925,23 +965,49 @@ impl Task {
                 .map_err(|e| said("setting the remote-tracking refs", &e))?;
                 Ok(format!("{} remote-tracking refs set", heads.len()))
             }
-            Self::Export { .. } => Err("an export is run with its frames' writer".into()),
+            Self::Export { .. } | Self::ExportRevision { .. } => {
+                Err("an export is run with its frames' writer".into())
+            }
         }
     }
 
     /// Runs an export, its pack in frames to `out`, and says the commit
     /// it exported; any other task as `run`.
     pub fn export(&self, out: &mut dyn Write) -> Result<String, String> {
-        let Self::Export {
-            git,
-            repository,
-            id,
-            checkout,
-            branch,
-            base,
-        } = self
-        else {
-            return self.run();
+        let (git, repository, id, checkout, spec, what, base) = match self {
+            Self::Export {
+                git,
+                repository,
+                id,
+                checkout,
+                branch,
+                base,
+            } => (
+                git,
+                repository,
+                id,
+                checkout,
+                format!("refs/heads/{branch}^{{commit}}"),
+                format!("the branch {branch}"),
+                base,
+            ),
+            Self::ExportRevision {
+                git,
+                repository,
+                id,
+                checkout,
+                revision,
+                base,
+            } => (
+                git,
+                repository,
+                id,
+                checkout,
+                format!("{revision}^{{commit}}"),
+                format!("the revision {revision}"),
+                base,
+            ),
+            _ => return self.run(),
         };
         let jailed = || jailed(git, repository, id, checkout);
         let resolved = git::run(
@@ -950,15 +1016,15 @@ impl Task {
                 "--verify",
                 "--quiet",
                 "--end-of-options",
-                &format!("refs/heads/{branch}^{{commit}}"),
+                &spec,
             ]),
             MAX_SAID,
             EXPORT_GIT_TIME,
         )
-        .map_err(|e| said(&format!("resolving the branch {branch}"), &e))?;
+        .map_err(|e| said(&format!("resolving {what}"), &e))?;
         let commit = String::from_utf8_lossy(&resolved).trim().to_string();
         if !git::object_id(&commit) {
-            return Err(format!("the branch {branch} resolved to {commit:?}"));
+            return Err(format!("{what} resolved to {commit:?}"));
         }
         // Every object from the branch's commit back to the base, the
         // store's, which the publish repository borrows too.
@@ -983,7 +1049,9 @@ impl Task {
 /// run and its answer written to `out`, one line, or for an export its
 /// pack's frames and then the line as a frame of its own.
 pub fn maintain(args: &[String], out: &mut dyn Write) -> Result<(), String> {
-    let framed = args.first().is_some_and(|word| word == "export");
+    let framed = args
+        .first()
+        .is_some_and(|word| word == "export" || word == "export-revision");
     let result = Task::parse(args).and_then(|task| task.export(out));
     let line = answer(&result);
     let _ = if framed {
@@ -1715,6 +1783,36 @@ pub(crate) mod tests {
         let e = gone.export(&mut out).unwrap_err();
         assert!(e.starts_with("resolving the branch nowhere"), "{e}");
         assert!(out.is_empty());
+        // A `/review`'s revision, as the worktree resolves it: its words
+        // cross framed, and its pack imports as the branch's does.
+        let revision = |revision: &str| Task::ExportRevision {
+            git: git.clone(),
+            repository: repository.clone(),
+            id: "r".into(),
+            checkout: checkout.clone(),
+            revision: revision.into(),
+            base: base.clone(),
+        };
+        let words: Vec<String> = revision("HEAD")
+            .args()
+            .iter()
+            .map(|w| w.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(Task::parse(&words).unwrap(), revision("HEAD"));
+        let mut out = Vec::new();
+        maintain(&words, &mut out).unwrap();
+        let (pack, line) = unframe(&out);
+        assert_eq!(line, format!("ok {}\n", commits[1]));
+        let reviewed = scratch.0.join("publish/w/review.git");
+        worker.publish(&reviewed, &store).unwrap();
+        fs::write(&file, &pack).unwrap();
+        worker.import(&reviewed, &file, &commits[1]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(revision("HEAD~1").export(&mut out).unwrap(), commits[0]);
+        // One that could be taken for an option is refused before git.
+        let mut bad = words.clone();
+        bad[5] = "--output=/tmp/x".into();
+        assert!(Task::parse(&bad).is_err());
     }
 
     /// A push's evidence (DESIGN.md §9, Pushing, step 3): the commits it
@@ -1962,7 +2060,8 @@ pub(crate) mod tests {
             | Task::Checkout { git, .. }
             | Task::Survey { git, .. }
             | Task::Track { git, .. }
-            | Task::Export { git, .. } => git.clone(),
+            | Task::Export { git, .. }
+            | Task::ExportRevision { git, .. } => git.clone(),
         }
     }
 

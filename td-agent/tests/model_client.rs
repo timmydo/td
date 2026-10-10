@@ -552,6 +552,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Prefix { .. } => "prefix",
             Kind::Task { .. } => "task",
             Kind::TaskNote { .. } => "task_note",
+            Kind::Review { .. } => "review",
             Kind::Request { .. } => "request",
             Kind::Assistant { .. } => "assistant",
             Kind::Usage { .. } => "usage",
@@ -5050,6 +5051,116 @@ fn the_wake_budget_holds_messages_past_twenty_turns_until_the_human_writes() {
     let (events, outcome, _) = h.turn();
     assert_eq!(outcome, "replied");
     assert_eq!(kinds(&events)[..2], ["message", "started"]);
+}
+
+/// `/review` reviews a repository workspace's worktree alone: in a
+/// directory workspace, or none, it does not run, and nothing is
+/// reserved or asked.
+#[test]
+fn a_review_is_of_a_repository_workspace_alone() {
+    use td_agent::config::TemplateShared;
+    let mut h = Harness::new_in(
+        "review",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        Vec::new(),
+    );
+    h.setup(Client {
+        template_shared: vec![TemplateShared {
+            system: false,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    });
+    h.down(&Down::Review {
+        revision: "HEAD".into(),
+    });
+    let (events, outcome, retry) = h.turn();
+    assert_eq!(
+        outcome,
+        "the review of HEAD did not run: /review reviews a repository workspace's worktree, and this conversation's workspace is not one"
+    );
+    assert!(!retry);
+    assert!(matches!(
+        events.first().map(|e| &e.kind),
+        Some(Kind::Started {
+            effect: td_agent::store::Effect::Review,
+            ..
+        })
+    ));
+    assert!(!kinds(&events).contains(&"request"));
+    assert!(h.reserved.is_empty());
+    assert!(h.mock.requests().is_empty());
+    h.close();
+
+    let mut h = Harness::new("review-bare", Role::Conversation, Vec::new());
+    h.setup(Client::default());
+    h.down(&Down::Review {
+        revision: "HEAD".into(),
+    });
+    let (events, outcome, _) = h.turn();
+    assert!(outcome.contains("is not one"), "{outcome}");
+    assert!(!kinds(&events).contains(&"request"));
+    assert!(h.reserved.is_empty());
+}
+
+/// `/review` stages the commit as a push does: exported from the
+/// worktree by a maintenance instance and imported into a repository no
+/// jail can write, then run by `td-agent review`, reserved at
+/// `review_max_cost` and charged as one request. Here the review stops
+/// for want of a key file, before any model, so it costs nothing; and
+/// nothing of the staging is kept.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host git"]
+fn a_review_stages_its_commit_and_is_charged_as_one_request() {
+    let Prepared { mut h, .. } = prepared(
+        "review-staged",
+        Client {
+            review_max_cost: ONE / 2,
+            ..Client::default()
+        },
+        |_| Vec::new(),
+    );
+    h.down(&Down::Review {
+        revision: "HEAD".into(),
+    });
+    let (events, outcome, _) = h.turn();
+    // Past the staging, which would say "did not run".
+    assert!(
+        outcome.starts_with("the review of HEAD failed (exit status: "),
+        "{outcome}"
+    );
+    assert!(outcome.contains("having spent $0.0000"), "{outcome}");
+    assert!(outcome.contains("key"), "{outcome}");
+    let request = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Request {
+                purpose,
+                reserved,
+                head,
+                ..
+            } => Some((*purpose, *reserved, head.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((request.0, request.1), (Purpose::Review, ONE / 2));
+    assert!(
+        request.2.contains(r#""review":"HEAD","commit":""#),
+        "{}",
+        request.2
+    );
+    assert_eq!(usage(&events), [(0, Basis::Nothing)]);
+    assert_eq!(
+        h.reserved.iter().map(|r| r.1).collect::<Vec<_>>(),
+        [ONE / 2]
+    );
+    assert_eq!(h.spent.iter().map(|s| s.1).collect::<Vec<_>>(), [0]);
+    assert!(!kinds(&events).contains(&"review"));
+    assert!(!h.state.conversation(&h.id).join("review").exists());
 }
 
 /// A schedule's firing, as the window hands it on.

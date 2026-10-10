@@ -190,6 +190,14 @@ impl StateDir {
         self.conversation(id).join("push.pack")
     }
 
+    /// Where conversation `id`'s `/review` stages the commit it reviews
+    /// (DESIGN.md §15, `/review`): its export's pack and the repository
+    /// it is imported into, in the conversation's own directory, which no
+    /// jail can write; made afresh for each review and removed after it.
+    pub fn review_stage(&self, id: &Id) -> PathBuf {
+        self.conversation(id).join("review")
+    }
+
     /// Makes the state directory and its conversations directory, each
     /// private to the caller, when they are missing.
     pub fn ensure(&self) -> Result<(), String> {
@@ -1083,6 +1091,8 @@ pub fn title(text: &str) -> String {
 pub enum Effect {
     Turn,
     Compact,
+    /// The person's `/review` (DESIGN.md §15, `/review`).
+    Review,
 }
 
 impl Effect {
@@ -1090,12 +1100,14 @@ impl Effect {
         match self {
             Self::Turn => "turn",
             Self::Compact => "compact",
+            Self::Review => "review",
         }
     }
     fn parse(word: &str) -> Option<Self> {
         match word {
             "turn" => Some(Self::Turn),
             "compact" => Some(Self::Compact),
+            "review" => Some(Self::Review),
             _ => None,
         }
     }
@@ -1129,6 +1141,10 @@ pub enum Purpose {
     /// A sub-agent's step (DESIGN.md §12, `task`), its `prefix` the
     /// `Task` event that began it.
     Task,
+    /// A `/review`'s run of `td-agent review` (DESIGN.md §15,
+    /// `/review`): the whole review, its own requests in its own session
+    /// log, reserved and charged as one.
+    Review,
 }
 
 impl Purpose {
@@ -1139,6 +1155,7 @@ impl Purpose {
             Self::Classify => "classify",
             Self::Compact => "compact",
             Self::Task => "task",
+            Self::Review => "review",
         }
     }
     fn parse(word: &str) -> Option<Self> {
@@ -1148,6 +1165,7 @@ impl Purpose {
             "classify" => Some(Self::Classify),
             "compact" => Some(Self::Compact),
             "task" => Some(Self::Task),
+            "review" => Some(Self::Review),
             _ => None,
         }
     }
@@ -1374,6 +1392,16 @@ pub enum Kind {
     /// What td-agent tells the sub-agent whose `Task` event is `task`,
     /// in its view alone: that its next request is its last.
     TaskNote { task: u64, text: String },
+    /// The review a `/review` brought (DESIGN.md §15, `/review`): the
+    /// request it was charged as, the revision reviewed, the model that
+    /// wrote it, and its text, given to the model as a review's, not the
+    /// person's words.
+    Review {
+        request: u64,
+        revision: String,
+        model: String,
+        text: String,
+    },
     /// A model request, logged and synced before it is sent: the turn it
     /// belongs to, what it is for, the prefix it begins with (0 for the
     /// file, else the `Prefix` event's sequence number), the exact text of
@@ -1600,6 +1628,18 @@ impl Event {
             Kind::TaskNote { task, text } => {
                 put("kind", Json::Str("task_note".into()));
                 put("task", Json::from(*task));
+                put("text", Json::Str(text.clone()));
+            }
+            Kind::Review {
+                request,
+                revision,
+                model,
+                text,
+            } => {
+                put("kind", Json::Str("review".into()));
+                put("request", Json::from(*request));
+                put("revision", Json::Str(revision.clone()));
+                put("model", Json::Str(model.clone()));
                 put("text", Json::Str(text.clone()));
             }
             Kind::Request {
@@ -1930,6 +1970,12 @@ impl Event {
             },
             Some("task_note") => Kind::TaskNote {
                 task: number("task")?,
+                text: string("text")?,
+            },
+            Some("review") => Kind::Review {
+                request: number("request")?,
+                revision: string("revision")?,
+                model: string("model")?,
                 text: string("text")?,
             },
             Some("request") => Kind::Request {
@@ -3005,6 +3051,41 @@ pub mod tests {
             &"a".repeat(33),
         ] {
             assert!(Id::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_sub_agents_note_and_a_review_read_back_as_written() {
+        for kind in [
+            Kind::TaskNote {
+                task: 4,
+                text: "[td-agent: stop here.]".into(),
+            },
+            Kind::Review {
+                request: 7,
+                revision: "HEAD~1".into(),
+                model: "a/reviewer".into(),
+                text: "One finding.\n".into(),
+            },
+            Kind::Started {
+                effect: Effect::Review,
+                of: 3,
+            },
+            Kind::Request {
+                turn: 8,
+                purpose: Purpose::Review,
+                prefix: 0,
+                head: "\"review\":\"HEAD\"".into(),
+                bytes: 0,
+                reserved: 5,
+            },
+        ] {
+            let event = Event {
+                seq: 9,
+                time: 1,
+                kind,
+            };
+            assert_eq!(Event::from_json(&event.to_json()).unwrap(), event);
         }
     }
 

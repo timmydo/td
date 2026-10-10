@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::io::Read;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -524,6 +524,29 @@ impl Worker {
     /// configuration, which `env`'s `HOME` locates, keeping only
     /// `user.name`, `user.email` and credential helpers.
     pub fn new(dir: &Path, env: &[(String, OsString)]) -> Result<Self, String> {
+        let worker = Self::at(dir, env)?;
+        worker.copy_identity()?;
+        Ok(worker)
+    }
+
+    /// A worker for local repositories alone, a `/review`'s staging
+    /// (DESIGN.md §15, `/review`): no identity and no credential helper
+    /// copied, its global configuration empty.
+    pub fn local(dir: &Path, env: &[(String, OsString)]) -> Result<Self, String> {
+        let worker = Self::at(dir, env)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&worker.config)
+            .map_err(|e| format!("{}: {e}", worker.config.display()))?;
+        Ok(worker)
+    }
+
+    /// The worker's private directories in `dir`, and the environment it
+    /// keeps of `env`.
+    fn at(dir: &Path, env: &[(String, OsString)]) -> Result<Self, String> {
         // git runs in `dir`, so every path it is given must not depend on
         // td-agent's own directory.
         if !dir.is_absolute() {
@@ -548,15 +571,13 @@ impl Worker {
             .cloned()
             .collect();
         let config = dir.join("gitconfig");
-        let worker = Self {
+        Ok(Self {
             config,
             hooks,
             env,
             prompt: None,
             asks: false,
-        };
-        worker.copy_identity()?;
-        Ok(worker)
+        })
     }
 
     /// This worker, its prompts answered by `prompt` when it is

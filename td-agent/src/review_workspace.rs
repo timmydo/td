@@ -34,7 +34,63 @@ pub struct Workspace {
     programs: jail::Programs,
     repository: PathBuf,
     objects: PathBuf,
+    /// The object directories `objects` borrows through its alternates,
+    /// which the checkout and the tools read too: a repository td-agent
+    /// staged for a `/review` borrows its store's (DESIGN.md §15).
+    borrowed: Vec<PathBuf>,
     git: PathBuf,
+}
+
+/// The most alternates a reviewed repository's objects may name, and the
+/// most bytes of the file that names them.
+const MAX_BORROWED: usize = 8;
+const MAX_ALTERNATES_BYTES: u64 = 16 * 1024;
+
+/// The object directories `objects/info/alternates` names, each made
+/// absolute against `objects` as git does and canonical: a directory
+/// named `objects`, and, as `--vendor` must be, neither holding the key
+/// at `key` nor within its directory, since each is bound into the jail.
+/// One level only: an alternate's own alternates are not followed.
+fn borrowed(objects: &Path, key: &Path) -> Result<Vec<PathBuf>, String> {
+    let credentials = key.parent().ok_or("key has no parent")?;
+    let file = objects.join("info").join("alternates");
+    let text = match fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+        Ok(meta) if !meta.is_file() => return Err(format!("{} is not a file", file.display())),
+        Ok(meta) if meta.len() > MAX_ALTERNATES_BYTES => {
+            return Err(format!(
+                "{} is past {MAX_ALTERNATES_BYTES} bytes",
+                file.display()
+            ))
+        }
+        Ok(_) => fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?,
+    };
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if out.len() == MAX_BORROWED {
+            return Err(format!("{} names more than {MAX_BORROWED}", file.display()));
+        }
+        let path = fs::canonicalize(objects.join(line))
+            .map_err(|e| format!("the alternate {line}: {e}"))?;
+        if !path.is_dir() || path.file_name() != Some(std::ffi::OsStr::new("objects")) {
+            return Err(format!(
+                "the alternate {} is not a git objects directory",
+                path.display()
+            ));
+        }
+        if key.starts_with(&path) || path.starts_with(credentials) {
+            return Err(format!(
+                "the alternate {} would expose the credential directory",
+                path.display()
+            ));
+        }
+        out.push(path);
+    }
+    Ok(out)
 }
 
 fn directory(path: &Path) -> Result<(), String> {
@@ -187,6 +243,10 @@ impl Workspace {
             scratch: root.join("scratch"),
             repository: root.join("repository.git"),
             objects: common.join("objects"),
+            borrowed: borrowed(
+                &common.join("objects"),
+                &fs::canonicalize(key_path).map_err(|e| format!("the key: {e}"))?,
+            )?,
             root,
             cleaned: false,
             _lock: held,
@@ -282,7 +342,9 @@ impl Workspace {
             home: self.root.join("home"),
             checkouts: vec![self.checkout.clone()],
             repositories: vec![self.repository.clone()],
-            objects: vec![self.objects.clone()],
+            objects: std::iter::once(self.objects.clone())
+                .chain(self.borrowed.iter().cloned())
+                .collect(),
             directory: Some(self.checkout.clone()),
             ..jail::Policy::default()
         }
@@ -296,6 +358,7 @@ impl Workspace {
         let mut visible = policy.roots();
         visible.extend(policy.repositories.iter().chain(&policy.objects).cloned());
         visible.extend([policy.home.clone(), self.root.clone(), self.objects.clone()]);
+        visible.extend(self.borrowed.iter().cloned());
         journal.outside(&visible)?;
         let spec = jail::spec_text(
             &self.programs,
@@ -308,11 +371,14 @@ impl Workspace {
     pub fn policy(&self) -> jail::Policy {
         let mut policy = jail::Policy {
             home: self.root.join("home"),
-            read: vec![
+            read: [
                 self.checkout.clone(),
                 self.repository.clone(),
                 self.objects.clone(),
-            ],
+            ]
+            .into_iter()
+            .chain(self.borrowed.iter().cloned())
+            .collect(),
             worktrees: vec![self.scratch.clone()],
             directory: Some(self.checkout.clone()),
             ..jail::Policy::default()
@@ -483,5 +549,66 @@ impl Drop for Workspace {
         if let Err(why) = self.cleanup() {
             eprintln!("td-agent review: {why}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// The alternates a reviewed repository borrows: none without the
+    /// file; each named directory, relative ones against `objects`, and
+    /// comments skipped; and refusals for a missing directory and for
+    /// more than the bound.
+    #[test]
+    fn borrowed_object_directories_are_read_from_alternates() {
+        let root = std::env::temp_dir().join(format!(
+            "td-agent-borrowed-{}",
+            crate::store::random_hex(8).unwrap()
+        ));
+        fs::create_dir_all(root.join("r.git/objects/info")).unwrap();
+        fs::create_dir_all(root.join("store.git/objects")).unwrap();
+        fs::create_dir_all(root.join("config/td-agent/objects")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let key = root.join("config/td-agent/key");
+        let objects = root.join("r.git/objects");
+        let borrowed = |objects: &Path| borrowed(objects, &key);
+        assert_eq!(borrowed(&objects).unwrap(), Vec::<PathBuf>::new());
+        let alternates = objects.join("info/alternates");
+        let store = root.join("store.git/objects");
+        fs::write(
+            &alternates,
+            format!(
+                "# a comment\n\n{}\n../../store.git/objects\n",
+                store.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(borrowed(&objects).unwrap(), [store.clone(), store.clone()]);
+        fs::write(&alternates, "/nonexistent/objects\n").unwrap();
+        assert!(borrowed(&objects).unwrap_err().contains("/nonexistent"));
+        let many = format!("{}\n", store.display()).repeat(MAX_BORROWED + 1);
+        fs::write(&alternates, many).unwrap();
+        assert!(borrowed(&objects).unwrap_err().contains("more than"));
+        // Nothing but an objects directory, and never one that would
+        // bind the key: an ancestor of it, or within its directory.
+        for (named, why) in [
+            (root.join("store.git"), "objects directory"),
+            (root.clone(), "objects directory"),
+            (root.join("config/td-agent/objects"), "credential"),
+        ] {
+            fs::write(&alternates, format!("{}\n", named.display())).unwrap();
+            let e = borrowed(&objects).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        let above = root.join("objects");
+        fs::create_dir_all(above.join("config")).unwrap();
+        let key = above.join("config/key");
+        fs::write(&alternates, format!("{}\n", above.display())).unwrap();
+        assert!(super::borrowed(&objects, &key)
+            .unwrap_err()
+            .contains("credential"));
+        fs::remove_dir_all(&root).unwrap();
     }
 }

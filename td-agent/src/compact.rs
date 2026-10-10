@@ -411,6 +411,7 @@ pub fn prunable(events: &[Event], protect: u64, minimum: u64) -> Vec<u64> {
             }
             Kind::User { text, .. }
             | Kind::Notification { text }
+            | Kind::Review { text, .. }
             | Kind::Message { text, .. }
             | Kind::Fired {
                 text,

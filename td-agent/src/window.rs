@@ -446,6 +446,11 @@ impl Session {
                         self.app.note(e);
                     }
                 }
+                Request::Review(revision) => {
+                    if let Err(e) = self.supervisor.review(revision) {
+                        self.app.note(e);
+                    }
+                }
                 Request::Schedule(command) => self.schedule(command),
                 Request::ClearTodo => {
                     if let Err(e) = self.supervisor.tell(&Down::ClearTodo) {

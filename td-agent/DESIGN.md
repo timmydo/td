@@ -200,7 +200,10 @@ worker's push, bound to a commit the human or classifier approved.
 same binary run by a person or an agent from a shell, with no window,
 conversation or jail, for one model's review of one git commit in td's
 review workflow (DEVELOPMENT.md, Code review), where it is meant to take
-an external reviewer CLI's place. It reads the commit's text as `git
+an external reviewer CLI's place. A conversation's `/review` runs it
+too, on a commit it staged where no jail can write, and accounts what
+it spent (§15, As built (`/review`)); the command itself is the
+same. It reads the commit's text as `git
 show` prints it from FILE or standard input (an interactive one is
 refused), at most 4 MiB (a larger one is refused, not cut, since a
 review of part of a commit says nothing of the rest), and sends it in
@@ -267,12 +270,19 @@ directories, up to 128 in total, but always checks out the same commit.
 Checkout and sparse expansion run through the existing maintenance jail;
 fixed Git inspection commands disable hooks, external diffs, textconv,
 replacement objects, automatic maintenance and transport. The source
-repository's objects are borrowed read-only, never modified.
+repository's objects are borrowed read-only, never modified, and so are
+the object directories its `objects/info/alternates` names, one level,
+at most 8: each must be a directory named `objects` and, as `--vendor`
+must, neither hold the key nor lie within its directory, or the review
+is refused, since each is bound into the checkout's and every tool's
+jail. A `/review` reviews a repository that borrows its store's objects
+this way (§15).
 
 This is a separate review capability profile, independent of conversation
 ask/auto mode and its classifier. Its tools are `read_file`, `glob`, `grep`,
 bounded foreground `shell`, and `expand_sparse`. Source, private Git
-metadata and borrowed objects are read-only in each fresh tool jail.
+metadata and borrowed objects, its alternates' included, are read-only
+in each fresh tool jail.
 Only scratch and the private home are writable. Scratch uses the existing
 executable worktree grant so newly built tests can run; source uses a
 non-executable read grant. Cargo receives typed
@@ -1807,7 +1817,9 @@ that limit is set. Without that limit, default diff-only reviews may leave the m
 unlisted when the list is unavailable. Explicit routing/filter choices
 require usable endpoint metadata even without a per-turn limit. What it spends is not added to the day's total; it
 is said on standard error, and the provider's own key limit is the
-bound across reviews.
+bound across reviews. A `/review` differs: the
+conversation that ran it reserves its cap with the window and charges
+what its session log accounts (§15, As built (`/review`)).
 
 Repository reviews always require a listed, priced model supporting tools
 and `max_tokens`. `--max-cost USD` caps the whole invocation, defaulting to
@@ -2269,8 +2281,8 @@ still held when the window closes is written whole to standard error.
   say) gets a `prefix` event holding the new one before its next
   request, and requests name the prefix they used.
 - **New events.** A `request` (its turn, its purpose, `turn`, `title`,
-  `classify`, `compact` or a sub-agent's `task` (§12),
-  its prefix, its exact head, its body's length and its reservation) is
+  `classify`, `compact`, a sub-agent's `task` (§12) or a `/review`'s
+  `review` (§15), its prefix, its exact head, its body's length and its reservation) is
   a started effect, synced before it is sent; an `assistant` message
   (its text, its reasoning text, its raw `reasoning_details` and its
   finish reason); `usage` (tokens, cost and its basis, §5); a `title`;
@@ -3519,7 +3531,8 @@ conversation's own; and nowhere may one conversation process serve two
 conversations, or an increment depend on td-jail moving an instance out
 of its launcher's cgroup on a host. The git worker's imports and pushes
 are children of the window process, which would take a limit of their
-own (§9).
+own (§9); a `/review`'s staging import and its review are the
+conversation process's own children (§15).
 
 **Mechanism.** td has one confinement implementation, td-jail
 (APPLICATIONS.md §C), and td-agent does not grow a second one. The jail is
@@ -3767,7 +3780,9 @@ standalone program: no boot test starts it (§18, 17).
 
 **The git worker** is the part of td-agent that runs git. It does so in
 two places, and the line between them is the design. Outside a jail it
-is the window process's, which holds the shared repositories; a
+is the window process's, which holds the shared repositories, but for a
+`/review`'s staging, which the conversation process does in its own
+directory (§15); a
 maintenance instance is started by the conversation process whose work
 needs it, or for workspace maintenance no turn asks for by the
 workspace's own conversation process (§2); the survey before a
@@ -3775,7 +3790,9 @@ deletion, whose conversation has no process left, by the window.
 
 - **Outside any jail**, only on repositories no jail can write: cloning
   and fetching the store, importing into and pushing from the publish
-  repository, and computing a push's evidence there. On a development host
+  repository, computing a push's evidence there, and importing a
+  `/review`'s pack into the repository it stages, which `td-agent
+  review` then reads. On a development host
   it runs the host's `git`; on td, the image's.
 - **Inside a maintenance instance**, a `workspace` jail instance with no
   network that runs only the git worker's fixed commands, every git
@@ -4031,7 +4048,9 @@ instance's `export` task resolves td-agent's record of the worktree's
 branch, never the jail's `HEAD`, to its commit with `rev-parse
 --verify`, and runs `pack-objects --stdout --revs` over that commit and
 not the base, a commit of the store, so every object the branch added
-since goes, and one the store already has may too. Its output is
+since goes, and one the store already has may too. Its
+`export-revision` twin, a `/review`'s (§15), resolves a revision the
+worktree names, `HEAD` the jail's, the same way. Its output is
 streamed as it comes, never held whole: a few pieces read ahead of the
 channel at most, so a slow reader holds git back, and once git exits its
 pipes are read for as long as its standard output still comes, a second
@@ -6298,6 +6317,8 @@ default; `jev_threshold`'s is calibrated (§11):
   at most two decimal places, `compact_keep_tokens`, from 1,000 to
   1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
   conversation's model (§14)
+- `review_model` and `review_max_cost`, a number of credits above zero;
+  defaults the conversation's model and 1 (As built (`/review`), below)
 - `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every
   resumption as cold, and `cold_resume_tokens`, from 1,000 to
   10,000,000, or `none`; defaults 300 and 32,000 (§14)
@@ -6374,8 +6395,8 @@ other key is refused by name.
 the `commands` directory beside the configuration file, a place no jail
 binds (§8), so their text is the person's. A name is 1 to 32 lowercase
 ASCII letters, digits and `-`, starting with a letter; the composer's
-own commands (`/commands`, `/compact`, `/schedule`, `/schedules`,
-`/skills`, `/unschedule`) are never looked up. `/NAME ARGS` in the composer asks
+own commands (`/commands`, `/compact`, `/review`, `/schedule`,
+`/schedules`, `/skills`, `/unschedule`) are never looked up. `/NAME ARGS` in the composer asks
 the window, which reads the file when it is sent: a regular file of its
 own in a directory of its own, never through a link, whose target could
 be a place a workspace writes, opened without blocking, so a FIFO
@@ -6392,6 +6413,77 @@ conversation, the first 128 by name of the first 1,024 entries the
 directory gives, each with its first line that is not blank in its
 first 4 KiB, cut to 120 characters, and how many more there are; a file named as one of the composer's own commands is listed
 as never used.
+
+**As built (`/review`).** `/review`, alone or followed by one revision,
+sent from the composer is the person's command, never a message, and
+reviews that revision, HEAD by default, of the open conversation's first
+worktree with `td-agent review --repo` (§2, the review command), its
+result put into the conversation for the model to read. The revision is
+one word of at most 256 bytes of letters, digits and `._/~^@{}:-`, never
+starting with `-`, so it is never taken for an option; the window
+refuses another and keeps it in the composer, and the conversation
+process checks it again, as does the maintenance instance's argument
+parser. The window asks the process, as for a compaction (§14): `review`
+is its frame, and the process is kept from the ask until the effect
+starts and then until it ends. The process logs an effect of its own, a
+`started` record of effect `review`.
+
+First the process checks the review's cap, `review_max_cost`, against
+`max_cost_per_conversation`, and that the log has room for the review at
+the store's worst case of six bytes a byte, so a review either would
+refuse is refused before anything is staged.
+
+Only a repository workspace's prepared first worktree is reviewed: the
+workspace's repository is the jail's to write (§9), so no git outside a
+jail may read it, and the commit reaches the review as a push's does
+(§9, Pushing). A maintenance instance resolves the revision in the
+worktree and exports, as a pack, the objects reachable from it and not
+from the store's commit of the worktree's base; the pack goes in the
+conversation's own `review/` directory, which no jail can write. The
+conversation process's own git worker, given no identity and no
+credential helper, makes `review/review.git` there, bare and borrowing
+the store's objects through its alternates, and imports the pack
+strictly, refusing it unless it holds the commit the instance named. As
+a push's export, the staging is heard from only when it ends: an
+interrupt said during it stops the review before it is reserved. The
+review then reads that repository, never the workspace's: its checkout
+and tools bind each object directory the repository's alternates name,
+read-only, besides its own (§2). A plain directory workspace, none, one
+that went with its archive, a worktree not yet prepared or a base whose
+upstream commit is not yet known says so, and nothing runs or is
+reserved; `review/` is removed whatever the review came to.
+
+Staged, the process reserves the cap with the window against the day's
+limit and logs a `request` of purpose `review` for the whole review, its
+head naming the revision, the commit staged, the model and the cap,
+before it starts this program's `review` with `--repo` the staged
+repository, `--commit` the full commit id, `--model` `review_model` or
+else the conversation's model, `--max-cost` the cap exactly, the
+conversation's effort only when it is the conversation's model and that
+model takes one, and the conversation's routing when it has one. The
+review runs beside the process, which goes on hearing the window: an
+interrupt, or the window closing, kills it, as does a failure to wait on
+it. If the conversation process itself is killed, the review is not: it
+runs on to its end, bounded by its own `--max-cost`, outside the
+window's ledger. Its output is kept up to 128 KiB, the rest read and
+dropped; of its standard error, its start, for the session log line it
+prints before asking any model, and its last 2 KiB. What it spent is
+what that session log accounts (`review-log`'s `accounted_cost`): none
+when it named no log or its log holds no request, since each request's
+body is logged before it is sent; its cap when the log cannot say. The
+request is settled with that and the reservation released with it. A
+review that finished with text is logged as a `review` event (the
+request, revision, model and text) and shown in the transcript under
+"review"; it reaches the model on its next request as a user message
+after the received line, labelled td-agent's: a review of the revision
+by the model, which the person asked for, not the person's words, and
+asking nothing by itself. It starts no turn: the person's next message
+says what to do with it. The effect's `finished` says what the review
+came to, what it cost and where its session log is: a review, one that
+could not be waited on, one that wrote nothing, a failure with its
+standard error's end, an interrupt, or why it did not run; the window
+shows one that did not review under "review". The Debug view says a
+review's request is its own session log's, not this log's to rebuild.
 
 ## 16. Prior art: opencode
 
@@ -7212,7 +7304,7 @@ After these: resource limits (§8), a loopback shared by
 a conversation's instances (§19), the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
 dialect. `web_fetch`, `question`, `task`'s sub-agents, schedules,
-skills and the person's commands are built (§3, §12, §15).
+skills, the person's commands and `/review` are built (§3, §12, §15).
 
 ## 19. Open questions
 

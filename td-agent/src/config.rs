@@ -83,6 +83,11 @@ pub struct Client {
     /// The model that writes a compaction's summary; the conversation's
     /// own when none.
     pub compact_model: Option<String>,
+    /// The model a `/review` runs on (DESIGN.md §15, `/review`); the
+    /// conversation's own when none.
+    pub review_model: Option<String>,
+    /// The most one `/review` may spend, its whole run.
+    pub review_max_cost: u64,
     /// How long, in seconds, a provider's prompt cache is taken to last
     /// (DESIGN.md §14).
     pub cache_ttl: u64,
@@ -298,6 +303,8 @@ impl Default for Client {
             compact_at: DEFAULT_COMPACT_AT,
             compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
             compact_model: None,
+            review_model: None,
+            review_max_cost: DEFAULT_REVIEW_MAX_COST,
             cache_ttl: DEFAULT_CACHE_TTL,
             cold_resume_tokens: Some(DEFAULT_COLD_RESUME_TOKENS),
             background_output_bytes: DEFAULT_BACKGROUND_OUTPUT_BYTES,
@@ -505,6 +512,11 @@ impl Client {
                 "compact_model".into(),
                 self.compact_model.clone().map_or(Json::Null, Json::Str),
             ),
+            (
+                "review_model".into(),
+                self.review_model.clone().map_or(Json::Null, Json::Str),
+            ),
+            ("review_max_cost".into(), Json::from(self.review_max_cost)),
             ("cache_ttl".into(), Json::from(self.cache_ttl)),
             (
                 "cold_resume_tokens".into(),
@@ -629,6 +641,20 @@ impl Client {
                     "compact_model",
                     id.as_str().ok_or("compact_model is not text")?,
                 )?),
+            },
+            review_model: match value.get("review_model") {
+                None | Some(Json::Null) => None,
+                Some(id) => Some(model_id(
+                    "review_model",
+                    id.as_str().ok_or("review_model is not text")?,
+                )?),
+            },
+            review_max_cost: match value.get("review_max_cost") {
+                None => DEFAULT_REVIEW_MAX_COST,
+                Some(n) => n
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or("review_max_cost is out of range")?,
             },
             cache_ttl: match value.get("cache_ttl") {
                 None => DEFAULT_CACHE_TTL,
@@ -808,6 +834,8 @@ const JEV_THRESHOLD_SHIPPED: u16 = 775;
 /// `compact_keep_tokens`'s default, and what it may be.
 const DEFAULT_COMPACT_KEEP_TOKENS: u64 = 20_000;
 const COMPACT_KEEP_TOKENS: std::ops::RangeInclusive<u64> = 1_000..=1_000_000;
+/// `review_max_cost`'s default: one credit, the cap the person chose.
+const DEFAULT_REVIEW_MAX_COST: u64 = cost::ONE;
 /// `cache_ttl`'s default, Anthropic's ephemeral cache's lifetime, and
 /// what it may be: 0 takes every resumption as cold.
 const DEFAULT_CACHE_TTL: u64 = 300;
@@ -969,6 +997,8 @@ const KEYS: &[(&str, Use)] = &[
     ("compact_at", Use::Read),
     ("compact_keep_tokens", Use::Read),
     ("compact_model", Use::Read),
+    ("review_model", Use::Read),
+    ("review_max_cost", Use::Read),
     ("cache_ttl", Use::Read),
     ("cold_resume_tokens", Use::Read),
 ];
@@ -1802,6 +1832,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
     {
         config.client.compact_model = Some(model_id("compact_model", id)?);
     }
+    if let Some(id) = table
+        .optional_str("review_model")
+        .map_err(|e| e.to_string())?
+    {
+        config.client.review_model = Some(model_id("review_model", id)?);
+    }
+    if let Some(value) = table.get("review_max_cost") {
+        config.client.review_max_cost = limit("review_max_cost", value)?
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                format!("`review_max_cost` is a number of credits above zero; not {value:?}")
+            })?;
+    }
     if let Some(value) = table.get("cache_ttl") {
         config.client.cache_ttl = match value {
             Toml::Int(n) => u64::try_from(*n).ok(),
@@ -2110,6 +2153,37 @@ mod tests {
             Client::from_json(&value).unwrap_err(),
             "jev_threshold is not a whole number"
         );
+    }
+
+    #[test]
+    fn a_review_has_its_own_model_and_cap() {
+        let default = Config::default().client;
+        assert_eq!(default.review_model, None);
+        assert_eq!(default.review_max_cost, cost::ONE);
+        let client = parse("review_model = \"a/reviewer\"\nreview_max_cost = 0.25\n")
+            .unwrap()
+            .client;
+        assert_eq!(client.review_model.as_deref(), Some("a/reviewer"));
+        assert_eq!(client.review_max_cost, cost::ONE / 4);
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        assert_eq!(
+            parse("review_max_cost = 2").unwrap().client.review_max_cost,
+            2 * cost::ONE
+        );
+        for refused in [
+            "review_max_cost = 0",
+            "review_max_cost = \"none\"",
+            "review_max_cost = -1",
+            "review_model = \"a b\"",
+        ] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
+        // An older client's, without the keys, takes the defaults.
+        let mut json = default.to_json();
+        if let Json::Obj(members) = &mut json {
+            members.retain(|(k, _)| k != "review_model" && k != "review_max_cost");
+        }
+        assert_eq!(Client::from_json(&json).unwrap(), default);
     }
 
     #[test]

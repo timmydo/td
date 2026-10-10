@@ -104,6 +104,9 @@ pub enum Down {
     /// The human asked to compact the conversation (DESIGN.md §14), with
     /// what the summary should keep in particular.
     Compact { focus: Option<String> },
+    /// The human asked for a review of `revision` of the workspace
+    /// (DESIGN.md §15, `/review`).
+    Review { revision: String },
     /// The human killed background process `number` (DESIGN.md §12):
     /// acted on as soon as it is heard, a turn under way or not.
     Kill { number: u64 },
@@ -821,6 +824,10 @@ impl Down {
                     .map(|f| ("focus".into(), Json::Str(f.clone())))
                     .collect(),
             ),
+            Self::Review { revision } => typed(
+                "review",
+                vec![("revision".into(), Json::Str(revision.clone()))],
+            ),
             Self::Kill { number } => typed("kill", vec![("number".into(), Json::from(*number))]),
             Self::Policy {
                 version,
@@ -1052,6 +1059,13 @@ impl Down {
                     .ok_or("no paused")?,
             }),
             Some("clear_todo") => Ok(Self::ClearTodo),
+            Some("review") => Ok(Self::Review {
+                revision: value
+                    .get("revision")
+                    .and_then(Json::as_str)
+                    .ok_or("no revision")?
+                    .to_string(),
+            }),
             Some("compact") => Ok(Self::Compact {
                 focus: value
                     .get("focus")
@@ -2160,6 +2174,9 @@ mod tests {
             },
             Down::Compact {
                 focus: Some("the failing test".into()),
+            },
+            Down::Review {
+                revision: "HEAD~1".into(),
             },
             Down::Kill { number: 3 },
             Down::Policy {
