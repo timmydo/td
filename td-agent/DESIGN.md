@@ -393,6 +393,32 @@ reservation. This does not imply the provider never received the request.
 An abrupt termination or failed log write can leave an unresolved attempt;
 a terminal run failure alone does not supply an attempt duration.
 Missing transport records or timing samples produce null, not zero.
+
+Metrics version 2 adds per-request diagnostics (at most 64 rows, with an
+omitted-row count): message/content bytes by role, opaque reasoning and
+call bytes, serialized context size, shared serialized prefix, routing
+policy/session id, cache policy, admission/reservation, served provider and
+reported usage. Shared prefix bytes exclude generation/routing options;
+they are a serialization proxy, not a tokenizer or proof of caching.
+Observed provider switches count changes between known served providers;
+missing provider identity remains unknown. Completion records retain the
+last non-null raw usage object; response chunks retain every original one.
+Retries reset served identity/usage before the next attempt.
+
+Token aggregates use non-null raw usage when available and report sample
+counts per field; partial coverage is visible. Cache read/write fields
+omitted by the provider stay null, while explicit zero stays zero. Older
+normalized cache zeros are ambiguous and excluded; positive older counts
+remain usable. The compact diagnostics select known numeric usage fields,
+not arbitrary provider payloads; the full trace preserves all fields.
+Malformed or non-text request bodies, and legacy bodies without messages,
+are marked analysis unavailable; other metrics remain usable. Outer record
+JSON/sequence validation still applies. Normalized legacy zeros bearing the
+defaulting flag are excluded for every token field. Known normalized counts
+also populate legacy diagnostic rows. `provider_cost_usd` is the raw numeric
+provider cost in dollars; `normalized_cost_pico` and accounting use
+pico-dollars. Reasoning/call fields count serialized non-null payload bytes.
+
 Invalid response hex, non-integer retry waits and status values outside
 the writer's u16 range are refused; nonstandard codes such as 999 are
 retained. These are harness observations, not provider billing or

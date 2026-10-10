@@ -135,6 +135,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
     let mut sequence = 0u64;
     let mut requests = 0u64;
     let mut transport = Transport::default();
+    let mut analysis = crate::review_analysis::Analysis::default();
     let mut tools = 0u64;
     let mut repeated = 0u64;
     let mut shortened = 0u64;
@@ -192,6 +193,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             .ok_or("review trace has no kind")?;
         let data = event.get("data").ok_or("review trace has no data")?;
         transport.event(kind, data, event.get("elapsed_ms").and_then(Json::as_u64))?;
+        analysis.event(kind, data)?;
         let count = |key| data.get(key).and_then(Json::as_u64).unwrap_or(0);
         match kind {
             "start" if data.get("version").and_then(Json::as_u64) != Some(1) => {
@@ -241,24 +243,26 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
                 visible = visible.saturating_add(count("model_visible_bytes"));
             }
             "completion" => {
-                if let Some(usage) = data.get("usage") {
+                let usage = data.get("usage");
+                if let Some(usage) = usage {
                     if let Some(cost) = usage.get("cost").and_then(Json::as_u64) {
                         reported = reported.saturating_add(cost);
                         cost_reports = cost_reports.saturating_add(1);
                     }
-                    for ((slot, reports), name) in
-                        tokens.iter_mut().zip(token_reports.iter_mut()).zip([
-                            "prompt_tokens",
-                            "completion_tokens",
-                            "reasoning_tokens",
-                            "cached_tokens",
-                            "cache_write_tokens",
-                        ])
-                    {
-                        if let Some(n) = usage.get(name).and_then(Json::as_u64) {
-                            *slot = slot.saturating_add(n);
-                            *reports = reports.saturating_add(1);
-                        }
+                }
+                for ((slot, reports), name) in
+                    tokens.iter_mut().zip(token_reports.iter_mut()).zip([
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "reasoning_tokens",
+                        "cached_tokens",
+                        "cache_write_tokens",
+                    ])
+                {
+                    let n = crate::review_analysis::reported_tokens(data, name);
+                    if let Some(n) = n {
+                        *slot = slot.saturating_add(n);
+                        *reports = reports.saturating_add(1);
                     }
                 }
             }
@@ -283,7 +287,18 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             .and_then(Json::as_bool)
             == Some(true);
     Ok(Json::Obj(vec![
-        ("metrics_version".into(), Json::from(1u64)),
+        ("metrics_version".into(), Json::from(2u64)),
+        ("diagnostics".into(), analysis.json()),
+        (
+            "token_report_counts".into(),
+            Json::Obj(
+                ["prompt", "completion", "reasoning", "cached", "cache_write"]
+                    .into_iter()
+                    .zip(token_reports)
+                    .map(|(k, n)| (k.into(), Json::from(n)))
+                    .collect(),
+            ),
+        ),
         ("records".into(), Json::from(sequence)),
         ("complete".into(), Json::Bool(complete)),
         ("partial_tail".into(), Json::Bool(partial)),
@@ -574,5 +589,92 @@ mod tests {
             Some(42)
         );
         assert_eq!(pending.get("complete").and_then(Json::as_bool), Some(false));
+    }
+    #[test]
+    fn raw_usage_distinguishes_omitted_cache_fields_from_reported_zero() {
+        let input = trace(&[
+            (0, "request_body", Json::Str(r#"{"model":"m","messages":[{"role":"user","content":"diff"}]}"#.into())),
+            (1, "completion", td_json::parse(r#"{"provider":"P","raw_usage":{"prompt_tokens":10},"usage":{"prompt_tokens":10,"cached_tokens":0,"cache_write_tokens":0}}"#).unwrap()),
+            (2, "request_body", Json::Str(r#"{"model":"m","messages":[{"role":"user","content":"diff"},{"role":"assistant","content":"inspect"}]}"#.into())),
+            (3, "completion", td_json::parse(r#"{"provider":"Q","raw_usage":{"prompt_tokens":20,"prompt_tokens_details":{"cached_tokens":0}},"usage":{"prompt_tokens":20,"cached_tokens":0,"cache_write_tokens":0}}"#).unwrap()),
+        ]);
+        let result = summarize(input.as_bytes()).unwrap();
+        assert_eq!(
+            result.get_path(&["token_report_counts", "cached"]),
+            Some(&Json::from(1u64))
+        );
+        assert_eq!(
+            result.get_path(&["tokens", "cache_write"]),
+            Some(&Json::Null)
+        );
+        assert_eq!(
+            result.get_path(&["diagnostics", "observed_provider_switches"]),
+            Some(&Json::from(1u64))
+        );
+    }
+    #[test]
+    fn partial_raw_usage_and_legacy_cache_zeros_remain_distinct() {
+        let input = trace(&[
+            (
+                0,
+                "completion",
+                td_json::parse(r#"{"usage":{"cached_tokens":0,"cache_write_tokens":0}}"#).unwrap(),
+            ),
+            (
+                1,
+                "completion",
+                td_json::parse(r#"{"raw_usage":{"prompt_tokens_details":{"cached_tokens":0}}}"#)
+                    .unwrap(),
+            ),
+        ]);
+        let result = summarize(input.as_bytes()).unwrap();
+        assert_eq!(
+            result.get_path(&["token_report_counts", "cached"]),
+            Some(&Json::from(1u64))
+        );
+        assert_eq!(
+            result.get_path(&["tokens", "cached"]),
+            Some(&Json::from(0u64))
+        );
+        assert_eq!(
+            result.get_path(&["tokens", "cache_write"]),
+            Some(&Json::Null)
+        );
+    }
+    #[test]
+    fn null_raw_usage_uses_unambiguous_normalized_counts() {
+        let input=trace(&[(0,"completion",td_json::parse(r#"{"raw_usage":null,"usage":{"prompt_tokens":7,"completion_tokens":3,"cached_tokens":0,"cache_write_tokens":20}}"#).unwrap())]);
+        let result = summarize(input.as_bytes()).unwrap();
+        assert_eq!(
+            result.get_path(&["tokens", "prompt"]),
+            Some(&Json::from(7u64))
+        );
+        assert_eq!(result.get_path(&["tokens", "cached"]), Some(&Json::Null));
+        assert_eq!(
+            result.get_path(&["tokens", "cache_write"]),
+            Some(&Json::from(20u64))
+        );
+    }
+    #[test]
+    fn unavailable_body_diagnostics_preserve_cost_and_legacy_unknown_tokens() {
+        for body in [Json::Str("not json".into()), Json::Null, Json::Obj(vec![])] {
+            let input=trace(&[(0,"request_body",body),(1,"completion",td_json::parse(r#"{"usage":{"cost":7,"prompt_tokens":0,"reasoning_tokens":0,"missing_token_counts_default_to_zero":true}}"#).unwrap())]);
+            let result = summarize(input.as_bytes()).unwrap();
+            assert_eq!(result.get("reported_cost"), Some(&Json::from(7u64)));
+            assert_eq!(result.get_path(&["tokens", "prompt"]), Some(&Json::Null));
+            assert_eq!(result.get_path(&["tokens", "reasoning"]), Some(&Json::Null));
+            let row = result
+                .get_path(&["diagnostics", "requests"])
+                .unwrap()
+                .as_arr()
+                .unwrap()
+                .first()
+                .unwrap();
+            assert_eq!(row.get("analysis_unavailable"), Some(&Json::Bool(true)));
+            assert_eq!(
+                row.get_path(&["reported_usage", "normalized_cost_pico"]),
+                Some(&Json::from(7u64))
+            );
+        }
     }
 }

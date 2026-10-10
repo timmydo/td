@@ -416,15 +416,19 @@ pub fn head(plan: &Plan, client: &Client) -> String {
 }
 
 /// Who served a reply, as its chunks name them.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Served {
     pub model: Option<String>,
     pub provider: Option<String>,
+    pub raw_usage: Option<Json>,
 }
 
 impl Served {
     /// Takes `model` and `provider` from a reply's JSON, once each.
     fn note(&mut self, value: &Json) {
+        if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+            self.raw_usage = Some(usage.clone());
+        }
         let text = |key: &str| value.get(key).and_then(Json::as_str).map(str::to_string);
         if self.model.is_none() {
             self.model = text("model");
@@ -506,17 +510,12 @@ where
     }
     let mut reader = sse::Reader::new(sse::MAX_EVENT, client::MAX_STREAM);
     let mut reply = Assembly::default();
-    // The first event that names its generation names who served it.
-    let mut looked = false;
     for chunk in chunks {
         let chunk = chunk.map_err(|e| Ended::Failed(format!("the stream broke: {e}")))?;
         let fed = reader.feed(&chunk, &mut |event| match event {
             sse::Event::Data(text) => {
-                if !looked {
-                    if let Ok(value) = td_json::parse(text) {
-                        served.note(&value);
-                        looked = value.get("id").is_some();
-                    }
+                if let Ok(value) = td_json::parse(text) {
+                    served.note(&value);
                 }
                 reply.event(text)
             }
@@ -838,6 +837,7 @@ pub(crate) fn request(
                         journal.event("retry_wait_ms", Json::from(wait.as_millis() as u64))?;
                         std::thread::sleep(wait);
                         attempt += 1;
+                        served = Served::default();
                     }
                     None => {
                         return Err(ended.text().to_string());
@@ -860,6 +860,10 @@ pub(crate) fn request(
             (
                 "reasoning_details".into(),
                 completion.details.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "raw_usage".into(),
+                served.raw_usage.clone().unwrap_or(Json::Null),
             ),
             ("finish".into(), Json::Str(completion.finish.clone())),
             (
@@ -1163,6 +1167,14 @@ mod tests {
         assert!(whole(&completion).is_ok());
         assert_eq!(served.model.as_deref(), Some("google/gemini-3.8-flash"));
         assert_eq!(served.provider.as_deref(), Some("Google"));
+        assert_eq!(
+            served
+                .raw_usage
+                .as_ref()
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(Json::as_u64),
+            Some(7)
+        );
         let said = spent(&completion, &served, 5);
         assert!(
             said.contains("served by google/gemini-3.8-flash through Google")

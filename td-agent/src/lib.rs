@@ -69,6 +69,7 @@ pub mod proxy;
 pub mod removal;
 pub mod repo;
 pub mod review;
+mod review_analysis;
 pub(crate) mod review_controls;
 pub(crate) mod review_environment;
 pub mod review_log;

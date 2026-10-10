@@ -1229,3 +1229,54 @@ fn commit_controlled_preflight_details_are_quoted_outside_the_system_prompt() {
     assert!(logs[0].contains("path dependency #blocked unavailable"));
     fixture.no_workspaces();
 }
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn retry_identity_and_raw_usage_belong_to_the_successful_attempt() {
+    let fixture = Fixture::new();
+    let limited=Reply::Http {status:429,headers:vec![("content-type".into(),"application/json".into()),("retry-after".into(),"0".into())],body:br#"{"provider":"Rejected provider","model":"rejected/model","usage":{"prompt_tokens_details":{"cached_tokens":999}},"error":{"message":"retry"}}"#.to_vec()};
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), limited, fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let logs = fixture.logs();
+    let events: Vec<Json> = logs[0]
+        .lines()
+        .map(|s| td_json::parse(s).unwrap())
+        .collect();
+    let completion = events
+        .iter()
+        .find(|e| e.get("kind").and_then(Json::as_str) == Some("completion"))
+        .unwrap()
+        .get("data")
+        .unwrap();
+    assert_eq!(
+        completion.get("provider").and_then(Json::as_str),
+        Some("Offline fixture")
+    );
+    assert_eq!(
+        completion
+            .get_path(&["raw_usage", "prompt_tokens"])
+            .and_then(Json::as_u64),
+        Some(100)
+    );
+    let summary = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(summary.get_path(&["tokens", "cached"]), Some(&Json::Null));
+    let rows = summary
+        .get_path(&["diagnostics", "requests"])
+        .unwrap()
+        .as_arr()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("served_provider").and_then(Json::as_str),
+        Some("Offline fixture")
+    );
+    fixture.no_workspaces();
+}
