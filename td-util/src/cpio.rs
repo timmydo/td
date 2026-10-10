@@ -63,11 +63,21 @@ pub fn members(archive: &[u8]) -> Result<Vec<Member<'_>>, String> {
         let size = field(6)? as usize;
         let namesize = field(11)? as usize;
         let name_start = at + HEADER;
-        let name = archive
-            .get(name_start..name_start + namesize.saturating_sub(1))
-            .ok_or_else(|| format!("truncated name at offset {at}"))?;
+        // The whole name field, NUL included, as newc requires: a stream cut
+        // inside the trailer's name or its terminator is not a whole archive.
+        let (nul, name) = archive
+            .get(name_start..name_start + namesize)
+            .ok_or_else(|| format!("truncated name at offset {at}"))?
+            .split_last()
+            .ok_or_else(|| format!("empty name at offset {at}"))?;
+        if *nul != 0 {
+            return Err(format!("name at offset {at} lacks its NUL"));
+        }
         let data_start = align4(name_start + namesize);
         if name == TRAILER {
+            if archive.len() < data_start {
+                return Err(format!("truncated trailer padding at offset {at}"));
+            }
             return Ok(out);
         }
         let data = archive
@@ -479,6 +489,26 @@ mod tests {
         assert_eq!(m[1].mtime, 7);
         assert!(members(&a[..a.len() - 20]).is_err());
         assert!(members(b"070707junk").is_err());
+    }
+
+    /// The trailer is the last record and is held to its whole length: a cut
+    /// in its padding, its NUL or its name is a truncated archive, and a name
+    /// whose terminator is not NUL is malformed.
+    #[test]
+    fn a_trailer_cut_short_or_a_name_without_its_nul_is_refused() {
+        let a = archive(&[("init", S_IFREG | 0o755, b"x")]);
+        assert!(members(&a).is_ok());
+        for cut in 1..=4 {
+            assert!(members(&a[..a.len() - cut]).is_err(), "cut {cut} accepted");
+        }
+        let mut bad = a.clone();
+        let nul = HEADER + "init".len();
+        assert_eq!(bad[nul], 0);
+        bad[nul] = b'x';
+        assert!(
+            members(&bad).is_err(),
+            "a name without its NUL was accepted"
+        );
     }
 
     #[test]
