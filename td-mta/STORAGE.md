@@ -1395,8 +1395,9 @@ no service activation. Connection destruction retains its existing
 synchronous cleanup limits. Authorization, stopped service activity,
 resource admission, backup selection, digest/domain verification and
 compatible configuration/credentials remain caller responsibilities.
-Online backup, restore, repair and history maintenance tools remain
-unimplemented. Offline selected-account verification is implemented below. SQLite integrity checks
+Online backup, repair and history maintenance tools remain unimplemented.
+Offline verification, database backup and fresh-epoch restore are implemented
+below. SQLite integrity checks
 do not replace digest and domain validation.
 
 ### Disposable ingress staging
@@ -2241,8 +2242,8 @@ database copy's publication, not physical/domain/digest verification. The copy
 includes all accounts' database metadata, history and bodies; it can preserve
 corruption. It excludes service configuration, credentials and disposable
 spools. It preserves the source epoch for offline inspection. Restoring it for
-service requires a separately implemented fresh-epoch restore; no restore or
-serving command is enabled by this increment.
+service requires a fresh epoch and separate activation policy. The restore
+command below prepares that database identity without starting service.
 
 Failures have fixed `stage`, adapter `error`, and `publication`. `unpublished`
 means this invocation did not attempt final-name publication; it can still
@@ -2264,3 +2265,81 @@ permissions, identical roots and invalid/non-UTF-8 arguments. A damaged digest
 survives a successful copy and fails subsequent verification, pinning the
 receipt's limited claim. Existing primitive tests own publication-fault and
 process-death evidence; the CLI adds no fault hook or resource matrix.
+
+
+## Offline database restore command
+
+`td-mta restore --root PATH --destination PATH [--timeout-seconds N]`
+prepares a restored database in an existing fresh private destination root.
+Run stopped under the same administrator, dedicated-owner and stable-path
+rules as backup and verification. Both roots remain cooperatively locked
+through all stages and native cleanup, before historical JSON output. It
+uses the same strict copy arguments, default 600-second checked timeout and
+one RuntimeClock/absolute deadline. Neither root directory is created, no
+existing destination storage file is overwritten, and failure never triggers
+automatic deletion or permission to activate the copy.
+
+First the consuming backup primitive checkpoints/closes the source and
+publishes its database without replacement. The command opens the destination
+and runs the same whole-database physical and current metadata/body checks as
+`store verify --all`, reusing one 64 KiB scratch buffer. All accounts must
+complete and the verified copy epoch must equal the backup receipt epoch.
+A digest failure stops before entropy or epoch replacement; the inspectable
+copy retains its original identity. Verification covers the stated current
+passes, not retained-history replay or separate configuration/credentials.
+
+After successful verification, `SystemEntropy::try_new` warms its native path
+on the command thread; consuming `renew_epoch` uses that same thread-local
+handle for one 16-byte candidate. There is no weak fallback or equal-candidate
+retry. The existing durable commit classifier distinguishes rejected and
+indeterminate epoch changes. Only known success proceeds to a checkpoint
+under the original deadline. Connection destruction retains its synchronous
+cleanup limits. Entropy warmup/fill, recovery, sync and kernel I/O may block or
+abort under the existing provider/storage contracts; the option is not a
+forcible wall-time guarantee. An epoch commit known durable after the deadline
+can be followed by checkpoint refusal, still without a completed command.
+
+Success emits one schema-1 JSON line with `command: "restore"`, `status: "ok"`,
+`scope: "database"`, canonical copied `source_epoch`, fresh destination `epoch`,
+`copied_bytes`, `physical_integrity: true`, `checked_at_ms`, and the same checked
+aggregate counts as whole-database verification. Counts and timestamp describe
+the completed copy verification under `source_epoch`; epoch renewal changes
+only the epoch and preserves account endpoints, floors, data and history.
+`copied_bytes` is the original backup receipt length, not a new final-file
+extent measurement. `service_ready: false` is explicit: restore does not start
+service or reconcile external delivery outcomes from an older snapshot. The
+operator must settle those outcomes and supply compatible service configuration
+and credentials before a future service activation. Source logical data and
+epoch remain unchanged; opening/checkpointing can still alter its sidecars.
+
+Failure emits fixed `stage` and `error`, plus invocation `progress`:
+
+- `unpublished`: this invocation did not attempt final-name copy publication;
+  pre-existing files and an owned partial may still exist.
+- `copy-uncertain`: copy publication was attempted but completion is unproven.
+- `copied`: durable copy completed; destination open, verification, entropy
+  warmup or a rejected epoch change failed before a known epoch replacement.
+- `epoch-uncertain`: the epoch commit result is indeterminate; reopen while
+  stopped to inspect persisted state, never infer it from this error.
+- `epoch-renewed`: fresh epoch commit succeeded, but checkpoint failed.
+
+These labels describe this invocation's progress, not absence or ownership of
+all destination artifacts. No failure line includes partial success counts,
+paths or message text. Copy/root/lock stages retain backup's fixed codes;
+destination opening uses `destination-open`, verification retains its existing
+stages/codes, entropy warmup uses `entropy`, renewal uses `epoch` and the final
+checkpoint uses `checkpoint`. Exit zero means completed database preparation,
+one means operational/output failure, and two means invalid usage. Missing
+success output can follow a completed restore; it never authorizes deletion or
+service activation. Interrupted or failed copies remain for explicit offline
+inspection; automatic resume over existing artifacts is not implemented.
+
+Three real-process cases exercise actual warmed entropy and persisted fresh
+epochs across two independent restores; both accounts retain shared IDs,
+complete body digests, sequence/floor and counts, while the source keeps its
+old epoch. They also cover no replacement, later-account digest failure with
+an inspectable original-epoch copy, corrupt source headers, invalid/non-UTF-8
+arguments, both lock roles, root policy and identical roots. Sample epoch
+inequality is a wiring check, not entropy-quality evidence. Existing core
+publication and epoch fault/process-death tests own those unchanged boundaries;
+this command does not add arbitrary native-fault or resource qualification.

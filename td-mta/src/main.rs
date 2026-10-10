@@ -1,4 +1,4 @@
-//! Offline account verification, database backup and packaging entry point.
+//! Offline verification, database backup/restore and packaging entry point.
 #![forbid(unsafe_code)]
 
 use std::{
@@ -20,7 +20,7 @@ use td_mta::{
     },
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nNo repair, restore or serving commands are available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nNo repair or serving commands are available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -59,7 +59,7 @@ fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Verif
     })
 }
 
-struct Backup {
+struct CopyOptions {
     root: String,
     destination: String,
     timeout_ms: u64,
@@ -76,7 +76,7 @@ fn timeout_ms(value: &str) -> Option<u64> {
     seconds.checked_mul(1000)
 }
 
-fn backup_arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Backup> {
+fn copy_arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<CopyOptions> {
     let mut root = None;
     let mut destination = None;
     let mut timeout = None;
@@ -89,7 +89,7 @@ fn backup_arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Optio
             _ => return None,
         }
     }
-    Some(Backup {
+    Some(CopyOptions {
         root: root?,
         destination: destination?,
         timeout_ms: timeout.unwrap_or(600_000),
@@ -173,7 +173,7 @@ impl From<Failure> for BackupFailure {
     }
 }
 
-fn backup(options: Backup) -> Result<BackupReceipt, BackupFailure> {
+fn backup(options: CopyOptions) -> Result<BackupReceipt, BackupFailure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     let deadline = scope(clock.as_ref(), options.timeout_ms)?;
     let mut source = locked_root(&options.root, "source-root", "source-lock")?;
@@ -199,6 +199,84 @@ fn backup_failure(output: &mut impl Write, error: BackupFailure) -> io::Result<(
     writeln!(output, "{{\"schema\":1,\"command\":\"backup\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"publication\":\"{}\"}}", error.failure.stage, error.failure.code, error.publication)
 }
 
+struct RestoreReceipt {
+    copy: BackupReceipt,
+    epoch: StoreEpoch,
+    checks: DatabaseChecks,
+}
+
+struct RestoreFailure {
+    failure: Failure,
+    progress: &'static str,
+}
+impl From<Failure> for RestoreFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            progress: "unpublished",
+        }
+    }
+}
+
+fn restore(options: CopyOptions) -> Result<RestoreReceipt, RestoreFailure> {
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let deadline = scope(clock.as_ref(), options.timeout_ms)?;
+    let mut source = locked_root(&options.root, "source-root", "source-lock")?;
+    let mut destination =
+        locked_root(&options.destination, "destination-root", "destination-lock")?;
+    let store = IndexStore::open(&mut source, Arc::clone(&clock), 1, deadline)
+        .map_err(|error| adapter("source-open", error))?;
+    let mut scratch = [0; 65536];
+    let copy = store
+        .backup(&mut destination, deadline, &mut scratch)
+        .map_err(|error| match error {
+            BackupError::Unpublished(error) => RestoreFailure {
+                failure: adapter("copy", error),
+                progress: "unpublished",
+            },
+            BackupError::IncompletePublication(error) => RestoreFailure {
+                failure: adapter("publication", error),
+                progress: "copy-uncertain",
+            },
+        })?;
+    let copied = |failure| RestoreFailure {
+        failure,
+        progress: "copied",
+    };
+    let store = IndexStore::open(&mut destination, Arc::clone(&clock), 1, deadline)
+        .map_err(|error| copied(adapter("destination-open", error)))?;
+    let checks = check_database(&store, clock.as_ref(), deadline, &mut scratch).map_err(copied)?;
+    if checks.epoch != copy.epoch {
+        return Err(copied(adapter("reports", ports::Error::Corrupt)));
+    }
+    let mut entropy = td_crypto::SystemEntropy::try_new()
+        .map_err(|error| copied(adapter("entropy", error.into())))?;
+    let store = store
+        .renew_epoch(&mut entropy, deadline)
+        .map_err(|error| match error {
+            ports::CommitFailure::Rejected(error) => copied(adapter("epoch", error)),
+            ports::CommitFailure::Indeterminate(error) => RestoreFailure {
+                failure: adapter("epoch", error),
+                progress: "epoch-uncertain",
+            },
+        })?;
+    let epoch = store.epoch();
+    store.checkpoint(deadline).map_err(|error| RestoreFailure {
+        failure: adapter("checkpoint", error),
+        progress: "epoch-renewed",
+    })?;
+    drop(store);
+    Ok(RestoreReceipt {
+        copy,
+        epoch,
+        checks,
+    })
+}
+
+fn restore_failure(output: &mut impl Write, error: RestoreFailure) -> io::Result<()> {
+    writeln!(output, "{{\"schema\":1,\"command\":\"restore\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"progress\":\"{}\"}}", error.failure.stage, error.failure.code, error.progress)
+}
+
 fn verify(options: Verify) -> Result<Verification, Failure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     verify_with_clock(options, clock)
@@ -209,42 +287,54 @@ fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<Verificat
     let mut root = locked_root(&options.root, "root", "lock")?;
     let store = IndexStore::open(&mut root, Arc::clone(&clock), 1, deadline)
         .map_err(|error| adapter("open", error))?;
-    store
-        .validate_integrity(deadline)
-        .map_err(|error| adapter("physical", error))?;
     let mut scratch = [0; 65536];
     match options.selection {
         Selection::Account(account) => {
+            physical(&store, deadline)?;
             check_account(&store, account, clock.as_ref(), deadline, &mut scratch)
                 .map(|report| Verification::Account(Box::new(report)))
         }
-        Selection::All => {
-            let accounts = store
-                .account_ids(deadline)
-                .map_err(|error| adapter("accounts", error))?;
-            let mut report = DatabaseChecks {
-                epoch: store.epoch(),
-                checked_at_ms: 0,
-                accounts: 0,
-                metadata_rows: 0,
-                mailboxes: 0,
-                submissions: 0,
-                recipients: 0,
-                blobs: 0,
-                body_bytes: 0,
-            };
-            for account in accounts {
-                let checked =
-                    check_account(&store, account, clock.as_ref(), deadline, &mut scratch)?;
-                report.add(checked)?;
-            }
-            report.checked_at_ms = clock
-                .sample()
-                .map_err(|error| adapter("clock", error))?
-                .utc_ms;
-            Ok(Verification::Database(report))
-        }
+        Selection::All => check_database(&store, clock.as_ref(), deadline, &mut scratch)
+            .map(Verification::Database),
     }
+}
+
+fn physical(store: &IndexStore<'_>, deadline: Deadline) -> Result<(), Failure> {
+    store
+        .validate_integrity(deadline)
+        .map_err(|error| adapter("physical", error))
+}
+
+fn check_database(
+    store: &IndexStore<'_>,
+    clock: &dyn Clock,
+    deadline: Deadline,
+    scratch: &mut [u8; 65536],
+) -> Result<DatabaseChecks, Failure> {
+    physical(store, deadline)?;
+    let accounts = store
+        .account_ids(deadline)
+        .map_err(|error| adapter("accounts", error))?;
+    let mut report = DatabaseChecks {
+        epoch: store.epoch(),
+        checked_at_ms: 0,
+        accounts: 0,
+        metadata_rows: 0,
+        mailboxes: 0,
+        submissions: 0,
+        recipients: 0,
+        blobs: 0,
+        body_bytes: 0,
+    };
+    for account in accounts {
+        let checked = check_account(store, account, clock, deadline, scratch)?;
+        report.add(checked)?;
+    }
+    report.checked_at_ms = clock
+        .sample()
+        .map_err(|error| adapter("clock", error))?
+        .utc_ms;
+    Ok(report)
 }
 
 enum Verification {
@@ -337,8 +427,33 @@ fn run() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let first = args.next();
+    if first.as_deref() == Some(OsStr::new("restore")) {
+        let Some(options) = copy_arguments(args) else {
+            restore_failure(
+                &mut io::stdout().lock(),
+                Failure {
+                    stage: "arguments",
+                    code: "invalid-arguments",
+                }
+                .into(),
+            )?;
+            return Ok(ExitCode::from(2));
+        };
+        return match restore(options) {
+            Ok(receipt) => {
+                let checks = receipt.checks;
+                writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"restore\",\"status\":\"ok\",\"scope\":\"database\",\"source_epoch\":\"{}\",\"epoch\":\"{}\",\"copied_bytes\":{},\"physical_integrity\":true,\"checked_at_ms\":{},\"accounts\":{},\"metadata_rows\":{},\"mailboxes\":{},\"submissions\":{},\"recipients\":{},\"blobs\":{},\"body_bytes\":{},\"service_ready\":false}}", receipt.copy.epoch, receipt.epoch, receipt.copy.bytes, checks.checked_at_ms, checks.accounts, checks.metadata_rows, checks.mailboxes, checks.submissions, checks.recipients, checks.blobs, checks.body_bytes)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let code = error.failure.exit_code();
+                restore_failure(&mut io::stdout().lock(), error)?;
+                Ok(code)
+            }
+        };
+    }
     if first.as_deref() == Some(OsStr::new("backup")) {
-        let Some(options) = backup_arguments(args) else {
+        let Some(options) = copy_arguments(args) else {
             backup_failure(
                 &mut io::stdout().lock(),
                 Failure {

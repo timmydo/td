@@ -664,3 +664,258 @@ fn whole_database_verification_accepts_empty_and_refuses_invalid_selection() {
         Some("open") | Some("physical")
     ));
 }
+
+fn restore_command(source: &Fixture, destination: &Fixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+    command
+        .args(["restore", "--root"])
+        .arg(&source.0)
+        .arg("--destination")
+        .arg(&destination.0);
+    command
+}
+
+#[test]
+fn restore_verifies_both_accounts_and_persists_a_destination_only_fresh_epoch() {
+    if private_case("restore_verifies_both_accounts_and_persists_a_destination_only_fresh_epoch") {
+        return;
+    }
+    let source = Fixture::new();
+    source.seed();
+    let destination = Fixture::new();
+    let json = report_command(
+        &restore_command(&source, &destination)
+            .args(["--timeout-seconds", "60"])
+            .output()
+            .unwrap(),
+        0,
+        "restore",
+    );
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert_eq!(json.get("scope").unwrap().as_str(), Some("database"));
+    assert_eq!(json.get("service_ready"), Some(&td_json::Json::Bool(false)));
+    assert_eq!(
+        json.get("physical_integrity"),
+        Some(&td_json::Json::Bool(true))
+    );
+    let original = StoreEpoch::from_bytes([9; 16]).to_string();
+    assert_eq!(
+        json.get("source_epoch").unwrap().as_str(),
+        Some(original.as_str())
+    );
+    let epoch = json.get("epoch").unwrap().as_str().unwrap();
+    StoreEpoch::parse(epoch).unwrap();
+    assert_ne!(epoch, original);
+    for (field, count) in [
+        ("accounts", 2),
+        ("metadata_rows", 2),
+        ("mailboxes", 0),
+        ("submissions", 0),
+        ("recipients", 0),
+        ("blobs", 2),
+        ("body_bytes", 65_596),
+    ] {
+        assert_eq!(json.get(field).unwrap().as_u64(), Some(count), "{field}");
+    }
+    assert!(json.get("copied_bytes").unwrap().as_u64().unwrap() > 0);
+    assert!(json.get("checked_at_ms").unwrap().as_u64().unwrap() > 0);
+    assert_eq!(
+        fs::metadata(destination.0.join("metadata.sqlite3"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert!(!destination
+        .0
+        .join("metadata.sqlite3.backup-partial")
+        .exists());
+    for (account, bytes) in [(ACCOUNT, 65_553), (OTHER, 43)] {
+        let copied = report(&destination.verify(account), 0);
+        assert_eq!(copied.get("epoch").unwrap().as_str(), Some(epoch));
+        assert_eq!(copied.get("body_bytes").unwrap().as_u64(), Some(bytes));
+        assert_eq!(copied.get("sequence").unwrap().as_u64(), Some(1));
+        assert_eq!(copied.get("history_floor").unwrap().as_u64(), Some(0));
+        let retained = report(&source.verify(account), 0);
+        assert_eq!(
+            retained.get("epoch").unwrap().as_str(),
+            Some(original.as_str())
+        );
+        assert_eq!(retained.get("body_bytes").unwrap().as_u64(), Some(bytes));
+        assert_eq!(retained.get("sequence").unwrap().as_u64(), Some(1));
+    }
+    let before = fs::read(destination.0.join("metadata.sqlite3")).unwrap();
+    let refused = report_command(
+        &restore_command(&source, &destination).output().unwrap(),
+        1,
+        "restore",
+    );
+    assert_eq!(refused.get("error").unwrap().as_str(), Some("conflict"));
+    assert_eq!(
+        refused.get("progress").unwrap().as_str(),
+        Some("unpublished")
+    );
+    assert_eq!(
+        fs::read(destination.0.join("metadata.sqlite3")).unwrap(),
+        before
+    );
+    let another = Fixture::new();
+    let second = report_command(
+        &restore_command(&source, &another).output().unwrap(),
+        0,
+        "restore",
+    );
+    // Sample inequality checks wiring, not entropy quality.
+    assert_ne!(second.get("epoch").unwrap().as_str(), Some(epoch));
+    assert_ne!(
+        second.get("epoch").unwrap().as_str(),
+        Some(original.as_str())
+    );
+}
+
+#[test]
+fn restore_verification_failure_keeps_an_inspectable_copy_under_its_original_epoch() {
+    if private_case(
+        "restore_verification_failure_keeps_an_inspectable_copy_under_its_original_epoch",
+    ) {
+        return;
+    }
+    let source = Fixture::new();
+    source.seed();
+    source.corrupt(OTHER_MARKER);
+    let destination = Fixture::new();
+    let failed = report_command(
+        &restore_command(&source, &destination).output().unwrap(),
+        1,
+        "restore",
+    );
+    assert_eq!(failed.get("stage").unwrap().as_str(), Some("bodies"));
+    assert_eq!(failed.get("error").unwrap().as_str(), Some("corrupt"));
+    assert_eq!(failed.get("progress").unwrap().as_str(), Some("copied"));
+    for field in [
+        "epoch",
+        "source_epoch",
+        "accounts",
+        "body_bytes",
+        "physical_integrity",
+        "service_ready",
+    ] {
+        assert!(failed.get(field).is_none(), "{field}");
+    }
+    assert_eq!(
+        fs::read(destination.0.join("metadata.sqlite3")).unwrap(),
+        fs::read(source.0.join("metadata.sqlite3")).unwrap()
+    );
+    let healthy = report(&destination.verify(ACCOUNT), 0);
+    assert_eq!(
+        healthy.get("epoch").unwrap().as_str(),
+        Some(StoreEpoch::from_bytes([9; 16]).to_string().as_str())
+    );
+    report(&destination.verify(OTHER), 1);
+    report(&source.verify(ACCOUNT), 0);
+    let broken = Fixture::new();
+    let path = source.0.join("metadata.sqlite3");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] = 0;
+    fs::write(path, bytes).unwrap();
+    let failed = report_command(
+        &restore_command(&source, &broken).output().unwrap(),
+        1,
+        "restore",
+    );
+    assert_eq!(failed.get("stage").unwrap().as_str(), Some("source-open"));
+    assert_eq!(
+        failed.get("progress").unwrap().as_str(),
+        Some("unpublished")
+    );
+    assert!(!broken.0.join("metadata.sqlite3").exists());
+}
+
+#[test]
+fn restore_refuses_bad_arguments_locks_and_root_policy_before_copying() {
+    if private_case("restore_refuses_bad_arguments_locks_and_root_policy_before_copying") {
+        return;
+    }
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    for flags in [
+        vec!["--root", "duplicate"],
+        vec!["--destination", "duplicate"],
+        vec!["--timeout-seconds", "0"],
+        vec!["--timeout-seconds", "18446744073709551615"],
+        vec!["--all"],
+    ] {
+        let failed = report_command(
+            &restore_command(&source, &destination)
+                .args(flags)
+                .output()
+                .unwrap(),
+            2,
+            "restore",
+        );
+        assert_eq!(
+            failed.get("error").unwrap().as_str(),
+            Some("invalid-arguments")
+        );
+        assert_eq!(
+            failed.get("progress").unwrap().as_str(),
+            Some("unpublished")
+        );
+        assert!(!source.0.join("LOCK").exists());
+        assert!(!destination.0.join("LOCK").exists());
+    }
+    let failed = restore_command(&source, &destination)
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .output()
+        .unwrap();
+    report_command(&failed, 2, "restore");
+    assert!(!source.0.join("LOCK").exists());
+    assert!(!destination.0.join("LOCK").exists());
+    source.seed();
+    for (root, stage) in [(&source, "source-lock"), (&destination, "destination-lock")] {
+        let held = PrivateRoot::open(root.0.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let failed = report_command(
+            &restore_command(&source, &destination).output().unwrap(),
+            1,
+            "restore",
+        );
+        assert_eq!(failed.get("stage").unwrap().as_str(), Some(stage));
+        assert_eq!(failed.get("error").unwrap().as_str(), Some("busy"));
+        assert_eq!(
+            failed.get("progress").unwrap().as_str(),
+            Some("unpublished")
+        );
+        assert!(!destination.0.join("metadata.sqlite3").exists());
+        drop(held);
+    }
+    fs::set_permissions(&destination.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed = report_command(
+        &restore_command(&source, &destination).output().unwrap(),
+        1,
+        "restore",
+    );
+    assert_eq!(
+        failed.get("stage").unwrap().as_str(),
+        Some("destination-root")
+    );
+    assert_eq!(
+        failed.get("progress").unwrap().as_str(),
+        Some("unpublished")
+    );
+    fs::set_permissions(&destination.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = fs::read(source.0.join("metadata.sqlite3")).unwrap();
+    let failed = report_command(
+        &restore_command(&source, &source).output().unwrap(),
+        1,
+        "restore",
+    );
+    assert_eq!(
+        failed.get("progress").unwrap().as_str(),
+        Some("unpublished")
+    );
+    assert_eq!(fs::read(source.0.join("metadata.sqlite3")).unwrap(), before);
+    report(&source.verify(ACCOUNT), 0);
+}

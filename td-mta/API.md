@@ -7002,8 +7002,12 @@ stored data and account endpoints/floors remain unchanged.
 
 STORAGE.md owns the original scope, entropy freshness and synchronous
 cleanup limits. This primitive grants no restore authorization,
-verification, resource admission or service activation; the operational
-restore command remains unimplemented.
+verification, resource admission or service activation. The separate stopped
+`restore` command composes durable no-replace copy, whole-database current
+metadata/body checks and fresh epoch renewal under both root locks, then
+checkpoints before completion. STORAGE.md defines its historical receipt and
+conservative progress on failure. It does not start service, reconcile
+external delivery outcomes or restore separate credentials/configuration.
 
 ### Disposable prepared ingress inputs
 

@@ -2807,7 +2807,7 @@ atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
 M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
 unavailable until their owning increment lands; M19 supplies shared CLI wiring.
-The standalone offline selected-account `store verify` and database `backup`
+The standalone offline `store verify`, database `backup` and `restore`
 commands below have landed independently and require no serving runtime or
 control socket.
 
@@ -2851,8 +2851,16 @@ reuses each account's maintenance passes sequentially under the offline root
 lock and one absolute deadline. It reports checked aggregate counts only
 after every account completes, including zero-account stores; a later-account
 failure emits no partial counts. This covers the stated current metadata/body
-checks, not retained-history replay. Repair, restore, online/configuration
+checks, not retained-history replay. Repair, online/configuration
 backup and runtime administration remain separate increments.
+The stopped database `restore --root PATH --destination PATH` command now
+composes no-replace copy, whole-database verification, one actual warmed
+SystemEntropy epoch renewal and a final checkpoint under both root locks.
+Its JSON reports copied source epoch, fresh destination epoch and completed
+current-data counts, or conservative invocation progress on failure. No
+artifact is automatically deleted. Successful restore does not start service,
+restore separate credentials/configuration or settle external SMTP outcomes.
+Repair, retained-history replay and service activation remain separate.
 
 The native offline primitives now include consuming IndexStore::backup
 and IndexStore::renew_epoch, plus bounded IndexReadView::verify_bodies
@@ -3258,8 +3266,10 @@ measurements and inputs. This portable case complements the separate
 native floor-two cleanup fixture, without qualifying that pruning path
 under portable observers.
 
-These primitives do not complete the restore command,
-selection/verification workflow or service activation.
+These primitives and installed offline database commands leave
+per-account backup/restore, retained-history replay, repair,
+configuration/credential snapshots, online consistency and service
+activation to later increments.
 
 **Acceptance:** backup while receiving and compacting, restore elsewhere, then
 verify every committed blob/reference/folder/queue record. Detect interior
