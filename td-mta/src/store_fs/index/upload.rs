@@ -419,45 +419,13 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         let planned = [self.length, 1, self.length, 0];
         let lease = self.lease.ok_or(ports::Error::Invalid)?;
         let logical_part = self.coordinator.ledger.part(lease, 0)?;
-        let database = self
-            .coordinator
-            .ledger
-            .remaining_capacity(Kind::DatabaseBytes)?;
-        let wal = self.coordinator.ledger.remaining_capacity(Kind::WalBytes)?;
-        let physical_lease = self.coordinator.ledger.reserve(
-            &[[
-                Charge {
-                    kind: Kind::DatabaseBytes,
-                    amount: database,
-                },
-                Charge {
-                    kind: Kind::WalBytes,
-                    amount: wal,
-                },
-                Charge::ZERO,
-                Charge::ZERO,
-            ]],
+        let (physical_lease, mut physical_ticket) = reserve_physical(
+            &mut self.coordinator.ledger,
+            &mut self.coordinator.stopped,
+            &mut self.coordinator.recoverable_files,
             self.deadline,
             time.monotonic,
         )?;
-        let physical_ticket = self
-            .coordinator
-            .ledger
-            .part(physical_lease, 0)
-            .and_then(|part| {
-                self.coordinator
-                    .ledger
-                    .begin_effect(part, [database, wal, 0, 0], time.monotonic)
-            });
-        let mut physical_ticket = match physical_ticket {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                if self.coordinator.ledger.cancel(physical_lease).is_err() {
-                    self.coordinator.stopped = true;
-                }
-                return Err(error.into());
-            }
-        };
         let mut logical_ticket =
             match self
                 .coordinator
@@ -607,6 +575,46 @@ pub struct UploadMaintenance {
     pub files: CommitFileUsage,
     pub admission_stopped: bool,
 }
+fn reserve_physical(
+    ledger: &mut Leases<'_>,
+    stopped: &mut bool,
+    recoverable_files: &mut bool,
+    deadline: Deadline,
+    now: Tick,
+) -> Result<(LeaseId, logical::EffectTicket), UploadError> {
+    let database = ledger.remaining_capacity(Kind::DatabaseBytes)?;
+    let wal = ledger.remaining_capacity(Kind::WalBytes)?;
+    let lease = ledger.reserve(
+        &[[
+            Charge {
+                kind: Kind::DatabaseBytes,
+                amount: database,
+            },
+            Charge {
+                kind: Kind::WalBytes,
+                amount: wal,
+            },
+            Charge::ZERO,
+            Charge::ZERO,
+        ]],
+        deadline,
+        now,
+    )?;
+    let ticket = ledger
+        .part(lease, 0)
+        .and_then(|part| ledger.begin_effect(part, [database, wal, 0, 0], now));
+    let ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            if ledger.cancel(lease).is_err() {
+                *stopped = true;
+                *recoverable_files = false;
+            }
+            return Err(error.into());
+        }
+    };
+    Ok((lease, ticket))
+}
 impl<P> UploadCoordinator<'_, '_, P> {
     /// Run after the upload job has finished. Unknown commits require reopen.
     pub fn checkpoint(&mut self, deadline: Deadline) -> Result<UploadMaintenance, UploadError> {
@@ -618,38 +626,13 @@ impl<P> UploadCoordinator<'_, '_, P> {
         }
         let mut last = self.store.clock.sample()?.monotonic;
         let now = check_time(&self.store, deadline, &mut last)?;
-        let database = self.ledger.remaining_capacity(Kind::DatabaseBytes)?;
-        let wal = self.ledger.remaining_capacity(Kind::WalBytes)?;
-        let lease = self.ledger.reserve(
-            &[[
-                Charge {
-                    kind: Kind::DatabaseBytes,
-                    amount: database,
-                },
-                Charge {
-                    kind: Kind::WalBytes,
-                    amount: wal,
-                },
-                Charge::ZERO,
-                Charge::ZERO,
-            ]],
+        let (lease, mut ticket) = reserve_physical(
+            &mut self.ledger,
+            &mut self.stopped,
+            &mut self.recoverable_files,
             deadline,
             now.monotonic,
         )?;
-        let ticket = self.ledger.part(lease, 0).and_then(|part| {
-            self.ledger
-                .begin_effect(part, [database, wal, 0, 0], now.monotonic)
-        });
-        let mut ticket = match ticket {
-            Ok(ticket) => ticket,
-            Err(error) => {
-                if self.ledger.cancel(lease).is_err() {
-                    self.stopped = true;
-                    self.recoverable_files = false;
-                }
-                return Err(error.into());
-            }
-        };
         let (outcome, files, writer_stopped) = self.store.checkpoint_observed(
             deadline,
             Some(now.monotonic),
@@ -723,3 +706,7 @@ fn settle_physical(
 #[cfg(test)]
 #[path = "upload_tests.rs"]
 mod tests;
+
+#[path = "upload_cleanup.rs"]
+mod cleanup;
+pub use cleanup::{UploadCleanup, UploadSweepDisposition};

@@ -2436,6 +2436,16 @@ upload timeout recovery, indeterminate refusal, forgotten-job refusal
 and maintenance timeout followed by a separately admitted successful
 measurement. No scheduler or multi-client fairness policy invokes this
 maintenance yet.
+Explicit expired-upload maintenance now visits one account-local lease per
+call. It advances past unexpired leases, removes expired leases together
+with unowned bodies, and preserves email and submission owners, including
+completed submissions. Its captured sequence binds the ownership decision
+to the native transaction. Known deletion releases exact logical quota;
+rejection releases none and uncertainty retains charges until reopen.
+Physical observation uses the same reserved coordinator path. Native tests
+cover expiry at the boundary, cursor/account scope, permanent-ID refusal,
+quota reuse with durable new upload, retained owners and late known or
+indeterminate commits. Automatic scheduling remains unimplemented.
 Native indexes serve metadata queries; parsed-body/search caches remain
 disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite

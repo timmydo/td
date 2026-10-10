@@ -227,8 +227,9 @@ releasing that fence. The original maintenance clock/deadline also covers
 observation. A retained native view refuses checkpoint with Busy.
 
 A physical-observation failure can be recovered this way only when the
-previous upload has a known outcome, both logical and physical tickets
-were settled and canceled, and the native writer remains healthy.
+previous upload or cleanup has a known outcome, logical accounting and
+physical tickets were settled (and tickets canceled), and the native writer
+remains healthy.
 A successful checkpoint with measured reconciliation then restores
 admission without changing body or category charges. Any refused
 maintenance attempt preserves the prior stop, including a checkpoint
@@ -244,6 +245,32 @@ reopening, known-success and rolled-back upload timeouts, indeterminate
 commit plus unavailable observation, pre-SQL refusal and measured
 checkpoint error preserving a prior stop, native stopped-writer refusal,
 and maintenance timeout followed by successful reconciliation.
+
+UploadCoordinator::expire_next_upload is explicit trusted maintenance, not
+an authenticated client operation. Each call visits at most one LeaseRow
+in account-local BlobId order using the existing primary key. None ends
+a pass; an Ok disposition permits advancing to that ID. The caller resets
+the cursor after the end so later passes include newly inserted lower
+IDs. Retained means this call did not remove the lease. Unexpired leases
+do not obstruct progress to subsequent IDs. Scheduling remains separate.
+
+Trusted UTC is sampled before planning and again before mutation. A lease
+is expired when expires_at is less than or equal to that UTC millisecond. An
+expired lease is deleted atomically with its body only when the same
+snapshot finds no email or submission owner; completed submissions still
+own their transmission bodies. The expected sequence and epoch bind that
+plan to the commit. Permanent ID retirement remains in force. Known
+success releases UploadBytes and, only for a removed body, BodyBytes and
+one BlobCount. It does not release queue charges. Rejection releases no
+logical usage; an indeterminate result retains charges and stops admission
+until reopen. Private typed retirement transitions check underflow before
+SQL and settle after known success; there is no public release-used API.
+Physical reservation and observation use the upload's existing single
+ledger path. A known cleanup outcome with settled accounting and healthy
+writer can recover a failed file observation through separate checkpoint
+maintenance. Its receipt preserves the durable outcome even when
+accounting stops further work. Removing a body frees reusable SQLite pages;
+it does not assert that the database file shrank.
 
 Reserve typed outcome storage before effects. Known COMMIT success
 retains its durable receipt and exact logical increments (length, one,

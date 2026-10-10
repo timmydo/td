@@ -6,20 +6,20 @@ use crate::{
     store_fs::tests::Fixture,
 };
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     MutexGuard, TryLockError,
 };
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const DEVICE: DeviceId = DeviceId::from_bytes([2; 16]);
 const SEED: BlobId = BlobId::from_bytes([3; 16]);
-struct Timer(AtomicU64, Mutex<std::collections::VecDeque<u64>>);
+struct Timer(AtomicU64, Mutex<std::collections::VecDeque<u64>>, AtomicI64);
 impl Clock for Timer {
     fn sample(&self) -> Result<Time, ports::Error> {
         if let Some(next) = self.1.lock().unwrap().pop_front() {
             self.0.store(next, Ordering::Relaxed);
         }
         Ok(Time {
-            utc_ms: 1234,
+            utc_ms: self.2.load(Ordering::Relaxed),
             monotonic: Tick(self.0.load(Ordering::Relaxed)),
         })
     }
@@ -83,7 +83,10 @@ fn row_bytes(row: Row<'_>) -> Vec<u8> {
     bytes.truncate(n);
     bytes
 }
-fn seed(store: &IndexStore<'_>) {
+fn seed(store: &IndexStore<'_>, expires_at: i64) {
+    seed_at(store, ACCOUNT, SEED, expires_at);
+}
+fn seed_at(store: &IndexStore<'_>, account: AccountId, id: BlobId, expires_at: i64) {
     let mut hash = td_crypto::Provider.sha256().unwrap();
     hash.update(b"seed").unwrap();
     let blob = row_bytes(Row::Blob(crate::format::row::BlobRow {
@@ -92,27 +95,31 @@ fn seed(store: &IndexStore<'_>) {
         created_at: 0,
     }));
     let lease = row_bytes(Row::Lease(LeaseRow {
-        account: ACCOUNT,
+        account,
         device: DEVICE,
-        expires_at: 100000,
+        expires_at,
         uses: LeaseUse::Both,
     }));
     store
         .commit(
             &td_crypto::Provider,
             CommitRequest {
-                account: ACCOUNT,
+                account,
                 epoch: store.epoch(),
-                expected: Sequence::from_u64(0),
+                expected: store
+                    .view(account, deadline())
+                    .unwrap()
+                    .identity()
+                    .committed_sequence,
                 utc_ms: 0,
                 deadline: deadline(),
             },
             &[
-                Operation::put(Table::Blobs, SEED.as_bytes(), &blob).unwrap(),
-                Operation::put(Table::Leases, SEED.as_bytes(), &lease).unwrap(),
+                Operation::put(Table::Blobs, id.as_bytes(), &blob).unwrap(),
+                Operation::put(Table::Leases, id.as_bytes(), &lease).unwrap(),
             ],
             &mut [BlobSource {
-                id: SEED,
+                id,
                 source: &mut b"seed".as_slice(),
             }],
         )
@@ -139,6 +146,20 @@ fn fixture_cells(
         &std::path::Path,
     ) -> Option<BlobId>,
 ) {
+    fixture_config(count, 100000, |_| {}, run);
+}
+fn fixture_config(
+    count: usize,
+    expires_at: i64,
+    setup: impl FnOnce(&IndexStore<'_>),
+    run: impl for<'r, 'a, 's> FnOnce(
+        &mut UploadCoordinator<'r, 'a, Policy>,
+        &'s IngressSpool<'r>,
+        &Arc<Timer>,
+        &Arc<Mutex<PolicyState>>,
+        &std::path::Path,
+    ) -> Option<BlobId>,
+) {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let spool_fixture = Fixture::new();
@@ -146,6 +167,7 @@ fn fixture_cells(
     let clock = Arc::new(Timer(
         AtomicU64::new(1),
         Mutex::new(std::collections::VecDeque::new()),
+        AtomicI64::new(1234),
     ));
     let resources = Limits {
         message_bytes: 8,
@@ -174,7 +196,8 @@ fn fixture_cells(
     )
     .unwrap();
     store.create_account(ACCOUNT, deadline()).unwrap();
-    seed(&store);
+    seed(&store, expires_at);
+    setup(&store);
     let spool = IngressSpool::open(&mut spool_root, &resources, clock.clone(), deadline()).unwrap();
     let mut states = [const { SlotState::EMPTY }; 4];
     let mut cells = [const { LeaseCell::EMPTY }; 4];
@@ -206,8 +229,7 @@ fn fixture_cells(
         return;
     }
     let mut coordinator = coordinator.unwrap();
-    assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
-    assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+    assert_recount(&coordinator);
     let published = run(
         &mut coordinator,
         &spool,
@@ -951,4 +973,426 @@ fn maintenance_cannot_clear_a_stopped_native_writer() {
         ));
         None
     });
+}
+
+#[test]
+fn expired_upload_releases_quota_and_preserves_permanent_ids() {
+    fixture_config(
+        4,
+        1234,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let receipt = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.id, SEED);
+            assert_eq!(
+                receipt.outcome,
+                Ok(UploadSweepDisposition::Retired {
+                    sequence: Sequence::from_u64(2),
+                    body_removed: true
+                })
+            );
+            assert!(!receipt.admission_stopped);
+            for kind in [Kind::BodyBytes, Kind::BlobCount, Kind::UploadBytes] {
+                assert_eq!(coordinator.used(kind).unwrap(), 0);
+            }
+            assert!(coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .is_none());
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut bytes = [0; 64];
+            assert!(view.get(Key::Blob(SEED), &mut bytes).unwrap().is_none());
+            assert!(view.get(Key::Lease(SEED), &mut bytes).unwrap().is_none());
+            drop(view);
+            let mut reused = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(2), spool, request(4))
+                .unwrap();
+            reused.write(b"body").unwrap();
+            reused.prepare().unwrap();
+            let UploadAttempt::Complete(rejected) = reused.commit().unwrap() else {
+                panic!("collision")
+            };
+            assert_eq!(
+                rejected.outcome,
+                Err(CommitError::Rejected(ports::Error::Conflict))
+            );
+            drop(reused);
+            let mut upload = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            upload.write(b"body").unwrap();
+            upload.prepare().unwrap();
+            let id = upload.id();
+            let UploadAttempt::Complete(published) = upload.commit().unwrap() else {
+                panic!("commit")
+            };
+            assert_eq!(published.outcome, Ok(Sequence::from_u64(3)));
+            drop(upload);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+            let mut second = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(10), spool, request(4))
+                .unwrap();
+            second.write(b"body").unwrap();
+            second.prepare().unwrap();
+            let UploadAttempt::Complete(second_result) = second.commit().unwrap() else {
+                panic!("commit")
+            };
+            assert_eq!(second_result.outcome, Ok(Sequence::from_u64(4)));
+            drop(second);
+            assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 2);
+            assert!(matches!(
+                coordinator.reserve(&td_crypto::Provider, &mut Random(12), spool, request(1)),
+                Err(UploadError::Ledger(logical::Error::Quota(Kind::BlobCount)))
+            ));
+            assert_recount(coordinator);
+            Some(id)
+        },
+    );
+}
+
+#[test]
+fn upload_sweep_advances_past_unexpired_lease_and_is_account_scoped() {
+    const OTHER: AccountId = AccountId::from_bytes([99; 16]);
+    const LATER: BlobId = BlobId::from_bytes([4; 16]);
+    const FOREIGN: BlobId = BlobId::from_bytes([1; 16]);
+    fixture_config(
+        4,
+        1235,
+        |store| seed_at(store, ACCOUNT, LATER, 1234),
+        |coordinator, _, _, _, _| {
+            let first = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(first.id, SEED);
+            assert_eq!(first.outcome, Ok(UploadSweepDisposition::Retained));
+            let next = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, Some(first.id), deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.id, LATER);
+            assert_eq!(
+                next.outcome,
+                Ok(UploadSweepDisposition::Retired {
+                    sequence: Sequence::from_u64(3),
+                    body_removed: true
+                })
+            );
+            assert!(coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, Some(next.id), deadline())
+                .unwrap()
+                .is_none());
+            assert_recount(coordinator);
+            None
+        },
+    );
+    fixture_config(
+        4,
+        1234,
+        |store| {
+            store.create_account(OTHER, deadline()).unwrap();
+            seed_at(store, OTHER, FOREIGN, 1234);
+        },
+        |coordinator, _, _, _, _| {
+            let local = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(local.id, SEED);
+            assert_eq!(
+                local.outcome,
+                Ok(UploadSweepDisposition::Retired {
+                    sequence: Sequence::from_u64(2),
+                    body_removed: true
+                })
+            );
+            let mut view = coordinator.store.view(OTHER, deadline()).unwrap();
+            let mut value = [0; 48];
+            assert!(view.get(Key::Lease(FOREIGN), &mut value).unwrap().is_some());
+            assert!(view.get(Key::Blob(FOREIGN), &mut value).unwrap().is_some());
+            drop(view);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+            assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn expired_lease_preserves_email_and_completed_submission_owners() {
+    use crate::{
+        format::row::{
+            EmailOrigin, EmailRow, FailureReason, NotificationState, RecipientState, SubmissionRow,
+        },
+        ids::{EmailId, IdentityId, SubmissionId, ThreadId},
+    };
+    for queue in [false, true] {
+        fixture_config(
+            4,
+            1234,
+            |store| {
+                let email = EmailId::from_bytes([8; 16]);
+                let thread = ThreadId::from_bytes([9; 16]);
+                let submission = SubmissionId::from_bytes([10; 16]);
+                let mut recipient = super::super::recipient_tests::queued();
+                recipient.state = RecipientState::Canceled;
+                recipient.next_attempt_at = None;
+                recipient.reason = FailureReason::Canceled;
+                let rows = if queue {
+                    vec![
+                        (
+                            Key::Submission(submission),
+                            Row::Submission(SubmissionRow {
+                                email,
+                                thread,
+                                identity: IdentityId::from_bytes([11; 16]),
+                                transmitted_blob: SEED,
+                                reverse_path: "",
+                                send_at: 0,
+                                expires_at: 432000000,
+                                recipient_count: 1,
+                                completed_at: Some(1),
+                                notification: NotificationState::None,
+                                notification_email: None,
+                            }),
+                        ),
+                        (Key::Recipient(submission, 0), Row::Recipient(recipient)),
+                    ]
+                } else {
+                    vec![
+                        (Key::Thread(thread), Row::Thread),
+                        (
+                            Key::Email(email),
+                            Row::Email(EmailRow {
+                                blob: SEED,
+                                thread,
+                                received_at: 0,
+                                origin: EmailOrigin::Jmap,
+                            }),
+                        ),
+                    ]
+                };
+                let encoded: Vec<_> = rows
+                    .iter()
+                    .map(|(key, row)| {
+                        let mut key_bytes = [0; 32];
+                        let len = key.encode(&mut key_bytes).unwrap();
+                        (key.table(), key_bytes[..len].to_vec(), row_bytes(*row))
+                    })
+                    .collect();
+                let operations: Vec<_> = encoded
+                    .iter()
+                    .map(|(table, key, row)| Operation::put(*table, key, row).unwrap())
+                    .collect();
+                store
+                    .commit(
+                        &td_crypto::Provider,
+                        CommitRequest {
+                            account: ACCOUNT,
+                            epoch: store.epoch(),
+                            expected: Sequence::from_u64(1),
+                            utc_ms: 1,
+                            deadline: deadline(),
+                        },
+                        &operations,
+                        &mut [],
+                    )
+                    .unwrap();
+            },
+            |coordinator, _, _, _, _| {
+                let result = coordinator
+                    .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.outcome,
+                    Ok(UploadSweepDisposition::Retired {
+                        sequence: Sequence::from_u64(3),
+                        body_removed: false
+                    })
+                );
+                assert!(!result.admission_stopped);
+                assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+                assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
+                assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 0);
+                assert_eq!(
+                    coordinator.used(Kind::QueueBytes).unwrap(),
+                    if queue { 4 } else { 0 }
+                );
+                assert_recount(coordinator);
+                let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+                let mut input = view.open_blob_input(&td_crypto::Provider, SEED, 8).unwrap();
+                let mut bytes = [0; 8];
+                assert_eq!(input.read(&mut bytes).unwrap(), 4);
+                assert_eq!(&bytes[..4], b"seed");
+                input.finish().unwrap();
+                None
+            },
+        );
+    }
+}
+
+#[test]
+fn upload_retirement_preserves_known_and_indeterminate_outcomes_after_deadline() {
+    for deny in [false, true] {
+        fixture_config(
+            4,
+            1234,
+            |_| {},
+            |coordinator, _, clock, _, _| {
+                let timer = clock.clone();
+                lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Transaction { operation }
+                        if !matches!(operation, TransactionOperation::Begin | TransactionOperation::Rollback)) {
+                        timer.0.store(100, Ordering::Relaxed);
+                        if deny { return Authorization::Deny; }
+                    }
+                    Authorization::Allow
+                })).unwrap();
+                let result = coordinator
+                    .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                    .unwrap()
+                    .unwrap();
+                assert!(result.admission_stopped);
+                assert_eq!(
+                    coordinator.used(Kind::BodyBytes).unwrap(),
+                    if deny { 4 } else { 0 }
+                );
+                assert_eq!(
+                    coordinator.used(Kind::UploadBytes).unwrap(),
+                    if deny { 4 } else { 0 }
+                );
+                assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), MAX_WAL_BYTES);
+                lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                    .unwrap()
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+                clock.0.store(200, Ordering::Relaxed);
+                let later = Deadline::after(Tick(200), 100).unwrap();
+                if deny {
+                    assert!(matches!(result.outcome, Err(CommitError::Indeterminate(_))));
+                    assert!(matches!(
+                        coordinator.checkpoint(later),
+                        Err(UploadError::Store(ports::Error::WriterStopped))
+                    ));
+                } else {
+                    assert_eq!(
+                        result.outcome,
+                        Ok(UploadSweepDisposition::Retired {
+                            sequence: Sequence::from_u64(2),
+                            body_removed: true
+                        })
+                    );
+                    let maintenance = coordinator.checkpoint(later).unwrap();
+                    assert_eq!(maintenance.outcome, Ok(()));
+                    assert!(!maintenance.admission_stopped);
+                    assert!(coordinator
+                        .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, later)
+                        .unwrap()
+                        .is_none());
+                }
+                None
+            },
+        );
+    }
+}
+
+#[test]
+fn rejected_upload_retirement_keeps_rows_and_logical_charges() {
+    fixture_config(
+        4,
+        1234,
+        |_| {},
+        |coordinator, _, _, _, _| {
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+            .authorizer(Some(|context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Delete { table_name, .. } if table_name == "blobs") {
+                    Authorization::Deny
+                } else { Authorization::Allow }
+            })).unwrap();
+            let result = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result.outcome, Err(CommitError::Rejected(_))));
+            assert!(!result.admission_stopped);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+            assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
+            assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+            assert_eq!(coordinator.ledger.pending(Kind::DatabaseBytes).unwrap(), 0);
+            assert_eq!(coordinator.ledger.pending(Kind::WalBytes).unwrap(), 0);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut bytes = [0; 64];
+            assert!(view.get(Key::Lease(SEED), &mut bytes).unwrap().is_some());
+            assert!(view.get(Key::Blob(SEED), &mut bytes).unwrap().is_some());
+            drop(view);
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            let retried = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                retried.outcome,
+                Ok(UploadSweepDisposition::Retired {
+                    sequence: Sequence::from_u64(2),
+                    body_removed: true
+                })
+            );
+            None
+        },
+    );
+}
+
+fn assert_recount(coordinator: &UploadCoordinator<'_, '_, Policy>) {
+    let usage = coordinator.store.usage_fence(deadline()).unwrap().usage();
+    for (kind, amount) in [
+        (Kind::BodyBytes, usage.body_bytes),
+        (Kind::BlobCount, usage.blob_count),
+        (Kind::UploadBytes, usage.upload_bytes),
+        (Kind::QueueBytes, usage.queue_bytes),
+        (Kind::QueueSubmissions, usage.queue_submissions),
+    ] {
+        assert_eq!(coordinator.used(kind).unwrap(), amount, "{kind:?}");
+    }
+}
+
+#[test]
+fn backwards_utc_after_planning_retains_the_upload() {
+    fixture_config(
+        4,
+        1234,
+        |_| {},
+        |coordinator, _, clock, _, _| {
+            for slot in lock(&coordinator.store.readers).unwrap().iter() {
+                let ReaderSlot::Available(native) = slot else {
+                    panic!("available reader")
+                };
+                let timer = clock.clone();
+                lock(&native.connection).unwrap().authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Read { table_name, .. } if table_name == "submissions") {
+                    timer.2.store(1233, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            })).unwrap();
+            }
+            let receipt = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert_eq!(clock.2.load(Ordering::Relaxed), 1233);
+            assert_eq!(receipt.outcome, Ok(UploadSweepDisposition::Retained));
+            assert!(!receipt.admission_stopped);
+            assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+            assert_recount(coordinator);
+            None
+        },
+    );
 }

@@ -457,13 +457,20 @@ physical completion replaces measured database/WAL buckets and settles the
 associated ticket atomically. Its checkpoint operation separately admits
 maintenance, captures file usage before releasing the checkpoint writer
 fence, and reconciles these same physical buckets. It can restore
-admission after a known upload outcome whose file observation failed,
-provided all tickets settled, the native writer stayed healthy and the
+admission after a known upload or cleanup outcome whose file observation
+failed, provided all tickets settled, the native writer stayed healthy and the
 checkpoint itself succeeds. A checkpoint error cannot clear a prior
 admission stop even if file measurement succeeds. It
 cannot clear an indeterminate commit or bookkeeping failure. This does
-not renew the earlier upload scope. Other service mutations and broader
-maintenance still need their own coordinated admission paths.
+not renew the earlier upload scope.
+
+Expired upload cleanup walks one lease at a time using the existing
+account/BlobId key. It atomically deletes the expired lease and, only when
+no email or submission owns it, the body. The owning coordinator releases
+logical charges only after proven commit, retaining charges for an
+indeterminate outcome. No expiry index or new schema is required.
+Other service mutations and broader maintenance still need their own
+coordinated admission paths.
 ADMISSION.md section 2 owns the reserved upload and maintenance contracts.
 
 ### Snapshots, changes, reclamation and backup

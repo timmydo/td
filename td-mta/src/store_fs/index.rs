@@ -68,8 +68,8 @@ mod upload;
 pub use completion::{CommitCompletion, CommitFileUsage};
 use completion::{CommitPhase, CommitWork};
 pub use upload::{
-    Upload, UploadAttempt, UploadAuthorization, UploadCompletion, UploadCoordinator, UploadError,
-    UploadGuard, UploadMaintenance, UploadRequest,
+    Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadCoordinator,
+    UploadError, UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition,
 };
 #[path = "index/backup.rs"]
 mod backup;

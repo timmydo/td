@@ -495,6 +495,25 @@ impl<'a> Leases<'a> {
         self.quotas = next;
         Ok(())
     }
+    pub(crate) fn check_expired_upload(
+        &self,
+        length: u64,
+        body_removed: bool,
+    ) -> Result<(), Error> {
+        self.healthy()?;
+        self.quotas.without_expired_upload(length, body_removed)?;
+        Ok(())
+    }
+    /// Only the owning coordinator's proven lease deletion releases live usage.
+    pub(crate) fn complete_expired_upload(
+        &mut self,
+        length: u64,
+        body_removed: bool,
+    ) -> Result<(), Error> {
+        self.healthy()?;
+        self.quotas = self.quotas.without_expired_upload(length, body_removed)?;
+        Ok(())
+    }
     pub(crate) fn remaining_capacity(&self, kind: Kind) -> Result<u64, Error> {
         self.healthy()?;
         let pending = self.quotas.pending().get(kind)?;
