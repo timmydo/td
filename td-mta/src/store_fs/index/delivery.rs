@@ -38,6 +38,8 @@ pub trait DeliveryGuard {
 }
 #[derive(Debug)]
 pub enum DeliveryError {
+    /// Publication did not start or consume work; retry under the same deadline.
+    CoordinationBusy,
     HeaderLimit,
     Storage(UploadError),
 }
@@ -64,6 +66,7 @@ impl From<format::Error> for DeliveryError {
 impl std::fmt::Display for DeliveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CoordinationBusy => f.write_str("delivery coordination is busy"),
             Self::HeaderLimit => f.write_str("message root headers exceed limit"),
             Self::Storage(e) => e.fmt(f),
         }
@@ -145,7 +148,7 @@ pub struct DeliveryRequest {
 }
 
 pub struct Delivery<'c, 's, 'r, 'a, C: Crypto, P, A: DeliveryAuthorization> {
-    coordinator: &'c mut StoreCoordinator<'r, 'a, P>,
+    coordinator: &'c StoreCoordinator<'r, 'a, P>,
     authorization: &'c A,
     crypto: &'c C,
     stage: Stage<'s, 'r, C::Sha256>,
@@ -171,7 +174,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
     /// Reserve only after this validated session requests DATA admission. The
     /// trusted driver supplies its connection policy and configured header bound.
     pub fn reserve_delivery<'c, 's, C: Crypto, A: DeliveryAuthorization>(
-        &'c mut self,
+        &'c self,
         crypto: &'c C,
         entropy: &mut impl Entropy,
         spool: &'s IngressSpool<'r>,
@@ -183,11 +186,13 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             header_bytes,
             deadline,
         } = request;
-        if self.stopped {
+        let mut state_guard = self.try_state()?;
+        let state = &mut *state_guard;
+        if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
-        if self.active {
-            return Err(ports::Error::Busy.into());
+        if state.ledger.available_cells() < 2 {
+            return Err(UploadError::Ledger(logical::Error::Full).into());
         }
         let (settings, envelope, extended) = session.delivery_context()?;
         let allowance = smtp_trace_allowance(settings.hostname)?;
@@ -266,7 +271,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             },
         );
         let now = check_time(&self.store, deadline, &mut last)?;
-        let lease = self.ledger.reserve(
+        let lease = state.ledger.reserve(
             &[[
                 Charge {
                     kind: Kind::BodyBytes,
@@ -282,16 +287,14 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             deadline,
             now.monotonic,
         )?;
+        drop(state_guard);
         let writer = match spool.begin(crypto, envelope.account, blob, deadline) {
             Ok(writer) => writer,
             Err(error) => {
-                if self.ledger.cancel(lease).is_err() {
-                    self.stopped = true;
-                }
+                let _ = self.cancel_job(Some(lease));
                 return Err(error.into());
             }
         };
-        self.active = true;
         Ok(Delivery {
             coordinator: self,
             authorization,
@@ -469,16 +472,11 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
     }
     pub fn discard(mut self) -> Result<(), DeliveryError> {
         let cleanup = discard_stage(std::mem::replace(&mut self.stage, Stage::Finished));
-        if let Some(lease) = self.lease.take() {
-            if let Err(error) = self.coordinator.ledger.cancel(lease) {
-                self.coordinator.stopped = true;
-                return Err(error.into());
-            }
-        }
-        self.coordinator.active = false;
+        self.coordinator.cancel_job(self.lease.take())?;
         cleanup.map_err(Into::into)
     }
 }
+
 fn store_bytes<D: Digest>(
     writer: &mut SpoolWriter<'_, '_, D>,
     length: &mut u64,
@@ -498,12 +496,7 @@ fn store_bytes<D: Digest>(
 impl<C: Crypto, P, A: DeliveryAuthorization> Drop for Delivery<'_, '_, '_, '_, C, P, A> {
     fn drop(&mut self) {
         let _ = discard_stage(std::mem::replace(&mut self.stage, Stage::Finished));
-        if let Some(lease) = self.lease.take() {
-            if self.coordinator.ledger.cancel(lease).is_err() {
-                self.coordinator.stopped = true;
-            }
-        }
-        self.coordinator.active = false;
+        let _ = self.coordinator.cancel_job(self.lease.take());
     }
 }
 
@@ -580,15 +573,29 @@ fn resolve_thread(
 
 impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
     pub fn commit(&mut self) -> Result<DeliveryCompletion, DeliveryError> {
-        if self.failed {
+        if self.failed || !matches!(self.stage, Stage::Prepared(_)) {
+            self.failed = true;
             return Err(ports::Error::Invalid.into());
         }
-        let result = self.commit_inner();
+        let coordinator = self.coordinator;
+        let mut state = coordinator.try_state().map_err(|error| match error {
+            ports::Error::Busy => DeliveryError::CoordinationBusy,
+            error => error.into(),
+        })?;
+        let mut result = self.commit_inner(&mut state);
         self.failed |= result.is_err();
+        drop(state);
+        if let Ok(completion) = &mut result {
+            completion.cleanup_error =
+                discard_stage(std::mem::replace(&mut self.stage, Stage::Finished)).err();
+        }
         result
     }
-    fn commit_inner(&mut self) -> Result<DeliveryCompletion, DeliveryError> {
-        if self.coordinator.stopped {
+    fn commit_inner(
+        &mut self,
+        state: &mut AdmissionState<'_>,
+    ) -> Result<DeliveryCompletion, DeliveryError> {
+        if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
         let Stage::Prepared(input) = &mut self.stage else {
@@ -703,9 +710,9 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
         let planned = [self.length, 1, 0, 0];
         let lease = self.lease.ok_or(ports::Error::Invalid)?;
         let mut effects = begin_publication(
-            &mut self.coordinator.ledger,
-            &mut self.coordinator.stopped,
-            &mut self.coordinator.recoverable_files,
+            &mut state.ledger,
+            &mut state.stopped,
+            &mut state.recoverable_files,
             lease,
             planned,
             self.deadline,
@@ -729,21 +736,18 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
         drop(guard);
         let outcome = completion.outcome();
         let recoverable = settle_publication(
-            &mut self.coordinator.ledger,
-            &mut self.coordinator.stopped,
+            &mut state.ledger,
+            &mut state.stopped,
             &mut effects,
             planned,
             &completion,
         );
-        let logical_canceled = self.coordinator.ledger.cancel(lease).is_ok();
+        let logical_canceled = state.ledger.cancel(lease).is_ok();
         if !logical_canceled {
-            self.coordinator.stopped = true;
+            state.stopped = true;
         }
-        self.coordinator.recoverable_files = recoverable && logical_canceled;
+        state.recoverable_files = recoverable && logical_canceled;
         self.lease = None;
-        let cleanup_error =
-            discard_stage(std::mem::replace(&mut self.stage, Stage::Finished)).err();
-        self.coordinator.active = false;
         Ok(DeliveryCompletion {
             email: self.email,
             blob: self.blob,
@@ -754,8 +758,8 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
                 epoch: self.epoch,
                 sequence,
             }),
-            admission_stopped: self.coordinator.stopped,
-            cleanup_error,
+            admission_stopped: state.stopped,
+            cleanup_error: None,
         })
     }
 }

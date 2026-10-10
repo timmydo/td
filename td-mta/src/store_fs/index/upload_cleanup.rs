@@ -24,16 +24,15 @@ impl<P> StoreCoordinator<'_, '_, P> {
     /// pass, including leases inserted before the previous cursor.
     #[must_use = "inspect the cleanup result before advancing the sweep"]
     pub fn expire_next_upload(
-        &mut self,
+        &self,
         crypto: &impl Crypto,
         account: AccountId,
         after: Option<BlobId>,
         deadline: Deadline,
     ) -> Result<Option<UploadCleanup>, UploadError> {
-        if self.active {
-            return Err(ports::Error::Busy.into());
-        }
-        if self.stopped {
+        let mut state_guard = self.try_state()?;
+        let state = &mut *state_guard;
+        if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
         let mut last = self.store.clock.sample()?.monotonic;
@@ -81,7 +80,8 @@ impl<P> StoreCoordinator<'_, '_, P> {
         if lease.expires_at > now.utc_ms {
             return Ok(Some(retained(id)));
         }
-        self.ledger
+        state
+            .ledger
             .check_expired_upload(blob.length, body_removed)?;
         let lease_delete = Operation::delete(Table::Leases, id.as_bytes())?;
         let body_delete = Operation::delete(Table::Blobs, id.as_bytes())?;
@@ -90,9 +90,9 @@ impl<P> StoreCoordinator<'_, '_, P> {
             .get(..if body_removed { 2 } else { 1 })
             .ok_or(ports::Error::Invalid)?;
         let (physical_lease, mut ticket) = reserve_physical(
-            &mut self.ledger,
-            &mut self.stopped,
-            &mut self.recoverable_files,
+            &mut state.ledger,
+            &mut state.stopped,
+            &mut state.recoverable_files,
             deadline,
             now.monotonic,
         )?;
@@ -109,23 +109,23 @@ impl<P> StoreCoordinator<'_, '_, P> {
             &mut [],
         );
         let files = completion.files();
-        let physical_settled = settle_physical(&mut self.ledger, &mut ticket, files);
-        let physical_canceled = self.ledger.cancel(physical_lease).is_ok();
+        let physical_settled = settle_physical(&mut state.ledger, &mut ticket, files);
+        let physical_canceled = state.ledger.cancel(physical_lease).is_ok();
         let outcome = completion.outcome();
         let logical_settled = match outcome {
-            Ok(_) => self
+            Ok(_) => state
                 .ledger
                 .complete_expired_upload(blob.length, body_removed)
                 .is_ok(),
             Err(CommitError::Rejected(_)) => true,
             Err(CommitError::Indeterminate(_)) => false,
         };
-        self.stopped = !physical_settled
+        state.stopped = !physical_settled
             || !physical_canceled
             || !logical_settled
             || completion.writer_stopped()
             || matches!(files, CommitFileUsage::Unavailable(_));
-        self.recoverable_files = matches!(files, CommitFileUsage::Unavailable(_))
+        state.recoverable_files = matches!(files, CommitFileUsage::Unavailable(_))
             && physical_settled
             && physical_canceled
             && logical_settled
@@ -137,7 +137,7 @@ impl<P> StoreCoordinator<'_, '_, P> {
                 sequence,
                 body_removed,
             }),
-            admission_stopped: self.stopped,
+            admission_stopped: state.stopped,
         }))
     }
 }

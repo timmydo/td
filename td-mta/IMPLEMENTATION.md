@@ -2420,19 +2420,20 @@ trusted monotonic time domain and quiesce auxiliary owners for cold
 initialization. ADMISSION.md section 2 owns these boundaries.
 
 The reservation owns staging and prepared input; Drop discards unused work.
-Forgetting it leaves the single lane and quota/spool reservations occupied
-until recovery. Cleanup failure retains the spool's retired-slot charge;
+Forgetting it leaves that job's quota/spool reservations occupied until
+recovery, without obstructing other admissible jobs or maintenance. Cleanup failure retains
+the spool's retired-slot charge;
 it does not erase a durable receipt. Native integration tests exercise
 reopening, nonempty accounting, policy revocation, guard lifetime, quota
 refusal, original deadlines, bounded replan and commit-outcome failures.
-The coordinator also admits explicit WAL checkpoint maintenance after an
-upload finishes. It reconciles database/WAL extents under the same
+The coordinator also admits explicit WAL checkpoint maintenance beside
+ongoing ingress, serialized with publication and settlement. It reconciles database/WAL extents under the same
 writer fence and ledger, with a separate original maintenance deadline.
 A known upload outcome with settled tickets and failed file observation
 can resume admission after this measurement; an indeterminate writer or
 bookkeeping failure still requires reopen. Native tests cover checkpoint
 reclamation, preserved logical charges, known-success and rolled-back
-upload timeout recovery, indeterminate refusal, forgotten-job refusal
+upload timeout recovery, indeterminate refusal, forgotten-job accounting
 and maintenance timeout followed by a separately admitted successful
 measurement. No scheduler or multi-client fairness policy invokes this
 maintenance yet.
@@ -2699,8 +2700,9 @@ reservations include format-derived trace room excluded from incoming SIZE.
 Remaining: the runtime must bind receiving authorization to actual sockets,
 TLS evidence and current gateway policy, drive deadlines and bounded
 transport close/drain, and connect actual handshake success to SMTP reset.
-The coordinator permits one outstanding ingress mutation job; concurrent
-receiving and fair scheduling remain required before listener activation.
+The coordinator admits concurrent receiving/upload jobs with independent
+spools and serializes only admission, publication and accounting. Fair
+runtime scheduling remains required before listener activation.
 A legal-boundary 421 operation supports ordered service closure after a
 flushed DATA result. These transport and runtime pieces remain M11 work.
 
@@ -2720,6 +2722,15 @@ public AUTH, DSN advertisement, or port binding in this task.
 
 **Depends on:** M07/M09/M10. **Own:** runtime listeners, fixed workers/slots,
 timeouts, startup/shutdown state and SMTP TLS wiring.
+
+Concurrent store coordination is implemented: idle ingress jobs retain
+no shared mutex, publication plans and settles under one coordinator lock,
+and delivery CoordinationBusy can be rescheduled. Upload retry refreshes
+its sequence under the commit lock. Checkpoint and expiry maintenance run
+beside idle ingress. Native tests cover worker
+progress beside an idle sender, current thread-anchor selection, independent
+quota release, physical completion capacity and uncertainty/poison refusal.
+Live transport scheduling and listener activation remain unimplemented.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,

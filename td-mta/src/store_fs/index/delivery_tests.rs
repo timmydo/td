@@ -30,6 +30,32 @@ impl Clock for Timer {
         })
     }
 }
+struct DevicePolicy;
+struct DeviceGuard(Access);
+impl UploadGuard for DeviceGuard {
+    fn access(&self) -> Access {
+        self.0
+    }
+}
+impl UploadAuthorization for DevicePolicy {
+    type Guard<'a> = DeviceGuard;
+    fn authorize(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        _: Deadline,
+    ) -> Result<DeviceGuard, ports::Error> {
+        if account != ACCOUNT || device != DeviceId::from_bytes([3; 16]) {
+            return Err(ports::Error::Forbidden);
+        }
+        Ok(DeviceGuard(Access {
+            account,
+            principal: Principal::Device(device),
+            config_generation: 1,
+        }))
+    }
+}
+
 struct Policy(Arc<Mutex<bool>>);
 struct Guard<'a>(MutexGuard<'a, bool>);
 impl DeliveryGuard for Guard<'_> {
@@ -82,7 +108,7 @@ struct Expected {
 }
 fn fixture(
     run: impl for<'r, 'a, 's> FnOnce(
-        &mut StoreCoordinator<'r, 'a, ()>,
+        &mut StoreCoordinator<'r, 'a, DevicePolicy>,
         &'s IngressSpool<'r>,
         &Policy,
         &Arc<Timer>,
@@ -95,7 +121,7 @@ fn fixture_with_limits(
     maximum: usize,
     headers: usize,
     run: impl for<'r, 'a, 's> FnOnce(
-        &mut StoreCoordinator<'r, 'a, ()>,
+        &mut StoreCoordinator<'r, 'a, DevicePolicy>,
         &'s IngressSpool<'r>,
         &Policy,
         &Arc<Timer>,
@@ -169,7 +195,7 @@ fn fixture_with_limits(
         },
         &mut states,
         &mut cells,
-        (),
+        DevicePolicy,
         deadline(),
     )
     .unwrap();
@@ -307,7 +333,7 @@ fn session_with_limit<'a>(routes: &'a Routing<'a>, maximum: usize) -> Session<'a
     session
 }
 fn deliver<'r, 'a>(
-    coordinator: &mut StoreCoordinator<'r, 'a, ()>,
+    coordinator: &StoreCoordinator<'r, 'a, DevicePolicy>,
     spool: &IngressSpool<'r>,
     policy: &Policy,
     routes: &Routing<'_>,
@@ -562,7 +588,16 @@ fn header_limit_is_permanent_and_work_exhaustion_is_temporary() {
             assert!(delivery.prepare().is_err());
             delivery.discard().unwrap();
             assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
-            assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                0
+            );
             Vec::new()
         });
     }
@@ -572,10 +607,16 @@ fn quotas_refuse_before_354_and_revocation_refuses_before_commit() {
     fixture(|coordinator, spool, policy, _, routes| {
         let mut session = session(routes);
         let remaining = coordinator
+            .state
+            .lock()
+            .unwrap()
             .ledger
             .remaining_capacity(Kind::BodyBytes)
             .unwrap();
         let held = coordinator
+            .state
+            .lock()
+            .unwrap()
             .ledger
             .reserve(
                 &[[
@@ -603,7 +644,13 @@ fn quotas_refuse_before_354_and_revocation_refuses_before_commit() {
             .is_err());
         assert!(matches!(session.pending(), Pending::BeginData { .. }));
         assert_eq!(spool.status().unwrap().occupied_slots, 0);
-        coordinator.ledger.cancel(held).unwrap();
+        coordinator
+            .state
+            .lock()
+            .unwrap()
+            .ledger
+            .cancel(held)
+            .unwrap();
         let mut delivery = coordinator
             .reserve_delivery(
                 &td_crypto::Provider,
@@ -747,7 +794,16 @@ fn exactly_one_provisioned_inbox_is_required_before_data_admission() {
                 Err(DeliveryError::Storage(UploadError::Store(error))) if error == if duplicate {ports::Error::Conflict} else {ports::Error::NotFound})
             );
             assert_eq!(spool.status().unwrap().occupied_slots, 0);
-            assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                0
+            );
             Vec::new()
         });
     }
@@ -1023,7 +1079,16 @@ fn local_trace_must_fit_the_header_limit_before_data_admission() {
             )))
         ));
         assert!(matches!(session.pending(), Pending::BeginData { .. }));
-        assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            0
+        );
         assert_eq!(spool.status().unwrap().occupied_slots, 0);
         Vec::new()
     });
@@ -1069,7 +1134,16 @@ fn invalid_gateway_receipt_text_refuses_before_data_admission() {
                 ports::Error::Invalid
             )))
         ));
-        assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            0
+        );
         assert_eq!(spool.status().unwrap().occupied_slots, 0);
         Vec::new()
     });
@@ -1131,7 +1205,275 @@ fn delivery_rechecks_inbox_after_body_preparation() {
         );
         delivery.discard().unwrap();
         assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
-        assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            0
+        );
         Vec::new()
     });
+}
+
+#[test]
+fn idle_delivery_does_not_block_a_worker_and_commit_uses_new_thread_anchor() {
+    fixture(|coordinator, spool, policy, _, routes| {
+        let coordinator = &*coordinator;
+        let waiting_session = session(routes);
+        let mut waiting = coordinator
+            .reserve_delivery(
+                &td_crypto::Provider,
+                &mut Random(40),
+                spool,
+                policy,
+                &waiting_session,
+                request(),
+            )
+            .unwrap();
+        waiting.write(b"References: <new@x>\r\n").unwrap();
+        waiting.write(b"\r\n").unwrap();
+        // The first sender retains its unfinished spool while another worker
+        // completes real delivery through the SMTP session.
+        let first = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    deliver(
+                        coordinator,
+                        spool,
+                        policy,
+                        routes,
+                        &mut Random(10),
+                        b"Message-ID: <new@x>\r\n\r\nfirst\r\n",
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
+        assert_eq!(spool.status().unwrap().occupied_slots, 1);
+        assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+        assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            MAXIMUM as u64
+        );
+        waiting.write(b"second\r\n").unwrap();
+        waiting.prepare().unwrap();
+        let second = waiting.commit().unwrap();
+        assert_eq!(second.thread, first.thread);
+        assert!(second.outcome.unwrap().sequence > first.outcome.unwrap().sequence);
+        drop(waiting);
+        assert_eq!(
+            coordinator.state.lock().unwrap().ledger.available_cells(),
+            4
+        );
+        vec![
+            Expected {
+                result: first,
+                tail: "Message-ID: <new@x>\r\n\r\nfirst\r\n".into(),
+            },
+            Expected {
+                result: second,
+                tail: "References: <new@x>\r\n\r\nsecond\r\n".into(),
+            },
+        ]
+    });
+}
+
+#[test]
+fn busy_publication_can_be_rescheduled_without_losing_prepared_delivery() {
+    fixture(|coordinator, spool, policy, _, routes| {
+        let session = session(routes);
+        let mut job = coordinator
+            .reserve_delivery(
+                &td_crypto::Provider,
+                &mut Random(10),
+                spool,
+                policy,
+                &session,
+                request(),
+            )
+            .unwrap();
+        job.write(b"\r\n").unwrap();
+        job.prepare().unwrap();
+        let guard = coordinator.state.lock().unwrap();
+        let (mut job, result) = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let result = job.commit();
+                    (job, result)
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(result, Err(DeliveryError::CoordinationBusy)));
+        assert!(!job.failed);
+        drop(guard);
+        let result = job.commit().unwrap();
+        assert!(result.outcome.is_ok());
+        {
+            let _guard = coordinator.state.lock().unwrap();
+            assert!(matches!(
+                job.commit(),
+                Err(DeliveryError::Storage(UploadError::Store(
+                    ports::Error::Invalid
+                )))
+            ));
+        }
+        vec![Expected {
+            result,
+            tail: "\r\n".into(),
+        }]
+    });
+}
+
+#[test]
+fn smtp_and_upload_share_accounting_without_sharing_ingress_custody() {
+    fixture(|coordinator, spool, policy, _, routes| {
+        let mut upload = coordinator
+            .reserve(
+                &td_crypto::Provider,
+                &mut Random(70),
+                spool,
+                UploadRequest {
+                    account: ACCOUNT,
+                    device: DeviceId::from_bytes([3; 16]),
+                    maximum: 8,
+                    deadline: deadline(),
+                },
+            )
+            .unwrap();
+        upload.write(b"body").unwrap();
+        let result = deliver(
+            coordinator,
+            spool,
+            policy,
+            routes,
+            &mut Random(10),
+            b"\r\nmail\r\n",
+        );
+        assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::UploadBytes)
+                .unwrap(),
+            8
+        );
+        upload.prepare().unwrap();
+        assert!(matches!(
+            upload.commit().unwrap(),
+            UploadAttempt::SequenceConflict
+        ));
+        upload.replan().unwrap();
+        let UploadAttempt::Complete(receipt) = upload.commit().unwrap() else {
+            panic!("second conflict")
+        };
+        assert!(receipt.outcome.is_ok());
+        drop(upload);
+        assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+        assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 2);
+        vec![Expected {
+            result,
+            tail: "\r\nmail\r\n".into(),
+        }]
+    });
+}
+
+#[test]
+fn policy_busy_is_a_failed_delivery_not_a_coordination_retry() {
+    fixture(|coordinator, spool, policy, _, routes| {
+        let session = session(routes);
+        let mut job = coordinator
+            .reserve_delivery(
+                &td_crypto::Provider,
+                &mut Random(10),
+                spool,
+                policy,
+                &session,
+                request(),
+            )
+            .unwrap();
+        job.write(b"\r\n").unwrap();
+        job.prepare().unwrap();
+        let guard = policy.0.lock().unwrap();
+        assert!(matches!(
+            job.commit(),
+            Err(DeliveryError::Storage(UploadError::Store(
+                ports::Error::Busy
+            )))
+        ));
+        assert!(job.failed);
+        drop(guard);
+        assert!(matches!(
+            job.commit(),
+            Err(DeliveryError::Storage(UploadError::Store(
+                ports::Error::Invalid
+            )))
+        ));
+        drop(job);
+        assert_eq!(
+            coordinator.state.lock().unwrap().ledger.available_cells(),
+            4
+        );
+        Vec::new()
+    });
+}
+
+#[test]
+fn delivery_spool_creation_runs_outside_coordination_and_rolls_back_failure() {
+    for fail in [false, true] {
+        fixture(|coordinator, spool, policy, _, routes| {
+            let session = session(routes);
+            let crypto = super::super::tests::CheckingCrypto(|| {
+                let state = coordinator.try_state().unwrap();
+                assert_eq!(
+                    state.ledger.pending(Kind::BodyBytes).unwrap(),
+                    MAXIMUM as u64
+                );
+                if fail {
+                    Err(td_crypto::Error::Crypto)
+                } else {
+                    Ok(())
+                }
+            });
+            let result = coordinator.reserve_delivery(
+                &crypto,
+                &mut Random(10),
+                spool,
+                policy,
+                &session,
+                request(),
+            );
+            if fail {
+                assert!(matches!(
+                    result,
+                    Err(DeliveryError::Storage(UploadError::Store(
+                        ports::Error::Crypto
+                    )))
+                ));
+            } else {
+                result.unwrap().discard().unwrap();
+            }
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                4
+            );
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            Vec::new()
+        });
+    }
 }

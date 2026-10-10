@@ -452,10 +452,14 @@ Retaining the receipt does not retain the writer fence: measurements are
 historical after return. The coordinator must exclusively own mutation and
 maintenance admission through its ledger reconciliation and preserve
 store/ledger association. StoreCoordinator owns one IndexStore and its
-consuming-initialized logical ledger, with one outstanding upload or receiving job. Its private
+consuming-initialized logical ledger. Concurrent uploads and receiving jobs
+own separate staging reservations; a coordination mutex serializes admission,
+publication and settlement, never network waits or spool writes. Its private
 physical completion replaces measured database/WAL buckets and settles the
-associated ticket atomically. Its checkpoint operation separately admits
-maintenance, captures file usage before releasing the checkpoint writer
+associated ticket atomically. Its checkpoint and upload-expiry maintenance
+can run beside admitted ingress: jobs retain no native view or pending
+SQL effect between calls, and admission keeps a physical-effect cell free.
+Its checkpoint operation separately admits maintenance, captures file usage before releasing the checkpoint writer
 fence, and reconciles these same physical buckets. It can restore
 admission after a known upload, receiving or cleanup outcome whose file observation
 failed, provided all tickets settled, the native writer stayed healthy and the
@@ -475,15 +479,15 @@ ADMISSION.md section 2 owns upload, receiving and maintenance contracts.
 
 ### Receiving delivery coordination
 
-The same StoreCoordinator that owns upload accounting now owns one SMTP
-Delivery job. It accepts a validated session envelope and a trusted
+The same StoreCoordinator that owns upload accounting also coordinates SMTP
+Delivery jobs. It accepts a validated session envelope and a trusted
 connection-policy provider, never arbitrary row batches or caller digests.
 It checks one provisioned Inbox, prepares filtered trace/raw bytes through
 IngressSpool, chooses a thread from the native anchor lookup, and publishes
 all receiving metadata and history with the immutable body in one commit.
 ADMISSION.md owns its quota, authorization-guard and completion semantics;
 POLICY.md owns exact identifier selection. Runtime transport/credential
-binding and concurrent scheduling remain separate. No SQL schema version
+binding and fair socket/worker scheduling remain separate. No SQL schema version
 or body layout changes in this increment.
 
 ### Snapshots, changes, reclamation and backup

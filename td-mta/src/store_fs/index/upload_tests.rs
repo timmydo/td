@@ -160,6 +160,21 @@ fn fixture_config(
         &std::path::Path,
     ) -> Option<BlobId>,
 ) {
+    fixture_plan(count, expires_at, 2, setup, run);
+}
+fn fixture_plan(
+    count: usize,
+    expires_at: i64,
+    blob_count: u64,
+    setup: impl FnOnce(&IndexStore<'_>),
+    run: impl for<'r, 'a, 's> FnOnce(
+        &mut StoreCoordinator<'r, 'a, Policy>,
+        &'s IngressSpool<'r>,
+        &Arc<Timer>,
+        &Arc<Mutex<PolicyState>>,
+        &std::path::Path,
+    ) -> Option<BlobId>,
+) {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let spool_fixture = Fixture::new();
@@ -178,7 +193,7 @@ fn fixture_config(
     .unwrap();
     let plan = DiskLimits {
         body_bytes: 16,
-        blob_count: 2,
+        blob_count,
         ..DiskLimits::default()
     }
     .plan(
@@ -393,23 +408,50 @@ fn only_proven_sequence_conflict_permits_one_original_deadline_replan() {
             Err(UploadError::Store(ports::Error::Conflict))
         ));
         assert_eq!(
-            upload.coordinator.ledger.pending(Kind::BodyBytes).unwrap(),
+            upload
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
             4
         );
         assert_eq!(
-            upload.coordinator.ledger.pending(Kind::BlobCount).unwrap(),
+            upload
+                .coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BlobCount)
+                .unwrap(),
             1
         );
         assert_eq!(
             upload
                 .coordinator
+                .state
+                .lock()
+                .unwrap()
                 .ledger
                 .pending(Kind::UploadBytes)
                 .unwrap(),
             4
         );
         for kind in [Kind::DatabaseBytes, Kind::WalBytes] {
-            assert_eq!(upload.coordinator.ledger.pending(kind).unwrap(), 0);
+            assert_eq!(
+                upload
+                    .coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(kind)
+                    .unwrap(),
+                0
+            );
         }
         policy.lock().unwrap().allowed = false;
         assert!(matches!(
@@ -436,25 +478,42 @@ fn only_proven_sequence_conflict_permits_one_original_deadline_replan() {
     });
 }
 #[test]
-fn forgotten_upload_keeps_its_single_lane_and_spool_reservation() {
-    fixture(|coordinator, spool, _, _, _| {
-        let upload = coordinator
-            .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
-            .unwrap();
-        std::mem::forget(upload);
-        assert!(matches!(
-            coordinator.reserve(&td_crypto::Provider, &mut Random(9), spool, request(4)),
-            Err(UploadError::Store(ports::Error::Busy))
-        ));
-        assert_eq!(spool.status().unwrap().occupied_slots, 1);
-        assert!(matches!(
-            coordinator.checkpoint(deadline()),
-            Err(UploadError::Store(ports::Error::Busy))
-        ));
-        assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 4);
-        None
-    });
+fn forgotten_upload_keeps_its_quota_without_blocking_other_jobs_or_maintenance() {
+    fixture_plan(
+        4,
+        100000,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let upload = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            std::mem::forget(upload);
+            let other = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(9), spool, request(4))
+                .unwrap();
+            assert_eq!(spool.status().unwrap().occupied_slots, 2);
+            other.discard().unwrap();
+            assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                3
+            );
+            None
+        },
+    );
 }
+
 #[test]
 fn durable_and_indeterminate_outcomes_survive_accounting_failure() {
     for deny in [false, true] {
@@ -500,7 +559,16 @@ fn durable_and_indeterminate_outcomes_survive_accounting_failure() {
                 assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), MAX_WAL_BYTES);
             }
             for kind in [Kind::DatabaseBytes, Kind::WalBytes] {
-                assert_eq!(coordinator.ledger.pending(kind).unwrap(), 0);
+                assert_eq!(
+                    coordinator
+                        .state
+                        .lock()
+                        .unwrap()
+                        .ledger
+                        .pending(kind)
+                        .unwrap(),
+                    0
+                );
             }
             (!deny).then_some(id)
         });
@@ -559,8 +627,20 @@ fn exhausted_spool_and_oversized_write_do_not_escape_the_reservation() {
             coordinator.reserve(&td_crypto::Provider, &mut Random(8), spool, request(4)),
             Err(UploadError::Store(ports::Error::Quota))
         ));
-        assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 0);
-        assert_eq!(coordinator.ledger.available_cells(), 4);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coordinator.state.lock().unwrap().ledger.available_cells(),
+            4
+        );
         drop(held);
         let mut upload = coordinator
             .reserve(&td_crypto::Provider, &mut Random(9), spool, request(4))
@@ -608,8 +688,26 @@ fn id_collision_is_final_rejection_with_measured_physical_usage() {
             files.database_bytes
         );
         assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), files.wal_bytes);
-        assert_eq!(coordinator.ledger.pending(Kind::DatabaseBytes).unwrap(), 0);
-        assert_eq!(coordinator.ledger.pending(Kind::WalBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::DatabaseBytes)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::WalBytes)
+                .unwrap(),
+            0
+        );
         None
     });
 }
@@ -697,7 +795,16 @@ fn reserve_refuses_policy_context_and_size_before_spooling() {
         ));
         assert_eq!(spool.status().unwrap(), before);
         for kind in [Kind::BodyBytes, Kind::BlobCount, Kind::UploadBytes] {
-            assert_eq!(coordinator.ledger.pending(kind).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(kind)
+                    .unwrap(),
+                0
+            );
         }
         assert!(!coordinator.admission_stopped());
         None
@@ -750,7 +857,16 @@ fn maintenance_checkpoints_and_reconciles_files_without_changing_logical_usage()
         assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
         assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 8);
         for kind in [Kind::DatabaseBytes, Kind::WalBytes] {
-            assert_eq!(coordinator.ledger.pending(kind).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(kind)
+                    .unwrap(),
+                0
+            );
         }
         Some(id)
     });
@@ -1324,8 +1440,26 @@ fn rejected_upload_retirement_keeps_rows_and_logical_charges() {
             assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
             assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
             assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
-            assert_eq!(coordinator.ledger.pending(Kind::DatabaseBytes).unwrap(), 0);
-            assert_eq!(coordinator.ledger.pending(Kind::WalBytes).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::DatabaseBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::WalBytes)
+                    .unwrap(),
+                0
+            );
             let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
             let mut bytes = [0; 64];
             assert!(view.get(Key::Lease(SEED), &mut bytes).unwrap().is_some());
@@ -1395,4 +1529,397 @@ fn backwards_utc_after_planning_retains_the_upload() {
             None
         },
     );
+}
+
+#[test]
+fn simultaneous_uploads_keep_independent_quota_and_leave_a_publication_cell() {
+    fixture_plan(
+        4,
+        100000,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let first = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            let mut second = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(9), spool, request(4))
+                .unwrap();
+            let third = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(10), spool, request(4))
+                .unwrap();
+            assert!(matches!(
+                coordinator.reserve(&td_crypto::Provider, &mut Random(11), spool, request(0)),
+                Err(UploadError::Ledger(logical::Error::Full))
+            ));
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                1
+            );
+            assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+            second.write(b"body").unwrap();
+            second.prepare().unwrap();
+            let id = second.id();
+            let UploadAttempt::Complete(receipt) = second.commit().unwrap() else {
+                panic!("unexpected conflict")
+            };
+            assert!(receipt.outcome.is_ok());
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                8
+            );
+            drop(first);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                4
+            );
+            drop(second);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                4
+            );
+            third.discard().unwrap();
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                4
+            );
+            assert_recount(coordinator);
+            Some(id)
+        },
+    );
+}
+
+#[test]
+fn overlapping_uploads_retry_against_the_current_sequence_under_one_lock() {
+    fixture_plan(
+        4,
+        100000,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let mut first = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            let mut second = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(9), spool, request(4))
+                .unwrap();
+            {
+                let _guard = coordinator.state.lock().unwrap();
+                assert!(matches!(
+                    first.replan(),
+                    Err(UploadError::Store(ports::Error::Invalid))
+                ));
+            }
+            first.write(b"body").unwrap();
+            first.prepare().unwrap();
+            second.write(b"body").unwrap();
+            second.prepare().unwrap();
+            assert!(matches!(
+                second.commit().unwrap(),
+                UploadAttempt::Complete(UploadCompletion { outcome: Ok(_), .. })
+            ));
+            assert!(matches!(
+                first.commit().unwrap(),
+                UploadAttempt::SequenceConflict
+            ));
+            {
+                let _guard = coordinator.state.lock().unwrap();
+                assert!(matches!(
+                    first.commit(),
+                    Err(UploadError::Store(ports::Error::Conflict))
+                ));
+                assert!(matches!(
+                    first.replan(),
+                    Err(UploadError::Store(ports::Error::Busy))
+                ));
+            }
+            first.replan().unwrap();
+            let guard = coordinator.state.lock().unwrap();
+            assert!(matches!(
+                first.replan(),
+                Err(UploadError::Store(ports::Error::Invalid))
+            ));
+            let (mut first, deferred) = std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        let result = first.commit();
+                        (first, result)
+                    })
+                    .join()
+                    .unwrap()
+            });
+            assert!(matches!(
+                deferred,
+                Err(UploadError::Store(ports::Error::Busy))
+            ));
+            drop(guard);
+            let mut third = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(10), spool, request(4))
+                .unwrap();
+            third.write(b"body").unwrap();
+            third.prepare().unwrap();
+            assert!(matches!(
+                third.commit().unwrap(),
+                UploadAttempt::Complete(UploadCompletion { outcome: Ok(_), .. })
+            ));
+            assert!(matches!(
+                first.commit().unwrap(),
+                UploadAttempt::Complete(UploadCompletion { outcome: Ok(_), .. })
+            ));
+            drop(first);
+            drop(second);
+            drop(third);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn uncertain_publication_stops_other_admitted_jobs() {
+    fixture_plan(
+        4,
+        100000,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let mut first = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            let mut second = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(9), spool, request(4))
+                .unwrap();
+            first.write(b"body").unwrap();
+            first.prepare().unwrap();
+            second.write(b"body").unwrap();
+            second.prepare().unwrap();
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+            .authorizer(Some(|context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Transaction { operation }
+                    if !matches!(operation, TransactionOperation::Begin | TransactionOperation::Rollback)) {
+                    Authorization::Deny
+                } else { Authorization::Allow }
+            })).unwrap();
+            let UploadAttempt::Complete(result) = first.commit().unwrap() else {
+                panic!("conflict")
+            };
+            assert!(matches!(result.outcome, Err(CommitError::Indeterminate(_))));
+            assert!(matches!(
+                second.commit(),
+                Err(UploadError::Store(ports::Error::WriterStopped))
+            ));
+            drop(first);
+            drop(second);
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                4
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+            None
+        },
+    );
+}
+
+#[test]
+fn poisoned_coordination_refuses_admission_and_cleanup_does_not_panic() {
+    fixture_plan(
+        4,
+        100000,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let coordinator = &*coordinator;
+            let upload = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            std::thread::scope(|scope| {
+                assert!(scope
+                    .spawn(|| {
+                        let _guard = coordinator.state.lock().unwrap();
+                        panic!("simulated worker failure");
+                    })
+                    .join()
+                    .is_err());
+            });
+            assert!(coordinator.admission_stopped());
+            assert_eq!(
+                coordinator.used(Kind::BodyBytes),
+                Err(logical::Error::Poisoned)
+            );
+            assert!(matches!(
+                coordinator.reserve(&td_crypto::Provider, &mut Random(9), spool, request(4)),
+                Err(UploadError::Store(ports::Error::WriterStopped))
+            ));
+            assert!(matches!(
+                coordinator.checkpoint(deadline()),
+                Err(UploadError::Store(ports::Error::WriterStopped))
+            ));
+            drop(upload);
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            None
+        },
+    );
+}
+
+#[test]
+fn expired_upload_cleanup_runs_beside_reserved_ingress_without_releasing_its_quota() {
+    fixture_plan(
+        4,
+        1234,
+        4,
+        |_| {},
+        |coordinator, spool, _, _, _| {
+            let mut upload = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            let cleanup = coordinator
+                .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                cleanup.outcome,
+                Ok(UploadSweepDisposition::Retired {
+                    body_removed: true,
+                    ..
+                })
+            ));
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                4
+            );
+            upload.write(b"body").unwrap();
+            upload.prepare().unwrap();
+            assert!(matches!(
+                upload.commit().unwrap(),
+                UploadAttempt::SequenceConflict
+            ));
+            upload.replan().unwrap();
+            let id = upload.id();
+            assert!(matches!(
+                upload.commit().unwrap(),
+                UploadAttempt::Complete(UploadCompletion { outcome: Ok(_), .. })
+            ));
+            drop(upload);
+            assert_recount(coordinator);
+            Some(id)
+        },
+    );
+}
+
+pub(super) struct CheckingCrypto<F>(pub(super) F);
+impl<F: Fn() -> Result<(), td_crypto::Error> + Send + Sync> Crypto for CheckingCrypto<F> {
+    type Sha256 = <td_crypto::Provider as Crypto>::Sha256;
+    type SigningKey = <td_crypto::Provider as Crypto>::SigningKey;
+    fn sha256(&self) -> Result<Self::Sha256, td_crypto::Error> {
+        (self.0)()?;
+        td_crypto::Provider.sha256()
+    }
+    fn equal_digest(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+        td_crypto::Provider.equal_digest(a, b)
+    }
+    fn generate_p256(&self, output: &mut [u8]) -> Result<usize, td_crypto::Error> {
+        td_crypto::Provider.generate_p256(output)
+    }
+    fn load_p256(&self, input: &[u8]) -> Result<Self::SigningKey, td_crypto::Error> {
+        td_crypto::Provider.load_p256(input)
+    }
+    fn p256_public(
+        &self,
+        key: &Self::SigningKey,
+        output: &mut [u8; 65],
+    ) -> Result<(), td_crypto::Error> {
+        td_crypto::Provider.p256_public(key, output)
+    }
+    fn sign_es256(
+        &self,
+        key: &Self::SigningKey,
+        input: &[u8],
+        output: &mut [u8; 64],
+    ) -> Result<(), td_crypto::Error> {
+        td_crypto::Provider.sign_es256(key, input, output)
+    }
+}
+
+#[test]
+fn spool_creation_releases_coordination_and_failure_cancels_only_its_reservation() {
+    for fail in [false, true] {
+        fixture_plan(
+            4,
+            100000,
+            4,
+            |_| {},
+            |coordinator, spool, _, _, _| {
+                let other = coordinator
+                    .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                    .unwrap();
+                let crypto = CheckingCrypto(|| {
+                    let state = coordinator.try_state().unwrap();
+                    assert_eq!(state.ledger.pending(Kind::BodyBytes).unwrap(), 8);
+                    if fail {
+                        Err(td_crypto::Error::Crypto)
+                    } else {
+                        Ok(())
+                    }
+                });
+                let result = coordinator.reserve(&crypto, &mut Random(9), spool, request(4));
+                if fail {
+                    assert!(matches!(
+                        result,
+                        Err(UploadError::Store(ports::Error::Crypto))
+                    ));
+                } else {
+                    result.unwrap().discard().unwrap();
+                }
+                assert_eq!(
+                    coordinator
+                        .state
+                        .lock()
+                        .unwrap()
+                        .ledger
+                        .pending(Kind::BodyBytes)
+                        .unwrap(),
+                    4
+                );
+                assert_eq!(spool.status().unwrap().occupied_slots, 1);
+                drop(other);
+                assert_recount(coordinator);
+                None
+            },
+        );
+    }
 }

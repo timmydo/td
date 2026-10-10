@@ -137,8 +137,8 @@ unimplemented; do not infer them from pure accounting helper tests.
 ### First reserved upload transaction
 
 StoreCoordinator implements this M08 adapter boundary; no listener or
-credential verifier invokes it yet. It accepts one device-authorized
-upload that commits a fresh BlobRow and its device-bound LeaseRow
+credential verifier invokes it yet. Each device-authorized
+upload commits a fresh BlobRow and its device-bound LeaseRow
 atomically. The adapter constructs these rows from its actual prepared
 input; it accepts neither an arbitrary transaction batch nor caller-
 supplied proof of a body digest. HTTP handling, credential verification,
@@ -149,12 +149,40 @@ The coordinator owns one IndexStore and the single logical ledger seeded
 by its consuming usage_fence initialization. Auxiliary owners are
 quiescent and pending effects settled during that cold capture. Its
 service-facing interface does not expose the mutable persistence core or
-another ledger. The initial adapter requires at least two ledger cells
-(logical and physical effects) and permits one outstanding upload or receiving job.
-This serializes its mutations and physical accounting without holding a
-SQLite writer fence while bytes arrive. Existing native views and
-ingress slot limits continue to apply; this is not a runtime fairness
-claim.
+another ledger. At least two ledger cells are required: each admitted
+job uses one logical cell, and admission leaves one cell for the current
+publication's physical effect. Uploads and receiving jobs borrow the
+coordinator concurrently and own separate spool inputs. Existing logical
+quotas and ingress slots bound the admitted jobs; no connection holds the
+coordination mutex while waiting for network input, writing a spool or
+preparing its body.
+
+Reserve, replan, commit and checkpoint/expiry maintenance try to acquire
+that mutex. Contention returns Busy before effects, except delivery
+commit returns its distinct CoordinationBusy variant. Only that variant
+promises a retryable prepared delivery under the original deadline;
+policy or storage Busy remains an ordinary failed attempt. Once acquired,
+the mutex covers planning, native publication and ledger settlement.
+Delivery plans against the then-current account snapshot, so an earlier
+concurrent delivery can supply its thread anchor. Uploads retain the
+existing one-time explicit sequence-conflict replan and refresh that
+retry's account endpoint under the commit lock, closing the gap between
+replan and retry. Their fresh body/lease rows do not depend on earlier
+account contents.
+
+Drop/discard retirement and passive usage/status inspection may wait for
+the mutex;
+the runtime must run those operations and synchronous store work on its
+workers, not its network event loop. Drop/discard retires only the job's
+own lease. A completed job cannot retire another job
+when later dropped. Forgotten jobs retain their quota and spool charge
+until recovery without holding up otherwise admissible ingress or
+maintenance. A poisoned coordination mutex refuses
+future admission and publication; no panic recovery invents a settlement.
+Private spool creation and final deletion run outside the coordination
+lock. Failed creation cancels the already-reserved lease; known durable
+completion remains reportable even if final spool deletion fails.
+This is concurrent store coordination, not a runtime fairness claim.
 
 Authentication remains upstream. A trusted authorization provider binds
 account, device and upload permission to current policy. Access is
@@ -195,10 +223,10 @@ staging. IngressSpool separately reserves its entire temporary slot.
 These are different resources. Existing global category quotas are used;
 per-account enforcement must precede advertising the eventual
 per-account limits. Before SQL, reserve database/WAL headroom in this
-same ledger and pin logical and physical effect tickets. The initial
-single mutation lane may conservatively reserve all remaining physical
-headroom. There is no second quota-used table or public
-release-used-by-kind operation.
+same ledger and pin logical and physical effect tickets. Serialized
+publication conservatively reserves all remaining physical headroom.
+There is no second quota-used table or public release-used-by-kind
+operation.
 
 A core-controlled completion disposition may prove that no
 storage-changing work began. Only that proof permits zero physical
@@ -217,10 +245,12 @@ expired or measurement/reconciliation fails, retain conservative
 physical charges and stop mutation admission until reopen and cold
 reconciliation, or the eligible maintenance path below.
 
-StoreCoordinator::checkpoint is a separate maintenance operation after
-an upload job has finished and released its mutable coordinator borrow.
-It takes its own caller-supplied deadline; it neither renews nor retries
-an upload. A forgotten active upload still refuses maintenance. The
+StoreCoordinator::checkpoint is a separate maintenance operation. It
+serializes against publication and settlement, while idle ingress jobs
+may remain admitted: they retain no native view or in-flight effect.
+The preserved physical-effect cell also admits maintenance when logical
+cells are saturated. It takes its own caller-supplied deadline; it
+neither renews nor retries an upload. The
 operation reserves physical headroom in the same ledger, checkpoints
 under the native writer fence and observes validated file extents before
 releasing that fence. The original maintenance clock/deadline also covers
@@ -247,7 +277,9 @@ checkpoint error preserving a prior stop, native stopped-writer refusal,
 and maintenance timeout followed by successful reconciliation.
 
 StoreCoordinator::expire_next_upload is explicit trusted maintenance, not
-an authenticated client operation. Each call visits at most one LeaseRow
+an authenticated client operation. It uses the same publication lock
+and may run beside ingress; removing proven used charges preserves other
+jobs' pending reservations. Each call visits at most one LeaseRow
 in account-local BlobId order using the existing primary key. None ends
 a pass; an Ok disposition permits advancing to that ID. The caller resets
 the cursor after the end so later passes include newly inserted lower
@@ -298,10 +330,10 @@ memory layout or resource permutation matrix is a prerequisite.
 StoreCoordinator owns the native writer and single ledger for uploads and
 receiving. Delivery captures the validated session's DATA envelope, reserves
 maximum stored BodyBytes and one BlobCount before 354, and owns one ingress
-slot. It consumes no UploadBytes. One active job holds the coordinator until
-completion/discard; the runtime must replace that serialization with fair
-concurrent ingress before enabling listeners. This is a functional delivery
-boundary, not a claim of live scheduling or credential verification.
+slot. It consumes no UploadBytes. Receiving and upload jobs can remain
+admitted concurrently under the shared coordination rules above. The
+runtime still owes fair scheduling and actual credential verification
+before enabling listeners.
 
 A connection-specific DeliveryAuthorization supplies actual peer/TLS/gateway
 facts and receiving permission. Its commit guard rechecks current policy and

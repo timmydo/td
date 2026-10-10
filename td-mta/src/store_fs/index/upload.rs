@@ -76,10 +76,12 @@ pub struct UploadRequest {
 
 pub struct StoreCoordinator<'r, 'a, P> {
     store: IndexStore<'r>,
-    ledger: Leases<'a>,
+    state: Mutex<AdmissionState<'a>>,
     authorization: P,
     work: crate::admission::WorkLimits,
-    active: bool,
+}
+struct AdmissionState<'a> {
+    ledger: Leases<'a>,
     stopped: bool,
     recoverable_files: bool,
 }
@@ -103,24 +105,29 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             .initialize_leases(plan, auxiliary, states, cells)?;
         Ok(Self {
             store,
-            ledger,
+            state: Mutex::new(AdmissionState {
+                ledger,
+                stopped: false,
+                recoverable_files: false,
+            }),
             authorization,
             work: *plan.work(),
-            active: false,
-            stopped: false,
-            recoverable_files: false,
         })
     }
     pub fn admission_stopped(&self) -> bool {
-        self.stopped
+        self.state.lock().map_or(true, |state| state.stopped)
     }
     pub fn used(&self, kind: Kind) -> Result<u64, logical::Error> {
-        self.ledger.used(kind)
+        self.state
+            .lock()
+            .map_err(|_| logical::Error::Poisoned)?
+            .ledger
+            .used(kind)
     }
 }
 impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
     pub fn reserve<'c, 's, C: Crypto>(
-        &'c mut self,
+        &'c self,
         crypto: &'c C,
         entropy: &mut impl Entropy,
         spool: &'s IngressSpool<'r>,
@@ -132,11 +139,13 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
             maximum,
             deadline,
         } = request;
-        if self.stopped {
+        let mut state_guard = self.try_state()?;
+        let state = &mut *state_guard;
+        if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
-        if self.active {
-            return Err(ports::Error::Busy.into());
+        if state.ledger.available_cells() < 2 {
+            return Err(logical::Error::Full.into());
         }
         if maximum > spool.capacity().bytes_each {
             return Err(ports::Error::Capacity.into());
@@ -154,7 +163,7 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
         entropy.fill(&mut bytes).map_err(ports::Error::from)?;
         let id = BlobId::from_bytes(bytes);
         let now = check_time(&self.store, deadline, &mut last)?;
-        let lease = self.ledger.reserve(
+        let lease = state.ledger.reserve(
             &[[
                 Charge {
                     kind: Kind::BodyBytes,
@@ -173,16 +182,14 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
             deadline,
             now.monotonic,
         )?;
+        drop(state_guard);
         let writer = match spool.begin(crypto, account, id, deadline) {
             Ok(writer) => writer,
             Err(error) => {
-                if self.ledger.cancel(lease).is_err() {
-                    self.stopped = true;
-                }
+                let _ = self.cancel_job(Some(lease));
                 return Err(error.into());
             }
         };
-        self.active = true;
         Ok(Upload {
             coordinator: self,
             crypto,
@@ -232,7 +239,7 @@ enum Stage<'s, 'r, D: Digest> {
     Finished,
 }
 pub struct Upload<'c, 's, 'r, 'a, C: Crypto, P> {
-    coordinator: &'c mut StoreCoordinator<'r, 'a, P>,
+    coordinator: &'c StoreCoordinator<'r, 'a, P>,
     crypto: &'c C,
     stage: Stage<'s, 'r, C::Sha256>,
     lease: Option<LeaseId>,
@@ -311,8 +318,12 @@ pub enum UploadAttempt {
 }
 impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
     pub fn replan(&mut self) -> Result<(), UploadError> {
-        if !self.replan_allowed || self.replanned || self.coordinator.stopped {
+        if !self.replan_allowed || self.replanned {
             return Err(ports::Error::Invalid.into());
+        }
+        let state_guard = self.coordinator.try_state()?;
+        if state_guard.stopped {
+            return Err(ports::Error::WriterStopped.into());
         }
         check_upload_time(
             &self.coordinator.store,
@@ -354,11 +365,13 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         Ok(())
     }
     pub fn commit(&mut self) -> Result<UploadAttempt, UploadError> {
-        if self.coordinator.stopped {
-            return Err(ports::Error::WriterStopped.into());
-        }
         if self.replan_allowed {
             return Err(ports::Error::Conflict.into());
+        }
+        let mut state_guard = self.coordinator.try_state()?;
+        let state = &mut *state_guard;
+        if state.stopped {
+            return Err(ports::Error::WriterStopped.into());
         }
         let Stage::Prepared(input) = &mut self.stage else {
             return Err(ports::Error::Invalid.into());
@@ -386,6 +399,18 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
                 .authorize(self.access.account, device, self.deadline)?;
         if guard.access() != self.access {
             return Err(ports::Error::Forbidden.into());
+        }
+        if self.replanned {
+            // No other coordinator mutation can invalidate this retry snapshot.
+            let identity = self
+                .coordinator
+                .store
+                .view(self.access.account, self.deadline)?
+                .identity();
+            if identity.epoch != self.identity.epoch {
+                return Err(ports::Error::Conflict.into());
+            }
+            self.identity = identity;
         }
         let time = check_upload_time(
             &self.coordinator.store,
@@ -423,9 +448,9 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         let planned = [self.length, 1, self.length, 0];
         let lease = self.lease.ok_or(ports::Error::Invalid)?;
         let mut effects = begin_publication(
-            &mut self.coordinator.ledger,
-            &mut self.coordinator.stopped,
-            &mut self.coordinator.recoverable_files,
+            &mut state.ledger,
+            &mut state.stopped,
+            &mut state.recoverable_files,
             lease,
             planned,
             self.deadline,
@@ -449,44 +474,39 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
         drop(guard);
         let outcome = completion.outcome();
         let recoverable = settle_publication(
-            &mut self.coordinator.ledger,
-            &mut self.coordinator.stopped,
+            &mut state.ledger,
+            &mut state.stopped,
             &mut effects,
             planned,
             &completion,
         );
-        if completion.is_sequence_conflict() && !self.coordinator.stopped && !self.replanned {
+        if completion.is_sequence_conflict() && !state.stopped && !self.replanned {
             self.replan_allowed = true;
             return Ok(UploadAttempt::SequenceConflict);
         }
-        let logical_canceled = self.coordinator.ledger.cancel(lease).is_ok();
+        let logical_canceled = state.ledger.cancel(lease).is_ok();
         if !logical_canceled {
-            self.coordinator.stopped = true;
+            state.stopped = true;
         }
-        self.coordinator.recoverable_files = recoverable && logical_canceled;
+        state.recoverable_files = recoverable && logical_canceled;
         self.lease = None;
+        let admission_stopped = state.stopped;
+        drop(state_guard);
         let cleanup_error =
             discard_stage(std::mem::replace(&mut self.stage, Stage::Finished)).err();
-        self.coordinator.active = false;
         Ok(UploadAttempt::Complete(UploadCompletion {
             id: self.id,
             length: self.length,
             digest,
             expires_at,
             outcome,
-            admission_stopped: self.coordinator.stopped,
+            admission_stopped,
             cleanup_error,
         }))
     }
     pub fn discard(mut self) -> Result<(), UploadError> {
         let cleanup = discard_stage(std::mem::replace(&mut self.stage, Stage::Finished));
-        if let Some(lease) = self.lease.take() {
-            if let Err(error) = self.coordinator.ledger.cancel(lease) {
-                self.coordinator.stopped = true;
-                return Err(error.into());
-            }
-        }
-        self.coordinator.active = false;
+        self.coordinator.cancel_job(self.lease.take())?;
         cleanup.map_err(UploadError::Store)
     }
 }
@@ -500,12 +520,7 @@ fn discard_stage<D: Digest>(stage: Stage<'_, '_, D>) -> Result<(), ports::Error>
 impl<C: Crypto, P> Drop for Upload<'_, '_, '_, '_, C, P> {
     fn drop(&mut self) {
         let _ = discard_stage(std::mem::replace(&mut self.stage, Stage::Finished));
-        if let Some(lease) = self.lease.take() {
-            if self.coordinator.ledger.cancel(lease).is_err() {
-                self.coordinator.stopped = true;
-            }
-        }
-        self.coordinator.active = false;
+        let _ = self.coordinator.cancel_job(self.lease.take());
     }
 }
 
@@ -572,20 +587,19 @@ fn reserve_physical(
     Ok((lease, ticket))
 }
 impl<P> StoreCoordinator<'_, '_, P> {
-    /// Run after the upload job has finished. Unknown commits require reopen.
-    pub fn checkpoint(&mut self, deadline: Deadline) -> Result<UploadMaintenance, UploadError> {
-        if self.active {
-            return Err(ports::Error::Busy.into());
-        }
-        if self.stopped && !self.recoverable_files {
+    /// Serialize with publication, not ingress. Unknown commits require reopen.
+    pub fn checkpoint(&self, deadline: Deadline) -> Result<UploadMaintenance, UploadError> {
+        let mut state_guard = self.try_state()?;
+        let state = &mut *state_guard;
+        if state.stopped && !state.recoverable_files {
             return Err(ports::Error::WriterStopped.into());
         }
         let mut last = self.store.clock.sample()?.monotonic;
         let now = check_time(&self.store, deadline, &mut last)?;
         let (lease, mut ticket) = reserve_physical(
-            &mut self.ledger,
-            &mut self.stopped,
-            &mut self.recoverable_files,
+            &mut state.ledger,
+            &mut state.stopped,
+            &mut state.recoverable_files,
             deadline,
             now.monotonic,
         )?;
@@ -613,21 +627,21 @@ impl<P> StoreCoordinator<'_, '_, P> {
                 (result.map(|_| ()), files, stopped)
             },
         );
-        let accounting_ok = settle_physical(&mut self.ledger, &mut ticket, files);
-        let canceled = self.ledger.cancel(lease).is_ok();
+        let accounting_ok = settle_physical(&mut state.ledger, &mut ticket, files);
+        let canceled = state.ledger.cancel(lease).is_ok();
         if !accounting_ok || !canceled || writer_stopped {
-            self.stopped = true;
-            self.recoverable_files = false;
+            state.stopped = true;
+            state.recoverable_files = false;
         } else {
             match files {
                 CommitFileUsage::Measured(_) if outcome.is_ok() => {
-                    self.stopped = false;
-                    self.recoverable_files = false;
+                    state.stopped = false;
+                    state.recoverable_files = false;
                 }
                 CommitFileUsage::Measured(_) => {}
                 CommitFileUsage::Unavailable(_) => {
-                    self.stopped = true;
-                    self.recoverable_files = true;
+                    state.stopped = true;
+                    state.recoverable_files = true;
                 }
                 CommitFileUsage::Unchanged => {}
             }
@@ -635,7 +649,7 @@ impl<P> StoreCoordinator<'_, '_, P> {
         Ok(UploadMaintenance {
             outcome,
             files,
-            admission_stopped: self.stopped,
+            admission_stopped: state.stopped,
         })
     }
 }
@@ -741,4 +755,26 @@ fn settle_publication(
         && logical_settled
         && !uncertain
         && !completion.writer_stopped()
+}
+
+impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
+    fn try_state(&self) -> Result<MutexGuard<'_, AdmissionState<'a>>, ports::Error> {
+        self.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ports::Error::Busy,
+            std::sync::TryLockError::Poisoned(_) => ports::Error::WriterStopped,
+        })
+    }
+    // Cleanup is worker-side: it may wait for an admitted synchronous publication.
+    fn cancel_job(&self, lease: Option<LeaseId>) -> Result<(), UploadError> {
+        let Some(lease) = lease else {
+            return Ok(());
+        };
+        let mut state = lock(&self.state)?;
+        let result = state.ledger.cancel(lease);
+        if result.is_err() {
+            state.stopped = true;
+            state.recoverable_files = false;
+        }
+        result.map_err(Into::into)
+    }
 }
