@@ -376,8 +376,17 @@ refusals, artifact failures and bytes removed. A failed summary is an incomplete
 not a successful final answer. Tool calls and results remain intermediate;
 only
 a whole final reply whose first line exactly identifies the resolved
-subject and full commit id reaches standard output. Reasoning details
-are echoed with their exact wire bytes as in §5. Source, quoted preflight
+subject and full commit id reaches standard output. A final reply that
+does not, with a step left, is asked once for the whole review again,
+beginning with that line, since a preamble would otherwise lose a
+session that found what it was asked to: the reply is kept, without an
+empty list of calls, and the next request is a final one, as the last
+step's is, no tools offered and a call refused, its harness message
+the ask in place of the step's status. The ask is logged as
+`review_restatement` and counted as `restatements` by `review-log`; a
+second miss, or one on the last step, ends the review incomplete.
+Reasoning details are echoed with their exact wire bytes as in §5.
+Source, quoted preflight
 diagnostics and tool results
 are untrusted review material; project instructions cannot widen the
 profile. No conversation or daily ledger is created.

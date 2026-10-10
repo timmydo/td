@@ -169,28 +169,32 @@ fn assistant(reply: &client::Completion) -> Result<String, String> {
     if let Some(reasoning) = &reply.reasoning {
         fields.push(("reasoning".into(), Json::Str(reasoning.clone())));
     }
-    fields.push((
-        "tool_calls".into(),
-        Json::Arr(
-            reply
-                .calls
-                .iter()
-                .map(|call| {
-                    Json::Obj(vec![
-                        ("id".into(), Json::Str(call.id.clone())),
-                        ("type".into(), Json::Str("function".into())),
-                        (
-                            "function".into(),
-                            Json::Obj(vec![
-                                ("name".into(), Json::Str(call.name.clone())),
-                                ("arguments".into(), Json::Str(call.arguments.clone())),
-                            ]),
-                        ),
-                    ])
-                })
-                .collect(),
-        ),
-    ));
+    // A reply without calls, a final review asked again, carries none:
+    // an empty list is refused by some providers.
+    if !reply.calls.is_empty() {
+        fields.push((
+            "tool_calls".into(),
+            Json::Arr(
+                reply
+                    .calls
+                    .iter()
+                    .map(|call| {
+                        Json::Obj(vec![
+                            ("id".into(), Json::Str(call.id.clone())),
+                            ("type".into(), Json::Str("function".into())),
+                            (
+                                "function".into(),
+                                Json::Obj(vec![
+                                    ("name".into(), Json::Str(call.name.clone())),
+                                    ("arguments".into(), Json::Str(call.arguments.clone())),
+                                ]),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ));
+    }
     let encoded = Json::Obj(fields).to_string();
     if let Some(details) = &reply.details {
         let parsed = td_json::parse(details).map_err(|e| e.to_string())?;
@@ -441,6 +445,11 @@ fn loop_review(
         );
     let mut force_compact = false;
     let mut context_recovered = false;
+    // A final review whose first line misses the commit is asked for
+    // again once, rather than its whole session lost to a preamble.
+    let mut restated = false;
+    // The next request is that restatement: final, as on the last step.
+    let mut restating = false;
     for step in 0..MAX_STEPS {
         messages.push(message("user", format!("[Review harness status: request {} of {}; accounted spending {}; remaining {} of {}. Tool result limit {} bytes; tool context remaining {} of {} bytes. Preserve evidence, avoid redundant calls, and finish before either budget is exhausted.]", step + 1, MAX_STEPS, cost::show(budget.charged), cost::show(budget.limit.saturating_sub(budget.charged)), cost::show(budget.limit), controls.output_limit, controls.remaining(), controls.context_limit)));
         if controls.remaining() == 0 {
@@ -470,7 +479,8 @@ fn loop_review(
             && crate::review_context::Context::tail(messages, 1).is_some()
             && step + 1 < MAX_STEPS
             && pair_cost.is_some_and(|n| n <= remaining);
-        let finalize = !compacting && (pressure(&context, &sized) || step + 1 == MAX_STEPS);
+        let finalize =
+            !compacting && (restating || pressure(&context, &sized) || step + 1 == MAX_STEPS);
         if force_compact && !compacting {
             return Err(
                 "context recovery cannot reserve a summary and final request; no complete review"
@@ -479,7 +489,11 @@ fn loop_review(
         }
         if finalize {
             let current = messages.last_mut().ok_or("review has no status message")?;
-            *current = message("user", format!("[Review harness: produce the final review now with supported findings and explicit limitations. No further tools will execute. Remaining cost {}.]", cost::show(remaining)));
+            *current = if std::mem::take(&mut restating) {
+                message("user", format!("[Review harness: a final review must begin with the exact line `{expected}`, with nothing before it, and that reply did not. Write the complete final review again, beginning with that line. No further tools will execute. Remaining cost {}.]", cost::show(remaining)))
+            } else {
+                message("user", format!("[Review harness: produce the final review now with supported findings and explicit limitations. No further tools will execute. Remaining cost {}.]", cost::show(remaining)))
+            };
             sized = client::turn_body("", prefix, messages)?;
         }
         let mut request_options = options.clone();
@@ -782,7 +796,17 @@ fn loop_review(
         if reply.calls.is_empty() {
             review::whole(&reply)?;
             if reply.content.as_deref().and_then(|s| s.lines().next()) != Some(expected) {
-                return Err("review does not identify the exact commit on its first line".into());
+                // Once, and only with a step left to ask it in.
+                if restated || step + 1 >= MAX_STEPS {
+                    return Err(
+                        "review does not identify the exact commit on its first line".into(),
+                    );
+                }
+                (restated, restating) = (true, true);
+                journal.event("review_restatement", Json::Obj(Vec::new()))?;
+                messages.push(assistant(&reply)?);
+                context.observe(client::turn_body("", prefix, messages)?.len(), reply.usage);
+                continue;
             }
             out.write_all(reply.content.as_deref().unwrap_or_default().as_bytes())
                 .and_then(|()| out.write_all(b"\n"))

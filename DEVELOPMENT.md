@@ -977,14 +977,31 @@ completion allowance is 32768 tokens; reducing it may cut reasoning or
 the final review. An interrupted or budget-stopped run is incomplete,
 even if its trace contains plausible findings.
 
+For GLM 5.3 (`--model z-ai/glm-5.3`), add `--routing floor`. Measured on
+one 870-line td-agent commit at `--max-cost 2`, floor served every
+request from one provider at about $0.16 per million tokens overall
+($0.007 for the first, uncached request); balanced cost $0.39 per
+million ($0.024 first) and nitro $0.43 ($0.049 first), nitro switching
+providers three times and losing some or all of the cache at each
+switch. Per-request latency was alike, 3.8 to 4.9 s, so nitro buys a
+review little, and it reserves its dearest tier, so a cap admits fewer
+requests. Request counts (15 to 44) followed the model's own
+exploration, not the routing: compare runs by the unit costs and cached
+share `td-agent review-log` reports, not their totals. Providers and
+prices change; measure again before relying on these figures.
+
 Require exit status zero and a final `REVIEWING` line naming the exact
-subject and full commit ID. Read the findings and reconcile their
-evidence, tests and limitations. Source is read-only, scratch is writable,
-and Cargo is offline. `--sparse DIRECTORY` supplies extra source trees;
-the model can also expand the checkout. A repository's Cargo runner may
-be absent, and external dependency sources are not supplied from the
-host's caches. Report an unrun test as a limitation. Review tests do not
-replace the branch's `ready` gate.
+subject and full commit ID. A final reply whose first line is not that
+line (a preamble before it, say) is asked once to restate the whole
+review from it, one more mostly cached request without tools that
+`review-log` counts as `restatements`; a second miss fails the review.
+Read the findings and reconcile their evidence, tests and limitations.
+Source is read-only, scratch is writable, and Cargo is offline.
+`--sparse DIRECTORY` supplies extra source trees; the model can also
+expand the checkout. A repository's Cargo runner may be absent, and
+external dependency sources are not supplied from the host's caches.
+Report an unrun test as a limitation. Review tests do not replace the
+branch's `ready` gate.
 
 Repository reviews expand declared path dependencies and prepare a private
 Cargo home. Metadata preflight reports unavailable locked inputs before the

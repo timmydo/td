@@ -157,6 +157,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
     let mut compaction_attempts = 0u64;
     let mut shortened_summary_inputs = 0u64;
     let mut context_refusals = 0u64;
+    let mut restatements = 0u64;
     let mut unavailable_artifacts = 0u64;
     let mut compacted_bytes = 0u64;
     let mut duration_ms = 0u64;
@@ -247,6 +248,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
                 shortened_summary_inputs = shortened_summary_inputs.saturating_add(1)
             }
             "context_refusal" => context_refusals = context_refusals.saturating_add(1),
+            "review_restatement" => restatements = restatements.saturating_add(1),
             "tool_artifact_unavailable" => {
                 unavailable_artifacts = unavailable_artifacts.saturating_add(1)
             }
@@ -355,6 +357,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             Json::from(shortened_summary_inputs),
         ),
         ("context_refusals".into(), Json::from(context_refusals)),
+        ("restatements".into(), Json::from(restatements)),
         (
             "unavailable_tool_artifacts".into(),
             Json::from(unavailable_artifacts),

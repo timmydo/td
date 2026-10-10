@@ -570,21 +570,66 @@ fn cargo_runs_offline_with_build_outputs_in_scratch() {
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn wrong_commit_identity_never_reaches_stdout() {
     let fixture = Fixture::new();
-    let mock = MockFetch::start(
-        &fixture.root.join("run"),
-        vec![
-            models(),
-            completion(
-                "REVIEWING: another commit (wrong)\nNo defects.",
-                None,
-                "stop",
-            ),
-        ],
-    );
+    let wrong = || {
+        completion(
+            "REVIEWING: another commit (wrong)\nNo defects.",
+            None,
+            "stop",
+        )
+    };
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models(), wrong(), wrong()]);
     let result = run(&fixture, &mock, "0.02");
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     assert!(String::from_utf8_lossy(&result.stderr).contains("exact commit"));
+    // Asked once to restate, then refused.
+    assert_eq!(mock.requests().len(), 3);
+    fixture.no_workspaces();
+}
+
+/// A final review with a preamble before its identity line is asked for
+/// again once, beginning with that line; the restated review is the one
+/// written, and the trace counts the restatement.
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_review_with_a_preamble_is_asked_to_restate_once() {
+    let fixture = Fixture::new();
+    let preamble = completion(
+        &format!(
+            "The tests pass.\n\nREVIEWING: fixture review ({})\nNo findings.",
+            fixture.commit
+        ),
+        None,
+        "stop",
+    );
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), preamble, fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.starts_with("REVIEWING: fixture review ("),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("The tests pass."), "{stdout}");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    // The ask takes the place of that step's status, a final request's,
+    // and the review it answers carries no empty tool calls.
+    let asked = requests[2].text();
+    assert!(asked.contains("must begin with the exact line"), "{asked}");
+    let after = asked.rsplit("\"role\":\"assistant\"").next().unwrap();
+    assert!(!after.contains("Review harness status"), "{after}");
+    assert!(!asked.contains("\"tool_calls\":[]"), "{asked}");
+    let logs = fixture.logs();
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(metrics.get("restatements").and_then(Json::as_u64), Some(1));
     fixture.no_workspaces();
 }
 
