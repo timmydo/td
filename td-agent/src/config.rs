@@ -91,12 +91,14 @@ pub struct Client {
 
 /// A configured template and its own shared directories, admitted; none
 /// when it names none and its workspaces bind `shared`; and its own
-/// network policy, none when its workspaces take `network`.
+/// network policy, none when its workspaces take `network`; and whether
+/// its conversations have the system view (DESIGN.md §8, System view).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TemplateShared {
     pub name: String,
     pub shared: Option<Vec<Shared>>,
     pub network: Option<Network>,
+    pub system: bool,
 }
 
 /// A workspace's network policy (DESIGN.md §10).
@@ -398,6 +400,19 @@ impl Client {
         }
     }
 
+    /// Whether a workspace's conversation has the system view: only one
+    /// made from a template that turns it on and is still configured.
+    pub fn system_for(&self, workspace: &Workspace) -> bool {
+        let template = match workspace {
+            Workspace::Template(name) => name,
+            Workspace::Repositories(repositories) => &repositories.template,
+            Workspace::Scratch | Workspace::Directory(_) => return false,
+        };
+        self.template_shared
+            .iter()
+            .any(|t| &t.name == template && t.system)
+    }
+
     /// A workspace's network policy: its template's own when it names
     /// one, `network` when it names none or the workspace has no
     /// template, and `off` when its template is no longer configured, so
@@ -524,6 +539,7 @@ impl Client {
                                         .network
                                         .map_or(Json::Null, |n| Json::Str(n.name().into())),
                                 ),
+                                ("system".into(), Json::Bool(template.system)),
                             ])
                         })
                         .collect(),
@@ -695,7 +711,14 @@ impl Client {
                                 })?,
                             ),
                         };
+                        let system = match item.get("system") {
+                            None => false,
+                            Some(system) => system.as_bool().ok_or_else(|| {
+                                format!("template {name:?}: `system` is true or false")
+                            })?,
+                        };
                         Ok(TemplateShared {
+                            system,
                             name: template_name(name)?,
                             shared,
                             network,
@@ -996,6 +1019,10 @@ pub struct Template {
     pub shared: Option<Vec<Shared>>,
     /// Its own network policy, in place of the top-level `network`.
     pub network: Option<Network>,
+    /// Its conversations have the system view (DESIGN.md §8, System
+    /// view): `system_status`, which reads the whole machine's processes
+    /// outside the jail.
+    pub system: bool,
 }
 
 /// One of a template's repositories.
@@ -1111,7 +1138,7 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
         if !item.is_table() {
             return Err(wrong.into());
         }
-        item.check_known_keys(&["name", "repos", "shared", "network"])
+        item.check_known_keys(&["name", "repos", "shared", "network", "system"])
             .map_err(|e| format!("`template`: {e}"))?;
         let name = item
             .optional_str("name")
@@ -1160,7 +1187,14 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
             None => None,
             Some(value) => Some(shared_list("template.shared", value)?),
         };
+        let system = match item.get("system") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| format!("template {name:?}: `system` is true or false"))?,
+        };
         templates.push(Template {
+            system,
             name,
             repos,
             shared,
@@ -1274,6 +1308,10 @@ pub fn templates_json(templates: &[Template]) -> Json {
                 if let Some(network) = template.network {
                     fields.push(("network".into(), Json::Str(network.name().into())));
                 }
+                // Only a template that turns it on names the system view.
+                if template.system {
+                    fields.push(("system".into(), Json::Bool(true)));
+                }
                 if let Some(shared) = &template.shared {
                     fields.push((
                         "shared".into(),
@@ -1353,7 +1391,7 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
     let id = crate::store::Id::parse(&"0".repeat(32)).ok_or("no placeholder id")?;
     let place = std::path::PathBuf::from(format!("/{}", "x".repeat(CHECK_PATH)));
     for item in items {
-        if !only_keys(item, &["name", "network", "shared", "repos"]) {
+        if !only_keys(item, &["name", "network", "system", "shared", "repos"]) {
             return Err(wrong.into());
         }
         let network = match item.get("network") {
@@ -1364,6 +1402,12 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
                     .and_then(Network::parse)
                     .ok_or("a template's network is off, allowlist or open")?,
             ),
+        };
+        // Written only as true, so it reads back as written.
+        let system = match item.get("system") {
+            None => false,
+            Some(Json::Bool(true)) => true,
+            Some(_) => return Err("a template's system view is written only as true".into()),
         };
         let name = template_name(item.get("name").and_then(Json::as_str).ok_or(wrong)?)?;
         if templates.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
@@ -1449,6 +1493,7 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
             .collect::<Result<Vec<_>, String>>()
             .map_err(|e| format!("template {name:?}: {e}"))?;
         let template = Template {
+            system,
             network,
             name,
             repos,
@@ -1938,6 +1983,7 @@ mod tests {
         assert_eq!(
             config.templates,
             [Template {
+                system: false,
                 network: None,
                 name: "td".into(),
                 repos: vec![Repo {
@@ -2193,6 +2239,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(n, network)| Template {
+            system: false,
             network,
             name: format!("t{n}"),
             repos: vec![repo.clone()],
@@ -2219,6 +2266,80 @@ mod tests {
         assert!(templates_from_json(&wrong)
             .unwrap_err()
             .contains("off, allowlist or open"));
+    }
+
+    /// A template's system view: `system = true` in the configuration,
+    /// `"system": true` in the templates file, written only when on, and
+    /// carried to conversations, where only a workspace made from a
+    /// template still listed with it on has it.
+    #[test]
+    fn a_templates_system_view_is_configured_kept_and_carried() {
+        let config = parse("[[template]]\nname = \"sys\"\nsystem = true\n").unwrap();
+        assert!(config.templates.first().unwrap().system);
+        assert!(
+            !parse("[[template]]\nname = \"plain\"\n")
+                .unwrap()
+                .templates
+                .first()
+                .unwrap()
+                .system
+        );
+        let e = parse("[[template]]\nname = \"x\"\nsystem = \"yes\"\n").unwrap_err();
+        assert!(e.contains("true or false"), "{e}");
+        let on = Template {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            repos: Vec::new(),
+            shared: None,
+        };
+        let off = Template {
+            system: false,
+            name: "plain".into(),
+            ..on.clone()
+        };
+        let written = templates_json(&[on.clone(), off.clone()]);
+        assert_eq!(
+            templates_from_json(&written).unwrap(),
+            [on.clone(), off.clone()]
+        );
+        assert_eq!(
+            written.to_string().matches("\"system\"").count(),
+            1,
+            "{written}"
+        );
+        let wrong = td_json::parse(
+            &written
+                .to_string()
+                .replace(r#""system":true"#, r#""system":false"#),
+        )
+        .unwrap();
+        assert!(templates_from_json(&wrong)
+            .unwrap_err()
+            .contains("only as true"));
+        let client = Client {
+            template_shared: vec![
+                TemplateShared {
+                    name: "sys".into(),
+                    shared: None,
+                    network: None,
+                    system: true,
+                },
+                TemplateShared {
+                    name: "plain".into(),
+                    shared: None,
+                    network: None,
+                    system: false,
+                },
+            ],
+            ..Client::default()
+        };
+        let back = Client::from_json(&client.to_json()).unwrap();
+        assert_eq!(back.template_shared, client.template_shared);
+        assert!(back.system_for(&Workspace::Template("sys".into())));
+        assert!(!back.system_for(&Workspace::Template("plain".into())));
+        assert!(!back.system_for(&Workspace::Template("gone".into())));
+        assert!(!back.system_for(&Workspace::Scratch));
     }
 
     /// The dialog's shared folders: paths parted by spaces, read-only
@@ -2270,6 +2391,7 @@ mod tests {
     fn a_scratch_template_made_in_the_window_keeps_its_shared_folders() {
         let templates = vec![
             Template {
+                system: false,
                 network: Some(Network::Off),
                 name: "system".into(),
                 repos: Vec::new(),
@@ -2279,6 +2401,7 @@ mod tests {
                 }]),
             },
             Template {
+                system: false,
                 network: None,
                 name: "plain".into(),
                 repos: Vec::new(),
@@ -2310,6 +2433,7 @@ mod tests {
             assert!(e.contains(why), "{to}: {e}");
         }
         let many = Template {
+            system: false,
             shared: Some(
                 (0..=MAX_TEMPLATE_SHARED)
                     .map(|n| Shared {
@@ -2393,12 +2517,14 @@ mod tests {
         }
         let templates = vec![
             Template {
+                system: false,
                 network: None,
                 name: "td".into(),
                 repos: vec![repo.clone(), local.clone()],
                 shared: None,
             },
             Template {
+                system: false,
                 network: None,
                 name: "notes".into(),
                 repos: vec![local],
@@ -2434,6 +2560,7 @@ mod tests {
         if let (Json::Arr(items), Json::Arr(more)) = (
             &mut twice,
             templates_json(&[Template {
+                system: false,
                 network: None,
                 name: "TD".into(),
                 ..templates.get(1).unwrap().clone()
@@ -2481,6 +2608,7 @@ mod tests {
         // Planned as a workspace: one branch of a remote named twice, and
         // a record past its bound, refused; no sparse path reads back.
         let twice = Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![repo.clone(), repo.clone()],
@@ -2501,6 +2629,7 @@ mod tests {
         )
         .unwrap();
         let long = Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![long],
@@ -2510,6 +2639,7 @@ mod tests {
             .unwrap_err()
             .contains("fewer sparse paths"));
         let none = vec![Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![checked_repo("/srv/td", "main", "a", Some(Vec::new())).unwrap()],
@@ -2773,11 +2903,13 @@ mod tests {
         let mut client = config.client.clone();
         client.template_shared = vec![
             TemplateShared {
+                system: false,
                 name: "open".into(),
                 shared: None,
                 network: Some(Network::Open),
             },
             TemplateShared {
+                system: false,
                 name: "plain".into(),
                 shared: None,
                 network: None,
@@ -2971,11 +3103,13 @@ mod tests {
             }],
             template_shared: vec![
                 TemplateShared {
+                    system: false,
                     name: "notes".into(),
                     shared: Some(own.clone()),
                     network: None,
                 },
                 TemplateShared {
+                    system: false,
                     name: "plain".into(),
                     shared: None,
                     network: None,

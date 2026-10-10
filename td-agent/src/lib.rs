@@ -91,6 +91,7 @@ pub mod sse;
 pub mod store;
 pub mod supervisor;
 pub mod system;
+pub mod sysview;
 pub mod templatedialog;
 pub mod toolhost;
 pub mod tools;

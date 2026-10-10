@@ -2386,6 +2386,9 @@ creates nothing.
   no repository, making an Empty workspace, and its own shared
   directories, which its workspaces bind in place of the configured
   `shared` list.
+- **Any template** may turn on the system view (§8, System view), so
+  its conversations can see what the whole machine is doing; the
+  built-ins never do.
 
 Choosing is the decision: no card follows it but a remote's admission
 (below). A template's repositories are prepared by increment 11's git
@@ -2399,8 +2402,9 @@ and a push names the remote branch it writes (§9).
 editing the configuration, which td-agent never writes: File →
 `New template…`, or the chooser's `New template…` row, opens a dialog of
 td-ui's entries asking a name, a remote, a base, a branch and,
-optionally, sparse paths parted by spaces, a network policy (§10) and
-shared folders. With the remote left empty the template names no
+optionally, sparse paths parted by spaces, a network policy (§10),
+shared folders and the system view (§8, System view), `on` or `off`.
+With the remote left empty the template names no
 repository and its workspace is a scratch directory, as Empty's is,
 the base, branch and sparse paths unread; the shared folders are paths
 parted by spaces, each absolute or under `~`, read-only unless it ends
@@ -2464,11 +2468,12 @@ of `None`) when it names none.
 `templatedialog::TemplateDialog` is composed as the key dialog is, from
 td-ui's `entry_model` entries painted by `chrome::TextEntry`, each under
 its label, `chrome::Buttons` and td-ui's confirmation, centred and at
-most 72 cells wide: a title, what it does, the seven fields (name;
+most 72 cells wide: a title, what it does, the eight fields (name;
 remote, empty for a scratch workspace; base, `main` at first; branch,
 `agent` at first; sparse paths; network, `off`, `allowlist` or `open`,
 any case, or empty for the settings' `network`; shared folders,
-`config::shared_field`'s),
+`config::shared_field`'s; system view, `on`, or `off` or empty, any
+case),
 two rows for a refusal, and Cancel and Save, with Remove between them
 for a template being edited. `Tab`/`Down` and `S-Tab`/`Up` move round
 the fields and buttons; `Return` saves from a field and presses a
@@ -2512,8 +2517,8 @@ has opened meanwhile, the note names the repository and File → New
 template… instead. The driven actions gain `new-template` and
 `edit-template`, which have no chord, and the state gains `template`:
 `none`, or the part the dialog's keyboard is on (`name`, `remote`,
-`base`, `branch`, `sparse`, `network`, `shared`, `cancel`, `remove`,
-`save`, or
+`base`, `branch`, `sparse`, `network`, `shared`, `system`, `cancel`,
+`remove`, `save`, or
 `confirm`); a dialog given input through them saves nothing (§10, As
 built (the policy)), so through the seam they open, cancel and remove.
 
@@ -3295,6 +3300,46 @@ read. What therefore fails in the jail, by design: `git config`, `git
 remote`, a `git sparse-checkout` that names or changes the sparse mode, adding
 worktrees and submodules, and gc; the git worker does gc in a
 maintenance instance.
+
+**System view.** The jail's private PID namespace and missing `/sys`
+mean no command in it can see the machine's other processes, so a
+question such as what is using the CPU has no answer inside it. Handing
+the jail the host's `/proc` would answer it and undo the jail: without
+Landlock, a same-user process's `/proc/<pid>/root` is a read-write way
+into the whole home. A template that turns the system view on
+(`system = true`, §15; the dialog's System view, §7) instead gives its
+conversations `system_status` (§12), which the conversation process
+runs outside the jail and which reads procfs and sysfs alone (the
+user database for names): uptime, load, CPU use over a one-second
+sample, memory and swap, pressure stalls, thermal zones' and hwmon
+chips' temperatures, batteries, and the processes busiest by CPU or
+resident memory, with pid, state, threads, user and command line, at
+most 100, optionally only those whose name or command line holds a
+given text. CPU use is each process's ticks between two samples a
+second apart, timed from the middle of each; a process is matched
+across them by pid and start time, one started after the first counted
+from nothing, and one the first missed, or a pid used again for an
+older process, shown `?`. It starts no program, writes nothing, never
+opens a process's `environ`, `mem`, descriptors or `root`, and the jail
+is unchanged; a command line is the kernel's copy of the process's
+argument memory, which for a process that rewrote its title may run
+into its environment. It runs on a thread of its own and is answered
+after at most 10 s: reading a command line takes that process's memory
+lock, which a process stuck on a hung mount holds, so past that the
+call says so and the thread is left to finish; until it has, a call
+says so at once rather than start another. Turning it on is the
+person's standing decision, so a call asks no card in either mode. What
+it does disclose is every process's command line, other users' included
+where procfs shows them, which can hold a secret passed as an argument;
+that goes to the model's provider as any tool result does, and the
+setting's label and §15 say so. A row shows 200 characters of it, but
+the filter reads 4 KiB, so that is a width, not a bound on what is
+disclosed. The flag is read from the template as the settings give it
+now, as its network policy is, so turning it on, or the settings
+changing otherwise, takes effect at the next turn; turning it off, or
+removing or renaming the template, takes it away at once, even while a
+turn runs: from the next call and the next request's tools. The
+built-ins never have it, and a review has none.
 
 **What the jail does not protect.** Anything outside the jail that later
 acts on a worktree or shared directory is a persistence channel, and much
@@ -4479,6 +4524,7 @@ flag lets injected text lower its own bar.
 | `schedule` | human | human |
 | `schedules`, `cancel_schedule` of the schedules delivering to it | run | run |
 | `skill`, the person's own files | run | run |
+| `system_status`, where the template turns the system view on | run | run |
 | network to a destination on the workspace allowlist, a command's or `web_fetch`'s | run | run |
 | network to another destination, policy `allowlist`, a command's or `web_fetch`'s | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
@@ -4983,7 +5029,11 @@ hidden:
   follow it;
 - a read-only directory's contents reach the provider and the workspace
   once granted, which is why the credential locations of §8 are refused
-  outright rather than left to the classifier.
+  outright rather than left to the classifier;
+- a workspace whose template turns the system view on (§8) reads every
+  process's command line, and a secret one holds is then sensitive
+  access in a tainted workspace, which in `auto` mode only the
+  classifier stands between and an outbound crossing.
 
 **Cards** are drawn by td-agent's chrome from toolkit widgets. Model text
 is rendered as text in the message list, so it cannot draw one. A card
@@ -5107,6 +5157,10 @@ and git tools, as far as the workspace has what they act on.
 - **`web_fetch {url, offset?, max_bytes?}`**: a page's text, fetched by
   the conversation process through the fetch service, its destination
   judged as a command's connection is (below).
+- **`system_status {sort?, limit?, match?}`**: what the machine is
+  doing, read by the conversation process from procfs and sysfs, for a
+  conversation whose template turns the system view on (§8, System
+  view).
 - **`conversations`** and **`send_message`**: other conversations (§3).
 - **`schedule`**, **`schedules`** and **`cancel_schedule`**: a schedule
   delivering a message at set times, made only on the person's card,
@@ -6117,6 +6171,9 @@ default; `jev_threshold`'s is calibrated (§11):
     template's workspaces; absent, the top-level list;
   - `network`: `off`, `allowlist` or `open` for this template's
     workspaces; absent, the top-level `network`
+  - `system`: `true` gives its conversations `system_status`, which
+    reads every process's CPU and memory use and command line outside
+    the jail (§8, System view); default `false`
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is

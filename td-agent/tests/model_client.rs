@@ -2040,6 +2040,7 @@ fn a_template_workspace_binds_its_own_shared_directories() {
                 write: false,
             }],
             template_shared: vec![TemplateShared {
+                system: false,
                 network: None,
                 name: "notes".into(),
                 shared: Some(vec![Shared {
@@ -2063,6 +2064,120 @@ fn a_template_workspace_binds_its_own_shared_directories() {
         );
         h.close();
     }
+}
+
+/// A conversation made from a template with the system view on is
+/// offered `system_status` and has a call to it answered from the host's
+/// /proc, outside any jail; one whose template has it off, or is no
+/// longer configured, is not offered it and has the call refused.
+#[test]
+fn only_a_system_view_template_offers_and_runs_system_status() {
+    use td_agent::config::TemplateShared;
+    for (name, system) in [("sys", true), ("plain", false), ("gone", false)] {
+        let mut h = Harness::new_in(
+            &format!("system-{name}"),
+            Role::Conversation,
+            Some(&format!("template:{name}")),
+            false,
+            vec![
+                Reply::sse("stream-tool-system.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+            ],
+        );
+        h.setup(Client {
+            template_shared: ["sys", "plain"]
+                .into_iter()
+                .map(|template| TemplateShared {
+                    system: template == "sys",
+                    network: None,
+                    name: template.into(),
+                    shared: Some(Vec::new()),
+                })
+                .collect(),
+            ..Client::default()
+        });
+        h.say("What is using my CPU?");
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied", "{name}");
+        let first = h.mock.requests()[0].text();
+        assert_eq!(first.contains("\"system_status\""), system, "{name}");
+        let results = results(&events);
+        assert_eq!(results.len(), 1, "{name}: {results:?}");
+        let (_, content, error) = &results[0];
+        if system {
+            assert!(!error, "{content}");
+            assert!(content.contains("PID"), "{content}");
+        } else {
+            assert!(error, "{name}: {content}");
+            assert!(!content.contains("PID"), "{name}: {content}");
+        }
+        h.close();
+    }
+}
+
+/// Settings that take the system view away while a turn runs take it
+/// at once: a call to `system_status` later in the same reply is
+/// refused, though other settings wait for the turn to end.
+#[test]
+fn a_system_view_taken_away_mid_turn_is_taken_at_once() {
+    use td_agent::config::TemplateShared;
+    let client = |system: bool| Client {
+        template_shared: vec![TemplateShared {
+            system,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    };
+    let mut h = Harness::new_in(
+        "system-revoked",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            Reply::sse("stream-tool-system-revoked.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(client(true));
+    h.say("What is using my CPU?");
+    // The question before it waits for the person while the view is
+    // taken.
+    let (call, _, _) = until_question(&mut h);
+    h.setup(client(false));
+    h.say("1");
+    let withdrawn = h.until(|up| match up {
+        Up::Withdraw { call } => Some(*call),
+        _ => None,
+    });
+    assert_eq!(withdrawn, call);
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    assert!(requests[0].text().contains("\"system_status\""));
+    let results = results(&events);
+    let (_, content, error) = results
+        .iter()
+        .find(|(id, _, _)| id == "toolu_system_02")
+        .unwrap();
+    assert!(*error && !content.contains("PID"), "{content}");
+    // The turn's next request no longer offers it.
+    let turns: Vec<String> = requests
+        .iter()
+        .map(|r| r.text())
+        .filter(|text| text.contains("\"tools\":"))
+        .collect();
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    let offered = |text: &str| {
+        flat(text).iter().any(|(k, v)| {
+            k.starts_with("tools.") && k.ends_with(".function.name") && v == "system_status"
+        })
+    };
+    assert!(offered(&turns[0]) && !offered(&turns[1]));
+    h.close();
 }
 
 /// A message the person sends while a turn runs is taken into it at its
@@ -2293,6 +2408,7 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -2362,6 +2478,7 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -2488,6 +2605,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -2669,6 +2787,7 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -5811,6 +5930,7 @@ fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -7643,6 +7763,7 @@ fn git_push_is_refused_until_it_can_export() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -7800,6 +7921,7 @@ fn prepared(
     git_in(&up, &["commit", "--quiet", "-m", "one"]);
     let remote = "https://example.org/a/td".to_string();
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {
@@ -8578,6 +8700,7 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        system: false,
         network: None,
         name: "td".into(),
         repos: vec![td_agent::config::Repo {

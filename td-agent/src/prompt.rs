@@ -50,6 +50,8 @@ pub struct Place<'a> {
     /// The network its commands reach, and the allowlist (DESIGN.md §10).
     pub network: crate::config::Network,
     pub allowlist: &'a [crate::config::Destination],
+    /// Its template turns the system view on (DESIGN.md §8, System view).
+    pub system: bool,
 }
 
 /// What a workspace's commands reach of the network, as its prefix says
@@ -122,7 +124,7 @@ pub fn prefix_with(created: u64, place: Option<&Place>, skills: Option<&str>) ->
         Some(place) if place.repositories.is_some() => crate::tools::Kit::Repositories,
         Some(_) => crate::tools::Kit::Workspace,
     };
-    crate::tools::prefix(kit, &system)
+    crate::tools::prefix(kit, place.is_some_and(|place| place.system), &system)
 }
 
 /// A repository workspace's project instructions (DESIGN.md §13), none
@@ -445,6 +447,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -520,6 +523,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -591,6 +595,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -620,6 +625,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -678,6 +684,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
@@ -690,6 +697,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Off,
             allowlist: &[],
+            system: false,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(
@@ -774,6 +782,7 @@ mod tests {
             removed: false,
             network: crate::config::Network::Allowlist,
             allowlist: &allowlist,
+            system: false,
         };
         let block = environment(0, "td", Some(&place));
         assert!(

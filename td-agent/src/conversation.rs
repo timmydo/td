@@ -631,6 +631,7 @@ pub fn serve_in(
         human: (0, Ok(crate::rules::Policy::default())),
         mode: crate::config::Mode::Ask,
         braked: false,
+        system_revoked: false,
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -954,6 +955,9 @@ struct Session {
     /// The circuit breaker tripped since the window last sent a policy:
     /// the workspace is in `ask` mode until the policy that says so.
     braked: bool,
+    /// Settings that wait for the turn take the system view away, which
+    /// is taken at once (DESIGN.md §8, System view).
+    system_revoked: bool,
 }
 
 /// A remote whose remote-tracking refs could not be set to `tried`, and
@@ -1092,6 +1096,8 @@ impl Session {
                 Down::Setup { key, client } => {
                     self.network_setup(&client);
                     self.setup = Some((key, *client));
+                    // Later settings still waiting may take it away.
+                    self.system_revoked = self.queue.iter().any(|down| self.revokes(down));
                 }
                 Down::Policy {
                     version,
@@ -1572,8 +1578,35 @@ impl Session {
                 rules,
                 mode,
             } => self.policy(version, rules, mode),
-            down => self.queue.push_back(down),
+            down => {
+                // Settings wait for the turn, but one that takes the
+                // system view away takes it at once (DESIGN.md §8).
+                if self.revokes(&down) {
+                    self.system_revoked = true;
+                }
+                self.queue.push_back(down)
+            }
         }
+    }
+
+    /// Whether `down` is settings that take this conversation's system
+    /// view away.
+    fn revokes(&self, down: &Down) -> bool {
+        match (down, &self.conversation.meta().workspace) {
+            (Down::Setup { client, .. }, Some(workspace)) => !client.system_for(workspace),
+            _ => false,
+        }
+    }
+
+    /// Whether the system view is this conversation's now: its
+    /// template's, as the settings say it, and not taken away by
+    /// settings that wait for the turn to end.
+    fn system_view(&self) -> bool {
+        !self.system_revoked
+            && match (&self.setup, &self.conversation.meta().workspace) {
+                (Some((_, client)), Some(workspace)) => client.system_for(workspace),
+                _ => false,
+            }
     }
 
     /// The human's rules, `version` of them, as the window sent them:
@@ -2645,6 +2678,8 @@ impl Session {
         };
         for (at, call) in calls.iter().enumerate() {
             self.hear();
+            // As the settings give it now, taken away at once.
+            let system_view = self.system_view();
             if self.interrupt {
                 self.result(reply, call, 0, CALL_SKIPPED.into(), true, Beside::default())?;
                 continue;
@@ -2669,17 +2704,20 @@ impl Session {
                 .seq;
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
-            let (answer, beside) = match tools::parse_in(kit, &call.name, &call.arguments) {
-                Ok(Args::Host { call: hosted, acts }) => {
-                    let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
-                    self.host(started, &call.name, hosted, acts, repeated)?
-                }
-                Ok(args) => {
-                    let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
-                    (self.run(started, args, repeated)?, Beside::default())
-                }
-                Err(why) => (Err(why), Beside::default()),
-            };
+            let (answer, beside) =
+                match tools::parse_offered(kit, system_view, &call.name, &call.arguments) {
+                    Ok(Args::Host { call: hosted, acts }) => {
+                        let repeated =
+                            repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
+                        self.host(started, &call.name, hosted, acts, repeated)?
+                    }
+                    Ok(args) => {
+                        let repeated =
+                            repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
+                        (self.run(started, args, repeated)?, Beside::default())
+                    }
+                    Err(why) => (Err(why), Beside::default()),
+                };
             let (content, error) = match answer {
                 Ok(content) => (content, false),
                 Err(why) => (format!("error: {why}"), true),
@@ -3754,6 +3792,7 @@ impl Session {
             removed: meta.removed,
             network,
             allowlist: &client.network_allowlist,
+            system: client.system_for(workspace) && !self.system_revoked,
         };
         Ok(crate::prompt::prefix_with(
             meta.created,
@@ -5150,6 +5189,9 @@ impl Session {
                 max_bytes,
             } => self.web_fetch(started, url, offset, max_bytes, repeated)?,
             Args::Question { question, options } => self.question(started, question, options),
+            // The template's standing decision: no card asks (DESIGN.md
+            // §8, System view).
+            Args::SystemStatus(ask) => Ok(crate::sysview::status(&ask)),
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::GitPush {
                 worktree,
@@ -7627,6 +7669,7 @@ mod tests {
             sparse: None,
         };
         let template = crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![
@@ -7693,6 +7736,7 @@ mod tests {
     #[test]
     fn a_call_into_a_worktree_not_ready_is_told_its_state() {
         let template = crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![

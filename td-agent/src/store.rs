@@ -3642,6 +3642,7 @@ pub mod tests {
         let state = scratch.state();
         assert!(state.load_templates().unwrap().is_empty());
         let templates = vec![crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![crate::config::checked_repo("/srv/git/td", "main", "agent", None).unwrap()],
@@ -3652,6 +3653,7 @@ pub mod tests {
         state.save_templates(&[]).unwrap();
         assert!(state.load_templates().unwrap().is_empty());
         let unchecked = vec![crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![crate::config::Repo {

@@ -1159,6 +1159,7 @@ impl App {
                 .template_shared
                 .iter()
                 .map(|template| crate::config::TemplateShared {
+                    system: template.system,
                     name: template.name.clone(),
                     shared: None,
                     network: template.network,
@@ -8796,7 +8797,7 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         assert_eq!(app.template_dialog().unwrap().editing(), Some("td"));
         assert!(text(&app).contains("Edit template"));
-        for _ in 0..8 {
+        for _ in 0..9 {
             key_live(&mut app, "Tab");
         }
         assert_eq!(app.template_dialog().unwrap().part(), "remove");
@@ -9075,11 +9076,13 @@ pub mod tests {
             network: Network::Allowlist,
             template_shared: vec![
                 crate::config::TemplateShared {
+                    system: false,
                     name: "open".into(),
                     shared: None,
                     network: Some(Network::Open),
                 },
                 crate::config::TemplateShared {
+                    system: false,
                     name: "plain".into(),
                     shared: None,
                     network: None,

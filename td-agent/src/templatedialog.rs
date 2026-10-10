@@ -1,6 +1,6 @@
 //! The dialog File → New template… and Edit template… open (DESIGN.md §7,
 //! Templates made in the window): a modal panel over the window holding a
-//! title, what the dialog does, seven td-ui entries (`entry_model`, painted
+//! title, what the dialog does, eight td-ui entries (`entry_model`, painted
 //! by `chrome::TextEntry`), each under its label, a line for why the
 //! template is refused, and td-ui's buttons: Cancel and Save, and Remove
 //! between them for a template being edited, which td-ui's confirmation
@@ -64,11 +64,16 @@ const FIELDS: &[(&str, &str, usize)] = &[
         "~/notes ~/out:rw",
         SHARED_BYTES,
     ),
+    (
+        "System view: on shows it every process, command lines too",
+        "off or on",
+        SYSTEM_BYTES,
+    ),
 ];
 /// How many fields the dialog has.
 const FIELD_COUNT: usize = FIELDS.len();
-/// The name, remote, base, branch, sparse paths', network's and shared
-/// folders' fields, by place.
+/// The name, remote, base, branch, sparse paths', network's, shared
+/// folders' and system view's fields, by place.
 const NAME: usize = 0;
 const REMOTE: usize = 1;
 const BASE: usize = 2;
@@ -76,6 +81,9 @@ const BRANCH: usize = 3;
 const SPARSE: usize = 4;
 const NETWORK: usize = 5;
 const SHARED: usize = 6;
+const SYSTEM: usize = 7;
+/// The most bytes the system view's field takes.
+const SYSTEM_BYTES: usize = 8;
 /// The most bytes the shared folders' field takes: every folder a
 /// template may name at the longest path, each with `:rw` and a space.
 const SHARED_BYTES: usize = crate::config::MAX_TEMPLATE_SHARED * (crate::config::MAX_NAME + 4);
@@ -113,7 +121,8 @@ impl Part {
             Self::Field(BRANCH) => "branch",
             Self::Field(SPARSE) => "sparse",
             Self::Field(NETWORK) => "network",
-            Self::Field(_) => "shared",
+            Self::Field(SHARED) => "shared",
+            Self::Field(_) => "system",
             Self::Cancel => "cancel",
             Self::Remove => "remove",
             Self::Save => "save",
@@ -211,7 +220,7 @@ impl TemplateDialog {
     pub fn new_template(surface: Surface, remote: Option<&str>) -> Result<Self, String> {
         Self::open(
             surface,
-            ["", remote.unwrap_or(""), "main", "agent", "", "", ""],
+            ["", remote.unwrap_or(""), "main", "agent", "", "", "", ""],
             None,
         )
     }
@@ -235,6 +244,7 @@ impl TemplateDialog {
         };
         let network = template.network.map_or("", crate::config::Network::name);
         let shared = crate::config::shared_text(template.shared.as_deref());
+        let system = if template.system { "on" } else { "" };
         Self::open(
             surface,
             [
@@ -245,6 +255,7 @@ impl TemplateDialog {
                 &sparse,
                 network,
                 &shared,
+                system,
             ],
             Some(template.clone()),
         )
@@ -317,7 +328,7 @@ impl TemplateDialog {
     }
 
     /// The text of field `at`: name, remote, base, branch, sparse paths,
-    /// network, shared folders.
+    /// network, shared folders, system view.
     pub fn text(&self, at: usize) -> &str {
         self.entries.get(at).map_or("", EntryModel::text)
     }
@@ -509,7 +520,8 @@ impl TemplateDialog {
             Ok(name) => name,
             Err(why) => return self.refuse(NAME, why),
         };
-        let (remote, network, shared) = (text(REMOTE), text(NETWORK), text(SHARED));
+        let (remote, network, shared, system) =
+            (text(REMOTE), text(NETWORK), text(SHARED), text(SYSTEM));
         let others: Vec<crate::config::Repo> = self
             .editing
             .as_ref()
@@ -548,8 +560,14 @@ impl TemplateDialog {
             Ok(shared) => shared,
             Err(why) => return self.refuse(SHARED, why),
         };
+        let system = match system.to_ascii_lowercase().as_str() {
+            "" | "off" => false,
+            "on" => true,
+            _ => return self.refuse(SYSTEM, "the system view is on or off"),
+        };
         Reply::Save {
             template: Template {
+                system,
                 network,
                 name,
                 repos,
@@ -1012,9 +1030,10 @@ mod tests {
                 dialog.text(3),
                 dialog.text(4),
                 dialog.text(5),
-                dialog.text(6)
+                dialog.text(6),
+                dialog.text(7)
             ],
-            ["", "/srv/git/td", "main", "agent", "", "", ""]
+            ["", "/srv/git/td", "main", "agent", "", "", "", ""]
         );
         assert_eq!(
             dialog.key("Return", false, &mut NoClipboard),
@@ -1064,6 +1083,7 @@ mod tests {
             dialog.key("Return", false, &mut NoClipboard),
             Reply::Save {
                 template: Template {
+                    system: false,
                     network: None,
                     name: "td".into(),
                     repos: vec![crate::config::checked_repo(
@@ -1127,6 +1147,24 @@ mod tests {
             template.shared,
             crate::config::shared_field("~/notes /srv/out:rw").unwrap()
         );
+        assert!(!template.system);
+        // The system view: on, off, or empty for off.
+        dialog.key("Tab", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "system");
+        typed(&mut dialog, "maybe");
+        dialog.key("Return", false, &mut NoClipboard);
+        assert_eq!(dialog.part(), "system");
+        assert!(
+            dialog.message().unwrap().contains("on or off"),
+            "{:?}",
+            dialog.message()
+        );
+        clear(&mut dialog);
+        typed(&mut dialog, "On");
+        let Reply::Save { template, .. } = dialog.key("Return", false, &mut NoClipboard) else {
+            panic!("not saved");
+        };
+        assert!(template.system);
         // Escape cancels, from anywhere; Tab goes round the buttons.
         for _ in 0..2 {
             dialog.key("Tab", false, &mut NoClipboard);
@@ -1164,17 +1202,31 @@ mod tests {
             template.shared,
             crate::config::shared_field("~/notes:rw").unwrap()
         );
-        let mut edited = TemplateDialog::edit(surface(), template.clone()).unwrap();
-        assert_eq!([edited.text(1), edited.text(6)], ["", "~/notes:rw"]);
+        let mut edited = TemplateDialog::edit(
+            surface(),
+            Template {
+                system: true,
+                ..template.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            [edited.text(1), edited.text(6), edited.text(7)],
+            ["", "~/notes:rw", "on"]
+        );
         assert_eq!(
             edited.key("Return", false, &mut NoClipboard),
             Reply::Save {
-                template: template.clone(),
+                template: Template {
+                    system: true,
+                    ..template.clone()
+                },
                 replacing: Some("system".into()),
             }
         );
         let repo = crate::config::checked_repo("/srv/git/td", "main", "agent", None).unwrap();
         let two = Template {
+            system: false,
             repos: vec![repo.clone(), repo],
             ..template
         };
@@ -1199,6 +1251,7 @@ mod tests {
         let second =
             crate::config::checked_repo("https://example.org/a/b", "main", "agent", None).unwrap();
         let template = Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![first, second.clone()],
@@ -1222,7 +1275,7 @@ mod tests {
         assert_eq!(saved.repos[0].base, "next");
         assert_eq!(saved.repos[1], second);
         // Remove: asked, cancelled, kept; asked, confirmed, removed.
-        for _ in 0..6 {
+        for _ in 0..7 {
             dialog.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(dialog.part(), "remove");
@@ -1241,7 +1294,7 @@ mod tests {
         );
         // A new template's dialog has no Remove.
         let mut new = TemplateDialog::new_template(surface(), None).unwrap();
-        for _ in 0..8 {
+        for _ in 0..9 {
             new.key("Tab", false, &mut NoClipboard);
         }
         assert_eq!(new.part(), "save");
@@ -1255,6 +1308,7 @@ mod tests {
         for sparse in [Some(vec!["docs/API guide".to_string()]), Some(Vec::new())] {
             let repo = crate::config::checked_repo("/srv/td", "main", "a", sparse.clone()).unwrap();
             let template = Template {
+                system: false,
                 network: None,
                 name: "td".into(),
                 repos: vec![repo],
@@ -1284,6 +1338,7 @@ mod tests {
     #[test]
     fn the_pointer_presses_buttons_and_focuses_fields() {
         let template = Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: vec![crate::config::checked_repo("/srv/td", "main", "a", None).unwrap()],

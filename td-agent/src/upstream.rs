@@ -96,6 +96,7 @@ mod tests {
 
     fn meta(remotes: &[(&str, &str)], archived: bool, removed: bool) -> Meta {
         let template = crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: remotes

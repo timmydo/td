@@ -918,6 +918,7 @@ impl Session {
             &templates,
             |template| match &admitted {
                 Some((name, own)) if *name == template.name => Some(TemplateShared {
+                    system: template.system,
                     name: template.name.clone(),
                     shared: own.clone(),
                     network: template.network,
@@ -2593,6 +2594,7 @@ pub fn run(
                         .map(|note| format!("template {:?}: {note}", template.name)),
                 );
                 client.template_shared.push(TemplateShared {
+                    system: template.system,
                     name: template.name.clone(),
                     shared,
                     network: template.network,
@@ -3172,6 +3174,7 @@ mod tests {
     fn a_template_saved_in_the_window_is_named_once_and_shares_the_top_level() {
         let repo = crate::config::checked_repo("/srv/td", "main", "a", None).unwrap();
         let template = |name: &str| crate::config::Template {
+            system: false,
             network: None,
             name: name.into(),
             repos: vec![repo.clone()],
@@ -3215,11 +3218,13 @@ mod tests {
         let own = Some(Vec::new());
         let held = vec![
             TemplateShared {
+                system: false,
                 name: "td".into(),
                 shared: own.clone(),
                 network: None,
             },
             TemplateShared {
+                system: false,
                 name: "notes".into(),
                 shared: None,
                 network: None,
@@ -3231,6 +3236,7 @@ mod tests {
         let listed = [listed.as_slice(), &[template("gone")]].concat();
         let shared = template_shared(&held, &configured, &listed, |t| {
             (t.name != "gone").then(|| TemplateShared {
+                system: t.system,
                 name: t.name.clone(),
                 shared: t.shared.as_ref().map(|_| {
                     vec![crate::workspace::Shared {
@@ -3253,6 +3259,7 @@ mod tests {
     #[test]
     fn templates_made_in_the_window_follow_the_configurations() {
         let template = |name: &str| crate::config::Template {
+            system: false,
             network: None,
             name: name.into(),
             repos: Vec::new(),
@@ -3290,6 +3297,7 @@ mod tests {
             write,
         };
         let template = |own: Option<Vec<crate::workspace::Shared>>| crate::config::Template {
+            system: false,
             network: None,
             name: "own".into(),
             repos: Vec::new(),
@@ -3398,6 +3406,7 @@ mod tests {
         assert!(local_remote(&remote, &places, &reached(&[], &top)).is_err());
         let templated = Client {
             template_shared: vec![crate::config::TemplateShared {
+                system: false,
                 name: "t".into(),
                 shared: Some(vec![shared(repo.join("refs"))]),
                 network: None,
@@ -3414,6 +3423,7 @@ mod tests {
     #[test]
     fn a_conversation_asks_only_what_its_record_names() {
         let template = crate::config::Template {
+            system: false,
             network: None,
             name: "td".into(),
             repos: ["main", "next"]
