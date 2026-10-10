@@ -5655,13 +5655,14 @@ it cannot reach a server the model started, nor the model's commands it.
 
 *Results.* A result's `content` items become the call's text in order,
 joined by blank lines: `text` as it is, a `resource` with `text` as that
-text, a `resource_link` as its URI, and any other item (an image, audio,
-a resource of bytes) as a line saying what td-agent did not show; with
-no content, `structuredContent` encoded. `isError` makes it an error
-result; a JSON-RPC error makes one naming its code and message. The text
-is cut as a `shell` call's output is, to a head and a tail (§12), and
-kept in the log as a `shell` call's is. It reaches the model as a tool
-result, which is data (§13), never as the person's words.
+text, a `resource_link` as a line naming its URI made visible, and any
+other item (an image, audio, a resource of bytes) as a line saying what
+td-agent did not show; with no content, `structuredContent` encoded.
+`isError` makes it an error result; a JSON-RPC error makes one naming
+its code and message. The text is cut as a `shell` call's output is, to
+a head and a tail (§12), and kept in the log as a `shell` call's is. It
+reaches the model as a tool result, which is data (§13), never as the
+person's words.
 
 *Failures.* A server that cannot be started, fails `initialize` or
 `tools/list`, breaks the protocol, or exits while its process runs, is
@@ -5712,6 +5713,44 @@ text, both waiting for room; after the program ends, what is left is
 read until its pipes close or are quiet for 300 ms, for at most a
 minute; a cancel ends that reading too, and one that ends the program
 reads none of what is left. Nothing uses it yet.
+
+**As built (MCP, the protocol).** `src/mcp.rs` speaks to a server over
+a `Transport`, which never waits on the server to send: what cannot go
+yet it holds, within a bound of its own, and sends as it is next asked
+for output, which it waits for until a deadline; the servers' step puts
+a `serve` call behind it. A line is cut at each newline, a trailing
+carriage return dropped and not counted, an empty line skipped; the
+lines a piece completes past the answer a wait was for are kept for the
+next read. `initialize` and every page of `tools/list` share the
+start's deadline, which the caller moves while the start's clock is
+stopped, and are never cancelled: a timeout, a JSON-RPC error, a reply
+without what it must carry, or the server's own end (its stop, never a
+turn's interrupt, which ends only the turn's wait) ends the server, said
+as which; an empty `nextCursor` ends the listing as none does, and at
+most 1,024 tools are kept from its pages, the rest left as pages past
+the eighth are. A call's wait asks its stop between pieces, at most a
+tenth of a second apart, and a result that is not an object ends the
+server. A reply's id is a number td-agent gave or none; a reply to no
+request outstanding is dropped, and one to a request abandoned forgets
+it; an error whose id is null, a request the server could not read,
+ends the server. A tool's description is made visible line by line, its
+line breaks kept, only as much as could show, and cut never within a
+`<U+XXXX>`. A tool a template's `tools` does not name is neither checked
+nor said; one listed again is said to repeat the first listing, offered
+or not; one server offers at most 128; what was left out is said for
+the first 32 tools and counted past them, and names a tool `tools`
+names that the server does not list, once. The 128 tools and 128 KiB
+are counted over every server in the template's order, and everything
+from the first tool that does not fit is left out. A server's text in
+what td-agent says, the JSON parser's words about a line included, is
+one line made visible and cut to 1,000 characters; there and in a
+description, a `<U+` of the server's own is named too, as a card names
+it, so every name shown is td-agent's. The servers' step counts the
+`list_changed` that the client notes, and cuts and logs a result's
+text; its transport holds what the client's window has no room for and
+retries it in short slices as it waits, since a `took` frees room on
+the reader thread without waking a wait, and turns a wait with no call
+open, or the `serve` call's end, into the server's end.
 
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
@@ -7584,7 +7623,8 @@ one commit:
   and its bounds, `initialize`, `tools/list` and its pages, `tools/call`
   and its results, the server's requests and notifications, timeouts,
   cancelling and abandoned replies, and the tools checked, cut and
-  encoded as offered; tested against a server in the test over pipes.
+  encoded as offered; tested against a server in the test, in memory
+  and over a socket.
 - **Configuration and rules.** `template.mcp` read and checked and
   carried to the conversation in its template settings, refused in a
   template made in the window; a conversation made from a template
@@ -7598,8 +7638,10 @@ one commit:
   on them; `mcp__SERVER__TOOL` calls dispatched with their cards,
   rules and results; failures told as notifications; tested with a
   fake server in the test and, jailed, with a small stdio server run
-  by `sh`. `web_fetch`, `question`, `task`'s sub-agents, schedules,
-skills, the person's commands and `/review` are built (§3, §12, §15).
+  by `sh`.
+
+`web_fetch`, `question`, `task`'s sub-agents, schedules, skills, the
+person's commands and `/review` are built (§3, §12, §15).
 
 ## 19. Open questions
 

@@ -56,6 +56,7 @@ pub mod host;
 pub mod jail;
 pub mod key;
 pub mod keydialog;
+pub mod mcp;
 pub mod menu;
 pub mod models;
 pub mod notes;
