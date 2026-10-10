@@ -2358,7 +2358,15 @@ dependency.
 planning, bounded history pruning, backup and unreferenced-blob deletion scheduling.
 
 Use the existing SQLite core for mailbox/email/thread/submission metadata;
-do not add a second replay or checkpoint implementation. Final recipient
+do not add a second replay or checkpoint implementation.
+Object commit requests now carry their captured store epoch. Both typed
+and encoded paths refuse a pre-restore epoch even when the restored
+account sequence matches, before reading prepared sources or SQL writes.
+Native tests reproduce the prior stale commit, then check unread sources,
+unchanged metadata/history, current-epoch sequence refusal, a successful
+current-epoch retry and durable body/metadata reopening. Existing fixtures
+supply their intended epoch. This does not add authentication, revocation
+or logical reservation coordination, and changes no resource cap. Final recipient
 coverage, aggregate queue-state validation and preservation of the named
 immutable queue identity/uncertainty/attempt-history fields are implemented
 in the core, including one-way Pending/Stored failure-notice history and

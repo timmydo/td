@@ -96,6 +96,7 @@ fn commit(
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(expected),
                 utc_ms: 0,
                 deadline: deadline()
@@ -528,6 +529,7 @@ fn whole_store_usage_fence_keeps_writes_busy_but_old_views_readable() {
     let remove = Operation::delete(Table::Blobs, BODY.as_bytes()).unwrap();
     let request = CommitRequest {
         account: ACCOUNT,
+        epoch: store.epoch(),
         expected: Sequence::from_u64(1),
         utc_ms: 0,
         deadline: deadline(),

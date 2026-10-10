@@ -356,6 +356,7 @@ fn all_passes_retain_one_native_wal_snapshot_while_the_writer_replaces_rows() {
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 deadline,
                 utc_ms: 0,
@@ -386,6 +387,7 @@ fn all_passes_retain_one_native_wal_snapshot_while_the_writer_replaces_rows() {
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(1),
                 deadline,
                 utc_ms: 0,
@@ -478,6 +480,7 @@ fn account_reports_bind_all_identity_fields_and_declared_blob_counts() {
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 deadline,
                 utc_ms: 0,
@@ -491,6 +494,7 @@ fn account_reports_bind_all_identity_fields_and_declared_blob_counts() {
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(1),
                 deadline,
                 utc_ms: 0,
@@ -591,6 +595,7 @@ fn account_reports_preserve_matching_old_wal_results_and_refuse_cross_snapshot_p
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 deadline,
                 utc_ms: 0,
@@ -613,6 +618,7 @@ fn account_reports_preserve_matching_old_wal_results_and_refuse_cross_snapshot_p
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(1),
                 deadline,
                 utc_ms: 0,

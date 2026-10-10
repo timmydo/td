@@ -43,9 +43,10 @@ impl Clock for Fixed {
 fn deadline() -> Deadline {
     Deadline::after(Tick(0), 100).unwrap()
 }
-fn request(sequence: u64) -> CommitRequest {
+fn request(epoch: StoreEpoch, sequence: u64) -> CommitRequest {
     CommitRequest {
         account: ACCOUNT,
+        epoch,
         expected: Sequence::from_u64(sequence),
         utc_ms: 0,
         deadline: deadline(),
@@ -145,7 +146,7 @@ fn crash_child() {
             store
                 .commit(
                     &td_crypto::Provider,
-                    request(0),
+                    request(store.epoch(), 0),
                     &operations,
                     &mut [BlobSource {
                         id: BLOB,
@@ -269,7 +270,7 @@ fn abrupt_death_before_and_after_commit_recovers_atomic_body_and_metadata() {
                 store
                     .commit(
                         &td_crypto::Provider,
-                        request(0),
+                        request(store.epoch(), 0),
                         &[Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap()],
                         &mut [BlobSource {
                             id: BLOB,
@@ -374,7 +375,7 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
         store
             .commit(
                 &td_crypto::Provider,
-                request(0),
+                request(store.epoch(), 0),
                 &operations,
                 &mut [
                     BlobSource {
@@ -391,7 +392,7 @@ fn stopped_checkpoint_backup_restores_bodies_metadata_and_queue_retention() {
         store
             .commit(
                 &td_crypto::Provider,
-                request(1),
+                request(store.epoch(), 1),
                 &[Operation::delete(Table::Emails, deleted_email.as_bytes()).unwrap()],
                 &mut [],
             )
@@ -593,7 +594,7 @@ fn abrupt_death_during_backup_copy_and_after_receipt_preserves_source_and_phase(
             store
                 .commit(
                     &td_crypto::Provider,
-                    request(0),
+                    request(store.epoch(), 0),
                     &[
                         Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
                         Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),
@@ -736,7 +737,7 @@ fn backup_preserves_digest_damage_without_granting_account_verification() {
     store
         .commit(
             &td_crypto::Provider,
-            request(0),
+            request(store.epoch(), 0),
             &[
                 Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
                 Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),
@@ -934,7 +935,7 @@ fn public_backup_copy_refusals_and_link_collision_preserve_locked_source() {
         store
             .commit(
                 &td_crypto::Provider,
-                request(0),
+                request(store.epoch(), 0),
                 &[
                     Operation::put(Table::Blobs, BLOB.as_bytes(), &blob).unwrap(),
                     Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &mailbox).unwrap(),

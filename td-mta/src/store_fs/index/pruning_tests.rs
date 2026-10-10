@@ -115,6 +115,7 @@ fn mailbox_commit(store: &IndexStore<'_>, expected: u64, fresh: bool) {
             &td_crypto::Provider,
             CommitRequest {
                 account: ACCOUNT,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(expected),
                 utc_ms: 0,
                 deadline: deadline()
@@ -746,6 +747,7 @@ fn pruned_reader_scenario(scenario: PrunedScenario) {
             &td_crypto::Provider,
             CommitRequest {
                 account: ACCOUNT,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 utc_ms: 0,
                 deadline: deadline()
@@ -1179,6 +1181,7 @@ fn shared_account_cleanup(partial_inputs: bool) {
                 &td_crypto::Provider,
                 CommitRequest {
                     account,
+                    epoch: store.epoch(),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline()

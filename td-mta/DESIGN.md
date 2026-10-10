@@ -16,7 +16,10 @@ Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
 encoded input to caller-reserved offset slots without copying row data;
 the SQLite writer consumes that binding through its shared commit path.
-Authenticated transaction coordination remains separate. SQLite owns
+Typed and encoded object commits require a captured store epoch as well
+as the expected account sequence. A stale epoch refuses before body reads
+or SQL writes, including after restore preserves the endpoint under a
+fresh epoch. Authenticated transaction coordination remains separate. SQLite owns
 relational metadata, immutable
 body chunks, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata

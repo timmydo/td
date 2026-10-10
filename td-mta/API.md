@@ -6698,8 +6698,19 @@ owns encoded replay, admission lifetime and prepared-source requirements.
 
 IndexStore::commit accepts Crypto, CommitRequest, a bounded Operation slice
 and a mutable slice of BlobSource { id, source: &mut dyn std::io::Read }.
-CommitRequest carries account, expected sequence, UTC validation time and
-one monotonic deadline. Every fresh BlobRow requires a matching source with
+CommitRequest carries account, captured store epoch, expected sequence,
+UTC validation time and one monotonic deadline. Under the writer fence,
+both typed and encoded commits compare the request epoch to the opened
+store before operation/source processing, WAL admission or SQL writes.
+A mismatch returns Rejected(Conflict) without reading a body or retiring
+writes. Capture this epoch with the state used to plan the request; do
+not replace a stale epoch with the current one merely to permit a retry.
+A fresh restore keeps account sequences but changes epoch, so old requests
+cannot commit against an equal restored endpoint. The ordinary expected
+sequence comparison remains inside BEGIN IMMEDIATE. Writer/clock refusal
+can precede either comparison. This is optimistic store identity checking,
+not account authorization, policy revocation or quota reconciliation.
+Every fresh BlobRow requires a matching source with
 exact length, digest and EOF; a supplied source matches exactly one Blob PUT.
 A 32 MiB hard maximum applies before reading;
 chunks are at most 64 KiB. A permanent SQLite registry prevents deleted blob

@@ -121,6 +121,7 @@ fn fill(store: &IndexStore<'_>, started: Instant) -> Vec<(BlobId, BlobRow)> {
             &td_crypto::Provider,
             CommitRequest {
                 account: ACCOUNT,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(bodies.len() as u64),
                 utc_ms: 0,
                 deadline: deadline(),

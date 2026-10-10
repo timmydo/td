@@ -400,6 +400,8 @@ pub struct IndexStore<'r> {
 #[derive(Clone, Copy, Debug)]
 pub struct CommitRequest {
     pub account: AccountId,
+    /// Store epoch captured when planning this transaction.
+    pub epoch: StoreEpoch,
     pub expected: Sequence,
     pub utc_ms: i64,
     pub deadline: Deadline,
@@ -797,6 +799,9 @@ impl<'r> IndexStore<'r> {
         sources: &mut [BlobSource<'_>],
         scratch: &mut [u8],
     ) -> Result<Sequence, ports::Error> {
+        if request.epoch != self.epoch {
+            return Err(ports::Error::Conflict);
+        }
         let (scratch, values) = scratch
             .split_at_mut_checked(65536)
             .ok_or(ports::Error::Corrupt)?;
@@ -1868,6 +1873,7 @@ mod tests {
                 ];
                 let request = CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -1988,6 +1994,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -2017,6 +2024,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(1),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -2228,6 +2236,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2245,6 +2254,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(1),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -2305,6 +2315,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2321,6 +2332,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -2335,6 +2347,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(1),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2351,6 +2364,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(1),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2417,6 +2431,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(u64::MAX - 1),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2431,6 +2446,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(u64::MAX),
                     utc_ms: 0,
                     deadline: deadline()
@@ -2543,6 +2559,7 @@ mod tests {
                     &td_crypto::Provider,
                     CommitRequest {
                         account: ACCOUNT,
+                        epoch: StoreEpoch::from_bytes([9; 16]),
                         expected: Sequence::default(),
                         utc_ms: 0,
                         deadline: deadline(),
@@ -2654,6 +2671,7 @@ mod tests {
                     &td_crypto::Provider,
                     CommitRequest {
                         account: ACCOUNT,
+                        epoch: StoreEpoch::from_bytes([9; 16]),
                         expected: Sequence::default(),
                         utc_ms: 0,
                         deadline: deadline(),
@@ -2803,6 +2821,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::from_u64(endpoint),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -2923,6 +2942,7 @@ mod tests {
         }
         let request = CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::default(),
             utc_ms: 0,
             deadline: deadline(),
@@ -3030,6 +3050,7 @@ mod tests {
         let created = Operation::change(ObjectType::Mailbox, ChangeAction::Created, ID.as_bytes());
         let request = CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::default(),
             utc_ms: 0,
             deadline: deadline(),
@@ -3200,6 +3221,7 @@ mod tests {
         let op = Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap();
         let request = CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::default(),
             utc_ms: 0,
             deadline: deadline(),
@@ -3250,6 +3272,7 @@ mod tests {
     fn request(sequence: u64) -> CommitRequest {
         CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::from_u64(sequence),
             utc_ms: 0,
             deadline: deadline(),
@@ -3412,7 +3435,10 @@ mod tests {
             assert_eq!(
                 store.commit(
                     &td_crypto::Provider,
-                    request(0),
+                    CommitRequest {
+                        epoch,
+                        ..request(0)
+                    },
                     &[put],
                     &mut [BlobSource {
                         id,
@@ -3446,7 +3472,10 @@ mod tests {
                 assert_eq!(
                     store.commit(
                         &td_crypto::Provider,
-                        request(1),
+                        CommitRequest {
+                            epoch,
+                            ..request(1)
+                        },
                         &[Operation::delete(Table::Blobs, id.as_bytes()).unwrap()],
                         &mut []
                     ),
@@ -3528,7 +3557,10 @@ mod tests {
             assert_eq!(
                 store.commit(
                     &td_crypto::Provider,
-                    request(2),
+                    CommitRequest {
+                        epoch,
+                        ..request(2)
+                    },
                     &[put],
                     &mut [BlobSource {
                         id,
@@ -3561,7 +3593,10 @@ mod tests {
             assert_eq!(
                 reopened.commit(
                     &td_crypto::Provider,
-                    request(2),
+                    CommitRequest {
+                        epoch,
+                        ..request(2)
+                    },
                     &[put],
                     &mut [BlobSource {
                         id,
@@ -4491,6 +4526,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline()
@@ -4546,6 +4582,7 @@ mod tests {
                 &td_crypto::Provider,
                 CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline()
@@ -4661,6 +4698,7 @@ mod tests {
         ) -> Result<Sequence, CommitError> {
             let request = CommitRequest {
                 account: ACCOUNT,
+                epoch: StoreEpoch::from_bytes([9; 16]),
                 expected: Sequence::from_u64(expected),
                 utc_ms: 0,
                 deadline: deadline(),
@@ -4848,6 +4886,7 @@ mod tests {
         let clock = Arc::new(RealClock(std::time::Instant::now()));
         let request = |expected| CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::from_u64(expected),
             utc_ms: 0,
             deadline: Deadline::after(clock.sample().unwrap().monotonic, 30_000).unwrap(),
@@ -6329,6 +6368,7 @@ mod tests {
                         &td_crypto::Provider,
                         CommitRequest {
                             account,
+                            epoch: StoreEpoch::from_bytes([9; 16]),
                             expected: Sequence::default(),
                             deadline: deadline(),
                             utc_ms: 0,
@@ -6415,6 +6455,7 @@ mod tests {
         ) -> Result<Sequence, CommitError> {
             let request = CommitRequest {
                 account,
+                epoch: StoreEpoch::from_bytes([9; 16]),
                 expected: Sequence::from_u64(expected),
                 utc_ms: 0,
                 deadline: deadline(),
@@ -6724,6 +6765,7 @@ mod tests {
         Key::Membership(email, ID).encode(&mut member_key).unwrap();
         let request = |sequence| CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::from_u64(sequence),
             utc_ms: 0,
             deadline: deadline(),
@@ -6851,6 +6893,7 @@ mod tests {
         }));
         let request = |sequence, utc_ms| CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::from_u64(sequence),
             utc_ms,
             deadline: deadline(),
@@ -7100,6 +7143,7 @@ mod tests {
                 let op = Operation::put(Table::Mailboxes, ID.as_bytes(), &parent).unwrap();
                 let mut request = CommitRequest {
                     account: ACCOUNT,
+                    epoch: StoreEpoch::from_bytes([9; 16]),
                     expected: Sequence::default(),
                     utc_ms: 0,
                     deadline: deadline(),
@@ -7178,6 +7222,7 @@ mod tests {
         let child_op = Operation::put(Table::Mailboxes, child_id.as_bytes(), &child).unwrap();
         let mut request = CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::default(),
             utc_ms: 0,
             deadline: deadline(),
@@ -7242,6 +7287,7 @@ mod tests {
         let op = Operation::put(Table::Mailboxes, ID.as_bytes(), &value).unwrap();
         let request = CommitRequest {
             account: ACCOUNT,
+            epoch: StoreEpoch::from_bytes([9; 16]),
             expected: Sequence::default(),
             utc_ms: 0,
             deadline: deadline(),

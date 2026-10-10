@@ -274,6 +274,7 @@ fn maximum_distinct_encoded_history_batch_fits_a_production_commit_deadline() {
     let clock = Arc::new(RealClock(std::time::Instant::now()));
     let request = |sequence| CommitRequest {
         account: ACCOUNT,
+        epoch: StoreEpoch::from_bytes([4; 16]),
         expected: Sequence::from_u64(sequence),
         utc_ms: 0,
         deadline: Deadline::after(clock.sample().unwrap().monotonic, 30_000).unwrap(),

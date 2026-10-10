@@ -70,6 +70,7 @@ fn apply(
             &td_crypto::Provider,
             CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: Sequence::from_u64(expected),
                 utc_ms: 0,
                 deadline: deadline()

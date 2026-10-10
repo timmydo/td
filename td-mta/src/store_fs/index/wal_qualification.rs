@@ -104,6 +104,7 @@ fn put_body(store: &IndexStore<'_>) {
             &td_crypto::Provider,
             CommitRequest {
                 account: ACCOUNT,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 utc_ms: 0,
                 deadline: deadline(),

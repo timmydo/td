@@ -67,10 +67,175 @@ impl ports::Entropy for Entropy {
 fn request(expected: u64) -> CommitRequest {
     CommitRequest {
         account: ACCOUNT,
+        epoch: EPOCH,
         expected: Sequence::from_u64(expected),
         utc_ms: 0,
         deadline: deadline(),
     }
+}
+
+fn commit_form(
+    store: &IndexStore<'_>,
+    request: CommitRequest,
+    operations: &[Operation<'_>],
+    source: &mut std::io::Cursor<&[u8]>,
+    encoded: bool,
+) -> Result<Sequence, CommitError> {
+    let mut sources = [BlobSource {
+        id: BlobId::from_bytes([11; 16]),
+        source,
+    }];
+    if !encoded {
+        return store.commit(&td_crypto::Provider, request, operations, &mut sources);
+    }
+    let mut bytes = vec![0; 1024];
+    let mut length = 0;
+    for operation in operations {
+        length += operation.encode(&mut bytes[length..]).unwrap();
+    }
+    bytes.truncate(length);
+    let mut slots = vec![None; operations.len()];
+    let batch = crate::format::batch::Batch::decode(
+        ports::TransactionInput {
+            bytes: &bytes,
+            count: operations.len(),
+        },
+        &mut slots,
+    )
+    .unwrap();
+    store.commit_batch(&td_crypto::Provider, request, &batch, &mut sources)
+}
+
+fn stale_epoch_commit(encoded: bool) {
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    let mut source_root = source.locked();
+    let mut destination_root = destination.locked();
+    let store = IndexStore::create(&mut source_root, EPOCH, clock(), 2, deadline()).unwrap();
+    seed(&store);
+    let captured = store.view(ACCOUNT, deadline()).unwrap().identity();
+    let stale = CommitRequest {
+        account: captured.account,
+        epoch: captured.epoch,
+        expected: captured.committed_sequence,
+        utc_ms: 0,
+        deadline: deadline(),
+    };
+    store
+        .backup(&mut destination_root, deadline(), &mut [0; 65536])
+        .unwrap();
+    let restored = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    let restored = restored
+        .renew_epoch(&mut Entropy::fresh(), deadline())
+        .unwrap();
+    drop(restored);
+    let restored = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    inspect(&restored, FRESH);
+    let current = restored.view(ACCOUNT, deadline()).unwrap().identity();
+    assert_eq!(current.committed_sequence, stale.expected);
+    assert_ne!(current.epoch, stale.epoch);
+
+    let id = BlobId::from_bytes([11; 16]);
+    let body = encode(Row::Blob(blob()));
+    let value = encode(mailbox("current epoch commit"));
+    let operations = [
+        Operation::put(Table::Blobs, id.as_bytes(), &body).unwrap(),
+        Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &value).unwrap(),
+        Operation::change(
+            ObjectType::Mailbox,
+            ChangeAction::Updated,
+            MAILBOX.as_bytes(),
+        ),
+    ];
+    let mut input = std::io::Cursor::new(RAW);
+    assert_eq!(
+        commit_form(&restored, stale, &operations, &mut input, encoded),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    );
+    assert_eq!(input.position(), 0);
+    inspect(&restored, FRESH);
+    let mut bytes = [0; 128];
+    assert!(restored
+        .view(ACCOUNT, deadline())
+        .unwrap()
+        .get(Key::Blob(id), &mut bytes)
+        .unwrap()
+        .is_none());
+
+    let active = CommitRequest {
+        epoch: current.epoch,
+        ..stale
+    };
+    assert_eq!(
+        commit_form(
+            &restored,
+            CommitRequest {
+                expected: Sequence::from_u64(1),
+                ..active
+            },
+            &operations,
+            &mut input,
+            encoded,
+        ),
+        Err(CommitError::Rejected(ports::Error::Conflict))
+    );
+    assert_eq!(input.position(), 0);
+    assert_eq!(
+        commit_form(&restored, active, &operations, &mut input, encoded),
+        Ok(Sequence::from_u64(3))
+    );
+    assert_eq!(input.position(), RAW.len() as u64);
+    restored.checkpoint(deadline()).unwrap();
+    drop(restored);
+    let restored = IndexStore::open(&mut destination_root, clock(), 2, deadline()).unwrap();
+    restored.validate_integrity(deadline()).unwrap();
+    let mut view = restored.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity().epoch, FRESH);
+    assert_eq!(view.identity().committed_sequence, Sequence::from_u64(3));
+    assert_eq!(view.identity().history_floor, captured.history_floor);
+    assert_eq!(
+        view.get(Key::Mailbox(MAILBOX), &mut bytes).unwrap(),
+        Some((mailbox("current epoch commit"), Sequence::from_u64(3)))
+    );
+    assert_eq!(
+        view.next_change(
+            ChangeCursor {
+                sequence: stale.expected,
+                operation: u32::MAX
+            },
+            ObjectType::Mailbox,
+        )
+        .unwrap(),
+        ChangeStep::Record(ChangeRecord {
+            cursor: ChangeCursor {
+                sequence: Sequence::from_u64(3),
+                operation: 2
+            },
+            change: Change {
+                kind: ObjectType::Mailbox,
+                action: ChangeAction::Updated,
+                id: *MAILBOX.as_bytes(),
+            },
+        })
+    );
+    let mut body = view
+        .open_blob_input(&td_crypto::Provider, id, RAW.len() as u64)
+        .unwrap();
+    assert_eq!(body.read(&mut bytes).unwrap(), RAW.len());
+    assert_eq!(&bytes[..RAW.len()], RAW);
+    body.finish().unwrap();
+    let original = IndexStore::open(&mut source_root, clock(), 2, deadline()).unwrap();
+    inspect(&original, EPOCH);
+}
+
+#[test]
+fn typed_commit_refuses_a_pre_restore_epoch_before_reading_a_body() {
+    stale_epoch_commit(false);
+}
+
+#[test]
+fn encoded_commit_refuses_a_pre_restore_epoch_before_reading_a_body() {
+    stale_epoch_commit(true);
 }
 fn mailbox(name: &str) -> Row<'_> {
     Row::Mailbox(MailboxRow {
@@ -287,7 +452,10 @@ fn restored_snapshot_changes_only_epoch_and_reopens_with_new_identity() {
     assert_eq!(
         restored.commit(
             &td_crypto::Provider,
-            request(2),
+            CommitRequest {
+                epoch: restored.epoch(),
+                ..request(2)
+            },
             &[Operation::put(Table::Blobs, DELETED.as_bytes(), &value).unwrap()],
             &mut [BlobSource {
                 id: DELETED,
@@ -300,7 +468,10 @@ fn restored_snapshot_changes_only_epoch_and_reopens_with_new_identity() {
     assert_eq!(
         restored.commit(
             &td_crypto::Provider,
-            request(2),
+            CommitRequest {
+                epoch: restored.epoch(),
+                ..request(2)
+            },
             &[
                 Operation::put(Table::Mailboxes, MAILBOX.as_bytes(), &value).unwrap(),
                 Operation::change(
@@ -708,7 +879,10 @@ fn restored_epoch_process_death_cuts_preserve_history_and_expected_identity() {
         assert_eq!(
             restored.commit(
                 &td_crypto::Provider,
-                request(2),
+                CommitRequest {
+                    epoch: restored.epoch(),
+                    ..request(2)
+                },
                 &[Operation::put(Table::Blobs, DELETED.as_bytes(), &value).unwrap()],
                 &mut [BlobSource {
                     id: DELETED,

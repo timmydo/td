@@ -130,6 +130,7 @@ impl Fixture {
                     &td_crypto::Provider,
                     CommitRequest {
                         account,
+                        epoch: store.epoch(),
                         expected: Sequence::from_u64(0),
                         utc_ms: 17,
                         deadline,

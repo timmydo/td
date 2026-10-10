@@ -30,6 +30,7 @@ fn deadline() -> Deadline {
 fn request(expected: u64) -> CommitRequest {
     CommitRequest {
         account: ACCOUNT,
+        epoch: StoreEpoch::from_bytes([4; 16]),
         expected: Sequence::from_u64(expected),
         utc_ms: 0,
         deadline: deadline(),

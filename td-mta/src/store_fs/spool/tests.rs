@@ -165,6 +165,7 @@ fn finished_bytes_digest_and_passive_metadata_commit_to_sqlite() {
             &td_crypto::Provider,
             CommitRequest {
                 account: ACCOUNT,
+                epoch: store.epoch(),
                 expected: Sequence::default(),
                 utc_ms: 0,
                 deadline: deadline(),

@@ -563,6 +563,7 @@ fn run_with_roots(
     };
     let request = CommitRequest {
         account: ACCOUNT,
+        epoch: StoreEpoch::from_bytes([0x57; 16]),
         expected: Sequence::default(),
         utc_ms: 0,
         deadline,

@@ -269,6 +269,7 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
             &td_crypto::Provider,
             super::CommitRequest {
                 account,
+                epoch: store.epoch(),
                 expected: crate::format::Sequence::default(),
                 utc_ms: 0,
                 deadline,

@@ -140,9 +140,21 @@ The writer admits the maximum length before inserting a row, then inserts and ha
 source EOF and digest must agree before COMMIT. Readers may wrap caller-owned
 provisional files, but those files carry no durable store authority.
 
-One writer mutex serializes BEGIN IMMEDIATE, expected account-sequence
-comparison, body streaming, relational changes, final reference/parent checks,
-sequence update and COMMIT. A rejected source or batch rolls back both body
+CommitRequest includes the store epoch captured with the state used to plan
+its operations. Under the writer mutex and original native scope, both
+commit forms compare it to the opened store epoch before processing
+operations or body sources, reserving WAL room or starting SQL writes.
+Mismatch returns Rejected(Conflict), leaves every source unread and does
+not stop a healthy writer. Writer acquisition, stopped-writer and native
+clock/deadline failures may refuse before this comparison. Restored copies
+retain account endpoints while epoch renewal changes store identity; an
+old request with an equal sequence must still refuse. Callers must retain
+the captured epoch rather than substitute the live one to admit stale work.
+This check supplies no authentication, policy or logical quota authority.
+
+One writer mutex serializes this epoch check, BEGIN IMMEDIATE, expected
+account-sequence comparison, body streaming, relational changes, final
+reference/parent checks, sequence update and COMMIT. A rejected source or batch rolls back both body
 and metadata. No separate publication proof, body rename or permanent-body orphan
 collection is required. The separate provisional ingress store below supplies
 prepared file inputs; service admission remains separate. Existing body
