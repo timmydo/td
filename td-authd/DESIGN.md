@@ -1090,9 +1090,10 @@ identify, unlock for unlock; identify, authorize for removal; identify,
 authorize, connect, create, prove, repeat, probe for addition; and connect,
 create, prove, repeat, probe for each new key of an enrollment in turn. A
 step outside its operation's list refuses. The widest login value, a
-removal of eight keys at its authorize step, is 98 bytes. From
-TOKEN-LOGIN.md increment 5's A4, a disclosure step also ends with the
-two approval-key bytes ("Elevation operations").
+removal of eight keys at its authorize step, is 98 bytes. A disclosure
+step (TOKEN-LOGIN.md increment 5's A4) also ends with the two
+approval-key bytes ("Elevation operations"); the widest of those, the
+identify step of a removal of eight keys, is 95.
 
 Step admission has two parts. The descriptions alone decide a step's
 shape, which a reader without the record or the device can check, as
@@ -1133,11 +1134,12 @@ supervision (`login.rs`, "Login-key operation supervision") calls
 presenting it. `LoginStep::asks_pin` names the PIN steps,
 `Request::is_login` and `Request::login_step` read a description, and
 `Request::login_ceiling` is the operation's deadline, amendment 6:
-`LOGIN_CEREMONY` (120 seconds) for an unlock, a removal and a one-key
-enrollment, `LOGIN_TWO_CEREMONIES` (240) for an addition and a two-key
-enrollment. Root's supervision takes its ceilings from these constants
-and reads a step and whether it asks for a PIN through these accessors;
-the worker takes its ceiling from `login_ceiling`.
+`LOGIN_CEREMONY` (120 seconds) per key ceremony, `LOGIN_TWO_CEREMONIES`
+(240) for two, plus `LOGIN_READING` (120) for an operation that
+discloses; `LOGIN_LONGEST` (360) is the largest. Root bounds its
+operation by these constants until its first step, then by that step's
+`login_ceiling`, which the worker takes too, and reads a step and
+whether it asks for a PIN through these accessors.
 
 The human UID is 1000 through 65533; the external application UID is 65536
 through 2147483647. A write's requester must equal its human owner. Names are
@@ -1184,7 +1186,10 @@ which key to connect or remove, or the step's fingerprint in lowercase
 hex, and on a PIN step `N PIN ATTEMPTS LEFT ON THIS KEY` and `ENTER ITS
 PIN, THEN TOUCH THE KEY`. Unlock alone omits its count, which it does not
 change and which its bytes still bind: the lock surface shows the prompt
-to whoever is at the machine.
+to whoever is at the machine. A disclosure step's rows end with its
+disclosure, whose rows include `LOGIN WILL NOT NEED A KEY` for a removal
+leaving none, then the approval key's rows, which replace the generic
+Escape row ("Elevation operations").
 
 These are structural checks, not caller admission or proof of
 randomness. The private root unlock and enrollment workers in
@@ -1802,8 +1807,9 @@ and request `1d` through its commit and td-boot's checked pair;
 `set-hostname` (L4), from its intake and backoff through request `1e`'s
 commit and the canonical write; and `deploy-publish` (L5), tag 5's key
 bytes, the table's row for request 19 and the update queue's backoff
-("Consent for a locally built system"). The rest of this section is a
-target: the login tags' key bytes (TOKEN-LOGIN.md's increment 5).
+("Consent for a locally built system"). Since TOKEN-LOGIN.md increment
+5's A4 the login tags' disclosure steps carry the key too, implemented
+and inert in production until its A5 admits a write.
 APPLICATIONS.md §L.1, "The v1 operations", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
 and its "Elevation increments" which commit lands each part;
@@ -1836,19 +1842,27 @@ carries the same two bytes after its tag byte, before its requester and
 ID, 115 bytes in all, and its rows end with the same key rows; its
 restart row, 35 columns, wraps at the narrowest prompt, above them, so
 the key is still never split. Tag 6, the live disk installation,
-carries none. TOKEN-LOGIN.md's increment 5 (its A4) adds the same two
-bytes to a login description that carries a disclosure, and to no
-other. Those are the first step of a first enrollment (8), its first
-`connect`, and the first step of a removal (10), its `identify`, when
-the removal leaves at most one key. On those steps the bytes are the
-value's last two, after the step's, because the decoder knows only from
-the step and the counts whether they belong. Each such step is presented
-before any token I/O, and its disclosure is the whole operation's, so
-one key confirms the operation and no later step carries one. The
-compositor sends that step's presentation receipt, which carries the
-exact description and so the key, only once the key is typed. The widest
-login value is unchanged, the authorize step of an eight-key removal,
-98 bytes, which carries no key.
+carries none. Since TOKEN-LOGIN.md increment 5's A4 a login
+description that carries a disclosure ends with the same two bytes, and
+no other does. Those are the first step of a first enrollment (8), its
+first `connect`, of either count, and the first step of a removal (10),
+its `identify`, when the removal leaves at most one key. On those steps
+the bytes are the value's last two, after the step's, because the
+decoder knows only from the step and the counts whether they belong: it
+requires them there and refuses them anywhere else as trailing bytes.
+Each such step is presented before any token I/O, and its disclosure is
+the whole operation's, so one key confirms the operation and no later
+step carries one. Root draws the key as above, beside the operation's
+nonce when `1b` starts it, and consent's `Operation::disclosed` puts it
+on root's own first step exactly when that step discloses; the worker
+receives that description and must repeat it exactly, so the key is
+root's alone and the worker never derives one. The step's rows end with
+the disclosure, `TOKEN-LOGIN.md`'s ("Enrollment, addition and removal")
+in rows that fit the narrowest prompt, then the key's rows in place of
+the generic Escape row. The compositor sends that step's presentation
+receipt, which carries the exact description and so the key, only once
+the key is typed. The widest login value is unchanged (above): its
+authorize step carries no key.
 
 **Requests.** `1d` asks for a rollback and `1e` selects the queued
 hostname request; neither takes an operand. Each answers `92` and the
@@ -2259,13 +2273,26 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 6. **Deadlines (2).** The fixed 120-second ceiling becomes 120 seconds per
    key ceremony, fixed when the operation starts and never renewed: unlock,
    removal and one-key enrollment 120 seconds, addition and two-key
-   enrollment 240. Each token transaction keeps the transport's own
-   two-minute bound. Physical timing is activation evidence. Root's
-   deadline counts from just before it spawns the worker, so it ends a
-   moment before the worker's, which counts from the worker's startup.
-   The worker's commit margin makes it likely, not certain, that a write
-   and its success frame land within it; a success root has not seen by
-   its deadline is uncertain (below).
+   enrollment 240. An operation that shows a disclosure (TOKEN-LOGIN.md
+   increment 5's A4), every first enrollment and a removal leaving at
+   most one key, adds a 120-second reading allowance, so reading it and
+   typing its approval key take nothing from the ceremonies: a one-key
+   enrollment and such a removal 240 seconds, a two-key enrollment 360.
+   The allowance is shared slack rather than reserved: a key typed at
+   once leaves the ceremonies the whole ceiling, and the slot may be held
+   that long, while each token session keeps its own bound.
+   The ceiling is consent's `login_ceiling`, so root, the worker and the
+   compositor's attempt lifetime agree. Root does not know a removal's
+   remaining count until the baseline, so until its first step it bounds
+   a removal by the allowance too and then narrows to that step's
+   ceiling; the worker is bounded by the longest, 360, until the
+   description names its operation. Each token transaction keeps the
+   transport's own two-minute bound. Physical timing is activation
+   evidence. Root's deadline counts from just before it spawns the
+   worker, so it ends a moment before the worker's, which counts from
+   the worker's startup. The worker's commit margin makes it likely, not
+   certain, that a write and its success frame land within it; a success
+   root has not seen by its deadline is uncertain (below).
 7. **Revocation (5).** Root performs TOKEN-LOGIN.md's "Cutover" whenever
    the reduced login state is not the one the volatile record
    `/run/td-login-cutover` names for this boot. That record names the
@@ -2669,7 +2696,14 @@ against the worker's five. A disclosure step (TOKEN-LOGIN.md increment
 worker for root's `11`, until the operation's deadline, since no token
 I/O is open while the person reads and types the key. A disclosure
 step's `13` that arrives at or after root's deadline ends the operation
-as TIMEOUT, and the generation continues, as a late `1c` does. After a
+as TIMEOUT, and the generation continues, as a late `1c` does; one for
+an operation that has already ended is answered and dropped, as such a
+`1c` is. Both are defence in depth: the compositor's attempt lifetime is
+the same ceiling and counts from before root's `1b` started, so it
+normally ends first, cancelling with `15` and showing TIMED OUT. Root
+reads the clock once per receipt, so one that crosses the deadline while
+root handles it is either acknowledged or TIMEOUT, never a stale
+acknowledgement. After a
 PIN step's `11`, root sends one `16`
 frame from the `1c` that names that step. The PIN stays in a clearing
 owner from decoding to the queued frame; root zeroes the received
@@ -2717,7 +2751,12 @@ uncertainty after a write's `13` for a typed failure, a lost channel, a
 failed exit, root's deadline and a cancel, an unlock's failure after `13`
 staying a failure, malformed and out-of-order frames, stale
 acknowledgements and PINs, the slot, teardown and the production
-refusal. The ignored root fixture
+refusal; root's key on exactly the disclosure steps, a disclosure's
+receipt after ten seconds still proceeding, the ceilings with and
+without the reading allowance and their narrowing at the first step, a
+receipt judged at one reading of the clock, and the defensive late
+receipt ending as TIMEOUT through the Session with the generation going
+on. The ignored root fixture
 `session::tests::root_login_supervision_meets_the_production_worker`,
 qemu-secret's `supervise-login` authority case, runs the production
 worker through the real Session in the disposable root VM: a missing

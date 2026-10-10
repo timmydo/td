@@ -2,9 +2,7 @@
 //! first enrollment, key addition and key removal. Nothing in production
 //! starts it yet.
 
-use crate::consent::{
-    Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_TWO_CEREMONIES,
-};
+use crate::consent::{Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_LONGEST};
 use crate::fido_ctap;
 use crate::fido_device::{self, Interruption};
 use crate::fido_p256::PublicKey;
@@ -227,7 +225,7 @@ pub(super) fn run(uid: u32) -> Result<(), String> {
     let started = Instant::now();
     // The longest ceiling until the description names the operation.
     let deadline = started
-        .checked_add(LOGIN_TWO_CEREMONIES)
+        .checked_add(LOGIN_LONGEST)
         .ok_or("login operation deadline overflow")?;
     let mut wire = Wire::new(stream, deadline)?;
     let context = Context {
@@ -322,8 +320,8 @@ fn perform<D: Devices>(
         return Err(Failure::Internal);
     }
     let operation = request.operation().clone();
-    // One ceremony, or two for an addition and a two-key enrollment
-    // (td-authd/DESIGN.md, "Login keys", Deadlines).
+    // Consent's ceiling, reading allowance included (td-authd/DESIGN.md,
+    // "Login keys", Deadlines).
     let ceiling = request.login_ceiling().ok_or(Failure::Internal)?;
     wire.limit(
         context
@@ -559,10 +557,15 @@ impl Ceremony<'_> {
     }
 
     /// Presents root's own first step, then requires the record unchanged
-    /// before any token I/O.
+    /// before any token I/O. Only that step can carry a disclosure, whose
+    /// acknowledgement waits for the person to type its approval key.
     fn begin(&mut self, wire: &mut Wire) -> Result<(), Failure> {
-        wire.acknowledge(0x10, 0x11, &self.current)
-            .map_err(|_| framing(wire))?;
+        let acknowledged = if self.current.login_approval().is_some() {
+            wire.acknowledge_typed(0x10, 0x11, &self.current)
+        } else {
+            wire.acknowledge(0x10, 0x11, &self.current)
+        };
+        acknowledged.map_err(|_| framing(wire))?;
         self.unchanged()
     }
 
@@ -916,7 +919,8 @@ impl Ceremony<'_> {
     }
 }
 
-/// The operation with its step, and an enrollment's new-key ordinal, replaced.
+/// The operation with its step, and an enrollment's new-key ordinal,
+/// replaced; no later step carries the first step's approval key.
 fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operation, Failure> {
     Ok(match operation.clone() {
         Operation::LoginUnlock {
@@ -941,6 +945,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             after,
             key: ordinal,
             step,
+            approval: None,
         },
         Operation::LoginAdd {
             account,
@@ -965,6 +970,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             after,
             removed,
             step,
+            approval: None,
         },
         _ => return Err(Failure::Internal),
     })
@@ -1117,7 +1123,7 @@ fn token(error: LoginError, reported: Option<u8>, wire: &Wire) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::LOGIN_CEREMONY;
+    use crate::consent::{ApprovalKey, LOGIN_CEREMONY, LOGIN_READING, LOGIN_TWO_CEREMONIES};
     use crate::crypto;
     use crate::fido_cbor::{self as cbor, Value};
     use crate::fido_ctap::fingerprint;
@@ -1571,6 +1577,10 @@ mod tests {
         /// first, once root admits it and before its acknowledgement: a
         /// guest swaps its keys at a connect step.
         admitted: Option<OnStep>,
+        /// Holds the acknowledgement of root's own first step this long, as
+        /// a person reading a disclosure and typing its key does, sending
+        /// it only if the worker has not ended the operation by then.
+        typing: Option<Duration>,
     }
 
     type OnStep = std::sync::Arc<dyn Fn(&Request) + Send + Sync>;
@@ -1744,6 +1754,16 @@ mod tests {
             if let (true, Some(admitted)) = (fresh, &plan.admitted) {
                 admitted(&current);
             }
+            if let (Some(typing), 1) = (plan.typing, invitations) {
+                match first_within(&mut stream, typing) {
+                    Some(Some(frame)) => {
+                        seen.push(frame);
+                        break;
+                    }
+                    Some(None) => break,
+                    None => {}
+                }
+            }
             let step = current.login_step().unwrap();
             let pin_step = tag == 0x10 && step.asks_pin();
             if pin_step && plan.pin.is_none() {
@@ -1800,6 +1820,12 @@ mod tests {
         step(count, LoginStep::Unlock { key, retries })
     }
 
+    /// The key root draws for each disclosure step here.
+    fn disclosure() -> ApprovalKey {
+        ApprovalKey::new(*b"58").unwrap()
+    }
+
+    /// With root's key on its disclosure step.
     fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
         Operation::LoginEnroll {
             account: UID,
@@ -1807,7 +1833,9 @@ mod tests {
             after,
             key,
             step,
+            approval: None,
         }
+        .disclosed(disclosure())
     }
 
     fn adding(before: u8, step: LoginStep) -> Operation {
@@ -1819,6 +1847,7 @@ mod tests {
         }
     }
 
+    /// With root's key on its disclosure step.
     fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
         Operation::LoginRemove {
             account: UID,
@@ -1826,7 +1855,9 @@ mod tests {
             after: before - removed.len() as u8,
             removed: removed.to_vec(),
             step,
+            approval: None,
         }
+        .disclosed(disclosure())
     }
 
     fn baseline(keys: &[Fingerprint]) -> Vec<u8> {
@@ -2040,19 +2071,34 @@ mod tests {
     fn deadlines_are_the_designs_and_every_session_the_transports() {
         assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
         assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
+        assert_eq!(LOGIN_READING, Duration::from_secs(120));
+        assert_eq!(LOGIN_LONGEST, Duration::from_secs(360));
         assert!(LOGIN_CEREMONY <= fido_device::MAX_LIFETIME);
-        let slot = Slot {
-            position: 1,
-            key: [1; 4],
+        let slot = |position| Slot {
+            position,
+            key: [position; 4],
         };
+        // A disclosing operation adds the reading allowance; the longest
+        // is the worker's bound before the description.
         for (operation, ceiling) in [
             (
                 step(1, LoginStep::Identify).operation().clone(),
                 LOGIN_CEREMONY,
             ),
-            (removing(1, &[slot], LoginStep::Identify), LOGIN_CEREMONY),
-            (enrolling(1, 1, LoginStep::Connect), LOGIN_CEREMONY),
-            (enrolling(2, 1, LoginStep::Connect), LOGIN_TWO_CEREMONIES),
+            (removing(3, &[slot(1)], LoginStep::Identify), LOGIN_CEREMONY),
+            (
+                removing(2, &[slot(1)], LoginStep::Identify),
+                LOGIN_CEREMONY + LOGIN_READING,
+            ),
+            (
+                removing(1, &[slot(1)], LoginStep::Identify),
+                LOGIN_CEREMONY + LOGIN_READING,
+            ),
+            (
+                enrolling(1, 1, LoginStep::Connect),
+                LOGIN_CEREMONY + LOGIN_READING,
+            ),
+            (enrolling(2, 1, LoginStep::Connect), LOGIN_LONGEST),
             (adding(1, LoginStep::Identify), LOGIN_TWO_CEREMONIES),
         ] {
             assert_eq!(login(operation).login_ceiling(), Some(ceiling));
@@ -2754,15 +2800,15 @@ mod tests {
         let worker = production(include_str!("login_operation.rs"));
         assert!(!worker.contains(".receive()"));
         assert_eq!(worker.matches(".receive_cleared()").count(), 1);
-        let acknowledge = production(include_str!("operation.rs"))
-            .split("pub(super) fn acknowledge(")
+        let exchange = production(include_str!("operation.rs"))
+            .split("    fn exchange(")
             .nth(1)
             .unwrap()
             .split("\n    }\n")
             .next()
             .unwrap();
-        assert!(acknowledge.contains("self.receive_cleared()?"));
-        assert!(!acknowledge.contains("self.receive()"));
+        assert!(exchange.contains("self.receive_cleared_by(wait)?"));
+        assert!(!exchange.contains("self.receive()"));
     }
 
     #[test]
@@ -3116,6 +3162,67 @@ mod tests {
         assert_eq!(seen, removal(&order, &removed, keys[2].fingerprint()));
         assert!(matches!(fixture.state(), State::Unenrolled));
         assert!(fixture.names().is_empty());
+    }
+
+    /// A disclosure step, root's own first, waits for its acknowledgement
+    /// until the operation deadline, as the person reads it and types its
+    /// key: past the five-second frame time it still proceeds. Any other
+    /// first step's frame time ends the operation before any token I/O.
+    #[test]
+    fn a_disclosure_waits_for_its_acknowledgement_past_the_frame_time() {
+        let typing = Some(Duration::from_millis(5_500));
+        let keys = [Key::new(80), Key::new(81), Key::new(82)];
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&keys[0], &keys[1], &keys[2]], None, None));
+        let by = &keys[0];
+        let order = fixture.fingerprints();
+        let position = |key: &Key| {
+            order
+                .iter()
+                .position(|fp| *fp == key.fingerprint())
+                .unwrap() as u8
+                + 1
+        };
+        // Leaving two keys discloses nothing.
+        let removed = slots(&order, &[position(&keys[1])]);
+        let start = by.device.transcript().len();
+        let (result, seen) = unlock(
+            &fixture,
+            &[&by.device],
+            Plan {
+                typing,
+                ..begins(removing(3, &removed, LoginStep::Identify))
+            },
+        );
+        assert_eq!(result, Err(Failure::Timeout));
+        assert_eq!(
+            seen,
+            failed(
+                vec![
+                    baseline(&order),
+                    invitation(0x10, &login(removing(3, &removed, LoginStep::Identify)))
+                ],
+                Failure::Timeout
+            )
+        );
+        assert_eq!(by.device.transcript().len(), start);
+        // Leaving one key discloses, carries root's key, and proceeds.
+        let mut positions = vec![position(&keys[1]), position(&keys[2])];
+        positions.sort();
+        let removed = slots(&order, &positions);
+        let identify = login(removing(3, &removed, LoginStep::Identify));
+        assert_eq!(identify.login_approval(), Some(disclosure()));
+        let (result, seen) = unlock(
+            &fixture,
+            &[&by.device],
+            Plan {
+                typing,
+                ..begins(removing(3, &removed, LoginStep::Identify))
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, removal(&order, &removed, by.fingerprint()));
+        assert_eq!(fixture.stored(), Some(vec![by.id.clone()]));
     }
 
     #[test]

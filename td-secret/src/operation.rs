@@ -119,10 +119,21 @@ impl Wire {
     /// One frame in clearing storage: a misordered PIN, or a partial
     /// frame, is zeroed when it is dropped.
     pub(super) fn receive_cleared(&mut self) -> Result<Cleared, String> {
-        let deadline = self.frame_deadline()?;
-        let mut header = [0; 2];
-        self.read(&mut header, deadline)?;
-        let length = usize::from(u16::from_be_bytes(header));
+        self.receive_cleared_by(None)
+    }
+
+    /// `receive_cleared`, whose header waits until `header` when given,
+    /// the rest then having one frame time.
+    fn receive_cleared_by(&mut self, header: Option<Instant>) -> Result<Cleared, String> {
+        let mut deadline = self.frame_deadline()?;
+        let mut length = [0; 2];
+        if let Some(header) = header {
+            self.read(&mut length, header)?;
+            deadline = self.frame_deadline()?;
+        } else {
+            self.read(&mut length, deadline)?;
+        }
+        let length = usize::from(u16::from_be_bytes(length));
         if length == 0 || length > LIMIT {
             return Err("invalid operation frame length".into());
         }
@@ -211,6 +222,29 @@ impl Wire {
         answer: u8,
         request: &consent::Request,
     ) -> Result<(), String> {
+        self.exchange(tag, answer, request, None)
+    }
+
+    /// A login disclosure step's presentation round: root acknowledges it
+    /// only once the person has read the disclosure and typed its approval
+    /// key, with no token I/O open, so the answer's header waits for the
+    /// operation deadline, or an open session's, as a PIN's does.
+    pub(super) fn acknowledge_typed(
+        &mut self,
+        tag: u8,
+        answer: u8,
+        request: &consent::Request,
+    ) -> Result<(), String> {
+        self.exchange(tag, answer, request, Some(self.bound()))
+    }
+
+    fn exchange(
+        &mut self,
+        tag: u8,
+        answer: u8,
+        request: &consent::Request,
+        wait: Option<Instant>,
+    ) -> Result<(), String> {
         let mut round = [0; 32];
         File::open("/dev/urandom")
             .and_then(|mut file| file.read_exact(&mut round))
@@ -219,7 +253,7 @@ impl Wire {
         message.extend_from_slice(&round);
         message.extend_from_slice(&request.encode());
         self.send(&message)?;
-        let reply = self.receive_cleared()?;
+        let reply = self.receive_cleared_by(wait)?;
         let reply = reply.bytes();
         if reply.first() != Some(&answer) || reply.get(1..) != message.get(1..) {
             return Err("operation acknowledgement does not match its request and round".into());
@@ -677,6 +711,41 @@ mod tests {
             child.receive().unwrap_err(),
             "private token operation expired"
         );
+    }
+
+    /// A login disclosure's acknowledgement waits as a PIN does: past a
+    /// frame time, within the operation deadline. Any other waits one frame
+    /// time.
+    #[test]
+    fn a_typed_acknowledgement_waits_for_the_operation_deadline_not_a_frame_time() {
+        std::thread::scope(|scope| {
+            for typed in [true, false] {
+                scope.spawn(move || {
+                    let (child, parent) = UnixStream::pair().unwrap();
+                    let mut wire = Wire::new(child, Instant::now() + FRAME_TIME * 2).unwrap();
+                    let mut root = Wire::new(parent, Instant::now() + FRAME_TIME * 3).unwrap();
+                    let answer = std::thread::spawn(move || {
+                        let mut prompt = root.receive().unwrap();
+                        std::thread::sleep(FRAME_TIME + Duration::from_millis(500));
+                        prompt[0] += 1;
+                        let _ = root.send(&prompt);
+                    });
+                    let result = if typed {
+                        wire.acknowledge_typed(0x10, 0x11, &request())
+                    } else {
+                        wire.acknowledge(0x10, 0x11, &request())
+                    };
+                    assert_eq!(result.is_ok(), typed, "{result:?}");
+                    assert_eq!(wire.expired(), !typed);
+                    answer.join().unwrap();
+                });
+            }
+        });
+        // The operation deadline still bounds it.
+        let (child, _parent) = UnixStream::pair().unwrap();
+        let mut wire = Wire::new(child, Instant::now() + Duration::from_millis(30)).unwrap();
+        assert!(wire.acknowledge_typed(0x10, 0x11, &request()).is_err());
+        assert!(wire.expired());
     }
 
     #[test]

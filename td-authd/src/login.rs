@@ -2,8 +2,8 @@
 //! login-operation` (td-login/TOKEN-LOGIN.md): root's side of its frames.
 
 use crate::consent::{
-    Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY, LOGIN_KEYS,
-    LOGIN_TWO_CEREMONIES,
+    Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY,
+    LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES,
 };
 use crate::unlock::{command, deadline_after, Event, Wire};
 use std::fs::File;
@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 /// fixtures drive them.
 pub(crate) const WRITES: bool = cfg!(test);
 
-/// Margin against the worker's five-second acknowledgement window.
+/// Margin against the worker's five-second acknowledgement window. A
+/// disclosure step's has the operation deadline instead: the person reads
+/// it and types its approval key, with no token I/O open.
 const ACK_TIME: Duration = Duration::from_secs(3);
 /// The worker's PIN frame: its tag and at most 63 PIN bytes.
 const PIN_FRAME: usize = 64;
@@ -103,43 +105,54 @@ impl Selection {
         !matches!(self, Self::Unlock)
     }
 
-    /// Root's ceiling, the worker's own: fixed when the operation starts.
+    /// Root's bound until its first step names the operation, from which
+    /// the description's ceiling, the worker's own, narrows it: a removal
+    /// may leave at most one key and so disclose.
     fn ceiling(&self) -> Duration {
         match self {
-            Self::Unlock | Self::Remove(_) | Self::Enroll(1) => LOGIN_CEREMONY,
-            Self::Enroll(_) | Self::Add => LOGIN_TWO_CEREMONIES,
+            Self::Unlock => LOGIN_CEREMONY,
+            Self::Enroll(1) | Self::Remove(_) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
+            Self::Add => LOGIN_TWO_CEREMONIES,
+            Self::Enroll(_) => LOGIN_LONGEST,
         }
     }
 
-    /// The operation at its first step against the worker's baseline, or
-    /// the kind that refuses it before any description reaches the worker.
-    fn operation(&self, owner: u32, baseline: &[Fingerprint]) -> Result<Operation, u8> {
+    /// The operation at its first step against the worker's baseline, with
+    /// `key` when that step carries a disclosure, or the kind that refuses
+    /// it before any description reaches the worker.
+    fn operation(
+        &self,
+        owner: u32,
+        baseline: &[Fingerprint],
+        key: ApprovalKey,
+    ) -> Result<Operation, u8> {
         let count = u8::try_from(baseline.len()).map_err(|_| INTERNAL)?;
-        match self {
-            Self::Enroll(_) if count != 0 => Err(ENROLLED),
-            Self::Enroll(after) => Ok(Operation::LoginEnroll {
+        let operation = match self {
+            Self::Enroll(_) if count != 0 => return Err(ENROLLED),
+            Self::Enroll(after) => Operation::LoginEnroll {
                 account: owner,
                 before: 0,
                 after: *after,
                 key: 1,
                 step: LoginStep::Connect,
-            }),
-            _ if count == 0 => Err(NO_RECORD),
-            Self::Unlock => Ok(Operation::LoginUnlock {
+                approval: None,
+            },
+            _ if count == 0 => return Err(NO_RECORD),
+            Self::Unlock => Operation::LoginUnlock {
                 account: owner,
                 before: count,
                 after: count,
                 step: LoginStep::Identify,
-            }),
+            },
             // Consent has no encoding for a ninth key.
-            Self::Add if count >= LOGIN_KEYS => Err(FULL),
-            Self::Add => Ok(Operation::LoginAdd {
+            Self::Add if count >= LOGIN_KEYS => return Err(FULL),
+            Self::Add => Operation::LoginAdd {
                 account: owner,
                 before: count,
                 after: count.checked_add(1).ok_or(INTERNAL)?,
                 step: LoginStep::Identify,
-            }),
-            Self::Remove(removed) => Ok(Operation::LoginRemove {
+            },
+            Self::Remove(removed) => Operation::LoginRemove {
                 account: owner,
                 before: count,
                 after: usize::from(count)
@@ -148,9 +161,19 @@ impl Selection {
                     .ok_or(SELECTION)?,
                 removed: removed.clone(),
                 step: LoginStep::Identify,
-            }),
-        }
+                approval: None,
+            },
+        };
+        // A first enrollment's first step, and a removal's that leaves at
+        // most one key, carries a disclosure; consent says which.
+        Ok(operation.disclosed(key))
     }
+}
+
+/// Each digit `2` plus its own random byte modulo 8, as an elevation's: 256
+/// is a multiple of 8, so every digit is equally likely.
+fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
+    ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
 }
 
 /// A PIN on its way to the worker, zeroed when dropped.
@@ -220,6 +243,8 @@ enum Phase {
 pub(crate) struct Login {
     owner: u32,
     nonce: [u8; 32],
+    /// The key a disclosure step carries, drawn beside the nonce.
+    approval: ApprovalKey,
     selection: Selection,
     child: Option<Child>,
     wire: Option<Wire>,
@@ -234,6 +259,9 @@ pub(crate) struct Login {
     last: bool,
     round: Vec<u8>,
     pin: Option<Pin>,
+    /// Before the worker started, so root's deadline ends no later than the
+    /// worker's, which counts from its own start.
+    started: Instant,
     deadline: Instant,
     acknowledgement_deadline: Option<Instant>,
     /// Root queued a write's commit acknowledgement.
@@ -277,13 +305,23 @@ impl Login {
             return Err("login writes are refused until activation".into());
         }
         let mut nonce = [0; 32];
+        let mut key = [0; 2];
         File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut nonce))
+            .and_then(|mut random| {
+                random.read_exact(&mut nonce)?;
+                random.read_exact(&mut key)
+            })
             .map_err(|_| "read login request randomness")?;
         if nonce == [0; 32] {
             return Err("zero login request nonce".into());
         }
-        Self::spawn(owner, nonce, selection, command("login-operation", owner))
+        Self::spawn(
+            owner,
+            nonce,
+            approval_key(key)?,
+            selection,
+            command("login-operation", owner),
+        )
     }
 
     /// The deadline counts from before the worker starts, so it ends no
@@ -291,10 +329,14 @@ impl Login {
     fn spawn(
         owner: u32,
         nonce: [u8; 32],
+        approval: ApprovalKey,
         selection: Selection,
         mut command: Command,
     ) -> Result<Self, String> {
-        let deadline = deadline_after(selection.ceiling())?;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(selection.ceiling())
+            .ok_or("login deadline overflow")?;
         let (parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
         let wire = Wire::new(parent)?;
         let child = command
@@ -304,6 +346,7 @@ impl Login {
         Ok(Self {
             owner,
             nonce,
+            approval,
             selection,
             child: Some(child),
             wire: Some(wire),
@@ -314,6 +357,7 @@ impl Login {
             last: false,
             round: Vec::new(),
             pin: None,
+            started,
             deadline,
             acknowledgement_deadline: None,
             committed: false,
@@ -331,16 +375,40 @@ impl Login {
         self.request.as_ref()
     }
 
+    /// A disclosure step's receipt follows its approval key, which the
+    /// person may type at any time before root's deadline: one at or after
+    /// it ends the operation as TIMEOUT, and one for an operation already
+    /// ended is dropped, each as a late PIN is, so the generation goes on.
     pub fn presented(&mut self, request: &Request) -> Result<(), String> {
-        self.acknowledge(request, Phase::Presented, PRESENTED)
+        self.presented_at(request, Instant::now())
+    }
+
+    /// `presented` with the clock read once, at `now`, for both the
+    /// disclosure's deadline and the acknowledgement's: a receipt that
+    /// crosses the deadline between two reads would otherwise be stale.
+    fn presented_at(&mut self, request: &Request, now: Instant) -> Result<(), String> {
+        if request.login_approval().is_some() && self.request.as_ref() == Some(request) {
+            if matches!(self.phase, Phase::Stopping | Phase::Done) {
+                return Ok(());
+            }
+            if self.phase == Phase::Presented && now >= self.deadline {
+                return self.stop(TIMEOUT, 0);
+            }
+        }
+        self.acknowledge(request, Phase::Presented, PRESENTED, now)
     }
 
     pub fn commit(&mut self, request: &Request) -> Result<(), String> {
-        self.acknowledge(request, Phase::Commit, COMMITTED)
+        self.acknowledge(request, Phase::Commit, COMMITTED, Instant::now())
     }
 
-    fn acknowledge(&mut self, request: &Request, expected: Phase, tag: u8) -> Result<(), String> {
-        let now = Instant::now();
+    fn acknowledge(
+        &mut self,
+        request: &Request,
+        expected: Phase,
+        tag: u8,
+        now: Instant,
+    ) -> Result<(), String> {
         if self.phase != expected
             || self.request.as_ref() != Some(request)
             || now >= self.deadline
@@ -526,7 +594,10 @@ impl Login {
     /// sees any description and so before any token I/O.
     fn begin(&mut self, frame: &[u8]) -> Result<Event, String> {
         let baseline = baseline(frame).ok_or("malformed login baseline")?;
-        let refused = match self.selection.operation(self.owner, &baseline) {
+        let refused = match self
+            .selection
+            .operation(self.owner, &baseline, self.approval)
+        {
             Err(kind) => Err(kind),
             Ok(operation) => Request::begin_login(self.nonce, self.owner, operation, &baseline)
                 .map_err(|_| match self.selection {
@@ -541,6 +612,13 @@ impl Login {
                 return self.reap();
             }
         };
+        // The description's ceiling, the worker's, now bounds the operation.
+        let ceiling = request.login_ceiling().ok_or("missing login ceiling")?;
+        self.deadline = self.deadline.min(
+            self.started
+                .checked_add(ceiling)
+                .ok_or("login deadline overflow")?,
+        );
         self.wire
             .as_mut()
             .ok_or("missing login endpoint")?
@@ -582,8 +660,12 @@ impl Login {
                 self.phase = Phase::Presented;
             }
         }
+        // Only root's own first step can disclose.
+        self.acknowledgement_deadline = Some(match &self.request {
+            Some(request) if request.login_approval().is_some() => self.deadline,
+            _ => deadline_after(ACK_TIME)?,
+        });
         self.round = frame;
-        self.acknowledgement_deadline = Some(deadline_after(ACK_TIME)?);
         Ok(self.event())
     }
 
@@ -679,7 +761,13 @@ impl Drop for Login {
 impl Login {
     /// A scripted worker: `login::tests::scripted_worker` playing `script`.
     pub(crate) fn scripted(selection: Selection, script: &str) -> Result<Self, String> {
-        Self::spawn(1000, [42; 32], selection, tests::fixture(script))
+        Self::spawn(
+            1000,
+            [42; 32],
+            tests::approval(),
+            selection,
+            tests::fixture(script),
+        )
     }
 
     pub(crate) fn fixture_pid(&self) -> Option<u32> {

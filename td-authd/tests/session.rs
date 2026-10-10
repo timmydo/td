@@ -1418,6 +1418,33 @@ fn a_pin_past_the_deadline_is_dropped_and_the_generation_lives_on() {
     assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
 }
 
+/// A disclosure's receipt, which follows its typed key, past root's
+/// deadline: answered, the operation ended as TIMEOUT, and the generation
+/// goes on, as for a late PIN.
+#[test]
+fn a_late_disclosure_receipt_is_answered_and_the_generation_lives_on() {
+    let mut session = quiet();
+    prepare(&mut session);
+    begin_login(&mut session, Selection::Enroll(1), "enroll-disclosure");
+    let reply = login_event(&mut session);
+    assert_eq!(reply[1], 4);
+    let connect = Description::decode(&reply[2..]).unwrap();
+    assert!(connect.login_approval().is_some());
+    match session.operation.as_mut().unwrap() {
+        Active::Login(op) => op.expire(),
+        _ => panic!("expected a login worker"),
+    }
+    assert_eq!(
+        session.answer(Request::Presented(connect.clone())).unwrap(),
+        [0x93]
+    );
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0d, 0x08, 0][..], &connect.encode()].concat()
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+}
+
 #[test]
 fn production_refuses_login_writes_before_any_worker_starts() {
     let mut session = quiet();
@@ -1817,7 +1844,8 @@ fn root_login_supervision_meets_the_production_worker() {
     // guest has no /run/td-volume, so no retained deployment's marker reads.
     let reply = end(&mut session, Selection::Enroll(1));
     assert_eq!(reply[..4], [0x91, 0x0d, 0x12, 0]);
-    assert_eq!(
+    // Its disclosure carries a key root drew.
+    assert!(matches!(
         Description::decode(&reply[4..]).unwrap().operation(),
         &Operation::LoginEnroll {
             account: 1000,
@@ -1825,8 +1853,9 @@ fn root_login_supervision_meets_the_production_worker() {
             after: 1,
             key: 1,
             step: crate::consent::LoginStep::Connect,
+            approval: Some(_),
         }
-    );
+    ));
     assert_eq!(state(&mut session), [0]);
     assert_eq!(fs::read_dir(directory).unwrap().count(), 0);
     session.close().unwrap();

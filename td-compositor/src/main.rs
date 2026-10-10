@@ -1226,7 +1226,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xf1e2c5245f2e49a3,
+            0xef19938ed8d1b8a4,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3317,7 +3317,9 @@ pub struct MappedRegion {
     /// for a rollback in every build, since L3, and `H` for the queued
     /// hostname change, since L4; and an elevation's or, since L5, an
     /// update's one commit, root's exact description and so its key,
-    /// follows only the two digits the evdev adapter offers. What a
+    /// follows only the two digits the evdev adapter offers, as, since
+    /// TOKEN-LOGIN.md increment 5's A4, a login disclosure step's
+    /// receipt does. What a
     /// runtime test cannot see is held here: that no test-only switch
     /// decides `B` or `H`, and that no other path confirms; Enter confirms
     /// only a live boot's whole-disk installation.
@@ -3416,10 +3418,13 @@ pub struct MappedRegion {
         assert!(
             approve.contains(".filter(|presented| self.answers(&runtime, presented, timestamp))")
         );
-        // Since L5 an update takes the key, from the one key reader, and
-        // Enter answers a whole-disk installation alone.
+        // Since L5 an update takes the key, and since TOKEN-LOGIN.md
+        // increment 5's A4 a login disclosure step, from the one key
+        // reader, and Enter answers a whole-disk installation alone.
         assert!(approve.contains(
-            "        if !matches!(self.selection, Selection::Install | Selection::Elevation(_))\n"
+            "        if !matches!(\n            self.selection,\n            \
+             Selection::Install | Selection::Elevation(_) | Selection::Login(_)\n        \
+             ) || !(b'2'..=b'9').contains(&digit)\n"
         ));
         assert!(approve
             .contains("            let Some(key) = approval_key(&presented.request) else {\n"));
@@ -3427,9 +3432,30 @@ pub struct MappedRegion {
             "fn approval_key(request: &Request) -> Option<ApprovalKey> {\n    \
              match request.operation() {\n        \
              Operation::Install { key, .. } => Some(*key),\n        \
+             Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {\n            \
+             *approval\n        }\n        \
              _ => Elevation::of(request).map(|(_, key)| key),\n    }\n}\n"
         ));
-        assert_eq!(occurrences(client, "approval_key("), 2);
+        // The reader, the digit's check, a presented prompt's keeping and
+        // a login step's receipt.
+        assert_eq!(occurrences(client, "approval_key("), 4);
+        // A login disclosure step's receipt goes only once its key is
+        // typed on that exact prompt; any other step's follows its
+        // presentation.
+        let tick = body(client, "    fn tick_login(");
+        assert!(tick.contains(
+            "                if login.shown.as_ref() == Some(&description)\n                    \
+             && (approval_key(&description).is_none()\n                        \
+             || login.attempt.approved(&description))\n                    \
+             && login.attempt.active()\n"
+        ));
+        assert_eq!(occurrences(client, ".approved("), 1);
+        let approved = body(client, "    fn approved(");
+        assert!(approved.contains(
+            "        self.confirmed.load(Ordering::SeqCst)\n            \
+             && self.presentation.lock().is_ok_and(|presented| {\n"
+        ));
+        assert!(approved.contains(".is_some_and(|presented| presented.request == *request)"));
         let confirm = body(client, "    pub fn confirm_install(");
         assert!(confirm.contains(
             "            if matches!(presented.request.operation(), Operation::InstallDisk { .. })\n                \

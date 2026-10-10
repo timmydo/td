@@ -292,11 +292,11 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0xf27203ecc1c3251f
+            0x0c03909956647c23
         );
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0xf6911aec2fe1fe13
+            0x965bc4d7d0e1ab83
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
@@ -306,7 +306,7 @@ mod confinement {
             fingerprint(include_str!("enrollment_operation.rs")),
             0x44a7a283c11747d6
         );
-        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xf1e2c5245f2e49a3, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
+        assert_eq!(fingerprint(include_str!("../../td-authd/src/consent.rs")), 0xef19938ed8d1b8a4, "shared consent changed: reconcile td-authd/tests/confinement.rs and td-compositor/src/main.rs pins");
         // The shared consent's hostname rules: firstboot's one copy.
         let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
         assert!(production.contains(

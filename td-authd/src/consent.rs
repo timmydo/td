@@ -50,6 +50,14 @@ pub const LOGIN_KEYS: u8 = 8;
 pub const LOGIN_CEREMONY: Duration = Duration::from_secs(120);
 /// An addition and a two-key enrollment: two ceremonies.
 pub const LOGIN_TWO_CEREMONIES: Duration = Duration::from_secs(240);
+/// Added to the ceiling of an operation that shows a disclosure, every
+/// first enrollment and a removal leaving at most one key: the person
+/// reads it and types its approval key before any token I/O, and that
+/// time does not come out of a ceremony's.
+pub const LOGIN_READING: Duration = Duration::from_secs(120);
+/// The longest login ceiling, a two-key enrollment's: the worker's bound
+/// until a description names its operation.
+pub const LOGIN_LONGEST: Duration = Duration::from_secs(360);
 
 /// How a disk installation stores its volume, as its plan names it
 /// (td-install/INSTALLER.md "Storage choice").
@@ -67,9 +75,10 @@ pub type Fingerprint = [u8; 4];
 /// Every login row fits, so wrapping never splits a fingerprint.
 pub const PROMPT_COLUMNS: usize = 34;
 
-/// The approval key an elevation prompt asks for: two ASCII digits, each
-/// `2` to `9`, typed in order (td-authd/DESIGN.md, "Elevation
-/// operations"). No other value can be constructed.
+/// The approval key an elevation prompt, an update's and a login
+/// disclosure step's ask for: two ASCII digits, each `2` to `9`, typed in
+/// order (td-authd/DESIGN.md, "Elevation operations"). No other value can
+/// be constructed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovalKey([u8; 2]);
 
@@ -222,6 +231,8 @@ struct Login<'a> {
     key: u8,
     removed: &'a [Slot],
     step: LoginStep,
+    /// A disclosure step's approval key, on no other step.
+    approval: Option<ApprovalKey>,
 }
 
 impl Login<'_> {
@@ -254,7 +265,33 @@ impl Login<'_> {
                         .all(|pair| matches!(pair, [low, high] if low.position < high.position))
             }
         };
-        self.account == owner && counts && self.kind.steps().contains(&self.step.byte())
+        self.account == owner
+            && counts
+            && self.kind.steps().contains(&self.step.byte())
+            && self.approval.is_some() == self.discloses()
+    }
+
+    /// Whether this step carries a disclosure (td-login/TOKEN-LOGIN.md,
+    /// "Enrollment, addition and removal"), and so the approval key: a
+    /// first enrollment's first step, its first key's connect, and the
+    /// first step, identify, of a removal that leaves at most one key. Each
+    /// comes before any token I/O and discloses for the whole operation,
+    /// so no later step carries one.
+    fn discloses(&self) -> bool {
+        self.reads()
+            && match self.kind {
+                LoginKind::Enroll => self.step == LoginStep::Connect && self.key == 1,
+                _ => self.step == LoginStep::Identify,
+            }
+    }
+
+    /// Whether the operation shows a disclosure, at its first step.
+    fn reads(&self) -> bool {
+        match self.kind {
+            LoginKind::Enroll => true,
+            LoginKind::Remove => self.after <= 1,
+            LoginKind::Unlock | LoginKind::Add => false,
+        }
     }
 
     /// The baseline holds the counted keys (none before an enrollment) and
@@ -273,12 +310,18 @@ impl Login<'_> {
             })
     }
 
-    /// Root's ceiling, which is the worker's: one ceremony per key the
-    /// person handles in turn.
+    /// Root's ceiling, which is the worker's and the compositor's
+    /// attempt's: one ceremony per key the person handles in turn, and the
+    /// reading allowance when the operation discloses.
     fn ceiling(&self) -> Duration {
-        match (self.kind, self.after) {
+        let ceremonies = match (self.kind, self.after) {
             (LoginKind::Unlock | LoginKind::Remove, _) | (LoginKind::Enroll, 1) => LOGIN_CEREMONY,
             (LoginKind::Enroll | LoginKind::Add, _) => LOGIN_TWO_CEREMONIES,
+        };
+        if self.reads() {
+            ceremonies.saturating_add(LOGIN_READING)
+        } else {
+            ceremonies
         }
     }
 
@@ -441,12 +484,14 @@ pub enum Operation {
         step: LoginStep,
     },
     /// First enrollment of `after` keys; `key` is the one this step creates.
+    /// `approval` is the disclosure's key, on the first key's connect only.
     LoginEnroll {
         account: u32,
         before: u8,
         after: u8,
         key: u8,
         step: LoginStep,
+        approval: Option<ApprovalKey>,
     },
     LoginAdd {
         account: u32,
@@ -454,13 +499,16 @@ pub enum Operation {
         after: u8,
         step: LoginStep,
     },
-    /// `removed` is in strictly increasing slot position.
+    /// `removed` is in strictly increasing slot position. `approval` is the
+    /// disclosure's key, on the identify step of a removal that leaves at
+    /// most one key only.
     LoginRemove {
         account: u32,
         before: u8,
         after: u8,
         removed: Vec<Slot>,
         step: LoginStep,
+        approval: Option<ApprovalKey>,
     },
     /// `deploy-rollback`: move `current` back to `previous`, the pair the
     /// two boot selectors name.
@@ -480,19 +528,29 @@ pub enum Operation {
 
 impl Operation {
     fn login(&self) -> Option<Login<'_>> {
-        let (kind, account, before, after, key, removed, step) = match self {
+        let (kind, account, before, after, key, removed, step, approval) = match self {
             Self::LoginUnlock {
                 account,
                 before,
                 after,
                 step,
-            } => (LoginKind::Unlock, account, before, after, 1, &[][..], step),
+            } => (
+                LoginKind::Unlock,
+                account,
+                before,
+                after,
+                1,
+                &[][..],
+                step,
+                None,
+            ),
             Self::LoginEnroll {
                 account,
                 before,
                 after,
                 key,
                 step,
+                approval,
             } => (
                 LoginKind::Enroll,
                 account,
@@ -501,19 +559,30 @@ impl Operation {
                 *key,
                 &[][..],
                 step,
+                *approval,
             ),
             Self::LoginAdd {
                 account,
                 before,
                 after,
                 step,
-            } => (LoginKind::Add, account, before, after, 1, &[][..], step),
+            } => (
+                LoginKind::Add,
+                account,
+                before,
+                after,
+                1,
+                &[][..],
+                step,
+                None,
+            ),
             Self::LoginRemove {
                 account,
                 before,
                 after,
                 removed,
                 step,
+                approval,
             } => (
                 LoginKind::Remove,
                 account,
@@ -522,6 +591,7 @@ impl Operation {
                 1,
                 removed.as_slice(),
                 step,
+                *approval,
             ),
             _ => return None,
         };
@@ -533,7 +603,50 @@ impl Operation {
             key,
             removed,
             step: *step,
+            approval,
         })
+    }
+
+    /// This login step with `key` as its approval key when the step
+    /// carries a disclosure, as root draws one for each such step; every
+    /// other step and operation unchanged.
+    pub fn disclosed(self, key: ApprovalKey) -> Self {
+        if !self.login().is_some_and(|login| login.discloses()) {
+            return self;
+        }
+        match self {
+            Self::LoginEnroll {
+                account,
+                before,
+                after,
+                key: ordinal,
+                step,
+                approval: _,
+            } => Self::LoginEnroll {
+                account,
+                before,
+                after,
+                key: ordinal,
+                step,
+                approval: Some(key),
+            },
+            Self::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: _,
+            } => Self::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: Some(key),
+            },
+            other => other,
+        }
     }
 }
 
@@ -649,6 +762,12 @@ impl Request {
     /// The step a login description presents.
     pub fn login_step(&self) -> Option<LoginStep> {
         self.operation.login().map(|login| login.step)
+    }
+
+    /// The approval key a login disclosure step carries; none on every
+    /// other step and description.
+    pub fn login_approval(&self) -> Option<ApprovalKey> {
+        self.operation.login().and_then(|login| login.approval)
     }
 
     /// A login operation's ceiling, root's and the worker's alike, fixed by
@@ -926,6 +1045,10 @@ impl Request {
                     if let Some(retries) = login.step.retries() {
                         bytes.push(retries);
                     }
+                    // Last, since only the step and counts say it belongs.
+                    if let Some(approval) = login.approval {
+                        bytes.extend_from_slice(&approval.digits());
+                    }
                 }
             }
             Operation::DeployRollback {
@@ -1046,7 +1169,7 @@ impl Request {
                 let account = input.number()?;
                 let before = input.byte()?;
                 let after = input.byte()?;
-                match tag {
+                let operation = match tag {
                     7 => Operation::LoginUnlock {
                         account,
                         before,
@@ -1061,6 +1184,7 @@ impl Request {
                             after,
                             key,
                             step: input.login_step()?,
+                            approval: None,
                         }
                     }
                     9 => Operation::LoginAdd {
@@ -1088,8 +1212,17 @@ impl Request {
                             after,
                             removed,
                             step: input.login_step()?,
+                            approval: None,
                         }
                     }
+                };
+                // A disclosure step's key ends the value: the step and the
+                // counts alone say it belongs, and on any other step two
+                // more bytes are trailing.
+                if operation.login().is_some_and(|login| login.discloses()) {
+                    operation.disclosed(input.approval_key()?)
+                } else {
+                    operation
                 }
             }
             11 => {
@@ -1273,13 +1406,15 @@ impl Request {
                 approval_lines(&mut lines, *key);
             }
         }
+        // A key's rows carry their own Escape.
         if !matches!(
             self.operation,
             Operation::Install { .. }
                 | Operation::InstallDisk { .. }
                 | Operation::DeployRollback { .. }
                 | Operation::SetHostname { .. }
-        ) {
+        ) && self.login_approval().is_none()
+        {
             lines.push("ESC TO CANCEL".into());
         }
         lines
@@ -1352,8 +1487,10 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         }
         lines.push(row);
     }
-    if login.kind == LoginKind::Remove && login.after == 0 {
-        lines.push("LOGIN WILL NOT NEED A KEY".into());
+    // A removal of every key says so on each step; its disclosure step
+    // says it last, as the disclosure's first row.
+    if login.kind == LoginKind::Remove && login.after == 0 && login.approval.is_none() {
+        lines.push(NO_KEY.into());
     }
     match login.step {
         LoginStep::Identify => lines.push("CONNECT ONLY ONE ENROLLED KEY".into()),
@@ -1383,7 +1520,52 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         lines.push(format!("{retries} PIN ATTEMPTS LEFT ON THIS KEY"));
         lines.push("ENTER ITS PIN, THEN TOUCH THE KEY".into());
     }
+    if let Some(key) = login.approval {
+        let disclosure: &[&[&str]] = match (login.kind, login.after) {
+            (LoginKind::Enroll, 1) => &[ENROLLMENT_DISCLOSURE, ONE_KEY_DISCLOSURE],
+            (LoginKind::Enroll, _) => &[ENROLLMENT_DISCLOSURE],
+            (_, 0) => &[NO_KEY_DISCLOSURE],
+            _ => &[ONE_KEY_DISCLOSURE],
+        };
+        lines.extend(
+            disclosure
+                .iter()
+                .flat_map(|rows| rows.iter())
+                .map(|row| row.to_string()),
+        );
+        approval_lines(lines, key);
+    }
 }
+
+/// What a first enrollment changes (td-login/TOKEN-LOGIN.md, "Enrollment,
+/// addition and removal"). Every disclosure row fits `PROMPT_COLUMNS`.
+const ENROLLMENT_DISCLOSURE: &[&str] = &[
+    "BOOT AND LOCK NEED A KEY AND PIN",
+    "CONSOLE AND SSH SESSIONS END NOW",
+    "SSH ONLY FOR THE PRIMARY ACCOUNT",
+    "ADMINISTRATION NEEDS A LOGIN",
+    "PIN SET ON ANOTHER LAYOUT MAY FAIL",
+];
+
+/// What one enrolled key risks: a one-key enrollment's addition to the
+/// enrollment disclosure, and a removal that leaves one key.
+const ONE_KEY_DISCLOSURE: &[&str] = &[
+    "LOST KEY OR BLOCKED PIN: NO LOGIN",
+    "RECOVERY NEEDS BOOTING OTHER CODE",
+    "HERE, WHICH ALSO BYPASSES THE LOCK",
+    "A BACKUP KEY CAN BE ADDED LATER",
+];
+
+const NO_KEY: &str = "LOGIN WILL NOT NEED A KEY";
+
+/// A removal of every key: login returns to needing none, and the cutover
+/// back restarts `sshd`, ending its open sessions.
+const NO_KEY_DISCLOSURE: &[&str] = &[
+    NO_KEY,
+    "CONSOLE LOGIN AND THE ORDINARY",
+    "SSH POLICY RETURN",
+    "OPEN SSH SESSIONS END NOW",
+];
 
 /// The approval key's rows, last on an elevation prompt, which carry its
 /// Escape. Each fits `PROMPT_COLUMNS`, so wrapping never splits the key.
@@ -2558,6 +2740,7 @@ mod tests {
                             after,
                             removed: removed.clone(),
                             step,
+                            approval: None,
                         });
                     }
                 }
@@ -2570,12 +2753,23 @@ mod tests {
                         after,
                         key,
                         step,
+                        approval: None,
                     });
                 }
             }
         }
+        // Each disclosure step with its key.
+        let mut operations: Vec<Operation> = operations
+            .into_iter()
+            .map(|operation| operation.disclosed(disclosure()))
+            .collect();
         operations.retain(|operation| Request::new([1; 32], 1000, operation.clone()).is_ok());
         operations
+    }
+
+    /// The key every test disclosure step carries.
+    fn disclosure() -> ApprovalKey {
+        approval(b"36")
     }
 
     fn login(operation: Operation) -> Request {
@@ -2598,6 +2792,7 @@ mod tests {
         }
     }
 
+    /// With the key on its disclosure step.
     fn enroll(after: u8, key: u8, step: LoginStep) -> Operation {
         Operation::LoginEnroll {
             account: 1000,
@@ -2605,10 +2800,13 @@ mod tests {
             after,
             key,
             step,
+            approval: None,
         }
+        .disclosed(disclosure())
     }
 
-    /// A removal from a three-key record.
+    /// A removal from a three-key record, with the key on its disclosure
+    /// step.
     fn remove(removed: Vec<Slot>, step: LoginStep) -> Operation {
         Operation::LoginRemove {
             account: 1000,
@@ -2616,7 +2814,9 @@ mod tests {
             after: 3 - removed.len() as u8,
             removed,
             step,
+            approval: None,
         }
+        .disclosed(disclosure())
     }
 
     fn unlock(step: LoginStep) -> Operation {
@@ -2638,7 +2838,11 @@ mod tests {
                 7,
                 vec![2, 2, 7, 0x3f, 0xa2, 0xc1, 0xd0, 8],
             ),
-            (enroll(2, 1, LoginStep::Connect), 8, vec![0, 2, 1, 8]),
+            (
+                enroll(2, 1, LoginStep::Connect),
+                8,
+                vec![0, 2, 1, 8, b'3', b'6'],
+            ),
             (
                 enroll(2, 2, LoginStep::Create { retries: 7 }),
                 8,
@@ -2669,7 +2873,9 @@ mod tests {
             (
                 remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify),
                 10,
-                vec![3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1],
+                vec![
+                    3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'3', b'6',
+                ],
             ),
             (
                 Operation::LoginRemove {
@@ -2678,6 +2884,7 @@ mod tests {
                     after: 0,
                     removed: vec![slot(1, A)],
                     step: LoginStep::Authorize { key: A, retries: 0 },
+                    approval: None,
                 },
                 10,
                 vec![
@@ -2698,6 +2905,293 @@ mod tests {
         }
         assert!(tags.into_iter().eq(7..=10));
         assert!(steps.into_iter().eq(1..=8));
+    }
+
+    /// An operation, its tag, its value's bytes after the account, the
+    /// value's width and its rows.
+    type Vector = (Operation, u8, Vec<u8>, usize, Vec<&'static str>);
+
+    /// The four disclosure steps (td-login/TOKEN-LOGIN.md increment 5's
+    /// A4), each with its key as the value's last two bytes, its width,
+    /// and its rows: the step's, the disclosure, then the key's.
+    fn disclosure_vectors() -> Vec<Vector> {
+        let key = Some(approval(b"92"));
+        let enrollment = [
+            "BOOT AND LOCK NEED A KEY AND PIN",
+            "CONSOLE AND SSH SESSIONS END NOW",
+            "SSH ONLY FOR THE PRIMARY ACCOUNT",
+            "ADMINISTRATION NEEDS A LOGIN",
+            "PIN SET ON ANOTHER LAYOUT MAY FAIL",
+        ];
+        let one_key = [
+            "LOST KEY OR BLOCKED PIN: NO LOGIN",
+            "RECOVERY NEEDS BOOTING OTHER CODE",
+            "HERE, WHICH ALSO BYPASSES THE LOCK",
+            "A BACKUP KEY CAN BE ADDED LATER",
+        ];
+        let keyed = ["APPROVE: TYPE 9 THEN 2", "ESC: CANCEL"];
+        let header = ["TD SECURE ATTENTION", "SESSION USER 1000"];
+        let enroll = |after| Operation::LoginEnroll {
+            account: 1000,
+            before: 0,
+            after,
+            key: 1,
+            step: LoginStep::Connect,
+            approval: key,
+        };
+        let remove = |before, removed: Vec<Slot>| Operation::LoginRemove {
+            account: 1000,
+            before,
+            after: before - removed.len() as u8,
+            removed,
+            step: LoginStep::Identify,
+            approval: key,
+        };
+        let rows = |head: &[&'static str], tail: &[&[&'static str]]| {
+            let mut rows = header.to_vec();
+            rows.extend(head);
+            rows.extend(tail.iter().flat_map(|rows| rows.iter()));
+            rows.extend(keyed);
+            rows
+        };
+        vec![
+            (
+                enroll(1),
+                8,
+                vec![0, 1, 1, 8, b'9', b'2'],
+                55,
+                rows(
+                    &[
+                        "ENROLL LOGIN KEYS (0 -> 1 KEY)",
+                        "NEW KEY 1 OF 1",
+                        "ACCOUNT UID 1000",
+                        "CONNECT ONLY THE NEW KEY",
+                    ],
+                    &[&enrollment, &one_key],
+                ),
+            ),
+            (
+                enroll(2),
+                8,
+                vec![0, 2, 1, 8, b'9', b'2'],
+                55,
+                rows(
+                    &[
+                        "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
+                        "NEW KEY 1 OF 2",
+                        "ACCOUNT UID 1000",
+                        "CONNECT ONLY THE NEW KEY",
+                    ],
+                    &[&enrollment],
+                ),
+            ),
+            (
+                remove(3, vec![slot(1, B), slot(3, A)]),
+                10,
+                vec![
+                    3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'9', b'2',
+                ],
+                65,
+                rows(
+                    &[
+                        "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
+                        "ACCOUNT UID 1000",
+                        "REMOVE: 1:01020304 3:3fa2c1d0",
+                        "CONNECT ONLY ONE ENROLLED KEY",
+                    ],
+                    &[&one_key],
+                ),
+            ),
+            (
+                remove(2, vec![slot(1, B), slot(2, A)]),
+                10,
+                vec![
+                    2, 0, 2, 1, 1, 2, 3, 4, 2, 0x3f, 0xa2, 0xc1, 0xd0, 1, b'9', b'2',
+                ],
+                65,
+                rows(
+                    &[
+                        "REMOVE 2 LOGIN KEYS (2 -> 0 KEYS)",
+                        "ACCOUNT UID 1000",
+                        "REMOVE: 1:01020304 2:3fa2c1d0",
+                        "CONNECT ONLY ONE ENROLLED KEY",
+                    ],
+                    &[&[
+                        "LOGIN WILL NOT NEED A KEY",
+                        "CONSOLE LOGIN AND THE ORDINARY",
+                        "SSH POLICY RETURN",
+                        "OPEN SSH SESSIONS END NOW",
+                    ]],
+                ),
+            ),
+        ]
+    }
+
+    /// `operation` with its approval field set to `approval`, whatever its
+    /// step; an operation without the field unchanged.
+    fn keyed(operation: Operation, approval: Option<ApprovalKey>) -> Operation {
+        match operation {
+            Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                approval: _,
+            } => Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                approval,
+            },
+            Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: _,
+            } => Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval,
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn each_disclosure_step_has_an_independent_literal_encoding_and_rows() {
+        for (operation, tag, tail, width, rows) in disclosure_vectors() {
+            let request = login(operation);
+            let mut literal = header(tag);
+            literal.extend(&tail);
+            assert_eq!(literal.len(), width);
+            assert_eq!(request.encode(), literal, "{request:?}");
+            assert_eq!(Request::decode(&literal).unwrap(), request);
+            assert_eq!(request.login_approval(), Some(approval(b"92")));
+            assert_eq!(request.lines(), rows);
+            for row in &rows {
+                assert!(row.len() <= PROMPT_COLUMNS, "{row:?}");
+            }
+            // The decoder requires the key: without it, or with one byte
+            // of it, the value is cut; construction without it refuses.
+            for cut in [1, 2] {
+                assert_eq!(
+                    Request::decode(&literal[..literal.len() - cut])
+                        .err()
+                        .unwrap(),
+                    "truncated consent request"
+                );
+            }
+            let keyless = keyed(request.operation().clone(), None);
+            assert_eq!(
+                Request::new([9; 32], 1000, keyless.clone()).err().unwrap(),
+                "invalid consent login operation"
+            );
+            // Root's draw attaches the key here, and only here.
+            assert_eq!(login(keyless.disclosed(approval(b"92"))), request);
+            // Each digit is 2 to 9, in typing order.
+            for index in [literal.len() - 2, literal.len() - 1] {
+                for byte in 0..=255u8 {
+                    let mut changed = literal.clone();
+                    changed[index] = byte;
+                    let decoded = Request::decode(&changed);
+                    if (b'2'..=b'9').contains(&byte) {
+                        assert!(decoded.is_ok(), "{index} {byte}");
+                    } else {
+                        assert_eq!(
+                            decoded.err().unwrap(),
+                            "invalid consent approval key",
+                            "{index} {byte}"
+                        );
+                    }
+                }
+            }
+            let mut swapped = literal.clone();
+            swapped.swap(literal.len() - 2, literal.len() - 1);
+            let swapped = Request::decode(&swapped).unwrap();
+            assert_eq!(swapped.login_approval(), Some(approval(b"29")));
+            assert_eq!(
+                swapped.lines().iter().rev().nth(1).unwrap(),
+                "APPROVE: TYPE 2 THEN 9"
+            );
+        }
+    }
+
+    /// No other step carries a key: two more bytes are trailing, and
+    /// construction with one refuses.
+    #[test]
+    fn only_a_disclosure_step_carries_the_key() {
+        let keyless = [
+            enroll(2, 2, LoginStep::Connect),
+            enroll(1, 1, LoginStep::Create { retries: 8 }),
+            enroll(2, 1, LoginStep::Probe { key: N }),
+            remove(vec![slot(2, A)], LoginStep::Identify),
+            remove(
+                vec![slot(1, B), slot(3, A)],
+                LoginStep::Authorize { key: B, retries: 8 },
+            ),
+            Operation::LoginRemove {
+                account: 1000,
+                before: 1,
+                after: 0,
+                removed: vec![slot(1, A)],
+                step: LoginStep::Authorize { key: A, retries: 8 },
+                approval: None,
+            },
+            add(LoginStep::Identify),
+            add(LoginStep::Connect),
+            unlock(LoginStep::Identify),
+        ];
+        for operation in keyless {
+            let request = login(operation.clone());
+            assert_eq!(request.login_approval(), None);
+            assert_eq!(operation.clone().disclosed(approval(b"92")), operation);
+            let mut bytes = request.encode();
+            bytes.extend(b"92");
+            assert_eq!(
+                Request::decode(&bytes).err().unwrap(),
+                "trailing consent request bytes",
+                "{operation:?}"
+            );
+            // Unlock and addition have no field for one.
+            let keyed = keyed(operation.clone(), Some(approval(b"92")));
+            if keyed != operation {
+                assert_eq!(
+                    Request::new([9; 32], 1000, keyed).err().unwrap(),
+                    "invalid consent login operation"
+                );
+            }
+        }
+        // Exactly the disclosure steps carry it among every login step.
+        for operation in every_login_operation() {
+            let request = login(operation.clone());
+            let disclosure = match (&operation, place(&request)) {
+                (Operation::LoginEnroll { .. }, ("connect", 1)) => true,
+                (Operation::LoginRemove { after, .. }, ("identify", _)) => *after <= 1,
+                _ => false,
+            };
+            assert_eq!(
+                request.login_approval().is_some(),
+                disclosure,
+                "{operation:?}"
+            );
+            let lines = request.lines();
+            if disclosure {
+                assert_eq!(lines[lines.len() - 2], "APPROVE: TYPE 3 THEN 6");
+                assert_eq!(lines[lines.len() - 1], "ESC: CANCEL");
+                assert!(!lines.iter().any(|line| line == "ESC TO CANCEL"));
+            } else {
+                assert_eq!(lines[lines.len() - 1], "ESC TO CANCEL");
+                assert!(!lines.iter().any(|line| line.starts_with("APPROVE")));
+            }
+        }
     }
 
     #[test]
@@ -2770,6 +3264,10 @@ mod tests {
                 bytes.extend(A);
             }
             bytes.push(1);
+            // Leaving at most one key, identify discloses.
+            if before.saturating_sub(positions.len() as u8) <= 1 {
+                bytes.extend(b"36");
+            }
             Request::decode(&bytes)
         };
         assert!(removal(3, &[1, 3]).is_ok());
@@ -2818,6 +3316,7 @@ mod tests {
                 after: 2,
                 key: 1,
                 step: LoginStep::Connect,
+                approval: None,
             },
             enroll(3, 1, LoginStep::Connect),
             enroll(0, 0, LoginStep::Connect),
@@ -2850,6 +3349,7 @@ mod tests {
                 after: 0,
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
+                approval: None,
             },
             Operation::LoginRemove {
                 account: 1000,
@@ -2857,6 +3357,7 @@ mod tests {
                 after: 0,
                 removed: vec![slot(1, A), slot(1, A)],
                 step: LoginStep::Identify,
+                approval: None,
             },
             Operation::LoginRemove {
                 account: 1000,
@@ -2864,6 +3365,7 @@ mod tests {
                 after: 8,
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
+                approval: None,
             },
         ];
         for operation in refused {
@@ -2890,6 +3392,7 @@ mod tests {
                 key: [0xff; 4],
                 retries: 255,
             },
+            approval: None,
         });
         // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1 + 4 + 1.
         assert_eq!(request.encode().len(), 98);
@@ -2900,6 +3403,31 @@ mod tests {
             .map(|operation| login(operation).encode().len())
             .max();
         assert_eq!(widest, Some(98));
+        // The widest disclosure step, a removal of eight keys at its
+        // identify, carries the key and stays below it.
+        let identify = login(
+            Operation::LoginRemove {
+                account: 1000,
+                before: LOGIN_KEYS,
+                after: 0,
+                removed: (1..=LOGIN_KEYS)
+                    .map(|position| slot(position, [0xff; 4]))
+                    .collect(),
+                step: LoginStep::Identify,
+                approval: None,
+            }
+            .disclosed(disclosure()),
+        );
+        // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1,
+        // the key 2.
+        assert_eq!(identify.encode().len(), 95);
+        let widest = every_login_operation()
+            .into_iter()
+            .map(login)
+            .filter(|request| request.login_approval().is_some())
+            .map(|request| request.encode().len())
+            .max();
+        assert_eq!(widest, Some(95));
     }
 
     /// No login row wraps at the renderer's narrowest output, even with the
@@ -3504,6 +4032,7 @@ mod tests {
                     after: 3,
                     removed: Vec::new(),
                     step: LoginStep::Authorize { key: N, retries: 8 },
+                    approval: None,
                 },
             ),
         ] {
@@ -3522,6 +4051,7 @@ mod tests {
                     after: 2,
                     removed,
                     step: LoginStep::Authorize { key: B, retries: 8 },
+                    approval: None,
                 },
             )
         };
@@ -3752,24 +4282,35 @@ mod tests {
         }
         assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
         assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
+        assert_eq!(LOGIN_READING, Duration::from_secs(120));
+        assert_eq!(LOGIN_LONGEST, LOGIN_TWO_CEREMONIES + LOGIN_READING);
         let ceremony = Some(Duration::from_secs(120));
         let two = Some(Duration::from_secs(240));
+        // A disclosing operation's ceiling adds the reading allowance to
+        // its ceremonies, on every step.
+        let read = Some(Duration::from_secs(240));
+        let two_read = Some(Duration::from_secs(360));
+        let mut seen = [false; 5];
         for operation in every_login_operation() {
             let request = login(operation.clone());
             assert!(request.is_login());
-            let (expected, step) = match operation {
-                Operation::LoginUnlock { step, .. }
-                | Operation::LoginRemove { step, .. }
-                | Operation::LoginEnroll { after: 1, step, .. } => Some((ceremony, step)),
-                Operation::LoginEnroll { step, .. } | Operation::LoginAdd { step, .. } => {
-                    Some((two, step))
-                }
+            let (index, expected, step) = match operation {
+                Operation::LoginUnlock { step, .. } => Some((0, ceremony, step)),
+                Operation::LoginRemove {
+                    after: 2.., step, ..
+                } => Some((1, ceremony, step)),
+                Operation::LoginRemove { step, .. }
+                | Operation::LoginEnroll { after: 1, step, .. } => Some((2, read, step)),
+                Operation::LoginEnroll { step, .. } => Some((3, two_read, step)),
+                Operation::LoginAdd { step, .. } => Some((4, two, step)),
                 _ => None,
             }
             .unwrap();
+            seen[index] = true;
             assert_eq!(request.login_ceiling(), expected, "{operation:?}");
             assert_eq!(request.login_step(), Some(step));
         }
+        assert_eq!(seen, [true; 5]);
         for operation in [
             Operation::Unlock {
                 role: Role::Primary,
@@ -3830,13 +4371,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            rows(enroll(2, 1, LoginStep::Connect))[2..],
+            rows(enroll(2, 1, LoginStep::Connect))[2..6],
             [
                 "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
                 "NEW KEY 1 OF 2",
                 "ACCOUNT UID 1000",
                 "CONNECT ONLY THE NEW KEY",
-                "ESC TO CANCEL",
             ]
         );
         assert_eq!(
@@ -3898,11 +4438,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            rows(remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify))[2..5],
+            rows(remove(vec![slot(1, B), slot(3, A)], LoginStep::Identify))[2..6],
             [
                 "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
                 "ACCOUNT UID 1000",
                 "REMOVE: 1:01020304 3:3fa2c1d0",
+                "CONNECT ONLY ONE ENROLLED KEY",
             ]
         );
         assert_eq!(
@@ -3917,6 +4458,7 @@ mod tests {
                     key: [6; 4],
                     retries: 2
                 },
+                approval: None,
             })[2..],
             [
                 "REMOVE 8 LOGIN KEYS (8 -> 0 KEYS)",

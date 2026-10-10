@@ -2247,11 +2247,14 @@ clears an application-store key.
 Its frames, in hex: the worker sends `18` the baseline, `10` and `12`
 invitations, `14` success and `15` a failure; root sends the
 description, `11` and `13` acknowledgements and `16` a PIN after each
-PIN step's acknowledgement. `17` stays store inspection's. From
-TOKEN-LOGIN.md increment 5's A4, the worker waits for a disclosure
-step's `11` until the operation's deadline rather than the five seconds
-above, since the person reads the disclosure and types its approval key
-before acknowledging and no token I/O is open meanwhile.
+PIN step's acknowledgement. `17` stays store inspection's. A disclosure
+step's `11` (TOKEN-LOGIN.md increment 5's A4) is waited for until the
+operation's deadline rather than the five seconds above, since the
+person reads the disclosure and types its approval key before root
+acknowledges and no token I/O is open meanwhile. That step is the
+first, root's own description with root's key, which the worker repeats
+exactly after deriving the same step from the decoded operation; every
+step it derives later carries no key.
 
 1. After startup it requires no active swap and a zero core-dump soft
    limit, as the named-write worker does, since it will hold a PIN and an
@@ -2452,11 +2455,10 @@ none is sent after the operation deadline, which root's own deadline has
 already ended.
 
 The operation deadline counts from startup. The worker starts under the
-longest, 240 seconds, and narrows it once the description names the
-operation: 120 seconds for an unlock, a removal and a one-key
-enrollment, 240 for an addition and a two-key enrollment, td-authd's
-ceilings. Each session opens with a deadline of at most the transport's
-two-minute lifetime (`fido_device::MAX_LIFETIME`) and never past the
+longest, `LOGIN_LONGEST`, and narrows it once the description names the
+operation to its `login_ceiling`, td-authd's (td-authd/DESIGN.md
+amendment 6, reading allowance included). Each session opens with a
+deadline of at most the transport's two-minute lifetime (`fido_device::MAX_LIFETIME`) and never past the
 operation's, so the HID worker's own watchdog never cuts a session the
 worker still waits on. While a session is open, its deadline also bounds
 every wait on root, each presentation's acknowledgement and each PIN, so

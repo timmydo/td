@@ -84,6 +84,8 @@ const MASK_ADVANCE: usize = 4;
 /// A store operation's or installation review's ceiling, in seconds; a
 /// login operation's is its own (td-authd's `login_ceiling`).
 const OPERATION_SECONDS: u64 = 120;
+/// A prompt whose rows this output cannot hold whole: refused, not clipped.
+pub(crate) const PROMPT_TOO_TALL: &str = "output cannot hold every trusted prompt argument";
 
 /// Rasterize once, retaining the exact immutable description beside its pixels.
 #[derive(Debug)]
@@ -190,7 +192,7 @@ impl Prepared {
             .and_then(|height| height.checked_sub(4 * scale))
             .ok_or("prompt height overflow")?;
         if text_height > height.saturating_sub(48) {
-            return Err("output cannot hold every trusted prompt argument".into());
+            return Err(PROMPT_TOO_TALL.into());
         }
         let mut pixels = vec![0; length];
         ui::fill(
@@ -827,6 +829,67 @@ mod tests {
         }
     }
 
+    /// The login disclosure prompts (TOKEN-LOGIN.md increment 5's A4),
+    /// each with its whole time line: the tallest, a one-key enrollment's
+    /// and a removal of seven of eight keys, are shown whole from 1024x768
+    /// and at 640x480, a two-key enrollment's from 800x600; the one-key
+    /// enrollment's refuses 800x600 rather than clips. The key is on the
+    /// prompt.
+    #[test]
+    fn the_login_disclosure_prompts_fit_a_1024_by_768_output() {
+        use crate::authority::consent::{ApprovalKey, LoginStep, Slot, LOGIN_KEYS};
+        let disclosures = |digits: &[u8; 2]| {
+            let key = ApprovalKey::new(*digits).unwrap();
+            let enroll = |after| Operation::LoginEnroll {
+                account: 65533,
+                before: 0,
+                after,
+                key: 1,
+                step: LoginStep::Connect,
+                approval: Some(key),
+            };
+            let remove = |removed: u8| Operation::LoginRemove {
+                account: 65533,
+                before: LOGIN_KEYS,
+                after: LOGIN_KEYS - removed,
+                removed: (1..=removed)
+                    .map(|position| Slot {
+                        position,
+                        key: [0xff; 4],
+                    })
+                    .collect(),
+                step: LoginStep::Identify,
+                approval: Some(key),
+            };
+            [
+                enroll(1),
+                enroll(2),
+                remove(LOGIN_KEYS - 1),
+                remove(LOGIN_KEYS),
+            ]
+            .map(|operation| Request::new([1; 32], 65533, operation).unwrap())
+        };
+        let prompt = |request: &Request, width: usize, height: usize| {
+            let ceiling = request.login_ceiling().unwrap().as_secs();
+            Prepared::with_time(request.clone(), width, height, width * 4, Some(ceiling))
+        };
+        for (request, swapped) in disclosures(b"47").into_iter().zip(disclosures(b"74")) {
+            for (width, height) in [(1024, 768), (1366, 768), (1280, 800), (640, 480)] {
+                assert!(prompt(&request, width, height).is_ok(), "{width}x{height}");
+            }
+            assert_ne!(
+                prompt(&request, 1024, 768).unwrap().pixels,
+                prompt(&swapped, 1024, 768).unwrap().pixels
+            );
+        }
+        let [one, two, ..] = disclosures(b"47");
+        assert!(prompt(&two, 800, 600).is_ok());
+        assert_eq!(
+            prompt(&one, 800, 600).err().unwrap(),
+            "output cannot hold every trusted prompt argument"
+        );
+    }
+
     /// Consent keeps every login row within `PROMPT_COLUMNS`, this renderer's
     /// columns at its narrowest accepted width, so wrapping never splits a
     /// fingerprint. The widest login prompt asks for a PIN, and at 800x600
@@ -854,6 +917,7 @@ mod tests {
                     key: [0xff; 4],
                     retries: 255,
                 },
+                approval: None,
             },
         )
         .unwrap();
@@ -1165,6 +1229,7 @@ mod tests {
         Notice::Login(&["LOGIN KEY STATE UNAVAILABLE:", "STATE COULD NOT BE READ"]),
         Notice::Login(&["A RETAINED SYSTEM CANNOT READ KEYS"]),
         Notice::Login(&["THE OPERATION FAILED"]),
+        Notice::Login(crate::secret_client::TOO_SMALL),
         Notice::Uncertain(&["LOGIN KEY STATE UNAVAILABLE:", "DIRECTORY DAMAGED"]),
         Notice::Restarting,
     ];
@@ -1716,6 +1781,7 @@ mod tests {
                             after,
                             key: created,
                             step,
+                            approval: None,
                         });
                     }
                     for removed in 1..=before {
@@ -1727,6 +1793,7 @@ mod tests {
                                 .map(|position| Slot { position, key })
                                 .collect(),
                             step,
+                            approval: None,
                         });
                     }
                 }

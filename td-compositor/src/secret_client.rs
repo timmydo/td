@@ -3,7 +3,8 @@
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
     Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery,
-    Request, Role, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_TWO_CEREMONIES,
+    Request, Role, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING,
+    LOGIN_TWO_CEREMONIES,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -316,7 +317,8 @@ impl Selection {
     }
     /// Whether a physical confirmation on the presented prompt must come
     /// before commit: the approval key for an update or an elevation, a
-    /// fresh Enter for a live boot's whole-disk installation.
+    /// fresh Enter for a live boot's whole-disk installation. A login
+    /// disclosure step's key comes before its receipt instead.
     fn confirms(&self) -> bool {
         matches!(self, Self::Install | Self::Elevation(_))
     }
@@ -352,12 +354,15 @@ impl Elevation {
     }
 }
 
-/// The approval key `request` carries: an update's (`deploy-publish`) or
-/// an elevation's. Every other description, a whole-disk installation's
-/// among them, has none.
+/// The approval key `request` carries: an update's (`deploy-publish`), an
+/// elevation's or a login disclosure step's. Every other description, a
+/// whole-disk installation's among them, has none.
 fn approval_key(request: &Request) -> Option<ApprovalKey> {
     match request.operation() {
         Operation::Install { key, .. } => Some(*key),
+        Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {
+            *approval
+        }
         _ => Elevation::of(request).map(|(_, key)| key),
     }
 }
@@ -381,8 +386,10 @@ pub(crate) enum LoginSelection {
     /// First enrollment of one or two keys.
     Enroll(u8),
     Add,
-    /// The slots to remove, positions strictly increasing.
-    Remove(Vec<Slot>),
+    /// The slots to remove, positions strictly increasing, and the keys
+    /// the removal leaves of the list it was chosen from, which fix its
+    /// ceiling: root's description must agree.
+    Remove(Vec<Slot>, u8),
 }
 
 impl LoginSelection {
@@ -393,7 +400,7 @@ impl LoginSelection {
             Self::Enroll(keys @ (1 | 2)) => vec![0x1b, 8, *keys],
             Self::Enroll(_) => return Err("a first enrollment has one or two keys".into()),
             Self::Add => vec![0x1b, 9],
-            Self::Remove(slots) => {
+            Self::Remove(slots, _) => {
                 let count = u8::try_from(slots.len())
                     .ok()
                     .filter(|count| (1..=LOGIN_KEYS).contains(count))
@@ -418,11 +425,15 @@ impl LoginSelection {
         })
     }
 
-    /// td-authd's ceiling: one ceremony per key the person handles in turn.
+    /// td-authd's ceiling: one ceremony per key the person handles in turn,
+    /// and the reading allowance when the operation discloses.
     fn ceiling(&self) -> Duration {
         match self {
-            Self::Unlock | Self::Remove(_) | Self::Enroll(1) => LOGIN_CEREMONY,
-            Self::Enroll(_) | Self::Add => LOGIN_TWO_CEREMONIES,
+            Self::Unlock => LOGIN_CEREMONY,
+            Self::Remove(_, after) if *after > 1 => LOGIN_CEREMONY,
+            Self::Remove(..) | Self::Enroll(1) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
+            Self::Add => LOGIN_TWO_CEREMONIES,
+            Self::Enroll(_) => LOGIN_LONGEST,
         }
     }
 
@@ -442,11 +453,14 @@ impl LoginSelection {
                     *account == 1000 && after == keys
                 }
                 (
-                    Self::Remove(slots),
+                    Self::Remove(slots, left),
                     Operation::LoginRemove {
-                        account, removed, ..
+                        account,
+                        after,
+                        removed,
+                        ..
                     },
-                ) => *account == 1000 && removed == slots,
+                ) => *account == 1000 && after == left && removed == slots,
                 _ => false,
             }
     }
@@ -456,7 +470,7 @@ impl LoginSelection {
             Self::Unlock => &["SESSION UNLOCKED"],
             Self::Enroll(_) => &["LOGIN KEYS ENROLLED"],
             Self::Add => &["LOGIN KEY ADDED"],
-            Self::Remove(_) => &["LOGIN KEYS REMOVED"],
+            Self::Remove(..) => &["LOGIN KEYS REMOVED"],
         }
     }
 }
@@ -519,9 +533,14 @@ impl Removal {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(LoginSelection::Remove(slots))
+        let after = self.keys.len().checked_sub(slots.len())?;
+        Some(LoginSelection::Remove(slots, u8::try_from(after).ok()?))
     }
 }
+
+/// A login step's prompt this output cannot hold whole, which is refused
+/// rather than clipped: the operation ends before its token I/O.
+pub(crate) const TOO_SMALL: &[&str] = &["THIS SCREEN IS TOO SMALL", "FOR THIS PROMPT"];
 
 /// TOKEN-LOGIN.md's text for root's terminal kind and detail, in rows the
 /// narrowest output's chrome holds whole, or none for a pair root never
@@ -877,17 +896,37 @@ impl Attempt {
         }
         let completed = receipt.completed();
         let request = receipt.into_request();
-        if self.selection.confirms() {
-            *self
+        if self.selection.confirms() || matches!(self.selection, Selection::Login(_)) {
+            let mut presentation = self
                 .presentation
                 .lock()
-                .map_err(|_| "presentation receipt lock poisoned")? = Some(Presented {
-                request: request.clone(),
-                after: completed,
-                typed: 0,
-            });
+                .map_err(|_| "presentation receipt lock poisoned")?;
+            // A login step replaces the one before it, whose key is spent:
+            // its confirmation goes with it, under the lock a digit sets it.
+            if matches!(self.selection, Selection::Login(_)) {
+                self.confirmed.store(false, Ordering::SeqCst);
+            }
+            *presentation =
+                (self.selection.confirms() || approval_key(&request).is_some()).then(|| {
+                    Presented {
+                        request: request.clone(),
+                        after: completed,
+                        typed: 0,
+                    }
+                });
         }
         Ok(request)
+    }
+
+    /// Whether `request`, the presented login disclosure step, has its
+    /// approval key typed: only then does its receipt go to root.
+    fn approved(&self, request: &Request) -> bool {
+        self.confirmed.load(Ordering::SeqCst)
+            && self.presentation.lock().is_ok_and(|presented| {
+                presented
+                    .as_ref()
+                    .is_some_and(|presented| presented.request == *request)
+            })
     }
 
     /// Whether a press stamped `timestamp` can answer `presented`: strictly
@@ -922,8 +961,9 @@ impl Attempt {
     }
 
     /// One approval-key digit, `2` to `9` in ASCII, pressed at `timestamp`,
-    /// which only the physical evdev adapter can offer, for an update or an
-    /// elevation: answers whether it ended the request. A press the prompt
+    /// which only the physical evdev adapter can offer, for an update, an
+    /// elevation or a login disclosure step: answers whether it ended the
+    /// request. A press the prompt
     /// cannot answer (stamped before the prompt was on glass or before the
     /// first digit, a withdrawn or replaced prompt, a key already typed)
     /// neither advances nor ends it.
@@ -936,8 +976,10 @@ impl Attempt {
         digit: u8,
         timestamp: u128,
     ) -> Result<bool, String> {
-        if !matches!(self.selection, Selection::Install | Selection::Elevation(_))
-            || !(b'2'..=b'9').contains(&digit)
+        if !matches!(
+            self.selection,
+            Selection::Install | Selection::Elevation(_) | Selection::Login(_)
+        ) || !(b'2'..=b'9').contains(&digit)
             || !self.active()
         {
             return Ok(false);
@@ -1032,6 +1074,9 @@ struct LoginPending {
     /// Root's current description; none before the worker's baseline.
     request: Option<Request>,
     receipt: Option<Request>,
+    /// The current step, presented and waiting for its approval key before
+    /// its receipt: a disclosure step.
+    shown: Option<Request>,
     /// The current step is the operation's final one: only its commit
     /// follows.
     last: bool,
@@ -1168,6 +1213,7 @@ impl Client {
             nonce,
             request: None,
             receipt: None,
+            shown: None,
             last: false,
             authorizer: None,
             field: false,
@@ -1238,16 +1284,31 @@ impl Client {
         match *status {
             0x03 => {}
             0x04 if login.receipt.is_none() && open => {
-                match login.attempt.present(description.clone()) {
-                    Ok(receipt) if receipt == description && login.attempt.active() => {
-                        let mut bytes = vec![0x13];
-                        bytes.extend_from_slice(&receipt.encode());
-                        if wire.exchange(&bytes)? != [0x93] {
-                            return Err("invalid presentation acknowledgement".into());
+                if login.shown.is_none() {
+                    match login.attempt.present(description.clone()) {
+                        Ok(receipt) if receipt == description && login.attempt.active() => {
+                            login.shown = Some(receipt);
                         }
-                        login.receipt = Some(receipt);
+                        Err(error) if error == crate::attention::PROMPT_TOO_TALL => {
+                            return login.abandon_saying(wire, TOO_SMALL)
+                        }
+                        _ => return login.abandon(wire),
                     }
-                    _ => login.abandon(wire)?,
+                }
+                // A disclosure step's receipt waits for its approval key
+                // (DESIGN.md, "Elevation consent"); any other step's
+                // follows its presentation. Root polls again meanwhile.
+                if login.shown.as_ref() == Some(&description)
+                    && (approval_key(&description).is_none()
+                        || login.attempt.approved(&description))
+                    && login.attempt.active()
+                {
+                    let mut bytes = vec![0x13];
+                    bytes.extend_from_slice(&description.encode());
+                    if wire.exchange(&bytes)? != [0x93] {
+                        return Err("invalid presentation acknowledgement".into());
+                    }
+                    login.receipt = login.shown.take();
                 }
             }
             // Root waits for the presented PIN step's PIN: the field opens,
@@ -1660,12 +1721,21 @@ impl LoginPending {
     /// why: the attempt's deadline passed, or a presentation failed. After
     /// Escape the screen is closing and `notice` shows nothing.
     fn abandon(&mut self, wire: &mut impl Exchange) -> Result<(), String> {
+        self.abandon_saying(wire, &["THE OPERATION FAILED"])
+    }
+
+    /// As `abandon`, saying `why` unless the attempt's time ran out.
+    fn abandon_saying(
+        &mut self,
+        wire: &mut impl Exchange,
+        why: &'static [&'static str],
+    ) -> Result<(), String> {
         self.cancel(wire)?;
         self.attempt
             .notice(Notice::Login(if self.attempt.expired() {
                 &["TIMED OUT"]
             } else {
-                &["THE OPERATION FAILED"]
+                why
             }))
     }
 
@@ -1681,7 +1751,7 @@ impl LoginPending {
             (0x80, 0) => self.cancelled,
             (0x81, 0) => !described && self.selection == LoginSelection::Add,
             (0x82, 0) => !described && matches!(self.selection, LoginSelection::Enroll(_)),
-            (0x83, 0) => !described && matches!(self.selection, LoginSelection::Remove(_)),
+            (0x83, 0) => !described && matches!(self.selection, LoginSelection::Remove(..)),
             _ => false,
         }
     }
@@ -1693,6 +1763,8 @@ impl LoginPending {
     /// name the authorizing key, which consent leaves to this reader.
     fn admit(&mut self, description: &Request, status: u8) -> Result<(), String> {
         let Some(current) = &self.request else {
+            // A removal chosen from a stale list, whose count left differs
+            // from root's baseline, is refused here as a changed operation.
             if !matches!(status, 0x03 | 0x04 | 0x0d | 0x0e)
                 || description.nonce() != &self.nonce
                 || !self.selection.selects(description)
@@ -1731,6 +1803,7 @@ impl LoginPending {
         self.last = admitted == Admitted::Last;
         self.request = Some(description.clone());
         self.receipt = None;
+        self.shown = None;
         self.field = false;
         self.pin_sent = false;
         Ok(())
@@ -1826,13 +1899,17 @@ mod tests {
     }
     impl Screen {
         fn new() -> Self {
+            Self::sized(800, 600)
+        }
+        fn sized(width: usize, height: usize) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "td-secret-screen-{}-{}",
                 std::process::id(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
             let mut runtime = Runtime::new(
-                crate::framebuffer::Framebuffer::test_file(&path, 800, 600, 3200).unwrap(),
+                crate::framebuffer::Framebuffer::test_file(&path, width, height, width * 4)
+                    .unwrap(),
             );
             runtime.enable_attention(true);
             runtime
@@ -1878,6 +1955,10 @@ mod tests {
                 if empty {
                     type_pin(attempt, PIN);
                 }
+                // A login disclosure on glass: they type its key.
+                if matches!(attempt.selection, Selection::Login(_)) {
+                    type_key(attempt);
+                }
             }
             Ok(reply)
         }
@@ -1893,6 +1974,25 @@ mod tests {
             .unwrap()
             .shown
             .map_or(0, |shown| shown + 1)
+    }
+    /// The presented prompt's approval key, each digit a fresh press after
+    /// the one before, as the evdev adapter offers them; nothing once typed
+    /// or for a prompt without one.
+    fn type_key(attempt: &Attempt) {
+        let shown = attempt
+            .presentation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|presented| presented.typed == 0)
+            .and_then(|presented| Some((approval_key(&presented.request)?, presented.after)));
+        if let Some((key, after)) = shown {
+            for (at, digit) in (after + 1..).zip(key.digits()) {
+                attempt
+                    .approve(&crate::input::test_origin(), digit, at)
+                    .unwrap();
+            }
+        }
     }
     /// `pin`'s keys, then Enter, as the evdev adapter offers them.
     fn type_pin(attempt: &Attempt, pin: &[u8]) {
@@ -3296,8 +3396,12 @@ mod tests {
     const BACKUP: Fingerprint = [0xb2; 4];
 
     impl Screen {
+        /// At 1024x768, which holds every disclosure prompt whole.
         fn login(selection: LoginSelection) -> Self {
-            let mut screen = Self::new();
+            Self::login_at(selection, 1024, 768)
+        }
+        fn login_at(selection: LoginSelection, width: usize, height: usize) -> Self {
+            let mut screen = Self::sized(width, height);
             screen.attempt = Attempt::new(
                 crate::input::test_origin(),
                 Arc::clone(&screen.attempt.runtime),
@@ -3342,14 +3446,24 @@ mod tests {
             step,
         })
     }
+    /// The key root drew for this operation's disclosure step.
+    const DISCLOSURE: &[u8; 2] = b"63";
+    fn disclosure() -> ApprovalKey {
+        ApprovalKey::new(*DISCLOSURE).unwrap()
+    }
+    /// With root's key on its disclosure step.
     fn enroll_step(after: u8, key: u8, step: LoginStep) -> Request {
-        login(Operation::LoginEnroll {
-            account: 1000,
-            before: 0,
-            after,
-            key,
-            step,
-        })
+        login(
+            Operation::LoginEnroll {
+                account: 1000,
+                before: 0,
+                after,
+                key,
+                step,
+                approval: None,
+            }
+            .disclosed(disclosure()),
+        )
     }
     fn add_step(step: LoginStep) -> Request {
         login(Operation::LoginAdd {
@@ -3371,14 +3485,19 @@ mod tests {
             },
         ]
     }
+    /// Leaving one key: its identify discloses.
     fn remove_step(step: LoginStep) -> Request {
-        login(Operation::LoginRemove {
-            account: 1000,
-            before: 3,
-            after: 1,
-            removed: removal(),
-            step,
-        })
+        login(
+            Operation::LoginRemove {
+                account: 1000,
+                before: 3,
+                after: 1,
+                removed: removal(),
+                step,
+                approval: None,
+            }
+            .disclosed(disclosure()),
+        )
     }
     fn new_key(key: Fingerprint) -> [LoginStep; 5] {
         [
@@ -3416,7 +3535,7 @@ mod tests {
             .chain(new_key(NEW))
             .map(add_step)
             .collect(),
-            LoginSelection::Remove(_) => vec![
+            LoginSelection::Remove(..) => vec![
                 remove_step(LoginStep::Identify),
                 remove_step(LoginStep::Authorize {
                     key: ENROLLED[0],
@@ -3431,7 +3550,7 @@ mod tests {
             LoginSelection::Enroll(1),
             LoginSelection::Enroll(2),
             LoginSelection::Add,
-            LoginSelection::Remove(removal()),
+            LoginSelection::Remove(removal(), 1),
         ]
     }
     fn status(code: u8, request: &Request) -> Vec<u8> {
@@ -3472,6 +3591,12 @@ mod tests {
             vec![0x11],
         ];
         for step in steps.iter().take(count) {
+            // A disclosure is presented at one poll and, its key typed,
+            // acknowledged at the next.
+            if approval_key(step).is_some() {
+                replies.push(status(4, step));
+                calls.push(vec![0x11]);
+            }
             replies.extend([status(4, step), vec![0x93]]);
             calls.extend([vec![0x11], description(&[0x13], step)]);
             if asks_pin(step) {
@@ -3537,13 +3662,148 @@ mod tests {
         }
     }
 
+    /// A disclosure's typed key confirms only its own prompt: the next
+    /// login step's presentation clears the confirmation with the key.
+    #[test]
+    fn a_typed_disclosure_key_does_not_outlive_its_prompt() {
+        let origin = crate::input::test_origin();
+        let selection = LoginSelection::Enroll(2);
+        let screen = Screen::login(selection.clone());
+        let steps = steps(&selection);
+        assert_eq!(
+            screen.attempt.present(steps[0].clone()),
+            Ok(steps[0].clone())
+        );
+        let after = screen
+            .attempt
+            .presentation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .after;
+        for (at, digit) in (after + 1..).zip(*DISCLOSURE) {
+            assert!(!screen.attempt.approve(&origin, digit, at).unwrap());
+        }
+        assert!(confirmed(&screen) && screen.attempt.approved(&steps[0]));
+        assert_eq!(
+            screen.attempt.present(steps[1].clone()),
+            Ok(steps[1].clone())
+        );
+        assert!(!confirmed(&screen));
+        assert!(!screen.attempt.approved(&steps[0]));
+        assert!(screen.attempt.presentation.lock().unwrap().is_none());
+    }
+
+    /// A login disclosure step's receipt follows only its typed key
+    /// (TOKEN-LOGIN.md increment 5's A4): root's `04` polls draw nothing
+    /// until then, Enter confirms nothing, and a digit stamped at the
+    /// prompt's own sample counts for nothing. The receipt then carries
+    /// the exact description, and the next step's follows its
+    /// presentation. A wrong digit cancels instead.
+    #[test]
+    fn a_disclosure_steps_receipt_waits_for_its_typed_key() {
+        let origin = crate::input::test_origin();
+        for selection in [
+            LoginSelection::Enroll(1),
+            LoginSelection::Enroll(2),
+            LoginSelection::Remove(removal(), 1),
+        ] {
+            let screen = Screen::login(selection.clone());
+            let steps = steps(&selection);
+            let first = &steps[0];
+            assert_eq!(approval_key(first), Some(disclosure()));
+            assert_eq!(approval_key(&steps[1]), None);
+            let (mut replies, _) = presented(&selection, 0);
+            replies.extend([status(4, first), status(4, first)]);
+            let mut root = wire(replies);
+            let mut client = login_client();
+            client
+                .start(&mut root, Arc::clone(&screen.attempt))
+                .unwrap();
+            while !root.replies.is_empty() {
+                client.tick(&mut root).unwrap();
+            }
+            assert_eq!(sent(&root, 0x13), 0, "{selection:?}");
+            let after = screen
+                .attempt
+                .presentation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .after;
+            screen.attempt.confirm_install(&origin, after + 1).unwrap();
+            assert!(!screen
+                .attempt
+                .approve(&origin, DISCLOSURE[0], after)
+                .unwrap());
+            root.replies.push_back(status(4, first));
+            client.tick(&mut root).unwrap();
+            assert_eq!(sent(&root, 0x13), 0);
+            for (at, digit) in (after + 1..).zip(*DISCLOSURE) {
+                assert!(!screen.attempt.approve(&origin, digit, at).unwrap());
+            }
+            root.replies.extend([
+                status(4, first),
+                vec![0x93],
+                status(4, &steps[1]),
+                vec![0x93],
+            ]);
+            client.tick(&mut root).unwrap();
+            client.tick(&mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert_eq!(
+                root.calls
+                    .iter()
+                    .filter(|call| call.first() == Some(&0x13))
+                    .collect::<Vec<_>>(),
+                [
+                    &description(&[0x13], first),
+                    &description(&[0x13], &steps[1])
+                ]
+            );
+            // A wrong digit at either position ends it with `15`.
+            for typed in [&b"9"[..], &[DISCLOSURE[0], b'9']] {
+                let screen = Screen::login(selection.clone());
+                let (mut replies, _) = presented(&selection, 0);
+                replies.push(status(4, first));
+                let mut wire = wire(replies);
+                let mut client = login_client();
+                client
+                    .start(&mut wire, Arc::clone(&screen.attempt))
+                    .unwrap();
+                while !wire.replies.is_empty() {
+                    client.tick(&mut wire).unwrap();
+                }
+                let (last, before) = typed.split_last().unwrap();
+                let after = screen
+                    .attempt
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .after;
+                for (at, digit) in (after + 1..).zip(before) {
+                    assert!(!screen.attempt.approve(&origin, *digit, at).unwrap());
+                }
+                assert!(screen.attempt.approve(&origin, *last, after + 10).unwrap());
+                wire.replies.extend([vec![0x95, 0], status(3, first)]);
+                client.tick(&mut wire).unwrap();
+                assert_eq!(sent(&wire, 0x15), 1);
+                assert_eq!(sent(&wire, 0x13), 0);
+            }
+        }
+    }
+
     #[test]
     fn root_refusing_a_write_shows_not_available() {
         for selection in [
             LoginSelection::Enroll(1),
             LoginSelection::Enroll(2),
             LoginSelection::Add,
-            LoginSelection::Remove(removal()),
+            LoginSelection::Remove(removal(), 1),
         ] {
             let screen = Screen::login(selection.clone());
             let (mut client, wire, result) = drive(&screen, vec![vec![0x9b, 0]]);
@@ -3594,7 +3854,12 @@ mod tests {
             ),
             // Other slots.
             (
-                LoginSelection::Remove(removal()[..1].to_vec()),
+                LoginSelection::Remove(removal()[..1].to_vec(), 1),
+                remove_step(LoginStep::Identify),
+            ),
+            // Another count left, and so another ceiling.
+            (
+                LoginSelection::Remove(removal(), 2),
                 remove_step(LoginStep::Identify),
             ),
             // Not the operation's first step.
@@ -4009,7 +4274,7 @@ mod tests {
                 LoginSelection::Unlock => (0x09, 0),
                 LoginSelection::Enroll(_) => (0x82, 0),
                 LoginSelection::Add => (0x81, 0),
-                LoginSelection::Remove(_) => (0x83, 0),
+                LoginSelection::Remove(..) => (0x83, 0),
             });
         }
         ends
@@ -4185,12 +4450,12 @@ mod tests {
                     Notice::Login(rows),
                 ),
                 0x83 => (
-                    LoginSelection::Remove(removal()),
+                    LoginSelection::Remove(removal(), 1),
                     Point::Baseline,
                     Notice::Login(rows),
                 ),
                 0x0e => (
-                    LoginSelection::Remove(removal()),
+                    LoginSelection::Remove(removal(), 1),
                     Point::Committed,
                     Notice::Uncertain(&[]),
                 ),
@@ -4268,7 +4533,7 @@ mod tests {
                 [&ended(0x0d, 0x80, 0)[..], &next.encode()].concat(),
             ]);
             let mut wire = CancelAt {
-                wire: wire(replies),
+                wire: typing(replies, &screen),
                 attempt: &screen.attempt,
                 at,
             };
@@ -4310,6 +4575,40 @@ mod tests {
                 assert_eq!(sent(&wire, 0x15), 0);
             }
         }
+    }
+
+    /// A prompt this output cannot hold whole ends the operation before
+    /// its token I/O and says so: a one-key enrollment's disclosure at
+    /// 800x600. A two-key enrollment's fits there.
+    #[test]
+    fn a_prompt_too_tall_for_the_screen_says_so() {
+        let one = LoginSelection::Enroll(1);
+        let first = steps(&one)[0].clone();
+        let end = [&ended(0x0d, 0x80, 0)[..], &first.encode()].concat();
+        let screen = Screen::login_at(one, 800, 600);
+        let mut root = wire(vec![
+            started(),
+            vec![0x91, 0x0b],
+            status(3, &first),
+            status(4, &first),
+            vec![0x95, 0],
+            end,
+        ]);
+        let mut client = login_client();
+        client
+            .start(&mut root, Arc::clone(&screen.attempt))
+            .unwrap();
+        while client.login.is_some() {
+            client.tick(&mut root).unwrap();
+        }
+        assert!(root.replies.is_empty());
+        assert_eq!(sent(&root, 0x15), 1);
+        assert_eq!(sent(&root, 0x13), 0);
+        assert_eq!(screen.shown(), Some(Notice::Login(TOO_SMALL)));
+        let two = LoginSelection::Enroll(2);
+        let screen = Screen::login_at(two.clone(), 800, 600);
+        let first = steps(&two)[0].clone();
+        assert_eq!(screen.attempt.present(first.clone()), Ok(first));
     }
 
     /// The client's own cancellation says why and withdraws the prompt: its
@@ -4379,13 +4678,17 @@ mod tests {
         );
     }
 
+    /// A disclosing operation's lifetime adds root's reading allowance to
+    /// its ceremonies, as root's and the worker's ceilings do.
     #[test]
     fn a_login_attempt_lives_its_operations_ceiling_and_no_longer() {
+        assert_eq!(LOGIN_READING, Duration::from_secs(120));
+        assert_eq!(LOGIN_LONGEST, Duration::from_secs(360));
         for (selection, seconds) in [
             (LoginSelection::Unlock, 120),
-            (LoginSelection::Enroll(1), 120),
-            (LoginSelection::Remove(removal()), 120),
-            (LoginSelection::Enroll(2), 240),
+            (LoginSelection::Enroll(1), 240),
+            (LoginSelection::Remove(removal(), 1), 240),
+            (LoginSelection::Enroll(2), 360),
             (LoginSelection::Add, 240),
         ] {
             let before = Instant::now();
@@ -4393,6 +4696,10 @@ mod tests {
             let lifetime = screen.attempt.deadline.unwrap().duration_since(before);
             assert!(lifetime >= Duration::from_secs(seconds));
             assert!(lifetime < Duration::from_secs(seconds + 1));
+            assert_eq!(
+                steps(&selection)[0].login_ceiling(),
+                Some(Duration::from_secs(seconds))
+            );
             // Its first prompt shows what is left, within that ceiling.
             let first = steps(&selection)[0].clone();
             assert_eq!(screen.attempt.present(first.clone()), Ok(first));
@@ -4416,20 +4723,27 @@ mod tests {
         for refused in [
             LoginSelection::Enroll(0),
             LoginSelection::Enroll(3),
-            LoginSelection::Remove(Vec::new()),
-            LoginSelection::Remove(removal().into_iter().rev().collect()),
-            LoginSelection::Remove(vec![Slot {
-                position: 9,
-                key: NEW,
-            }]),
-            LoginSelection::Remove(vec![Slot {
-                position: 0,
-                key: NEW,
-            }]),
+            LoginSelection::Remove(Vec::new(), 1),
+            LoginSelection::Remove(removal().into_iter().rev().collect(), 1),
+            LoginSelection::Remove(
+                vec![Slot {
+                    position: 9,
+                    key: NEW,
+                }],
+                1,
+            ),
+            LoginSelection::Remove(
+                vec![Slot {
+                    position: 0,
+                    key: NEW,
+                }],
+                1,
+            ),
             LoginSelection::Remove(
                 (1..=9)
                     .map(|position| Slot { position, key: NEW })
                     .collect(),
+                0,
             ),
         ] {
             assert!(wire(refused).is_err());
@@ -4451,7 +4765,7 @@ mod tests {
             }
         );
         let chosen = digits.selection().unwrap();
-        assert_eq!(chosen, LoginSelection::Remove(removal()));
+        assert_eq!(chosen, LoginSelection::Remove(removal(), 1));
         assert_eq!(
             wire(chosen),
             Ok([&[0x1b, 10, 2, 1][..], &ENROLLED[0], &[3], &ENROLLED[2]].concat())
@@ -4459,10 +4773,13 @@ mod tests {
         assert!(digits.toggle(1));
         assert_eq!(
             digits.selection(),
-            Some(LoginSelection::Remove(vec![Slot {
-                position: 3,
-                key: ENROLLED[2],
-            }]))
+            Some(LoginSelection::Remove(
+                vec![Slot {
+                    position: 3,
+                    key: ENROLLED[2],
+                }],
+                2
+            ))
         );
         assert!(digits.toggle(3));
         assert_eq!(digits.selection(), None);
@@ -4986,43 +5303,50 @@ mod tests {
     }
 
     /// A PIN step whose field would not fit beneath its prompt is not
-    /// presented: at 800x600 the removal of eight keys fails at its prompt,
-    /// before any receipt, so no PIN reaches the key.
+    /// presented: at 800x600 the removal of eight keys fails at its
+    /// authorize prompt, before any receipt, so no PIN reaches the key.
     #[test]
     fn a_pin_step_without_room_for_its_field_is_never_presented() {
         use crate::authority::consent::{Slot, LOGIN_KEYS};
-        let removal = |step| {
+        // `removed` of eight keys; a disclosure step carries its key.
+        let removal = |removed: u8, step| {
             Request::new(
                 NONCE,
                 1000,
                 Operation::LoginRemove {
                     account: 1000,
                     before: LOGIN_KEYS,
-                    after: 0,
-                    removed: (1..=LOGIN_KEYS)
+                    after: LOGIN_KEYS - removed,
+                    removed: (1..=removed)
                         .map(|position| Slot {
                             position,
                             key: [0xa1; 4],
                         })
                         .collect(),
                     step,
-                },
+                    approval: None,
+                }
+                .disclosed(disclosure()),
             )
             .unwrap()
         };
-        let screen = Screen::login(LoginSelection::Unlock);
-        let authorize = removal(LoginStep::Authorize {
-            key: [0xa1; 4],
-            retries: 8,
-        });
+        let screen = Screen::login_at(LoginSelection::Unlock, 800, 600);
+        let authorize = removal(
+            LOGIN_KEYS,
+            LoginStep::Authorize {
+                key: [0xa1; 4],
+                retries: 8,
+            },
+        );
         assert_eq!(
             screen.attempt.present(authorize).unwrap_err(),
             "output cannot hold the PIN field beneath this prompt"
         );
-        // The same operation's silent first step, which asks no PIN, is
-        // shown at that size.
-        let screen = Screen::login(LoginSelection::Unlock);
-        assert!(screen.attempt.present(removal(LoginStep::Identify)).is_ok());
+        // A removal's silent first step, which asks no PIN and, leaving
+        // two keys, discloses nothing, is shown at that size.
+        let screen = Screen::login_at(LoginSelection::Unlock, 800, 600);
+        let identify = removal(LOGIN_KEYS - 2, LoginStep::Identify);
+        assert!(screen.attempt.present(identify).is_ok());
     }
 
     /// A paint that fails as the field opens takes it off the screen and
@@ -5244,7 +5568,7 @@ mod tests {
     fn the_field_leaves_the_presented_prompt_on_glass() {
         let unlock = LoginSelection::Unlock;
         let last = unlock_pin_step();
-        let screen = Screen::login(unlock.clone());
+        let screen = Screen::login_at(unlock.clone(), 800, 600);
         let mut replies = presented(&unlock, 1).0;
         replies.extend([status(4, &last), vec![0x93]]);
         let mut wire = wire(replies);

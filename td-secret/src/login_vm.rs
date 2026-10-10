@@ -184,7 +184,7 @@ fn operated(
 ) -> (Result<(), Failure>, Vec<Vec<u8>>) {
     let (worker, parent) = UnixStream::pair().unwrap();
     let authority = std::thread::spawn(move || root(parent, plan));
-    let deadline = context.started.checked_add(LOGIN_TWO_CEREMONIES).unwrap();
+    let deadline = context.started.checked_add(LOGIN_LONGEST).unwrap();
     let mut wire = Wire::new(worker, deadline).unwrap();
     let mut random = File::open("/dev/urandom").unwrap();
     let result = operate(

@@ -49,6 +49,12 @@ fn adding(before: u8, step: LoginStep) -> Operation {
     }
 }
 
+/// The key `Login::scripted` draws for every disclosure step.
+pub(crate) fn approval() -> ApprovalKey {
+    ApprovalKey::new(*b"47").unwrap()
+}
+
+/// With root's key on its disclosure step.
 fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
     Operation::LoginEnroll {
         account: 1000,
@@ -56,9 +62,12 @@ fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
         after,
         key,
         step,
+        approval: None,
     }
+    .disclosed(approval())
 }
 
+/// With root's key on its disclosure step.
 fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
     Operation::LoginRemove {
         account: 1000,
@@ -66,7 +75,9 @@ fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
         after: before - removed.len() as u8,
         removed: removed.to_vec(),
         step,
+        approval: None,
     }
+    .disclosed(approval())
 }
 
 fn request(operation: Operation) -> Request {
@@ -327,6 +338,18 @@ fn scripted_worker() {
             }
             w.invite(0x12, &request(enrolling(2, 2, LoginStep::Probe { key: M })));
             w.send(&[0x14]);
+        }
+        // A one-key enrollment's disclosure, acknowledged whenever root
+        // does, then its create step, held there.
+        "enroll-disclosure" => {
+            w.stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            w.send(&[0x18, 0]);
+            w.description(enrolling(1, 1, LoginStep::Connect));
+            w.present(enrolling(1, 1, LoginStep::Connect));
+            w.present(enrolling(1, 1, LoginStep::Create { retries: 8 }));
+            w.hold();
         }
         "remove" => {
             let authorize = removing(3, &slots(), LoginStep::Authorize { key: B, retries: 3 });
@@ -741,27 +764,53 @@ fn acknowledgements_and_pins_must_name_the_current_step_in_time() {
 
 #[test]
 fn deadlines_are_the_workers_ceilings_counted_from_before_its_start() {
-    for (selection, seconds) in [
-        (Selection::Unlock, 120),
-        (Selection::Remove(slots()), 120),
-        (Selection::Enroll(1), 120),
-        (Selection::Enroll(2), 240),
-        (Selection::Add, 240),
+    let leaving_two = Selection::Remove(vec![Slot {
+        position: 2,
+        key: B,
+    }]);
+    // Until the baseline, a removal's bound allows it to disclose.
+    for (selection, bound, seconds) in [
+        (Selection::Unlock, 120, 120),
+        (Selection::Remove(slots()), 240, 240),
+        (leaving_two, 240, 120),
+        (Selection::Enroll(1), 240, 240),
+        (Selection::Enroll(2), 360, 360),
+        (Selection::Add, 240, 240),
     ] {
-        assert_eq!(selection.ceiling(), Duration::from_secs(seconds));
-        // The compositor reads the same ceiling from the description.
+        let bound = Duration::from_secs(bound);
+        let ceiling = Duration::from_secs(seconds);
+        assert_eq!(selection.ceiling(), bound);
+        // The worker and the compositor read the same ceiling from the
+        // description.
         let baseline: &[Fingerprint] = match selection {
             Selection::Enroll(_) => &[],
             _ => &[A, B, C],
         };
-        let operation = selection.operation(1000, baseline).unwrap();
+        let operation = selection.operation(1000, baseline, approval()).unwrap();
         let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
-        assert_eq!(request.login_ceiling(), Some(selection.ceiling()));
+        assert_eq!(request.login_ceiling(), Some(ceiling));
         let before = Instant::now();
-        let login = scripted(selection, "silent");
-        let ceiling = Duration::from_secs(seconds);
+        let login = scripted(selection.clone(), "silent");
+        assert!(login.deadline >= before + bound);
+        assert!(login.deadline <= Instant::now() + bound);
+        // Root's first step narrows it to the description's ceiling,
+        // still counted from before the worker started.
+        let script = match baseline {
+            [] => "baseline-none",
+            _ => "baseline-three",
+        };
+        let before = Instant::now();
+        let mut login = scripted(selection, script);
+        let after = Instant::now();
+        while login.request().is_none() {
+            assert_eq!(login.poll(), Ok(Event::Waiting));
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(login.request().unwrap().login_ceiling(), Some(ceiling));
         assert!(login.deadline >= before + ceiling);
-        assert!(login.deadline <= Instant::now() + ceiling);
+        assert!(login.deadline <= after + ceiling);
+        login.cancel().unwrap();
+        assert_eq!(drive(&mut login).0, ended(false, CANCELLED, 0));
     }
 }
 
@@ -946,4 +995,149 @@ fn a_pin_still_queued_at_the_deadline_is_never_written() {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&ready);
     }
+}
+
+/// Polls until root presents a step: its description.
+fn presenting(login: &mut Login) -> Request {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match login.poll().unwrap() {
+            Event::Present(request) => return request,
+            Event::Waiting => thread::sleep(Duration::from_millis(1)),
+            event => panic!("unexpected {event:?}"),
+        }
+        assert!(Instant::now() < until, "nothing presented");
+    }
+}
+
+/// Root draws one key beside the nonce, as an elevation's, and its first
+/// step carries it exactly when that step discloses: a first enrollment of
+/// either count and a removal that leaves at most one key.
+#[test]
+fn root_puts_its_key_on_exactly_the_disclosure_steps() {
+    let three = [A, B, C];
+    let remove = |positions: &[u8]| {
+        Selection::Remove(
+            positions
+                .iter()
+                .map(|position| Slot {
+                    position: *position,
+                    key: three[usize::from(*position) - 1],
+                })
+                .collect(),
+        )
+    };
+    for (selection, baseline, disclosed) in [
+        (Selection::Enroll(1), &[][..], true),
+        (Selection::Enroll(2), &[], true),
+        (remove(&[1, 2, 3]), &three, true),
+        (remove(&[1, 3]), &three, true),
+        (remove(&[2]), &three, false),
+        (Selection::Unlock, &three, false),
+        (Selection::Add, &three, false),
+    ] {
+        let operation = selection.operation(1000, baseline, approval()).unwrap();
+        let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
+        assert_eq!(
+            request.login_approval(),
+            disclosed.then(approval),
+            "{selection:?}"
+        );
+    }
+    // Each digit is 2 plus its own byte modulo 8: every byte maps, and
+    // every digit is equally likely.
+    let mut counts = [0; 8];
+    for byte in 0..=255u8 {
+        let digits = approval_key([byte, !byte]).unwrap().digits();
+        assert_eq!(digits, [b'2' + byte % 8, b'2' + !byte % 8]);
+        counts[usize::from(digits[0] - b'2')] += 1;
+    }
+    assert_eq!(counts, [32; 8]);
+}
+
+/// The person reads a disclosure and types its key before the receipt
+/// comes, so root waits for it until its own deadline, not the three
+/// seconds any other step has: a key typed after ten seconds proceeds.
+#[test]
+fn a_disclosure_receipt_waits_for_the_operation_deadline() {
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    let connect = presenting(&mut login);
+    assert_eq!(connect, request(enrolling(1, 1, LoginStep::Connect)));
+    assert_eq!(connect.login_approval(), Some(approval()));
+    assert_eq!(login.acknowledgement_deadline, Some(login.deadline));
+    let typed = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < typed {
+        assert_eq!(login.poll(), Ok(Event::Present(connect.clone())));
+        thread::sleep(Duration::from_millis(100));
+    }
+    login.presented(&connect).unwrap();
+    // The worker goes on, and the next step has the usual window.
+    let create = presenting(&mut login);
+    assert_eq!(
+        create,
+        request(enrolling(1, 1, LoginStep::Create { retries: 8 }))
+    );
+    assert_eq!(create.login_approval(), None);
+    assert!(login.acknowledgement_deadline.unwrap() <= Instant::now() + ACK_TIME);
+    login.cancel().unwrap();
+    assert_eq!(drive(&mut login).0, ended(false, CANCELLED, 0));
+}
+
+/// One reading of the clock judges a disclosure's receipt: read just
+/// before root's deadline, it is acknowledged though the deadline has
+/// passed by the time root queues it, not a stale acknowledgement; read
+/// at the deadline, it ends the operation as TIMEOUT.
+#[test]
+fn a_disclosure_receipt_is_judged_at_one_instant() {
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    let connect = presenting(&mut login);
+    login.expire();
+    let deadline = login.deadline;
+    assert_eq!(
+        login.presented_at(&connect, deadline - Duration::from_millis(1)),
+        Ok(())
+    );
+    assert!(login.phase == Phase::Running);
+    assert!(login.end.is_none());
+    login.cancel().unwrap();
+    assert_eq!(drive(&mut login).0, ended(false, CANCELLED, 0));
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    let connect = presenting(&mut login);
+    login.expire();
+    let deadline = login.deadline;
+    assert_eq!(login.presented_at(&connect, deadline), Ok(()));
+    assert_eq!(drive(&mut login).0, ended(false, TIMEOUT, 0));
+}
+
+/// A disclosure's receipt at or after root's deadline ends the operation
+/// as TIMEOUT, as a late PIN does, and is no violation; an unanswered one
+/// times out there too, and a changed one is still a violation.
+#[test]
+fn a_late_disclosure_receipt_ends_the_operation_not_the_generation() {
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    let connect = presenting(&mut login);
+    login.expire();
+    assert_eq!(login.presented(&connect), Ok(()));
+    assert_eq!(drive(&mut login).0, ended(false, TIMEOUT, 0));
+    assert!(login.child.is_none());
+    // Once ended, another is dropped.
+    assert_eq!(login.presented(&connect), Ok(()));
+    assert_eq!(login.poll(), Ok(ended(false, TIMEOUT, 0)));
+    // Never answered: root's deadline ends it.
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    presenting(&mut login);
+    login.expire();
+    assert_eq!(drive(&mut login).0, ended(false, TIMEOUT, 0));
+    // A receipt for another description stops the worker as before.
+    let mut login = scripted(Selection::Enroll(1), "enroll-disclosure");
+    presenting(&mut login);
+    let other = request(enrolling(2, 1, LoginStep::Connect));
+    assert!(login.presented(&other).is_err());
+    assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0));
+    // Any other step's late receipt is still a stale acknowledgement.
+    let mut login = scripted(Selection::Unlock, "stall-pin");
+    let identify = presenting(&mut login);
+    login.expire();
+    assert!(login.presented(&identify).is_err());
+    assert_eq!(drive(&mut login).0, ended(false, INTERNAL, 0));
 }

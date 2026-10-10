@@ -6050,10 +6050,37 @@ Enter installing nothing (td-update/DESIGN.md).
 The approval key appears only on the private prompt, so ordinary
 rendering never carries it. The login-key disclosures, enrollment's and
 the one-key and remove-every-key removal disclosures (TOKEN-LOGIN.md
-increment 5's A4), use it from the start. Each is typed on the
-operation's first step, which carries the disclosure, and confirms that
-step's presentation receipt, under the rules above. A live boot's
-whole-disk installation keeps its fresh Enter.
+increment 5's A4), take it, implemented and inert in production until
+that increment's A5 admits a write. Each is typed on the operation's
+first step, which carries the disclosure, under the rules above, and
+confirms that step's presentation receipt rather than a commit: the
+client presents the step at root's first `04`, sends nothing while
+root's later `04` polls find the key untyped, and sends the receipt, the
+exact description and so its key, at the first poll after the second
+digit. Enter, a digit before presentation and a wrong digit act as on
+an elevation's prompt, the wrong digit cancelling with `15` and
+draining; every other login step's receipt still follows its
+presentation, and the step after a disclosure carries no key. A live
+boot's whole-disk installation keeps its fresh Enter.
+
+A disclosure prompt is taller than any other login prompt. With its
+time line a one-key enrollment's is 18 rows and a removal of seven of
+eight keys 16, so at the prompt's doubled scale they are shown whole
+from 768 rows of output (1024x768 and 1366x768 among them) and, at the
+single scale below 800x600, at 640x480; on an 800x600 output the
+one-key enrollment's refuses as any prompt that cannot hold its rows
+does, and the operation fails before any token I/O, while a two-key
+enrollment's, 14 rows, fits. Any login step whose prompt an output
+cannot hold whole ends the operation with `THIS SCREEN IS TOO SMALL /
+FOR THIS PROMPT` rather than the generic failure. A disclosure's typed
+key confirms only its own prompt: the next step's presentation clears
+the confirmation with the key. Device-dispatcher tests type a two-key
+enrollment's key through `read_device` with Enter, the keypad, 1, a
+digit under Control, a repeat, a digit another read keyboard holds and a
+security key's own keyboard typing nothing, and a wrong digit at either
+position ending it with a drain; host tests drive each disclosure's
+receipt against a scripted authority, and the whole status sequence of
+every operation types the key.
 
 ### Login-key operations
 
@@ -6109,9 +6136,9 @@ checks root's descriptions without the record or the device:
   at its deadline or on a cancellation, describes that step while it
   reaps the worker. Presenting it still needs `04` and committing it a
   receipt, so admitting it under `03` lets nothing through;
-- from TOKEN-LOGIN.md increment 5's A4, a disclosure step's receipt is
+- a disclosure step's receipt (TOKEN-LOGIN.md increment 5's A4) is
   sent only once its approval key is typed ("Elevation consent"); every
-  other step's receipt follows its presentation as before;
+  other step's receipt follows its presentation;
 - in an addition, the new key's prove, repeat and probe never name the
   key the authorize step named: a rule spanning more than one step,
   which consent leaves to its reader;
@@ -6155,11 +6182,13 @@ wider than the output's columns, its width less 48 over the scaled
 advance, wraps at a space; a row that fits is drawn as it is.
 
 The attempt's lifetime is td-authd's ceiling for the selected operation
-(`login_ceiling`: 120 seconds for an unlock, a removal and a one-key
-enrollment, 240 for an addition and a two-key enrollment), fixed at the
-selection and never renewed. A prompt's time line accepts at most its
-own request's ceiling, so only a two-ceremony login prompt may show more
-than 120 seconds.
+(`login_ceiling`, td-authd/DESIGN.md amendment 6: 120 seconds per key
+ceremony, plus the reading allowance for an operation that discloses),
+fixed at the selection and never renewed. A removal's selection carries
+the count it leaves of the list it was chosen from, which fixes its
+ceiling, and root's description must agree. A prompt's time line
+accepts at most its own request's ceiling, so only a two-ceremony or
+disclosing login prompt may show more than 120 seconds.
 
 Host tests drive every operation's whole status sequence against a
 scripted authority, each PIN step's `0c`, the person's typing and its
@@ -6520,9 +6549,9 @@ excluded from every selection, confirmation and field below.
 
 1. **One operation per lifetime (3).** Implemented for the key-management
    screen and the lock surface, whose chord opens a login unlock with no
-   selection at all. Still to come: a disclosure's approval key
-   ("Elevation consent") confirms its operation at its first step
-   (TOKEN-LOGIN.md increment 5's A4).
+   selection at all. A disclosure's approval key ("Elevation consent")
+   confirms its operation at its first step (TOKEN-LOGIN.md increment
+   5's A4), implemented and inert until that increment's A5.
 2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
    "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its

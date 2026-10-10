@@ -10144,10 +10144,13 @@ mod tests {
         );
         assert_eq!(
             target.secret_roles,
-            [Selection::Login(LoginSelection::Remove(vec![Slot {
-                position: 2,
-                key: [0xb2; 4],
-            }]))]
+            [Selection::Login(LoginSelection::Remove(
+                vec![Slot {
+                    position: 2,
+                    key: [0xb2; 4],
+                }],
+                1
+            ))]
         );
     }
 
@@ -10193,16 +10196,19 @@ mod tests {
         let target = target.lock().unwrap();
         assert_eq!(
             target.secret_roles,
-            [Selection::Login(LoginSelection::Remove(vec![
-                Slot {
-                    position: 1,
-                    key: ENROLLED[0],
-                },
-                Slot {
-                    position: 3,
-                    key: ENROLLED[2],
-                },
-            ]))]
+            [Selection::Login(LoginSelection::Remove(
+                vec![
+                    Slot {
+                        position: 1,
+                        key: ENROLLED[0],
+                    },
+                    Slot {
+                        position: 3,
+                        key: ENROLLED[2],
+                    },
+                ],
+                1
+            ))]
         );
         assert_eq!(target.notices.len(), 6);
         assert_eq!(target.confirmations, [102_000_000]);
@@ -10643,10 +10649,13 @@ mod tests {
         read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 90));
         assert_eq!(
             target.lock().unwrap().secret_roles,
-            [Selection::Login(LoginSelection::Remove(vec![Slot {
-                position: 2,
-                key: ENROLLED[1],
-            }]))]
+            [Selection::Login(LoginSelection::Remove(
+                vec![Slot {
+                    position: 2,
+                    key: ENROLLED[1],
+                }],
+                2
+            ))]
         );
     }
 
@@ -10720,10 +10729,13 @@ mod tests {
         read_reports(&target, &bindings, 0, &presses(&[KEY_ENTER], 60));
         assert_eq!(
             target.lock().unwrap().secret_roles,
-            [Selection::Login(LoginSelection::Remove(vec![Slot {
-                position: 2,
-                key: ENROLLED[1],
-            }]))]
+            [Selection::Login(LoginSelection::Remove(
+                vec![Slot {
+                    position: 2,
+                    key: ENROLLED[1],
+                }],
+                2
+            ))]
         );
         // And for a choice made on the first screen.
         let target = Mutex::new(RecordingTarget {
@@ -13663,6 +13675,179 @@ mod tests {
         }
     }
 
+    /// A two-key enrollment's first step, its disclosure, carrying the
+    /// approval key `44`.
+    fn disclosure() -> crate::authority::consent::Request {
+        crate::authority::consent::Request::new(
+            LOCK_NONCE,
+            1000,
+            crate::authority::consent::Operation::LoginEnroll {
+                account: 1000,
+                before: 0,
+                after: 2,
+                key: 1,
+                step: crate::authority::consent::LoginStep::Connect,
+                approval: Some(crate::authority::consent::ApprovalKey::new(*b"44").unwrap()),
+            },
+        )
+        .unwrap()
+    }
+
+    /// `K` then `2` on an unlocked seat whose device `excluded` is a
+    /// security key's own keyboard, driven until the disclosure is on
+    /// glass, presented at root's `04` and not yet acknowledged.
+    fn disclosed(excluded: &[usize]) -> (LockedSeat, crate::secret_client::Client, Root) {
+        use crate::secret_client::{LoginSelection, Selection};
+        let seat = LockedSeat::open(excluded);
+        seat.chord(10);
+        seat.press(&[KEY_K, KEY_2], 20);
+        let attempt = seat.queued.attempt().unwrap();
+        assert_eq!(
+            attempt.selection(),
+            &Selection::Login(LoginSelection::Enroll(2))
+        );
+        let connect = disclosure();
+        let mut root = root(vec![
+            started(),
+            vec![0x91, 0x0b],
+            status(3, &connect),
+            status(4, &connect),
+        ]);
+        let mut client = crate::secret_client::Client::trusting_memory();
+        client.start(&mut root, attempt).unwrap();
+        run(&mut client, &mut root).unwrap();
+        assert!(root.replies.is_empty());
+        assert!(seat
+            .runtime
+            .lock()
+            .unwrap()
+            .attention_request_visible(&connect));
+        assert_eq!(root.sent(0x13), 0);
+        (seat, client, root)
+    }
+
+    /// One poll at root's `04`, answering a receipt if one is sent:
+    /// whether it was.
+    fn receipt(client: &mut crate::secret_client::Client, root: &mut Root) -> bool {
+        let before = root.sent(0x13);
+        root.replies.extend([status(4, &disclosure()), vec![0x93]]);
+        client.tick(root).unwrap();
+        let sent = root.sent(0x13) > before;
+        assert_eq!(root.replies.len(), usize::from(!sent));
+        root.replies.clear();
+        sent
+    }
+
+    /// One key change from `device`, applied as the dispatcher applies it
+    /// while that device stays connected: a whole read's end releases
+    /// what it holds.
+    fn hold(seat: &LockedSeat, device: usize, code: u16, value: i32, millis: u32) {
+        let mut pointer = PointerMotion::default();
+        for event in later(vec![at_millis(key(code, value), millis), syn(millis)]) {
+            apply(
+                seat.target.as_ref(),
+                event,
+                device,
+                seat.bindings.as_ref(),
+                &mut pointer,
+                None,
+            )
+            .unwrap();
+        }
+    }
+
+    /// TOKEN-LOGIN.md increment 5's A4, through the whole device
+    /// dispatcher: a login disclosure step's receipt goes to root only
+    /// once its approval key is typed under "Elevation consent"'s rules.
+    /// Enter, the keypad, 1, a digit under Control, a repeat, a digit
+    /// another read keyboard holds and a security key's own keyboard type
+    /// none of it; two fresh presses of the right digits send the exact
+    /// description as the receipt, once.
+    #[test]
+    fn a_login_disclosure_is_acknowledged_only_after_its_typed_key() {
+        const KEY: usize = 1;
+        let (seat, mut client, mut root) = disclosed(&[KEY]);
+        assert!(!receipt(&mut client, &mut root));
+        seat.press(&[KEY_ENTER, KEY_KPENTER, KEY_KP4, KEY_1], 30);
+        seat.read(KEY, 40, presses(&[KEY_4, KEY_4], 41));
+        seat.read(
+            0,
+            50,
+            vec![
+                at_millis(key(KEY_LEFTCTRL, KEY_PRESS), 51),
+                syn(51),
+                at_millis(key(KEY_4, KEY_PRESS), 52),
+                syn(52),
+                at_millis(key(KEY_4, KEY_RELEASE), 53),
+                syn(53),
+                at_millis(key(KEY_LEFTCTRL, KEY_RELEASE), 54),
+                syn(54),
+            ],
+        );
+        assert!(seat.attention_open());
+        assert!(!receipt(&mut client, &mut root));
+        // The first digit, then its repeats, which supply no second.
+        seat.read(
+            0,
+            60,
+            vec![
+                at_millis(key(KEY_4, KEY_PRESS), 61),
+                syn(61),
+                at_millis(key(KEY_4, KEY_REPEAT), 62),
+                syn(62),
+                at_millis(key(KEY_4, KEY_REPEAT), 63),
+                syn(63),
+                at_millis(key(KEY_4, KEY_RELEASE), 64),
+                syn(64),
+            ],
+        );
+        assert!(!receipt(&mut client, &mut root));
+        // Held on another read keyboard, pressed there under Control, a
+        // press is no fresh one.
+        hold(&seat, 2, KEY_LEFTCTRL, KEY_PRESS, 65);
+        hold(&seat, 2, KEY_4, KEY_PRESS, 66);
+        hold(&seat, 2, KEY_LEFTCTRL, KEY_RELEASE, 67);
+        hold(&seat, 0, KEY_4, KEY_PRESS, 70);
+        hold(&seat, 0, KEY_4, KEY_RELEASE, 71);
+        hold(&seat, 2, KEY_4, KEY_RELEASE, 72);
+        assert!(seat.attention_open());
+        assert!(!receipt(&mut client, &mut root));
+        // The second, a fresh press: the receipt, the description itself.
+        seat.press(&[KEY_4], 80);
+        assert!(receipt(&mut client, &mut root));
+        assert_eq!(
+            root.calls.last().unwrap(),
+            &[&[0x13][..], &disclosure().encode()].concat()
+        );
+        assert_eq!(root.sent(0x13), 1);
+        assert_eq!(root.sent(0x15), 0);
+        assert!(seat.attention_open());
+    }
+
+    /// A wrong digit, at either position, ends the disclosure
+    /// unacknowledged as Escape does: `15` to root, and the screen drains
+    /// until the digit is released.
+    #[test]
+    fn a_wrong_digit_ends_a_login_disclosure_with_a_drain() {
+        for wrong in [&[KEY_5][..], &[KEY_4, KEY_9]] {
+            let (seat, mut client, mut root) = disclosed(&[]);
+            let (last, typed) = wrong.split_last().unwrap();
+            seat.press(typed, 30);
+            hold(&seat, 0, *last, KEY_PRESS, 41);
+            assert!(seat.bindings.lock().unwrap().attention == AttentionState::Draining);
+            root.replies.extend([
+                vec![0x95, 0],
+                [&[0x91, 0x0d, 0x80, 0][..], &disclosure().encode()].concat(),
+            ]);
+            run(&mut client, &mut root).unwrap();
+            assert!(root.replies.is_empty());
+            assert_eq!(root.sent(0x15), 1);
+            assert_eq!(root.sent(0x13), 0);
+            hold(&seat, 0, *last, KEY_RELEASE, 42);
+            assert!(!seat.attention_open());
+        }
+    }
+
     /// Escape's drained screen at 800x600, which shows no result.
     fn drained() -> Vec<u8> {
         let mut drained = vec![0; 800 * 600 * 4];
@@ -13694,6 +13879,7 @@ mod tests {
                     key: ENROLLED[0],
                 }],
                 step,
+                approval: None,
             },
         )
         .unwrap()
@@ -13716,7 +13902,7 @@ mod tests {
         let attempt = seat.queued.attempt().unwrap();
         assert!(matches!(
             attempt.selection(),
-            Selection::Login(LoginSelection::Remove(_))
+            Selection::Login(LoginSelection::Remove(..))
         ));
         let (identify, step) = (
             remove_step(crate::authority::consent::LoginStep::Identify),

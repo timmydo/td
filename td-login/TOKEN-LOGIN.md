@@ -1048,8 +1048,9 @@ PIN authorize it, or on a planned protected volume a disk proof
 key requires the one-key disclosure. Removing every key is refused on a
 planned protected volume, where the machine never logs in without a key;
 elsewhere it requires a disclosure that the machine will log in without
-a key, confirmed the same way; the record is then unlinked and the
-cutover restores console login and the ordinary SSH policy.
+a key and that open SSH sessions end now, confirmed the same way; the
+record is then unlinked and the cutover restores console login and the
+ordinary SSH policy.
 
 **On a planned protected volume** (`td-install/ENCRYPTION.md` increment
 8; td-authd's `/var/lib/td/login/protected` marker present), this is the
@@ -1818,10 +1819,12 @@ and the oracle that shows it.
      The cutover ends the logged-in serial session and an open SSH
      session, and leaves the enforced form, the record naming it and a
      greeter that refuses.
-   - A4, the disclosures' approval key, inert in production:
+   - A4, landed: the disclosures' approval key, inert in production:
      - Only a disclosure step carries the key. That is the first step
        of a first enrollment (its first `connect`), and the first step
        of a removal that leaves at most one key (`identify`).
+       Root draws it beside the operation's nonce and puts it on its own
+       first step; the worker repeats that description exactly.
      - Both are presented before any token I/O, and each disclosure
        belongs to the whole operation. So one key confirms the
        operation, and no later step carries one.
@@ -1837,13 +1840,19 @@ and the oracle that shows it.
        a wrong digit act as they do on an elevation's prompt.
      - Root waits for that receipt, and the worker for root's
        acknowledgement, until the operation's deadline rather than the
-       usual three and five seconds.
+       usual three and five seconds. A disclosing operation's ceiling
+       adds a reading allowance, the same for root, the worker and the
+       compositor (`td-authd/DESIGN.md`, amendment 6).
      - The widest login value is unchanged: the authorize step of an
-       eight-key removal, which carries no key.
+       eight-key removal, which carries no key (`td-authd/DESIGN.md`,
+       "Immutable consent description prerequisite").
+     - A disclosure prompt an output cannot hold whole is refused with
+       a notice before any token I/O; which outputs hold each is
+       `td-compositor/DESIGN.md`'s ("Elevation consent").
      - The evidence is literal vectors, host tests (among them a key
-       typed after ten seconds still proceeds, and a receipt after
-       root's deadline ends as TIMEOUT) and device-dispatcher
-       tests, as for L3's key.
+       typed after ten seconds still proceeds, and a receipt at root's
+       deadline, defence in depth behind the compositor's own deadline,
+       ends as TIMEOUT) and device-dispatcher tests, as for L3's key.
    - A5, activation:
      - `login::WRITES` becomes true, so production admits enrollment,
        addition and removal.

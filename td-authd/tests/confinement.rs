@@ -133,7 +133,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xf1e2c5245f2e49a3,
+        0xef19938ed8d1b8a4,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -167,9 +167,28 @@ fn the_production_source_and_raw_boundary_are_closed() {
     for forbidden in ["lock-session", "Command::new(", "unlock-operation", "/bin/"] {
         assert!(!login.contains(forbidden), "login.rs: {forbidden}");
     }
+    // A disclosure's key (TOKEN-LOGIN.md increment 5's A4): drawn beside
+    // the nonce, as an elevation's, and put on root's own first step, which
+    // consent alone decides discloses; its receipt waits for root's
+    // deadline.
+    assert_eq!(login.matches("File::open(\"/dev/urandom\")").count(), 1);
+    assert!(login.contains("ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))"));
+    assert_eq!(login.matches("approval_key(key)?").count(), 1);
+    assert_eq!(login.matches(".disclosed(").count(), 1);
+    assert!(login.contains(
+        "            Some(request) if request.login_approval().is_some() => self.deadline,\n"
+    ));
+    // Root's operation deadline is the description's ceiling, the worker's
+    // and the compositor's, reading allowance included; the clock is read
+    // once per receipt.
+    assert_eq!(
+        login.matches("self.deadline = self.deadline.min(").count(),
+        1
+    );
+    assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0x91487acb4fcd817f,
+        0x3911f2716b9a330c,
         "login worker supervisor changed"
     );
     assert_eq!(
