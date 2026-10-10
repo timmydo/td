@@ -385,6 +385,9 @@ pub fn prunable(events: &[Event], protect: u64, minimum: u64) -> Vec<u64> {
     let floor = in_force(events).map_or(0, |f| f.tail);
     for event in events.iter().rev().take_while(|e| e.seq >= floor) {
         let bytes = match &event.kind {
+            // A sub-agent's result is not in the view, so neither counted
+            // nor pruned (DESIGN.md §12, `task`).
+            Kind::ToolResult { reply, .. } if !replies.contains_key(reply) => 0,
             Kind::ToolResult {
                 reply,
                 id,
@@ -529,6 +532,31 @@ mod tests {
         // What came after the compaction ages the results before it.
         events.extend(call(13, "d", "newer.txt", 45_000 * 4));
         assert_eq!(prunable(&events, PROTECT_TOKENS, MINIMUM_TOKENS), [9]);
+    }
+
+    /// A sub-agent's results, which its own requests carry and the
+    /// conversation's never do, are neither pruned nor counted toward
+    /// the recent tokens that protect the conversation's own.
+    #[test]
+    fn a_sub_agents_results_are_neither_pruned_nor_counted() {
+        let mut events: Vec<Event> = Vec::new();
+        events.extend(call(1, "a", "old.txt", 30_000 * 4));
+        let mut sub = call(4, "s", "sub.txt", 45_000 * 4);
+        if let Kind::Request {
+            purpose, prefix, ..
+        } = &mut sub[0].kind
+        {
+            *purpose = Purpose::Task;
+            *prefix = 3;
+        }
+        events.extend(sub);
+        events.extend(sending(7));
+        // Were the sub-agent's 45,000 tokens counted, the old result
+        // would be past the protected window.
+        assert!(prunable(&events, PROTECT_TOKENS, 0).is_empty());
+        events.extend(call(9, "c", "recent.txt", 45_000 * 4));
+        events.extend(sending(12));
+        assert_eq!(prunable(&events, PROTECT_TOKENS, 0), [3]);
     }
 
     /// Results one reply asked for together, past the window between

@@ -45,6 +45,8 @@ pub const READ_COUNT: usize = 20;
 pub const MAX_READ_COUNT: usize = 100;
 /// `question`'s bounds: its text, how many options, and each option.
 pub const MAX_QUESTION: usize = 600;
+/// The longest prompt a `task` gives its sub-agent.
+pub const MAX_TASK_PROMPT: usize = 32 * 1024;
 pub const MAX_OPTIONS: usize = 6;
 pub const MAX_OPTION: usize = 200;
 pub const READ_BYTES: usize = 32 * 1024;
@@ -79,6 +81,7 @@ pub enum Tool {
     GitFetch,
     GitPush,
     SystemStatus,
+    Task,
 }
 
 /// Which tools a conversation has: the conversation's own, a
@@ -89,6 +92,8 @@ pub enum Kit {
     Workspace,
     Repositories,
     Review,
+    /// A sub-agent's (DESIGN.md §12, `task`): a workspace's tools alone.
+    Task,
 }
 
 /// The tools every conversation has, in the order the prefix defines
@@ -113,6 +118,7 @@ pub fn known(name: &str) -> bool {
         .chain(WORKSPACE)
         .chain(REPOSITORIES)
         .chain(SYSTEM_VIEW)
+        .chain(DELEGATE)
         .any(|tool| tool.name() == name)
 }
 
@@ -144,6 +150,24 @@ const SYSTEM_VIEW: &[Tool] = &[Tool::SystemStatus];
 
 const REVIEW: &[Tool] = &[Tool::ReadFile, Tool::Glob, Tool::Grep, Tool::Shell];
 
+/// A sub-agent's tools (DESIGN.md §12, `task`): the workspace's, but for
+/// the background processes, which would outlive it.
+const TASK: &[Tool] = &[
+    Tool::ReadFile,
+    Tool::WriteFile,
+    Tool::EditFile,
+    Tool::ApplyPatch,
+    Tool::Glob,
+    Tool::Grep,
+    Tool::Sed,
+    Tool::Shell,
+    Tool::WebFetch,
+];
+
+/// What a conversation in a workspace hands work on with (DESIGN.md §12,
+/// `task`), after the conversation's own tools.
+const DELEGATE: &[Tool] = &[Tool::Task];
+
 impl Tool {
     pub fn name(self) -> &'static str {
         match self {
@@ -173,6 +197,7 @@ impl Tool {
             Self::GitFetch => "git_fetch",
             Self::GitPush => "git_push",
             Self::SystemStatus => "system_status",
+            Self::Task => "task",
         }
     }
 
@@ -188,11 +213,14 @@ impl Tool {
 
     /// The tools a conversation with `kit` has.
     pub fn all(kit: Kit) -> Vec<Self> {
-        if kit == Kit::Review {
-            return REVIEW.to_vec();
+        match kit {
+            Kit::Review => return REVIEW.to_vec(),
+            Kit::Task => return TASK.to_vec(),
+            _ => {}
         }
         let mut tools = CONVERSATION.to_vec();
         if kit != Kit::Conversation {
+            tools.extend_from_slice(DELEGATE);
             tools.extend_from_slice(WORKSPACE);
         }
         if kit == Kit::Repositories {
@@ -557,6 +585,16 @@ pub(crate) fn definition(tool: Tool) -> Json {
                 &[],
             ),
         ),
+        Tool::Task => (
+            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace with its file, shell and web tools, and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. Its writes and commands wait for the person's approval as yours do. It runs within this turn, on this conversation's model, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use it for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
+            schema(
+                vec![(
+                    "prompt",
+                    property("string", "The work and everything the sub-agent needs to do it, at most 32768 bytes."),
+                )],
+                &["prompt"],
+            ),
+        ),
         Tool::GitPush => (
             "Push a worktree's branch to its remote, outside the jail. td-agent sends the commits from the base to the branch's tip, scans them for credential shapes and binary files, and asks for approval: a push to main or master, a forced push, and one whose scan matched always go to the person, as may any other. Commit first: only committed work is pushed, and only to refs/heads/ on the worktree's own remote. The result is what git and the remote said.".to_string(),
             schema(
@@ -689,6 +727,10 @@ pub enum Args {
     },
     /// `system_status` (DESIGN.md §8, System view).
     SystemStatus(crate::sysview::Ask),
+    /// `task`, with the sub-agent's prompt (DESIGN.md §12).
+    Task {
+        prompt: String,
+    },
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
         worktree: String,
@@ -1222,6 +1264,22 @@ pub fn parse_offered(
                 offset: number(m, "offset", 0, u64::MAX)?.unwrap_or(0),
                 max_bytes: number(m, "max_bytes", 1, MAX_READ_BYTES as u64)?
                     .map_or(READ_BYTES, |n| n as usize),
+            }
+        }
+        Tool::Task => {
+            let m = members(tool_name, &value, &["prompt"])?;
+            let prompt = required(m, "prompt")?.trim();
+            if prompt.is_empty() {
+                return Err("`prompt` is empty".into());
+            }
+            if prompt.len() > MAX_TASK_PROMPT {
+                return Err(format!(
+                    "`prompt` is {} bytes; at most {MAX_TASK_PROMPT}",
+                    prompt.len()
+                ));
+            }
+            Args::Task {
+                prompt: prompt.to_string(),
             }
         }
         Tool::SystemStatus => {
@@ -2020,6 +2078,49 @@ mod tests {
         let prefix = prefix(Kit::Repositories, false, "s");
         assert!(prefix.contains("\"git_fetch\""));
         assert!(!super::prefix(Kit::Workspace, false, "s").contains("\"git_fetch\""));
+    }
+
+    /// `task` is offered beside a workspace's tools, after the
+    /// conversation's own, and to no
+    /// conversation without one; a sub-agent's kit is the workspace's
+    /// tools alone, with the system view where the template gives it,
+    /// and no conversation tool or `task` of its own. Its prompt is
+    /// required, trimmed and bounded.
+    #[test]
+    fn task_is_a_workspace_conversations_and_its_sub_agent_has_the_workspace_alone() {
+        assert!(known("task"));
+        assert!(!acting("task"));
+        for kit in [Kit::Workspace, Kit::Repositories] {
+            assert_eq!(
+                Tool::offered(kit, true).get(CONVERSATION.len()),
+                Some(&Tool::Task)
+            );
+        }
+        for kit in [Kit::Conversation, Kit::Review, Kit::Task] {
+            assert!(!Tool::offered(kit, true).contains(&Tool::Task));
+        }
+        let sub = Tool::offered(Kit::Task, true);
+        assert!(sub.contains(&Tool::SystemStatus));
+        assert!(TASK.iter().all(|t| sub.contains(t)));
+        assert!(!sub.contains(&Tool::ProcessList));
+        assert!(CONVERSATION.iter().all(|t| !sub.contains(t)));
+        assert!(!Tool::offered(Kit::Task, false).contains(&Tool::SystemStatus));
+        assert_eq!(
+            parse_offered(Kit::Workspace, false, "task", r#"{"prompt":"  Find it. "}"#).unwrap(),
+            Args::Task {
+                prompt: "Find it.".into()
+            }
+        );
+        for bad in [r#"{}"#, r#"{"prompt":"  "}"#, r#"{"prompt":"x","more":1}"#] {
+            assert!(
+                parse_offered(Kit::Workspace, false, "task", bad).is_err(),
+                "{bad}"
+            );
+        }
+        let long = format!(r#"{{"prompt":"{}"}}"#, "x".repeat(MAX_TASK_PROMPT + 1));
+        assert!(parse_offered(Kit::Workspace, false, "task", &long).is_err());
+        assert!(parse_offered(Kit::Task, false, "task", r#"{"prompt":"x"}"#).is_err());
+        assert!(parse_offered(Kit::Task, false, "send_message", "{}").is_err());
     }
 
     /// `system_status` is offered only where the template turns the

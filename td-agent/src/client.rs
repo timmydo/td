@@ -288,6 +288,9 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
         }
     };
     let mut purposes: Vec<(u64, Purpose)> = Vec::new();
+    // The turn replies, whose calls alone are this view's: a sub-agent's
+    // results answer its own replies (DESIGN.md §12, `task`).
+    let mut turn_replies: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     // What compaction pruned, and the replies whose calls its stubs name.
     let pruned = crate::compact::pruned(events);
     let mut replies: std::collections::BTreeMap<u64, &[crate::store::Call]> =
@@ -388,47 +391,21 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
                     .rev()
                     .find(|(seq, _)| seq == request)
                     .is_some_and(|(_, p)| *p == Purpose::Turn);
-                let content = content.as_deref().unwrap_or_default();
-                if !turn
-                    || *incomplete
-                    || (content.is_empty() && details.is_none() && calls.is_empty())
-                {
+                if !turn {
                     continue;
                 }
-                // A reply that only calls tools has no content to give.
-                let content = if content.is_empty() && !calls.is_empty() {
-                    Json::Null
-                } else {
-                    Json::Str(content.into())
-                };
-                let mut message = format!("{{\"role\":\"assistant\",\"content\":{content}");
-                if !calls.is_empty() {
-                    let calls: Vec<Json> = calls
-                        .iter()
-                        .map(|call| {
-                            Json::Obj(vec![
-                                ("id".into(), Json::Str(call.id.clone())),
-                                ("type".into(), Json::Str("function".into())),
-                                (
-                                    "function".into(),
-                                    Json::Obj(vec![
-                                        ("name".into(), Json::Str(call.name.clone())),
-                                        ("arguments".into(), Json::Str(call.arguments.clone())),
-                                    ]),
-                                ),
-                            ])
-                        })
-                        .collect();
-                    message.push_str(",\"tool_calls\":");
-                    message.push_str(&Json::Arr(calls).to_string());
+                turn_replies.insert(event.seq);
+                if *incomplete {
+                    continue;
                 }
-                if let Some(details) = details {
-                    message.push_str(",\"reasoning_details\":");
-                    message.push_str(details);
+                if let Some(message) =
+                    assistant_message(content.as_deref(), details.as_deref(), calls)
+                {
+                    out.push((event.seq, message));
                 }
-                message.push('}');
-                out.push((event.seq, message));
             }
+            // A sub-agent's call's result is its own.
+            Kind::ToolResult { reply, .. } if !turn_replies.contains(reply) => {}
             Kind::ToolResult {
                 reply,
                 id,
@@ -456,6 +433,107 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
         }
     }
     out
+}
+
+/// A whole reply as a request gives it back: its text, its calls and its
+/// reasoning details; none for one with nothing to give.
+fn assistant_message(
+    content: Option<&str>,
+    details: Option<&str>,
+    calls: &[crate::store::Call],
+) -> Option<String> {
+    let content = content.unwrap_or_default();
+    if content.is_empty() && details.is_none() && calls.is_empty() {
+        return None;
+    }
+    // A reply that only calls tools has no content to give.
+    let content = if content.is_empty() && !calls.is_empty() {
+        Json::Null
+    } else {
+        Json::Str(content.into())
+    };
+    let mut message = format!("{{\"role\":\"assistant\",\"content\":{content}");
+    if !calls.is_empty() {
+        let calls: Vec<Json> = calls
+            .iter()
+            .map(|call| {
+                Json::Obj(vec![
+                    ("id".into(), Json::Str(call.id.clone())),
+                    ("type".into(), Json::Str("function".into())),
+                    (
+                        "function".into(),
+                        Json::Obj(vec![
+                            ("name".into(), Json::Str(call.name.clone())),
+                            ("arguments".into(), Json::Str(call.arguments.clone())),
+                        ]),
+                    ),
+                ])
+            })
+            .collect();
+        message.push_str(",\"tool_calls\":");
+        message.push_str(&Json::Arr(calls).to_string());
+    }
+    if let Some(details) = details {
+        message.push_str(",\"reasoning_details\":");
+        message.push_str(details);
+    }
+    message.push('}');
+    Some(message)
+}
+
+/// A sub-agent's request as `events` give it (DESIGN.md §12, `task`): the
+/// prefix of its `Task` event at `task`, and its messages, the prompt and
+/// then each whole reply of its requests with its calls' results. None
+/// when `task` names no `Task` event.
+pub fn task_view(events: &[Event], task: u64) -> Option<(&str, Vec<String>)> {
+    let (prefix, prompt) = events.iter().find_map(|e| match &e.kind {
+        Kind::Task { prefix, prompt, .. } if e.seq == task => Some((prefix.as_str(), prompt)),
+        _ => None,
+    })?;
+    let mut messages = vec![crate::prompt::message("user", prompt)];
+    let mut requests: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut replies: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for event in events.iter().filter(|e| e.seq > task) {
+        match &event.kind {
+            Kind::Request {
+                purpose: Purpose::Task,
+                prefix,
+                ..
+            } if *prefix == task => {
+                requests.insert(event.seq);
+            }
+            Kind::Assistant {
+                request,
+                content,
+                details,
+                incomplete: false,
+                calls,
+                ..
+            } if requests.contains(request) => {
+                replies.insert(event.seq);
+                messages.extend(assistant_message(
+                    content.as_deref(),
+                    details.as_deref(),
+                    calls,
+                ));
+            }
+            Kind::ToolResult {
+                reply, id, content, ..
+            } if replies.contains(reply) => messages.push(
+                Json::Obj(vec![
+                    ("role".into(), Json::Str("tool".into())),
+                    ("tool_call_id".into(), Json::Str(id.clone())),
+                    ("content".into(), Json::Str(content.clone())),
+                ])
+                .to_string(),
+            ),
+            Kind::TaskNote { task: of, text } if *of == task => {
+                messages.push(crate::prompt::message("user", text))
+            }
+            _ => {}
+        }
+    }
+    Some((prefix, messages))
 }
 
 /// The prefix a turn request at `prefix` begins with: the file's text, or
@@ -576,6 +654,13 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
                 .ok_or_else(|| format!("request {} names no prefix {prefix}", event.seq))?;
             turn_body(head, prefix, &messages(before, timed(prefix)))
         }
+        // A sub-agent's: its own prefix and messages.
+        Purpose::Task => {
+            let before = events.get(..index).unwrap_or_default();
+            let (prefix, messages) = task_view(before, *prefix)
+                .ok_or_else(|| format!("request {} names no sub-agent {prefix}", event.seq))?;
+            turn_body(head, prefix, &messages)
+        }
     }
 }
 
@@ -625,6 +710,19 @@ pub fn compact_body(
 /// before any report. A request that failed leaves the estimate as it
 /// was, so asking it again sends the same head.
 pub fn estimate(events: &[Event], bytes: u64) -> u64 {
+    estimate_of(events, bytes, |purpose, _| purpose == Purpose::Turn)
+}
+
+/// `estimate` for a request of the sub-agent whose `Task` event is at
+/// `task`, from its own requests alone (DESIGN.md §12, `task`).
+pub fn task_estimate(events: &[Event], task: u64, bytes: u64) -> u64 {
+    estimate_of(events, bytes, |purpose, prefix| {
+        purpose == Purpose::Task && prefix == task
+    })
+}
+
+/// `estimate` from the requests `ours` takes, by purpose and prefix.
+fn estimate_of(events: &[Event], bytes: u64, ours: impl Fn(Purpose, u64) -> bool) -> u64 {
     let whole = bytes.div_ceil(4);
     let mut last: Option<(u64, u64)> = None;
     let mut sizes: Vec<(u64, u64)> = Vec::new();
@@ -632,10 +730,11 @@ pub fn estimate(events: &[Event], bytes: u64) -> u64 {
     for event in events {
         match &event.kind {
             Kind::Request {
-                purpose: Purpose::Turn,
+                purpose,
+                prefix,
                 bytes,
                 ..
-            } => sizes.push((event.seq, *bytes)),
+            } if ours(*purpose, *prefix) => sizes.push((event.seq, *bytes)),
             Kind::Assistant {
                 request,
                 incomplete: false,

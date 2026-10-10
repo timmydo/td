@@ -111,6 +111,17 @@ impl Reply {
         }
     }
 
+    /// The same stream, each `from` in it made `to`.
+    pub fn replace(self, from: &str, to: &str) -> Self {
+        let Self::Stream { ref body, .. } = self else {
+            return self;
+        };
+        let text = String::from_utf8(body.clone()).expect("a UTF-8 fixture");
+        let replaced = text.replace(from, to);
+        assert_ne!(replaced, text, "{from:?} is not in the stream");
+        self.body(replaced.into_bytes())
+    }
+
     /// A stream cut off after the event that carries `marker`.
     pub fn cut_after(self, marker: &str) -> Self {
         let Self::Stream { ref body, .. } = self else {

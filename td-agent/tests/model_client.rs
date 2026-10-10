@@ -550,6 +550,8 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Notice { .. } => "notice",
             Kind::Notification { .. } => "notification",
             Kind::Prefix { .. } => "prefix",
+            Kind::Task { .. } => "task",
+            Kind::TaskNote { .. } => "task_note",
             Kind::Request { .. } => "request",
             Kind::Assistant { .. } => "assistant",
             Kind::Usage { .. } => "usage",
@@ -2195,6 +2197,363 @@ fn only_a_system_view_template_offers_and_runs_system_status() {
         }
         h.close();
     }
+}
+
+/// A `task` runs a sub-agent within the turn: its requests carry its own
+/// prefix, the workspace's tools alone, and the prompt, not the person's
+/// words; its calls run as the conversation's do; and only its final
+/// report comes back, as the `task` call's result. Each body the log
+/// rebuilds is the one sent.
+#[test]
+fn a_task_runs_a_sub_agent_whose_report_is_its_result() {
+    use td_agent::config::TemplateShared;
+    let mut h = Harness::new_in(
+        "task",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            Reply::sse_with(
+                "stream-tool-system.sse",
+                "\"id\":\"toolu_system_01\",\"type\":\"function\",\"function\":{\"name\":\"system_status\"",
+                "\"id\":\"toolu_task_01\",\"type\":\"function\",\"function\":{\"name\":\"task\"",
+            )
+            .replace("{\\\"limit\\\": 3}", "{\\\"prompt\\\": \\\"Find the busiest process.\\\"}"),
+            Reply::sse("stream-tool-system.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        template_shared: vec![TemplateShared {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    });
+    h.say("What is using my CPU?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    let texts: Vec<String> = requests.iter().map(|r| r.text()).collect();
+    // The conversation is offered `task`; the sub-agent the workspace's
+    // tools and the system view, and no conversation tool or `task`.
+    assert!(texts[0].contains("\"name\":\"task\""), "{}", texts[0]);
+    let sub = &texts[1];
+    assert!(sub.contains("You are a sub-agent of td-agent"), "{sub}");
+    assert!(sub.contains("Find the busiest process."), "{sub}");
+    assert!(!sub.contains("What is using my CPU?"), "{sub}");
+    for tool in ["read_file", "shell", "system_status"] {
+        assert!(sub.contains(&format!("\"name\":\"{tool}\"")), "{tool}");
+    }
+    for tool in ["task", "send_message", "todo_write", "question"] {
+        assert!(!sub.contains(&format!("\"name\":\"{tool}\"")), "{tool}");
+    }
+    // Its second step has its own call's result.
+    assert!(texts[2].contains("\"tool_call_id\":\"toolu_system_01\""));
+    assert!(texts[2].contains("PID"));
+    // The conversation's next request has the report as the task's
+    // result, and nothing of the sub-agent's own steps.
+    let next = &texts[3];
+    assert!(
+        next.contains("\"tool_call_id\":\"toolu_task_01\""),
+        "{next}"
+    );
+    assert!(
+        next.contains("A sparse checkout keeps only the paths you name"),
+        "{next}"
+    );
+    assert!(!next.contains("toolu_system_01"), "{next}");
+    assert!(!next.contains("PID"), "{next}");
+    let results = results(&events);
+    let (_, report, error) = results
+        .iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(!error, "{report}");
+    assert!(report.starts_with("A sparse checkout"), "{report}");
+    let purposes: Vec<Purpose> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Request { purpose, .. } => Some(*purpose),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        purposes[..4],
+        [Purpose::Turn, Purpose::Task, Purpose::Task, Purpose::Turn]
+    );
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    let at: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, Kind::Request { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for (n, text) in texts.iter().take(4).enumerate() {
+        assert_eq!(
+            &td_agent::client::body(events, at[n], conversation.prefix_file()).unwrap(),
+            text,
+            "request {n}"
+        );
+    }
+}
+
+/// The conversation's reply that calls `task` with `prompt`.
+fn task_call(prompt: &str) -> Reply {
+    Reply::sse_with(
+        "stream-tool-system.sse",
+        "\"id\":\"toolu_system_01\",\"type\":\"function\",\"function\":{\"name\":\"system_status\"",
+        "\"id\":\"toolu_task_01\",\"type\":\"function\",\"function\":{\"name\":\"task\"",
+    )
+    .replace(
+        "{\\\"limit\\\": 3}",
+        &format!("{{\\\"prompt\\\": \\\"{prompt}\\\"}}"),
+    )
+}
+
+/// A sub-agent whose next request a limit refuses is told, in a note its
+/// view alone carries, that its next is its last, and asked where the
+/// work stands; that request carries the note, the conversation's next
+/// does not, the report says why it ended there, and every body rebuilt
+/// from the log, which reopens whole, is the one sent.
+#[test]
+fn a_sub_agent_at_a_limit_is_told_its_last_request_is_its_last() {
+    use td_agent::config::TemplateShared;
+    let mut h = Harness::new_in(
+        "task-wrap",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            task_call("Find the busiest process."),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        template_shared: vec![TemplateShared {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    });
+    h.say("What is using my CPU?");
+    h.until_spent(1);
+    // The sub-agent's first request: refused for the day.
+    let day = "max_cost_per_day is $1.0000, and $0.9999 of it is spent";
+    h.day = Day::Refuse(day.into());
+    loop {
+        let up = h.next();
+        let refused = matches!(up, Up::Reserve { .. });
+        if !h.hear(&up) {
+            if let Up::Event(event) = up {
+                h.heard.push(event);
+            }
+        }
+        if refused {
+            break;
+        }
+    }
+    h.day = Day::Grant;
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let kinds = kinds(&events);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "task_note").count(),
+        1,
+        "{kinds:?}"
+    );
+    let texts: Vec<String> = h.mock.requests().iter().map(|r| r.text()).collect();
+    let last = &texts[1];
+    assert!(last.contains("so your work stops here"), "{last}");
+    assert!(last.contains(day), "{last}");
+    let next = &texts[2];
+    assert!(!next.contains("so your work stops here"), "{next}");
+    let (_, report, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(!error, "{report}");
+    assert!(report.starts_with("A sparse checkout"), "{report}");
+    assert!(
+        report.contains(&format!("[td-agent: {day}, so the sub-agent was asked")),
+        "{report}"
+    );
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e.kind, Kind::TaskNote { .. })));
+    let at: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, Kind::Request { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for (n, text) in texts.iter().take(3).enumerate() {
+        assert_eq!(
+            &td_agent::client::body(events, at[n], conversation.prefix_file()).unwrap(),
+            text,
+            "request {n}"
+        );
+    }
+}
+
+/// The person's stop reaches the caller's turn through its sub-agent,
+/// whether the sub-agent's reply was streaming or it waited out a rate
+/// limit: the turn ends with it, and the conversation asks nothing more.
+#[test]
+fn a_stop_during_a_sub_agent_ends_the_callers_turn() {
+    use td_agent::config::TemplateShared;
+    let shared = || Client {
+        template_shared: vec![TemplateShared {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    };
+    let waiting = Reply::status(429, "error-429.json").with_header("retry-after", "30");
+    let streaming = Reply::sse("stream-sonnet.sse")
+        .cut_after("paths you name")
+        .tail(Tail::Open);
+    for (name, sub, wait) in [
+        ("task-stop-wait", waiting, true),
+        ("task-stop-stream", streaming, false),
+    ] {
+        let mut h = Harness::new_in(
+            name,
+            Role::Conversation,
+            Some("template:sys"),
+            false,
+            vec![task_call("Find the busiest process."), sub],
+        );
+        h.setup(shared());
+        h.say("What is using my CPU?");
+        // The sub-agent's request is sent, and waits or streams.
+        if wait {
+            h.until_spent(2);
+        } else {
+            h.until_spent(1);
+            h.until_text();
+        }
+        let began = std::time::Instant::now();
+        h.down(&Down::Interrupt);
+        let (events, outcome, _) = h.turn();
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(10),
+            "{name}"
+        );
+        assert_ne!(outcome, "replied", "{name}");
+        let (_, why, error) = results(&events)
+            .into_iter()
+            .find(|(id, _, _)| id == "toolu_task_01")
+            .unwrap();
+        assert!(error, "{name}: {why}");
+        // Nothing asked of the model after the stop.
+        // Nor of the model in a turn; the title's request is after it.
+        let streamed = h
+            .mock
+            .requests()
+            .iter()
+            .filter(|r| r.text().contains("\"stream\":true"))
+            .count();
+        assert_eq!(streamed, 2, "{name}");
+        h.close();
+    }
+}
+
+/// A sub-agent's request the provider rate-limits is asked again after
+/// its wait, as a turn's is, and its work goes on; one that fails ends
+/// it, and the `task` call says so, and that what it changed stays.
+#[test]
+fn a_sub_agents_rate_limit_is_waited_out_and_its_failure_reported() {
+    use td_agent::config::TemplateShared;
+    let shared = || Client {
+        template_shared: vec![TemplateShared {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    };
+    let limited = Reply::status(429, "error-429.json").with_header("retry-after", "0");
+    let mut h = Harness::new_in(
+        "task-limited",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            task_call("Find the busiest process."),
+            limited,
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(shared());
+    h.say("What is using my CPU?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let (_, report, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(!error, "{report}");
+    assert!(report.starts_with("A sparse checkout"), "{report}");
+    let purposes: Vec<Purpose> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Request { purpose, .. } => Some(*purpose),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        purposes[..4],
+        [Purpose::Turn, Purpose::Task, Purpose::Task, Purpose::Turn]
+    );
+    h.close();
+
+    let mut h = Harness::new_in(
+        "task-failed",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            task_call("Find the busiest process."),
+            Reply::status(400, "error-502.json"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(shared());
+    h.say("What is using my CPU?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let (_, why, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(error, "{why}");
+    assert!(
+        why.starts_with("error: the sub-agent's request error 400"),
+        "{why}"
+    );
+    assert!(
+        why.ends_with("Whatever the sub-agent changed in the workspace stays as it left it."),
+        "{why}"
+    );
+    h.close();
 }
 
 /// Settings that take the system view away while a turn runs take it

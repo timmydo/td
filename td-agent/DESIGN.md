@@ -733,7 +733,9 @@ them (§4). A workspace adds its own tools, the file, shell and git
 tools of §12, and its own paragraph and environment block (§13); the
 tools below are every conversation's. Creating a workspace is the
 human's act, through a template; no model creates, archives or deletes
-a workspace or a conversation.
+a workspace or a conversation. A `task` sub-agent (§12) is no
+conversation: it runs within its caller's turn, in its caller's log and
+workspace, and is gone when it reports.
 
 **Coordination.** Every conversation has `conversations`,
 `send_message`, `history_search`, `history_read` and `todo_write`
@@ -2266,7 +2268,8 @@ still held when the window closes is written whole to standard error.
   from the one this program writes (an empty prefix from increment 4,
   say) gets a `prefix` event holding the new one before its next
   request, and requests name the prefix they used.
-- **New events.** A `request` (its turn, its purpose, `turn` or `title`,
+- **New events.** A `request` (its turn, its purpose, `turn`, `title`,
+  `classify`, `compact` or a sub-agent's `task` (§12),
   its prefix, its exact head, its body's length and its reservation) is
   a started effect, synced before it is sent; an `assistant` message
   (its text, its reasoning text, its raw `reasoning_details` and its
@@ -5139,8 +5142,8 @@ Anthropic's guidance on writing tools for agents: fewer tools, natural
 identifiers, actionable errors. Their definitions are fixed text in the
 prefix. Every conversation has the conversation tools, `todo_write`,
 the history tools, `conversations`, `send_message`, `question` and the
-schedule tools; its workspace adds the file, shell, process, directory
-and git tools, as far as the workspace has what they act on.
+schedule tools; its workspace adds `task` and the file, shell, process,
+directory and git tools, as far as the workspace has what they act on.
 
 - **`read_file {path, offset?, limit?}`**: line-numbered output, at most
   2,000 lines or 100 KiB. A partial view says so and names the next
@@ -5218,6 +5221,8 @@ and git tools, as far as the workspace has what they act on.
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
 - **`git_fetch`** and **`git_push`**: §9.
+- **`task {prompt}`**: hands a piece of work to a sub-agent, in a
+  conversation with a workspace (As built (`task`), below).
 
 Paths are absolute. Worktrees and shared directories are bound at their
 real paths, so the paths the model sees are the paths the human sees. A
@@ -5448,8 +5453,63 @@ the provider returned it as text. The stubs and summaries compaction
 writes name the sequence numbers they replace, so a model can recover
 what a summary dropped.
 
-Planned later, each its own increment: a `task` tool for summarizing
-child conversations within a workspace, and an MCP stdio client.
+Planned later: an MCP stdio client.
+
+**As built (`task`).** `task {prompt}` runs a sub-agent within the
+caller's turn and answers the call with its final report. It is offered
+after the conversation tools to a conversation with a workspace, and
+the prompt is required, at most 32 KiB. The sub-agent sees only its own
+prefix, written from `prompt/task.txt` with the workspace's environment
+block and project instructions, and the prompt as its one user
+message: none of the conversation, the person's words included. Its
+environment block leaves out the received-time line and the news,
+which come to the conversation's messages alone, and names no git
+tool. Its tools are the workspace's file, shell and `web_fetch` tools,
+and `system_status` where the template gives the system view; no
+conversation tool, so it messages, schedules, asks and delegates
+nothing, and no background process, which would outlive it. Its calls
+run and are approved as the caller's are, cards, rules and the
+classifier included (§11), the kit checked again for each call. It
+keeps its own record of the digests a write must match, from none,
+and the caller's is put back after it: a write of the caller's still
+matches only the version the caller read or wrote, never one the
+sub-agent made since, and a process starting again takes up only
+those of the conversation's own calls. It runs on the conversation's
+model, effort and routing, each request estimated from its own
+requests alone (§14), reserved, limited by `max_cost_per_turn` and
+`max_cost_per_conversation` as the caller's turn's own, and counted in
+that turn; a request the provider rate-limits is asked again after its
+wait, as a turn's is. It takes at most 64 requests and is not
+compacted. Its 64th request, or the one after a request a cost limit
+refused, is its last: a `task_note` event, which only the sub-agent's
+view carries, tells it why and asks it, without calling a tool, where
+the work stands, and the request is bounded as a turn's wrap-up (§2),
+offering no tools where `tool_choice` can be sent; the report says
+why. Past its model's context, a failed request, an interrupt, a full
+log or a last request that called tools anyway, the call is answered
+with why, with the last text the sub-agent wrote, at most 4 KiB, and a
+note that what it changed in the workspace stays; the caller goes on,
+but for an interrupt, during the sub-agent's stream, its rate limit's
+wait or between its steps, which ends the caller's turn as one of its
+own would, as the window closing during that wait does. A report
+cut short or filtered says so after it, and one past 64 KiB is given
+in part, naming the reply `history_read` reads whole. Before each
+request it keeps room in the log for the calls of the caller's reply
+still to answer.
+
+Its records are the caller's log's (§6): a `task` event (the call, the
+sub-agent's kind, model, prefix and prompt), then `request` events of
+purpose `task` whose `prefix` names that event, their `assistant`
+replies, their calls' `tool_call` and `tool_result` events, and any
+`task_note` naming it. A
+sub-agent's request is rebuilt from those alone (`client::task_view`),
+which the live loop and the Debug view both use, and its records are
+never in the conversation's view: its replies are not turn replies,
+and a result answering one is left out of every request and of
+compaction's pruning. The window shows the start with its prompt
+folded, and its replies as the sub-agent's, while they stream as well.
+The conversation's title is made from a reply of its own, never a
+sub-agent's.
 
 **As built (`question`).** `question {question, options?}` takes one
 question of at most 600 bytes and up to six options, each one line of at
@@ -7149,11 +7209,10 @@ in parallel with it.
     boot test starts it, its window or its model.
 
 After these: resource limits (§8), a loopback shared by
-a conversation's instances (§19), child conversations within a
-workspace, the MCP client, moving a
+a conversation's instances (§19), the MCP client, moving a
 conversation between workspaces, and a native Anthropic Messages
-dialect. `web_fetch`, `question`, schedules, skills and the person's
-commands are built (§3, §12, §15).
+dialect. `web_fetch`, `question`, `task`'s sub-agents, schedules,
+skills and the person's commands are built (§3, §12, §15).
 
 ## 19. Open questions
 

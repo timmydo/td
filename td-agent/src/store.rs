@@ -1126,6 +1126,9 @@ pub enum Purpose {
     /// A compaction's handoff summary (DESIGN.md §14), its body the
     /// view the compaction before it names and the summary prompt.
     Compact,
+    /// A sub-agent's step (DESIGN.md §12, `task`), its `prefix` the
+    /// `Task` event that began it.
+    Task,
 }
 
 impl Purpose {
@@ -1135,6 +1138,7 @@ impl Purpose {
             Self::Title => "title",
             Self::Classify => "classify",
             Self::Compact => "compact",
+            Self::Task => "task",
         }
     }
     fn parse(word: &str) -> Option<Self> {
@@ -1143,6 +1147,7 @@ impl Purpose {
             "title" => Some(Self::Title),
             "classify" => Some(Self::Classify),
             "compact" => Some(Self::Compact),
+            "task" => Some(Self::Task),
             _ => None,
         }
     }
@@ -1354,6 +1359,21 @@ pub enum Kind {
     /// with, its `messages` last, or, as increment 7 wrote it, an array of
     /// the messages alone (`client::turn_body`).
     Prefix { text: String },
+    /// A sub-agent's start (DESIGN.md §12, `task`): the `task` call it
+    /// answers, which kind it is, its model, and the exact text of its
+    /// prefix and of the prompt it was given. Its requests name it as
+    /// their `prefix`; its replies and their tool results are its own
+    /// and never in the conversation's view (`client::view`).
+    Task {
+        call: u64,
+        agent: String,
+        model: String,
+        prefix: String,
+        prompt: String,
+    },
+    /// What td-agent tells the sub-agent whose `Task` event is `task`,
+    /// in its view alone: that its next request is its last.
+    TaskNote { task: u64, text: String },
     /// A model request, logged and synced before it is sent: the turn it
     /// belongs to, what it is for, the prefix it begins with (0 for the
     /// file, else the `Prefix` event's sequence number), the exact text of
@@ -1561,6 +1581,25 @@ impl Event {
             }
             Kind::Prefix { text } => {
                 put("kind", Json::Str("prefix".into()));
+                put("text", Json::Str(text.clone()));
+            }
+            Kind::Task {
+                call,
+                agent,
+                model,
+                prefix,
+                prompt,
+            } => {
+                put("kind", Json::Str("task".into()));
+                put("call", Json::from(*call));
+                put("agent", Json::Str(agent.clone()));
+                put("model", Json::Str(model.clone()));
+                put("prefix", Json::Str(prefix.clone()));
+                put("prompt", Json::Str(prompt.clone()));
+            }
+            Kind::TaskNote { task, text } => {
+                put("kind", Json::Str("task_note".into()));
+                put("task", Json::from(*task));
                 put("text", Json::Str(text.clone()));
             }
             Kind::Request {
@@ -1880,6 +1919,17 @@ impl Event {
                 text: string("text")?,
             },
             Some("prefix") => Kind::Prefix {
+                text: string("text")?,
+            },
+            Some("task") => Kind::Task {
+                call: number("call")?,
+                agent: string("agent")?,
+                model: string("model")?,
+                prefix: string("prefix")?,
+                prompt: string("prompt")?,
+            },
+            Some("task_note") => Kind::TaskNote {
+                task: number("task")?,
                 text: string("text")?,
             },
             Some("request") => Kind::Request {

@@ -129,6 +129,8 @@ fn kind(event: &Event) -> &'static str {
         Kind::Notice { .. } => "notice",
         Kind::Notification { .. } => "notification",
         Kind::Prefix { .. } => "prefix",
+        Kind::Task { .. } => "task",
+        Kind::TaskNote { .. } => "task_note",
         Kind::Request { .. } => "request",
         Kind::Assistant { .. } => "assistant",
         Kind::Usage { .. } => "usage",
@@ -187,6 +189,16 @@ pub fn render(event: &Event) -> String {
         Kind::Interrupted { started } => format!("#{started} was interrupted by a restart"),
         Kind::Notice { text } | Kind::Notification { text } => text.clone(),
         Kind::Prefix { text } => format!("the request prefix changed ({} bytes)", text.len()),
+        Kind::Task {
+            call,
+            agent,
+            model,
+            prompt,
+            ..
+        } => format!(
+            "a {agent} sub-agent began on {model}, for the call at #{call}, asked:\n{prompt}"
+        ),
+        Kind::TaskNote { task, text } => format!("td-agent told the sub-agent at #{task}:\n{text}"),
         Kind::Request {
             turn,
             purpose,

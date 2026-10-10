@@ -2353,7 +2353,7 @@ impl App {
                 } else {
                     Some((finish.as_str(), Tone::Neutral))
                 };
-                let mut message = Message::new("assistant");
+                let mut message = Message::new(self.author(request));
                 if let Some(reasoning) = &reasoning {
                     message = message.and_then(|m| m.section("reasoning", reasoning, true));
                 }
@@ -2432,8 +2432,29 @@ impl App {
                 }
             }
             Kind::Prefix { text } => self.system(Ok(&text), self.system_shown),
+            // A sub-agent's start: its prompt behind its header, its
+            // replies below it as the sub-agent's (DESIGN.md §12, `task`).
+            Kind::Task {
+                agent,
+                model,
+                prompt,
+                ..
+            } => {
+                let pushed = Message::new("td-agent")
+                    .and_then(|m| m.status(&format!("{agent} sub-agent"), Tone::Neutral))
+                    .and_then(|m| m.text(&format!("a {agent} sub-agent runs on {model}")))
+                    .and_then(|m| m.section("prompt", &prompt, true))
+                    .map_err(|e| e.to_string())
+                    .and_then(|m| self.push_message(m));
+                if let Err(e) = pushed {
+                    self.note(format!("the transcript refused a sub-agent: {e}"));
+                }
+            }
             Kind::Title { .. } | Kind::ToolCall { .. } => {}
             Kind::Notice { text } | Kind::Notification { text } => self.notice_message(&text),
+            Kind::TaskNote { .. } => {
+                self.notice_message("the sub-agent was told its next request is its last, and asked, without calling a tool, where the work stands")
+            }
             Kind::Message {
                 from,
                 role,
@@ -2817,9 +2838,21 @@ impl App {
 
     /// A streaming message: its reasoning section, when there is
     /// reasoning, then its text.
-    fn streaming_message(reasoning: Option<&str>, text: &str) -> Result<Message, String> {
-        let mut message =
-            Message::new("assistant").and_then(|m| m.status("streaming", Tone::Neutral));
+    /// Whose reply request `request` brings: a sub-agent's is its own,
+    /// not the conversation's (DESIGN.md §12, `task`).
+    fn author(&self, request: u64) -> &'static str {
+        match self.meter.request(request).map(|r| r.0) {
+            Some(Purpose::Task) => "sub-agent",
+            _ => "assistant",
+        }
+    }
+
+    fn streaming_message(
+        who: &str,
+        reasoning: Option<&str>,
+        text: &str,
+    ) -> Result<Message, String> {
+        let mut message = Message::new(who).and_then(|m| m.status("streaming", Tone::Neutral));
         if let Some(reasoning) = reasoning {
             message = message.and_then(|m| m.section("reasoning", reasoning, true));
         }
@@ -2830,7 +2863,8 @@ impl App {
 
     fn start_stream(&mut self, request: u64, reasoning: &str, content: &str) -> Result<(), String> {
         let has = !reasoning.is_empty();
-        let message = Self::streaming_message(has.then_some(reasoning), content)?;
+        let message =
+            Self::streaming_message(self.author(request), has.then_some(reasoning), content)?;
         let index = self.push_message(message)?;
         self.streaming = Some(Streaming {
             request,
@@ -2857,7 +2891,11 @@ impl App {
                     .and_then(|m| m.section_text(0))
                     .unwrap_or_default()
                     .to_string();
-                let message = Self::streaming_message(Some(reasoning), &text)?;
+                let message = Self::streaming_message(
+                    self.author(streaming.request),
+                    Some(reasoning),
+                    &text,
+                )?;
                 self.edit_stream(|list, index| list.replace(index, message.clone()))?;
                 if let Some(drawn) = self.streaming.as_mut() {
                     drawn.reasoning = true;

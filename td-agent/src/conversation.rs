@@ -68,6 +68,10 @@ use crate::tools::{self, Args, Listed, Op, Reach};
 use crate::wake;
 use crate::workspace::{Entry, Workspace};
 
+// `task`'s sub-agent, a child of this module for its private session.
+#[path = "subagent.rs"]
+mod subagent;
+
 /// What a turn ends with when there is no window settings to make a
 /// request with: the window sends them first, so only a harness that
 /// does not sees this.
@@ -2720,6 +2724,17 @@ impl Session {
     /// the human interrupted them: each call not yet run is answered as
     /// not run, so the next request still has a result for every call.
     fn answer(&mut self, reply: u64) -> Result<bool, String> {
+        let kit = match &self.conversation.meta().workspace {
+            None => tools::Kit::Conversation,
+            Some(Workspace::Repositories(_)) => tools::Kit::Repositories,
+            Some(_) => tools::Kit::Workspace,
+        };
+        self.answer_in(reply, kit)
+    }
+
+    /// `answer`, each call checked against the tools of `kit`: the
+    /// conversation's, or a sub-agent's (DESIGN.md §12, `task`).
+    fn answer_in(&mut self, reply: u64, kit: tools::Kit) -> Result<bool, String> {
         let calls = self
             .conversation
             .events()
@@ -2731,11 +2746,6 @@ impl Session {
                 _ => None,
             })
             .unwrap_or_default();
-        let kit = match &self.conversation.meta().workspace {
-            None => tools::Kit::Conversation,
-            Some(Workspace::Repositories(_)) => tools::Kit::Repositories,
-            Some(_) => tools::Kit::Workspace,
-        };
         for (at, call) in calls.iter().enumerate() {
             self.hear();
             // As the settings give it now, taken away at once.
@@ -2766,6 +2776,14 @@ impl Session {
             self.sync()?;
             let (answer, beside) =
                 match tools::parse_offered(kit, system_view, &call.name, &call.arguments) {
+                    // A sub-agent's process would outlive it (§12, `task`).
+                    Ok(Args::Host {
+                        call: host::Call::Background { .. },
+                        ..
+                    }) if kit == tools::Kit::Task => (
+                        Err("a sub-agent starts no background process; run the command in the foreground".into()),
+                        Beside::default(),
+                    ),
                     Ok(Args::Host { call: hosted, acts }) => {
                         let repeated =
                             repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
@@ -3796,7 +3814,6 @@ impl Session {
     /// workspace, the workspace prepared for `client`'s shared directories
     /// and named, with its tools.
     fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
-        let meta = self.conversation.meta().clone();
         // Listed as they are now, so one added is offered from the next
         // request, as a changed prefix.
         let skills = self
@@ -3804,12 +3821,21 @@ impl Session {
             .as_deref()
             .and_then(|dir| crate::skills::scan(dir).ok())
             .and_then(|found| crate::skills::index(&found.skills));
+        self.placed(client, |created, place| {
+            crate::prompt::prefix_with(created, place, skills.as_deref())
+        })
+    }
+
+    /// What `made` makes of the conversation's creation time and of its
+    /// workspace as the prompt names it, prepared: none without one.
+    fn placed<R>(
+        &mut self,
+        client: &Client,
+        made: impl FnOnce(u64, Option<&crate::prompt::Place>) -> R,
+    ) -> Result<R, String> {
+        let meta = self.conversation.meta().clone();
         let Some(workspace) = &meta.workspace else {
-            return Ok(crate::prompt::prefix_with(
-                meta.created,
-                None,
-                skills.as_deref(),
-            ));
+            return Ok(made(meta.created, None));
         };
         let state = StateDir::at(self.state.clone());
         // The network its commands reach, as the settings give it now,
@@ -3854,11 +3880,7 @@ impl Session {
             allowlist: &client.network_allowlist,
             system: client.system_for(workspace) && !self.system_revoked,
         };
-        Ok(crate::prompt::prefix_with(
-            meta.created,
-            Some(&place),
-            skills.as_deref(),
-        ))
+        Ok(made(meta.created, Some(&place)))
     }
 
     /// Runs a workspace tool's call, the `ToolCall` record `started`, in
@@ -5252,6 +5274,7 @@ impl Session {
             // The template's standing decision: no card asks (DESIGN.md
             // §8, System view).
             Args::SystemStatus(ask) => Ok(crate::sysview::status(&ask)),
+            Args::Task { prompt } => self.task(started, prompt)?,
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::GitPush {
                 worktree,
@@ -6615,12 +6638,27 @@ impl Session {
             Kind::User { text, .. } => Some(text.clone()),
             _ => None,
         });
+        // The conversation's own reply, never a sub-agent's (§12, `task`).
+        let turns: Vec<u64> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    Kind::Request {
+                        purpose: Purpose::Turn,
+                        ..
+                    }
+                )
+            })
+            .map(|e| e.seq)
+            .collect();
         let reply = events.iter().rev().find_map(|e| match &e.kind {
             Kind::Assistant {
+                request,
                 content,
                 incomplete: false,
                 ..
-            } => Some(content.clone().unwrap_or_default()),
+            } if turns.contains(request) => Some(content.clone().unwrap_or_default()),
             _ => None,
         });
         let (Some(first), Some(reply)) = (first, reply) else {

@@ -238,11 +238,34 @@ impl Bench {
         }
     }
 
+    /// Puts `digests` in place of the ones a write must match, and gives
+    /// those back: a sub-agent's are its own, from none, so a write of
+    /// the conversation's never matches a version only the sub-agent saw
+    /// (DESIGN.md §12, `task`).
+    pub fn swap_digests(&mut self, digests: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        std::mem::replace(&mut self.digests, digests)
+    }
+
     /// The digests a conversation's log holds, as a process starting
     /// again takes them up: each result that kept one, of the call its
-    /// assistant message made.
+    /// assistant message made; never a sub-agent's, whose replies answer
+    /// no turn request.
     pub fn restore(&mut self, events: &[Event]) {
+        let mut turns: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut replies: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for event in events {
+            match &event.kind {
+                Kind::Request {
+                    purpose: crate::store::Purpose::Turn,
+                    ..
+                } => {
+                    turns.insert(event.seq);
+                }
+                Kind::Assistant { request, .. } if turns.contains(request) => {
+                    replies.insert(event.seq);
+                }
+                _ => {}
+            }
             let Kind::ToolResult {
                 reply,
                 id,
@@ -254,6 +277,9 @@ impl Bench {
             else {
                 continue;
             };
+            if !replies.contains(reply) {
+                continue;
+            }
             self.record_each(digests);
             let Some(digest) = digest else {
                 continue;
@@ -387,7 +413,16 @@ mod tests {
             digest: digest.map(str::to_string),
             digests: Vec::new(),
         };
+        let request = |purpose, prefix| Kind::Request {
+            turn: 1,
+            purpose,
+            prefix,
+            head: String::new(),
+            bytes: 0,
+            reserved: 0,
+        };
         let events = [
+            event(2, request(crate::store::Purpose::Turn, 0)),
             event(
                 3,
                 Kind::Assistant {
@@ -411,6 +446,25 @@ mod tests {
             event(5, result(3, "r", Some("d1"), false)),
             event(6, result(3, "f", Some("bad"), true)),
             event(7, result(3, "e", Some("d2"), false)),
+            // A sub-agent's edit of the same file is its own.
+            event(9, request(crate::store::Purpose::Task, 8)),
+            event(
+                10,
+                Kind::Assistant {
+                    content: None,
+                    reasoning: None,
+                    details: None,
+                    calls: vec![asked(
+                        "s",
+                        "edit_file",
+                        r#"{"path":"/w/a","old_string":"y","new_string":"q"}"#,
+                    )],
+                    request: 9,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                },
+            ),
+            event(11, result(10, "s", Some("d3"), false)),
         ];
         let mut bench = Bench::default();
         bench.restore(&events);
@@ -425,7 +479,8 @@ mod tests {
             Call::Edit { expected, .. } => expected,
             _ => None,
         };
-        // The edit's digest, which came after the read's.
+        // The edit's digest, which came after the read's, and not the
+        // sub-agent's after it.
         assert_eq!(
             expected(bench.with_digest(edit("/w/a"))).as_deref(),
             Some("d2")
@@ -451,23 +506,24 @@ mod tests {
         let mut patched = Bench::default();
         patched.record(&edit("/w/b"), Some("d0"));
         let mut events = events.to_vec();
+        events.push(event(15, request(crate::store::Purpose::Turn, 0)));
         events.push(event(
-            9,
+            16,
             Kind::Assistant {
                 content: None,
                 reasoning: None,
                 details: None,
                 calls: vec![asked("p", "apply_patch", r#"{"input":"x"}"#)],
-                request: 8,
+                request: 15,
                 finish: "tool_calls".into(),
                 incomplete: false,
             },
         ));
-        let mut done = result(9, "p", None, false);
+        let mut done = result(16, "p", None, false);
         if let Kind::ToolResult { digests, .. } = &mut done {
             *digests = vec![("/w/a".into(), Some("d3".into())), ("/w/b".into(), None)];
         }
-        events.push(event(10, done));
+        events.push(event(17, done));
         patched.restore(&events);
         assert_eq!(
             expected(patched.with_digest(edit("/w/a"))).as_deref(),
