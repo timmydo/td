@@ -14,7 +14,7 @@ pub use index::{
     CommitFileUsage, CommitRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
     LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
     UploadAuthorization, UploadCompletion, UploadCoordinator, UploadError, UploadGuard,
-    UploadRequest, UsageFence,
+    UploadMaintenance, UploadRequest, UsageFence,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

@@ -2425,6 +2425,17 @@ until recovery. Cleanup failure retains the spool's retired-slot charge;
 it does not erase a durable receipt. Native integration tests exercise
 reopening, nonempty accounting, policy revocation, guard lifetime, quota
 refusal, original deadlines, bounded replan and commit-outcome failures.
+The coordinator also admits explicit WAL checkpoint maintenance after an
+upload finishes. It reconciles database/WAL extents under the same
+writer fence and ledger, with a separate original maintenance deadline.
+A known upload outcome with settled tickets and failed file observation
+can resume admission after this measurement; an indeterminate writer or
+bookkeeping failure still requires reopen. Native tests cover checkpoint
+reclamation, preserved logical charges, known-success and rolled-back
+upload timeout recovery, indeterminate refusal, forgotten-job refusal
+and maintenance timeout followed by a separately admitted successful
+measurement. No scheduler or multi-client fairness policy invokes this
+maintenance yet.
 Native indexes serve metadata queries; parsed-body/search caches remain
 disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite

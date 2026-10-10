@@ -214,8 +214,36 @@ other kinds or reservations. Rollback may grow extents; checkpoint may
 grow the database while shrinking WAL. A proven logical rejection
 therefore never supplies a zero physical charge. If the scope has
 expired or measurement/reconciliation fails, retain conservative
-physical charges and stop mutation admission until locked recovery and
-reconciliation.
+physical charges and stop mutation admission until reopen and cold
+reconciliation, or the eligible maintenance path below.
+
+UploadCoordinator::checkpoint is a separate maintenance operation after
+an upload job has finished and released its mutable coordinator borrow.
+It takes its own caller-supplied deadline; it neither renews nor retries
+an upload. A forgotten active upload still refuses maintenance. The
+operation reserves physical headroom in the same ledger, checkpoints
+under the native writer fence and observes validated file extents before
+releasing that fence. The original maintenance clock/deadline also covers
+observation. A retained native view refuses checkpoint with Busy.
+
+A physical-observation failure can be recovered this way only when the
+previous upload has a known outcome, both logical and physical tickets
+were settled and canceled, and the native writer remains healthy.
+A successful checkpoint with measured reconciliation then restores
+admission without changing body or category charges. Any refused
+maintenance attempt preserves the prior stop, including a checkpoint
+error with successfully measured file extents. Indeterminate commits,
+ledger bookkeeping failures and stopped native writers require reopen
+and cold reconciliation; this path grants no retry authority over them.
+A maintenance observation failure retains conservative physical charges
+and requires another separately admitted maintenance operation. Its
+receipt reports the checkpoint outcome independently of accounting and
+admission state. Runtime scheduling and multi-client fairness remain
+unimplemented. Acceptance covers actual WAL reclamation and exact body
+reopening, known-success and rolled-back upload timeouts, indeterminate
+commit plus unavailable observation, pre-SQL refusal and measured
+checkpoint error preserving a prior stop, native stopped-writer refusal,
+and maintenance timeout followed by successful reconciliation.
 
 Reserve typed outcome storage before effects. Known COMMIT success
 retains its durable receipt and exact logical increments (length, one,

@@ -425,6 +425,10 @@ fn forgotten_upload_keeps_its_single_lane_and_spool_reservation() {
             Err(UploadError::Store(ports::Error::Busy))
         ));
         assert_eq!(spool.status().unwrap().occupied_slots, 1);
+        assert!(matches!(
+            coordinator.checkpoint(deadline()),
+            Err(UploadError::Store(ports::Error::Busy))
+        ));
         assert_eq!(coordinator.ledger.pending(Kind::BodyBytes).unwrap(), 4);
         None
     });
@@ -685,4 +689,266 @@ fn coordinator_refuses_missing_physical_effect_cell_at_initialization() {
             panic!("undersized coordinator accepted")
         });
     }
+}
+
+#[test]
+fn maintenance_checkpoints_and_reconciles_files_without_changing_logical_usage() {
+    fixture(|coordinator, spool, _, _, _| {
+        assert!(coordinator.used(Kind::WalBytes).unwrap() > 0);
+        let before_database = coordinator.used(Kind::DatabaseBytes).unwrap();
+        let result = coordinator.checkpoint(deadline()).unwrap();
+        assert_eq!(result.outcome, Ok(()));
+        assert!(!result.admission_stopped);
+        let CommitFileUsage::Measured(files) = result.files else {
+            panic!("missing files")
+        };
+        assert!(files.database_bytes >= before_database);
+        assert_eq!(files.wal_bytes, 0);
+        assert_eq!(
+            coordinator.used(Kind::DatabaseBytes).unwrap(),
+            files.database_bytes
+        );
+        assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+        let mut upload = coordinator
+            .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+            .unwrap();
+        upload.write(b"body").unwrap();
+        upload.prepare().unwrap();
+        let id = upload.id();
+        let UploadAttempt::Complete(result) = upload.commit().unwrap() else {
+            panic!("commit")
+        };
+        assert_eq!(result.outcome, Ok(Sequence::from_u64(2)));
+        drop(upload);
+        assert!(coordinator.used(Kind::WalBytes).unwrap() > 0);
+        assert_eq!(coordinator.checkpoint(deadline()).unwrap().outcome, Ok(()));
+        assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+        assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 8);
+        for kind in [Kind::DatabaseBytes, Kind::WalBytes] {
+            assert_eq!(coordinator.ledger.pending(kind).unwrap(), 0);
+        }
+        Some(id)
+    });
+}
+#[test]
+fn separate_maintenance_recovers_known_commit_but_refuses_indeterminate_commit() {
+    for deny in [false, true] {
+        fixture(|coordinator, spool, clock, _, _| {
+            let timer = clock.clone();
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Transaction { operation }
+                        if !matches!(operation, TransactionOperation::Begin | TransactionOperation::Rollback)) {
+                        timer.0.store(100, Ordering::Relaxed);
+                        if deny { return Authorization::Deny; }
+                    }
+                    Authorization::Allow
+                })).unwrap();
+            let mut upload = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+                .unwrap();
+            upload.write(b"body").unwrap();
+            upload.prepare().unwrap();
+            let id = upload.id();
+            let UploadAttempt::Complete(result) = upload.commit().unwrap() else {
+                panic!("commit")
+            };
+            assert!(result.admission_stopped);
+            assert_eq!(upload.deadline, deadline());
+            drop(upload);
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            clock.0.store(200, Ordering::Relaxed);
+            let later = Deadline::after(Tick(200), 100).unwrap();
+            if deny {
+                assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), MAX_WAL_BYTES);
+                assert!(matches!(result.outcome, Err(CommitError::Indeterminate(_))));
+                assert!(matches!(
+                    coordinator.checkpoint(later),
+                    Err(UploadError::Store(ports::Error::WriterStopped))
+                ));
+                assert!(coordinator.admission_stopped());
+                return None;
+            }
+            assert_eq!(result.outcome, Ok(Sequence::from_u64(2)));
+            assert!(matches!(
+                coordinator.checkpoint(deadline()),
+                Err(UploadError::Store(ports::Error::Deadline))
+            ));
+            assert!(coordinator.admission_stopped());
+            *clock.1.lock().unwrap() = [200, 200, 200, 300].into();
+            let early = coordinator.checkpoint(later).unwrap();
+            assert_eq!(early.outcome, Err(ports::Error::Deadline));
+            assert_eq!(early.files, CommitFileUsage::Unchanged);
+            assert!(early.admission_stopped);
+            let later = Deadline::after(Tick(300), 100).unwrap();
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+                .authorizer(Some(|context: AuthContext<'_>| {
+                    if matches!(context.action, AuthAction::Pragma { pragma_name, .. } if pragma_name == "wal_checkpoint") {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                })).unwrap();
+            let refused = coordinator.checkpoint(later).unwrap();
+            assert!(refused.outcome.is_err());
+            assert!(matches!(refused.files, CommitFileUsage::Measured(_)));
+            assert!(refused.admission_stopped);
+            assert!(coordinator.admission_stopped());
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            let maintenance = coordinator.checkpoint(later).unwrap();
+            assert_eq!(maintenance.outcome, Ok(()));
+            assert!(!maintenance.admission_stopped);
+            let CommitFileUsage::Measured(files) = maintenance.files else {
+                panic!("missing files")
+            };
+            assert_eq!(
+                coordinator.used(Kind::DatabaseBytes).unwrap(),
+                files.database_bytes
+            );
+            assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+            assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 8);
+            assert!(matches!(
+                coordinator.reserve(
+                    &td_crypto::Provider,
+                    &mut Random(9),
+                    spool,
+                    UploadRequest {
+                        deadline: later,
+                        ..request(1)
+                    }
+                ),
+                Err(UploadError::Ledger(logical::Error::Quota(Kind::BlobCount)))
+            ));
+            Some(id)
+        });
+    }
+}
+#[test]
+fn maintenance_timeout_stays_conservative_until_a_separate_successful_measurement() {
+    fixture(|coordinator, _, clock, _, _| {
+        let timer = clock.clone();
+        lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Pragma { pragma_name, .. } if pragma_name == "wal_checkpoint") {
+                    timer.0.store(100, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            })).unwrap();
+        let result = coordinator.checkpoint(deadline()).unwrap();
+        assert_eq!(result.outcome, Err(ports::Error::Deadline));
+        assert_eq!(
+            result.files,
+            CommitFileUsage::Unavailable(ports::Error::Deadline)
+        );
+        assert!(result.admission_stopped);
+        assert_eq!(
+            coordinator.used(Kind::DatabaseBytes).unwrap(),
+            MAX_PAGES * PAGE_BYTES
+        );
+        assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), MAX_WAL_BYTES);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+            .unwrap()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        let result = coordinator
+            .checkpoint(Deadline::after(Tick(100), 100).unwrap())
+            .unwrap();
+        assert_eq!(result.outcome, Ok(()));
+        assert!(!result.admission_stopped);
+        assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), 0);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        None
+    });
+}
+
+#[test]
+fn maintenance_after_timed_out_rollback_preserves_logical_quota_for_a_new_upload() {
+    fixture(|coordinator, spool, clock, _, _| {
+        let timer = clock.clone();
+        lock(&lock(&coordinator.store.writer).unwrap().native.connection).unwrap()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Insert { table_name } if table_name == "blobs") {
+                    timer.0.store(100, Ordering::Relaxed);
+                }
+                Authorization::Allow
+            })).unwrap();
+        let mut upload = coordinator
+            .reserve(&td_crypto::Provider, &mut Random(8), spool, request(4))
+            .unwrap();
+        upload.write(b"body").unwrap();
+        upload.prepare().unwrap();
+        let old_id = upload.id();
+        let UploadAttempt::Complete(result) = upload.commit().unwrap() else {
+            panic!("commit")
+        };
+        assert_eq!(
+            result.outcome,
+            Err(CommitError::Rejected(ports::Error::Deadline))
+        );
+        assert!(result.admission_stopped);
+        drop(upload);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        assert_eq!(coordinator.used(Kind::UploadBytes).unwrap(), 4);
+        lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+            .unwrap()
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        let later = Deadline::after(Tick(100), 100).unwrap();
+        assert_eq!(coordinator.checkpoint(later).unwrap().outcome, Ok(()));
+        assert!(!coordinator.admission_stopped());
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        assert_eq!(
+            coordinator
+                .store
+                .view(ACCOUNT, later)
+                .unwrap()
+                .get(Key::Blob(old_id), &mut [0; 64])
+                .unwrap(),
+            None
+        );
+        let mut upload = coordinator
+            .reserve(
+                &td_crypto::Provider,
+                &mut Random(9),
+                spool,
+                UploadRequest {
+                    deadline: later,
+                    ..request(4)
+                },
+            )
+            .unwrap();
+        upload.write(b"body").unwrap();
+        upload.prepare().unwrap();
+        let id = upload.id();
+        let UploadAttempt::Complete(result) = upload.commit().unwrap() else {
+            panic!("commit")
+        };
+        assert_eq!(result.outcome, Ok(Sequence::from_u64(2)));
+        assert!(!result.admission_stopped);
+        Some(id)
+    });
+}
+
+#[test]
+fn maintenance_cannot_clear_a_stopped_native_writer() {
+    fixture(|coordinator, _, _, _, _| {
+        lock(&coordinator.store.writer).unwrap().stopped = true;
+        let result = coordinator.checkpoint(deadline()).unwrap();
+        assert_eq!(result.outcome, Err(ports::Error::WriterStopped));
+        assert_eq!(result.files, CommitFileUsage::Unchanged);
+        assert!(result.admission_stopped);
+        assert!(matches!(
+            coordinator.checkpoint(deadline()),
+            Err(UploadError::Store(ports::Error::WriterStopped))
+        ));
+        None
+    });
 }

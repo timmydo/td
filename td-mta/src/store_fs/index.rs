@@ -69,7 +69,7 @@ pub use completion::{CommitCompletion, CommitFileUsage};
 use completion::{CommitPhase, CommitWork};
 pub use upload::{
     Upload, UploadAttempt, UploadAuthorization, UploadCompletion, UploadCoordinator, UploadError,
-    UploadGuard, UploadRequest,
+    UploadGuard, UploadMaintenance, UploadRequest,
 };
 #[path = "index/backup.rs"]
 mod backup;
@@ -1138,34 +1138,50 @@ impl<'r> IndexStore<'r> {
         deadline: Deadline,
         previous: Option<ports::Tick>,
     ) -> Result<ports::Tick, ports::Error> {
-        let (writer, acquired) = self.writer_observed(deadline)?;
-        if previous.is_some_and(|previous| acquired < previous) {
-            return Err(ports::Error::Invalid);
-        }
-        if writer.stopped {
-            return Err(ports::Error::WriterStopped);
-        }
-        if lock(&self.readers)?
-            .iter()
-            .any(|slot| matches!(slot, ReaderSlot::Borrowed))
-        {
-            return Err(ports::Error::Busy);
-        }
-        writer.native.begin_work_after(deadline, acquired)?;
-        writer.native.run(|db| {
-            let (busy, _, _): (i64, i64, i64) = db
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .map_err(sql)?;
-            if busy != 0 {
+        self.checkpoint_observed(deadline, previous, |result, _, _| result)
+    }
+    fn checkpoint_observed<T>(
+        &self,
+        deadline: Deadline,
+        previous: Option<ports::Tick>,
+        finish: impl FnOnce(Result<ports::Tick, ports::Error>, bool, Option<&Writer>) -> T,
+    ) -> T {
+        let (writer, acquired) = match self.writer_observed(deadline) {
+            Ok(pair) => pair,
+            Err(error) => return finish(Err(error), false, None),
+        };
+        let mut started = false;
+        let result = (|| {
+            if previous.is_some_and(|previous| acquired < previous) {
+                return Err(ports::Error::Invalid);
+            }
+            if writer.stopped {
+                return Err(ports::Error::WriterStopped);
+            }
+            if lock(&self.readers)?
+                .iter()
+                .any(|slot| matches!(slot, ReaderSlot::Borrowed))
+            {
                 return Err(ports::Error::Busy);
             }
-            Ok(())
-        })?;
-        self.root.root.directory.file.sync_all()?;
-        let observed = lock(&writer.native.scope.budget)?.last;
-        Ok(observed)
+            writer.native.begin_work_after(deadline, acquired)?;
+            writer.native.run(|db| {
+                started = true;
+                let (busy, _, _): (i64, i64, i64) = db
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(sql)?;
+                if busy != 0 {
+                    return Err(ports::Error::Busy);
+                }
+                Ok(())
+            })?;
+            self.root.root.directory.file.sync_all()?;
+            let observed = lock(&writer.native.scope.budget)?.last;
+            Ok(observed)
+        })();
+        finish(result, started, Some(&writer))
     }
 }
 fn body_rowid(db: &Connection, account: AccountId, id: BlobId) -> Result<i64, ports::Error> {

@@ -80,6 +80,7 @@ pub struct UploadCoordinator<'r, 'a, P> {
     authorization: P,
     active: bool,
     stopped: bool,
+    recoverable_files: bool,
 }
 impl<'r, 'a, P: UploadAuthorization> UploadCoordinator<'r, 'a, P> {
     /// Cold initialization requires quiescent auxiliary owners and settled effects.
@@ -105,6 +106,7 @@ impl<'r, 'a, P: UploadAuthorization> UploadCoordinator<'r, 'a, P> {
             authorization,
             active: false,
             stopped: false,
+            recoverable_files: false,
         })
     }
     pub fn admission_stopped(&self) -> bool {
@@ -492,31 +494,16 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
             }],
         );
         drop(guard);
-        let physical = match completion.files() {
-            CommitFileUsage::Unchanged => self
-                .coordinator
-                .ledger
-                .complete_effect(&mut physical_ticket, EffectResult::Proven([0; 4])),
-            CommitFileUsage::Measured(files) => self.coordinator.ledger.complete_physical(
-                &mut physical_ticket,
-                files.database_bytes,
-                files.wal_bytes,
-            ),
-            CommitFileUsage::Unavailable(_) => {
-                self.coordinator.stopped = true;
-                self.coordinator
-                    .ledger
-                    .complete_effect(&mut physical_ticket, EffectResult::Uncertain)
-            }
-        };
-        if physical.is_err() {
+        let physical_settled = settle_physical(
+            &mut self.coordinator.ledger,
+            &mut physical_ticket,
+            completion.files(),
+        );
+        if !physical_settled || matches!(completion.files(), CommitFileUsage::Unavailable(_)) {
             self.coordinator.stopped = true;
-            let _ = self
-                .coordinator
-                .ledger
-                .complete_effect(&mut physical_ticket, EffectResult::Uncertain);
         }
-        if self.coordinator.ledger.cancel(physical_lease).is_err() {
+        let physical_canceled = self.coordinator.ledger.cancel(physical_lease).is_ok();
+        if !physical_canceled {
             self.coordinator.stopped = true;
         }
         let outcome = completion.outcome();
@@ -528,12 +515,12 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
                 EffectResult::Uncertain
             }
         };
-        if self
+        let logical_settled = self
             .coordinator
             .ledger
             .complete_effect(&mut logical_ticket, effect)
-            .is_err()
-        {
+            .is_ok();
+        if !logical_settled {
             self.coordinator.stopped = true;
         }
         self.coordinator.stopped |= completion.writer_stopped();
@@ -541,9 +528,18 @@ impl<C: Crypto, P: UploadAuthorization> Upload<'_, '_, '_, '_, C, P> {
             self.replan_allowed = true;
             return Ok(UploadAttempt::SequenceConflict);
         }
-        if self.coordinator.ledger.cancel(lease).is_err() {
+        let logical_canceled = self.coordinator.ledger.cancel(lease).is_ok();
+        if !logical_canceled {
             self.coordinator.stopped = true;
         }
+        self.coordinator.recoverable_files =
+            matches!(completion.files(), CommitFileUsage::Unavailable(_))
+                && physical_settled
+                && physical_canceled
+                && logical_settled
+                && logical_canceled
+                && !completion.writer_stopped()
+                && !matches!(outcome, Err(CommitError::Indeterminate(_)));
         self.lease = None;
         let cleanup_error =
             discard_stage(std::mem::replace(&mut self.stage, Stage::Finished)).err();
@@ -601,6 +597,127 @@ fn check_upload_time(
     check_time(store, deadline, last).inspect_err(|error| {
         *failed = Some(*error);
     })
+}
+
+/// Result of separately admitted WAL maintenance; this never retries an upload.
+#[derive(Debug)]
+#[must_use = "inspect maintenance and admission outcomes before accepting more work"]
+pub struct UploadMaintenance {
+    pub outcome: Result<(), ports::Error>,
+    pub files: CommitFileUsage,
+    pub admission_stopped: bool,
+}
+impl<P> UploadCoordinator<'_, '_, P> {
+    /// Run after the upload job has finished. Unknown commits require reopen.
+    pub fn checkpoint(&mut self, deadline: Deadline) -> Result<UploadMaintenance, UploadError> {
+        if self.active {
+            return Err(ports::Error::Busy.into());
+        }
+        if self.stopped && !self.recoverable_files {
+            return Err(ports::Error::WriterStopped.into());
+        }
+        let mut last = self.store.clock.sample()?.monotonic;
+        let now = check_time(&self.store, deadline, &mut last)?;
+        let database = self.ledger.remaining_capacity(Kind::DatabaseBytes)?;
+        let wal = self.ledger.remaining_capacity(Kind::WalBytes)?;
+        let lease = self.ledger.reserve(
+            &[[
+                Charge {
+                    kind: Kind::DatabaseBytes,
+                    amount: database,
+                },
+                Charge {
+                    kind: Kind::WalBytes,
+                    amount: wal,
+                },
+                Charge::ZERO,
+                Charge::ZERO,
+            ]],
+            deadline,
+            now.monotonic,
+        )?;
+        let ticket = self.ledger.part(lease, 0).and_then(|part| {
+            self.ledger
+                .begin_effect(part, [database, wal, 0, 0], now.monotonic)
+        });
+        let mut ticket = match ticket {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                if self.ledger.cancel(lease).is_err() {
+                    self.stopped = true;
+                    self.recoverable_files = false;
+                }
+                return Err(error.into());
+            }
+        };
+        let (outcome, files, writer_stopped) = self.store.checkpoint_observed(
+            deadline,
+            Some(now.monotonic),
+            |result, started, writer| {
+                let stopped = writer.map_or_else(
+                    || matches!(result, Err(ports::Error::WriterStopped)),
+                    |writer| writer.stopped,
+                );
+                let files = if !started {
+                    CommitFileUsage::Unchanged
+                } else {
+                    match writer {
+                        Some(writer) => {
+                            match StoreFileUsage::capture(self.store.root, &writer.native) {
+                                Ok(files) => CommitFileUsage::Measured(files),
+                                Err(error) => CommitFileUsage::Unavailable(error),
+                            }
+                        }
+                        None => CommitFileUsage::Unavailable(ports::Error::WriterStopped),
+                    }
+                };
+                (result.map(|_| ()), files, stopped)
+            },
+        );
+        let accounting_ok = settle_physical(&mut self.ledger, &mut ticket, files);
+        let canceled = self.ledger.cancel(lease).is_ok();
+        if !accounting_ok || !canceled || writer_stopped {
+            self.stopped = true;
+            self.recoverable_files = false;
+        } else {
+            match files {
+                CommitFileUsage::Measured(_) if outcome.is_ok() => {
+                    self.stopped = false;
+                    self.recoverable_files = false;
+                }
+                CommitFileUsage::Measured(_) => {}
+                CommitFileUsage::Unavailable(_) => {
+                    self.stopped = true;
+                    self.recoverable_files = true;
+                }
+                CommitFileUsage::Unchanged => {}
+            }
+        }
+        Ok(UploadMaintenance {
+            outcome,
+            files,
+            admission_stopped: self.stopped,
+        })
+    }
+}
+
+fn settle_physical(
+    ledger: &mut Leases<'_>,
+    ticket: &mut logical::EffectTicket,
+    files: CommitFileUsage,
+) -> bool {
+    let result = match files {
+        CommitFileUsage::Unchanged => ledger.complete_effect(ticket, EffectResult::Proven([0; 4])),
+        CommitFileUsage::Measured(files) => {
+            ledger.complete_physical(ticket, files.database_bytes, files.wal_bytes)
+        }
+        CommitFileUsage::Unavailable(_) => ledger.complete_effect(ticket, EffectResult::Uncertain),
+    };
+    let settled = result.is_ok();
+    if !settled {
+        let _ = ledger.complete_effect(ticket, EffectResult::Uncertain);
+    }
+    settled
 }
 
 #[cfg(test)]

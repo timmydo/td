@@ -454,9 +454,17 @@ maintenance admission through its ledger reconciliation and preserve
 store/ledger association. UploadCoordinator owns one IndexStore and its
 consuming-initialized logical ledger, with one outstanding upload. Its private
 physical completion replaces measured database/WAL buckets and settles the
-associated ticket atomically. Other service mutations and maintenance still
-need their own coordinated admission paths. ADMISSION.md section 2 owns the
-reserved upload contract.
+associated ticket atomically. Its checkpoint operation separately admits
+maintenance, captures file usage before releasing the checkpoint writer
+fence, and reconciles these same physical buckets. It can restore
+admission after a known upload outcome whose file observation failed,
+provided all tickets settled, the native writer stayed healthy and the
+checkpoint itself succeeds. A checkpoint error cannot clear a prior
+admission stop even if file measurement succeeds. It
+cannot clear an indeterminate commit or bookkeeping failure. This does
+not renew the earlier upload scope. Other service mutations and broader
+maintenance still need their own coordinated admission paths.
+ADMISSION.md section 2 owns the reserved upload and maintenance contracts.
 
 ### Snapshots, changes, reclamation and backup
 
