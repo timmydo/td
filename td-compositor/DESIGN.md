@@ -6050,8 +6050,10 @@ Enter installing nothing (td-update/DESIGN.md).
 The approval key appears only on the private prompt, so ordinary
 rendering never carries it. The login-key disclosures, enrollment's and
 the one-key and remove-every-key removal disclosures (TOKEN-LOGIN.md
-increment 5), use it from the start; a live boot's whole-disk
-installation keeps its fresh Enter.
+increment 5's A4), use it from the start. Each is typed on the
+operation's first step, which carries the disclosure, and confirms that
+step's presentation receipt, under the rules above. A live boot's
+whole-disk installation keeps its fresh Enter.
 
 ### Login-key operations
 
@@ -6107,6 +6109,9 @@ checks root's descriptions without the record or the device:
   at its deadline or on a cancellation, describes that step while it
   reaps the worker. Presenting it still needs `04` and committing it a
   receipt, so admitting it under `03` lets nothing through;
+- from TOKEN-LOGIN.md increment 5's A4, a disclosure step's receipt is
+  sent only once its approval key is typed ("Elevation consent"); every
+  other step's receipt follows its presentation as before;
 - in an addition, the new key's prove, repeat and probe never name the
   key the authorize step named: a rule spanning more than one step,
   which consent leaves to its reader;
@@ -6512,8 +6517,8 @@ excluded from every selection, confirmation and field below.
 1. **One operation per lifetime (3).** Implemented for the key-management
    screen and the lock surface, whose chord opens a login unlock with no
    selection at all. Still to come: a disclosure's approval key
-   ("Elevation consent") confirms its operation (TOKEN-LOGIN.md
-   increment 5).
+   ("Elevation consent") confirms its operation at its first step
+   (TOKEN-LOGIN.md increment 5's A4).
 2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
    "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its

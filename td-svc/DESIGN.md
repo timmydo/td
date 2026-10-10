@@ -539,7 +539,8 @@ documented in `Documentation/admin-guide/cgroup-v2.rst`, not numeric process
 group identity after its leader has been reaped.
 
 **Planned, not implemented: `stop=leaf`.** The login-key tier's activation
-(`td-login/TOKEN-LOGIN.md`, "Cutover") adds a unit key `stop`, with values
+(`td-login/TOKEN-LOGIN.md`, "Cutover"; its increment 5's A1) adds a
+unit key `stop`, with values
 `group` (the default, today's behaviour) and `leaf`. It is valid only with
 `cgroup=service` and without `tty=`; a `pair-exec` unit already stops this
 way and does not declare it. A requested stop or restart of a `stop=leaf`

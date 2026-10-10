@@ -1742,6 +1742,100 @@ and the oracle that shows it.
      cut followed by a boot whose firstboot renders the enforced form
      before `sshd` and the greeter start.
 
+   Increment 5 is specified as five commits, A1 to A5, in landing
+   order. Only A5 admits a write. Before it, a cutover arises only when
+   the login state changes within a boot, which in production only
+   damage to the directory or the record does. A1's `sshd` stop and A2's
+   atomic publication and record are live on every machine and change
+   no admitted login. A1 and A2 each add their live piece to AGENTS.md
+   principle 7's list and to this document's opening when they land.
+   - A1, td-svc `stop=leaf` (`td-svc/DESIGN.md`):
+     - the key, and its validation: `cgroup=service`, no `tty=`, not
+       `pair-exec`;
+     - a requested stop, restart or shutdown that kills the whole leaf
+       and waits for it to empty, through the pair's `cgroup.kill` and
+       `cgroup.events` reader; the stop path opens both controls at the
+       stop, since a leaf whose leader restarted in place is not empty;
+     - a leader crash, which restarts the leader in place;
+     - the shipped `sshd` unit, which sets it.
+
+     Stopping `sshd` now ends the OpenSSH sessions in its leaf, as
+     shutdown already did by killing everything. A stock machine whose
+     placement failed keeps `sshd` in `stopping` after a requested stop
+     or restart, as that section's fail-closed rule says, until a
+     reboot. The evidence is table and supervisor fixtures, and a guest
+     that holds a session child in its own session through a restart.
+   - A2, firstboot's two renders:
+     - Stage-1's `td-firstboot render-primary-sshd /sysroot` publishes
+       `/sysroot/run/td-sshd.conf` itself, a root:root mode-0600
+       temporary renamed into place, in place of the shell's truncating
+       redirect. It then writes the volatile record
+       `/sysroot/run/td-login-cutover` for the form it rendered.
+       `td-authd/DESIGN.md`'s amendment 7 gives the record's bytes,
+       writers and reader once.
+     - The new fixed verb `td-firstboot render-ssh-policy` takes no
+       operand. It renders under `/` for a running boot, publishes the
+       policy the same way, and prints the form it published. It writes
+       no record, and is inert until A3 runs it.
+
+     A2 amends `THREAT-MODEL.md` §1's render and serialization
+     statements to match.
+   - A3, td-authd's revocation and reboot guard, amendment 7 as stated
+     there: the check and when it runs, the cutover beside the operation
+     slot, the line's hand-back, `9a`'s revocation byte, the reboot and
+     the guard. The compositor decodes the byte, polls `1a` every 250 ms
+     while it reads `01`, and shows `02`'s and `03`'s texts. A recipe
+     test pins the line constant to the greeter unit's `tty=`. On a
+     stock machine the boot's record names the unenrolled state, so the
+     check changes nothing.
+
+     Host child fixtures with a scripted td-svc cover the host-fixture
+     items of the failure injection listed above. Its guest items, the
+     authority killed between publication and restart and the cut
+     followed by a boot, are A5's. `qemu-login-system`'s seed phase replaces
+     its own `stop greeter` with a cutover: after seeding, a restarted
+     pair finds the record and the state different. It ends the
+     logged-in serial session and an open SSH session, and leaves the
+     enforced form and a greeter that refuses.
+   - A4, the disclosures' approval key, inert in production:
+     - Only a disclosure step carries the key. That is the first step
+       of a first enrollment (its first `connect`), and the first step
+       of a removal that leaves at most one key (`identify`).
+     - Both are presented before any token I/O, and each disclosure
+       belongs to the whole operation. So one key confirms the
+       operation, and no later step carries one.
+     - The key's two bytes are drawn as an elevation's are and are the
+       description's last, after the step's (`td-authd/DESIGN.md`,
+       "Elevation operations"). The decoder requires them on such a step
+       and refuses them on any other.
+     - The step's rows end with the disclosure ("Enrollment, addition
+       and removal") and then the key rows.
+     - The compositor sends that step's presentation receipt only once
+       the key is typed under its "Elevation consent" rules. The receipt
+       carries the exact description, so it carries the key. Enter and
+       a wrong digit act as they do on an elevation's prompt.
+     - Root waits for that receipt, and the worker for root's
+       acknowledgement, until the operation's deadline rather than the
+       usual three and five seconds.
+     - The widest login value is unchanged: the authorize step of an
+       eight-key removal, which carries no key.
+     - The evidence is literal vectors, host tests (among them a key
+       typed after ten seconds still proceeds, and a receipt after
+       root's deadline ends as TIMEOUT) and device-dispatcher
+       tests, as for L3's key.
+   - A5, activation:
+     - `login::WRITES` becomes true, so production admits enrollment,
+       addition and removal.
+     - The documents' statements of what is implemented follow. None
+       describes the tier as usable before the hardware evidence below.
+     - Its oracle is this item's full-system QEMU list, plus the
+       guest-side failure injection. These run as further
+       `qemu-login-system` phases that drive the attention screen over
+       QMP.
+
+   A5 lands only after A3 and A4, so no build admits a write whose
+   cutover or disclosure is missing.
+
 Hardware evidence on the T430s follows increment 5 and precedes any claim
 that the tier is usable. Follow-ups: store release at login, idle-timeout
 lock, a suspend initiator, built-in UV and PIN setup.

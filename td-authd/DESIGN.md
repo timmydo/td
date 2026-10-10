@@ -1090,7 +1090,9 @@ identify, unlock for unlock; identify, authorize for removal; identify,
 authorize, connect, create, prove, repeat, probe for addition; and connect,
 create, prove, repeat, probe for each new key of an enrollment in turn. A
 step outside its operation's list refuses. The widest login value, a
-removal of eight keys at its authorize step, is 98 bytes.
+removal of eight keys at its authorize step, is 98 bytes. From
+TOKEN-LOGIN.md increment 5's A4, a disclosure step also ends with the
+two approval-key bytes ("Elevation operations").
 
 Step admission has two parts. The descriptions alone decide a step's
 shape, which a reader without the record or the device can check, as
@@ -1834,13 +1836,19 @@ carries the same two bytes after its tag byte, before its requester and
 ID, 115 bytes in all, and its rows end with the same key rows; its
 restart row, 35 columns, wraps at the narrowest prompt, above them, so
 the key is still never split. Tag 6, the live disk installation,
-carries none. TOKEN-LOGIN.md's increment 5 adds the same two bytes,
-right after the tag byte, to the login tags whose descriptions
-carry a disclosure: enrollment (8) and removal (10), whose one-key and
-remove-every-key disclosures it confirms. Root draws a fresh key for
-each presented description, so each step of a multi-step enrollment has
-its own. The widest login value, a removal of eight keys at its
-authorize step, becomes 100 bytes.
+carries none. TOKEN-LOGIN.md's increment 5 (its A4) adds the same two
+bytes to a login description that carries a disclosure, and to no
+other. Those are the first step of a first enrollment (8), its first
+`connect`, and the first step of a removal (10), its `identify`, when
+the removal leaves at most one key. On those steps the bytes are the
+value's last two, after the step's, because the decoder knows only from
+the step and the counts whether they belong. Each such step is presented
+before any token I/O, and its disclosure is the whole operation's, so
+one key confirms the operation and no later step carries one. The
+compositor sends that step's presentation receipt, which carries the
+exact description and so the key, only once the key is typed. The widest
+login value is unchanged, the authorize step of an eight-key removal,
+98 bytes, which carries no key.
 
 **Requests.** `1d` asks for a rollback and `1e` selects the queued
 hostname request; neither takes an operand. Each answers `92` and the
@@ -2108,7 +2116,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    unenrolled, enrolled, or unavailable with its typed cause, as
    TOKEN-LOGIN.md defines them ("Login-key operation supervision" below
    gives the bytes). The answer also carries the revocation status of
-   amendment 7, reserved as `00` until increment 5. Only td-authd
+   amendment 7, reserved as `00` until increment 5's A3, which
+   defines `00` settled, `01` pending, `02` failed and restarting and
+   `03` held. Only td-authd
    decides that a session unlocks: on a login unlock's observed success.
 
    An enrolled answer also carries the record's slot count and each
@@ -2255,47 +2265,131 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    and its success frame land within it; a success root has not seen by
    its deadline is uncertain (below).
 7. **Revocation (5).** Root performs TOKEN-LOGIN.md's "Cutover" whenever
-   the login state, reduced to unenrolled or enforced (enrolled or
-   unavailable), differs from the root-owned mode-0600 volatile record
-   `/run/td-login-cutover`, which names the boot ID and the state the
-   console and SSH were last brought to; firstboot writes it after its
-   boot-time render. An absent or unreadable record, or one naming another
-   boot ID, needs a cutover toward the enforced form unless the state is
-   verifiably unenrolled; an unavailable state never renders the ordinary
-   policy. The check runs after every login operation, including one whose
-   worker failed or whose outcome is uncertain, at every Prepare after
-   login state is reported, and when the authority starts. The cutover:
-   - renders the SSH policy for that state through a new fixed root
-     subcommand, `td-firstboot render-ssh-policy`, which applies
-     firstboot's account validation and serializes publication against all
-     account readers, as boot-time rendering does (`td-login/THREAT-MODEL.md`
-     §1);
-   - returns the greeter's line to root:root with the pinned terminal
-     mode, owner first, so no descriptor opened after the state change and
-     before the restart outlives it (`td-login/TOKEN-LOGIN.md`,
-     "Cutover"); increment 5 specifies how the line is named;
-   - asks td-svc, over its existing control socket, to restart `sshd` and
-     `greeter`, issuing both requests before polling either, so their
-     TERM waits overlap; it names no other unit;
-   - polls `status` for each until it has left `stopping`, which for
-     `greeter` means its `tty=` containment is empty and for `sshd` its
-     whole service leaf (`td-svc/DESIGN.md`, `stop=leaf`), and runs a new
-     leader: a pid different from the leader recorded before the request,
-     whose `/proc` start time is later than the request. Each unit must
-     finish within 30 seconds of its request, longer than the default
-     10-second `stop-timeout` plus KILL observation even under emulation;
-   - only then writes the volatile record and reports completion.
+   the reduced login state is not the one the volatile record
+   `/run/td-login-cutover` names for this boot. That record names the
+   state the console and SSH were last brought to.
+
+   **The reduced state** is `unenrolled` or `enforced`, decided by the
+   shared predicate's directory-and-name check alone, the one firstboot,
+   td-login and `render-ssh-policy` apply (TOKEN-LOGIN.md, "SSH"). It is
+   not the `1a` answer, whose helper may also report the record
+   unreadable. So root and the verb always reduce alike: a valid
+   directory without the record name is unenrolled, and anything else is
+   enforced. A later state that enforces without a record, such as
+   `td-install/ENCRYPTION.md` increment 8's protected marker, extends
+   that shared check, never root's reduction alone.
+
+   **The record.** It is exactly three lines, each ending in a newline:
+   - `td-login-cutover-v1`;
+   - the boot ID, the 36 bytes of `/proc/sys/kernel/random/boot_id`
+     without its newline;
+   - `unenrolled` or `enforced`.
+
+   It is root:root mode 0600, published by renaming a temporary
+   `/run/td-login-cutover.tmp`, which the writer opens with
+   `O_CREAT|O_EXCL|O_NOFOLLOW` after removing a stale one.
+   - Firstboot writes it in stage 1, under `/sysroot`, right after
+     publishing its boot-time render, naming the form it rendered. A
+     failure to write it fails that step, which stops boot as a failed
+     render does.
+   - Root writes it only after a cutover is observed complete, naming
+     the form `render-ssh-policy` reported publishing.
+   - Root reads it with `O_NOFOLLOW|O_NONBLOCK` and requires a regular
+     file, one link, root:root, mode 0600, at most 128 bytes and that
+     exact grammar. Anything else, an absent record included, reads as
+     naming no state, as does a record naming another boot ID.
+   - A record that names no state for this boot needs a cutover to the
+     current reduced state, whichever it is. On a stock boot firstboot
+     has written it, so the check changes nothing.
+   - An unavailable state never renders the ordinary policy: it reduces
+     to enforced.
+
+   **When it runs.**
+   - Root begins the generation's check inside the first `1a` after
+     Prepare: it computes the state, begins the check, then answers, so
+     that answer already reads `01` if a cutover began. That first check
+     is the authority-start check, since root learns only from Prepare
+     whether the boot is live.
+   - After every login operation, including one whose worker failed or
+     whose outcome is uncertain, the check begins when the operation
+     ends, before its terminal status is delivered. The compositor's `1a`
+     after that status therefore already sees it.
+   - A live boot (`td.live=1`) runs none, since root answers `1a`
+     unenrolled there by fiat.
+
+   **Beside the slot.** A cutover does not take the one operation slot,
+   so no request meets it as busy, and a login operation, an inspection
+   or an elevation may run beside it. A check that falls due while a
+   cutover runs is taken again in the same `tick` that settles it, so no
+   `00` is reported between the two, and a state that changed meanwhile
+   converges to the newer state. The cutover is a nonblocking state
+   machine that `tick` advances; `1a` reports it pending (`01`) until it
+   settles. Generation teardown abandons a cutover in flight without
+   writing the record, so the next generation's check repeats it.
+
+   **The cutover:**
+   - It renders the SSH policy through the fixed root subcommand
+     `td-firstboot render-ssh-policy` (TOKEN-LOGIN.md increment 5's
+     A2). That verb applies firstboot's account validation, publishes
+     the policy by rename, and prints the one word of the form it
+     published, which is the form root records. The account tables are
+     read-only binds from `prepare-primary-profile` to shutdown, so
+     within a boot it validates the set stage 1 validated. The rename is
+     what serializes publication against `sshd`'s readers. Root
+     launches it as it launches its helpers, with an empty environment
+     and `/` as its working directory, and reaps it without blocking.
+     Its output must be exactly `unenrolled` or `enforced` and a newline,
+     read through a 16-byte bound, and its exit successful; anything
+     else is a failed render. At ten seconds, and at generation teardown,
+     root kills and reaps it, so no stale render can land after a newer
+     cutover's.
+   - It returns the greeter's line to root:root with the pinned terminal
+     mode, so no descriptor opened after the state change and before the
+     restart outlives it (`td-login/TOKEN-LOGIN.md`, "Cutover").
+     - The line is `/dev/ttyS0`, the greeter unit's `tty=`, which a
+       recipe test pins.
+     - Root takes the line only once `symlink_metadata` shows a
+       character device: `lchown` to 0:0 first, then mode 0600, then it
+       reads both back.
+     - An absent node is skipped, since no session can hold it.
+     - A node of any other type, or a failed change or read-back, is a
+       failed revocation.
+   - It asks td-svc, over its existing control socket, to restart `sshd`
+     and `greeter`, issuing both requests before polling either so their
+     TERM waits overlap. It names no other unit, and bounds each control
+     exchange at two seconds.
+   - It polls `status` for each unit until the unit has left `stopping`
+     and runs a new leader. Leaving `stopping` means, for `greeter`, that
+     its `tty=` containment is empty; for `sshd`, that its whole service
+     leaf is (`td-svc/DESIGN.md`, `stop=leaf`). A new leader is a pid
+     different from the leader recorded before the request, whose
+     `/proc` start time is later than the request. Each unit must finish
+     within 30 seconds of its request, longer than the default 10-second
+     `stop-timeout` plus KILL observation even under emulation.
+   - Only then does it write the record and settle (`00`).
 
    One transient td-svc failure (a refused connection or a busy reply) is
-   retried once. A refusal after that, a failed render, or a teardown still
-   pending at its deadline is a failed revocation, never only a warning.
-   The `1a` revocation status then reads failed; the compositor shows `A
-   CONSOLE OR SSH SESSION COULD NOT BE CLOSED: RESTARTING` on its trusted
-   surface, and root asks td-svc for an orderly `reboot`, whose boot
-   ordering then enforces the boundary: firstboot renders the enforced
-   form before `sshd` and the greeter start. If that request fails too,
-   the authority ends its generation, and the next generation's check
-   repeats the cutover.
+   retried once. A failed revocation, never only a warning, is any of:
+   - a refusal after that retry;
+   - a failed render;
+   - a failed hand-back;
+   - a teardown still pending at its deadline.
+
+   On a failed revocation:
+   - The `1a` revocation status reads failed (`02`).
+   - The compositor shows `A CONSOLE OR SSH SESSION COULD NOT BE CLOSED:
+     RESTARTING` on its lock surface and attention screen.
+   - Root asks td-svc for an orderly `reboot` through `/bin/td-svc
+     reboot`, as td-install requests one, waiting at most ten seconds.
+     The reboot's boot ordering then enforces the boundary: firstboot
+     renders the enforced form before `sshd` and the greeter start.
+   - Root makes that request only once no operation holds the slot, so a
+     reboot never interrupts an update, an elevation or a login commit.
+     The slot operation's own deadline bounds the wait. While `02`
+     reads, the compositor sends no request that takes the slot, and
+     one that arrives is a protocol violation that ends the generation.
+   - If that request fails too, the authority ends its generation, and
+     the next generation's check repeats the cutover.
 
    **Reboot guard.** Before requesting an automatic reboot, root writes the
    current boot ID to the durable root-owned mode-0600
@@ -2304,7 +2398,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    revocation while that file exists requests no further reboot: the
    machine stays in its boot-time state, where firstboot's render and
    td-login's refusal already enforce the boundary, and the `1a` status
-   reads held, which the compositor shows on its lock surface and
+   reads held (`03`), which the compositor shows on its lock surface and
    attention screen as `SESSION REVOCATION FAILED AFTER A RESTART`. If the
    guard itself cannot be written, for example because the directory is
    damaged, root likewise holds without rebooting and shows the same
@@ -2413,7 +2507,7 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
-| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1) |
+| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` (amendment 1), or from TOKEN-LOGIN.md increment 5's A3 `00` to `03` (amendment 7) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
@@ -2421,7 +2515,8 @@ argument. The paired requests are:
 needs nor takes the operation slot. The compositor admits only an answer
 of exactly that shape, with a username under `primary_account`'s rules
 and a hostname empty or under `Hostname::parse`'s; anything else, a
-nonzero revocation byte included until increment 5 defines one, is a
+revocation byte other than `00` included until increment 5's A3 defines
+`01` to `03`, is a
 protocol violation that ends the paired generation.
 
 `1b` needs completed preparation and an empty operation slot, as `12`
@@ -2473,7 +2568,13 @@ the worker's typed `15` ends it with its kind at any point before `14`.
 Success needs `14`, then the worker's successful exit and the clean end
 of its channel. Root answers the compositor's `13` and `14` with `11` and
 `13` as for secret operations, within three seconds of the invitation
-against the worker's five, and after a PIN step's `11` it sends one `16`
+against the worker's five. A disclosure step (TOKEN-LOGIN.md increment
+5's A4) is the exception: root waits for the compositor's `13`, and the
+worker for root's `11`, until the operation's deadline, since no token
+I/O is open while the person reads and types the key. A disclosure
+step's `13` that arrives at or after root's deadline ends the operation
+as TIMEOUT, and the generation continues, as a late `1c` does. After a
+PIN step's `11`, root sends one `16`
 frame from the `1c` that names that step. The PIN stays in a clearing
 owner from decoding to the queued frame; root zeroes the received
 request and the written frame and never formats it, `Debug` included.

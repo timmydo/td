@@ -2247,7 +2247,11 @@ clears an application-store key.
 Its frames, in hex: the worker sends `18` the baseline, `10` and `12`
 invitations, `14` success and `15` a failure; root sends the
 description, `11` and `13` acknowledgements and `16` a PIN after each
-PIN step's acknowledgement. `17` stays store inspection's.
+PIN step's acknowledgement. `17` stays store inspection's. From
+TOKEN-LOGIN.md increment 5's A4, the worker waits for a disclosure
+step's `11` until the operation's deadline rather than the five seconds
+above, since the person reads the disclosure and types its approval key
+before acknowledging and no token I/O is open meanwhile.
 
 1. After startup it requires no active swap and a zero core-dump soft
    limit, as the named-write worker does, since it will hold a PIN and an
