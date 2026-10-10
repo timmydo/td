@@ -635,6 +635,84 @@ fn diff_only_trace_keeps_rate_limit_and_malformed_response_bytes() {
 
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn connection_failures_close_the_logged_attempt_and_preserve_budget_and_cleanup() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            Reply::Error("transport: fixture connection refused".into()),
+        ],
+    );
+    let result = fixture.command(&mock, "0.02").output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("fixture connection refused"));
+    assert_eq!(mock.requests().len(), 2);
+    let logs = fixture.logs();
+    assert_eq!(logs.len(), 1);
+    let summary = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(summary.get("requests").and_then(Json::as_u64), Some(1));
+    assert_eq!(
+        summary.get("request_attempts").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        summary.get("unresolved_attempts").and_then(Json::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        summary.get("request_error_count").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        summary
+            .get_path(&["finished_attempt_ms", "samples"])
+            .and_then(Json::as_u64),
+        Some(1)
+    );
+    let reservation = logs[0]
+        .lines()
+        .map(|line| td_json::parse(line).unwrap())
+        .find(|event| event.get("kind").and_then(Json::as_str) == Some("budget_reservation"))
+        .unwrap();
+    let charged = reservation
+        .get_path(&["data", "charged"])
+        .and_then(Json::as_u64)
+        .unwrap();
+    let reserved = reservation
+        .get_path(&["data", "reserved"])
+        .and_then(Json::as_u64)
+        .unwrap();
+    assert!(reserved > 0);
+    assert_eq!(
+        summary.get("accounted_cost").and_then(Json::as_u64),
+        Some(charged + reserved)
+    );
+    assert_eq!(
+        summary.get("request_errors"),
+        Some(&Json::Arr(vec![Json::from(
+            "the request: fixture connection refused"
+        )]))
+    );
+    assert_eq!(summary.get("response_header_ms"), Some(&Json::Null));
+    assert_eq!(summary.get("http_status_counts"), Some(&Json::Obj(vec![])));
+    assert_eq!(
+        summary
+            .get_path(&["end", "success"])
+            .and_then(Json::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        summary
+            .get_path(&["cleanup", "success"])
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn binary_output_is_preserved_in_trace() {
     let fixture = Fixture::new();
     let bytes = 4 * 1024 * 1024;

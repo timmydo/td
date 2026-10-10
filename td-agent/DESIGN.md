@@ -352,16 +352,20 @@ waits. Attempt duration and response-header latency report measured
 samples, total, minimum and maximum in milliseconds using monotonic
 record timestamps; finished-attempt duration excludes retry waits. An
 attempt without a completion or request-error record is unresolved, not
-inferred successful or failed. This includes connection failures that
-end the run before a request-error record is written; a terminal run
-failure alone does not supply an attempt duration. Missing transport
-records or timing samples produce null, not zero. Invalid response hex,
-non-integer retry waits and status values outside the writer's u16 range
-are refused; nonstandard codes such as 999 are retained. These are
-harness observations, not provider billing or network-only timings; log
-writes, parser work and diff-only stdout backpressure are included. This
-command cannot recover a provider charge from a response that never
-arrived.
+inferred successful or failed. Failures before response headers arrive
+(including local refusals, connection errors and head timeouts) write a
+request-error record before ending the run, so their elapsed time
+contributes a finished-attempt sample while keeping the conservative
+reservation. This does not imply the provider never received the request.
+An abrupt termination or failed log write can leave an unresolved attempt;
+a terminal run failure alone does not supply an attempt duration.
+Missing transport records or timing samples produce null, not zero.
+Invalid response hex, non-integer retry waits and status values outside
+the writer's u16 range are refused; nonstandard codes such as 999 are
+retained. These are harness observations, not provider billing or
+network-only timings; log writes, parser work and diff-only stdout
+backpressure are included. This command cannot recover a provider charge
+from a response that never arrived.
 
 The terminal `end` record reports success or failure; normal repository
 loop exits also record budget totals and cleanup. Records are written

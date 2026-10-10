@@ -707,9 +707,21 @@ pub(crate) fn request(
     let mut attempt = 0;
     let completion = loop {
         journal.event("request_attempt", Json::from(attempt as u64))?;
-        let mut stream =
-            td_fetch_client::post_stream(&url, &headers, body.as_bytes(), Some(client::MAX_STREAM))
-                .map_err(|e| format!("the request: {e}"))?;
+        let mut stream = match td_fetch_client::post_stream(
+            &url,
+            &headers,
+            body.as_bytes(),
+            Some(client::MAX_STREAM),
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let why = format!("the request: {error}");
+                journal
+                    .text("request_error", &why)
+                    .map_err(|logging| format!("{why}; recording request failure: {logging}"))?;
+                return Err(why);
+            }
+        };
         let json = stream.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type")
                 && value
