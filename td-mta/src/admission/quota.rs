@@ -160,6 +160,28 @@ impl Quotas {
         self.pending = next;
         Ok(())
     }
+    pub(super) fn replace_physical(
+        &mut self,
+        reserved: Usage,
+        database_bytes: u64,
+        wal_bytes: u64,
+    ) -> Result<(), Error> {
+        let mut next = self.clone();
+        for (kind, measured) in [
+            (Kind::DatabaseBytes, database_bytes),
+            (Kind::WalBytes, wal_bytes),
+        ] {
+            next.pending.subtract(kind, reserved.get(kind)?)?;
+            let previous = next.used.get(kind)?;
+            next.used.subtract(kind, previous)?;
+            next.used.add(kind, measured)?;
+            if add(measured, next.pending.get(kind)?, "physical usage")? > next.caps.get(kind)? {
+                return Err(Error::Inconsistent("measured physical usage exceeds quota"));
+            }
+        }
+        *self = next;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

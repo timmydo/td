@@ -12,7 +12,9 @@ mod index;
 pub use index::{
     AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitCompletion, CommitError,
     CommitFileUsage, CommitRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
-    LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage, UsageFence,
+    LedgerInitError, LogicalUsage, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
+    UploadAuthorization, UploadCompletion, UploadCoordinator, UploadError, UploadGuard,
+    UploadRequest, UsageFence,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

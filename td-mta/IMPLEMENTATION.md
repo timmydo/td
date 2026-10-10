@@ -2400,15 +2400,31 @@ writer and original native scope. Native tests cover rollback WAL growth,
 known success with expired accounting, a pre-SQL deadline refusal and
 precise sequence-conflict classification. The existing target body
 scenario exercises the new completion on its initial body commit.
-These observations provide no ledger or authorization authority; the
-private quota transition and reserved upload adapter remain planned.
+These observations provide no authority over an arbitrary ledger or policy.
+UploadCoordinator now owns one IndexStore and its consuming-initialized
+Leases ledger. It reserves logical body/count/upload quotas before taking
+actual IngressSpool custody, constructs a fresh body and device-bound lease,
+and reserves physical headroom before their atomic native commit. Its
+private measured-bucket transition settles physical tickets without a
+second ledger or public release-used operation. Known success retains its
+receipt if accounting fails; indeterminate completion stops admission and
+retains conservative charges. Only a proven sequence conflict permits one
+explicit same-epoch replan under the original deadline.
 
-The next concrete adapter is the first reserved upload transaction in
-ADMISSION.md section 2: bind authorized device context and captured store
-identity to actual IngressSpool custody, then atomically publish the body
-and upload lease. That section owns the authorization fence, replanning,
-quota reconciliation and durable-result rules. This adapter is planned;
-it is neither a generic ports::Store implementation nor an HTTP endpoint.
+The trusted UploadAuthorization adapter returns a guard that excludes
+policy publication and revocation through synchronous commit. Its Access
+value remains context rather than a credential. No production credential
+verifier, generic ports::Store implementation or HTTP endpoint invokes this
+adapter yet. The caller must supply the store and ingress with the same
+trusted monotonic time domain and quiesce auxiliary owners for cold
+initialization. ADMISSION.md section 2 owns these boundaries.
+
+The reservation owns staging and prepared input; Drop discards unused work.
+Forgetting it leaves the single lane and quota/spool reservations occupied
+until recovery. Cleanup failure retains the spool's retired-slot charge;
+it does not erase a durable receipt. Native integration tests exercise
+reopening, nonempty accounting, policy revocation, guard lifetime, quota
+refusal, original deadlines, bounded replan and commit-outcome failures.
 Native indexes serve metadata queries; parsed-body/search caches remain
 disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite

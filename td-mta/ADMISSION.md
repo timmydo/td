@@ -136,19 +136,21 @@ unimplemented; do not infer them from pure accounting helper tests.
 
 ### First reserved upload transaction
 
-This is the next M08 implementation boundary, not a running service.
-Start with one device-authorized upload that commits a fresh
-BlobRow and its device-bound LeaseRow atomically. The adapter constructs
-these rows from its actual prepared input; it accepts neither an
-arbitrary transaction batch nor caller-supplied proof of a body digest.
-HTTP handling, credential verification, general object mutations and
-request idempotence remain their own increments.
+UploadCoordinator implements this M08 adapter boundary; no listener or
+credential verifier invokes it yet. It accepts one device-authorized
+upload that commits a fresh BlobRow and its device-bound LeaseRow
+atomically. The adapter constructs these rows from its actual prepared
+input; it accepts neither an arbitrary transaction batch nor caller-
+supplied proof of a body digest. HTTP handling, credential verification,
+general object mutations and request idempotence remain their own
+increments.
 
 The coordinator owns one IndexStore and the single logical ledger seeded
 by its consuming usage_fence initialization. Auxiliary owners are
 quiescent and pending effects settled during that cold capture. Its
 service-facing interface does not expose the mutable persistence core or
-another ledger. The initial adapter permits one outstanding upload job.
+another ledger. The initial adapter requires at least two ledger cells
+(logical and physical effects) and permits one outstanding upload job.
 This serializes its mutations and physical accounting without holding a
 SQLite writer fence while bytes arrive. Existing native views and
 ingress slot limits continue to apply; this is not a runtime fairness

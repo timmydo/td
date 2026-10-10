@@ -180,9 +180,12 @@ pub use td_mta::{mailbox_sweep, reference_sweep};
 #[path = "../src/account_checks.rs"]
 #[allow(unused)] // Match the source-recompiled filesystem report types.
 mod account_checks;
+#[path = "../src/admission.rs"]
+#[allow(unused)] // Keep private ledger transitions with the recompiled storage core.
+mod admission;
 use td_mta::{
-    admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,
-    row_references, store_paths,
+    bounded, config, format, ids, limits, mailbox_parents, ownership, ports, row_references,
+    store_paths,
 };
 #[path = "../src/recipient_sweep.rs"]
 #[allow(dead_code)]

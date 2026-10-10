@@ -495,6 +495,53 @@ impl<'a> Leases<'a> {
         self.quotas = next;
         Ok(())
     }
+    pub(crate) fn remaining_capacity(&self, kind: Kind) -> Result<u64, Error> {
+        self.healthy()?;
+        let pending = self.quotas.pending().get(kind)?;
+        self.quotas
+            .caps()
+            .get(kind)?
+            .checked_sub(self.quotas.used().get(kind)?)
+            .and_then(|remaining| remaining.checked_sub(pending))
+            .ok_or(Error::Invalid)
+    }
+    /// Trusted single-store coordinator only: settle its entire physical ticket
+    /// against the native observation before releasing mutation ownership.
+    pub(crate) fn complete_physical(
+        &mut self,
+        ticket: &mut EffectTicket,
+        database_bytes: u64,
+        wal_bytes: u64,
+    ) -> Result<(), Error> {
+        let part = ticket.part.ok_or(Error::InactiveTicket)?;
+        let (index, mut record) = self.record(part)?;
+        if !record.busy || record.amounts != ticket.planned {
+            return Err(Error::Invalid);
+        }
+        let expected = [Some(Kind::DatabaseBytes), Some(Kind::WalBytes), None, None];
+        let mut reserved = Usage::default();
+        for ((actual, expected), amount) in
+            record.kinds.into_iter().zip(expected).zip(record.amounts)
+        {
+            if actual != expected && !(actual.is_none() && amount == 0) {
+                return Err(Error::Invalid);
+            }
+            if let Some(kind) = actual {
+                reserved.add(kind, amount)?;
+            } else if amount != 0 {
+                return Err(Error::Invalid);
+            }
+        }
+        let mut next = self.quotas.clone();
+        next.replace_physical(reserved, database_bytes, wal_bytes)?;
+        record.busy = false;
+        record.amounts = [0; CHARGES_PER_CELL];
+        let cell = self.cells.get_mut(index).ok_or(Error::Stale)?;
+        cell.record = Some(record);
+        self.quotas = next;
+        ticket.part = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -870,6 +917,52 @@ mod tests {
             Leases::new(&p, Usage::default(), &mut states, &mut cells).err(),
             Some(Error::Invalid)
         );
+        Ok(())
+    }
+    #[test]
+    fn refused_physical_measurement_preserves_ticket_and_other_reservations(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let p = plan(100)?;
+        let mut states = [const { SlotState::EMPTY }; 4];
+        let mut cells = [const { Cell::EMPTY }; 4];
+        let mut book = Leases::new(&p, Usage::default(), &mut states, &mut cells)?;
+        let other = reserve(&mut book, &[charges(Kind::QueueBytes, 7)])?;
+        let database = book.remaining_capacity(Kind::DatabaseBytes)?;
+        let wal = book.remaining_capacity(Kind::WalBytes)?;
+        let physical = reserve(
+            &mut book,
+            &[[
+                Charge {
+                    kind: Kind::DatabaseBytes,
+                    amount: database,
+                },
+                Charge {
+                    kind: Kind::WalBytes,
+                    amount: wal,
+                },
+                Charge::ZERO,
+                Charge::ZERO,
+            ]],
+        )?;
+        let part = book.part(physical, 0)?;
+        let mut ticket = book.begin_effect(part, [database, wal, 0, 0], Tick(0))?;
+        assert!(book
+            .complete_physical(&mut ticket, database + 1, 0)
+            .is_err());
+        assert_eq!(book.cancel(physical), Err(Error::Busy));
+        assert_eq!(book.used(Kind::DatabaseBytes)?, 0);
+        assert_eq!(book.used(Kind::WalBytes)?, 0);
+        assert_eq!(book.pending(Kind::DatabaseBytes)?, database);
+        assert_eq!(book.pending(Kind::WalBytes)?, wal);
+        assert_eq!(book.pending(Kind::QueueBytes)?, 7);
+        book.complete_effect(&mut ticket, EffectResult::Uncertain)?;
+        book.cancel(physical)?;
+        assert_eq!(book.used(Kind::DatabaseBytes)?, database);
+        assert_eq!(book.used(Kind::WalBytes)?, wal);
+        assert_eq!(book.pending(Kind::DatabaseBytes)?, 0);
+        assert_eq!(book.pending(Kind::WalBytes)?, 0);
+        assert_eq!(book.pending(Kind::QueueBytes)?, 7);
+        book.cancel(other)?;
         Ok(())
     }
 }

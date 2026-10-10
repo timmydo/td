@@ -576,9 +576,13 @@ pub use td_mta::{mailbox_sweep, reference_sweep};
 #[allow(unused)] // Match the source-recompiled filesystem report types.
 mod account_checks;
 #[cfg(td_native_alloc_probe)]
+#[path = "../src/admission.rs"]
+#[allow(unused)] // Keep private ledger transitions with the recompiled storage core.
+mod admission;
+#[cfg(td_native_alloc_probe)]
 use td_mta::{
-    admission, bounded, config, format, ids, limits, mailbox_parents, ownership, ports,
-    row_references, store_paths,
+    bounded, config, format, ids, limits, mailbox_parents, ownership, ports, row_references,
+    store_paths,
 };
 #[cfg(td_native_alloc_probe)]
 #[path = "../src/recipient_sweep.rs"]

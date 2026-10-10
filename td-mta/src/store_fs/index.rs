@@ -63,8 +63,14 @@ pub use usage_fence::{
 };
 #[path = "index/completion.rs"]
 mod completion;
+#[path = "index/upload.rs"]
+mod upload;
 pub use completion::{CommitCompletion, CommitFileUsage};
 use completion::{CommitPhase, CommitWork};
+pub use upload::{
+    Upload, UploadAttempt, UploadAuthorization, UploadCompletion, UploadCoordinator, UploadError,
+    UploadGuard, UploadRequest,
+};
 #[path = "index/backup.rs"]
 mod backup;
 #[cfg(test)]

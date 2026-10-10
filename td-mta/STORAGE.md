@@ -434,8 +434,8 @@ checkpoint, fresh deadline or work-scope renewal is performed.
 
 Unavailable preserves the accounting error rather than substituting zero.
 A deadline during known successful completion can therefore return an Ok
-sequence with Unavailable(Deadline). A future coordinator must preserve
-that durable success and stop new admission until reconciliation; a
+sequence with Unavailable(Deadline). UploadCoordinator preserves that
+durable success and stops new admission until reconciliation; a
 healthy low-level writer flag does not override that responsibility.
 Indeterminate results retain the core's stopped writer even if file
 measurement succeeds. The receipt grants no authentication, ledger update,
@@ -451,8 +451,12 @@ cause from the generic Conflict code.
 Retaining the receipt does not retain the writer fence: measurements are
 historical after return. The coordinator must exclusively own mutation and
 maintenance admission through its ledger reconciliation and preserve
-store/ledger association. Private atomic measured-bucket replacement and
-reserved upload policy remain service integration work.
+store/ledger association. UploadCoordinator owns one IndexStore and its
+consuming-initialized logical ledger, with one outstanding upload. Its private
+physical completion replaces measured database/WAL buckets and settles the
+associated ticket atomically. Other service mutations and maintenance still
+need their own coordinated admission paths. ADMISSION.md section 2 owns the
+reserved upload contract.
 
 ### Snapshots, changes, reclamation and backup
 
