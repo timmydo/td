@@ -2737,16 +2737,21 @@ typed worker handoffs, handles partial writes and flush completion,
 applies idle/DATA/connection deadlines, and bounds close/drain. Worker
 execution pauses client-idle timing. Known final DATA results and legal
 expiry notices get a bounded finishing allowance without extending
-mutation leases. The session enforces 100 accepted MAIL commands across
-resets. A native local TCP fixture connects this driver to durable Inbox
-delivery and reopen verification, including delayed completion after
-DATA/session expiry. The fixture drives storage synchronously and does
-not prove worker scheduling. Scripted cases cover backpressure,
-handoffs, timer boundaries, EOF, clock regression, transport faults,
-stalled shutdown and STARTTLS plaintext refusal. Actual TLS
-handoff/reset, bounded worker dispatch, peer admission, readiness and
-listener activation remain unimplemented. Those integrations form the
-next M11 increment.
+mutation leases; all finishing is capped at five seconds beyond the
+original one-hour session deadline for both plaintext and TLS. The
+session enforces 100 accepted MAIL commands across resets. A native
+local TCP fixture connects this driver to durable Inbox delivery and
+reopen verification, including delayed completion after DATA/session
+expiry. The fixture drives storage synchronously and does not prove
+worker scheduling. Scripted cases cover backpressure, handoffs, timer
+boundaries, EOF, clock regression, transport faults, stalled shutdown
+and STARTTLS plaintext refusal. The receiving STARTTLS owner now
+consumes the exact command and same socket through 220 flushing and an
+actual handshake, then resets SMTP and returns the TLS transport. Real
+TLS fixtures verify encrypted commands, EHLO reset, retained deadlines,
+failed-upgrade closure, cancellation and capacity release. Bounded
+worker dispatch, peer admission, readiness and listener activation
+remain unimplemented. Those integrations form the next M11 increment.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,

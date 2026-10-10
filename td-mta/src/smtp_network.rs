@@ -52,6 +52,7 @@ pub struct Network<'a> {
     work: Option<Work>,
     reply_grace: Option<Deadline>,
     session_deadline: Deadline,
+    transport_deadline: Deadline,
     idle_deadline: Deadline,
     data_deadline: Option<Deadline>,
     idle_seconds: u64,
@@ -68,6 +69,8 @@ impl<'a> Network<'a> {
         clock: &(impl Clock + ?Sized),
     ) -> Result<Self, Error> {
         let now = clock.sample()?.monotonic;
+        let session_deadline = after(now, SESSION_SECONDS)?;
+        let transport_deadline = after(session_deadline.tick(), FINISH_SECONDS)?;
         Ok(Self {
             session: Session::new(routes, settings)?,
             input: [0; SOCKET_CHUNK],
@@ -76,7 +79,8 @@ impl<'a> Network<'a> {
             written: 0,
             work: None,
             reply_grace: None,
-            session_deadline: after(now, SESSION_SECONDS)?,
+            session_deadline,
+            transport_deadline,
             idle_deadline: after(now, plan.limits().smtp_idle_seconds)?,
             data_deadline: None,
             idle_seconds: plan.limits().smtp_idle_seconds,
@@ -112,7 +116,7 @@ impl<'a> Network<'a> {
         self.session.data_written(result)?;
         if result.is_err() {
             self.closing = Closing::Reply {
-                deadline: after(now, FINISH_SECONDS)?,
+                deadline: self.finishing_deadline(now)?,
             };
         }
         Ok(())
@@ -129,7 +133,7 @@ impl<'a> Network<'a> {
         self.session.committed(result)?;
         self.data_deadline = None;
         if matches!(self.session.pending(), Pending::Reply { .. }) {
-            self.reply_grace = Some(after(now, FINISH_SECONDS)?);
+            self.reply_grace = Some(self.finishing_deadline(now)?);
         }
         Ok(())
     }
@@ -142,14 +146,31 @@ impl<'a> Network<'a> {
         let now = self.complete_work(work, clock)?;
         self.session.message_too_large()?;
         self.closing = Closing::Reply {
-            deadline: after(now, FINISH_SECONDS)?,
+            deadline: self.finishing_deadline(now)?,
         };
         Ok(())
     }
 
-    /// The trusted TLS worker calls this only after an actual successful
-    /// handshake on this connection. A failed upgrade must abort the owner.
-    pub fn tls_established(&mut self, clock: &(impl Clock + ?Sized)) -> Result<(), Error> {
+    // The command borrow also validates each subsequent upgrade turn.
+    pub(crate) fn check_starttls(&mut self, clock: &(impl Clock + ?Sized)) -> Result<&[u8], Error> {
+        if !matches!(self.closing, Closing::Open)
+            || self.work != Some(Work::Tls)
+            || self.start != self.end
+        {
+            return Err(Error::Conflict);
+        }
+        let now = self.now(clock)?;
+        if self.deadline().expired(now) {
+            return Err(Error::Deadline);
+        }
+        match self.session.pending() {
+            Pending::StartTls { command } => Ok(command),
+            _ => Err(Error::Conflict),
+        }
+    }
+
+    /// smtp_starttls::Upgrade calls this after its actual successful handshake.
+    pub(crate) fn tls_established(&mut self, clock: &(impl Clock + ?Sized)) -> Result<(), Error> {
         self.complete_work(Work::Tls, clock)?;
         self.session.tls_established()
     }
@@ -181,7 +202,7 @@ impl<'a> Network<'a> {
     fn queue_close(&mut self, now: Tick) -> Result<(), Error> {
         self.session.service_unavailable()?;
         self.closing = Closing::Reply {
-            deadline: after(now, FINISH_SECONDS)?,
+            deadline: self.finishing_deadline(now)?,
         };
         Ok(())
     }
@@ -206,6 +227,14 @@ impl<'a> Network<'a> {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn transport_deadline(&self) -> Deadline {
+        self.transport_deadline
+    }
+
+    fn finishing_deadline(&self, now: Tick) -> Result<Deadline, Error> {
+        Ok(after(now, FINISH_SECONDS)?.min(self.transport_deadline))
     }
 
     /// Every dispatched job retains this original enclosing deadline. The
@@ -332,13 +361,13 @@ impl<'a> Network<'a> {
                         self.end = 0;
                         let deadline = match self.closing {
                             Closing::Reply { deadline } => deadline,
-                            _ => grace.unwrap_or(after(now, FINISH_SECONDS)?),
+                            _ => grace.unwrap_or(self.finishing_deadline(now)?),
                         };
                         self.closing = Closing::Shutdown { deadline };
                     } else if self.session_deadline.expired(now) {
                         self.session.service_unavailable()?;
                         self.closing = Closing::Reply {
-                            deadline: grace.unwrap_or(after(now, FINISH_SECONDS)?),
+                            deadline: grace.unwrap_or(self.finishing_deadline(now)?),
                         };
                     }
                 } else {

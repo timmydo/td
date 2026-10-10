@@ -448,24 +448,28 @@ DATA/session deadlines never renew, and every worker additionally
 applies its storage/handshake execution budget. Accepted MAIL commands
 count toward the transaction ceiling across protocol resets.
 
-A known final DATA result receives a five-second finishing allowance
-even if the old DATA or session lease expired while awaiting completion.
-This allowance never authorizes storage work. After session expiry, the
-final result and following 421 share that allowance with shutdown/drain.
-A worker refusal closing the connection, or expiry at a legal command
-boundary, likewise shares five seconds for its reply and closure.
-Partial commands or incomplete DATA abort on expiry. Clock or transport
-failure can still prevent an acknowledgement; the stored outcome remains
-unchanged.
+A known final DATA result receives up to five seconds to finish, even if
+the old DATA or session work lease expired while awaiting completion.
+Every finishing allowance is capped at five seconds after the original
+one-hour session deadline. Plaintext and TLS use that fixed transport
+cap, established at connection creation; late completion cannot renew
+it. A result arriving at or after that cap cannot be acknowledged, but
+stays committed. This allowance never authorizes storage work. After
+session expiry, the final result and following 421 share that allowance
+with shutdown/drain. A worker refusal closing the connection, or expiry
+at a legal command boundary, likewise shares five seconds for its reply
+and closure. Partial commands or incomplete DATA abort on expiry. Clock
+or transport failure can still prevent an acknowledgement; the stored
+outcome remains unchanged.
 
 Other close replies flush under the ordinary reply deadline, then write
-shutdown and input discard share five seconds. Additional reads stop
-after 64 KiB or EOF; buffered tails are discarded immediately. This
-bounds shutdown work and is best effort, not a guarantee that the peer
-receives a refusal: unread input can still cause a reset. No discarded
-bytes return to parsing. The caller disposes uncommitted jobs on
-workers, and the final scheduler must still enforce bounded slots,
-queues and peer fairness.
+shutdown and input discard share up to five seconds within the fixed
+transport cap. Additional reads stop after 64 KiB or EOF; buffered tails
+are discarded immediately. This bounds shutdown work and is best effort,
+not a guarantee that the peer receives a refusal: unread input can still
+cause a reset. No discarded bytes return to parsing. The caller disposes
+uncommitted jobs on workers, and the final scheduler must still enforce
+bounded slots, queues and peer fairness.
 
 For an HTTP transfer of admitted maximum B bytes, use
 `max(120 seconds, 30 seconds + ceil(B / minimum_rate))`. The default minimum

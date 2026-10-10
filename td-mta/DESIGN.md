@@ -15,8 +15,10 @@ contract and current client calls. The receiving session and native Inbox
 delivery adapter are implemented; transcript tests bind acceptance to
 reopened mail. A nonblocking receiving driver now connects session
 input, reply flushing, worker handoffs, deadlines and bounded closure to
-transports. Listener activation, worker scheduling and live STARTTLS
-integration remain separate, with no advertised service capabilities.
+transports. Receiving STARTTLS now joins the driver to an actual TLS
+handshake. Listener activation and worker scheduling remain
+separate, with no advertised service capabilities.
+
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
 encoded input to caller-reserved offset slots without copying row data;
@@ -1479,14 +1481,14 @@ connection facts, resolves immutable threads and publishes one Inbox email
 with its body, envelope and history in one transaction. Transcript fixtures
 connect its actual outcomes to the session and verify reopened mail. The
 receiving network driver additionally exercises real local TCP delivery
-and reopened storage. STARTTLS integration, worker scheduling and
-listener activation remain M11 work. The engine binds routing for its
-lifetime, accepts only configured recipients, retains accepted envelope
-spellings, and exposes one account for one atomic delivery. It
-advertises SIZE, 8BITMIME and enhanced status codes; optional STARTTLS
-hands the original command to the transport owner without generating
-220. Only successful TLS completion resets SMTP state. No PIPELINING or
-other unimplemented extension is advertised.
+and reopened storage. Worker scheduling and listener activation remain
+M11 work. The engine binds routing for its lifetime, accepts only
+configured recipients, retains accepted envelope spellings, and exposes
+one account for one atomic delivery. It advertises SIZE, 8BITMIME and
+enhanced status codes; optional STARTTLS hands the original command to
+the transport owner without generating 220. Only successful TLS
+completion resets SMTP state. No PIPELINING or other unimplemented
+extension is advertised.
 The advertised incoming SIZE excludes the delivery adapter's declared trace
 allowance; admission reserves the stored-message ceiling including that
 allowance. The native adapter derives the allowance from its trace format and protocol
@@ -1513,28 +1515,50 @@ original DATA/session deadline and its own execution budget.
 Accepted MAIL commands count toward the fixed 100-transaction limit even
 after RSET, EHLO or STARTTLS. Expiry at a legal command boundary queues
 421; a partial command or incomplete DATA aborts. Known final DATA
-results get a five-second finishing allowance even when completion
-arrives after the old DATA or session deadline. This grants no new
-mutation lease and does not reclassify a committed result as a
-rejection. If the session expired, flush the final result followed by
-421, then shut down and drain under that same allowance. A stalled reply
-or failed clock/transport can still lose acknowledgement.
+results get up to five seconds to finish, capped at five seconds after
+the original one-hour session deadline, even when completion arrives
+after the old DATA or session work deadline. This grants no new mutation
+lease and does not reclassify a committed result as a rejection. If the
+session expired, flush the final result followed by 421, then shut down
+and drain under that same allowance. Plaintext and TLS share this fixed
+transport cap, established at connection creation; late completion
+cannot renew it. A result arriving at or after the cap cannot be
+acknowledged, but remains committed. A stalled reply or failed
+clock/transport can likewise lose acknowledgement.
 
 Worker refusals that close the session and expiry notices also share a
-five-second reply/shutdown/drain allowance. Other close replies use
-their ordinary reply deadlines, then five seconds for write shutdown and
-discard. Draining stops after 64 KiB of additional reads or EOF;
-buffered tails are discarded immediately. This is best effort: a bounded
-close can still reset with unread peer input and cannot guarantee
-receipt of a refusal. Drained bytes never become commands. Storage job
-disposal remains on a worker. These bounded turns do not establish
-runtime queue admission or fairness.
+five-second reply/shutdown/drain allowance, within the fixed transport
+cap. Other close replies use their ordinary reply deadlines, then five
+seconds for write shutdown and discard. Draining stops after 64 KiB of
+additional reads or EOF; buffered tails are discarded immediately. This
+is best effort: a bounded close can still reset with unread peer input
+and cannot guarantee receipt of a refusal. Drained bytes never become
+commands. Storage job disposal remains on a worker. These bounded turns
+do not establish runtime queue admission or fairness.
 
 A service-unavailable operation queues 421 at an empty command boundary;
 for gateway revocation the driver flushes DATA's 451, then queues 421 before
 feeding more input. STARTTLS's exact original command can be fed through the
 existing control LineReader for ServerStartTls; the combined command/DATA
 framer remains private to this engine.
+
+The `smtp_starttls` upgrade consumes the network owner and its same TCP
+socket on a TLS worker. It accepts only an already-dispatched STARTTLS
+handoff with no buffered plaintext, passes the exact received command to
+ServerStartTls, and owns both reply flushing and the actual handshake.
+Native construction and handshake capacity admission precede its 220.
+The caller supplies the original handshake deadline, including queue and
+preparation time, within the unchanged session work deadline. The TLS
+transport receives the separate fixed finishing cap. Bounded turns
+preserve both deadlines and detect clock regression. Only a successful
+TLS handshake authorized by its retained policy returns the session and
+its TLS transport for further SMTP. Failure or cancellation closes the
+connection and releases native state and handshake capacity on the
+worker; there is no plaintext fallback. Borrowed wire buffers are
+released and owned buffers are freed on refusal. A local real-TLS
+fixture exercises post-handshake EHLO reset and encrypted commands;
+worker queues, listener admission and service activation remain
+separate.
 
 Implement a bounded SMTP state machine with EHLO/HELO, MAIL, RCPT, DATA, RSET,
 NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise

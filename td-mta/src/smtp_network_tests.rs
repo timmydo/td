@@ -569,3 +569,33 @@ fn transport_errors_are_terminal_in_every_output_and_input_phase() {
         }
     });
 }
+
+#[test]
+fn late_results_cannot_renew_the_original_transport_finishing_cap() {
+    fixture(|routes, plan, timer| {
+        for beyond_cap in [false, true] {
+            timer.0.store(1, Ordering::Relaxed);
+            let mut n = network(routes, plan, timer);
+            let mut w = Wire::default();
+            let original = n.deadline();
+            pending_commit(&mut n, &mut w, timer);
+            let before = w.output.len();
+            timer.0.store(
+                original.tick().0 + if beyond_cap { 5000 } else { 4000 },
+                Ordering::Relaxed,
+            );
+            n.committed(Ok(committed_result()), timer).unwrap();
+            w.write_max = Some(0);
+            if !beyond_cap {
+                assert_eq!(n.advance(&mut w, timer), Ok(Progress::Pending));
+                timer.0.store(original.tick().0 + 4999, Ordering::Relaxed);
+                assert_eq!(n.advance(&mut w, timer), Ok(Progress::Pending));
+                timer.0.store(original.tick().0 + 5000, Ordering::Relaxed);
+            }
+            assert_eq!(n.advance(&mut w, timer), Err(Error::Deadline));
+            assert_eq!(n.advance(&mut w, timer), Ok(Progress::Closed));
+            assert_eq!(w.output.len(), before);
+            assert_eq!(n.deadline(), original);
+        }
+    });
+}

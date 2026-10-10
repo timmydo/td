@@ -74,6 +74,7 @@ pub mod reference_sweep;
 pub mod row_references;
 pub mod smtp_network;
 pub mod smtp_session;
+pub mod smtp_starttls;
 pub mod smtp_wire;
 pub mod store_fs;
 pub mod store_paths;
