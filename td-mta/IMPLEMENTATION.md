@@ -2683,6 +2683,25 @@ explicit runtime data, never permission to use public DNS during automated tests
 
 **Depends on:** M04/M06/M08. **Own:** SMTP parser/session state and store adapter.
 
+Implemented: `smtp_session` provides receiving command/envelope state,
+configured recipient routing, CRLF/dot-transparency decoding, message/line
+bounds and explicit reply, reservation, write, commit and STARTTLS handoffs.
+It stops input while an operation is pending; only a successful trusted
+commit result emits final acceptance. Transcript tests cover every split of
+an EHLO command and a DATA transcript, sequencing, alias/Postmaster
+behavior, null and quoted senders, extensions, refusals and uncertain
+publication. These fixtures use
+supplied operation outcomes and do not establish recovered durable delivery.
+Remaining: the owning native delivery adapter must reserve/store decoded
+mail, generate truthful trace fields, select immutable threads, file once
+in Inbox and publish history atomically. Connect its actual results to the
+session, then prove recovery from the acceptance transcript. Stored-message
+reservations include an adapter-supplied trace allowance excluded from the
+incoming SIZE limit. A legal-boundary 421 operation supports ordered service
+closure after a temporary DATA refusal. Runtime deadlines, bounded transport
+close/drain and connecting actual handshake success to the implemented SMTP
+reset remain M11 integration.
+
 Implement the DESIGN section 9 command/extension set as a pure state machine
 fed bounded chunks and a transport-independent peer context. Resolve aliases,
 validate recipients early, stream DATA, generate trace metadata, commit delivery

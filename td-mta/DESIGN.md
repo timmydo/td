@@ -11,7 +11,9 @@ The M01 library skeleton provides typed local IDs, configuration versioning and
 checked resource planning only. [RESOURCES.md](RESOURCES.md) records the
 current planner and component observations; section 5 owns resource policy.
 [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
-contract and current client calls. There are no protocol handlers or listeners.
+contract and current client calls. The receiving session state machine is
+implemented separately from its native delivery adapter and runtime; there
+are no listeners or advertised service capabilities.
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
 encoded input to caller-reserved offset slots without copying row data;
@@ -1460,6 +1462,35 @@ deadline. Native resource and complete crash/fault qualification, domain
 mutation policy and service deployment remain activation requirements.
 
 ## 9. SMTP receiving and message representation
+
+The current `smtp_session` engine consumes one command or DATA line per
+turn. Pending replies require an explicit flush acknowledgement; reservation,
+body writes and publication require separate trusted driver results before
+input resumes. A final DATA 250 follows only a successful commit result for
+the routed account. An indeterminate result closes without a final reply.
+This is a protocol boundary, not proof that a supplied result is durable:
+the native delivery adapter, trace generation, threading/Inbox publication,
+transport deadlines and live STARTTLS integration remain M10/M11 work.
+Transcript fixtures exercise the engine but do not yet satisfy the recovered
+mail acceptance criterion. The engine binds routing for its lifetime, accepts
+only configured recipients, retains accepted envelope spellings, and exposes
+one account for one atomic delivery. It advertises SIZE, 8BITMIME and enhanced
+status codes; optional STARTTLS hands the original command to the transport
+owner without generating 220. Only successful TLS completion resets SMTP
+state. No PIPELINING or other unimplemented extension is advertised.
+The advertised incoming SIZE excludes the delivery adapter's declared trace
+allowance; admission reserves the stored-message ceiling including that
+allowance. The adapter must fit its generated fields within that allowance.
+Framing, line-size, message-size and streaming-write failures during DATA
+close the connection, so the remaining stream cannot become commands.
+The runtime must flush a close reply and use bounded transport draining so
+unread DATA does not erase a permanent refusal through a TCP reset; drained
+bytes never reenter the parser. The session does not implement this shutdown.
+A service-unavailable operation queues 421 at an empty command boundary;
+for gateway revocation the driver flushes DATA's 451, then queues 421 before
+feeding more input. STARTTLS's exact original command can be fed through the
+existing control LineReader for ServerStartTls; the combined command/DATA
+framer remains private to this engine.
 
 Implement a bounded SMTP state machine with EHLO/HELO, MAIL, RCPT, DATA, RSET,
 NOOP, QUIT, SIZE, 8BITMIME, STARTTLS, and enhanced status codes. Advertise

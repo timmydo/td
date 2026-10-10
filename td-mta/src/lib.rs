@@ -1,4 +1,4 @@
-//! Service foundations only: no listeners, protocol handlers or capabilities.
+//! Service foundations and receiving protocol state; no listeners or capabilities.
 #![forbid(unsafe_code)]
 
 pub mod account_checks;
@@ -72,6 +72,7 @@ pub mod ports;
 pub mod recipient_sweep;
 pub mod reference_sweep;
 pub mod row_references;
+pub mod smtp_session;
 pub mod smtp_wire;
 pub mod store_fs;
 pub mod store_paths;
