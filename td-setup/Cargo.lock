@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "td-fido"
+version = "0.1.0"
+
+[[package]]
 name = "td-install"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +43,9 @@ version = "0.1.0"
 [[package]]
 name = "td-tpm"
 version = "0.1.0"
+dependencies = [
+ "td-fido",
+]
 
 [[package]]
 name = "td-ui"

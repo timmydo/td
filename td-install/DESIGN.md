@@ -239,11 +239,11 @@ with it.
 **D8. One recorded `unsafe` surface.** Everything here is ordinary file
 I/O: partition tables and filesystems are bytes at offsets, and efivarfs is a
 filesystem. The sibling crates the binary links for device-bound storage,
-td-protector, td-tpm and td-json, forbid `unsafe` and reach the TPM
-through td-tpm's safe file I/O on `/dev/tpmrm0` (D10 records that open
-and td-protector's `/dev/random` read). The pipes that carry key material
-to cryptsetup are std's, created by td-protector's runner, and the
-device-mapper requests cryptsetup's own.
+td-protector, td-tpm with its td-fido, and td-json, forbid `unsafe` and
+reach the TPM through td-tpm's safe file I/O on `/dev/tpmrm0` (D10
+records that open and td-protector's `/dev/random` read). The pipes that
+carry key material to cryptsetup are std's, created by td-protector's
+runner, and the device-mapper requests cryptsetup's own.
 The one exception is publication onto a disk this process holds, which
 binds a loop device over the volume with two value-pinned requests
 (`UNSAFE.md` §21, §5 "Publishing through a loop over the claim"). Any
@@ -310,8 +310,10 @@ td-protector, which reads the fixed path `/dev/random` and names it in
 its error. Those two device opens are the documented exceptions;
 td-protector's cryptsetup runner also execs the absolute cryptsetup path
 td-install gives it, naming that program in its errors, which is an exec
-of a path this crate chose rather than an open. Nothing else
-reaches another path through td-tpm, td-protector or td-json, and a
+of a path this crate chose rather than an open. td-tpm's salted
+sessions read `/dev/random` and td-fido's hidraw code opens its
+devices, but the device-bound path calls neither. Nothing else reaches
+another path through td-tpm, td-fido, td-protector or td-json, and a
 further path a linked sibling opens for this binary is an amendment here,
 as a further syscall is to D8.
 

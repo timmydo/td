@@ -5,9 +5,10 @@ use crate::types::Recipe;
 /// the completion page's key, and the toolkit are Cargo siblings. The
 /// toolkit's font, notices and Wayland codec reach the compositor tree by
 /// relative source paths. The protector's own dependencies, the TPM client
-/// and td-json, are in its lock, and the TPM client includes the engine's
-/// SHA-256 by relative path, as the protector does with td-fido's
-/// HMAC-SHA256, so those trees are staged too.
+/// and td-json, are in its lock with the TPM client's td-fido, and the TPM
+/// client and td-fido include the engine's SHA-256 by relative path, as
+/// the protector does with td-fido's HMAC-SHA256, so those trees are
+/// staged too.
 /// The system image carries it, and a live boot's session starts it
 /// (td-install/INSTALLER.md "Live startup").
 pub fn recipe() -> Recipe {

@@ -7,9 +7,10 @@ increment 4, run over this crate instead of each carrying a copy.
 td-boot's selector PCR 11 measurement reads, extends and reads back
 through `read_pcr` and `extend_pcr`; the client's unit tests and
 td-boot's pin those exact command bytes. It is pure `std`, depends on
-no crate, compiles the engine's SHA-256 as shared source, and forbids
-`unsafe`; it adds no syscall surface to `UNSAFE.md`. The device is
-opened through safe file I/O.
+one sibling crate, `td-fido = { path = "../td-fido" }`, for the P-256,
+AES and HMAC-SHA256 of its salted sessions, compiles the engine's
+SHA-256 as shared source, and forbids `unsafe`; it adds no syscall
+surface to `UNSAFE.md`. The device is opened through safe file I/O.
 
 ## API boundary
 
@@ -23,8 +24,10 @@ The crate owns the protocol and nothing a consumer persists or decides:
   scripted transports.
 - **Commands.** `Client::call` marshals one command with at most one
   session: an empty password session or a policy session with a fresh
-  32-byte caller nonce from `/dev/urandom`. A command is sized and
-  checked against `MAX_PACKET` before its parameters are copied. Buffers
+  32-byte caller nonce from `/dev/urandom`. A command in a salted
+  session takes its own path ("Salted and PIN-authorized sessions"). A
+  command is sized and checked against `MAX_PACKET` before its
+  parameters are copied. Buffers
   that carry secrets (the sealed sensitive area, the Create parameters,
   `call`'s command and reply buffers, and the Unseal reply parameters)
   are allocated once at their final size, so no reallocation leaves a
@@ -93,44 +96,118 @@ The crate owns the protocol and nothing a consumer persists or decides:
   password-session reply. Both take a `u8` index and refuse one outside
   the `PcrSelection` range.
 
+## Salted and PIN-authorized sessions
+
+`td-install/ENCRYPTION.md` increment 8a adds these for the tpm-pin
+protector ("PIN and dictionary-attack policy" there); nothing in
+production calls them before item 9. They are bytes over the same safe
+file I/O, `session.rs` and `auth.rs`; TPM 2.0 Part 1 specifies each
+derivation.
+
+- **Salted sessions.** A session is salted to the unpersonalized
+  storage primary: td-tpm draws an ephemeral P-256 scalar from
+  `/dev/random`, which blocks until the kernel's generator is
+  initialized, as early boot needs (the scalar hides the salt, so unlike
+  a nonce it is a secret), and sends its public point as
+  TPM2_StartAuthSession's `encryptedSalt`, with the primary as tpmKey
+  and `TPM_RH_NULL` as bind. The salt is KDFe with SHA-256 over Z, the
+  x-coordinate of the ECDH point td-fido's `SecretScalar::agree`
+  computes, the label `SECRET` with its zero octet, the ephemeral x as
+  PartyUInfo and the primary's x, as CreatePrimary's checked outPublic
+  returned it, as PartyVInfo. The session key is KDFa (HMAC-SHA256) over
+  the salt with `ATH`, nonceTPM then nonceCaller. The session's
+  symmetric definition is AES-128 in CFB mode and its hash SHA-256;
+  td-fido's `fido_aes` carries AES-128 and CFB beside its AES-256-CBC.
+  A started session's handle must be the class its kind takes, 2 for
+  an HMAC session and 3 for a policy or trial session; another is
+  refused and stays owned for drop's flush.
+- **Session commands.** A command in a salted session carries one
+  authorization: a fresh 32-byte nonceCaller from `/dev/urandom`, the
+  attributes, and the HMAC, HMAC-SHA256 keyed with the session key
+  followed by the authValue with its trailing zero octets removed
+  (`trim_auth`, as the TPM stores an authValue), over cpHash (the
+  command code, the handles' Names, and the parameter area as sent),
+  nonceCaller, nonceTPM and the attributes. With `decrypt` the data of
+  the first command parameter, a TPM2B, is encrypted with AES-128-CFB
+  under the key and IV KDFa derives from that same session value with
+  `CFB`, nonceCaller then nonceTPM; with `encrypt` the first response
+  parameter's, nonceTPM then nonceCaller. The reply's HMAC, over rpHash
+  (success, the command code and the parameter area as received), the
+  new nonceTPM, nonceCaller and the echoed attributes, is compared with
+  `equal` before anything in the reply is trusted or decrypted, and the
+  new nonceTPM replaces the old. Every session command td sends clears
+  continueSession, so the TPM ends the session with the command; td
+  stops owning it only once a success reply has verified, so a refused,
+  malformed or unverified reply leaves it owned for drop's flush. The session key,
+  salt and derived keys are zeroed on drop or once used; the authValue
+  stays the caller's to zero, borrowed for the command.
+- **PolicyAuthValue.** `auth_policy_digest` and `PcrPolicy::auth_digest`
+  are PolicyPCR, then PolicyAuthValue, then PolicyCommandCode(Unseal),
+  from the zero digest: the tpm-pin policy. `policy_digest` is
+  unchanged.
+- **Sealing with an authValue.** `seal_with_auth` seals a 1 to 128-byte
+  payload under `auth_digest` beneath the unpersonalized storage
+  primary, with an authValue of at most 32 bytes (`MAX_AUTH_VALUE`, the
+  nameAlg's digest size) that is not empty once trimmed, trimmed, as
+  TPM2B_SENSITIVE_CREATE's userAuth, and the consumer's attributes,
+  `SEALED_ATTRIBUTES` or `DA_SEALED_ATTRIBUTES` (noDA clear, so a wrong
+  authValue counts against the TPM's lockout). Anything else is
+  refused, and the payload zeroed, before any TPM I/O. A trial session
+  first checks the TPM's own PolicyGetDigest. It creates the primary
+  and, given the Name a consumer recorded (`expected_primary`, which a
+  re-seal under an existing token passes), refuses another before any
+  session is salted to it, so a primary that appeared after enrollment
+  never receives the new authValue and payload to test PINs against
+  offline; a first seal passes none and records the Name returned. The
+  Create runs in an HMAC session salted to the primary, authorizing the
+  primary (whose authValue is empty) with `decrypt`, so the authValue
+  and payload cross the bus encrypted; the
+  payload buffer is zeroed as it is marshaled, as `seal_object` does. It
+  returns the sealed pair and the primary's Name, `AuthSealed`, for the
+  consumer to record. The authValue path is its own method rather than a
+  new `seal_object` signature, so the PCR-only path and its consumers
+  are unchanged.
+- **Unsealing with an authValue.** `unseal_with_auth` takes the policy,
+  the recorded primary Name, the authValue and the pair. Before any I/O
+  it refuses an authValue over 32 bytes or empty once trimmed, and a
+  public area outside the
+  two sealed formats (`validate_auth_sealed_public` checks one against a
+  policy for a consumer). It creates the primary and refuses one whose
+  Name is not the recorded one before Load, so no authValue is ever used
+  under another primary; loads the object; starts a policy session
+  salted to the primary; runs PolicyPCR, PolicyAuthValue and
+  PolicyCommandCode(Unseal), checked against PolicyGetDigest; and sends
+  Unseal with `encrypt` alone, since Unseal has no command parameter, so
+  the payload crosses the bus encrypted. The caller zeroes the payload.
+- **Typed authorization refusals.** `Refusal::authorization` and
+  `UnsealError::authorization` name `TPM_RC_AUTH_FAIL` on session 1
+  (`RC_AUTH_FAIL`, 0x98e; td sends one session), a wrong authValue the
+  TPM counted, as `AuthRefusal::AuthFail`, and `TPM_RC_LOCKOUT`
+  (`RC_LOCKOUT`, 0x921) as `AuthRefusal::Lockout`. Every other code is
+  none, `TPM_RC_BAD_AUTH` (0x9a2) included, which a noDA object's wrong
+  authValue returns uncounted. The TPM compares a policy session's
+  digest with the object's authPolicy before it checks the HMAC, so a
+  session that reaches Unseal over another chain is `TPM_RC_POLICY_FAIL`
+  (0x99d) and costs no attempt. An error response carries no session
+  HMAC, so an interposer can forge either kind: a typed refusal is
+  grounds to stop, never proof the PIN was wrong or the TPM locked.
+- **Dictionary-attack state.** `dictionary_attack` reads
+  TPM2_GetCapability of `TPM_CAP_TPM_PROPERTIES` twice, for
+  `TPM_PT_PERMANENT` alone and for the four from
+  `TPM_PT_LOCKOUT_COUNTER` (`TPM_PT_MAX_AUTH_FAIL`,
+  `TPM_PT_LOCKOUT_INTERVAL`, `TPM_PT_LOCKOUT_RECOVERY`), each reply
+  holding exactly the properties asked for, in order, whatever its
+  moreData; it returns TPMA_PERMANENT's lockoutAuthSet and inLockout and
+  the four values. It needs no authorization, and its replies carry no
+  HMAC: what it reports can deny service or mislead a display, never
+  prove the TPM's state.
+
 ## Planned: protected-tier commands
 
-Nothing here is current. `td-install/ENCRYPTION.md` increment 8 (8a,
-and 8i for signing) adds, still as bytes over the same safe file I/O and
-with no syscall surface. The crate then depends on one sibling,
-`td-fido = { path = "../td-fido" }`, for P-256 and AES, and on no other
-crate; "It is pure `std`, depends on no crate" above then reads "on
-td-fido alone".
+Nothing here is current. `td-install/ENCRYPTION.md` increment 8 (8a's
+next commit, and 8i for signing) adds, still as bytes over the same safe
+file I/O, in the sessions above, and with no syscall surface:
 
-- **Salted sessions.** A policy session may be salted to the storage
-  primary: td-tpm draws an ephemeral P-256 key, sends its public point
-  as TPM2_StartAuthSession's `encryptedSalt`, derives the salt by KDFe
-  from the shared point with the primary's public point, and derives
-  the session key by KDFa from the salt and both nonces. td-fido's AES
-  gains the AES-128 key schedule for it. Such a session sets
-  `decrypt` and `encrypt` with AES-128 in CFB mode, so a command's first
-  sensitive parameter and a response's are encrypted under keys KDFa
-  derives from the session key and authValue. The primary's Name is
-  returned for the consumer to compare with the one it recorded.
-- **HMAC policy sessions.** A policy session may carry PolicyAuthValue,
-  after which `call` computes the command HMAC, HMAC-SHA256 keyed with
-  the session key followed by the object's authValue with its trailing
-  zero bytes removed, over cpHash, the two nonces and the session
-  attributes, and verifies the response HMAC over rpHash before it
-  trusts or decrypts a reply. The authValue is the caller's zeroing
-  owner, borrowed for the command.
-- **Sealing with an authValue.** `seal_object` takes an optional
-  authValue for TPM2B_SENSITIVE_CREATE's userAuth, sent encrypted in a
-  salted session, and the consumer's attributes, so a consumer can seal
-  with noDA clear.
-- **Typed authorization refusals.** `UnsealError`'s refusal names
-  `TPM_RC_AUTH_FAIL` on a session (0x98e for session 1) and
-  `TPM_RC_LOCKOUT` (0x921) as their own kinds.
-- **Dictionary-attack state.** TPM2_GetCapability of
-  `TPM_CAP_TPM_PROPERTIES` for `TPM_PT_PERMANENT`,
-  `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
-  `TPM_PT_LOCKOUT_INTERVAL` and `TPM_PT_LOCKOUT_RECOVERY`, each reply
-  checked for exactly the properties asked.
 - **Lockout hierarchy.** TPM2_HierarchyChangeAuth of `TPM_RH_LOCKOUT`
   from the empty authorization to a caller's value,
   TPM2_DictionaryAttackParameters, TPM2_DictionaryAttackLockReset and
@@ -156,10 +233,11 @@ specified in `td-secret/DESIGN.md`; the disk protector's policies,
 secret and PCR 12 cap in `td-protector/DESIGN.md`, and its tokens and
 recovery flow in `td-install/ENCRYPTION.md`.
 
-Sessions are neither salted nor parameter-encrypted. Physical TPM-bus
-interposition is outside every current consumer's boundary; the planned
-protected tier salts its sessions (above, and `td-install/ENCRYPTION.md`,
-"PIN and dictionary-attack policy").
+The sessions of `seal_object`, `unseal_object` and `load_and_flush`
+are neither salted nor parameter-encrypted: physical TPM-bus
+interposition is outside every current consumer's boundary. The
+protected tier's PIN path salts its sessions (above, and
+`td-install/ENCRYPTION.md`, "PIN and dictionary-attack policy").
 
 ## Bounds
 
@@ -188,3 +266,38 @@ nothing after a transport error, and extend then read. td-secret's tests pin
 the complete seal and unseal command stream against a scripted TPM and
 its persisted envelope bytes, and its pinned-emulator and QEMU guest
 oracles exercise this client against a TPM.
+
+The salted and PIN-authorized sessions' unit tests pin, against
+independent vectors (`tests/session_vectors.txt`, printed by
+`tests/session_vectors.py`, a stdlib-only host fixture tool with integer
+P-256 and a table-free AES-128 it checks against FIPS 197 and SP 800-38A
+before printing), the salted session's ECDH point, KDFe salt, session
+key and StartAuthSession bytes for an HMAC and a policy session;
+AES-128-CFB parameter encryption both ways, each with its own KDFa key;
+the whole Create command in the salted HMAC session, its sensitive area
+encrypted, and its reply; the whole Unseal command with the authValue
+and its encrypted reply, a reply changed at any byte, under another
+authValue or with other attributes refused; the PolicyAuthValue digest
+literal and command bytes; authValue trimming; GetCapability's two
+commands and its exact-properties check; and, against a scripted TPM,
+the typed `TPM_RC_AUTH_FAIL` and `TPM_RC_LOCKOUT` replies at Unseal,
+another primary's Name refused before Load at unseal and before any
+salted session at seal, an authValue empty once trimmed refused before
+I/O, each session kind's handle class, and a session left owned after a
+forged or malformed success reply. td-fido's tests pin AES-128
+against FIPS 197 and CFB against SP 800-38A.
+
+Ignored oracles against the pinned swtpm 0.10.1 (`emulator_tests.rs`:
+`TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --manifest-path
+td-tpm/Cargo.toml emulator_ -- --ignored`) seal and unseal with the
+right PIN in a salted session; refuse a wrong PIN with 0x98e and raise
+the counter, which an orderly restart keeps, while a noDA object's wrong
+PIN is 0x9a2 and uncounted; lock out after 32 wrong PINs with 0x921,
+refusing the right PIN too, the DA parameters set by a raw
+TPM2_DictionaryAttackParameters under swtpm's empty lockoutAuth until
+the lockout commands are the client's; refuse a changed PCR 4 and a
+closed PCR 12 at PolicyPCR and, in a session over the PCRs as they read,
+at Unseal's policy check, without the counter moving; refuse a fresh TPM
+state at Load; refuse another primary's Name before Load; re-seal under
+the recorded primary's Name; and refuse, under a fresh TPM, a re-seal
+recording the first TPM's primary before its Create is sent.

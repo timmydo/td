@@ -11,6 +11,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "td-fido"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
 version = "0.1.0"
 
@@ -25,3 +29,6 @@ dependencies = [
 [[package]]
 name = "td-tpm"
 version = "0.1.0"
+dependencies = [
+ "td-fido",
+]

@@ -2,12 +2,30 @@ use crate::ladder::{split_target_debug, target_rustc};
 use crate::types::{Recipe, Step};
 const LIB_RS: &str = include_str!("../../../td-secret/src/lib.rs");
 const MAIN_RS: &str = include_str!("../../../td-secret/src/main.rs");
-/// The TPM 2.0 client crate td-secret depends on (td-tpm/DESIGN.md).
-const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
-/// The FIDO2 client crate td-secret depends on (td-fido/DESIGN.md): its
-/// files, with the test-only authenticator side td-secret's tests compile
-/// by path and td-fido's own tests' vectors.
-const FIDO_FILES: &[(&str, &str)] = &[
+/// The TPM 2.0 client crate td-secret depends on (td-tpm/DESIGN.md), its
+/// test-only emulator oracle included.
+const TPM_SOURCES: &[(&str, &str)] = &[
+    (
+        "{src}/td-tpm/src/lib.rs",
+        include_str!("../../../td-tpm/src/lib.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/auth.rs",
+        include_str!("../../../td-tpm/src/auth.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/session.rs",
+        include_str!("../../../td-tpm/src/session.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/emulator_tests.rs",
+        include_str!("../../../td-tpm/src/emulator_tests.rs"),
+    ),
+];
+/// The FIDO2 client crate td-secret and td-tpm depend on
+/// (td-fido/DESIGN.md): its files, with the test-only authenticator side
+/// td-secret's tests compile by path.
+const FIDO_SOURCES: &[(&str, &str)] = &[
     (
         "{src}/td-fido/src/lib.rs",
         include_str!("../../../td-fido/src/lib.rs"),
@@ -71,6 +89,13 @@ const FIDO_FILES: &[(&str, &str)] = &[
     (
         "{src}/td-fido/src/fido_virtual_tests.rs",
         include_str!("../../../td-fido/src/fido_virtual_tests.rs"),
+    ),
+];
+/// td-tpm's and td-fido's own tests' vectors.
+const TEST_VECTORS: &[(&str, &str)] = &[
+    (
+        "{src}/td-tpm/tests/session_vectors.txt",
+        include_str!("../../../td-tpm/tests/session_vectors.txt"),
     ),
     (
         "{src}/td-fido/tests/aes_vectors.txt",
@@ -195,6 +220,7 @@ pub fn recipe() -> Recipe {
         "{src}/td-authd/tests",
         "{src}/engine/src",
         "{src}/td-tpm/src",
+        "{src}/td-tpm/tests",
         "{src}/td-fido/src",
         "{src}/td-fido/tests",
         "{root}/test-deps",
@@ -209,10 +235,11 @@ pub fn recipe() -> Recipe {
     for &(path, content) in [
         ("{src}/td-secret/src/lib.rs", LIB_RS),
         ("{src}/td-secret/src/main.rs", MAIN_RS),
-        ("{src}/td-tpm/src/lib.rs", TPM_RS),
     ]
     .iter()
-    .chain(FIDO_FILES)
+    .chain(TPM_SOURCES)
+    .chain(FIDO_SOURCES)
+    .chain(TEST_VECTORS)
     {
         steps.push(Step::WriteFile {
             path: path.into(),
@@ -340,18 +367,20 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
-    // td-tpm, the TPM client td-secret's sealed-store formats run over, and
-    // td-fido, the FIDO2 client its token operations run over, each with the
-    // shipped profile; the unwinding test harness links its own copies.
+    // td-fido, the FIDO2 client its token operations run over, then td-tpm,
+    // the TPM client its sealed-store formats run over and whose sessions
+    // use td-fido, each with the shipped profile; the unwinding test
+    // harness links its own copies.
     for (crate_name, source) in [
-        ("td_tpm", "{src}/td-tpm/src/lib.rs"),
         ("td_fido", "{src}/td-fido/src/lib.rs"),
+        ("td_tpm", "{src}/td-tpm/src/lib.rs"),
     ] {
         for (dir, profile) in [
             ("{root}", &["-C", "opt-level=s", "-C", "panic=abort"][..]),
             ("{root}/test-deps", &[][..]),
         ] {
             let output = format!("{dir}/lib{crate_name}.rlib");
+            let fido = format!("td_fido={dir}/libtd_fido.rlib");
             let mut args = vec![
                 "--edition",
                 "2021",
@@ -367,6 +396,9 @@ pub fn recipe() -> Recipe {
                 "relocation-model=static",
             ];
             args.extend_from_slice(profile);
+            if crate_name == "td_tpm" {
+                args.extend_from_slice(&["--extern", &fido]);
+            }
             args.extend_from_slice(&["-o", &output, source]);
             steps.push(
                 target_rustc("{src}", rustc, &args)
@@ -489,48 +521,44 @@ pub fn recipe() -> Recipe {
         .env("SOURCE_DATE_EPOCH", "1"),
     );
     steps.push(Step::run("{root}", &["{root}/secret-tests"]));
-    for (crate_name, output, source) in [
+    for (crate_name, output, source, externs) in [
         (
             "td_tpm_tests",
             "{root}/tpm-tests",
             "{src}/td-tpm/src/lib.rs",
+            &["--extern", "td_fido={root}/test-deps/libtd_fido.rlib"][..],
         ),
         (
             "td_fido_tests",
             "{root}/fido-tests",
             "{src}/td-fido/src/lib.rs",
+            &[][..],
         ),
     ] {
+        let mut args = vec!["--edition", "2021", "--test", "--crate-name", crate_name];
+        args.extend_from_slice(externs);
+        args.extend_from_slice(&[
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-C",
+            "target-feature=+crt-static",
+            "-C",
+            "relocation-model=static",
+            &linker,
+            "-L",
+            glib,
+            &lib_b,
+            &bin_b,
+            "-Clink-arg=-L{root}/eh",
+            "-Clink-arg=-static-libgcc",
+            "-o",
+            output,
+            source,
+        ]);
         steps.push(
-            target_rustc(
-                "{src}",
-                rustc,
-                &[
-                    "--edition",
-                    "2021",
-                    "--test",
-                    "--crate-name",
-                    crate_name,
-                    "--target",
-                    "x86_64-unknown-linux-gnu",
-                    "-C",
-                    "target-feature=+crt-static",
-                    "-C",
-                    "relocation-model=static",
-                    &linker,
-                    "-L",
-                    glib,
-                    &lib_b,
-                    &bin_b,
-                    "-Clink-arg=-L{root}/eh",
-                    "-Clink-arg=-static-libgcc",
-                    "-o",
-                    output,
-                    source,
-                ],
-            )
-            .env("PATH", &path)
-            .env("SOURCE_DATE_EPOCH", "1"),
+            target_rustc("{src}", rustc, &args)
+                .env("PATH", &path)
+                .env("SOURCE_DATE_EPOCH", "1"),
         );
         steps.push(Step::run("{root}", &[output]));
     }

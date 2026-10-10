@@ -27,7 +27,9 @@ use crate::types::{Recipe, Step};
 // `rustc src/main.rs` pulls them all in — but only if every module file sits beside
 // it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines. td-secret's
 // shared `tpm.rs` runs over the sibling crate td-tpm, compiled first as an
-// rlib with the binary's profile and passed by `--extern`.
+// rlib with the binary's profile and passed by `--extern`, after td-fido,
+// whose P-256, AES and HMAC-SHA256 td-tpm's sessions use; the link finds
+// td-fido by `-L dependency`.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
@@ -37,7 +39,6 @@ use crate::types::{Recipe, Step};
 // That guard's roster exempts named reviewed bodies from even that, and none
 // of td-firstboot's is on it.
 pub(crate) const MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs");
-const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
@@ -206,7 +207,8 @@ pub fn recipe() -> Recipe {
         exec: false,
     });
     // td-secret's store crypto and store mount td-fido's HMAC-SHA256 and
-    // root admission by path.
+    // root admission by path; td-tpm's rlib needs the rest of td-fido's
+    // production files (the CTAP modules above among them), and td-tpm's.
     for (path, content) in [
         (
             "{src}/td-fido/src/hmac.rs",
@@ -216,6 +218,46 @@ pub fn recipe() -> Recipe {
             "{src}/td-fido/src/root.rs",
             include_str!("../../../td-fido/src/root.rs"),
         ),
+        (
+            "{src}/td-fido/src/lib.rs",
+            include_str!("../../../td-fido/src/lib.rs"),
+        ),
+        (
+            "{src}/td-fido/src/crypto.rs",
+            include_str!("../../../td-fido/src/crypto.rs"),
+        ),
+        (
+            "{src}/td-fido/src/fido_aes.rs",
+            include_str!("../../../td-fido/src/fido_aes.rs"),
+        ),
+        (
+            "{src}/td-fido/src/fido_device.rs",
+            include_str!("../../../td-fido/src/fido_device.rs"),
+        ),
+        (
+            "{src}/td-fido/src/fido_p256.rs",
+            include_str!("../../../td-fido/src/fido_p256.rs"),
+        ),
+        (
+            "{src}/td-fido/src/fido_pin.rs",
+            include_str!("../../../td-fido/src/fido_pin.rs"),
+        ),
+        (
+            "{src}/td-fido/src/fido_transaction.rs",
+            include_str!("../../../td-fido/src/fido_transaction.rs"),
+        ),
+        (
+            "{src}/td-tpm/src/lib.rs",
+            include_str!("../../../td-tpm/src/lib.rs"),
+        ),
+        (
+            "{src}/td-tpm/src/auth.rs",
+            include_str!("../../../td-tpm/src/auth.rs"),
+        ),
+        (
+            "{src}/td-tpm/src/session.rs",
+            include_str!("../../../td-tpm/src/session.rs"),
+        ),
     ] {
         steps.push(Step::WriteFile {
             path: path.into(),
@@ -223,11 +265,6 @@ pub fn recipe() -> Recipe {
             exec: false,
         });
     }
-    steps.push(Step::WriteFile {
-        path: "{src}/td-tpm/src/lib.rs".into(),
-        content: TPM_RS.into(),
-        exec: false,
-    });
     steps.push(Step::MkDir {
         path: "{root}/eh".into(),
     });
@@ -235,35 +272,41 @@ pub fn recipe() -> Recipe {
         Step::run("{root}", &[objcopy, libgcc_a, "{root}/eh/libgcc_eh.a"]).env("PATH", &path),
     );
     steps.push(Step::run("{root}", &[ranlib, "{root}/eh/libgcc_eh.a"]).env("PATH", &path));
-    steps.push(
-        target_rustc(
-            "{src}",
-            rustc,
-            &[
-                "--edition",
-                "2021",
-                "--crate-type",
-                "rlib",
-                "--crate-name",
-                "td_tpm",
-                "-C",
-                "opt-level=s",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-C",
-                "target-feature=+crt-static",
-                "-C",
-                "relocation-model=static",
-                "-C",
-                "panic=abort",
-                "-o",
-                "{root}/libtd_tpm.rlib",
-                "{src}/td-tpm/src/lib.rs",
-            ],
-        )
-        .env("PATH", &path)
-        .env("SOURCE_DATE_EPOCH", "1"),
-    );
+    for (name, externs, source) in [
+        ("td_fido", &[][..], "{src}/td-fido/src/lib.rs"),
+        (
+            "td_tpm",
+            &["--extern", "td_fido={root}/libtd_fido.rlib"][..],
+            "{src}/td-tpm/src/lib.rs",
+        ),
+    ] {
+        let output = format!("{{root}}/lib{name}.rlib");
+        let mut args = vec![
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            name,
+            "-C",
+            "opt-level=s",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-C",
+            "target-feature=+crt-static",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "panic=abort",
+        ];
+        args.extend_from_slice(externs);
+        args.extend_from_slice(&["-o", &output, source]);
+        steps.push(
+            target_rustc("{src}", rustc, &args)
+                .env("PATH", &path)
+                .env("SOURCE_DATE_EPOCH", "1"),
+        );
+    }
     steps.push(
         target_rustc(
             "{src}",
@@ -286,6 +329,9 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "--extern",
                 "td_tpm={root}/libtd_tpm.rlib",
+                // td-tpm's own dependency, td-fido, is found here.
+                "-L",
+                "dependency={root}",
                 &linker,
                 "-L",
                 glib,
@@ -481,9 +527,10 @@ mod tests {
             !mine.is_empty() && !proven.is_empty(),
             "no rustc step found"
         );
-        // The ONLY differences may be the output path, the crate root and
-        // td-tpm's one `--extern`; every other argument is toolchain/link
-        // configuration and must match.
+        // The ONLY differences may be the output path, the crate root,
+        // td-tpm's one `--extern` and the `-L dependency` that finds its
+        // td-fido; every other argument is toolchain/link configuration and
+        // must match.
         let extern_at = mine
             .iter()
             .position(|arg| arg == "td_tpm={root}/libtd_tpm.rlib")
@@ -492,8 +539,12 @@ mod tests {
             panic!("td-tpm's rlib is the first rustc argument, not an --extern")
         });
         assert_eq!(mine.get(flag_at).map(String::as_str), Some("--extern"));
+        assert_eq!(
+            mine.get(extern_at + 1..extern_at + 3),
+            Some(&["-L".to_string(), "dependency={root}".to_string()][..])
+        );
         let mut mine = mine;
-        mine.drain(flag_at..=extern_at);
+        mine.drain(flag_at..extern_at + 3);
         let normalize = |argv: Vec<String>| -> Vec<String> {
             argv.into_iter()
                 .map(|arg| {

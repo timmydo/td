@@ -17,7 +17,8 @@ const MAIN_RS: &str = include_str!("../../../td-portal/src/main.rs");
 /// codecs and HMAC-SHA256 are td-fido's files, by path. Those sibling
 /// trees are staged beside td-portal so cargo compiles exactly what the crate
 /// names. td-portal's dependencies are the roster siblings `td-ui` and
-/// `td-tpm`, so its lock lists only those and itself; the binary is linked
+/// `td-tpm`, so its lock lists only those, td-tpm's td-fido and itself
+/// (with its test-only compositor harness); the binary is linked
 /// fully static, as every td-owned program on the image, so the system tree's
 /// `/bin/td-portal` needs no loader.
 ///

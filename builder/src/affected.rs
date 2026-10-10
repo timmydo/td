@@ -387,6 +387,8 @@ const TARGET_STATIC_RECIPES: &[(&str, &str)] = &[
     ("td-secret/src", "recipes/src/recipes/td-secret.rs"),
     ("td-fido/src", "recipes/src/recipes/td-secret.rs"),
     ("td-fido/src", "recipes/src/recipes/td-firstboot.rs"),
+    ("td-fido/src", "recipes/src/recipes/td-boot.rs"),
+    ("td-fido/src", "recipes/src/recipes/td-install.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-secret.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-firstboot.rs"),
     ("td-tpm/src", "recipes/src/recipes/td-boot.rs"),

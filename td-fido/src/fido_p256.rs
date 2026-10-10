@@ -66,7 +66,9 @@ impl SecretScalar {
         Point::generator().multiply(&self.0).affine()
     }
 
-    pub(super) fn agree(&self, peer: &PublicKey) -> Result<SharedSecret, &'static str> {
+    /// ECDH: the x-coordinate of this scalar times `peer`, the shared
+    /// secret Z that td-tpm's salted sessions also derive their salt from.
+    pub fn agree(&self, peer: &PublicKey) -> Result<SharedSecret, &'static str> {
         let mut point = peer.point().multiply(&self.0);
         let result = point.affine().map(|mut affine| {
             let mut secret = SharedSecret(Box::new([0; 32]));
@@ -87,10 +89,10 @@ impl Drop for SecretScalar {
     }
 }
 
-pub(super) struct SharedSecret(Box<[u8; 32]>);
+pub struct SharedSecret(Box<[u8; 32]>);
 
 impl SharedSecret {
-    pub(super) fn bytes(&self) -> &[u8; 32] {
+    pub fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }

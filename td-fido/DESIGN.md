@@ -3,9 +3,10 @@
 td-fido is td's FIDO2 (CTAP2) client and the home of the HMAC-SHA256
 td's std-only crates share. AGENTS.md principle 2 puts code two crates
 need in one sibling crate: td-secret's portable vault, store enrollment
-and login keys use a security key today, and `td-install/ENCRYPTION.md`
-increment 8 has td-boot's selector unlock a disk with one and td-tpm
-salt its sessions with this crate's P-256 and AES. Increment 8a moved
+and login keys use a security key today, td-tpm salts and encrypts its
+PIN-authorized sessions with this crate's P-256, AES and HMAC-SHA256,
+and `td-install/ENCRYPTION.md` increment 8 has td-boot's selector unlock
+a disk with one. Increment 8a moved
 the code here from td-secret with no behaviour change; td-secret is its
 first consumer. It is pure `std`, depends on no crate, compiles the
 engine's SHA-256 as shared source, and forbids `unsafe`; it adds no
@@ -27,8 +28,11 @@ prerequisites" onward):
 - `fido_pin`: PIN protocols one and two, the PIN and pinUvAuthToken
   flows, hmac-secret and the login profile; `fido_transaction`: one
   owned PIN transaction over a `Channel`.
-- `fido_p256`: software P-256 (ECDH and ES256 verification);
-  `fido_aes`: AES-256-CBC for the PIN protocols.
+- `fido_p256`: software P-256 (ECDH and ES256 verification), its ECDH
+  `SecretScalar::agree` public for td-tpm's session salt; `fido_aes`:
+  AES-256-CBC for the PIN protocols, and AES-128 in CFB mode, over the
+  same round function, for td-tpm's parameter encryption, pinned to
+  FIPS 197 and SP 800-38A.
 - `fido_device`: root and desktop hidraw admission, the operation lock
   under `/run/td-fido` (or the desktop runtime directory), the Session
   that drives a token through a HID worker, and that worker.
@@ -56,13 +60,14 @@ so:
 td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"
 }`, and imports its modules under their old names, so its own
 modules, and the files td-firstboot and td-portal share with it, name
-them as before. Per `td-install/ENCRYPTION.md` item 8, td-tpm (8a's
-salted sessions), td-protector (its HMAC-SHA256) and td-boot (8b's
-FIDO2 boot client) are the only other crates that may depend on it
-directly; any other dependent is an amendment here and to
-`FIDO_DEPENDENTS` in `builder/src/affected.rs`, whose lock preflight
-refuses the rest. Crates that reach it through td-secret, as td-pass
-does, are not dependents.
+them as before. td-tpm depends on it the same way for its salted
+sessions (td-tpm/DESIGN.md). Per `td-install/ENCRYPTION.md` item 8,
+td-protector (its HMAC-SHA256) and td-boot (8b's FIDO2 boot client) are
+the only other crates that may depend on it directly; any other
+dependent is an amendment here and to `FIDO_DEPENDENTS` in
+`builder/src/affected.rs`, whose lock preflight refuses the rest. Crates
+that reach it only through td-secret or td-tpm, as td-pass does, are
+not dependents.
 
 Four crates compile some of its files as shared source instead:
 td-protector compiles `hmac.rs` for its PIN's authValue (below); as
@@ -75,11 +80,12 @@ therefore reach siblings only through `super::` names those crates also
 provide.
 
 The td-secret recipe builds td-fido's rlib twice, with the shipped
-profile and for the test harness, links td-secret against them, and
-runs td-fido's own tests; the td-firstboot, td-portal and td-pass
-recipes stage its tree or the files they compile, as the td-setup
-recipe stages its tree and the td-boot and td-install recipes
-`hmac.rs` for td-protector.
+profile and for the test harness, links td-secret and td-tpm against
+them, and runs td-fido's and td-tpm's own tests. The td-boot, td-install
+and td-firstboot recipes stage its files and build its rlib before
+td-tpm's (td-boot's and td-install's staging also serves td-protector's
+`hmac.rs`); the td-setup, td-portal and td-pass recipes stage its tree
+for cargo.
 
 ## Shared HMAC-SHA256
 

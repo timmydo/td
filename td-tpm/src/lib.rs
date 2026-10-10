@@ -1,7 +1,7 @@
 //! td's TPM 2.0 client: bounded command transport, password and policy
-//! sessions, the owner storage primary, PCR policy sealing, and PCR
-//! extension. Envelope formats and refusal policy belong to callers
-//! (DESIGN.md).
+//! sessions, salted and PIN-authorized sessions, the owner storage
+//! primary, PCR policy sealing, and PCR extension. Envelope formats and
+//! refusal policy belong to callers (DESIGN.md).
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -19,6 +19,18 @@
     reason = "the shared hash also supports build artifact files"
 )]
 mod sha256;
+
+mod auth;
+#[cfg(test)]
+mod emulator_tests;
+mod session;
+pub use auth::{
+    auth_policy_digest, validate_auth_sealed_public, AuthRefusal, AuthSealed, DictionaryAttack,
+    DA_SEALED_ATTRIBUTES, GET_CAPABILITY, NO_DA, POLICY_AUTH_VALUE, PT_LOCKOUT_COUNTER,
+    PT_LOCKOUT_INTERVAL, PT_LOCKOUT_RECOVERY, PT_MAX_AUTH_FAIL, PT_PERMANENT, RC_AUTH_FAIL,
+    RC_LOCKOUT,
+};
+pub use session::{trim_auth, MAX_AUTH_VALUE};
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -206,11 +218,25 @@ pub fn pcr_digest(values: &[[u8; 32]]) -> [u8; 32] {
 /// PolicyPCR(selection, pcr_digest) then PolicyCommandCode(Unseal), both
 /// extended from the zero digest.
 pub fn policy_digest(selection: PcrSelection, pcr_digest: &[u8; 32]) -> [u8; 32] {
+    policy_digest_from(selection, pcr_digest, false)
+}
+
+/// PolicyPCR, PolicyAuthValue when `auth_value`, then
+/// PolicyCommandCode(Unseal), from the zero digest.
+fn policy_digest_from(
+    selection: PcrSelection,
+    pcr_digest: &[u8; 32],
+    auth_value: bool,
+) -> [u8; 32] {
     let mut bytes = vec![0; 32];
     put32(&mut bytes, POLICY_PCR);
     bytes.extend_from_slice(&selection.marshal());
     bytes.extend_from_slice(pcr_digest);
     let mut bytes = digest(&bytes).to_vec();
+    if auth_value {
+        put32(&mut bytes, POLICY_AUTH_VALUE);
+        bytes = digest(&bytes).to_vec();
+    }
     put32(&mut bytes, POLICY_COMMAND_CODE);
     put32(&mut bytes, UNSEAL);
     digest(&bytes)
@@ -240,8 +266,14 @@ const NOT_SEALED: &str = "sealed TPM object does not have the fixed PCR-only pol
 /// The authPolicy of a SHA-256 keyed-hash object with `SEALED_ATTRIBUTES`,
 /// refusing any other public area.
 fn sealed_auth_policy(public: &[u8]) -> Result<&[u8], String> {
+    sealed_policy(public, SEALED_ATTRIBUTES)
+}
+
+/// The authPolicy of a SHA-256 keyed-hash object with exactly
+/// `attributes`, refusing any other public area.
+fn sealed_policy(public: &[u8], attributes: u32) -> Result<&[u8], String> {
     let mut public = Reader(public);
-    if public.u16()? != 8 || public.u16()? != SHA256 || public.u32()? != SEALED_ATTRIBUTES {
+    if public.u16()? != 8 || public.u16()? != SHA256 || public.u32()? != attributes {
         return Err(NOT_SEALED.into());
     }
     let policy = public.blob()?;
@@ -285,6 +317,25 @@ impl From<UnsealError> for String {
     fn from(error: UnsealError) -> Self {
         error.message
     }
+}
+
+/// `handle` if its class is the one a session of `kind` takes: 2 for an
+/// HMAC session, 3 for a policy or trial session. A refused handle stays
+/// owned, so drop flushes it.
+fn session_class(handle: u32, kind: u8) -> Result<u32, String> {
+    let class = if kind == session::HMAC_SESSION { 2 } else { 3 };
+    if handle >> 24 != class {
+        return Err("unexpected TPM session handle class".into());
+    }
+    Ok(handle)
+}
+
+/// A loaded storage primary: its handle, Name and public point.
+struct Primary {
+    handle: u32,
+    name: Vec<u8>,
+    x: Vec<u8>,
+    y: Vec<u8>,
 }
 
 pub struct Client<T: Transport> {
@@ -402,8 +453,14 @@ impl<T: Transport> Client<T> {
             }
             let handle = if returns_handle {
                 let handle = reader.u32()?;
-                let kind = if code == START_AUTH_SESSION { 3 } else { 0x80 };
-                if handle >> 24 != kind {
+                // An HMAC session is class 2, a policy or trial session 3.
+                let class = handle >> 24;
+                let expected = if code == START_AUTH_SESSION {
+                    class == 2 || class == 3
+                } else {
+                    class == 0x80
+                };
+                if !expected {
                     return Err("unexpected TPM handle class".into());
                 }
                 self.handles.push(handle);
@@ -449,6 +506,12 @@ impl<T: Transport> Client<T> {
         &mut self,
         personalization: Option<&[u8; 32]>,
     ) -> Result<(u32, Vec<u8>), String> {
+        let primary = self.primary(personalization)?;
+        Ok((primary.handle, primary.name))
+    }
+
+    /// `storage_primary`, with the public point a salted session needs.
+    fn primary(&mut self, personalization: Option<&[u8; 32]>) -> Result<Primary, String> {
         let mut public = Vec::new();
         put16(&mut public, 0x23); // ECC
         put16(&mut public, SHA256);
@@ -490,7 +553,12 @@ impl<T: Transport> Client<T> {
         let name = reader.blob()?;
         check_name(returned_public, name)?;
         reader.end()?;
-        Ok((handle.ok_or("missing TPM parent handle")?, name.to_vec()))
+        Ok(Primary {
+            handle: handle.ok_or("missing TPM parent handle")?,
+            name: name.to_vec(),
+            x: x.to_vec(),
+            y: y.to_vec(),
+        })
     }
 
     /// The personalized primary, refused if the TPM derives the same Name
@@ -581,25 +649,43 @@ impl<T: Transport> Client<T> {
     /// A policy session (or trial) satisfying `policy`, checked against the
     /// TPM's own PolicyGetDigest. The session is owned by this client.
     pub fn policy_session(&mut self, policy: &PcrPolicy, trial: bool) -> Result<u32, String> {
+        let handle = self.start_session(if trial { TRIAL_SESSION } else { POLICY_SESSION })?;
+        self.satisfy(handle, policy, false)?;
+        Ok(handle)
+    }
+
+    /// An unsalted, unbound policy or trial session, owned by this client.
+    fn start_session(&mut self, kind: u8) -> Result<u32, String> {
         let mut parameters = Vec::new();
         put_blob(&mut parameters, &random()?)?;
         put_blob(&mut parameters, &[])?;
-        parameters.push(if trial { TRIAL_SESSION } else { POLICY_SESSION });
+        parameters.push(kind);
         put16(&mut parameters, ALG_NULL);
         put16(&mut parameters, SHA256);
         let (handle, out) =
             self.call(START_AUTH_SESSION, &[NULL, NULL], None, &parameters, true)?;
-        let handle = handle.ok_or("missing TPM session handle")?;
+        let handle = session_class(handle.ok_or("missing TPM session handle")?, kind)?;
         let mut reader = Reader(&out);
         if reader.blob()?.len() != 32 {
             return Err("invalid TPM session nonce".into());
         }
         reader.end()?;
+        Ok(handle)
+    }
+
+    /// PolicyPCR, PolicyAuthValue when `auth_value`, and
+    /// PolicyCommandCode(Unseal) in the session `handle`, checked against
+    /// the TPM's own PolicyGetDigest.
+    fn satisfy(&mut self, handle: u32, policy: &PcrPolicy, auth_value: bool) -> Result<(), String> {
         let mut parameters = Vec::new();
         put_blob(&mut parameters, &policy.pcr_digest)?;
         parameters.extend_from_slice(&policy.selection.marshal());
         let (_, out) = self.call(POLICY_PCR, &[handle], None, &parameters, false)?;
         Reader(&out).end()?;
+        if auth_value {
+            let (_, out) = self.call(POLICY_AUTH_VALUE, &[handle], None, &[], false)?;
+            Reader(&out).end()?;
+        }
         let (_, out) = self.call(
             POLICY_COMMAND_CODE,
             &[handle],
@@ -610,11 +696,11 @@ impl<T: Transport> Client<T> {
         Reader(&out).end()?;
         let (_, out) = self.call(POLICY_GET_DIGEST, &[handle], None, &[], false)?;
         let mut reader = Reader(&out);
-        if reader.blob()? != policy.digest() {
+        let expected = policy_digest_from(policy.selection, &policy.pcr_digest, auth_value);
+        if reader.blob()? != expected {
             return Err("TPM policy digest mismatch".into());
         }
-        reader.end()?;
-        Ok(handle)
+        reader.end()
     }
 
     /// Seal `payload` under `policy` beneath the storage primary, bound to

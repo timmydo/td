@@ -17,3 +17,6 @@ dependencies = [
 [[package]]
 name = "td-tpm"
 version = "0.1.0"
+dependencies = [
+ "td-fido",
+]

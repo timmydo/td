@@ -1052,7 +1052,8 @@ device-bound tier's volume format, release order, PCR 12 cap and
 volatile handoff, which it keeps. td-protector carries its policies,
 token formats and planner (td-protector/DESIGN.md, "Protected roles
 (planned)"), and td-tpm the commands it adds (td-tpm/DESIGN.md,
-"Planned: protected-tier commands"). The storage operations here that
+"Salted and PIN-authorized sessions" and "Planned: protected-tier
+commands"). The storage operations here that
 run on the booted system are refused by td-authd until item 9; root can
 run their worker directly, which is how the oracles reach them. The
 selector's half is not unreachable before item 9: from 8c on, the
@@ -1128,15 +1129,18 @@ TPM's lockout bounds.
 and every Unseal, runs in a session salted to td's storage primary:
 td-tpm encrypts the session salt to the primary's ECC P-256 key (an
 ephemeral ECDH key and KDFe), so the session key is unknown to anyone
-recording the bus, and sets the session's encrypt and decrypt
-attributes with AES-128 in CFB mode, so Unseal's response, the
-protector secret, and a new authorization sent to the TPM cross it
-encrypted. The command HMAC is keyed with that session key and the
-authValue, so a recording gives no offline test of the PIN. The
-primary's Name is recorded in each tpm-pin and lockout token when it is
-first written and must match at every later use: trust on first use. An
-interposer present at that first seal defeats it; one that appears
-later is refused as a changed TPM. td-tpm takes P-256 and AES from
+recording the bus. With AES-128 in CFB mode, a command that sends a
+secret sets the session's decrypt attribute, so Create's sensitive
+area (a new authValue and the protector secret) and a new authorization
+cross it encrypted, and Unseal sets encrypt alone, so its response, the
+protector secret, does. The command HMAC is keyed with that session key
+and the authValue, so a recording gives no offline test of the PIN.
+The primary's Name is recorded in each tpm-pin and lockout token when
+it is first written and must match at every later use, a re-seal for a
+PIN change or an update included: td-tpm refuses another primary
+before it salts a session to it, so no secret is encrypted to it. That
+is trust on first use. An interposer present at that first seal
+defeats it; one that appears later is refused as a changed TPM. td-tpm takes P-256 and AES from
 td-fido by path ("FIDO2 protectors"); the kernel's own TPM bus
 protection (`TCG_TPM2_HMAC`) stays off as pinned.
 

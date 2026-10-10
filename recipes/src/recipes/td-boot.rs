@@ -6,13 +6,14 @@ use crate::types::{Recipe, Step};
 // ed25519 VERIFIER — which reaches its hash as `crate::sha512`, so the two
 // arrive as a pair or the build does not link. `ed25519_sign.rs` is NOT here
 // and must not be: this binary verifies and never signs. Its PCR 11 measurement
-// runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), and its
+// runs over the sibling TPM 2.0 client td-tpm (td-tpm/DESIGN.md), whose
+// sessions use td-fido's P-256 and AES (td-fido/DESIGN.md), and its
 // volume discovery, the live selector's PCR 12 release cap and the installed
 // selector's release and the deployment initramfs's unlock over
 // td-protector, which reaches td-json; each is
 // compiled first as an rlib with the binary's profile and passed by
-// `--extern`, as td-install passes them. td-tpm includes the same engine
-// SHA-256 by `#[path]`.
+// `--extern`, as td-install passes them. td-tpm and td-fido include the
+// same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
@@ -27,7 +28,92 @@ const CONSOLE_RS: &str = include_str!("../../../td-init/src/console.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
-const TPM_RS: &str = include_str!("../../../td-tpm/src/lib.rs");
+/// td-tpm's files and td-fido's, whose P-256, AES and HMAC-SHA256 td-tpm's
+/// sessions use, each crate's whole `src` (test-only files included, as
+/// the staging test below holds). td-protector's PIN derivation also
+/// compiles td-fido's `hmac.rs` by `#[path]`.
+const TPM_AND_FIDO: &[(&str, &str)] = &[
+    (
+        "{src}/td-tpm/src/lib.rs",
+        include_str!("../../../td-tpm/src/lib.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/auth.rs",
+        include_str!("../../../td-tpm/src/auth.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/session.rs",
+        include_str!("../../../td-tpm/src/session.rs"),
+    ),
+    (
+        "{src}/td-tpm/src/emulator_tests.rs",
+        include_str!("../../../td-tpm/src/emulator_tests.rs"),
+    ),
+    (
+        "{src}/td-fido/src/lib.rs",
+        include_str!("../../../td-fido/src/lib.rs"),
+    ),
+    (
+        "{src}/td-fido/src/crypto.rs",
+        include_str!("../../../td-fido/src/crypto.rs"),
+    ),
+    (
+        "{src}/td-fido/src/hmac.rs",
+        include_str!("../../../td-fido/src/hmac.rs"),
+    ),
+    (
+        "{src}/td-fido/src/root.rs",
+        include_str!("../../../td-fido/src/root.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_aes.rs",
+        include_str!("../../../td-fido/src/fido_aes.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_cbor.rs",
+        include_str!("../../../td-fido/src/fido_cbor.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_ctap.rs",
+        include_str!("../../../td-fido/src/fido_ctap.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_device.rs",
+        include_str!("../../../td-fido/src/fido_device.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_enroll.rs",
+        include_str!("../../../td-fido/src/fido_enroll.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_fixtures.rs",
+        include_str!("../../../td-fido/src/fido_fixtures.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_hid.rs",
+        include_str!("../../../td-fido/src/fido_hid.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_p256.rs",
+        include_str!("../../../td-fido/src/fido_p256.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_pin.rs",
+        include_str!("../../../td-fido/src/fido_pin.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_transaction.rs",
+        include_str!("../../../td-fido/src/fido_transaction.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_virtual.rs",
+        include_str!("../../../td-fido/src/fido_virtual.rs"),
+    ),
+    (
+        "{src}/td-fido/src/fido_virtual_tests.rs",
+        include_str!("../../../td-fido/src/fido_virtual_tests.rs"),
+    ),
+];
 const JSON_RS: &str = include_str!("../../../td-json/src/lib.rs");
 const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
 const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
@@ -36,9 +122,6 @@ const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
 const PROTECTOR_PIN_RS: &str = include_str!("../../../td-protector/src/pin.rs");
-// td-protector's PIN derivation compiles td-fido's shared HMAC-SHA256 by
-// `#[path]` beside the engine SHA-256 staged above.
-const FIDO_HMAC_RS: &str = include_str!("../../../td-fido/src/hmac.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
@@ -153,11 +236,6 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
-            path: "{src}/td-tpm/src/lib.rs".into(),
-            content: TPM_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
             path: "{src}/td-json/src/lib.rs".into(),
             content: JSON_RS.into(),
             exec: false,
@@ -198,11 +276,6 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
-            path: "{src}/td-fido/src/hmac.rs".into(),
-            content: FIDO_HMAC_RS.into(),
-            exec: false,
-        },
-        Step::WriteFile {
             path: "{src}/td-protector/src/recovery.rs".into(),
             content: PROTECTOR_RECOVERY_RS.into(),
             exec: false,
@@ -226,6 +299,13 @@ pub fn recipe() -> Recipe {
             path: "{root}/eh".into(),
         },
     ];
+    for (path, content) in TPM_AND_FIDO {
+        steps.push(Step::WriteFile {
+            path: (*path).into(),
+            content: (*content).into(),
+            exec: false,
+        });
+    }
     for dest in [
         "{root}/profile-repro-a/source",
         "{root}/profile-repro-b/source",
@@ -248,10 +328,12 @@ pub fn recipe() -> Recipe {
         let source = format!("{root}/source");
         let output = format!("{root}/lib{name}.rlib");
         let lib = format!("{source}/{krate}/src/lib.rs");
-        let externs: Vec<String> = externs
+        // A dependency's own dependencies, td-tpm's td-fido, are found here.
+        let mut externs: Vec<String> = externs
             .iter()
             .flat_map(|dep| ["--extern".to_owned(), format!("{dep}={root}/lib{dep}.rlib")])
             .collect();
+        externs.extend(["-L".to_owned(), format!("dependency={root}")]);
         let mut args = vec![
             "--edition",
             "2021",
@@ -329,7 +411,8 @@ pub fn recipe() -> Recipe {
     // canonical remaps, deterministic build ID, runtime strip, and companion
     // transform must all converge byte for byte.
     for root in ["{root}/profile-repro-a", "{root}/profile-repro-b"] {
-        steps.push(library(root, "td_tpm", "td-tpm", &[]));
+        steps.push(library(root, "td_fido", "td-fido", &[]));
+        steps.push(library(root, "td_tpm", "td-tpm", &["td_fido"]));
         steps.push(library(root, "td_json", "td-json", &[]));
         steps.push(library(
             root,
@@ -380,7 +463,7 @@ mod tests {
     fn every_sibling_crate_source_is_staged() {
         crate::ladder::assert_sibling_sources_staged(
             super::recipe(),
-            &["td-tpm", "td-json", "td-protector"],
+            &["td-tpm", "td-fido", "td-json", "td-protector"],
         );
     }
 }

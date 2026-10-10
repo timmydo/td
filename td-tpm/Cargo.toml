@@ -3,12 +3,17 @@ name = "td-tpm"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "td's dependency-free TPM 2.0 client: transport, PCR policy, sealing and PCR extension"
+description = "td's TPM 2.0 client: transport, PCR policy, salted and PIN-authorized sessions, sealing and PCR extension"
 
 [package.metadata.td-gate]
 clippy-all-targets = true
 
 [workspace]
+
+# P-256 and AES for salted, parameter-encrypted sessions, and HMAC-SHA256
+# for their HMACs and key derivation (td-tpm/DESIGN.md).
+[dependencies]
+td-fido = { path = "../td-fido" }
 
 [lints.rust]
 unsafe_code = "forbid"

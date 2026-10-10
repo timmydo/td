@@ -1,6 +1,9 @@
-//! Bounded AES-256-CBC primitive for CTAP. No padding or authentication here.
+//! Bounded AES-256-CBC primitive for CTAP, and AES-128-CFB for td-tpm's
+//! session parameter encryption. No padding or authentication here.
 
 const MAX_BYTES: usize = 128;
+/// td-tpm's MAX_PACKET: no TPM parameter is longer.
+const MAX_CFB_BYTES: usize = 4096;
 
 pub fn encrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
     validate_length(bytes.len())?;
@@ -27,6 +30,38 @@ pub fn decrypt(key: &[u8; 32], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'
     Ok(())
 }
 
+/// AES-128 in CFB mode with 128-bit feedback, as TPM 2.0 parameter
+/// encryption uses it (Part 1, "CFB Mode Parameter Encryption"): a short
+/// last block takes the leading bytes of its keystream. An empty input is
+/// left as it is.
+pub fn cfb_encrypt(key: &[u8; 16], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
+    cfb(key, iv, bytes, true)
+}
+
+pub fn cfb_decrypt(key: &[u8; 16], iv: &[u8; 16], bytes: &mut [u8]) -> Result<(), &'static str> {
+    cfb(key, iv, bytes, false)
+}
+
+fn cfb(key: &[u8; 16], iv: &[u8; 16], bytes: &mut [u8], encrypt: bool) -> Result<(), &'static str> {
+    if bytes.len() > MAX_CFB_BYTES {
+        return Err("AES-CFB input exceeds 4096 bytes");
+    }
+    let aes = Aes128::new(key);
+    let mut feedback = *iv;
+    for chunk in bytes.chunks_mut(16) {
+        let mut pad = feedback;
+        aes.encrypt_block(&mut pad);
+        for (byte, (pad, next)) in chunk.iter_mut().zip(pad.iter().zip(feedback.iter_mut())) {
+            let ciphertext = if encrypt { *byte ^ pad } else { *byte };
+            *byte ^= pad;
+            *next = ciphertext;
+        }
+        pad.fill(0);
+        std::hint::black_box(&mut pad);
+    }
+    Ok(())
+}
+
 fn validate_length(size: usize) -> Result<(), &'static str> {
     if size == 0 || size > MAX_BYTES || !size.is_multiple_of(16) {
         return Err("CTAP AES input must contain one through eight complete blocks");
@@ -41,10 +76,56 @@ struct Aes256 {
 
 impl Drop for Aes256 {
     fn drop(&mut self) {
-        for key in self.rounds.iter_mut() {
-            key.fill(0);
+        clear(self.rounds.as_mut());
+    }
+}
+
+struct Aes128 {
+    rounds: Box<[[u8; 16]; 11]>,
+}
+
+impl Drop for Aes128 {
+    fn drop(&mut self) {
+        clear(self.rounds.as_mut());
+    }
+}
+
+fn clear(rounds: &mut [[u8; 16]]) {
+    for key in rounds.iter_mut() {
+        key.fill(0);
+    }
+    std::hint::black_box(rounds);
+}
+
+impl Aes128 {
+    fn new(key: &[u8; 16]) -> Self {
+        let mut aes = Self {
+            rounds: Box::new([[0; 16]; 11]),
+        };
+        let mut words = [0u32; 4];
+        for (word, bytes) in words.iter_mut().zip(key.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
-        std::hint::black_box(self.rounds.as_mut());
+        let mut rcon = 1u8;
+        for (round, output) in aes.rounds.iter_mut().enumerate() {
+            if round > 0 {
+                let [a, b, c, d] = words;
+                let t = sub_word(d.rotate_left(8)) ^ (u32::from(rcon) << 24);
+                rcon = xtime(rcon);
+                words = [a ^ t, b ^ a ^ t, c ^ b ^ a ^ t, d ^ c ^ b ^ a ^ t];
+            }
+            for (bytes, word) in output.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *bytes = word.to_be_bytes();
+            }
+        }
+        words.fill(0);
+        std::hint::black_box(&mut words);
+        aes
+    }
+
+    fn encrypt_block(&self, state: &mut [u8; 16]) {
+        let [first, middle @ .., last] = &*self.rounds;
+        encrypt_rounds(first, middle, last, state);
     }
 }
 
@@ -96,16 +177,7 @@ impl Aes256 {
 
     fn encrypt_block(&self, state: &mut [u8; 16]) {
         let [first, middle @ .., last] = &*self.rounds;
-        xor(state, first);
-        for key in middle {
-            substitute(state, sbox);
-            shift_rows(state);
-            mix_columns(state);
-            xor(state, key);
-        }
-        substitute(state, sbox);
-        shift_rows(state);
-        xor(state, last);
+        encrypt_rounds(first, middle, last, state);
     }
 
     fn decrypt_block(&self, state: &mut [u8; 16]) {
@@ -121,6 +193,19 @@ impl Aes256 {
         substitute(state, inverse_sbox);
         xor(state, first);
     }
+}
+
+fn encrypt_rounds(first: &[u8; 16], middle: &[[u8; 16]], last: &[u8; 16], state: &mut [u8; 16]) {
+    xor(state, first);
+    for key in middle {
+        substitute(state, sbox);
+        shift_rows(state);
+        mix_columns(state);
+        xor(state, key);
+    }
+    substitute(state, sbox);
+    shift_rows(state);
+    xor(state, last);
 }
 
 fn xor(state: &mut [u8; 16], key: &[u8; 16]) {
@@ -241,6 +326,53 @@ mod tests {
         let mut block = sealed;
         aes.decrypt_block(&mut block);
         assert_eq!(block, plain);
+    }
+
+    #[test]
+    fn fips197_aes128_block_and_schedule() {
+        let aes = Aes128::new(&hex("000102030405060708090a0b0c0d0e0f"));
+        let mut block = hex("00112233445566778899aabbccddeeff");
+        aes.encrypt_block(&mut block);
+        assert_eq!(block, hex("69c4e0d86a7b0430d8cdb78070b4c55a"));
+        // FIPS 197 A.1's last round key.
+        assert_eq!(
+            Aes128::new(&hex("2b7e151628aed2a6abf7158809cf4f3c")).rounds[10],
+            hex::<16>("d014f9a8c9ee2589e13f0cc8b6630ca6")
+        );
+    }
+
+    /// SP 800-38A F.3.13 and F.3.14, whole and cut short: a partial last
+    /// block is the leading bytes of the whole one's.
+    #[test]
+    fn nist_sp800_38a_cfb128_aes128_both_directions() {
+        let key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv = hex("000102030405060708090a0b0c0d0e0f");
+        let plain: [u8; 64] = hex(concat!(
+            "6bc1bee22e409f96e93d7e117393172a",
+            "ae2d8a571e03ac9c9eb76fac45af8e51",
+            "30c81c46a35ce411e5fbc1191a0a52ef",
+            "f69f2445df4f9b17ad2b417be66c3710",
+        ));
+        let sealed: [u8; 64] = hex(concat!(
+            "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b",
+            "26751f67a3cbb140b1808cf187a4f4dfc04b05357c5d1c0eeac4c66f9ff7f2e6",
+        ));
+        for size in 0..=64 {
+            let mut encrypted = plain[..size].to_vec();
+            cfb_encrypt(&key, &iv, &mut encrypted).unwrap();
+            assert_eq!(encrypted, sealed[..size]);
+            cfb_decrypt(&key, &iv, &mut encrypted).unwrap();
+            assert_eq!(encrypted, plain[..size]);
+        }
+        let mut long = vec![0xa5; MAX_CFB_BYTES + 1];
+        assert!(cfb_encrypt(&key, &iv, &mut long).is_err());
+        assert!(cfb_decrypt(&key, &iv, &mut long).is_err());
+        assert!(long.iter().all(|byte| *byte == 0xa5));
+        long.pop();
+        cfb_encrypt(&key, &iv, &mut long).unwrap();
+        assert!(long.iter().any(|byte| *byte != 0xa5));
+        cfb_decrypt(&key, &iv, &mut long).unwrap();
+        assert!(long.iter().all(|byte| *byte == 0xa5));
     }
 
     #[test]
