@@ -151,8 +151,10 @@ tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
 The packaging entry point supports `--version`, `--help`, and offline
-`store verify` for an explicitly selected account. STORAGE.md owns its scope
-and machine-readable results. Other commands arrive with their implementations. Its direct
+`store verify` for an explicitly selected account and stopped-database
+`backup` to a fresh destination. STORAGE.md owns their scope and
+machine-readable results. Other commands arrive with their implementations.
+Its direct
 dependencies are the local `td-crypto`, `td-header`, `td-json`, `td-mime`
 and `td-nfc` crates, plus the approved private rusqlite dependency with
 bundled SQLite. Application protocols, configuration and scheduling use std
@@ -1417,7 +1419,9 @@ connections, copies through caller-owned 64 KiB scratch under retained source
 and destination locks, and publishes without replacement only after file sync.
 Its receipt follows destination directory sync; explicit failure phases keep
 partial artifacts distinguishable from successful backups. STORAGE.md owns
-the bounded copy and offline recovery contract; no backup CLI is enabled.
+the bounded copy and offline recovery contract. The offline `backup` CLI
+exposes this database-only copy without semantic verification or restore
+authority; it does not include configuration or credentials.
 Old schemas are refused; no data migration is required.
 Startup validates the closed schema and store identity without a full integrity
 scan. Explicit validate_integrity maintenance runs SQLite's full

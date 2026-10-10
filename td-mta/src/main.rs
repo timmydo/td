@@ -1,4 +1,4 @@
-//! Offline account verification and packaging entry point.
+//! Offline account verification, database backup and packaging entry point.
 #![forbid(unsafe_code)]
 
 use std::{
@@ -15,11 +15,12 @@ use td_mta::{
     metadata_sweep,
     ports::{self, Clock, Deadline},
     store_fs::{
-        AccountCheckError, AccountCheckLimits, BodyCheckLimits, IndexStore, LockError, PrivateRoot,
+        AccountCheckError, AccountCheckLimits, BackupError, BackupReceipt, BodyCheckLimits,
+        IndexStore, LockError, LockedRoot, PrivateRoot,
     },
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH --account ID [--timeout-seconds N]\n\nVerify database integrity and the selected account's metadata and body digests.\nRun offline with access to the private store; the writer lock must be free.\nJSON output describes only the selected account. Default timeout: 600 seconds.\nNo repair or serving commands are available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store verify --root PATH --account ID [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and the selected account's metadata and body digests.\nRun offline with access to the private store; the writer lock must be free.\nVerification JSON describes only the selected account. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nNo repair, restore or serving commands are available.\n";
 
 struct Verify {
     root: String,
@@ -37,14 +38,7 @@ fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Verif
             "--root" if root.is_none() => root = Some(value),
             "--account" if account.is_none() => account = Some(AccountId::parse(&value).ok()?),
             "--timeout-seconds" if timeout.is_none() => {
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return None;
-                }
-                let seconds = value.parse::<u64>().ok()?;
-                if seconds == 0 {
-                    return None;
-                }
-                timeout = Some(seconds.checked_mul(1000)?);
+                timeout = Some(timeout_ms(&value)?);
             }
             _ => return None,
         }
@@ -52,6 +46,43 @@ fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Verif
     Some(Verify {
         root: root?,
         account: account?,
+        timeout_ms: timeout.unwrap_or(600_000),
+    })
+}
+
+struct Backup {
+    root: String,
+    destination: String,
+    timeout_ms: u64,
+}
+
+fn timeout_ms(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.parse::<u64>().ok()?;
+    if seconds == 0 {
+        return None;
+    }
+    seconds.checked_mul(1000)
+}
+
+fn backup_arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<Backup> {
+    let mut root = None;
+    let mut destination = None;
+    let mut timeout = None;
+    while let Some(flag) = args.next() {
+        let value = args.next()?.into_string().ok()?;
+        match flag.to_str()? {
+            "--root" if root.is_none() => root = Some(value),
+            "--destination" if destination.is_none() => destination = Some(value),
+            "--timeout-seconds" if timeout.is_none() => timeout = Some(timeout_ms(&value)?),
+            _ => return None,
+        }
+    }
+    Some(Backup {
+        root: root?,
+        destination: destination?,
         timeout_ms: timeout.unwrap_or(600_000),
     })
 }
@@ -93,29 +124,80 @@ fn adapter(stage: &'static str, error: ports::Error) -> Failure {
     Failure { stage, code }
 }
 
+fn scope(clock: &dyn Clock, timeout_ms: u64) -> Result<Deadline, Failure> {
+    let started = clock.sample().map_err(|error| adapter("clock", error))?;
+    Deadline::after(started.monotonic, timeout_ms).map_err(|_| Failure {
+        stage: "arguments",
+        code: "invalid-arguments",
+    })
+}
+
+fn locked_root(
+    path: &str,
+    root_stage: &'static str,
+    lock_stage: &'static str,
+) -> Result<LockedRoot, Failure> {
+    let root = PrivateRoot::open(path).map_err(|_| Failure {
+        stage: root_stage,
+        code: "root-policy-or-io",
+    })?;
+    root.try_lock().map_err(|error| Failure {
+        stage: lock_stage,
+        code: match error {
+            LockError::Busy => "busy",
+            LockError::Policy => "lock-policy",
+            LockError::Io(_) => "io",
+        },
+    })
+}
+
+struct BackupFailure {
+    failure: Failure,
+    publication: &'static str,
+}
+impl From<Failure> for BackupFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            publication: "unpublished",
+        }
+    }
+}
+
+fn backup(options: Backup) -> Result<BackupReceipt, BackupFailure> {
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let deadline = scope(clock.as_ref(), options.timeout_ms)?;
+    let mut source = locked_root(&options.root, "source-root", "source-lock")?;
+    let mut destination =
+        locked_root(&options.destination, "destination-root", "destination-lock")?;
+    let store = IndexStore::open(&mut source, clock, 1, deadline)
+        .map_err(|error| adapter("source-open", error))?;
+    store
+        .backup(&mut destination, deadline, &mut [0; 65536])
+        .map_err(|error| match error {
+            BackupError::Unpublished(error) => BackupFailure {
+                failure: adapter("copy", error),
+                publication: "unpublished",
+            },
+            BackupError::IncompletePublication(error) => BackupFailure {
+                failure: adapter("publication", error),
+                publication: "uncertain",
+            },
+        })
+}
+
+fn backup_failure(output: &mut impl Write, error: BackupFailure) -> io::Result<()> {
+    writeln!(output, "{{\"schema\":1,\"command\":\"backup\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"publication\":\"{}\"}}", error.failure.stage, error.failure.code, error.publication)
+}
+
 fn verify(options: Verify) -> Result<CompleteChecks, Failure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     verify_with_clock(options, clock)
 }
 
 fn verify_with_clock(options: Verify, clock: Arc<dyn Clock>) -> Result<CompleteChecks, Failure> {
-    let started = clock.sample().map_err(|error| adapter("clock", error))?;
-    let deadline = Deadline::after(started.monotonic, options.timeout_ms).map_err(|_| Failure {
-        stage: "arguments",
-        code: "invalid-arguments",
-    })?;
-    let root = PrivateRoot::open(&options.root).map_err(|_| Failure {
-        stage: "root",
-        code: "root-policy-or-io",
-    })?;
-    let mut root = root.try_lock().map_err(|error| Failure {
-        stage: "lock",
-        code: match error {
-            LockError::Busy => "busy",
-            LockError::Policy => "lock-policy",
-            LockError::Io(_) => "io",
-        },
-    })?;
+    let deadline = scope(clock.as_ref(), options.timeout_ms)?;
+    let mut root = locked_root(&options.root, "root", "lock")?;
     let store = IndexStore::open(&mut root, Arc::clone(&clock), 1, deadline)
         .map_err(|error| adapter("open", error))?;
     store
@@ -161,6 +243,30 @@ fn run() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let first = args.next();
+    if first.as_deref() == Some(OsStr::new("backup")) {
+        let Some(options) = backup_arguments(args) else {
+            backup_failure(
+                &mut io::stdout().lock(),
+                Failure {
+                    stage: "arguments",
+                    code: "invalid-arguments",
+                }
+                .into(),
+            )?;
+            return Ok(ExitCode::from(2));
+        };
+        return match backup(options) {
+            Ok(receipt) => {
+                writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"backup\",\"status\":\"ok\",\"scope\":\"database\",\"epoch\":\"{}\",\"bytes\":{},\"semantic_verified\":false}}", receipt.epoch, receipt.bytes)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let code = error.failure.exit_code();
+                backup_failure(&mut io::stdout().lock(), error)?;
+                Ok(code)
+            }
+        };
+    }
     if first.as_deref() == Some(OsStr::new("store")) {
         if args.next().as_deref() != Some(OsStr::new("verify")) {
             failure(

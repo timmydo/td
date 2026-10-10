@@ -155,6 +155,15 @@ impl Fixture {
     fn verify(&self, account: AccountId) -> Output {
         self.command(account).output().unwrap()
     }
+    fn backup_command(&self, destination: &Self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_td-mta"));
+        command
+            .args(["backup", "--root"])
+            .arg(&self.0)
+            .arg("--destination")
+            .arg(&destination.0);
+        command
+    }
     fn corrupt(&self, marker: &[u8]) {
         let path = self.0.join("metadata.sqlite3");
         let mut bytes = fs::read(&path).unwrap();
@@ -356,4 +365,171 @@ fn malformed_options_are_rejected_before_store_access() {
     let json = report(&output, 2);
     assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
     assert!(!fixture.0.join("LOCK").exists());
+}
+
+#[test]
+fn backup_copies_all_accounts_without_overwrite_or_semantic_claim() {
+    if private_case("backup_copies_all_accounts_without_overwrite_or_semantic_claim") {
+        return;
+    }
+    let source = Fixture::new();
+    source.seed();
+    let destination = Fixture::new();
+    let output = source
+        .backup_command(&destination)
+        .args(["--timeout-seconds", "60"])
+        .output()
+        .unwrap();
+    let json = report_command(&output, 0, "backup");
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert_eq!(json.get("scope").unwrap().as_str(), Some("database"));
+    assert_eq!(
+        json.get("semantic_verified"),
+        Some(&td_json::Json::Bool(false))
+    );
+    assert_eq!(
+        json.get("epoch").unwrap().as_str(),
+        Some(StoreEpoch::from_bytes([9; 16]).to_string().as_str())
+    );
+    let path = destination.0.join("metadata.sqlite3");
+    let copied = fs::read(&path).unwrap();
+    assert_eq!(
+        json.get("bytes").unwrap().as_u64(),
+        Some(copied.len() as u64)
+    );
+    assert_eq!(copied, fs::read(source.0.join("metadata.sqlite3")).unwrap());
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    assert!(!destination
+        .0
+        .join("metadata.sqlite3.backup-partial")
+        .exists());
+    for (account, bytes) in [(ACCOUNT, 65_553), (OTHER, 43)] {
+        let checked = report(&destination.verify(account), 0);
+        assert_eq!(checked.get("body_bytes").unwrap().as_u64(), Some(bytes));
+        assert_eq!(checked.get("sequence").unwrap().as_u64(), Some(1));
+        assert_eq!(checked.get("epoch"), json.get("epoch"));
+    }
+    let before_refusal = fs::read(&path).unwrap();
+    let output = source.backup_command(&destination).output().unwrap();
+    let refused = report_command(&output, 1, "backup");
+    assert_eq!(refused.get("error").unwrap().as_str(), Some("conflict"));
+    assert_eq!(
+        refused.get("publication").unwrap().as_str(),
+        Some("unpublished")
+    );
+    assert_eq!(fs::read(path).unwrap(), before_refusal);
+    report(&source.verify(ACCOUNT), 0);
+
+    // A consistent backup preserves damage; its receipt is not verification.
+    source.corrupt(MARKER);
+    let damaged = Fixture::new();
+    let output = source.backup_command(&damaged).output().unwrap();
+    let copied_damage = report_command(&output, 0, "backup");
+    assert_eq!(
+        copied_damage.get("semantic_verified"),
+        Some(&td_json::Json::Bool(false))
+    );
+    let failed_check = report(&damaged.verify(ACCOUNT), 1);
+    assert_eq!(failed_check.get("stage").unwrap().as_str(), Some("bodies"));
+    assert_eq!(failed_check.get("error").unwrap().as_str(), Some("corrupt"));
+}
+
+#[test]
+fn backup_refuses_busy_or_invalid_roots_without_publication() {
+    if private_case("backup_refuses_busy_or_invalid_roots_without_publication") {
+        return;
+    }
+    let source = Fixture::new();
+    source.seed();
+    let destination = Fixture::new();
+    for (fixture, stage) in [(&source, "source-lock"), (&destination, "destination-lock")] {
+        let lock = PrivateRoot::open(fixture.0.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let output = source.backup_command(&destination).output().unwrap();
+        let json = report_command(&output, 1, "backup");
+        assert_eq!(json.get("stage").unwrap().as_str(), Some(stage));
+        assert_eq!(json.get("error").unwrap().as_str(), Some("busy"));
+        assert_eq!(
+            json.get("publication").unwrap().as_str(),
+            Some("unpublished")
+        );
+        drop(lock);
+        assert!(!destination.0.join("metadata.sqlite3").exists());
+        assert!(!destination
+            .0
+            .join("metadata.sqlite3.backup-partial")
+            .exists());
+    }
+    fs::set_permissions(&destination.0, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = source.backup_command(&destination).output().unwrap();
+    let json = report_command(&output, 1, "backup");
+    assert_eq!(
+        json.get("stage").unwrap().as_str(),
+        Some("destination-root")
+    );
+    assert_eq!(
+        json.get("publication").unwrap().as_str(),
+        Some("unpublished")
+    );
+    fs::set_permissions(&destination.0, fs::Permissions::from_mode(0o700)).unwrap();
+    let original = fs::read(source.0.join("metadata.sqlite3")).unwrap();
+    let output = source.backup_command(&source).output().unwrap();
+    let json = report_command(&output, 1, "backup");
+    assert_eq!(
+        json.get("publication").unwrap().as_str(),
+        Some("unpublished")
+    );
+    assert_eq!(
+        fs::read(source.0.join("metadata.sqlite3")).unwrap(),
+        original
+    );
+    report(&source.verify(ACCOUNT), 0);
+}
+
+#[test]
+fn backup_arguments_refuse_before_either_root_is_accessed() {
+    if private_case("backup_arguments_refuse_before_either_root_is_accessed") {
+        return;
+    }
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    for extra in [
+        vec!["--root", "duplicate"],
+        vec!["--destination", "duplicate"],
+        vec!["--timeout-seconds", "0"],
+        vec!["--timeout-seconds", "18446744073709551615"],
+        vec!["--account", "invalid-for-backup"],
+    ] {
+        let output = source
+            .backup_command(&destination)
+            .args(extra)
+            .output()
+            .unwrap();
+        let json = report_command(&output, 2, "backup");
+        assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
+        assert_eq!(
+            json.get("error").unwrap().as_str(),
+            Some("invalid-arguments")
+        );
+        assert!(!source.0.join("LOCK").exists());
+        assert!(!destination.0.join("LOCK").exists());
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["backup", "--root"])
+        .arg(&source.0)
+        .output()
+        .unwrap();
+    let json = report_command(&output, 2, "backup");
+    assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
+    let output = source
+        .backup_command(&destination)
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .arg("x")
+        .output()
+        .unwrap();
+    report_command(&output, 2, "backup");
+    assert!(!source.0.join("LOCK").exists());
+    assert!(!destination.0.join("LOCK").exists());
 }

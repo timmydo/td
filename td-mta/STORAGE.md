@@ -2167,3 +2167,58 @@ bytes refuses after physical validation; corrupting the other account's body
 does not enlarge selected-account scope. Corrupt database headers, occupied
 locks, missing accounts, invalid permissions and malformed arguments refuse.
 Reopen checks preserve the original epoch and committed account sequence.
+
+## Offline database backup command
+
+`td-mta backup --root PATH --destination PATH [--timeout-seconds N]`
+opens the existing source and destination private roots under their cooperative
+locks and delegates to the consuming `IndexStore::backup` primitive above.
+Run stopped as a local administrator under the same dedicated-owner and
+stable-path assumptions as verification. The command never creates root
+directories. The destination must have no database, WAL, SHM, backup-partial or
+legacy FORMAT entry; no existing file is overwritten or automatically removed.
+The filesystem must support hard links and directory sync. Source and
+destination locks remain held through checkpoint, native connection closure,
+copy and durable publication. They release before the historical result is
+written. Lock acquisition may create LOCK; source opening/checkpoint may
+recover WAL and change native sidecars.
+
+One RuntimeClock and absolute deadline cover both root acquisitions, source
+opening, checkpoint and streaming copy. The timeout defaults to 600 seconds
+and accepts the same positive decimal/checked arithmetic as verification.
+Existing native allowances, the 8 GiB database ceiling and 64 KiB copy scratch
+remain. No disk space is reserved. Native and synchronous kernel operations
+cannot be forcibly interrupted at the deadline. After the final-name link
+succeeds, cleanup and directory sync proceed without a new deadline refusal
+that could conceal completed durability.
+
+Schema-1 JSON success has `command: "backup"`, `status: "ok"`,
+`scope: "database"`, canonical `epoch`, copied `bytes`, and
+`semantic_verified: false`. Completion certifies the stopped, checkpointed
+database copy's publication, not physical/domain/digest verification. The copy
+includes all accounts' database metadata, history and bodies; it can preserve
+corruption. It excludes service configuration, credentials and disposable
+spools. It preserves the source epoch for offline inspection. Restoring it for
+service requires a separately implemented fresh-epoch restore; no restore or
+serving command is enabled by this increment.
+
+Failures have fixed `stage`, adapter `error`, and `publication`. `unpublished`
+means this invocation did not attempt final-name publication; it can still
+leave a partial file, and pre-existing destination files may remain.
+`uncertain` means publication was attempted, but the final name, partial-name
+cleanup or directory durability is unproven. Neither grants a successful
+backup or automatic deletion. Inspect artifacts explicitly under both locks
+before retrying. Root/lock stages identify `source-root`, `source-lock`,
+`destination-root` or `destination-lock`; native opening uses `source-open`,
+unpublished copy errors use `copy`, and uncertain publication uses
+`publication`. Clock/arguments stages and the zero/one/two exit meanings are
+the same as verification. Output failure exits one and can follow a completed
+durable copy; absence of a success line does not authorize removing it.
+
+Process fixtures exercise two accounts sharing a BlobId and a multi-chunk
+body, verify copied account sequences/epoch and full digests, compare copied
+bytes and private file mode, and refuse replacement, occupied roots, bad
+permissions, identical roots and invalid/non-UTF-8 arguments. A damaged digest
+survives a successful copy and fails subsequent verification, pinning the
+receipt's limited claim. Existing primitive tests own publication-fault and
+process-death evidence; the CLI adds no fault hook or resource matrix.

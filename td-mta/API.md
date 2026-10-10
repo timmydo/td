@@ -6960,8 +6960,10 @@ calls whose filesystem effects may be uncertain. Neither failure grants successf
 backup acknowledgement. Both can leave artifacts for explicit offline
 inspection, and both consume the engine. STORAGE.md owns recovery of the
 brief two-link publication state, original clock handoff and filesystem
-limits. This is an offline storage primitive; it grants no CLI, online backup,
-quota reservation, body-integrity or service-activation claim. Opening a
+limits. This offline storage primitive grants no online backup, quota
+reservation, body-integrity or service-activation claim. The separate offline
+`backup` command exposes its database-only copy and failure phases as specified
+in STORAGE.md. Opening a
 snapshot permits offline inspection; restoring it for service requires a
 fresh epoch.
 
