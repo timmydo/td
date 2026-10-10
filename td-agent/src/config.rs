@@ -83,6 +83,10 @@ pub struct Client {
     /// The model that writes a compaction's summary; the conversation's
     /// own when none.
     pub compact_model: Option<String>,
+    /// The model and routing an explore sub-agent runs on (DESIGN.md
+    /// §12, `task`); the conversation's own when none.
+    pub explore_model: Option<String>,
+    pub explore_routing: Option<String>,
     /// The model a `/review` runs on (DESIGN.md §15, `/review`); the
     /// conversation's own when none.
     pub review_model: Option<String>,
@@ -303,6 +307,8 @@ impl Default for Client {
             compact_at: DEFAULT_COMPACT_AT,
             compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
             compact_model: None,
+            explore_model: None,
+            explore_routing: None,
             review_model: None,
             review_max_cost: DEFAULT_REVIEW_MAX_COST,
             cache_ttl: DEFAULT_CACHE_TTL,
@@ -390,6 +396,7 @@ impl Client {
         ]
         .into_iter()
         .chain(&self.compact_model)
+        .chain(&self.explore_model)
         {
             if !wanted.contains(id) {
                 wanted.push(id.clone());
@@ -511,6 +518,14 @@ impl Client {
             (
                 "compact_model".into(),
                 self.compact_model.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "explore_model".into(),
+                self.explore_model.clone().map_or(Json::Null, Json::Str),
+            ),
+            (
+                "explore_routing".into(),
+                self.explore_routing.clone().map_or(Json::Null, Json::Str),
             ),
             (
                 "review_model".into(),
@@ -641,6 +656,20 @@ impl Client {
                     "compact_model",
                     id.as_str().ok_or("compact_model is not text")?,
                 )?),
+            },
+            explore_model: match value.get("explore_model") {
+                None | Some(Json::Null) => None,
+                Some(id) => Some(model_id(
+                    "explore_model",
+                    id.as_str().ok_or("explore_model is not text")?,
+                )?),
+            },
+            explore_routing: match value.get("explore_routing") {
+                None | Some(Json::Null) => None,
+                Some(word) => Some(
+                    routing(word.as_str().ok_or("explore_routing is not text")?)
+                        .map_err(|why| why.replacen("`routing`", "`explore_routing`", 1))?,
+                ),
             },
             review_model: match value.get("review_model") {
                 None | Some(Json::Null) => None,
@@ -997,6 +1026,8 @@ const KEYS: &[(&str, Use)] = &[
     ("compact_at", Use::Read),
     ("compact_keep_tokens", Use::Read),
     ("compact_model", Use::Read),
+    ("explore_model", Use::Read),
+    ("explore_routing", Use::Read),
     ("review_model", Use::Read),
     ("review_max_cost", Use::Read),
     ("cache_ttl", Use::Read),
@@ -1833,6 +1864,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
         config.client.compact_model = Some(model_id("compact_model", id)?);
     }
     if let Some(id) = table
+        .optional_str("explore_model")
+        .map_err(|e| e.to_string())?
+    {
+        config.client.explore_model = Some(model_id("explore_model", id)?);
+    }
+    if let Some(word) = table
+        .optional_str("explore_routing")
+        .map_err(|e| e.to_string())?
+    {
+        config.client.explore_routing =
+            Some(routing(word).map_err(|why| why.replacen("`routing`", "`explore_routing`", 1))?);
+    }
+    if let Some(id) = table
         .optional_str("review_model")
         .map_err(|e| e.to_string())?
     {
@@ -2153,6 +2197,25 @@ mod tests {
             Client::from_json(&value).unwrap_err(),
             "jev_threshold is not a whole number"
         );
+    }
+
+    #[test]
+    fn an_explore_sub_agent_has_its_own_model_and_routing() {
+        let default = Config::default().client;
+        assert_eq!(
+            (default.explore_model, default.explore_routing),
+            (None, None)
+        );
+        let client = parse("explore_model = \"a/cheap\"\nexplore_routing = \"cheapest\"\n")
+            .unwrap()
+            .client;
+        assert_eq!(client.explore_model.as_deref(), Some("a/cheap"));
+        assert_eq!(client.explore_routing.as_deref(), Some("cheapest"));
+        assert_eq!(Client::from_json(&client.to_json()).unwrap(), client);
+        assert!(client.wanted().contains(&"a/cheap".to_string()));
+        let refused = parse("explore_routing = \"quickest\"").unwrap_err();
+        assert!(refused.contains("`explore_routing` is one of"), "{refused}");
+        assert!(parse("explore_model = \"a b\"").is_err());
     }
 
     #[test]

@@ -201,7 +201,7 @@ pub fn render(event: &Event) -> String {
             prompt,
             ..
         } => format!(
-            "a {agent} sub-agent began on {model}, for the call at #{call}, asked:\n{prompt}"
+            "the {agent} sub-agent began on {model}, for the call at #{call}, asked:\n{prompt}"
         ),
         Kind::TaskNote { task, text } => format!("td-agent told the sub-agent at #{task}:\n{text}"),
         Kind::Review {

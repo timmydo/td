@@ -21,6 +21,7 @@ pub const CONVERSATION: &str = include_str!("../prompt/conversation.txt");
 pub const NO_WORKSPACE: &str = include_str!("../prompt/no-workspace.txt");
 pub const WORKSPACE: &str = include_str!("../prompt/workspace.txt");
 pub const TASK: &str = include_str!("../prompt/task.txt");
+pub const EXPLORE: &str = include_str!("../prompt/explore.txt");
 const TOOLS: &str = "{tools}";
 /// The system text of a title request (DESIGN.md §13).
 pub const TITLE: &str = include_str!("../prompt/title.txt");
@@ -131,18 +132,32 @@ pub fn prefix_with(created: u64, place: Option<&Place>, skills: Option<&str>) ->
 /// A sub-agent's prefix (DESIGN.md §12, `task`): its own instructions,
 /// the environment and project instructions of the conversation's
 /// workspace `place`, and the workspace's tools alone.
-pub fn task_prefix(created: u64, place: &Place) -> String {
+pub fn task_prefix(created: u64, place: &Place, agent: crate::tools::SubAgent) -> String {
+    let explore = agent == crate::tools::SubAgent::Explore;
+    let explore_git = format!("{GIT_WORK} {TASK_GIT}");
     let environment: Vec<String> = environment(created, &os(OS_RELEASE), Some(place))
         .lines()
         .filter(|line| !NOT_TASKS.iter().any(|not| line.starts_with(not)))
+        // An explorer runs nothing, so no command reaches the network.
+        .filter(|line| !(explore && line.starts_with("- Network:")))
         .map(|line| line.replace(GIT_TOOLS, TASK_GIT).replace(READY_NEWS, ""))
+        .map(|line| match explore {
+            true => line
+                .replace(SHELL_THERE, SEARCH_THERE)
+                .replace(&explore_git, EXPLORE_GIT),
+            false => line,
+        })
         .collect();
-    let mut system = format!("{}\n\n{}", TASK.trim_end(), environment.join("\n"));
+    let instructions = match agent {
+        crate::tools::SubAgent::General => TASK,
+        crate::tools::SubAgent::Explore => EXPLORE,
+    };
+    let mut system = format!("{}\n\n{}", instructions.trim_end(), environment.join("\n"));
     if let Some(project) = project(place) {
         system.push_str("\n\n");
         system.push_str(&project);
     }
-    crate::tools::prefix(crate::tools::Kit::Task, place.system, &system)
+    crate::tools::prefix(agent.kit(), place.system, &system)
 }
 
 /// A repository workspace's project instructions (DESIGN.md §13), none
@@ -249,6 +264,15 @@ const GIT_TOOLS: &str = "git_fetch fetches a worktree's remote, and git_push pus
 /// What the workspace line says of news a sub-agent is never sent.
 const READY_NEWS: &str = ", and td-agent tells you when it is ready or fails";
 const TASK_GIT: &str = "git through shell has no credentials, and reaches the network only as the Network line says; fetching and pushing are the conversation's, not yours.";
+
+/// What the environment block says of a shell and of git through it,
+/// which an explore sub-agent has not, and what it is told instead.
+const SHELL_THERE: &str =
+    "shell runs there unless told otherwise, and glob and grep search there by default";
+const SEARCH_THERE: &str = "glob and grep search there by default";
+const GIT_WORK: &str = "Commit there with git through shell; widen a worktree's paths with `git sparse-checkout add`. The repository's configuration is td-agent's and read-only.";
+const EXPLORE_GIT: &str =
+    "A path outside a worktree's sparse paths is not checked out: say so rather than guess at it.";
 
 /// The lines of the environment block a sub-agent's has not: the time
 /// stamps and news that come to the conversation's messages alone.
@@ -494,7 +518,7 @@ mod tests {
         assert!(!block.contains("Git: none"), "{block}");
         // A sub-agent's has the worktrees, and neither the news, the time
         // stamps nor the git tools, which are the conversation's.
-        let task = task_prefix(0, &place);
+        let task = task_prefix(0, &place, crate::tools::SubAgent::General);
         assert!(task.contains("You are a sub-agent of td-agent"), "{task}");
         assert!(task.contains("`git sparse-checkout add`"), "{task}");
         assert!(
@@ -512,6 +536,28 @@ mod tests {
             "tells you when",
         ] {
             assert!(!task.contains(gone), "{gone}: {task}");
+        }
+        // An explorer's has no shell, no git work and no network line,
+        // and its own instructions and tools.
+        let explore = task_prefix(0, &place, crate::tools::SubAgent::Explore);
+        assert!(
+            explore.contains("You are an explore sub-agent"),
+            "{explore}"
+        );
+        assert!(
+            explore.contains("glob and grep search there by default"),
+            "{explore}"
+        );
+        assert!(explore.contains(EXPLORE_GIT), "{explore}");
+        for gone in [
+            "shell runs there",
+            "git sparse-checkout add",
+            "git through shell",
+            "- Network:",
+            "You are a sub-agent of td-agent",
+            "\"name\":\"shell\"",
+        ] {
+            assert!(!explore.contains(gone), "{gone}: {explore}");
         }
     }
 
@@ -736,6 +782,16 @@ mod tests {
             allowlist: &[],
             system: false,
         };
+        // An explorer of a directory or scratch is told it searches there,
+        // never that a shell runs, whatever the block's wording.
+        for place in [&place, &scratch] {
+            assert!(environment(0, "td", Some(place)).contains(SHELL_THERE));
+            let explore = task_prefix(0, place, crate::tools::SubAgent::Explore);
+            assert!(explore.contains(SEARCH_THERE), "{explore}");
+            for gone in ["shell", "- Network:"] {
+                assert!(!explore.contains(gone), "{gone}: {explore}");
+            }
+        }
         let block = environment(0, "td", Some(&scratch));
         let odd = Place {
             scratch: false,

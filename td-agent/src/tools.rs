@@ -94,6 +94,44 @@ pub enum Kit {
     Review,
     /// A sub-agent's (DESIGN.md §12, `task`): a workspace's tools alone.
     Task,
+    /// An explore sub-agent's: the workspace's read and search tools.
+    Explore,
+}
+
+/// Which sub-agent a `task` call asks for (DESIGN.md §12, `task`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubAgent {
+    /// The workspace's tools, writes and commands included.
+    General,
+    /// Reading and searching alone, typically on a cheaper model.
+    Explore,
+}
+
+impl SubAgent {
+    pub const WORDS: &[&str] = &["general", "explore"];
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Explore => "explore",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "general" => Some(Self::General),
+            "explore" => Some(Self::Explore),
+            _ => None,
+        }
+    }
+
+    /// The tools it is given.
+    pub fn kit(self) -> Kit {
+        match self {
+            Self::General => Kit::Task,
+            Self::Explore => Kit::Explore,
+        }
+    }
 }
 
 /// The tools every conversation has, in the order the prefix defines
@@ -164,6 +202,11 @@ const TASK: &[Tool] = &[
     Tool::WebFetch,
 ];
 
+/// An explore sub-agent's tools (DESIGN.md §12, `task`): it reads and
+/// searches, and changes and runs nothing: only a rule or a repeated call
+/// puts one of its calls on a card.
+const EXPLORE: &[Tool] = &[Tool::ReadFile, Tool::Glob, Tool::Grep];
+
 /// What a conversation in a workspace hands work on with (DESIGN.md §12,
 /// `task`), after the conversation's own tools.
 const DELEGATE: &[Tool] = &[Tool::Task];
@@ -216,6 +259,7 @@ impl Tool {
         match kit {
             Kit::Review => return REVIEW.to_vec(),
             Kit::Task => return TASK.to_vec(),
+            Kit::Explore => return EXPLORE.to_vec(),
             _ => {}
         }
         let mut tools = CONVERSATION.to_vec();
@@ -586,12 +630,18 @@ pub(crate) fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Task => (
-            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace with its file, shell and web tools, and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. Its writes and commands wait for the person's approval as yours do. It runs within this turn, on this conversation's model, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use it for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
+            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. A general sub-agent has the workspace's file, shell and web tools, on this conversation's model, and its writes and commands wait for the person's approval as yours do. An explore sub-agent only reads and searches the workspace, with read_file, glob and grep, changes and runs nothing, and usually runs on a cheaper model the person configured: use it to find and understand code. Either runs within this turn, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use one for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
             schema(
-                vec![(
-                    "prompt",
-                    property("string", "The work and everything the sub-agent needs to do it, at most 32768 bytes."),
-                )],
+                vec![
+                    (
+                        "prompt",
+                        property("string", "The work and everything the sub-agent needs to do it, at most 32768 bytes."),
+                    ),
+                    (
+                        "agent",
+                        one_of("Which sub-agent: general, with the workspace's tools, or explore, reading and searching alone; general when left out.", SubAgent::WORDS),
+                    ),
+                ],
                 &["prompt"],
             ),
         ),
@@ -730,6 +780,7 @@ pub enum Args {
     /// `task`, with the sub-agent's prompt (DESIGN.md §12).
     Task {
         prompt: String,
+        agent: SubAgent,
     },
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
@@ -1267,7 +1318,16 @@ pub fn parse_offered(
             }
         }
         Tool::Task => {
-            let m = members(tool_name, &value, &["prompt"])?;
+            let m = members(tool_name, &value, &["prompt", "agent"])?;
+            let agent = match text(m, "agent")? {
+                None => SubAgent::General,
+                Some(word) => SubAgent::parse(word).ok_or_else(|| {
+                    format!(
+                        "`agent` is one of {}, not {word:?}",
+                        SubAgent::WORDS.join(", ")
+                    )
+                })?,
+            };
             let prompt = required(m, "prompt")?.trim();
             if prompt.is_empty() {
                 return Err("`prompt` is empty".into());
@@ -1280,6 +1340,7 @@ pub fn parse_offered(
             }
             Args::Task {
                 prompt: prompt.to_string(),
+                agent,
             }
         }
         Tool::SystemStatus => {
@@ -2096,7 +2157,7 @@ mod tests {
                 Some(&Tool::Task)
             );
         }
-        for kit in [Kit::Conversation, Kit::Review, Kit::Task] {
+        for kit in [Kit::Conversation, Kit::Review, Kit::Task, Kit::Explore] {
             assert!(!Tool::offered(kit, true).contains(&Tool::Task));
         }
         let sub = Tool::offered(Kit::Task, true);
@@ -2108,9 +2169,40 @@ mod tests {
         assert_eq!(
             parse_offered(Kit::Workspace, false, "task", r#"{"prompt":"  Find it. "}"#).unwrap(),
             Args::Task {
-                prompt: "Find it.".into()
+                prompt: "Find it.".into(),
+                agent: SubAgent::General,
             }
         );
+        assert_eq!(
+            parse_offered(
+                Kit::Workspace,
+                false,
+                "task",
+                r#"{"prompt":"x","agent":"explore"}"#
+            )
+            .unwrap(),
+            Args::Task {
+                prompt: "x".into(),
+                agent: SubAgent::Explore,
+            }
+        );
+        assert!(parse_offered(
+            Kit::Workspace,
+            false,
+            "task",
+            r#"{"prompt":"x","agent":"y"}"#
+        )
+        .is_err());
+        // An explore sub-agent reads and searches alone, with the system
+        // view where its template gives it.
+        let explore = Tool::offered(Kit::Explore, true);
+        assert_eq!(
+            explore,
+            [Tool::ReadFile, Tool::Glob, Tool::Grep, Tool::SystemStatus]
+        );
+        assert!(explore.iter().all(|t| !t.acts()));
+        assert!(parse_offered(Kit::Explore, false, "shell", r#"{"command":"ls"}"#).is_err());
+        assert!(parse_offered(Kit::Explore, false, "task", r#"{"prompt":"x"}"#).is_err());
         for bad in [r#"{}"#, r#"{"prompt":"  "}"#, r#"{"prompt":"x","more":1}"#] {
             assert!(
                 parse_offered(Kit::Workspace, false, "task", bad).is_err(),

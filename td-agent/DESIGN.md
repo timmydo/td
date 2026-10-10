@@ -5240,8 +5240,9 @@ directory and git tools, as far as the workspace has what they act on.
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
 - **`git_fetch`** and **`git_push`**: §9.
-- **`task {prompt}`**: hands a piece of work to a sub-agent, in a
-  conversation with a workspace (As built (`task`), below).
+- **`task {prompt, agent?}`**: hands a piece of work to a sub-agent, a
+  general one or one that explores, in a conversation with a workspace
+  (As built (`task`), below).
 
 Paths are absolute. Worktrees and shared directories are bound at their
 real paths, so the paths the model sees are the paths the human sees. A
@@ -5474,47 +5475,60 @@ what a summary dropped.
 
 Planned later: an MCP stdio client.
 
-**As built (`task`).** `task {prompt}` runs a sub-agent within the
-caller's turn and answers the call with its final report. It is offered
-after the conversation tools to a conversation with a workspace, and
-the prompt is required, at most 32 KiB. The sub-agent sees only its own
-prefix, written from `prompt/task.txt` with the workspace's environment
-block and project instructions, and the prompt as its one user
-message: none of the conversation, the person's words included. Its
-environment block leaves out the received-time line and the news,
-which come to the conversation's messages alone, and names no git
-tool. Its tools are the workspace's file, shell and `web_fetch` tools,
-and `system_status` where the template gives the system view; no
-conversation tool, so it messages, schedules, asks and delegates
-nothing, and no background process, which would outlive it. Its calls
-run and are approved as the caller's are, cards, rules and the
-classifier included (§11), the kit checked again for each call. It
-keeps its own record of the digests a write must match, from none,
-and the caller's is put back after it: a write of the caller's still
-matches only the version the caller read or wrote, never one the
-sub-agent made since, and a process starting again takes up only
-those of the conversation's own calls. It runs on the conversation's
-model, effort and routing, each request estimated from its own
-requests alone (§14), reserved, limited by `max_cost_per_turn` and
+**As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
+the caller's turn and answers the call with its final report. It is
+offered after the conversation tools to a conversation with a workspace;
+the prompt is required, at most 32 KiB, and `agent` is `general`, the
+default, or `explore`. The sub-agent sees only its own prefix, written
+from `prompt/task.txt` (`prompt/explore.txt` for an explore sub-agent)
+with the workspace's environment block and project instructions, and the
+prompt as its one user message: none of the conversation, the person's
+words included. Its environment block leaves out the received-time line
+and the news, which come to the conversation's messages alone, and names
+no git tool. A general sub-agent's tools are the workspace's file, shell
+and `web_fetch` tools, an explore sub-agent's `read_file`, `glob` and
+`grep` alone, so that it changes and runs nothing, and only a rule or a
+repeated call puts one of its calls on a card. An explore sub-agent's
+environment block says, in place of a shell, that glob and grep search
+the workspace by default; in place of committing and widening paths with
+git, that a path outside a worktree's sparse paths is not checked out
+and to say so rather than guess at it; and leaves out the Network line,
+since it runs no command. Either has `system_status` where the template
+gives the system view, and no conversation tool, so it messages,
+schedules, asks and delegates nothing, and no background process, which
+would outlive it. Its calls run and are approved as the caller's are,
+cards, rules and the classifier included (§11), the kit checked again
+for each call. It keeps its own record of the digests a write must
+match, from none, and the caller's is put back after it: a write of the
+caller's still matches only the version the caller read or wrote, never
+one the sub-agent made since, and a process starting again takes up only
+those of the conversation's own calls. A general sub-agent runs on the
+conversation's model, effort and routing; an explore sub-agent on
+`explore_model` and `explore_routing` where they are set (§15), each
+else the conversation's, with the conversation's effort where its model
+takes one, the model checked against the models list and its price as a
+turn's is, and refused, the call answered with why, where it takes no
+tools or `max_tokens`. Each request is estimated from its own requests
+alone (§14), reserved, limited by `max_cost_per_turn` and
 `max_cost_per_conversation` as the caller's turn's own, and counted in
 that turn; a request the provider rate-limits is asked again after its
-wait, as a turn's is. It takes at most 64 requests and is not
-compacted. Its 64th request, or the one after a request a cost limit
-refused, is its last: a `task_note` event, which only the sub-agent's
-view carries, tells it why and asks it, without calling a tool, where
-the work stands, and the request is bounded as a turn's wrap-up (§2),
-offering no tools where `tool_choice` can be sent; the report says
-why. Past its model's context, a failed request, an interrupt, a full
-log or a last request that called tools anyway, the call is answered
-with why, with the last text the sub-agent wrote, at most 4 KiB, and a
+wait, as a turn's is. It takes at most 64 requests and is not compacted.
+Its 64th request, or the one after a request a cost limit refused, is
+its last: a `task_note` event, which only the sub-agent's view carries,
+tells it why and asks it, without calling a tool, where the work stands,
+and the request is bounded as a turn's wrap-up (§2), offering no tools
+where `tool_choice` can be sent; the report says why. Past its model's
+context, a failed request, an interrupt, a full log or a last request
+that called tools anyway, the call is answered with why, with the last
+text the sub-agent wrote, at most 4 KiB, and, for a general sub-agent, a
 note that what it changed in the workspace stays; the caller goes on,
 but for an interrupt, during the sub-agent's stream, its rate limit's
 wait or between its steps, which ends the caller's turn as one of its
-own would, as the window closing during that wait does. A report
-cut short or filtered says so after it, and one past 64 KiB is given
-in part, naming the reply `history_read` reads whole. Before each
-request it keeps room in the log for the calls of the caller's reply
-still to answer.
+own would, as the window closing during that wait does. A report cut
+short or filtered says so after it, and one past 64 KiB is given in
+part, naming the reply `history_read` reads whole. Before each request
+it keeps room in the log for the calls of the caller's reply still
+to answer.
 
 Its records are the caller's log's (§6): a `task` event (the call, the
 sub-agent's kind, model, prefix and prompt), then `request` events of
@@ -6317,6 +6331,9 @@ default; `jev_threshold`'s is calibrated (§11):
   at most two decimal places, `compact_keep_tokens`, from 1,000 to
   1,000,000, and `compact_model`; defaults `true`, 0.8, 20,000 and the
   conversation's model (§14)
+- `explore_model` and `explore_routing`, one of `routing`'s modes;
+  defaults the conversation's model and routing (§12, As built
+  (`task`))
 - `review_model` and `review_max_cost`, a number of credits above zero;
   defaults the conversation's model and 1 (As built (`/review`), below)
 - `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every

@@ -2460,7 +2460,7 @@ impl App {
             } => {
                 let pushed = Message::new("td-agent")
                     .and_then(|m| m.status(&format!("{agent} sub-agent"), Tone::Neutral))
-                    .and_then(|m| m.text(&format!("a {agent} sub-agent runs on {model}")))
+                    .and_then(|m| m.text(&format!("the {agent} sub-agent runs on {model}")))
                     .and_then(|m| m.section("prompt", &prompt, true))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));

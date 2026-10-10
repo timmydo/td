@@ -2317,6 +2317,141 @@ fn task_call(prompt: &str) -> Reply {
     )
 }
 
+/// An explore sub-agent runs on `explore_model`, with the explore prompt
+/// and the workspace's read and search tools alone; the conversation
+/// goes on on its own model, with the report as the call's result, and
+/// every body rebuilt from the log is the one sent.
+#[test]
+fn an_explore_sub_agent_reads_alone_on_its_own_model() {
+    use td_agent::config::TemplateShared;
+    let explore = Reply::sse_with(
+        "stream-tool-system.sse",
+        "\"id\":\"toolu_system_01\",\"type\":\"function\",\"function\":{\"name\":\"system_status\"",
+        "\"id\":\"toolu_task_01\",\"type\":\"function\",\"function\":{\"name\":\"task\"",
+    )
+    .replace(
+        "{\\\"limit\\\": 3}",
+        "{\\\"prompt\\\": \\\"Where is the jail set up?\\\", \\\"agent\\\": \\\"explore\\\"}",
+    );
+    let mut h = Harness::new_in(
+        "explore",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            explore.clone(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        template_shared: vec![TemplateShared {
+            system: true,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        explore_model: Some("anthropic/claude-haiku-4.5".into()),
+        ..Client::default()
+    });
+    h.say("How does the jail start?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let texts: Vec<String> = h.mock.requests().iter().map(|r| r.text()).collect();
+    let sub = flat(&texts[1]);
+    assert_eq!(sub["model"], "anthropic/claude-haiku-4.5");
+    assert!(
+        texts[1].contains("You are an explore sub-agent"),
+        "{}",
+        texts[1]
+    );
+    assert!(texts[1].contains("Where is the jail set up?"));
+    let tools: Vec<&String> = sub
+        .iter()
+        .filter(|(k, _)| k.starts_with("tools.") && k.ends_with(".function.name"))
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(tools, ["read_file", "glob", "grep", "system_status"]);
+    assert_eq!(flat(&texts[2])["model"], flat(&texts[0])["model"]);
+    let agent = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Task { agent, model, .. } => Some((agent.clone(), model.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        agent,
+        (
+            "explore".to_string(),
+            "anthropic/claude-haiku-4.5".to_string()
+        )
+    );
+    let (_, report, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(!error, "{report}");
+    assert!(report.starts_with("A sparse checkout"), "{report}");
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    let at: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, Kind::Request { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for (n, text) in texts.iter().take(3).enumerate() {
+        assert_eq!(
+            &td_agent::client::body(events, at[n], conversation.prefix_file()).unwrap(),
+            text,
+            "request {n}"
+        );
+    }
+
+    // An `explore_model` the models list has not is refused, the call
+    // answered with why, and nothing asked of it.
+    let mut h = Harness::new_in(
+        "explore-unknown",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            explore,
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client {
+        template_shared: vec![TemplateShared {
+            system: false,
+            network: None,
+            name: "sys".into(),
+            shared: Some(Vec::new()),
+        }],
+        explore_model: Some("nobody/no-such-model".into()),
+        ..Client::default()
+    });
+    h.say("How does the jail start?");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let (_, why, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(error, "{why}");
+    assert!(
+        why.contains(
+            "nobody/no-such-model is not in the provider's models list; set `explore_model`"
+        ),
+        "{why}"
+    );
+    // An explorer changes nothing, so no note says its changes stay.
+    assert!(!why.contains("changed in the workspace"), "{why}");
+    assert_eq!(h.mock.requests().len(), 3);
+}
+
 /// A sub-agent whose next request a limit refuses is told, in a note its
 /// view alone carries, that its next is its last, and asked where the
 /// work stands; that request carries the note, the conversation's next

@@ -11,7 +11,7 @@ use super::{
 use crate::client::{self, Failure, Params};
 use crate::cost;
 use crate::store::{Basis, Effect, Kind, Purpose};
-use crate::tools;
+use crate::tools::SubAgent;
 
 /// The most requests one sub-agent makes, its last asking for its
 /// report.
@@ -39,13 +39,79 @@ impl Session {
         &mut self,
         started: u64,
         prompt: String,
+        agent: SubAgent,
     ) -> Result<Result<String, String>, String> {
         let theirs = self.bench.swap_digests(BTreeMap::new());
-        let done = self.delegate(started, prompt);
+        let done = self.delegate(started, prompt, agent);
         self.bench.swap_digests(theirs);
-        Ok(done?.map_err(|why| {
-            format!("{why}. Whatever the sub-agent changed in the workspace stays as it left it.")
+        Ok(done?.map_err(|why| match agent {
+            SubAgent::General => format!(
+                "{why}. Whatever the sub-agent changed in the workspace stays as it left it."
+            ),
+            // It changes nothing.
+            SubAgent::Explore => why,
         }))
+    }
+
+    /// What an explore sub-agent asks with: `explore_model` and
+    /// `explore_routing` where they are set, else the conversation's own,
+    /// checked as a turn's model is (DESIGN.md §12, `task`).
+    fn explorer(&mut self, asking: Asking) -> Result<Asking, String> {
+        let client = &asking.client;
+        let routing = client
+            .explore_routing
+            .clone()
+            .or_else(|| asking.routing.clone())
+            .filter(|r| r != crate::config::DEFAULT_ROUTING);
+        let Some(name) = client.explore_model.clone() else {
+            if routing == asking.routing {
+                return Ok(asking);
+            }
+            return self.explore_on(asking.name.clone(), "`explore_model`", routing, asking);
+        };
+        self.explore_on(name, "`explore_model`", routing, asking)
+    }
+
+    /// `asking` on model `name`, which `setting` names, and `routing`.
+    fn explore_on(
+        &mut self,
+        name: String,
+        setting: &str,
+        routing: Option<String>,
+        asking: Asking,
+    ) -> Result<Asking, String> {
+        let client = asking.client.clone();
+        let model = self.model(setting, &name, &client)?;
+        let model = match &routing {
+            None => model,
+            Some(routing) => {
+                let reasoning = model.as_ref().is_none_or(|m| m.supports("reasoning"));
+                // The conversation's hint names its own menu; this
+                // routing may be `explore_routing`'s.
+                Some(
+                    self.routed(&client, &name, routing, reasoning)
+                        .map_err(|e| {
+                            format!(
+                                "{e} (the explore sub-agent routes by `explore_routing` where it is set, else as the conversation does)"
+                            )
+                        })?,
+                )
+            }
+        };
+        if let Some(missing) = model
+            .as_ref()
+            .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
+        {
+            return Err(format!(
+                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
+            ));
+        }
+        Ok(Asking {
+            name,
+            model,
+            routing,
+            ..asking
+        })
     }
 
     /// `task`'s work. Each request is reserved and limited as a turn's,
@@ -54,9 +120,25 @@ impl Session {
     /// at the step limit or when a limit refuses the next, offers no tools
     /// and is bounded as a turn's last is, so that it reports where the
     /// work stands.
-    fn delegate(&mut self, started: u64, prompt: String) -> Result<Result<String, String>, String> {
+    fn delegate(
+        &mut self,
+        started: u64,
+        prompt: String,
+        agent: SubAgent,
+    ) -> Result<Result<String, String>, String> {
         let Some(turn) = self.current_turn() else {
             return Ok(Err("a sub-agent runs only within a turn".into()));
+        };
+        let asking = match self.asking()? {
+            Ok(asking) => asking,
+            Err(why) => return Ok(Err(why)),
+        };
+        let asking = match agent {
+            SubAgent::General => asking,
+            SubAgent::Explore => match self.explorer(asking) {
+                Ok(asking) => asking,
+                Err(why) => return Ok(Err(why)),
+            },
         };
         let Asking {
             key,
@@ -65,12 +147,9 @@ impl Session {
             reasoning_effort,
             model,
             routing,
-        } = match self.asking()? {
-            Ok(asking) => asking,
-            Err(why) => return Ok(Err(why)),
-        };
+        } = asking;
         let prefix = match self.placed(&client, |created, place| {
-            place.map(|place| crate::prompt::task_prefix(created, place))
+            place.map(|place| crate::prompt::task_prefix(created, place, agent))
         }) {
             Ok(Some(prefix)) => prefix,
             Ok(None) => {
@@ -83,7 +162,7 @@ impl Session {
         let task = self
             .log(Kind::Task {
                 call: started,
-                agent: "task".into(),
+                agent: agent.word().into(),
                 model: name.clone(),
                 prefix,
                 prompt,
@@ -116,9 +195,13 @@ impl Session {
                         "you have made {steps} requests, one short of the most a sub-agent makes"
                     )
                 });
+                let files = match agent {
+                    SubAgent::General => ", and the state of any file you changed that is not finished or not checked",
+                    SubAgent::Explore => "",
+                };
                 self.log(Kind::TaskNote {
                     task,
-                    text: format!("[td-agent: {why}, so your work stops here. Without calling a tool, report where it stands: what you found and did, what is left to do, and the state of any file you changed that is not finished or not checked.]"),
+                    text: format!("[td-agent: {why}, so your work stops here. Without calling a tool, report where it stands: what you found and did, what is left to do{files}.]"),
                 })?;
                 noted = true;
             }
@@ -237,7 +320,7 @@ impl Session {
                             };
                             return Ok(Err(self.stopped(task, &why)));
                         }
-                        if !self.answer_in(reply, tools::Kit::Task)? {
+                        if !self.answer_in(reply, agent.kit())? {
                             return Ok(Err(self.stopped(task, INTERRUPTED)));
                         }
                         continue;
