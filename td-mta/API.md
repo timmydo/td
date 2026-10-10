@@ -9,12 +9,15 @@ disk/work ledgers and exact request retention before consumers.
 
 ## 1. Ownership and I/O
 
-Handles lease startup pools and release capacity on Drop; they cannot grow
-collections per operation. Errors are fixed typed values, with OS kind/code
-where relevant, never dynamically formatted diagnostics. Implementations may
-use cold allocations only where RESOURCES.md budgets them. No trait call
-authorizes access merely because it accepts a typed ID. The coordinator
-checks account/device authorization and rechecks it at the operation boundary.
+Handles retain bounded ownership and release capacity on Drop. Existing
+fixed-buffer APIs preserve their explicit capacity contracts; new adapters
+may use bounded per-operation allocation under DESIGN section 5. Errors are
+fixed typed values, with OS kind/code where relevant, never dynamically
+formatted diagnostics. Representations must bound untrusted growth and
+define exhaustion; RESOURCES.md estimates are not a global cold-allocation-
+only rule. No trait call authorizes access merely because it accepts a typed
+ID. The coordinator checks account/device authorization and rechecks it at
+the operation boundary.
 
 Clock returns UTC plus monotonic boot-local milliseconds. Deadline uses the
 latter, checked addition and expiry at now >= deadline. Never persist Tick
@@ -370,10 +373,11 @@ The runtime bounds the number of leases through its slots/jobs. A lease can
 outlive the public set, and its last owner destroys the payload before returning
 capacity. The payload is separately boxed so its allocation is freed before
 the reservation is released; only the small shared ownership header remains
-until the enclosing Arc finishes dropping. Charge that transient metadata and
-allocator bookkeeping to the same existing ledger. Acquire/release reservation
-ordering fences destruction before slot reuse, but does not synchronize
-mutable payload access or publish application authorization.
+until the enclosing Arc finishes dropping. Charge that transient metadata
+and allocator bookkeeping in integrated measurements under DESIGN section 5.
+Acquire/release reservation ordering fences destruction before slot reuse,
+but does not synchronize mutable payload access or publish application
+authorization.
 
 Construction uses cold allocations for the bitmap, loader-supplied boxed
 payload and shared owner; std allocation failure and unexpected
@@ -546,8 +550,9 @@ integration remain M11/M13.
 into_buffers aborts and destroys the native pump before releasing its generation
 and any remaining permit, then returns both original arrays for explicit pool
 reuse. Ordinary Drop aborts through the pump, releases owners and frees owned
-arrays. Complete runtime session/byte slots, return queues and aggregate
-qualification remain required before service activation. No listener is enabled.
+arrays. Runtime integration still needs bounded session slots and reliable
+return queues. Integrated memory measurements follow DESIGN section 5/M23;
+aggregate byte-ledger proof is not an adapter prerequisite. No listener is enabled.
 
 ### 1.9 SMTP control framing
 
@@ -631,8 +636,8 @@ real direct SMTP handoff and private gateway client-certificate peers under
 TLS 1.2/1.3. These fixtures start at the STARTTLS command boundary; they do not
 implement the initial SMTP greeting/EHLO or the complete mail protocol.
 Existing session/wire reservations are retained; no worker, allocation or
-resource allowance is added. M07e still gates whole native/session resource
-qualification before service activation.
+resource allowance is added. M07e records component observations; M23
+measures integrated native/session memory under DESIGN section 5.
 
 ### 1.11 Outbound STARTTLS reply ownership
 
@@ -673,8 +678,8 @@ sequencing or current-generation authority. Tests supply the EHLO capability
 boundary, then exercise real local command/reply exchange and both upgrade
 owners through verified TLS. Complete greeting/EHLO dispatch, fresh post-TLS
 EHLO, AUTH and transaction reset remain M17. M07e must account for these
-borrowed reservations within the complete outbound session ledger before
-activation; this API grants no new resource allowance.
+borrowed reservations during outbound integration under DESIGN section 5;
+this API grants no new resource allowance.
 
 ### 1.12 MIME base64 octets
 

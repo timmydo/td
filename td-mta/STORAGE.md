@@ -80,7 +80,8 @@ plus 32 extra frames for commit and sector padding, plus the WAL header:
 `(2097152 + 32) * (4096 + 24) + 32` bytes. The WAL ceiling is twice that
 bound, 17280796224 bytes. This conservative disk bound is
 not preallocation or a free-space guarantee. The WAL index can map up to
-34 MiB outside SQLite's 16 MiB heap, explicitly charged in the startup ledger.
+34 MiB outside SQLite's 16 MiB heap. RESOURCES.md records that mapping
+allowance; DESIGN section 5 governs process memory measurements.
 Crash recovery can reread the entire WAL; checkpoint can write up to 8 GiB.
 These native calls cannot guarantee a yield at a caller deadline. Return Busy
 before writing when the existing WAL leaves insufficient room. SQLite reuses

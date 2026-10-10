@@ -240,7 +240,9 @@ fund the checked RESOURCES.md ledger, including the fixed 34 MiB WAL-index
 mapping allowance outside SQLite's 16 MiB requested-heap limit. These are
 reservations, not measured RSS limits. A smaller explicit
 budget is accepted only when the complete configured plan fits it; changing
-the budget alone does not change connection counts or the RSS release targets.
+the budget alone does not change connection counts. DESIGN section 5 treats
+RSS figures as provisional goals and the ledger as existing planner behavior;
+replacing this configuration rule requires a separate atomic code change.
 
 ### `[disk]`
 
@@ -1400,8 +1402,9 @@ scratch remains 28 KiB within the existing 64 KiB parser reservation. This is
 an object-layout guard, not compiler peak-stack evidence: parameter moves,
 initialization temporaries, nested helper frames, trusted reader frames and
 provider stack use need separate execution evidence. M04b2c3d4b supplies
-the structural-loader check below; later protected/provider paths must
-qualify their additional frames before service integration.
+the structural-loader check below. Later protected/provider paths review
+concrete stack risks and preserve enforced layout guards under DESIGN
+section 5; new generic instances do not automatically need separate probes.
 
 
 ### Portable structural-loader stack qualification
@@ -1445,12 +1448,12 @@ This establishes a point-in-time executable stack ceiling for these
 test-compiled loader paths on the qualified artifact, not an exact high-water measurement or a
 whole-process RSS bound. Fixture construction and mapping inspection allocate;
 this is not the service allocation test. The reader is an injected bounded
-slice reader. M04b3/M05/M07/M19 must requalify protected finalization, real reader
-adapters, providers and runtime integration with the same total reservations.
-Compiler/profile/target or loader-path changes require a manual rerun of this
-portable check; ordinary `ready` does not enforce it. Every new compiled
-instance of `read`/`build_stanzas` needs qualification, even when using the
-same reader type. Five scenario bodies intentionally repeat the loader unit
+slice reader. These observations do not establish production reader/provider
+stack use. Rerun this portable check when retaining its claim after compiler,
+profile, target or exercised-path changes; ordinary `ready` does not enforce
+its freshness. DESIGN section 5 governs new measurements; each generic
+instance is not a new qualification prerequisite. Five scenario bodies
+intentionally repeat the loader unit
 cases to exercise an external compilation; changes to their coverage must
 update both suites.
 
@@ -1494,9 +1497,10 @@ and discard candidate authority on any late error. The decoder's maximum
 scratch is sized to reuse the existing 28 KiB stream region after structural
 EOF; compile-time checks pin both kinds' fit. M04b3b must implement that reuse.
 No second concurrent buffer is budgeted.
-New compiled finalizer/reader instances still need CONFIG.md's target stack
-qualification before service use. Provider inputs remain M07's separate
-certificate-generation ledger; this helper does not load keys or trust stores.
+New compiled finalizer/reader instances preserve their capacity contracts
+and review concrete stack risks under DESIGN section 5. Provider inputs
+remain M07's bounded certificate-generation lifecycle; this helper does not
+load keys or trust stores.
 
 ## Referenced-file inventory
 
@@ -1597,8 +1601,8 @@ headroom. Individual signature/password limits do not guarantee aggregate
 fit in the 192 KiB text arena. Identity preimage encoding has its own
 192 KiB ceiling. Existing structural stack qualification does not cover this
 compiled finalizer. The combined fixture below covers its test instances;
-M04b3b2b2b/M05/M07 must qualify the complete production
-reader/finalizer/provider path before service use. Protected-input
+Production reader/finalizer/provider integration preserves enforced input
+and layout guards; targeted measurements follow DESIGN section 5. Protected-input
 integration, effective output and runtime publication remain pending;
 M04b3b2b1's identity assembly is specified below.
 
@@ -1636,7 +1640,8 @@ confers no file trust, authentication, digest or publication authority.
 The local td-crypto streaming Digest can consume the writer later without
 retaining a second 192 KiB buffer. Actual combined reader/materializer/view
 stack qualification for the test instances is described below; installed
-service integration must be qualified separately. This object-layout guard
+service integration must assess concrete stack risks under DESIGN section 5.
+This object-layout guard
 does not measure compiler frames or total stack use.
 
 
@@ -1669,12 +1674,13 @@ This is manual point-in-time qualification of these generic reader, opener
 and sink instances in the integration test's pinned release-musl compilation.
 Fixture construction and mapping inspection allocate; no hot-path heap,
 provider-allocation or process-RSS bound is established. Protected-file
-opening, provider adapters and installed runtime callers must requalify
-their complete compiled paths within the existing worker reservation before
-service use. This test does not confer configuration publication authority.
+opening, provider adapters and installed runtime callers retain bounded
+inputs and layout guards; concrete stack risks need targeted evidence under
+DESIGN section 5, without mandatory per-instance byte-reservation proofs.
+This test does not confer configuration publication authority.
 
 Rerun the portable command manually after compiler, profile, target or
 compiled-path changes, including the loader, inventory, material decoder,
 materializer, preimage assembly and identity encoder. `ready` does not enforce
-this evidence freshness. Each new compiled reader/opener/sink instance needs
-its own qualification; a prior artifact does not qualify later code.
+this evidence freshness. A prior artifact does not qualify later code, but
+a new generic instance alone does not mandate another resource fixture.

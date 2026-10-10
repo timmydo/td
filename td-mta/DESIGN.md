@@ -8,8 +8,9 @@ An incomplete increment must not advertise capabilities it cannot provide.
 The v1 release requires the acceptance evidence in section 15.
 
 The M01 library skeleton provides typed local IDs, configuration versioning and
-checked resource planning only. [RESOURCES.md](RESOURCES.md) records its checked startup
-byte ledger; [CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
+checked resource planning only. [RESOURCES.md](RESOURCES.md) records the
+current planner and component observations; section 5 owns resource policy.
+[CONFORMANCE.md](CONFORMANCE.md) inventories the unimplemented JMAP
 contract and current client calls. There are no protocol handlers or listeners.
 Checked scalar/key/row and operation codecs define bounded application
 values in [FORMAT.md](FORMAT.md). Its complete batch decoder binds exact
@@ -105,8 +106,9 @@ V1 must report sender authentication as not evaluated, never as passed.
    account. Possession of an opaque ID does not authorize its use.
 4. A submission accepted by JMAP remains queryable after restart, including
    while its smart host is unavailable. Queue state is not held only in RAM.
-5. Request processing has fixed memory, connection, descriptor, disk, and work
-   limits. Exceeding a limit produces a defined refusal, never silent loss.
+5. Request processing bounds untrusted input, concurrency, retained state,
+   descriptors, disk use and work. Enforced limits have defined refusal
+   behavior, never silent loss. Memory performance follows section 5.
 6. Production td-owned code follows the repository's panic/indexing rules.
    Checked arithmetic, bounded nesting, and explicit error handling extend
    the rule to lengths, counters, conversions, locks, and thread creation.
@@ -180,9 +182,10 @@ it is not described as dependency-free once they are added.
 
 Reusable protocol-independent components belong in shared std-only td
 libraries. The bounded JSON string framer and scalar escaping live in td-json.
-The mail hot path uses only its incremental string API, whose state and
-caller-provided output are fixed; its allocating Json value/parser API is not
-admitted there. td-json owns no mail, clock, crypto or scheduler policy.
+Existing streaming mail adapters use its incremental string API with fixed
+state and caller-provided output. Future request dispatch chooses bounded
+representations under section 5; it need not eliminate every allocation.
+td-json owns no mail, clock, crypto or scheduler policy.
 
 The deterministic NFC ordering/composition engine lives in td-nfc. Pure
 source/decoder/decomposition checkpoints and fixed Unicode tables remain
@@ -1160,39 +1163,66 @@ or a prerequisite silently downloaded by the test suite.
 
 ## 5. Resource and execution model
 
-Targets for the default personal profile are RSS below 64 MiB idle and below
-128 MiB under the workload in section 15. These are unverified release gates,
-not measurements. Record RSS and cgroup memory separately: filesystem page
-cache can affect the latter.
+Resource policy separates enforceable limits from performance goals. Bound
+untrusted message/request sizes, parser depth, operation counts, concurrency,
+queues, caches and retained generations. Streaming bodies and disk-backed
+indexes must avoid retaining the mailbox or full messages in RAM. Check
+lengths and capacity before growth; use fallible reservation where available
+and defined refusal at enforced limits. Durability, authorization and bounded
+work remain correctness requirements regardless of memory performance.
 
-Use a fixed set of long-lived workers, preallocated connection slots, and
-bounded queues of slot IDs. Allocate and touch application arenas before
-opening listeners. Do not spawn a thread per connection/request or load the
-mailbox's full metadata/content into RAM. Use bounded I/O chunks, relational SQLite indexes and
-a fixed cache. No unbounded mmap or memory-sized-to-mail
-strategy is permitted. Maintenance shares an explicit budget with live work.
+The initial performance goals are RSS below 64 MiB idle and below 128 MiB
+under the section 15 workload. They are provisional tuning goals, not a
+byte-exact architectural budget or a prerequisite for implementing adapters.
+Measure the integrated service before choosing a release memory claim or
+changing these goals. Record RSS and cgroup memory separately, including
+page-cache effects, workload, concurrency and sampling limitations. A ledger
+sum or isolated allocation probe establishes neither result.
+
+Prefer reusable buffers and borrowed views where they simplify ownership and
+streaming. Bounded per-request allocations are permitted. There is no global
+zero-allocation contract and no requirement to allocate and touch every
+application arena before listening. Existing APIs with caller-owned fixed
+buffers keep their specific capacity/ownership contracts until explicitly
+refactored; their allocation tests are local regressions, not a template
+required for every new adapter. Do not add arenas, replay passes or ownership
+facades solely to satisfy speculative byte accounting. This does not remove
+capacity admission needed for correctness: quota/effect reservations, complete
+response capacity before mutation, TLS handoff buffers and completion credits
+remain governed by their specific contracts.
+
+Use bounded worker concurrency and queues; do not spawn an unbounded thread
+per connection/request. Buffer capacities, worker roles/counts, stack sizes,
+cache sizes and scheduling quanta are implementation choices to validate
+against progress, fairness and measured workloads. RESOURCES.md records the
+current proposal and implemented limits. Its byte partitions and TLS
+allowances are planning estimates, not mandatory per-component ceilings.
+The existing Limits::plan validation and native SQLite caps remain implemented
+behavior; this design change does not relax them. Replacing the speculative
+planner is a separate atomic code/configuration change, not a prerequisite
+for functional storage work. Maintenance must share bounded capacity with
+live work and preserve foreground progress.
 
 Event-source streams hold connection slots but no storage read view between
-events. RESOURCES.md fixes their nonblocking main-thread scheduling and the
-eight fixed worker threads across six roles; event peers cannot occupy
-request/commit/control workers.
-Use safe std with a bounded round-robin socket scan and a deadline-based wait
-of at most five milliseconds. Established TLS record work is bounded per
-slot; disk, dial, handshake and DNS jobs use fixed workers. Safe std exposes
-no poll/epoll; adding an OS readiness adapter would require the explicit
-unsafe review from section 3 and a resource-contract amendment.
-Read slots are acquired per store operation with a bounded fair wait queue;
-exhaustion returns a retryable HTTP 503 before response headers or the mapped
-JMAP method error. A streaming response that has begun cannot fabricate an
-error object inside its body: finish from its admitted view or terminate it.
-An online backup uses one read slot; interactive work shares the other. This
-intentional concurrency limit preserves the memory budget.
+events. RESOURCES.md proposes nonblocking main-thread scheduling and eight
+workers across six roles; event peers cannot occupy request/commit/control
+workers. Use safe std with a bounded round-robin socket scan and a wait
+based on deadlines, using the current proposed five-millisecond quantum.
+Established TLS record work is bounded per slot; disk, dial, handshake and DNS jobs use
+fixed workers. Safe std exposes no poll/epoll; adding an OS readiness
+adapter would require the explicit unsafe review from section 3 and a design
+amendment. Read slots are acquired per store operation with a bounded fair
+wait queue; exhaustion returns a retryable HTTP 503 before response headers
+or the mapped JMAP method error. A streaming response that has begun cannot
+fabricate an error object inside its body: finish from its admitted view or
+terminate it. An online backup uses one read slot; interactive work shares
+the other. This default reserves foreground capacity during background work.
 
 [ADMISSION.md](ADMISSION.md) fixes disk quotas, checkpoint completion space,
 maintenance drain/exclusive budgets, network timers and exact JMAP response
 retention. These are admission contracts, not measured throughput or guarantees
 against a host disk filling concurrently. They gate persistence and protocol
-implementations alongside the RAM ledger.
+implementations; they do not impose the speculative RAM ledger.
 
 Initial default ceilings (validated together at startup):
 
@@ -1216,38 +1246,31 @@ Initial default ceilings (validated together at startup):
 | Maintenance sort scratch on disk | 64 MiB per account |
 | Active log plus retained generations | 8 MiB each, 4 retained |
 
-Values are operator-adjustable within compiled maxima and an explicit startup
-memory budget. SMTP command/path/line limits also obey their protocol minimums;
-the resource table does not replace RFC limits. The implementation must add an
-arena ledger with byte counts, worker stack sizes, scratch reservations, and
-TLS headroom before committing a default profile. A larger configured pool
-cannot silently retain the default memory claim.
+Values are operator-adjustable within implemented compiled maxima. SMTP
+command/path/line limits also obey protocol minimums; the table does not
+replace RFC limits. Advertise only limits the service enforces. Changes to
+concurrency or cache settings require representative measurements before
+retaining a published memory claim.
 
-The ledger reserves 131515648 bytes under the default 128 MiB planning budget,
-including planned stack, TLS, reload, process and 34 MiB WAL-index mapping
-allowances. The disposable index cache defaults to 4 MiB. Default connection
-counts remain eight SMTP, eight HTTPS and one outbound delivery. Established
-TLS processing has a separate allowance for the single main thread, alongside
-the handshake and generation allowances. These are qualification targets, not
-RSS evidence or enforced provider allocation limits. M02/M07 must fit concrete
-structures and provider use within the ledger before enabling service admission.
+TLS measurements include handshakes, decoded peer material, session caches
+and old/new certificate overlap. Bounded wire input alone does not bound
+provider temporaries; application counters alone do not bound the process.
+Keep provider input/concurrency restrictions and disable unneeded resumption
+caches and 0-RTT. Measure representative and adversarial cases when integrating
+or changing those paths, then resolve concrete excessive growth.
 
-The no-allocation contract covers td-owned hot processing: SMTP parsing and
-streaming, MIME scanning, HTTP/JSON parsing, JMAP evaluation/serialization,
-queue dispatch, and structured logging after slot admission. SQLite query and
-commit wrappers may allocate Rust/native memory within separately bounded
-reservations; those paths need resource qualification before activation.
-Use reusable arenas, borrowed views, bounded formatting, and fallible capacity
-checks. Allocating on every admitted request and calling it admission work is
-not an exemption. Any std/platform allocation unavoidable in an I/O adapter is
-named, bounded, and measured alongside TLS; it must not grow with message or
-mailbox size. Configuration reload, startup, certificate rotation, and offline
-migration are cold paths, still bounded and accounted for at peak overlap.
-
-TLS library allocations are a separate measured budget, including handshake
-records, certificate chains, session caches, and concurrent old/new certificate
-generations. Application allocation counters alone do not establish whole-
-process bounds. Disable unneeded resumption caches and 0-RTT.
+Qualification has a stopping rule: cover each changed correctness boundary,
+enforced exhaustion/refusal and a representative lifecycle. Add a resource
+scenario for a new production behavior, a reproduced regression, a changed
+enforced limit or a named integration/release question. Do not enumerate
+every combination of account count, body size, backup epoch, live reader,
+history pruning and fence ownership merely because it can be tested. Existing
+fixture measurements remain evidence for their exact inputs; their exclusions
+are limits on claims, not an instruction to implement every excluded case.
+Whole-service memory/fairness evaluation belongs to M23 after functional
+integration, with targeted earlier measurement where a concrete risk warrants
+it. A measured leak, attacker-controlled unbounded growth or broken refusal
+must be fixed when found; deferring performance tuning never excuses those.
 
 All network operations have idle and total deadlines; slow progress must not
 reset the total deadline forever. Bound keepalive requests and fairness between
@@ -1752,9 +1775,10 @@ An unresolved design decision is written down before implementing dependent
 code; it is not delegated to whichever worker arrives first.
 
 The plan's initial schema/format/dependency tasks resolve exact encodings,
-provider features, memory ledger and standard capability tables. They may
-refine this document with measured evidence, but cannot silently relax its
-durability, authentication, allocation, or no-live-service-test boundaries.
+provider features, enforced resource limits and standard capability tables.
+They may refine this document with measured evidence, but cannot silently
+relax its durability, authentication, bounded-input/work, or no-live-service-test
+boundaries. Resource tuning follows section 5.
 
 ## 15. Acceptance evidence
 
@@ -1769,9 +1793,11 @@ V1 is ready only with reproducible evidence for all of the following:
 - Syntax/confinement lint coverage and malformed-input property/fuzz fixtures
   for SMTP, HTTP, JSON, MIME, config, database rows, DNS and certificates. Fuzzing
   tooling is development-only and separately pinned/approved if external.
-- Allocation instrumentation of admitted hot operations, including error and
-  logging paths; separate TLS/cold-path measurements. Pool exhaustion refuses
-  predictably, and a long run shows no resident growth with delivered count.
+- Measure retained memory across repeated successful and failed operations,
+  including logging, TLS and configuration/certificate replacement. Use
+  allocation instrumentation to investigate concrete growth where useful;
+  allocation itself is not a failure. Pool exhaustion refuses predictably,
+  and a long run shows no unexplained retained growth with delivered count.
 - A deterministic 1 GiB corpus of 10000 messages with mixed folders, MIME,
   Unicode, attachments, duplicate Message-IDs and distinct identical messages.
   Measure idle and peak RSS after restart and during 4 concurrent SMTP streams,

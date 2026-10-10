@@ -361,7 +361,7 @@ treated as separators.
 
 ACME account keys, orders and renewed certificates are service-managed state,
 not additional operator include files. Bound provider-parsed material in the
-separate certificate-generation ledger; do not keep an uncharged second copy
+bounded certificate-generation lifecycle; avoid redundant retained copies
 inside configuration text. Material formats and TLS acceptance policy are
 defined in [td-crypto/TLS.md](../td-crypto/TLS.md). In particular, initial
 local identities use P-256 with unencrypted PRIVATE KEY PKCS#8 PEM and a
@@ -375,17 +375,18 @@ profile material; compilation never performs network issuance. No certificate
 is trusted merely because its profile reference resolves.
 
 Bound each raw chain file/response to 64 KiB, private key to 16 KiB, and
-explicit CA bundle to 128 KiB. These are individual ceilings, not simultaneous
-allocation promises. One certificate generation, including all profiles,
-relay/ACME/gateway trust stores, raw material still retained, parsed provider
-objects and allocator overhead, must fit its RESOURCES.md ledger reservation.
-Public-root parsed objects are charged here too; immutable compiled root bytes
-belong to process/image allowance. Reject combined overflow even when every
-file meets its own bound. Renew one complete generation at a time: retain at
-most old and replacement generations, with no per-profile side
-generations or uncharged trust cache. M03/M07 must prove provider allocation
-bounds and old/new/session overlap before enabling material loading; bounded
-input alone is not that proof.
+explicit CA bundle to 128 KiB. These are individual ceilings, not
+simultaneous allocation promises. One certificate generation, including all
+profiles, relay/ACME/gateway trust stores, raw material still retained,
+parsed provider objects and allocator overhead, is measured during
+integration under DESIGN section 5. Public-root parsed objects and immutable
+compiled roots also count in whole-process observations. Enforce material
+count and input caps even when the combined representation allocates. Renew
+one complete generation at a time: retain at most old and replacement
+generations, with no per-profile side generations or an unbounded trust
+cache. M03/M07 test material lifecycles and exhaustion; M23 measures
+integrated old/new/session overlap. Bounded input alone establishes no
+provider or process memory claim.
 
 ### Referenced-file requirements
 
@@ -580,8 +581,10 @@ stack, outside the
 snapshot owner. Their current x86-64 layouts total 75776 bytes; a production
 compile-time guard enforces the 80 KiB ceiling on each target. This leaves 176 KiB for all other control-worker
 call frames, initialization copies and provider stack use. Do not place
-another full view array on that stack. M04b3/M05/M07/M19 must qualify each new compiled
-path before enabling it; M23 retains whole-process RSS qualification. Stack arrays borrow the snapshot only within
+another full view array on that stack. New paths preserve the enforced
+layout guards and review concrete stack risks under DESIGN section 5;
+there is no per-instance qualification prerequisite. M23 measures the
+integrated service. Stack arrays borrow the snapshot only within
 finalization, do not escape, and are dropped before moving/publishing the
 owning snapshot. No typed reinterpretation of byte arenas, self-reference or
 extra allocation is required.

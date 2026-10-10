@@ -42,6 +42,30 @@ Submission: one green reviewed commit, ready, pushed branch
 Open issue: stop dependent implementation and record the exact ambiguity
 ```
 
+## Resource work and functional priority
+
+DESIGN section 5 owns memory policy. Enforced input/concurrency/work limits
+and correct refusal are functional requirements. Byte-exact arena accounting,
+allocation-free operation and exhaustive resource-selector combinations are
+not prerequisites for new behavior. Existing milestone allocation/layout
+observations below describe delivered evidence, not requirements to repeat
+the same probe pattern on every composition. An exclusion states what a test
+did not establish; it does not automatically create the next task.
+
+The storage workstream next addresses missing mutation policy, transaction
+coordination and operational verification/backup/restore behavior. Select one
+concrete behavior and its correctness/failure tests per increment. Additional
+body-loan/account/epoch/pruning/fence resource permutations are deferred unless
+a production change, reproduced failure or named release question needs them.
+No further qualification-only selector is planned merely to fill a matrix.
+
+Dependency edges below require functional APIs and their correctness tests.
+They do not require a prerequisite milestone's later whole-service resource
+measurements before dependent functional work can start. Public deployment
+still requires protocol, authorization, durability, fault and bounded-refusal
+evidence. M23 measures the integrated service and resolves concrete memory
+problems before making a release claim.
+
 ## Milestones and dependency order
 
 | Milestone | Tasks | Result |
@@ -98,7 +122,7 @@ need adapters. The dependency edges are the shared-interface handoff gate.
 
 | Boundary | Inputs / outputs | Owner |
 | --- | --- | --- |
-| `Limits`, `ResourcePlan` | Valid config -> checked arena/slot/stack ledger | M01/M04 |
+| `Limits`, `ResourcePlan` | Current config validation/planning; enforced limits remain explicit | M01/M04 |
 | `Clock`; shared `Entropy`, `Digest`, `Crypto` | Injected time, randomness, digest/sign; future verification | M02/M03a/M07 |
 | `WireBuffer`, `Arena`, `SlotId` | Caller-owned capacity -> borrowed views / limit errors | M04 |
 | `Store`, `ReadView`, `Transaction` | Bounded operations -> committed IDs and sequence | M05/M08 |
@@ -117,8 +141,9 @@ JMAP client, session types, submit code and integration tests.
 
 Create std-only `td-mta` library manifest/lock and deny-lint configuration, with
 test discovery and offline gate coverage. Define typed IDs, limit/error enums,
-config version, and the default resource ledger. Record bytes for every slot,
-arena, scratch page and stack; don't allocate the whole message limit per slot.
+config version, and initial resource planning. The implemented byte ledger is
+recorded in RESOURCES.md; it is not a requirement for future representations.
+Do not allocate the whole message limit per slot.
 Compile a table of all standard JMAP methods/properties required by advertised
 capabilities and all methods currently used by td-mail. Separate mandatory
 requirements from optional extension support and record RFC section references.
@@ -168,7 +193,8 @@ recipient results. Freeze the adapter and store APIs in compiling modules.
 
 Specify receivedAt sorting/text semantics, MIME/property/charset coverage,
 initial retry/cancel behavior, error mapping, and bounded per-operation work.
-Choose the minimum worker layout and TLS/cold-path budget within M01's ledger.
+Choose bounded worker concurrency and buffer ownership; M01's byte ledger is
+an estimate, not a design constraint on those choices.
 Pin event-stream scheduling, read-slot wait/error mappings, maintenance work
 budgets and reservation reconciliation around SQLite commit outcomes.
 This is the main design review checkpoint; protocol consumers wait for it.
@@ -441,7 +467,8 @@ Split at these concrete boundaries before dependent milestones start:
     on the pinned release musl target, including initialization, nested
     helper/fixture-reader frames, failure/reuse, near-maximum pending text and full table cases.
     CONFIG.md defines the checked non-growing guarded stack ceiling. Later
-    compiled instances, adapters/providers/finalization must be qualified.
+    paths preserve enforced layout/input guards and assess concrete stack
+    risks under DESIGN section 5, without per-instance probe prerequisites.
     Ordinary host gates exercise fixture behavior but not the target ceiling.
     Preserve the 36 KiB workspace and existing 256 KiB
     control-worker stack reservations, including 80 KiB for later borrowed
@@ -479,8 +506,10 @@ Split at these concrete boundaries before dependent milestones start:
     maximum signatures, independent limits, late errors and storage reuse.
     CONFIG.md scopes the evidence; this is not heap/RSS qualification.
   - **M04b3b2b2b:** remaining M05 adapter integration, M07 provider validation
-    and streamed redacted effective output. Requalify actual production
-    reader/finalizer/provider instances and combined memory before service use.
+    and streamed redacted effective output. Preserve enforced input/layout
+    guards and assess concrete reader/finalizer/provider stack risks under
+    DESIGN section 5. M23 measures integrated memory; every compiled instance
+    does not require a separate qualification fixture.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked
@@ -588,12 +617,13 @@ that ownership to the authenticated ports::Store adapter. The current
 begin_blob/finish/StagedBlob contracts do not implement
 that store. The synchronous core accepts prepared bounded sources; it must
 not hold its global writer while an untrusted network peer supplies bytes.
-Also complete mutation/queue policy, quota/result reconciliation,
-guarded-stack and combined
-native/RSS qualification, the full 8 GiB database checkpoint, normal WAL
-admission scheduling and portable maximum-WAL resource qualification,
-the full crash/fault matrix, retention scheduling and operational
-inspection/backup/restore. No legacy store migration is required.
+Next implement mutation/queue policy, quota/result reconciliation, normal
+WAL admission scheduling, retention and operational inspection/backup/restore
+with focused correctness/failure tests. Combined service resource evaluation
+belongs to M23; maximum-database/WAL and consolidated crash/fault evidence
+belong to release qualification in M23/M24. Those release cases do not create
+an endless prerequisite sequence for functional storage increments. No
+legacy store migration is required.
 SQLite durability alone grants neither authorization nor a memory qualification.
 
 ## M06 — Streaming message and MIME representation
@@ -2162,10 +2192,11 @@ Implement the remaining work as independently reviewable increments:
         Local fixtures cover both owners through verified TLS, malformed/tailed
         replies and admission cleanup. Full greeting/EHLO/AUTH dispatch and
         post-TLS state reset remain M17; M07e owns whole-session accounting.
-- **M07e — resource/service admission:** qualify complete generation overlap,
-  session/handshake peaks, worker entropy and Rust/native stack/allocation/RSS
-  on the portable artifact before activating the adapters. Amend the checked
-  ledger if measurements cannot fit; never infer a bound from buffer limits.
+- **M07e — component resource evidence:** measure representative generation
+  overlap, session/handshake lifecycles and worker entropy on the portable
+  artifact. Investigate concrete retained growth or unsafe stack use; never
+  infer a process bound from buffer limits. These measurements do not require
+  every composition to fit the speculative ledger before functional use.
   Account for retained peer state, decoded-message expansion and separate
   header/body polling calls before service admission.
   - **M07e1 — representative worker stack:** a portable-only release fixture
@@ -2313,9 +2344,10 @@ Mail integration fixtures cover valid/untrusted/expired/wrong-name chains,
 mTLS admission, fragmented records, STARTTLS reset, handshake saturation,
 wrong keys and returned/fatal failure boundaries. Test M02 digest-bearing
 fixture inputs through the real provider; fake output is not a digest oracle.
-Fit cold/session/handshake generations, native allocations and Rust/C peak
-stack within the service ledger and measure whole-process RSS. Warm workers
-before admission and report secret-erasure limits. Any allocator hook first
+Retain enforced provider input/concurrency limits and test representative
+lifecycles and exhaustion. Whole-service RSS is measured after integration in
+M23; report secret-erasure limits without a byte-ledger proof requirement.
+Any allocator hook first
 requires an UNSAFE.md amendment. No live CA/provider contact, ignored
 certificate errors, hidden second backend or unreviewed direct mail
 dependency.
@@ -2607,7 +2639,8 @@ timeouts, startup/shutdown state and SMTP TLS wiring.
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,
 bound pending handshakes and drain/close saturated connections correctly.
-Allocate/touch application buffers before admission. Add observable readiness
+Acquire bounded slot capacity before effects; per-request allocation is
+permitted under DESIGN section 5. Add observable readiness
 and worker-failure handling without yet claiming complete operational tooling.
 
 **Acceptance:** real local SMTP clients deliver and retrieve persisted raw mail;
@@ -3248,17 +3281,20 @@ stands in for a production binary in this suite. Public egress is denied.
 corpus generators, allocator evidence and limit/refusal regression cases.
 
 Run the DESIGN section 15 workload and many-small-message variant on release
-builds. Measure RSS separately from page cache/cgroup accounting, record the
-whole pool ledger, and detect allocations in successful AND failed admitted
-hot operations. Name bounded std/TLS/cold-path allocations explicitly. Any
-unsafe instrumentation needs the repository's documented test surface.
+builds. Measure RSS separately from page cache/cgroup accounting and record
+actual concurrent owners, configuration and retained memory over repeated
+operations. Use allocation instrumentation to diagnose growth when useful,
+including failed operations; nonzero allocation counts alone are not defects.
+Any unsafe instrumentation needs the documented test surface.
 
-**Acceptance:** <64 MiB idle, <128 MiB workload RSS under the default profile,
-or a reviewed design amendment supported by measurements before release.
-Repeated ingestion, queries, retries, renewals and reloads do not grow retained
-RAM. Saturation yields defined refusals and reserves progress for health and
-existing accepted work. Disk full and checkpoint pressure cannot corrupt mail.
-Fix concrete hot-path violations in their owning modules, with focused tests.
+**Acceptance:** report idle/workload memory against the provisional 64/128 MiB
+goals and establish a measured release profile. If those goals are missed,
+identify the causes and review tuning or revised goals from actual service
+evidence; do not repair a speculative ledger to simulate a memory result.
+Repeated ingestion, queries, retries, renewals and reloads show no unexplained
+retained growth. Saturation yields defined refusals and reserves progress for
+health and accepted work. Disk full and checkpoint pressure cannot corrupt
+mail. Fix concrete violations in their owning modules with focused tests.
 
 ## M24 — Crash matrix and protocol robustness release gate
 

@@ -400,7 +400,8 @@ body lifecycle; M23 steady-state resource/concurrency qualification.
 The concrete IngressSpool reserves an entire configured message_bytes slot
 before create_new, using smtp_sessions + https_connections cold slots. The
 default is 512 MiB across 16 slots; the theoretical hard ceiling is 2 GiB
-across 64. ResourcePlan still validates the complete 128 MiB memory budget.
+across 64. ResourcePlan still validates its current 128 MiB planning budget;
+DESIGN section 5 separates that arithmetic from process memory claims.
 This pool has no hot used-byte counter: partial and prepared files keep the
 full reservation until their descriptor closes and owned inode unlinks.
 Failed cleanup retires the charged slot until bounded startup cleanup. The

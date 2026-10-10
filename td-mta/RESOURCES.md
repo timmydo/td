@@ -1,4 +1,16 @@
-# Startup resource ledger
+# Resource planning and component evidence
+
+[DESIGN.md section 5](DESIGN.md#5-resource-and-execution-model) owns resource
+policy. This document inventories current code, a proposed runtime layout and
+fixed-fixture observations. The byte ledger, scratch partitions, worker layout
+and provider allowances below are planning estimates. They do not impose
+byte-exact architectural ceilings, blanket preallocation/zero-allocation, or
+qualification of every listed exclusion before functional implementation.
+Only explicitly implemented caps and API capacity/ownership rules describe
+current enforced behavior. Historical milestone observations remain scoped
+to their fixtures. New evidence follows section 5's stopping rule; whole-service
+performance is evaluated after integration in M23.
+
 
 M01 and M02c3a implement `Limits::plan` in [src/limits.rs](src/limits.rs).
 It validates
@@ -10,11 +22,13 @@ they convey no authorization. Derived MIME-part wire IDs belong to M02.
 
 ## Default reservation
 
-All quantities below are bytes. This is a planned ceiling for each component,
-not a claim that the service exists or its RSS has been measured. Ownership below assigns
-concrete structures/workers within it; M04 implements pools; M07 measures TLS;
-M23 verifies resident usage. A structure exceeding its reservation must change
-the checked ledger and pass the budget gate before admission is enabled.
+All quantities below are bytes. This is a planning estimate for each
+component, not a claim that the service exists or its RSS has been measured.
+Ownership below records proposed structures/workers; M04 implements bounded
+primitives and M07 measures TLS components. M23 measures integrated resident
+usage. A structure need not fit these estimates as a design requirement.
+Limits::plan still enforces its existing arithmetic/configuration budget;
+changing that validator requires an explicit atomic implementation update.
 
 | Component | Count | Bytes each | Total |
 | --- | ---: | ---: | ---: |
@@ -46,22 +60,13 @@ and a 4 MiB disposable index cache. Default connection counts are unchanged.
 With all other defaults, three TLS handshake slots require 135709952 bytes,
 exceeding the unchanged 128 MiB compiled maximum. Reduce other configured
 reservations, such as the disposable cache, before adding that third slot.
-The 64 MiB idle and 128 MiB workload RSS release ceilings remain independent
-and unverified. The TLS entries are demand headroom, not additional arenas to
-allocate and touch at startup. Idle retains its actual current generation;
-provider state for unused session/handshake slots, processing headroom and
-the replacement generation are not expected to be resident. Application arenas
-and owned TLS wire pools still must be allocated and touched before admission;
-those wire pools are already charged within the session entries. The ledger sum cannot establish either
-RSS result; nondefault pool sizes require separate qualification.
-
-The TLS entries are qualification ceilings. They give the measured fixtures
-room for retained peer chains, native caches, decoder expansion and complete
-generation overlap, but are not proven maxima for every admitted input.
-The current Rust/native counters constrain requested bytes in overlapping
-domains; they do not measure allocator overhead or every realloc transient.
-Increasing these entries does not qualify service admission or RSS. M07e must
-still account for those costs and concurrent owners within the ledger.
+The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
+DESIGN section 5. TLS entries estimate demand, not additional arenas to
+allocate and touch at startup. The ledger sum establishes no RSS bound.
+Provider counters observe requested bytes in overlapping domains; allocator
+overhead and realloc transients require care when interpreting measurements.
+M07/M23 use those observations to diagnose actual resource problems, not to
+prove that every admitted input fits each speculative entry.
 
 The generated Unicode arrays have a checked 58720-byte compiled payload.
 Named static slices give each table one runtime allocation identity.
@@ -161,8 +166,8 @@ encoded-header adapters or combined service RSS.
   allocator metadata or every Rust wrapper allocation. Application operation
   slots contain offsets/type/action, never borrowed self-referencing rows.
   The synchronous core applies closed parameterized SQL without mailbox-sized
-  RAM collections. The full coordinator still must qualify simultaneous
-  stack/scratch/native owners and enforce logical disk/category reservations.
+  RAM collections. The full coordinator must enforce logical disk/category
+  reservations; integrated measurements account for simultaneous owners.
 - Outbound: exactly 100 envelope cells of 320 bytes, 100 distinct 4096-byte
   RCPT reply cells, and 128 KiB transfer/reply scratch. This per-attempt batch
   is independent of the configured inbound recipient ceiling. The final DATA
@@ -175,7 +180,8 @@ encoded-header adapters or combined service RSS.
 - Fixed control scratch and queues have the partitions below. No HTTP-01,
   administration, resolver, ACME or migration path can invent another pool.
 - Eight worker stacks fund the fixed roles below; no worker/thread may appear
-  outside this count without a ledger amendment. The main stack allowance is a
+  outside this proposal without reviewing concurrency and progress effects.
+  The main stack allowance is a
   resident budget,
   not a claim that the host's virtual stack mapping is one MiB. The control
   worker reserves 80 KiB of its existing 256 KiB stack for temporary borrowed
@@ -196,15 +202,16 @@ encoded-header adapters or combined service RSS.
   36874 pump bytes is 137231. This window can extend past authenticated
   Finished. The mail owner retains its handshake permit until facade and
   socket output drain;
-  the corresponding additional handshake memory reservation must cover the
-  whole pre-drain window before activation. After authenticated Finished and
+  integration measurements must include that complete pre-drain overlap.
+  After authenticated Finished and
   complete facade output drain, its permanent ciphertext ceiling is 36874 bytes. That established
   ceiling plus 16384 plaintext bytes and the pump buffers totals 90132 bytes,
   leaving 434156 of the 512 KiB session target before handles, retained input,
   peer chains, native state and allocator overhead. Post-operation output
   refusal does not bound temporary allocation or Vec capacity. Complete
-  session accounting remains an M07e admission blocker. Measure coexistence
-  within 512 KiB, or amend the ledger before serving. The runtime must reserve
+  session observations remain M07e evidence. Measure coexistence
+  during integration rather than treating 512 KiB as a proven cap. The
+  runtime must reserve
   the wire buffers before admission and recover both through into_buffers on
   teardown or constructor refusal, for either representation. The pump accepts
   borrowed references or Box-owned arrays allocated before admission; it never
@@ -223,7 +230,7 @@ encoded-header adapters or combined service RSS.
   never one pool per listener or worker. Complete allocation/RSS accounting
   remains M07e.
   Internal backend queues, peer chains and retained handshake fragments need
-  separate measurement within these same entries, not an added allowance.
+  measurement during integration; these entries remain estimates.
   Incoming TLS 1.3 tickets still derive secrets, query the clock and copy peer
   chains before discard with resumption disabled. Include these temporary
   allocations and record work in established-session measurements.
@@ -233,7 +240,7 @@ encoded-header adapters or combined service RSS.
   TLS operation at a time, including control-message decoding after Finished.
   It can coexist with both handshake workers and both certificate generations.
   Increasing connection counts does not multiply this serial allowance;
-  moving established TLS work to more threads requires a ledger amendment.
+  moving established TLS work to more threads requires concurrency measurements.
   These allowances fund provider allocations, not extra td-owned wire pools.
   Raw handshake byte caps do not bound decoded vector sizes. The decoded-list
   fixture charges pre-Finished expansion to handshake headroom. Incoming
@@ -259,10 +266,11 @@ encoded-header adapters or combined service RSS.
   Boxed payloads are freed
   before their slot is released. Charge the cold bitmap, payload/shared-owner
   allocations, leases and briefly overlapping final-drop ownership headers to
-  this same ledger, including allocator overhead; no new allowance is added.
+  integrated measurements, including allocator overhead.
   The runtime bounds lease counts and destruction concurrency with its fixed
   slots/workers. GenerationSet cannot bound T's contents, loader temporaries,
-  extracted resources or native allocations; M07e still proves their aggregate.
+  extracted resources or native allocations; integrated measurements must
+  account for those owners without claiming a proven universal maximum.
   The TLS policy compiler reserves at most 18 table entries (16 listeners,
   relay and ACME). Within one complete compilation it reserves at most 32
   temporary HTTPS identity cache entries: one per certificate profile with and
@@ -284,11 +292,13 @@ encoded-header adapters or combined service RSS.
   relay/ACME trust. It occupies one of the same two generation slots; complete
   replacement and retained client sessions cannot create a third slot or
   independent trust-cache allowance. The compiler
-  does not yet measure/enforce the 8 MiB native aggregate and cannot activate
-  serving. SessionPreparation retains the handshake count, generation and two
+  does not enforce an 8 MiB native aggregate; that figure remains a planning
+  estimate and supplies no activation or process memory claim.
+  SessionPreparation retains the handshake count, generation and two
   preallocated buffers without allocating; native construction runs later on a
-  fixed TLS worker. The runtime must still supply/retain the complete session
-  slot and native byte allowance; a pair of arrays alone is not that admission.
+  fixed TLS worker. The runtime must still retain a bounded session slot
+  and generation/handshake ownership; a pair of arrays
+  alone is not that admission.
   Socket handoff moves those same owners into TlsConnection without another
   wire allocation. It holds the count permit through queued/Pending native
   progress, releasing it only after mail handshake authorization or abort.
@@ -297,7 +307,7 @@ encoded-header adapters or combined service RSS.
   and optional-permit bookkeeping to the same session/slot reservations.
 - Certificate overlap, reload overlap, allocator bookkeeping, executable
   pages and main/worker stacks all count at peak coexistence. RSS tests must
-  validate the allowances; this ledger is not an OS memory limiter.
+  report actual integrated peaks; this ledger is not an OS memory limiter.
 
 Message size, upload/queue quotas, queue length and log file limits are disk or
 admission bounds. Growing them does not reserve whole bodies or a whole queue in
@@ -321,7 +331,10 @@ admission code actually enforces.
 
 ## Fixed execution ownership
 
-These are implementation requirements, not running workers. The main thread
+This is a proposed runtime layout, not running workers. Its exact counts,
+quanta and buffer partitions may change during integration under DESIGN
+section 5. Bounded concurrency, ownership, completion delivery and foreground
+progress remain requirements. The main thread
 owns nonblocking accept/read/write and bounded established-TLS record work.
 It visits connection slots in rotating order, at most one 16 KiB application
 chunk/record per ready slot per turn. It then processes completion/timer events
@@ -382,9 +395,9 @@ whole request is not one main-thread operation. Main only does bounded socket
 record work, scheduling, and small HTTP-01/event/health framing from existing
 validated state (at most 2 KiB of that control framing per turn). Worker jobs
 resume in rotating slot order; no request owns a worker across an idle wait.
-Use fixed Mutex/Condvar rings, not channels with implicit growable wait queues.
-Use allocation-free unstable sorting with a complete deterministic tie-break,
-never a stable sort that allocates hidden scratch. Typed adapter errors carry
+Use bounded queues with explicit saturation. Sorting must have a complete
+deterministic tie-break and bounded input/scratch; allocation is permitted.
+Typed adapter errors carry
 bounded codes, not newly allocated error messages. M05 must measure std path
 conversion/directory iteration and impose a verified path bound or explicitly
 account for unavoidable adapter allocations; no unverified std stack threshold
@@ -428,9 +441,10 @@ M21 must measure this separate process and its bounded page/body lifecycle.
 
 ## Scratch partitions
 
-Partitions are byte ceilings at simultaneous peak. Implementers may reuse
-space only when the lifetimes are mutually exclusive and tested. Larger
-concrete structures require a ledger amendment before admission is enabled.
+Partitions below are proposed capacity estimates. Implementers may reuse
+storage only when its lifetimes permit it. Existing fixed-buffer APIs enforce
+their supplied capacities; larger or allocating representations may be chosen
+explicitly under DESIGN section 5 without a speculative ledger proof.
 
 | Reservation | Partition |
 | --- | --- |
@@ -2507,7 +2521,8 @@ This ledger does not budget whole earlier JMAP responses, generic JSON trees,
 or all MIME body values in memory. ADMISSION.md defines bounded private response
 spools/result references and their work/disk admission. POLICY.md defines
 parser/charset/search/thread policies and CASES.md the fixture inventory.
-Concrete implementations must fit these contracts before enabling service.
+Service implementations must enforce admitted input, work, disk and
+concurrency limits. Speculative memory partitions do not block implementation.
 
 ## Evidence
 
@@ -2546,8 +2561,9 @@ it neither measures peak used stack bytes nor qualifies every provider/CPU
 path, maximum configuration/certificate layout, production opener, scheduler
 frame or simultaneous worker. Initial and later RNG work for this one worker
 is included in its exercised paths; per-worker native heap state is not
-measured. Rust/native allocation, complete generation/session coexistence,
-whole-process RSS and the known session-cap sum remain admission blockers.
+measured. Rust/native allocation, complete generation/session coexistence
+and whole-process RSS remain unmeasured service dimensions. Under DESIGN
+section 5 they do not create a byte-ledger prerequisite for functional work.
 The retained-connection scenarios also exercise implicit handoff tails, tightened
 handshake deadlines, sticky failure, gateway reload refusal, established clock
 failure and authorization/permit release. Successful execution on the observed
@@ -3560,7 +3576,8 @@ Link wrapping covers undefined references only. Hidden/local libc calls,
 startup paths and unqualified alternate allocators remain outside the counts.
 Thus these are diagnostic C boundary observations, potentially overlapping
 Rust System calls, not exact native heap or whole-service RSS measurements.
-Service activation still requires the complete memory qualification in M07e.
+M23 measures integrated service memory; this diagnostic supplies no service
+memory claim or exhaustive pre-integration qualification requirement.
 
 Positive controls use opaque C function pointers and require exact nonzero
 call deltas. Direct allocator calls used only in null checks can disappear
@@ -3857,9 +3874,10 @@ generation cases. RSS is sampled in its own process. Exact
 with allocation completion `tls-generation-trust-allocation-v1: DOMAIN passed`
 and RSS completion `rss-observation-v2: generation-trust passed`. Other
 scenario output cannot supply its evidence. The first-to-candidate retained
-delta is about 1.2 MiB in both counter domains and must fit the generation
-entry. Its single HTTPS listener has no views to share across listeners.
-Complete aggregate qualification remains required before service activation.
+delta is about 1.2 MiB in both counter domains, compared with the generation
+estimate. Its single HTTPS listener has no views to share across listeners.
+Integrated memory measurements remain M23 work; this fixture alone supplies
+no service memory claim.
 The case does not establish a maximum for arbitrary subjects, mixed algorithms,
 ACME trust or concurrent sessions.
 
@@ -3922,8 +3940,8 @@ traffic, maximum tickets, mTLS or complete service qualification. The
 large-ticket case covers one near-ceiling fragmented ticket. Socket-free
 crypto fixtures also qualify selected accepted flights and terminal refusal
 of two 48000-byte tickets in one flight; they do not establish an exact
-threshold or refusal-memory peak. The known session-admission blocker remains
-explicit; configured queue limits are not a whole-memory bound.
+threshold or refusal-memory peak. Session/counter allowances remain planning
+estimates; configured queue limits are not a whole-memory bound.
 
 ## Decoded certificate-list refusal observations
 
@@ -4062,6 +4080,6 @@ at 512 bytes, and SpoolInput at 384 bytes. These states fit existing SMTP
 increase above the 128 MiB process budget is introduced. Paths use the existing
 bounded stack buffers for constructed names. Startup directory iteration
 uses bounded temporary std path/name allocations, retains no entry list and
-examines at most 65 entries. Whole-service stack, std allocation and combined
-RSS qualification remain required before listener activation; these layout
+examines at most 65 entries. M23 measures integrated service memory and
+targeted stack/allocation diagnostics follow DESIGN section 5; these layout
 and streaming fixtures are not a claim about kernel page-cache residency.
