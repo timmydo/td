@@ -8850,8 +8850,8 @@ installs it; Enter does not (`td-compositor/DESIGN.md`, "Physical
 installation confirmation"). The login-key disclosures, enrollment's and
 the one-key and remove-every-key removal disclosures
 (`td-login/TOKEN-LOGIN.md`, increment 5's A4), take the approval key
-on the operation's first step, implemented and inert until that
-increment's A5 admits a write. The live medium's whole-disk installation, which `I`
+on the operation's first step, live since that increment's A5 admits
+a write. The live medium's whole-disk installation, which `I`
 selects on a live boot, keeps its fresh Enter: it runs on the live
 medium, before any installed principal exists, so there is no principal
 table to consult. It keeps Enter's weaker answer to a reflex press,
@@ -8981,7 +8981,8 @@ firstboot reports how many keys the file holds and warns on the console
 while it holds any.
 
 `td-login/TOKEN-LOGIN.md`'s increment 5, which activates login-key
-enrollment, may follow now that L7 has landed.
+enrollment, followed L7 and has landed: its A5 admits enrollment,
+addition and removal from the attention screen's `K`.
 
 #### Elevation increments
 

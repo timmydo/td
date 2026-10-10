@@ -1810,8 +1810,8 @@ and request `1d` through its commit and td-boot's checked pair;
 commit and the canonical write; and `deploy-publish` (L5), tag 5's key
 bytes, the table's row for request 19 and the update queue's backoff
 ("Consent for a locally built system"). Since TOKEN-LOGIN.md increment
-5's A4 the login tags' disclosure steps carry the key too, implemented
-and inert in production until its A5 admits a write.
+5's A4 the login tags' disclosure steps carry the key too, live since
+its A5 admits a write.
 APPLICATIONS.md §L.1, "The v1 operations", says what
 `deploy-rollback`, `set-hostname` and `deploy-publish` are and why,
 and its "Elevation increments" which commit lands each part;
@@ -2089,40 +2089,40 @@ request's key, sees
 the kernel keeps the old one and the count cleared, and reboots to
 `TD-HOSTNAME-READY` with the new name.
 
-## Login keys and session lock (target)
+## Login keys and session lock
 
-Implemented, inert: the consent operations and step admission
-(amendments 3 and 4), and the worker supervision, requests and deadlines
-of amendments 2, 5 and 6 ("Login-key operation supervision" below). The
-paired compositor sends `1b` for a first enrollment and an addition,
-which a production build refuses as it refuses every login operation
-that may write, and an unlock's `1b` only from its lock surface while
-the state is enrolled (`td-compositor/DESIGN.md`, "The lock surface"),
-so nothing in production starts the worker but that unlock on a machine
-holding a record, which nothing in production writes. Its PIN field
-sends `1c` only after this supervisor's `91 0c` for a presented PIN
-step, which only that unlock reaches (`td-compositor/DESIGN.md`, "The
-PIN field"). Login state (1) is implemented and live: request `1a`, its
-cache and the `9a` answer, which the compositor asks at connect, uses
-for `D`'s key list and, since TOKEN-LOGIN.md increment 4's C7, locks on
-at every generation's start where it is enrolled or unavailable, drawing
-its names on the lock surface, and since C9 reads to decide whether
-`Super+l` and the attention menu's `L` lock (enrolled or unavailable) or
-do nothing (unenrolled, where `L` shows `NO LOGIN KEYS ENROLLED`). No
-td-authd change was needed for either: the connect-time `1a` already
-preceded the compositor's first paint, and the later answers already
-reached it. Update consent (8) is implemented (C4) and live: on an
-enrolled or unavailable machine request 19 refuses a queued deployment
-that cannot read the record. Every deployment built from TOKEN-LOGIN.md
-increment 4's C10b onward carries the tier marker, so on such a machine
-it admits a marked deployment that reads the record's version (any
-marked one while the record cannot be read) and refuses one built
-before C10b, which carries none; nothing enrolls before increment 5.
-Revocation (7) is implemented and live (TOKEN-LOGIN.md increment 5's
-A3, `revocation.rs`): every generation's first `1a` checks the record,
-and on a stock boot firstboot's record names the unenrolled state, so
-the check changes nothing.
-[`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md) owns the planned
+Implemented and live since TOKEN-LOGIN.md increment 5's A5: the
+consent operations and step admission (amendments 3 and 4), and the
+worker supervision, requests and deadlines of amendments 2, 5 and 6
+("Login-key operation supervision" below). The paired compositor sends
+`1b` for a first enrollment, an addition and a removal from its `K`
+screen, each of which a production build starts, and an unlock's `1b`
+only from its lock surface while the state is enrolled
+(`td-compositor/DESIGN.md`, "The lock surface"). Its PIN field sends
+`1c` only after this supervisor's `91 0c` for a presented PIN step
+(`td-compositor/DESIGN.md`, "The PIN field"). Login state (1) is
+implemented and live: request `1a`, its cache and the `9a` answer, which
+the compositor asks at connect, uses for `D`'s key list and, since
+TOKEN-LOGIN.md increment 4's C7, locks on at every generation's start
+where it is enrolled or unavailable, drawing its names on the lock
+surface, and since C9 reads to decide whether `Super+l` and the
+attention menu's `L` lock (enrolled or unavailable) or do nothing
+(unenrolled, where `L` shows `NO LOGIN KEYS ENROLLED`). No td-authd
+change was needed for either: the connect-time `1a` already preceded the
+compositor's first paint, and the later answers already reached it.
+Update consent (8) is implemented (C4) and live: on an enrolled or
+unavailable machine request 19 refuses a queued deployment that cannot
+read the record. Every deployment built from TOKEN-LOGIN.md increment
+4's C10b onward carries the tier marker, so on such a machine it admits
+a marked deployment that reads the record's version (any marked one
+while the record cannot be read) and refuses one built before C10b,
+which carries none; nothing enrolled before increment 5. Revocation (7)
+is implemented and live (TOKEN-LOGIN.md increment 5's A3,
+`revocation.rs`): every generation's first `1a` and every login
+operation's end check the record. On a stock boot firstboot's record
+names the unenrolled state, so the check changes nothing until the owner
+enrolls a key or removes the last one, which cuts over.
+[`td-login/TOKEN-LOGIN.md`](../td-login/TOKEN-LOGIN.md) owns the
 login-key tier. "Session lock" there is the compositor's display and
 input lock; it is unrelated to this document's secret-session statuses
 (idle, a released key, relocking), and unlocking the session neither
@@ -2220,7 +2220,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    PIN (`16`) and typed failure (`15`) frames, and the commit round an
    unlock also runs, are `td-secret/DESIGN.md`'s, "Login-key worker"; the
    worker's unlock, first enrollment, addition and removal are
-   implemented in `login_operation.rs`, inert. The slot is what
+   implemented in `login_operation.rs`. The slot is what
    serializes the worker's writes to the login store: each of the
    worker's token sessions holds `/run/td-fido/operation.lock` only for
    that session. Across td-authd processes the worker depends on td-svc:
@@ -2234,7 +2234,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    non-success after `13` is a failure. The re-read is amendment 1's: root
    reports the uncertain end (`91 0e`), and the compositor's `1a` after
    every login operation refreshes root's cached state.
-3. **Consent operations (2).** Implemented, inert: `consent.rs` has tags
+3. **Consent operations (2).** Implemented: `consent.rs` has tags
    7 to 10, login unlock, first enrollment, key addition and key removal.
    Each carries its step, the key count before and after and the
    fingerprints involved, and every PIN step of every one of them carries
@@ -2263,9 +2263,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    the worker as one bounded frame in a clearing owner and keeps no copy.
    Both peers ship atomically, without negotiation, as earlier additions
    did; the compositor's private client sends `1b` from increment 3,
-   and its PIN field `1c`. Until
-   activation, `1b` refuses enrollment, addition and removal in a
-   production build, and an unlock refuses while no record exists. Host
+   and its PIN field `1c`. Since activation (TOKEN-LOGIN.md increment
+   5's A5) every `1b` starts its worker, and an unlock ends as NO
+   RECORD while no record exists. Host
    child fixtures and the ignored root session fixture drive both requests
    through the real paired Session, as they do for secret operations.
    Request `1a` landed with login state in increment 4's C3, still
@@ -2576,7 +2576,7 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    From C10b it admits a queued deployment whose marker lists the
    enrolled record's version, or any marked one while the record cannot
    be read, and still refuses one built before C10b, which carries no
-   marker; no machine enrolls before increment 5, and an unenrolled
+   marker; no machine enrolled before increment 5, and an unenrolled
    machine reads no marker. The full-system refusal, in
    `qemu-login-system` (C11), depends on C10b's marked deployments.
 9. **Session admission (planned).** `td-install/ENCRYPTION.md`
@@ -2611,11 +2611,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     step's description names the operation, its tokens' fingerprints
     and, for a PIN or recovery-key step, which secret it asks for;
     secrets reach it through `1c`. Until ENCRYPTION.md's item 9 a
-    production build refuses every storage operation, as it refuses
-    login writes before activation. Its request bytes, consent tags and
-    screen are fixed by increment 8e's first commit, a documentation
-    commit amending this section and `td-compositor/DESIGN.md` before
-    their code.
+    production build refuses every storage operation, as it refused
+    login writes before TOKEN-LOGIN.md's A5. Its request bytes, consent
+    tags and screen are fixed by increment 8e's first commit, a
+    documentation commit amending this section and
+    `td-compositor/DESIGN.md` before their code.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.
@@ -2634,7 +2634,7 @@ argument. The paired requests are:
 | Request | Response |
 | --- | --- |
 | `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` to `03` (amendments 1 and 7) |
-| `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started; `9b 00`: refused in this build |
+| `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
 `1a` needs completed preparation, or it ends the generation, but neither
@@ -2735,14 +2735,14 @@ The worker starts a commit round only with five seconds of its own
 deadline left and refuses a late acknowledgement, which makes a late
 `14` unlikely but cannot exclude one.
 
-Until activation (TOKEN-LOGIN.md increment 5) `login::WRITES` is false in
-every production build: `1b` answers `9b 00` for an enrollment, addition
-or removal before starting anything. Test builds set it, so host fixtures
-drive every operation. An unlock is wired, and ends as NO RECORD while no
-record exists; the production compositor sends `1b` for a first
-enrollment or an addition, which this refuses, and for an unlock only
-from its lock surface while the state is enrolled. Only this
-supervisor's `91 06` for that unlock's committed last step leaves the
+Since activation (TOKEN-LOGIN.md increment 5's A5) every production
+build starts the worker for each `1b`: an enrollment, addition or
+removal as the `K` screen selects it, and an unlock, which ends as NO
+RECORD while no record exists and which the production compositor sends
+only from its lock surface while the state is enrolled. `9b 00`, the
+refusal before activation, is gone with `login::WRITES`; the compositor
+takes any `9b` but `9b 01` and a nonce as a protocol violation. Only
+this supervisor's `91 06` for an unlock's committed last step leaves the
 lock surface.
 
 Host tests drive the controller and the paired Session against scripted
@@ -2752,13 +2752,13 @@ each refusal from the baseline with the worker killed before any step,
 uncertainty after a write's `13` for a typed failure, a lost channel, a
 failed exit, root's deadline and a cancel, an unlock's failure after `13`
 staying a failure, malformed and out-of-order frames, stale
-acknowledgements and PINs, the slot, teardown and the production
-refusal; root's key on exactly the disclosure steps, a disclosure's
-receipt after ten seconds still proceeding, the ceilings with and
-without the reading allowance and their narrowing at the first step, a
-receipt judged at one reading of the clock, and the defensive late
-receipt ending as TIMEOUT through the Session with the generation going
-on. The ignored root fixture
+acknowledgements and PINs, the slot, teardown and production's
+admission of every operation to its worker; root's key on exactly the
+disclosure steps, a disclosure's receipt after ten seconds still
+proceeding, the ceilings with and without the reading allowance and
+their narrowing at the first step, a receipt judged at one reading of
+the clock, and the defensive late receipt ending as TIMEOUT through the
+Session with the generation going on. The ignored root fixture
 `session::tests::root_login_supervision_meets_the_production_worker`,
 qemu-secret's `supervise-login` authority case, runs the production
 worker through the real Session in the disposable root VM: a missing

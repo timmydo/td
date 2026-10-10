@@ -17,7 +17,7 @@ Device binding protects a disk read away from its machine, not a lost
 one. No increment may describe enrollment, disk confidentiality beyond
 that, or protected login as shipped until its complete boot and recovery
 path passes the acceptance tests below.
-The planned TPM-free login-key tier in
+The TPM-free login-key tier in
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) is an authentication
 tier over either storage state, not a third storage tier: it replaces
 automatic login with a FIDO2 key and PIN at boot and lock. Its scope,
@@ -56,8 +56,8 @@ binds release to td's selector image, its initramfs and its load options;
 code that runs before the selector, including option ROMs and firmware
 drivers, is not covered. It does **not** protect a lost or stolen machine:
 whoever powers it on reaches the automatic-login desktop exactly as on an
-unencrypted install, or, once the planned login-key tier exists and keys
-are enrolled, its lock screen. No installer text, document or claim may
+unencrypted install, or, where login keys are enrolled, its lock
+screen. No installer text, document or claim may
 describe it, alone or combined with login keys, as lost-laptop
 protection: with login keys the volume key is still released with no user
 action, so a locked machine holds it in RAM while exposing its devices and
@@ -65,8 +65,8 @@ every surface reachable before unlock.
 
 TPM possession here releases storage and nothing else. It is device binding
 in the sense of AGENTS.md principle 7, not authentication: the session is
-still admitted by the existing, disclosed automatic login (or, once it
-exists, by the planned login-key tier), and this tier neither changes nor
+still admitted by the existing, disclosed automatic login (or, where
+keys are enrolled, by the login-key tier), and this tier neither changes nor
 strengthens either. Root on the booted system holds the volume key and can
 change any protector, so this tier makes no authorization claim about
 protector changes. Its own protector changes happen only in the selector,

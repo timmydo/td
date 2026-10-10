@@ -242,9 +242,16 @@ pub fn system_phase(cmdline: &str) -> Result<&str, String> {
 pub const LOGIN_SYSTEM_TEST: &str =
     "login_operation::tests::vm::system::qemu_login_system_locks_unlocks_and_refuses_on_a_full_system";
 pub const LOGIN_SYSTEM_PASS: &str = "TD-LOGIN-SYSTEM-PASS";
-/// `seed` enrolls; `locked` is the enrolled machine's boot and its
-/// relocks; each damage named after `damaged-` boots unavailable and is
-/// repaired, and the `repaired-` boot after it is an enrolled one again.
+/// The guest's word that its enrollment's record is published, on which
+/// the host cuts its power: QEMU killed.
+pub const LOGIN_SYSTEM_CUT: &str = "TD-LOGIN-SYSTEM-CUT";
+/// `seed` enrolls through the attention screen; `locked` is the enrolled
+/// machine's boot and its relocks; each damage named after `damaged-`
+/// boots unavailable and is repaired, and the `repaired-` boot after it
+/// is an enrolled one again; `added` adds keys to eight, `removed` removes
+/// them, `unlocked` boots unenrolled and enrolls one key across a killed
+/// authority, `cut` removes it, enrolls another and is cut right after
+/// that publication, and `after-cut` is the boot after the cut.
 pub const LOGIN_SYSTEM_PHASES: &[&str] = &[
     "seed",
     "locked",
@@ -262,7 +269,14 @@ pub const LOGIN_SYSTEM_PHASES: &[&str] = &[
     "repaired-record-truncated",
     "damaged-record-version",
     "repaired-record-version",
+    "added",
+    "removed",
+    "unlocked",
+    "cut",
+    "after-cut",
 ];
+/// The phase the host cuts rather than lets reboot.
+pub const LOGIN_SYSTEM_CUT_PHASE: &str = "cut";
 /// The stock image's hostname, which its lock surface shows.
 pub const LOGIN_SYSTEM_HOST: &str = "td";
 /// The serial greeter's one refusal line (td-login/THREAT-MODEL.md §3).
@@ -275,45 +289,139 @@ pub const CONSOLE_REFUSED: &str =
 const UNLOCK: &[&str] = &[
     "pin", "pin", "touch", "touch", "release", "unlocked", "desktop",
 ];
+/// A key-management operation's PIN step: its prompt with the field
+/// empty, then its touch request.
+const PIN_STEP: &[&str] = &["step-pin", "step-touch"];
+
+/// The attention menu, then its `K` screen.
+fn manage(screens: &mut Vec<&'static str>) {
+    screens.extend(["menu", "keys"]);
+}
+
+/// A new key's create, prove and repeat, each a PIN step, then its probe,
+/// which asks for a touch.
+fn ceremony(screens: &mut Vec<&'static str>) {
+    for _ in 0..3 {
+        screens.extend(PIN_STEP);
+    }
+    screens.push("step");
+}
+
+/// A first enrollment of `keys` keys up to its last touch: the
+/// disclosure, then each key's connect step, the first key's being the
+/// disclosure, and ceremony.
+fn enrollment(screens: &mut Vec<&'static str>, keys: usize) {
+    manage(screens);
+    screens.push("disclosure");
+    ceremony(screens);
+    for _ in 1..keys {
+        screens.push("step");
+        ceremony(screens);
+    }
+}
+
+/// An addition: the authorizing key's PIN step, the connect step, the new
+/// key's ceremony, its success and the desktop.
+fn addition(screens: &mut Vec<&'static str>) {
+    manage(screens);
+    screens.extend(PIN_STEP);
+    screens.push("step");
+    ceremony(screens);
+    screens.extend(["added", "desktop"]);
+}
+
+/// A removal: the positions screen before and after the choice, the
+/// disclosure, the authorizing key's PIN step, its success and the
+/// desktop.
+fn removal(screens: &mut Vec<&'static str>) {
+    manage(screens);
+    screens.extend(["removing", "removing", "disclosure"]);
+    screens.extend(PIN_STEP);
+    screens.extend(["removed", "desktop"]);
+}
 
 /// The screens each phase asks for, in order. `seed` boots unlocked from
 /// the blank to the desktop, once its serial greeter has logged in and
-/// been stopped so that no shell reads the answers. `locked` starts
-/// locked under a client, then unlocks, relocks with `Super+l`, unlocks,
-/// relocks with `L`, unlocks, queues three updates, relocks by a killed
-/// compositor, restarts the pair with the state helper failing until it
-/// answers again, unlocks, and last suspends to RAM, after which its
-/// virtio-gpu card shows nothing more.
+/// been stopped so that no shell reads the answers, then sees an
+/// enrollment refused while `previous` lacks the tier marker and enrolls
+/// two keys. `locked` starts locked under a client, then unlocks, relocks
+/// with `Super+l`, unlocks, relocks with `L`, unlocks, queues three
+/// updates, relocks by a killed compositor, restarts the pair with the
+/// state helper failing until it answers again, unlocks, and last
+/// suspends to RAM, after which its virtio-gpu card shows nothing more.
+/// The later phases manage keys from an unlocked session; `unlocked`
+/// ends on its next generation's lock, and `cut` with its enrollment's
+/// last touch.
 pub fn login_system_screens(phase: &str) -> Vec<&'static str> {
     let mut screens = Vec::new();
-    if phase == "seed" {
-        // The cutover's restarted pair locks on the enrolled record.
-        screens.extend(["blank-unlocked", "desktop", "locked"]);
-    } else if phase == "locked" {
-        screens.extend(["blank", "locked", "locked"]);
-        screens.extend(UNLOCK);
-        screens.push("locked");
-        screens.extend(UNLOCK);
-        screens.extend(["menu", "locked"]);
-        screens.extend(UNLOCK);
-        for _ in 0..2 {
-            screens.extend(["menu", "update-refused", "desktop"]);
+    match phase {
+        "seed" => {
+            screens.extend(["blank-unlocked", "desktop"]);
+            manage(&mut screens);
+            screens.extend(["version-refused", "desktop"]);
+            enrollment(&mut screens, 2);
+            screens.extend(["enrolled", "desktop"]);
         }
-        screens.extend(["menu", "install", "desktop", "killed", "locked"]);
-        screens.extend([
-            "locked-unreadable",
-            "unreadable",
-            "locked-unreadable",
-            "locked",
-        ]);
-        screens.extend(UNLOCK);
-        screens.push("asleep");
-    } else if phase.starts_with("damaged-directory-") {
-        screens.extend(["blank", "locked-damaged", "damaged", "locked-damaged"]);
-    } else if phase.starts_with("damaged-record-") {
-        screens.extend(["blank", "locked-record", "record", "locked-record"]);
-    } else if phase.starts_with("repaired-") {
-        screens.extend(["blank", "locked"]);
+        "locked" => {
+            screens.extend(["blank", "locked", "locked"]);
+            screens.extend(UNLOCK);
+            screens.push("locked");
+            screens.extend(UNLOCK);
+            screens.extend(["menu", "locked"]);
+            screens.extend(UNLOCK);
+            for _ in 0..2 {
+                screens.extend(["menu", "update-refused", "desktop"]);
+            }
+            screens.extend(["menu", "install", "desktop", "killed", "locked"]);
+            screens.extend([
+                "locked-unreadable",
+                "unreadable",
+                "locked-unreadable",
+                "locked",
+            ]);
+            screens.extend(UNLOCK);
+            screens.push("asleep");
+        }
+        "added" => {
+            screens.extend(["blank", "locked"]);
+            screens.extend(UNLOCK);
+            for _ in 0..6 {
+                addition(&mut screens);
+            }
+            manage(&mut screens);
+            screens.extend(["eight", "desktop"]);
+        }
+        "removed" => {
+            screens.extend(["blank", "locked"]);
+            screens.extend(UNLOCK);
+            removal(&mut screens);
+            removal(&mut screens);
+        }
+        "unlocked" => {
+            screens.extend(["blank-unlocked", "desktop"]);
+            enrollment(&mut screens, 1);
+            screens.push("locked");
+        }
+        "cut" => {
+            screens.extend(["blank", "locked"]);
+            screens.extend(UNLOCK);
+            removal(&mut screens);
+            enrollment(&mut screens, 1);
+        }
+        "after-cut" => {
+            screens.extend(["blank", "locked"]);
+            screens.extend(UNLOCK);
+        }
+        _ if phase.starts_with("damaged-directory-") => {
+            screens.extend(["blank", "locked-damaged", "damaged", "locked-damaged"]);
+        }
+        _ if phase.starts_with("damaged-record-") => {
+            screens.extend(["blank", "locked-record", "record", "locked-record"]);
+        }
+        _ if phase.starts_with("repaired-") => {
+            screens.extend(["blank", "locked"]);
+        }
+        _ => {}
     }
     screens
 }

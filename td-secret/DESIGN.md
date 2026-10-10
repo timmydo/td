@@ -4,7 +4,7 @@ The portable personal-vault workstream for td-pass is specified separately
 in [PORTABLE.md](PORTABLE.md). It targets TPM-independent primary/backup
 FIDO2 protection and supported foreign-Linux use. Its staged prerequisites
 do not change the application credential interfaces or protection below.
-The planned login-key root worker and record in
+The login-key root worker and record in
 [../td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md) reuse that
 PIN/hmac-secret flow and the root-only USB transport below; they do not
 change application-store protection either.
@@ -2245,14 +2245,12 @@ itself after 170 seconds, inside the guest's bound.
 `login_operation.rs`: session unlock, first enrollment, key addition
 and key removal. td-authd supervises it on the paired `TDLA003`
 requests `1b` and `1c` (`td-authd/DESIGN.md`, "Login-key operation
-supervision"), but nothing in production starts it except an unlock:
-the compositor sends `1b` for a first enrollment or an addition, which
-a production td-authd refuses before starting anything, as it refuses
-removal, and an unlock's `1b` only from its lock surface while the
-login state is enrolled, so only on a machine holding a record, which
-nothing in production writes (TOKEN-LOGIN.md increment 4's C7); the
-compositor's PIN field sends `1c` only at a PIN step, which only that
-unlock reaches.
+supervision"), and since TOKEN-LOGIN.md increment 5's A5 production
+starts it for every operation: the compositor sends `1b` for a first
+enrollment, an addition or a removal from its `K` screen, and an
+unlock's `1b` only from its lock surface while the login state is
+enrolled (TOKEN-LOGIN.md increment 4's C7); the compositor's PIN field
+sends `1c` only at a presented PIN step.
 It reaches the command line only
 through `run`, keeps the unlock worker's root startup, unnamed
 socketpair, descriptor inventory and bounded framing, and uses its
@@ -2312,10 +2310,9 @@ step it derives later carries no key.
    enforcement it claims ("Deployments"), so `run` reads the record
    versions of each retained deployment that carries it and none from
    one built before C10b; a write still fails as VERSION while either
-   retained deployment predates C10b. Production still refuses every
-   write before it reaches the worker (`td-authd/DESIGN.md`,
-   `login::WRITES`), so this changes no production answer until
-   activation.
+   retained deployment predates C10b. Since TOKEN-LOGIN.md increment
+   5's A5 production admits every write to the worker, so this read
+   decides each production write.
 3. It presents root's own first step (identify, or an enrollment's
    first connect), then reads the record again: if it no longer reads as
    the baseline, an unavailable state included, it fails as RECORD
@@ -2606,8 +2603,9 @@ assert it. The record is the production `/var/lib/td/login/1000`, the
 directory made root's with mode 0700 as firstboot does. The departure
 from `run` is the versions: both retained deployments read this
 build's, standing for the tier markers `run` reads from the volume,
-which these guests have none of, since production still refuses every
-write that leaves a record; `login-changed` also runs empty read sets,
+which these diskless guests lack (`qemu-login-system` reads a real
+volume's, "Login system guest"); `login-changed` also runs empty read
+sets,
 as a machine without marked deployments reads, and others that share no
 version, and
 departs once more, wrapping the store's write in a counter that its
@@ -2705,28 +2703,33 @@ provisioned afresh, the guest exercises no change of state between
 generations within one boot; `qemu-login-system` does.
 
 The host checks the display. The guest writes `TD-LOGIN-SCREEN NAME
-[ARGUMENT...]` to `/dev/console` and waits on ttyS0, read without
-becoming its controlling terminal, for `TD-LOGIN-SHOWN NAME`. The host
-(`guest_screens.rs`, beside the boot oracles) takes the request from a
-finished console line, requires the names in `LOGIN_DESKTOP_SCREENS`'
-order, captures the display through QMP `screendump` until that name's
-check accepts a whole 1280x800 capture, within 60 seconds, and only then
-types the answer into the serial socket, so the guest acts on nothing
-the host has not seen. A screen given arguments it does not take is
-refused at once. A screen may hold from its answer until the next is
-accepted: the host keeps capturing back to back whether or not the
-guest has asked for the next screen, and every capture meanwhile, the
-accepting one included, must satisfy the hold. Every screen of a
-locked generation holds only the guest's magenta, black, and the
-attention ground and white, which the lock surface, the attention
-screens and the PIN step paint, so no client or desktop pixel shows
-while locked, between steps included; `touch` holds nothing, since its
-successor is the unlock, `unlocked` and `blank-unlocked` hold no pixel
-of the attention ground, and `desktop`, the last, holds nothing. After
-the boot, a request left in the console's last lines fails. Host tests
-pin the guest's requests, in its source order, to that list, every
-check to an independently drawn frame, each screen's hold, and the
-judgement of holds across requests.
+[ARGUMENT...]` to `/dev/console` on a line of its own and waits on
+ttyS0, read without becoming its controlling terminal, for
+`TD-LOGIN-SHOWN NAME`. Each guest test first sets the kernel's console
+log level to 1, before it creates any UHID device, so only a KERN_EMERG
+message, a panic's, still reaches ttyS0: printk bypasses the tty layer,
+so a probe could otherwise land inside a request or any other line the
+host checks, and the host reads no other kernel line of these guests. The
+host (`guest_screens.rs`, beside the boot oracles) takes the request
+from a finished console line, requires the names in
+`LOGIN_DESKTOP_SCREENS`' order, captures the display through QMP
+`screendump` until that name's check accepts a whole 1280x800 capture,
+within 60 seconds, and only then types the answer into the serial
+socket, so the guest acts on nothing the host has not seen. A screen
+given arguments it does not take is refused at once. A screen may hold
+from its answer until the next is accepted: the host keeps capturing
+back to back whether or not the guest has asked for the next screen, and
+every capture meanwhile, the accepting one included, must satisfy the
+hold. Every screen of a locked generation holds only the guest's
+magenta, black, and the attention ground and white, which the lock
+surface, the attention screens and the PIN step paint, so no client or
+desktop pixel shows while locked, between steps included; `touch` holds
+nothing, since its successor is the unlock, `unlocked` and
+`blank-unlocked` hold no pixel of the attention ground, and `desktop`,
+the last, holds nothing. After the boot, a request left in the console's
+last lines fails. Host tests pin the guest's requests, in its source
+order, to that list, every check to an independently drawn frame, each
+screen's hold, and the judgement of holds across requests.
 
 | Screen | The host accepts |
 | --- | --- |
@@ -2905,23 +2908,24 @@ temporary cleanup, which td-firstboot's host tests cover.
 
 ### Login system guest
 
-`qemu-login-system` is TOKEN-LOGIN.md increment 4's C11: the login tier
-on the full system, with no TPM. `td-recipe-eval qemu-login-system`
-builds `system-secret-vm-test`, the production system image with the
-secret fixture's unit and test binaries, and boots it sixteen times in
-order on one disposable volume, each boot naming its phase as
+`qemu-login-system` is TOKEN-LOGIN.md increment 4's C11, extended by
+increment 5's A5: the login tier on the full system, with no TPM.
+`td-recipe-eval qemu-login-system` builds `system-secret-vm-test`, the
+production system image with the secret fixture's unit and test
+binaries, and boots it twenty-one times in order on one disposable
+volume, each boot naming its phase as
 `td.login-system=PHASE` beside `td.hid-fixture=1`; the fixture init
 requires exactly one listed phase and runs the one ignored test,
 `qemu_login_system_locks_unlocks_and_refuses_on_a_full_system` in
 `login_system_vm.rs`, beneath the stock supervisor, then asks td-svc to
 reboot through the unchanged persistent shutdown, which ends QEMU under
-`-no-reboot`: QEMU's S3 wake resets the q35 chipset, after which the
-guest's ACPI soft-off no longer powers the machine down. It runs by hand,
-on KVM only, and is in neither `check` nor `check integration`. Every
-boot is the stock firstboot, serial greeter, sshd, boot health, seat,
-compositor, td-authd, terminal and the rest of the unit table; the test
-adds a UHID keyboard before the seat starts, which the fixture unit's
-readiness gates, and UHID keys.
+`-no-reboot`, but for `cut`, whose power the host cuts: QEMU's S3 wake
+resets the q35 chipset, after which the guest's ACPI soft-off no longer
+powers the machine down. It runs by hand, on KVM only, and is in neither
+`check` nor `check integration`. Every boot is the stock firstboot,
+serial greeter, sshd, boot health, seat, compositor, td-authd, terminal
+and the rest of the unit table; the test adds a UHID keyboard before the
+seat starts, which the fixture unit's readiness gates, and UHID keys.
 
 The volume is made as the boot oracles make theirs, with a throwaway
 signing identity, but mkfs runs beneath `td-builder userns-private`, as
@@ -2941,7 +2945,21 @@ named deployment, whose ID must be the booted manifest's as the host
 computes it; `release`, the touch request the guest names last before
 it completes the touch; `killed`, the lock palette or QEMU's inactive
 output once a compositor is killed; and `asleep`, the desktop the guest
-suspends from. Every hold of a lock screen admits the lock palette and
+suspends from. Key management adds `keys`, the `K` screen's rows;
+`version-refused`, `eight`, `enrolled`, `added` and `removed`, each the
+attention screen showing exactly its notice; `removing COUNT
+[POSITION...]`, `D`'s screen for that many keys with those positions
+chosen; and the prompts `step`, `step-pin MASKS` and `step-touch`,
+whose rows the guest names from consent's own `Request::lines` for the
+step it expects, each space written `_`, and which the host checks row
+by row with the time line (1 to 360 seconds) and, for the PIN steps,
+the field's text and masks, every other pixel the ground. `disclosure`
+is such a prompt whose approval-key row the guest names `KEY`: the host
+finds the one key of the 64 whose `APPROVE: TYPE X THEN Y` row the
+frame shows, checks the whole prompt with it, and answers `TD-LOGIN-SHOWN
+disclosure XY`, the only answer that carries a word; the guest types it.
+Every key-management screen holds the lock palette, since a cutover
+follows each write. Every hold of a lock screen admits the lock palette and
 QEMU's own frame for no scanout, black with its grey "Display output is
 not active." in the 16-pixel row from 384 within 128 pixels of the
 centre, which shows between a compositor's exit and its successor's
@@ -2959,10 +2977,15 @@ asks for a screen, since its getty flushes the line's input first.
 
 | Phase | The boot |
 | --- | --- |
-| `seed` | unenrolled, with `inspect-login` failing and the boot's cutover record naming the unenrolled state: once the serial greeter has logged in it is stopped, so no shell reads ttyS0, then `blank-unlocked`, holding no lock pixel, and `desktop`; the ordinary SSH form, root's loopback key refused; then the greeter started and logged in again and an SSH session opened as the primary account; two persistent keys enrolled through the worker with the production retained read, the first alone and the second added across a gated swap, and the record copied aside; last the cutover (TOKEN-LOGIN.md increment 5's A3): the pair restarted finds the enrolled state and the unenrolled record, and both sessions end, the record names the enforced form for this boot, no reboot guard exists, ttyS0 is root's, the greeter parks refusing, `locked`, and the enforced SSH form |
+| `seed` | unenrolled, with `inspect-login` failing and the boot's cutover record naming the unenrolled state: once the serial greeter has logged in it is stopped, so no shell reads ttyS0, then `blank-unlocked`, holding no lock pixel, and `desktop`; the ordinary SSH form, root's loopback key refused; the production retained read; with a fixture volume bound over `/run/td-volume/td` whose `previous` names a deployment without the tier marker, `2` is refused with `version-refused` and no key request; then the serial greeter started and logged in again, its login held by a `sleep` that ignores TERM, and an SSH session opened as the primary account; two persistent keys enrolled through the attention screen, `2`, the disclosure's key read by the host, each key's create, prove and repeat, each a PIN step and its touch, and its probe, whose `step` prompt asks a touch and no PIN, the second across a swap, with the cutover's `render-ssh-policy` held by a wrapper bind-mounted over `/bin/td-firstboot`; once the render begins the record is published, the boot's cutover record removed and both sessions still alive; the render released, the cutover (TOKEN-LOGIN.md increment 5's A3): every process with ttyS0 as its controlling terminal and every member of `sshd`'s leaf at the start are gone and the SSH client has exited, the record names the enforced form for this boot, no reboot guard exists, ttyS0 is root's and the greeter parks refusing; `enrolled`, the record copied aside, and the enforced SSH form |
 | `locked` | locked from the first frame and still locked once the terminal is ready; boot health completes and the enforced SSH form refuses root and admits the primary; unlocks with each key, relocks by `Super+l` and by the menu's `L`; three queued updates; a killed compositor; the pair restarted with the helper failing; an unlock; last, suspend to RAM |
 | `damaged-CAUSE` | locked with the cause's rows; the chord shows them and no login worker lives for a second after it or after Escape, nor is one started at all; enforced SSH; then the documented recovery |
 | `repaired-CAUSE` | locked as enrolled, the record the copy; enforced SSH; then the next cause's damage, if any |
+| `added` | locked, enforced SSH; unlocked with the first key, which authorizes the addition of each of six new keys (`A`, its PIN step, the connect step, the swap, the new key's ceremony with its probe's touch, `added`) to eight in the record; `A` then shows `eight` with a key plugged, which receives no request |
+| `removed` | locked, enforced SSH; unlocked; the seven keys but the first removed, authorized by the second, behind the one-key disclosure; then, with the serial login held again, the last removed behind the remove-every-key disclosure: the record unlinked, the held login starts at once, the cutover record names the unenrolled form, `removed`, the ordinary SSH form |
+| `unlocked` | unenrolled as on `seed`, `blank-unlocked` and `desktop`; the ordinary SSH form; with a serial login held and an SSH session open and the cutover's `render-ssh-policy` held by a wrapper bind-mounted over `/bin/td-firstboot`, one key enrolled: once the render begins the record is published, the cutover record removed, `sshd` and the greeter not restarted and both sessions alive; the authority is killed and the render released, and the next generation's check completes the revocation as on `seed`; it starts `locked` |
+| `cut` | locked; unlocked; the key removed behind its disclosure, back to unenrolled as on `removed`; another key enrolled with the render held: once the render begins, so the worker's write and directory sync are done, the record is published, the boot's cutover record removed and neither `sshd` nor the greeter restarted, the guest prints `TD-LOGIN-SYSTEM-CUT cut` and the host kills QEMU |
+| `after-cut` | the whole new record; the boot's cutover record names the enforced form, which firstboot wrote in stage 1, and no reboot guard; `sshd` and the greeter started before the authority and not restarted, the record not rewritten; locked, enforced SSH, and an unlock with the new key |
 
 The causes, each made at the end of the boot before: the login
 directory mode 0755, owned by the account, or replaced by a file; the
@@ -3032,13 +3055,15 @@ screen is forgiven only when QEMU has already exited, or exits within
 5 seconds once that marker is on the console), the selected current
 deployment, boot health's success marker, rootcheck's login directory
 marker except on a damaged directory's boots, and the serial greeter's
-exact refusal line once with no greeting on every boot but `seed`,
-whose greeter logs in and, once the cutover restarts it on the
-enrolled record, prints the refusal line once. This proves the tier's locked boot, unlocks,
-relocks and refusals on the full system in QEMU. It does not show
+exact refusal line once on every boot, with a greeting exactly on
+`seed`, `removed`, `unlocked` and `cut`, whose greeters log in. `cut`
+instead requires its cut word once, the kill on it and no pass line or
+shutdown, and its volume is left as the cut left it. This proves the
+tier's enrollment, addition, removal, cutover both ways, locked boot,
+unlocks, relocks and refusals on the full system in QEMU. It does not show
 `Super+l` or `L` on an unavailable session, or request 19's admission
 while the state could not be read. The keys and keyboard are UHID
-fixtures, presence is scripted and enrollment's root is simulated; QEMU
+fixtures and presence is scripted; QEMU
 has no lid, its S3 is not a laptop's and leaves no display to see the
 resume's lock on, and there is no physical-presence, USB, firmware or
 YubiKey claim.

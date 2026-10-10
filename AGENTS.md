@@ -265,17 +265,13 @@ device-bound encrypted default, which the installer chooses on machines
 with a usable TPM and a keyboard console, releases storage to TPM
 possession alone; it is device binding under this principle and advances
 no authentication or protector-authorization claim.
-The planned TPM-free login-key tier (`td-login/TOKEN-LOGIN.md`; nothing
-in production enrolls yet, and its pieces are inert but for firstboot's
-login directory and the cutover record it writes at every boot, the
-login state root reports, the key-management screen's refusals, and
-the update, console and SSH refusals, td-authd's console and SSH
-cutover against that record, and the compositor's locked start, `Super+l` and attention `L`, which act only
-once a key is enrolled or the login directory is not valid, though every
-paired session consumes `Super+l` and shows `L`; `sshd`'s unit stopping
-its whole leaf (`stop=leaf`) is live on every machine) lets the installed
-account trade auto-login for a FIDO2 key plus PIN at boot and session
-lock; that document states what it does not protect.
+The TPM-free login-key tier (`td-login/TOKEN-LOGIN.md`) lets the
+installed account's owner enroll FIDO2 keys on the attention screen,
+trading auto-login and the ordinary SSH form for a key plus PIN at boot
+and session lock. Until a key is enrolled, login, SSH, updates and
+the lock change only where the login directory is invalid, though every
+paired session consumes `Super+l` and shows `L`. That document says
+when the tier may be called usable and what it does not protect.
 
 # Tests
 

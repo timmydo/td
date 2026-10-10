@@ -347,6 +347,7 @@ pub(crate) fn run(
         order: fixture::LOGIN_DESKTOP_SCREENS,
         keep: Some(&keep),
         wake: None,
+        reads: &[],
     };
     for ((name, test), is_tpm) in cases {
         let emulator = match (is_tpm, tpm, tpm_scratch.as_ref()) {
@@ -777,7 +778,6 @@ fn pin_step(
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         || !matches!(retries, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8")
-        || masks > 63
     {
         return Err("invalid PIN step arguments".into());
     }
@@ -791,19 +791,49 @@ fn pin_step(
         "ENTER ITS PIN, THEN TOUCH THE KEY".into(),
         "ESC TO CANCEL".into(),
     ];
-    // Eight rows and the time line, centred.
-    let height = (lines.len() + 1) * PROMPT_PITCH - FIELD_GAP;
-    let top = (800 - height) / 2;
+    prompt_matches(pixels, &lines, Some((field, masks)))
+}
+
+/// The longest login prompt's time line: a disclosing two-key
+/// enrollment's ceiling (td-authd/DESIGN.md, amendment 6).
+const LONGEST_PROMPT_SECONDS: usize = 360;
+
+/// Where a trusted prompt of `rows` rows begins: its rows and time line
+/// centred on the 800-row output.
+fn prompt_top(rows: usize) -> Result<usize, String> {
+    let height = (rows + 1) * PROMPT_PITCH - FIELD_GAP;
+    800usize
+        .checked_sub(height)
+        .map(|spare| spare / 2)
+        .ok_or_else(|| "the prompt is taller than the output".into())
+}
+
+/// A trusted prompt of `lines`, as the compositor presents a description
+/// with its time line, and beneath it the PIN field's row with that many
+/// masks when `field` names one: every pixel.
+fn prompt_matches(
+    pixels: &[u8],
+    lines: &[String],
+    field: Option<(&str, usize)>,
+) -> Result<bool, String> {
+    if lines.is_empty() || field.is_some_and(|(_, masks)| masks > 63) {
+        return Err("invalid prompt arguments".into());
+    }
+    let top = prompt_top(lines.len())?;
     let time = top + lines.len() * PROMPT_PITCH;
-    let text = top + height + FIELD_GAP;
+    let text = time + PROMPT_PITCH;
     let band = text + PROMPT_HEIGHT + FIELD_GAP;
+    if field.is_some() && band + MASK_SIDE > 800 {
+        return Err("the PIN field does not fit beneath the prompt".into());
+    }
+    let masks = field.map_or(0, |(_, masks)| masks);
     for (y, row) in rows_of(pixels)?.enumerate() {
         let in_rows =
             (top..time + PROMPT_HEIGHT).contains(&y) && (y - top) % PROMPT_PITCH < PROMPT_HEIGHT;
-        if in_rows || (text..text + PROMPT_HEIGHT).contains(&y) {
+        if in_rows || (field.is_some() && (text..text + PROMPT_HEIGHT).contains(&y)) {
             continue;
         }
-        let masked = (band..band + MASK_SIDE).contains(&y);
+        let masked = field.is_some() && (band..band + MASK_SIDE).contains(&y);
         for (x, pixel) in row.chunks_exact(3).enumerate() {
             let ink = masked
                 && x >= 24
@@ -820,7 +850,7 @@ fn pin_step(
         }
     }
     let mut timed = false;
-    for seconds in 1..=120 {
+    for seconds in 1..=LONGEST_PROMPT_SECONDS {
         let unit = if seconds == 1 { "SECOND" } else { "SECONDS" };
         if super::update::row_matches(
             pixels,
@@ -831,7 +861,10 @@ fn pin_step(
             break;
         }
     }
-    Ok(timed && super::update::row_matches(pixels, text, field)?)
+    match field {
+        Some((field, _)) if timed => super::update::row_matches(pixels, text, field),
+        _ => Ok(timed),
+    }
 }
 
 /// `pin FINGERPRINT RETRIES MASKS`: the PIN field open with that many masks.
@@ -1671,6 +1704,89 @@ mod tests {
             }
         }
         pixels
+    }
+
+    /// Any login prompt as the compositor lays it out: `lines` and the
+    /// time line in Unifont, doubled and centred, then the field's row and
+    /// its masks when one is named.
+    pub(super) fn login_prompt_frame(
+        lines: &[String],
+        seconds: usize,
+        field: Option<(&str, usize)>,
+    ) -> Vec<u8> {
+        let mut pixels = GROUND.repeat(1280 * 800);
+        let unit = if seconds == 1 { "SECOND" } else { "SECONDS" };
+        let time = format!("TIME LEFT WHEN SHOWN: {seconds} {unit}");
+        let top = prompt_top(lines.len()).unwrap();
+        let mut put_text = |top: usize, row: &str| {
+            for (column, character) in row.bytes().enumerate() {
+                for y in 0..32 {
+                    for x in 0..16 {
+                        if super::super::update::ascii_pixel(character, x / 2, y / 2).unwrap() {
+                            put(&mut pixels, 24 + column * 16 + x, top + y, INK);
+                        }
+                    }
+                }
+            }
+        };
+        for (index, row) in lines
+            .iter()
+            .map(String::as_str)
+            .chain([time.as_str()])
+            .enumerate()
+        {
+            put_text(top + index * PROMPT_PITCH, row);
+        }
+        let text = top + (lines.len() + 1) * PROMPT_PITCH;
+        if let Some((field, masks)) = field {
+            put_text(text, field);
+            let band = text + PROMPT_HEIGHT + FIELD_GAP;
+            for mask in 0..masks {
+                for y in band..band + MASK_SIDE {
+                    for x in 0..MASK_SIDE {
+                        put(&mut pixels, 24 + mask * MASK_ADVANCE + x, y, INK);
+                    }
+                }
+            }
+        }
+        pixels
+    }
+
+    /// The general prompt check reads the unlock's PIN step as the fixed
+    /// layout does, and a prompt of any height its own way.
+    #[test]
+    fn a_prompt_of_any_height_is_its_rows_time_and_field() {
+        let lines: Vec<String> = [
+            "TD SECURE ATTENTION",
+            "SESSION USER 1000",
+            "UNLOCK SESSION WITH A LOGIN KEY",
+            "ACCOUNT UID 1000",
+            "UNLOCK WITH KEY 3fa2c1d0",
+            "8 PIN ATTEMPTS LEFT ON THIS KEY",
+            "ENTER ITS PIN, THEN TOUCH THE KEY",
+            "ESC TO CANCEL",
+        ]
+        .map(String::from)
+        .to_vec();
+        let field = Some(("ENTER THE PIN FOR THIS KEY", 4));
+        assert!(
+            login_prompt_frame(&lines, 117, field)
+                == prompt_frame(8, "ENTER THE PIN FOR THIS KEY", 4, 117)
+        );
+        let tall: Vec<String> = (0..17).map(|row| format!("ROW {row}")).collect();
+        let frame = login_prompt_frame(&tall, 360, None);
+        assert!(prompt_matches(&frame, &tall, None).unwrap());
+        assert!(!prompt_matches(&frame, &tall[1..], None).unwrap());
+        // Seventeen rows leave no room for a field beneath them.
+        assert!(prompt_matches(&frame, &tall, Some(("TOUCH YOUR KEY", 0))).is_err());
+        let short = &tall[..9];
+        let touch = login_prompt_frame(short, 240, Some(("TOUCH YOUR KEY", 0)));
+        assert!(prompt_matches(&touch, short, Some(("TOUCH YOUR KEY", 0))).unwrap());
+        assert!(!prompt_matches(&touch, short, None).unwrap());
+        assert!(!prompt_matches(&login_prompt_frame(&tall, 361, None), &tall, None).unwrap());
+        let taller: Vec<String> = (0..20).map(|row| format!("ROW {row}")).collect();
+        assert!(prompt_matches(&frame, &taller, None).is_err());
+        assert!(prompt_matches(&frame, &[], None).is_err());
     }
 
     #[test]

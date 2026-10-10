@@ -13,11 +13,6 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Until activation (TOKEN-LOGIN.md increment 5) a production build
-/// refuses enrollment, addition and removal before any worker starts; host
-/// fixtures drive them.
-pub(crate) const WRITES: bool = cfg!(test);
-
 /// Margin against the worker's five-second acknowledgement window. A
 /// disclosure step's has the operation deadline instead: the person reads
 /// it and types its approval key, with no token I/O open.
@@ -300,9 +295,6 @@ impl Login {
     pub fn start(owner: u32, selection: Selection) -> Result<Self, String> {
         if owner != 1000 {
             return Err("login supervisor requires the configured graphical session".into());
-        }
-        if selection.writes() && !WRITES {
-            return Err("login writes are refused until activation".into());
         }
         let mut nonce = [0; 32];
         let mut key = [0; 2];

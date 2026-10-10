@@ -3179,8 +3179,8 @@ fn deliver_key_decision<T: InputTarget>(
 
 /// Why a login operation that needs enrolled keys is not sent: unenrolled
 /// shows `NO LOGIN KEYS ENROLLED`, unavailable its cause's rows, and no
-/// answer at all, which the paired profile never has once connected, `NOT
-/// AVAILABLE IN THIS BUILD`.
+/// answer at all, which the paired profile never has once connected,
+/// `LOGIN KEY STATE NOT KNOWN`.
 fn no_login_keys(state: Option<crate::authority::LoginState>) -> crate::attention::Notice {
     use crate::authority::LoginState;
     let rows = match state {
@@ -3189,7 +3189,7 @@ fn no_login_keys(state: Option<crate::authority::LoginState>) -> crate::attentio
         _ => None,
     };
     rows.map_or(
-        crate::attention::Notice::NotAvailable,
+        crate::attention::Notice::StateUnknown,
         crate::attention::Notice::Login,
     )
 }
@@ -10090,7 +10090,7 @@ mod tests {
                 Notice::Login(unavailable("unreadable")),
             ),
             // No answer: the direct profile, which has no authority.
-            (None, Notice::NotAvailable),
+            (None, Notice::StateUnknown),
         ] {
             let target = Mutex::new(RecordingTarget::default());
             let bindings = attention_bindings(None);
@@ -12115,7 +12115,7 @@ mod tests {
         let target = target.lock().unwrap();
         assert_eq!(target.attention_events, [true]);
         assert!(target.secret_roles.is_empty());
-        assert_eq!(target.notices, [crate::attention::Notice::NotAvailable]);
+        assert_eq!(target.notices, [crate::attention::Notice::StateUnknown]);
     }
 
     // `Super+l` and the attention menu's `L` (TOKEN-LOGIN.md increment 4's

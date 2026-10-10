@@ -1197,8 +1197,10 @@ impl Client {
             return shown;
         }
         let response = wire.exchange(&selection.request()?)?;
+        // Root starts every selection (TOKEN-LOGIN.md increment 5's A5):
+        // any other answer, the old refusal `9b 00` included, is a
+        // violation.
         let nonce = match response.as_slice() {
-            [0x9b, 0] => return attempt.notice(Notice::NotAvailable),
             [0x9b, 1, nonce @ ..] => {
                 <[u8; 32]>::try_from(nonce).map_err(|_| "invalid login operation start")?
             }
@@ -1312,8 +1314,7 @@ impl Client {
                 }
             }
             // Root waits for the presented PIN step's PIN: the field opens,
-            // and once the person submits it the PIN goes as `1c`. Nothing
-            // in production reaches a PIN step.
+            // and once the person submits it the PIN goes as `1c`.
             0x0c if presented && open && asks_pin(&description) && !login.pin_sent => {
                 if login.field {
                     login.send_pin(wire, &description)?;
@@ -3797,8 +3798,11 @@ mod tests {
         }
     }
 
+    /// Root starts every login selection with its nonce; anything else,
+    /// the refusal `9b 00` that preceded activation included, ends the
+    /// paired generation with nothing shown.
     #[test]
-    fn root_refusing_a_write_shows_not_available() {
+    fn a_login_start_is_roots_nonce_or_a_violation() {
         for selection in [
             LoginSelection::Enroll(1),
             LoginSelection::Enroll(2),
@@ -3806,13 +3810,16 @@ mod tests {
             LoginSelection::Remove(removal(), 1),
         ] {
             let screen = Screen::login(selection.clone());
-            let (mut client, wire, result) = drive(&screen, vec![vec![0x9b, 0]]);
+            let before = screen.shown();
+            let (client, wire, result) = drive(&screen, vec![[&[0x9b, 1][..], &NONCE].concat()]);
             assert_eq!(result, Ok(()));
-            assert!(client.login.is_none());
-            // Nothing began, so nothing ended.
-            assert!(!client.take_login_end());
+            assert!(client.login.is_some());
             assert_eq!(wire.calls.len(), 1);
-            assert_eq!(screen.shown(), Some(Notice::NotAvailable));
+            assert_eq!(screen.shown(), before);
+            let screen = Screen::login(selection);
+            let (_, _, result) = drive(&screen, vec![vec![0x9b, 0]]);
+            assert!(result.is_err());
+            assert_eq!(screen.shown(), before);
         }
         for start in [
             vec![0x9b, 1],

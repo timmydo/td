@@ -1,21 +1,26 @@
 // qemu-login-system (td-secret/DESIGN.md, "Login system guest"): the
 // production system image's supervisor, firstboot, serial greeter, sshd,
-// boot health, compositor and td-authd over a record this worker
-// enrolled, through a UHID keyboard and UHID keys, with no TPM. One test,
-// booted once per phase on one disposable volume (`PHASES`, which
-// recipes/src/fixtures/secret_vm.rs pins); the host checks the display at
-// each screen the guest names, as login-desktop's does, and wakes the
-// guest from the suspend to RAM it asks for.
+// boot health, compositor, td-authd and its login worker, through a UHID
+// keyboard and UHID keys, with no TPM. One test, booted once per phase on
+// one disposable volume (`PHASES`, which recipes/src/fixtures/secret_vm.rs
+// pins); the host checks the display at each screen the guest names, as
+// login-desktop's does, reads each disclosure's approval key off it for
+// the guest to type, wakes the guest from the suspend to RAM it asks for
+// and cuts its power where it says.
 
 use super::*;
-use std::os::unix::fs::chown;
-use std::process::{Output, Stdio};
+use std::os::unix::fs::{chown, symlink};
+use std::process::{Child, Output, Stdio};
 
-/// The boots, in order. `seed` enrolls two keys on an unenrolled machine;
-/// `locked` is the first enrolled boot; each `damaged-` boot shows its
-/// damage, which the boot before it made, and repairs it, and the
-/// `repaired-` boot after it is an ordinary enrolled one again, which
-/// makes the next damage.
+/// The boots, in order. `seed` enrolls two keys through the attention
+/// screen of an unenrolled machine; `locked` is the first enrolled boot;
+/// each `damaged-` boot shows its damage, which the boot before it made,
+/// and repairs it, and the `repaired-` boot after it is an ordinary
+/// enrolled one again, which makes the next damage. `added` adds keys to
+/// eight, `removed` removes all but one and then the last, `unlocked`
+/// boots unenrolled and enrolls one key across a killed authority, `cut`
+/// removes that key, enrolls another and is cut right after its
+/// publication, and `after-cut` is the boot after the cut.
 const PHASES: &[&str] = &[
     "seed",
     "locked",
@@ -33,6 +38,11 @@ const PHASES: &[&str] = &[
     "repaired-record-truncated",
     "damaged-record-version",
     "repaired-record-version",
+    "added",
+    "removed",
+    "unlocked",
+    "cut",
+    "after-cut",
 ];
 /// The stock image's hostname, which the lock surface shows.
 const HOSTNAME: &str = "td";
@@ -42,13 +52,24 @@ const INPUT_READY: &str = "/run/td-secret-system-input-ready";
 /// persistent keys and the intact record a repair restores.
 const STATE: &str = "/var/lib/td-fixture/login-system";
 const SYSTEM_KEYS: &[&str] = &["a", "b"];
+/// The keys `added` adds to those two, to eight.
+const ADDED_KEYS: &[&str] = &["c", "d", "e", "f", "g", "h"];
+/// `unlocked`'s one-key enrollment's key, and `cut`'s.
+const SINGLE_KEY: &str = "i";
+const CUT_KEY: &str = "j";
 /// A boot's own scratch, and the record's second name for the link damage.
 const WORK: &str = "/run/td-login-system";
 const SECOND_LINK: &str = "/var/lib/td/login-second-link";
-/// The keyboard's left GUI modifier, and the usages of L and I.
+/// The keyboard's left GUI modifier, and the usages of L, I, K, A, D, 1
+/// and 2.
 const SUPER: u8 = 0x08;
 const KEY_L: u8 = 0x0f;
 const KEY_I: u8 = 0x0c;
+const KEY_K: u8 = 0x0e;
+const KEY_A: u8 = 0x04;
+const KEY_D: u8 = 0x07;
+const KEY_1: u8 = 0x1e;
+const KEY_2: u8 = 0x1f;
 const SSH_REPLY: &str = "TD-LOGIN-SYSTEM-SSH";
 const UPDATE_READY: &str = " is ready. Press Ctrl+Alt+Escape, then I to review it.";
 const UPDATE_BACKING_OFF: &str = "the installation queue is backing off after unapproved requests";
@@ -60,6 +81,16 @@ const CUTOVER: &str = "/run/td-login-cutover";
 const REBOOT_GUARD: &str = "/var/lib/td/login/cutover-reboot";
 /// The open SSH session's remote command's operand, which names it.
 const SESSION_SLEEP: &str = "4321";
+/// While this exists the account's profile holds a serial login: its
+/// login shell runs `sleep HOLD_SLEEP` in the foreground with TERM
+/// ignored, so the session reads nothing the host answers on ttyS0 and
+/// outlives a TERM.
+const SERIAL_HOLD: &str = "/run/td-login-system/serial-hold";
+const HOLD_SLEEP: &str = "7777";
+const PROFILE: &str = "/home/tester/.profile";
+/// The word on which the host cuts the power (the fixture's
+/// `LOGIN_SYSTEM_CUT`).
+const CUT: &str = "TD-LOGIN-SYSTEM-CUT";
 
 fn phase() -> &'static str {
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap();
@@ -113,6 +144,10 @@ fn ready(names: &[&str]) {
 struct Proc {
     pid: u32,
     parent: u32,
+    /// The controlling terminal, as `/proc/PID/stat` encodes it, and the
+    /// start in clock ticks since boot.
+    tty: u64,
+    start: u64,
     argv: Vec<String>,
 }
 
@@ -124,20 +159,119 @@ fn processes() -> Vec<Proc> {
         .filter_map(|pid| {
             let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             let (_, fields) = stat.rsplit_once(')')?;
-            let mut fields = fields.split_whitespace();
-            if fields.next()? == "Z" {
+            let fields: Vec<&str> = fields.split_whitespace().collect();
+            if *fields.first()? == "Z" {
                 return None;
             }
-            let parent = fields.next()?.parse().ok()?;
+            let parent = fields.get(1)?.parse().ok()?;
+            let tty = fields.get(4)?.parse().ok()?;
+            let start = fields.get(19)?.parse().ok()?;
             let argv = fs::read(format!("/proc/{pid}/cmdline"))
                 .ok()?
                 .split(|byte| *byte == 0)
                 .filter(|word| !word.is_empty())
                 .map(|word| String::from_utf8_lossy(word).into_owned())
                 .collect();
-            Some(Proc { pid, parent, argv })
+            Some(Proc {
+                pid,
+                parent,
+                tty,
+                start,
+                argv,
+            })
         })
         .collect()
+}
+
+/// A process by its pid and its start, so a reused pid is not it.
+type Member = (u32, u64);
+
+/// ttyS0's number as `/proc/PID/stat` gives a controlling terminal.
+fn serial_tty() -> u64 {
+    let rdev = fs::metadata("/dev/ttyS0").unwrap().rdev();
+    let (major, minor) = ((rdev >> 8) & 0xfff, (rdev & 0xff) | ((rdev >> 12) & !0xff));
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// The processes whose controlling terminal is ttyS0: the greeter's
+/// `tty=` containment, a serial session's every process.
+fn serial_members() -> Vec<Member> {
+    let tty = serial_tty();
+    processes()
+        .iter()
+        .filter(|process| process.tty == tty)
+        .map(|process| (process.pid, process.start))
+        .collect()
+}
+
+/// The members of the cgroup leaf `pid` runs in: for `sshd`'s leader its
+/// unit's whole service leaf, every OpenSSH session in it.
+fn leaf_members(pid: u32) -> Vec<Member> {
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap();
+    let procs = fs::read_to_string(format!("/sys/fs/cgroup{path}/cgroup.procs")).unwrap();
+    let all = processes();
+    procs
+        .lines()
+        .filter_map(|line| line.parse::<u32>().ok())
+        .filter_map(|pid| all.iter().find(|process| process.pid == pid))
+        .map(|process| (process.pid, process.start))
+        .collect()
+}
+
+/// Whether none of `members` lives.
+fn gone(members: &[Member]) -> bool {
+    let all = processes();
+    !members.iter().any(|(pid, start)| {
+        all.iter()
+            .any(|process| process.pid == *pid && process.start == *start)
+    })
+}
+
+/// Whether every one of `members` lives.
+fn alive(members: &[Member]) -> bool {
+    let all = processes();
+    members.iter().all(|(pid, start)| {
+        all.iter()
+            .any(|process| process.pid == *pid && process.start == *start)
+    })
+}
+
+/// `pid`'s start, in clock ticks since boot.
+fn started(pid: u32) -> u64 {
+    processes()
+        .iter()
+        .find(|process| process.pid == pid)
+        .map(|process| process.start)
+        .unwrap_or_else(|| panic!("no process {pid}"))
+}
+
+/// Whether `pid` ignores SIGTERM: bit 14 of its ignored mask.
+fn ignores_term(pid: u32) -> bool {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .unwrap();
+    u64::from_str_radix(mask.trim(), 16).unwrap() & (1 << 14) != 0
+}
+
+/// `unit`'s leader, as td-svc reports it.
+fn leader(unit: &str) -> u32 {
+    let status = service(&["status", unit]);
+    status
+        .lines()
+        .filter_map(|line| line.strip_prefix(&format!("{unit} ")))
+        .find_map(|rest| {
+            rest.split_whitespace()
+                .find_map(|word| word.strip_prefix("pid="))?
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("{unit}'s leader: {status}"))
 }
 
 fn runs(process: &Proc, program: &str, verb: &str) -> bool {
@@ -148,21 +282,23 @@ fn runs(process: &Proc, program: &str, verb: &str) -> bool {
         && process.argv.get(1).is_some_and(|word| word == verb)
 }
 
-/// The paired authority: the wayland unit's `td-authd terminal-serve
-/// --primary`, once there is exactly one.
+/// The paired authorities: the wayland unit's `td-authd terminal-serve
+/// --primary`.
+fn authorities() -> Vec<u32> {
+    processes()
+        .iter()
+        .filter(|process| {
+            runs(process, "td-authd", "terminal-serve")
+                && process.argv.iter().any(|word| word == "--primary")
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// The paired authority, once there is exactly one.
 fn authority() -> u32 {
-    let find = || -> Vec<u32> {
-        processes()
-            .iter()
-            .filter(|process| {
-                runs(process, "td-authd", "terminal-serve")
-                    && process.argv.iter().any(|word| word == "--primary")
-            })
-            .map(|process| process.pid)
-            .collect()
-    };
-    system_wait("one paired authority", || find().len() == 1);
-    find()[0]
+    system_wait("one paired authority", || authorities().len() == 1);
+    authorities()[0]
 }
 
 fn compositor() -> Option<u32> {
@@ -299,19 +435,45 @@ fn backup() -> PathBuf {
     Path::new(STATE).join("record")
 }
 
+/// The persistent key `name`, as this boot finds it.
+fn restore(name: &str) -> Virtual {
+    Virtual::restore(Config::default(), &key_file(name))
+        .unwrap_or_else(|damage| panic!("virtual key {name}: {damage}"))
+}
+
 fn restored() -> Vec<Virtual> {
-    SYSTEM_KEYS
-        .iter()
-        .map(|name| {
-            Virtual::restore(Config::default(), &key_file(name))
-                .unwrap_or_else(|damage| panic!("virtual key {name}: {damage}"))
-        })
-        .collect()
+    SYSTEM_KEYS.iter().map(|name| restore(name)).collect()
+}
+
+/// A new persistent key `name` on `@var`, with the PIN set.
+fn new_key(name: &str) -> Virtual {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(STATE)
+        .unwrap();
+    Virtual::persistent(
+        Config::default(),
+        Some(PIN),
+        &format!("system-{name}"),
+        &key_file(name),
+    )
+    .unwrap()
+}
+
+/// A key's newest credential, the one it enrolled last.
+fn credential(key: &Virtual) -> Vec<u8> {
+    key.state().credentials.last().unwrap().id.clone()
+}
+
+/// A key's enrolled credential's fingerprint, as a step names it.
+fn enrolled_print(key: &Virtual) -> Fingerprint {
+    fingerprint(&credential(key))
 }
 
 /// A key's enrolled credential's fingerprint, as the PIN step shows it.
 fn print(key: &Virtual) -> String {
-    hex(&fingerprint(&key.state().credentials.last().unwrap().id))
+    hex(&enrolled_print(key))
 }
 
 fn enrolled() -> Vec<Vec<u8>> {
@@ -573,11 +735,10 @@ impl Recorder {
     }
 }
 
-/// The record a worker enrolled, and the volume's marked deployments
-/// read as production reads them: its files root's, so the current one's
-/// marker gives this build's version, which a reader requiring another
-/// owner does not see.
-fn seed_record() {
+/// The worker's production read of the retained deployments: the
+/// volume's files are root's, so the current one's marker gives this
+/// build's version, which a reader requiring another owner does not see.
+fn retained_reads() {
     let volume = Volume {
         path: Path::new(login_tier::VOLUME),
         owner: 0,
@@ -598,56 +759,6 @@ fn seed_record() {
         }),
         Err(Failure::Version)
     );
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .recursive(true)
-        .create(STATE)
-        .unwrap();
-    for (name, seed) in SYSTEM_KEYS.iter().zip(["system-a", "system-b"]) {
-        Virtual::persistent(Config::default(), Some(PIN), seed, &key_file(name)).unwrap();
-    }
-    let keys = restored();
-    let [first, second] = &keys[..] else {
-        panic!("two keys");
-    };
-    let plugged = Plugged::insert(first, NAME);
-    let (result, _) = operated(
-        begins(enrolling(1, 1, LoginStep::Connect)),
-        &Polls::default(),
-        &production,
-    );
-    assert_eq!(result, Ok(()));
-    // The second key added by the first, across a person's swap.
-    let port: Port = Arc::new(Mutex::new(Some(plugged)));
-    let changed = Swapped::default();
-    let polls = Polls::default();
-    let connect = login(adding(1, LoginStep::Connect));
-    let plan = Plan {
-        operation: Some(adding(1, LoginStep::Identify)),
-        pin: Some(pin_frame(PIN)),
-        ..swap(&port, &changed, &polls, connect, second)
-    };
-    let (result, _) = operated(plan, &polls, &production);
-    assert_eq!(result, Ok(()));
-    swapped(&changed);
-    port.lock().unwrap().take().unwrap().remove();
-    let ids = enrolled();
-    for key in &keys {
-        assert_eq!(key.saved(), Ok(()));
-        assert!(ids.contains(&key.state().credentials.last().unwrap().id));
-    }
-    let State::Enrolled(record) = state() else {
-        panic!("not enrolled");
-    };
-    assert_eq!(record.version(), VERSION);
-    let mut copy = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(backup())
-        .unwrap();
-    copy.write_all(&fs::read(record_path()).unwrap()).unwrap();
-    copy.sync_all().unwrap();
 }
 
 /// The cutover record for this boot naming `form`.
@@ -664,17 +775,8 @@ fn remote_session() -> Option<u32> {
         .map(|process| process.pid)
 }
 
-/// The seed's cutover (TOKEN-LOGIN.md increment 5's A3): with the serial
-/// greeter's session logged in again and an SSH session open as the
-/// primary account, the record is enrolled and the pair restarted. Its
-/// authority's first `1a` finds the reduced state enforced and the boot's
-/// record unenrolled, so it renders the enforced form, hands the line
-/// back, restarts `sshd` and `greeter` and records the form. Both sessions
-/// end, the greeter that replaces the serial one refuses, and the lock
-/// surface shows no failure.
-fn cutover(host: &mut Host) {
-    service(&["start", "greeter"]);
-    let shell = idle_login_shell();
+/// An SSH session as the primary account, its remote command running.
+fn open_ssh() -> Child {
     let mut session = ssh_command(true, "tester", "/run/td-ssh-selftest", false)
         .args(["/bin/sleep", SESSION_SLEEP])
         .stdout(Stdio::null())
@@ -688,18 +790,318 @@ fn cutover(host: &mut Host) {
         );
         remote_session().is_some()
     });
-    seed_record();
-    assert_eq!(
-        fs::read_to_string(CUTOVER).unwrap(),
-        cutover_record("unenrolled")
+    session
+}
+
+/// From now on in this boot, a serial login is held (`SERIAL_HOLD`).
+fn hold_serial() {
+    let profile =
+        format!("if [ -e {SERIAL_HOLD} ]; then trap '' TERM; /bin/sleep {HOLD_SLEEP}; fi\n");
+    fs::write(PROFILE, profile).unwrap();
+    fs::set_permissions(PROFILE, Permissions::from_mode(0o644)).unwrap();
+    chown(PROFILE, Some(UID), Some(UID)).unwrap();
+    fs::write(SERIAL_HOLD, b"").unwrap();
+}
+
+/// The held serial login: its login shell on ttyS0 and that shell's
+/// `sleep`.
+fn held_session() -> Option<(u32, u32)> {
+    let all = processes();
+    let tty = serial_tty();
+    let shell = all.iter().find(|process| {
+        process.tty == tty
+            && process
+                .argv
+                .first()
+                .is_some_and(|name| name.starts_with('-'))
+    })?;
+    let sleep = all
+        .iter()
+        .find(|process| process.parent == shell.pid && runs(process, "sleep", HOLD_SLEEP))?;
+    Some((shell.pid, sleep.pid))
+}
+
+/// Waits for the serial greeter's held login, whose `sleep` ignores TERM,
+/// and returns its session's containment.
+fn held_login() -> Vec<Member> {
+    let mut held = None;
+    system_wait("the held serial login", || {
+        held = held_session();
+        held.is_some()
+    });
+    let (_, sleep) = held.unwrap();
+    assert!(ignores_term(sleep), "the held login's sleep takes TERM");
+    let members = serial_members();
+    assert!(
+        members.len() >= 2,
+        "the held login's processes: {members:?}"
     );
-    service(&["restart", "wayland"]);
-    system_wait("the serial session ended", || {
-        !Path::new(&format!("/proc/{shell}")).exists()
+    members
+}
+
+/// The approval key the guest's own copy of a disclosure carries: root
+/// draws the real one, which the host reads off the screen.
+fn placeholder() -> ApprovalKey {
+    ApprovalKey::new(*b"22").unwrap()
+}
+
+/// A step's rows as root describes it, consent's own lines, named to the
+/// host with each space as `_` and a disclosure's key row, root's own
+/// draw, as `KEY`.
+fn rows(operation: Operation) -> Vec<String> {
+    Request::new([1; 32], UID, operation.disclosed(placeholder()))
+        .unwrap()
+        .lines()
+        .into_iter()
+        .map(|row| {
+            if row.starts_with("APPROVE: TYPE ") {
+                "KEY".into()
+            } else {
+                row.replace(' ', "_")
+            }
+        })
+        .collect()
+}
+
+fn words(rows: &[String]) -> Vec<&str> {
+    rows.iter().map(String::as_str).collect()
+}
+
+/// Types decimal digits on the number row: an approval key, or removal
+/// positions.
+fn type_digits(keyboard: &mut Keyboard, text: &str) {
+    for usage in digits(text.as_bytes()) {
+        keyboard.key(usage);
+    }
+}
+
+/// From the desktop: the attention menu, its `K` screen and `choice` on it.
+fn manage(host: &mut Host, keyboard: &mut Keyboard, choice: u8) {
+    chord(keyboard);
+    host.screen("menu", &[]);
+    keyboard.key(KEY_K);
+    host.screen("keys", &[]);
+    keyboard.key(choice);
+}
+
+/// A disclosure step's prompt, its approval key read off the screen by
+/// the host and typed, which is that step's receipt.
+fn approve(host: &mut Host, keyboard: &mut Keyboard, operation: Operation) {
+    let key = host.read("disclosure", &words(&rows(operation)));
+    assert!(
+        key.len() == 2 && key.bytes().all(|digit| (b'2'..=b'9').contains(&digit)),
+        "the approval key {key:?}"
+    );
+    type_digits(keyboard, &key);
+}
+
+/// A PIN step of `operation`: its prompt with the field empty, the PIN
+/// typed on the keyboard and Enter, the touch request while `key` waits
+/// for its touch, and the touch.
+fn pin_step(host: &mut Host, keyboard: &mut Keyboard, key: &Virtual, operation: Operation) {
+    let rows = rows(operation);
+    let mut field = vec!["0"];
+    field.extend(words(&rows));
+    host.screen("step-pin", &field);
+    type_pin(keyboard, PIN);
+    keyboard.key(ENTER);
+    system_wait("the key waiting for its touch", || key.touching());
+    host.screen("step-touch", &words(&rows));
+    let touched = key.touched();
+    key.release_touch();
+    system_wait("the touch", || !key.touching() && key.touched() > touched);
+}
+
+/// A step that asks no PIN but a touch, `operation`'s prompt: the probe's
+/// no-PIN assertion. Its prompt while `key` waits for the touch, and the
+/// touch.
+fn touch_step(host: &mut Host, key: &Virtual, operation: Operation) {
+    system_wait("the key waiting for its touch", || key.touching());
+    host.screen("step", &words(&rows(operation)));
+    let touched = key.touched();
+    key.release_touch();
+    system_wait("the touch", || !key.touching() && key.touched() > touched);
+}
+
+/// A new key's create, prove and repeat after its connect step, each a PIN
+/// step and its touch, its PIN retries at eight, then the probe, whose
+/// no-PIN assertion asks for a touch. The new credential's fingerprint.
+fn ceremony(
+    host: &mut Host,
+    keyboard: &mut Keyboard,
+    key: &Virtual,
+    step: impl Fn(LoginStep) -> Operation,
+) -> Fingerprint {
+    let made = key.state().credentials.len();
+    pin_step(host, keyboard, key, step(LoginStep::Create { retries: 8 }));
+    system_wait("the created credential", || {
+        key.state().credentials.len() == made + 1
     });
-    system_wait("the SSH session ended", || {
-        remote_session().is_none() && session.try_wait().unwrap().is_some()
+    let new = enrolled_print(key);
+    for step in [
+        step(LoginStep::Prove {
+            key: new,
+            retries: 8,
+        }),
+        step(LoginStep::Repeat {
+            key: new,
+            retries: 8,
+        }),
+    ] {
+        pin_step(host, keyboard, key, step);
+    }
+    touch_step(host, key, step(LoginStep::Probe { key: new }));
+    new
+}
+
+/// Every key's touch is held until the guest has seen its request.
+fn held(keys: &[&Virtual]) {
+    for key in keys {
+        key.script(Script {
+            presence: Presence::Held,
+            ..Script::default()
+        });
+    }
+}
+
+/// A first enrollment of `keys` from the desktop: `1` or `2`, the
+/// disclosure on the first key's connect step and its approval key, then
+/// each key connected alone, the next once the previous key is removed,
+/// and its ceremony. Returns after the last key's last touch, that key
+/// still connected: the commit, publication and cutover follow on their
+/// own.
+fn enroll(host: &mut Host, keyboard: &mut Keyboard, keys: &[&Virtual]) -> Plugged {
+    let after = u8::try_from(keys.len()).unwrap();
+    let enrolling = |key, step| Operation::LoginEnroll {
+        account: UID,
+        before: 0,
+        after,
+        key,
+        step,
+        approval: None,
+    };
+    held(keys);
+    let mut plugged = Plugged::insert(keys[0], NAME);
+    manage(host, keyboard, if after == 1 { KEY_1 } else { KEY_2 });
+    approve(host, keyboard, enrolling(1, LoginStep::Connect));
+    for (index, key) in keys.iter().enumerate() {
+        let ordinal = u8::try_from(index + 1).unwrap();
+        if ordinal > 1 {
+            host.screen(
+                "step",
+                &words(&rows(enrolling(ordinal, LoginStep::Connect))),
+            );
+            plugged.remove();
+            plugged = Plugged::insert(key, NAME);
+        }
+        ceremony(host, keyboard, key, |step| enrolling(ordinal, step));
+    }
+    plugged
+}
+
+/// An addition to `before` keys authorized by `by`: `A`, the authorize
+/// step's PIN and touch, the connect step, `by` swapped for `new`, its
+/// ceremony and `LOGIN KEY ADDED`; Escape returns to the desktop.
+fn add(host: &mut Host, keyboard: &mut Keyboard, by: &Virtual, new: &Virtual, before: u8) {
+    let adding = |step| Operation::LoginAdd {
+        account: UID,
+        before,
+        after: before + 1,
+        step,
+    };
+    held(&[by, new]);
+    let plugged = Plugged::insert(by, NAME);
+    manage(host, keyboard, KEY_A);
+    let authorize = LoginStep::Authorize {
+        key: enrolled_print(by),
+        retries: 8,
+    };
+    pin_step(host, keyboard, by, adding(authorize));
+    host.screen("step", &words(&rows(adding(LoginStep::Connect))));
+    plugged.remove();
+    let plugged = Plugged::insert(new, NAME);
+    ceremony(host, keyboard, new, adding);
+    host.screen("added", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    plugged.remove();
+}
+
+/// The record's slots that hold `keys`' credentials, by position.
+fn slots_of(keys: &[&Virtual]) -> Vec<Slot> {
+    let ids = stored().expect("an enrolled record");
+    let mut slots: Vec<Slot> = keys
+        .iter()
+        .map(|key| {
+            let id = credential(key);
+            let at = ids.iter().position(|stored| *stored == id).unwrap();
+            Slot {
+                position: u8::try_from(at + 1).unwrap(),
+                key: fingerprint(&id),
+            }
+        })
+        .collect();
+    slots.sort_by_key(|slot| slot.position);
+    slots
+}
+
+/// A removal of `removed` from `before` keys, authorized by `by`: `D`,
+/// the positions typed and Enter, the disclosure with its approval key,
+/// and the authorize step's PIN and touch. Returns with `by` connected:
+/// the commit follows on its own.
+fn remove(
+    host: &mut Host,
+    keyboard: &mut Keyboard,
+    by: &Virtual,
+    removed: &[Slot],
+    before: u8,
+) -> Plugged {
+    let after = before - u8::try_from(removed.len()).unwrap();
+    held(&[by]);
+    let plugged = Plugged::insert(by, NAME);
+    manage(host, keyboard, KEY_D);
+    let count = before.to_string();
+    host.screen("removing", &[&count]);
+    let positions: Vec<String> = removed
+        .iter()
+        .map(|slot| slot.position.to_string())
+        .collect();
+    type_digits(keyboard, &positions.concat());
+    let mut chosen = vec![count.as_str()];
+    chosen.extend(words(&positions));
+    host.screen("removing", &chosen);
+    keyboard.key(ENTER);
+    let removing = |step| Operation::LoginRemove {
+        account: UID,
+        before,
+        after,
+        removed: removed.to_vec(),
+        step,
+        approval: None,
+    };
+    approve(host, keyboard, removing(LoginStep::Identify));
+    let authorize = LoginStep::Authorize {
+        key: enrolled_print(by),
+        retries: 8,
+    };
+    pin_step(host, keyboard, by, removing(authorize));
+    plugged
+}
+
+/// After an enrollment's last touch with a serial session and an SSH
+/// session open: the record published, then the cutover (TOKEN-LOGIN.md,
+/// "Cutover"): every process of both containments gone, the SSH client
+/// ended, the boot's record naming the enforced form, no reboot guard,
+/// ttyS0 root's and a parked greeter refusing, with no shell.
+fn revoked(serial: &[Member], ssh: &[Member], client: &mut Child) {
+    system_wait("the published record", || {
+        matches!(state(), State::Enrolled(_))
     });
+    system_wait("the serial session's containment emptied", || gone(serial));
+    system_wait("the SSH session's containment emptied", || {
+        gone(ssh) && client.try_wait().unwrap().is_some()
+    });
+    assert!(remote_session().is_none(), "the SSH session's command");
     system_wait("the enforced record", || {
         fs::read_to_string(CUTOVER).ok() == Some(cutover_record("enforced"))
     });
@@ -708,11 +1110,454 @@ fn cutover(host: &mut Host) {
     assert_eq!((line.uid(), line.gid()), (0, 0), "ttyS0 handed back");
     parked_greeter();
     assert_eq!(login_shell(), None, "a serial shell after the cutover");
-    // The serial session's leader exiting hung up every descriptor open
-    // on its controlling terminal, the host's among them: open it again.
+    assert_eq!(held_session(), None, "the held login after the cutover");
+}
+
+/// After the last key's removal, `by` still connected: the record
+/// unlinked, then the cutover back: the serial greeter logs in at once,
+/// held; the boot's record names the unenrolled form, no reboot guard;
+/// then `LOGIN KEYS REMOVED` on the session, which stayed unlocked, and
+/// Escape; and the ordinary SSH form, which still refuses root.
+fn unenrolled_again(host: &mut Host, keyboard: &mut Keyboard, by: Plugged) {
+    system_wait("the removed record", || {
+        matches!(state(), State::Unenrolled)
+    });
+    held_login();
+    system_wait("the unenrolled record", || {
+        fs::read_to_string(CUTOVER).ok() == Some(cutover_record("unenrolled"))
+    });
+    assert!(!Path::new(REBOOT_GUARD).exists(), "a failed revocation");
+    // The parked greeter's exit hung up the host's descriptor too.
     *host = Host::open();
-    host.screen("locked", &[]);
+    host.screen("removed", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    by.remove();
+    sshd(false);
+}
+
+/// With `previous` naming a deployment whose initramfs carries no tier
+/// marker, behind a bind of a fixture volume whose `current` is the booted
+/// deployment: a first enrollment's `2` is refused with `A RETAINED
+/// SYSTEM CANNOT READ KEYS` before any presentation or token request, and
+/// the machine stays unenrolled.
+fn unmarked_previous(host: &mut Host, keyboard: &mut Keyboard, key: &Virtual) {
+    use crate::login_tier::tests::{bundle, initramfs};
+    let volume = Path::new(login_tier::VOLUME);
+    let current = fs::read_link(volume.join("boot/current")).unwrap();
+    let current = current
+        .to_str()
+        .unwrap()
+        .strip_prefix("../deployments/")
+        .unwrap()
+        .to_string();
+    let fixture = Path::new(WORK).join("volume");
+    let deployments = fixture.join("deployments");
+    fs::create_dir_all(fixture.join("boot")).unwrap();
+    fs::create_dir_all(&deployments).unwrap();
+    let unmarked = Path::new(WORK).join("unmarked-deployment");
+    fs::create_dir(&unmarked).unwrap();
+    let id = bundle(&unmarked, &initramfs(None));
+    fs::rename(&unmarked, deployments.join(&id)).unwrap();
+    let kept = deployments.join(&current);
+    fs::create_dir(&kept).unwrap();
+    symlink(
+        format!("../deployments/{current}"),
+        fixture.join("boot/current"),
+    )
+    .unwrap();
+    symlink(
+        format!("../deployments/{id}"),
+        fixture.join("boot/previous"),
+    )
+    .unwrap();
+    let bind = |from: &Path, to: &Path| {
+        assert!(Command::new("/bin/mount")
+            .args(["-o", "bind"])
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap()
+            .success());
+    };
+    // The booted deployment is bound aside first, since the fixture then
+    // hides it, and into the fixture's `current` last: a bind carries no
+    // mount beneath its source.
+    let real = Path::new(WORK).join("current-deployment");
+    fs::create_dir(&real).unwrap();
+    bind(&volume.join("deployments").join(&current), &real);
+    bind(&fixture, volume);
+    let shown = volume.join("deployments").join(&current);
+    bind(&real, &shown);
+    let give_up = Duration::from_secs(10);
+    assert_eq!(
+        login_tier::retained(volume, login_tier::CURRENT, 0, give_up),
+        Ok(READS.to_vec())
+    );
+    assert!(login_tier::retained(volume, login_tier::PREVIOUS, 0, give_up).is_err());
+    let plugged = Plugged::insert(key, NAME);
+    manage(host, keyboard, KEY_2);
+    host.screen("version-refused", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    assert_eq!(plugged.remove().requests, 0, "the refusal reached the key");
+    assert!(matches!(state(), State::Unenrolled));
+    for target in [shown.as_path(), volume, real.as_path()] {
+        assert!(Command::new("/bin/umount")
+            .arg(target)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+/// While mounted over `/bin/td-firstboot`, a `render-ssh-policy` run,
+/// which is how td-authd's cutover renders, marks that it began and waits
+/// for the release before running the real binary from a copy, so the
+/// cutover holds between its record's removal and its restarts. td-authd
+/// kills a render at ten seconds. Every other verb runs at once.
+struct HeldRender(PathBuf);
+
+impl HeldRender {
+    fn mount() -> Self {
+        let real = fs::canonicalize("/bin/td-firstboot").unwrap();
+        let copy = Path::new(WORK).join("td-firstboot-real");
+        fs::copy(&real, &copy).unwrap();
+        fs::set_permissions(&copy, Permissions::from_mode(0o755)).unwrap();
+        let wrapper = Path::new(WORK).join("td-firstboot-held");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = render-ssh-policy ]; then\n    : > {began} || exit 1\n    while [ ! -e {release} ]; do /bin/sleep 0.05; done\nfi\nexec {copy} \"$@\"\n",
+                began = Self::began_path().display(),
+                release = Self::release_path().display(),
+                copy = copy.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, Permissions::from_mode(0o755)).unwrap();
+        assert!(Command::new("/bin/mount")
+            .args(["-o", "bind"])
+            .arg(&wrapper)
+            .arg(&real)
+            .status()
+            .unwrap()
+            .success());
+        Self(real)
+    }
+
+    fn began_path() -> PathBuf {
+        Path::new(WORK).join("render-began")
+    }
+
+    fn release_path() -> PathBuf {
+        Path::new(WORK).join("render-release")
+    }
+
+    fn began(&self) -> bool {
+        Self::began_path().exists()
+    }
+
+    fn release(&self) {
+        fs::write(Self::release_path(), b"").unwrap();
+    }
+
+    fn unmount(self) {
+        assert!(Command::new("/bin/umount")
+            .arg(&self.0)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+/// An unenrolled boot's start: the serial greeter logged in, then stopped,
+/// so no shell reads the host's answers on ttyS0; the keyboard; the blank,
+/// then the unlocked generation's first frame, holding no lock pixel, and
+/// the desktop; boot health and the ordinary SSH form, which refuses root.
+fn unenrolled_start() -> (Host, Keyboard) {
+    idle_login_shell();
+    service(&["stop", "greeter"]);
+    system_wait("ttyS0 released", || serial().is_none());
+    let keyboard = Keyboard::new();
+    let mut host = Host::open();
+    release_console();
+    blank_screen();
+    host.screen("blank-unlocked", &[]);
+    fs::write(INPUT_READY, b"ready").unwrap();
+    ready(&["wayland", "terminal"]);
+    host.screen("desktop", &[]);
+    boot_healthy();
+    sshd(false);
+    (host, keyboard)
+}
+
+/// `seed`: unenrolled, with the state helper failing: root reads no
+/// record, so td-authd runs no helper and the session starts unlocked, and
+/// the boot's record names that state, so root's check changes nothing.
+/// An enrollment is refused while `previous` lacks the tier marker; then,
+/// with the serial greeter logged in again and held by a process that
+/// ignores TERM and an SSH session open as the primary account, both keys
+/// are enrolled through the attention screen and the cutover ends both
+/// sessions. Root's SSH key is refused before and after.
+fn seed() -> Vec<Virtual> {
+    assert!(matches!(state(), State::Unenrolled));
+    assert_eq!(
+        fs::read_to_string(CUTOVER).unwrap(),
+        cutover_record("unenrolled")
+    );
+    let failing = Recorder::mount(true);
+    let (mut host, mut keyboard) = unenrolled_start();
+    // Only the mount's own check ran the helper.
+    let helpers = failing
+        .verbs()
+        .iter()
+        .filter(|verb| *verb == "inspect-login")
+        .count();
+    assert_eq!(helpers, 1, "td-authd ran the state helper unenrolled");
+    failing.unmount();
+    retained_reads();
+    let keys: Vec<Virtual> = SYSTEM_KEYS.iter().map(|name| new_key(name)).collect();
+    unmarked_previous(&mut host, &mut keyboard, &keys[0]);
+    hold_serial();
+    service(&["start", "greeter"]);
+    let serial = held_login();
+    let mut client = open_ssh();
+    let ssh = leaf_members(leader("sshd"));
+    // The greeter's start may have hung up the host's descriptor.
+    host = Host::open();
+    let render = HeldRender::mount();
+    let plugged = enroll(&mut host, &mut keyboard, &[&keys[0], &keys[1]]);
+    // Held at its render, the cutover has removed the boot's record and
+    // ended nothing yet: both sessions outlived the enrollment itself.
+    system_wait("the cutover's render", || render.began());
+    assert!(!Path::new(CUTOVER).exists(), "the cutover kept its record");
+    assert!(
+        alive(&serial) && alive(&ssh),
+        "a session ended before the cutover"
+    );
+    render.release();
+    revoked(&serial, &ssh, &mut client);
+    render.unmount();
+    // The serial session's leader exiting hung up every descriptor open on
+    // its controlling terminal, the host's among them.
+    host = Host::open();
+    host.screen("enrolled", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    plugged.remove();
+    let ids = enrolled();
+    for key in &keys {
+        assert!(ids.contains(&credential(key)));
+    }
+    let State::Enrolled(record) = state() else {
+        panic!("not enrolled");
+    };
+    assert_eq!(record.version(), VERSION);
+    let mut copy = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(backup())
+        .unwrap();
+    copy.write_all(&fs::read(record_path()).unwrap()).unwrap();
+    copy.sync_all().unwrap();
     sshd(true);
+    keys
+}
+
+/// `unlocked`: the boot after every key's removal starts unlocked with the
+/// ordinary SSH form. Then a one-key enrollment across a killed authority:
+/// with a serial login held and an SSH session open, the cutover's render
+/// after the publication is held, td-authd is killed while it waits,
+/// before either restart, and the next generation's first check completes
+/// the revocation; that generation starts locked.
+fn unlocked() -> Vec<Virtual> {
+    assert!(matches!(state(), State::Unenrolled));
+    assert_eq!(
+        fs::read_to_string(CUTOVER).unwrap(),
+        cutover_record("unenrolled")
+    );
+    let (_, mut keyboard) = unenrolled_start();
+    let key = new_key(SINGLE_KEY);
+    hold_serial();
+    service(&["start", "greeter"]);
+    let serial = held_login();
+    let mut client = open_ssh();
+    let (sshd_leader, greeter_leader) = (leader("sshd"), leader("greeter"));
+    let ssh = leaf_members(sshd_leader);
+    // The greeter's start may have hung up the host's descriptor.
+    let mut host = Host::open();
+    let render = HeldRender::mount();
+    let old = authority();
+    let plugged = enroll(&mut host, &mut keyboard, &[&key]);
+    system_wait("the cutover's render", || render.began());
+    // Published, its record removed, and neither unit restarted.
+    assert!(matches!(state(), State::Enrolled(_)));
+    assert!(!Path::new(CUTOVER).exists(), "the cutover kept its record");
+    assert_eq!(
+        (leader("sshd"), leader("greeter")),
+        (sshd_leader, greeter_leader)
+    );
+    assert!(
+        alive(&serial) && alive(&ssh),
+        "a session ended before the kill"
+    );
+    assert!(Command::new("/bin/kill")
+        .args(["-KILL", &old.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    render.release();
+    system_wait(
+        "the next authority",
+        || matches!(authorities()[..], [new] if new != old),
+    );
+    revoked(&serial, &ssh, &mut client);
+    render.unmount();
+    host = Host::open();
+    host.screen("locked", &[]);
+    plugged.remove();
+    assert_eq!(stored(), Some(vec![credential(&key)]));
+    sshd(true);
+    vec![key]
+}
+
+/// An enrolled boot's first frames: locked from the first frame and still
+/// locked once the terminal is ready; boot health and the enforced SSH
+/// form, which refuses root and admits the primary.
+fn locked_start(host: &mut Host) {
+    host.screen("locked", &[]);
+    ready(&["wayland", "terminal"]);
+    boot_healthy();
+    sshd(true);
+}
+
+/// `added`: from the two keys, an addition of each of six more,
+/// authorized by the first, to eight; a ninth is refused before any
+/// token.
+fn added(host: &mut Host, keyboard: &mut Keyboard) -> Vec<Virtual> {
+    locked_start(host);
+    let mut keys = restored();
+    assert_eq!(stored().unwrap().len(), 2);
+    unlock(host, keyboard, &keys[0]);
+    for name in ADDED_KEYS {
+        let new = new_key(name);
+        let before = u8::try_from(keys.len()).unwrap();
+        add(host, keyboard, &keys[0], &new, before);
+        keys.push(new);
+        assert_eq!(stored().unwrap().len(), keys.len());
+    }
+    let ids = stored().unwrap();
+    for key in &keys {
+        assert!(ids.contains(&credential(key)));
+    }
+    // A key is plugged, so the refusal is root's at the baseline, not a
+    // missing key: it reaches no token.
+    let plugged = Plugged::insert(&keys[0], NAME);
+    manage(host, keyboard, KEY_A);
+    host.screen("eight", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    assert_eq!(plugged.remove().requests, 0, "the refusal reached the key");
+    assert_eq!(stored(), Some(ids));
+    keys
+}
+
+/// `removed`: from eight keys, seven removed, leaving the first: the
+/// one-key disclosure, authorized by the second, which is among them.
+/// Then the last, behind the remove-every-key disclosure, and the cutover
+/// back, with the serial greeter logging in at once.
+fn removed(host: &mut Host, keyboard: &mut Keyboard) -> Vec<Virtual> {
+    locked_start(host);
+    let keys: Vec<Virtual> = SYSTEM_KEYS
+        .iter()
+        .chain(ADDED_KEYS)
+        .map(|name| restore(name))
+        .collect();
+    assert_eq!(stored().unwrap().len(), 8);
+    unlock(host, keyboard, &keys[0]);
+    let others: Vec<&Virtual> = keys[1..].iter().collect();
+    let plugged = remove(host, keyboard, &keys[1], &slots_of(&others), 8);
+    host.screen("removed", &[]);
+    keyboard.key(ESCAPE);
+    host.screen("desktop", &[]);
+    plugged.remove();
+    assert_eq!(stored(), Some(vec![credential(&keys[0])]));
+    hold_serial();
+    let plugged = remove(host, keyboard, &keys[0], &slots_of(&[&keys[0]]), 1);
+    unenrolled_again(host, keyboard, plugged);
+    keys
+}
+
+/// `cut`: the one key removed, behind its disclosure, back to unenrolled;
+/// then a one-key enrollment whose cutover's render is held, and the
+/// power cut as soon as its record is published. It never returns.
+fn cut(host: &mut Host, keyboard: &mut Keyboard) -> ! {
+    locked_start(host);
+    let single = restore(SINGLE_KEY);
+    assert_eq!(stored(), Some(vec![credential(&single)]));
+    unlock(host, keyboard, &single);
+    hold_serial();
+    let plugged = remove(host, keyboard, &single, &slots_of(&[&single]), 1);
+    unenrolled_again(host, keyboard, plugged);
+    let last = new_key(CUT_KEY);
+    let (sshd_leader, greeter_leader) = (leader("sshd"), leader("greeter"));
+    let render = HeldRender::mount();
+    let plugged = enroll(host, keyboard, &[&last]);
+    // The cutover starts only after the worker's successful end, so once
+    // its render begins the record's rename and directory sync are done;
+    // it has removed the boot's record and restarted neither unit.
+    system_wait("the cutover's render", || render.began());
+    assert!(matches!(state(), State::Enrolled(_)));
+    assert!(!Path::new(CUTOVER).exists(), "the cutover kept its record");
+    assert_eq!(
+        (leader("sshd"), leader("greeter")),
+        (sshd_leader, greeter_leader)
+    );
+    let mut console = OpenOptions::new().write(true).open("/dev/console").unwrap();
+    console
+        .write_all(format!("{CUT} cut\n").as_bytes())
+        .unwrap();
+    // The host kills QEMU on that word; nothing more runs.
+    let _held = (render, plugged);
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// `after-cut`: the power cut came right after the publication, before
+/// the cutover's restarts. This boot's firstboot rendered the enforced
+/// form and recorded it in stage 1, before `sshd` and the greeter
+/// started; the authority's check found that record and restarted
+/// neither, so both still run under firstboot's form. The record is the
+/// whole new one, and its key unlocks.
+fn after_cut(host: &mut Host, keyboard: &mut Keyboard, record: fs::Metadata) -> Vec<Virtual> {
+    let last = restore(CUT_KEY);
+    assert_eq!(stored(), Some(vec![credential(&last)]));
+    assert_eq!(
+        fs::read_to_string(CUTOVER).unwrap(),
+        cutover_record("enforced")
+    );
+    assert!(!Path::new(REBOOT_GUARD).exists(), "a failed revocation");
+    // A cutover would restart both units after the authority started,
+    // and publish another record than the one `record` saw before it.
+    locked_start(host);
+    let authority = started(authority());
+    for unit in ["sshd", "greeter"] {
+        assert!(
+            started(leader(unit)) <= authority,
+            "{unit} after the authority"
+        );
+    }
+    let unchanged = fs::metadata(CUTOVER).unwrap();
+    assert_eq!(
+        (unchanged.ino(), unchanged.mtime(), unchanged.mtime_nsec()),
+        (record.ino(), record.mtime(), record.mtime_nsec()),
+        "the authority rewrote the boot's record"
+    );
+    unlock(host, keyboard, &last);
+    vec![last]
 }
 
 /// Leaves `damage` for the next boot, as other code on the machine could.
@@ -1050,6 +1895,7 @@ impl Drop for SystemDiagnostics {
 #[ignore = "requires qemu-login-system's full system image, volume and UHID"]
 fn qemu_login_system_locks_unlocks_and_refuses_on_a_full_system() {
     guard("fido-system");
+    quiet_kernel_console();
     let _diagnostics = SystemDiagnostics;
     let phase = phase();
     eprintln!("login system phase {phase}");
@@ -1061,87 +1907,97 @@ fn qemu_login_system_locks_unlocks_and_refuses_on_a_full_system() {
         HOSTNAME
     );
     assert!(Device::discover().unwrap().is_empty());
-    if phase == "seed" {
-        // Unenrolled, with the state helper failing: root reads no record,
-        // so td-authd runs no helper and the session starts unlocked. The
-        // boot's record names that state, so root's check changes nothing.
-        assert!(matches!(state(), State::Unenrolled));
-        assert_eq!(
-            fs::read_to_string(CUTOVER).unwrap(),
-            cutover_record("unenrolled")
-        );
-        let failing = Recorder::mount(true);
-        // The serial greeter logged in, and its shell would read the
-        // host's answers: once it has, the greeter is stopped until the
-        // cutover.
-        idle_login_shell();
-        service(&["stop", "greeter"]);
-        system_wait("ttyS0 released", || serial().is_none());
-        let mut host = Host::open();
-        release_console();
-        blank_screen();
-        host.screen("blank-unlocked", &[]);
-        fs::write(INPUT_READY, b"ready").unwrap();
-        ready(&["wayland", "terminal"]);
-        host.screen("desktop", &[]);
-        boot_healthy();
-        sshd(false);
-        // Only the mount's own check ran the helper.
-        let helpers = failing
-            .verbs()
-            .iter()
-            .filter(|verb| *verb == "inspect-login")
-            .count();
-        assert_eq!(helpers, 1, "td-authd ran the state helper unenrolled");
-        failing.unmount();
-        cutover(&mut host);
-        return;
+    let keys = match phase {
+        "seed" => seed(),
+        "unlocked" => unlocked(),
+        _ => enrolled_boot(phase),
+    };
+    if let Some(next) = next_damage(phase) {
+        damage(next);
     }
-    let ids = enrolled_or_damaged(phase);
-    let keys = restored();
-    if !ids.is_empty() {
-        for key in &keys {
-            assert!(ids.contains(&key.state().credentials.last().unwrap().id));
-        }
+    for key in &keys {
+        assert_eq!(key.saved(), Ok(()));
+        assert_eq!(key.state().retries, 8);
     }
+    assert!(Device::discover().unwrap().is_empty());
+}
+
+/// A boot that starts enrolled or unavailable: its greeter parked
+/// refusing before the host is asked anything, since its getty flushes
+/// the line's input first, and its first frame the lock surface's. A
+/// greeter that a cutover back restarts is no longer parked.
+fn enrolled_boot(phase: &str) -> Vec<Virtual> {
+    // Before the input is ready, so before the seat and the authority.
+    assert!(authorities().is_empty(), "an authority before the seat");
+    let record = fs::metadata(CUTOVER);
     let mut keyboard = Keyboard::new();
     let parked = parked_greeter();
     let mut host = Host::open();
     start(&mut host);
-    match phase.split_once('-') {
-        None => {
-            host.screen("locked", &[]);
-            ready(&["wayland", "terminal"]);
-            host.screen("locked", &[]);
-            boot_healthy();
-            sshd(true);
-            unlock(&mut host, &mut keyboard, &keys[0]);
-            // The unlock's close cut off the keyboard's first fresh
-            // report, which Caps Lock spends as the chord does.
-            keyboard.key(CAPS_LOCK);
-            keyboard.report(SUPER, 0);
-            keyboard.report(SUPER, KEY_L);
-            keyboard.report(0, 0);
-            host.screen("locked", &[]);
-            unlock(&mut host, &mut keyboard, &keys[1]);
-            chord(&mut keyboard);
-            host.screen("menu", &[]);
-            keyboard.key(KEY_L);
-            host.screen("locked", &[]);
-            unlock(&mut host, &mut keyboard, &keys[0]);
-            updates(&mut host, &mut keyboard);
-            killed(&mut host);
-            unreadable(&mut host, &mut keyboard, &keys[0]);
-            unlock(&mut host, &mut keyboard, &keys[1]);
-            suspend(&mut host, &mut keyboard, &keys[1]);
+    let (keys, parks) = match phase {
+        "locked" => (locked(&mut host, &mut keyboard), true),
+        "added" => (added(&mut host, &mut keyboard), true),
+        "removed" => (removed(&mut host, &mut keyboard), false),
+        "cut" => cut(&mut host, &mut keyboard),
+        "after-cut" => (after_cut(&mut host, &mut keyboard, record.unwrap()), true),
+        _ => (damaged_or_repaired(phase, &mut host, &mut keyboard), true),
+    };
+    if parks {
+        assert_eq!(greeter(), Some(parked), "the serial greeter left its park");
+    }
+    keys
+}
+
+/// The two keys, each in the record unless the phase damaged it.
+fn system_keys(phase: &str) -> Vec<Virtual> {
+    let ids = enrolled_or_damaged(phase);
+    let keys = restored();
+    if !ids.is_empty() {
+        for key in &keys {
+            assert!(ids.contains(&credential(key)));
         }
+    }
+    keys
+}
+
+/// `locked`: the first enrolled boot's unlocks with each key, relocks,
+/// updates, killed compositor, unreadable state and, last, suspend.
+fn locked(host: &mut Host, keyboard: &mut Keyboard) -> Vec<Virtual> {
+    let keys = system_keys("locked");
+    host.screen("locked", &[]);
+    ready(&["wayland", "terminal"]);
+    host.screen("locked", &[]);
+    boot_healthy();
+    sshd(true);
+    unlock(host, keyboard, &keys[0]);
+    // The unlock's close cut off the keyboard's first fresh report, which
+    // Caps Lock spends as the chord does.
+    keyboard.key(CAPS_LOCK);
+    keyboard.report(SUPER, 0);
+    keyboard.report(SUPER, KEY_L);
+    keyboard.report(0, 0);
+    host.screen("locked", &[]);
+    unlock(host, keyboard, &keys[1]);
+    chord(keyboard);
+    host.screen("menu", &[]);
+    keyboard.key(KEY_L);
+    host.screen("locked", &[]);
+    unlock(host, keyboard, &keys[0]);
+    updates(host, keyboard);
+    killed(host);
+    unreadable(host, keyboard, &keys[0]);
+    unlock(host, keyboard, &keys[1]);
+    suspend(host, keyboard, &keys[1]);
+    keys
+}
+
+/// A `damaged-` boot, which shows its cause and repairs it, or a
+/// `repaired-` one, which is enrolled again.
+fn damaged_or_repaired(phase: &str, host: &mut Host, keyboard: &mut Keyboard) -> Vec<Virtual> {
+    let keys = system_keys(phase);
+    match phase.split_once('-') {
         Some(("damaged", damage)) => {
-            damaged_boot(
-                &mut host,
-                &mut keyboard,
-                &keys,
-                damage.starts_with("record-"),
-            );
+            damaged_boot(host, keyboard, &keys, damage.starts_with("record-"));
             boot_healthy();
             sshd(true);
             repair(damage);
@@ -1153,15 +2009,7 @@ fn qemu_login_system_locks_unlocks_and_refuses_on_a_full_system() {
         }
         _ => panic!("no phase {phase}"),
     }
-    assert_eq!(greeter(), Some(parked), "the serial greeter left its park");
-    if let Some(next) = next_damage(phase) {
-        damage(next);
-    }
-    for key in &keys {
-        assert_eq!(key.saved(), Ok(()));
-        assert_eq!(key.state().retries, 8);
-    }
-    assert!(Device::discover().unwrap().is_empty());
+    keys
 }
 
 /// The record's credentials on an enrolled boot, and none on a damaged

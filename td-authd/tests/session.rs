@@ -1249,7 +1249,7 @@ fn login_pin_step(session: &mut Session) -> Description {
 
 fn begin_login(session: &mut Session, selection: Selection, script: &'static str) {
     let answer = session
-        .begin_login(selection, true, |owner, selection| {
+        .begin_login(selection, |owner, selection| {
             assert_eq!(owner, 1000);
             Login::scripted(selection, script)
         })
@@ -1445,47 +1445,51 @@ fn a_late_disclosure_receipt_is_answered_and_the_generation_lives_on() {
     assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
 }
 
+/// Activation (TOKEN-LOGIN.md increment 5's A5): every login selection,
+/// enrollment, addition and removal among them, starts the one fixed
+/// worker, whose baseline then decides; none is refused before it.
 #[test]
-fn production_refuses_login_writes_before_any_worker_starts() {
+fn production_admits_every_login_operation_to_its_worker() {
     let mut session = quiet();
     prepare(&mut session);
-    for selection in [
-        Selection::Enroll(1),
-        Selection::Enroll(2),
-        Selection::Add,
-        Selection::Remove(vec![crate::consent::Slot {
-            position: 1,
-            key: [1; 4],
-        }]),
+    for (selection, script, kind) in [
+        (Selection::Enroll(1), "baseline-three", 0x82),
+        (Selection::Enroll(2), "baseline-three", 0x82),
+        (Selection::Add, "baseline-none", 0x09),
+        (
+            Selection::Remove(vec![crate::consent::Slot {
+                position: 1,
+                key: [1; 4],
+            }]),
+            "baseline-none",
+            0x09,
+        ),
+        (Selection::Unlock, "baseline-none", 0x09),
     ] {
-        assert_eq!(
-            session
-                .begin_login(selection, false, |_, _| panic!("a login write started"))
-                .unwrap(),
-            [0x9b, 0]
-        );
+        let started = selection.clone();
+        let answer = session
+            .begin_login(selection, |owner, selection| {
+                assert_eq!((owner, &selection), (1000, &started));
+                Login::scripted(selection, script)
+            })
+            .unwrap();
+        assert_eq!(answer, [&[0x9b, 1][..], &[42; 32]].concat());
+        assert!(matches!(session.operation, Some(Active::Login(_))));
+        assert_eq!(login_end(&mut session), [0x91, 0x0d, kind, 0]);
         assert!(session.operation.is_none());
     }
-    // An unlock is wired; with no record it refuses from the baseline.
-    let answer = session
-        .begin_login(Selection::Unlock, false, |_, selection| {
-            Login::scripted(selection, "baseline-none")
-        })
-        .unwrap();
-    assert_eq!(answer[..2], [0x9b, 1]);
-    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x09, 0]);
 }
 
 #[test]
 fn a_login_operation_occupies_the_one_operation_slot() {
     let mut session = quiet();
     assert!(session
-        .begin_login(Selection::Unlock, true, |_, _| panic!("unprepared"))
+        .begin_login(Selection::Unlock, |_, _| panic!("unprepared"))
         .is_err());
     prepare(&mut session);
     begin_login(&mut session, Selection::Unlock, "silent");
     assert!(session
-        .begin_login(Selection::Unlock, true, |_, _| panic!("second login"))
+        .begin_login(Selection::Unlock, |_, _| panic!("second login"))
         .is_err());
     assert!(session
         .answer_with(
@@ -1522,9 +1526,7 @@ fn a_login_operation_occupies_the_one_operation_slot() {
     )));
     session.event = Some(Event::Waiting);
     assert!(session
-        .begin_login(Selection::Unlock, true, |_, _| panic!(
-            "login beside unlock"
-        ))
+        .begin_login(Selection::Unlock, |_, _| panic!("login beside unlock"))
         .is_err());
 }
 
@@ -1545,7 +1547,7 @@ fn login_state_needs_preparation_but_never_the_operation_slot() {
     assert_eq!(session.answer(Request::LoginState).unwrap(), unenrolled);
     assert!(matches!(session.operation, Some(Active::Login(_))));
     assert!(session
-        .begin_login(Selection::Unlock, true, |_, _| panic!("second login"))
+        .begin_login(Selection::Unlock, |_, _| panic!("second login"))
         .is_err());
     session.close_with(|_| fixture("cleanup_child")).unwrap();
 }

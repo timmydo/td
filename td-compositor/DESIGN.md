@@ -6050,8 +6050,8 @@ Enter installing nothing (td-update/DESIGN.md).
 The approval key appears only on the private prompt, so ordinary
 rendering never carries it. The login-key disclosures, enrollment's and
 the one-key and remove-every-key removal disclosures (TOKEN-LOGIN.md
-increment 5's A4), take it, implemented and inert in production until
-that increment's A5 admits a write. Each is typed on the operation's
+increment 5's A4), take it, live since that increment's A5 admits a
+write. Each is typed on the operation's
 first step, which carries the disclosure, under the rules above, and
 confirms that step's presentation receipt rather than a commit: the
 client presents the step at root's first `04`, sends nothing while
@@ -6084,25 +6084,26 @@ every operation types the key.
 
 ### Login-key operations
 
-TOKEN-LOGIN.md's key management starts on the attention menu, inert in
-production. A fresh physical K, before the lifetime's operation, opens
-the key-management screen: `1` enrolls one key, `2` two, `A` adds a key
-and `D` removes keys. On that screen the menu's own letters select
-nothing, and Escape still cancels. Each choice is the lifetime's one
-operation, read under the menu's rules (a fresh press, from a device
-secure attention reads, of a key no other such device holds), so a
-security key's own keyboard neither opens the screen nor chooses on it.
-A screen that fails to paint consumes the lifetime instead: a choice
-the person cannot see is no choice. Nor is one on a screen still on its
-way: each key-management screen names the paint that shows it, the
-first from its setting, as a prompt's presentation does, and a press on
-it chooses nothing until that paint is on glass. With a flip in flight
-the repaint is only owed, so `K` then `1` faster than the flip selects
-nothing; the same `1` once the screen is shown selects. Unlike a
-prompt's confirmation, the gate is read when a press is processed, not
-against its timestamp: where a paint presents synchronously (fbdev), a
-`1` queued in the same read as `K` selects. That is typeahead from a
-device secure attention reads, not an unseen screen.
+TOKEN-LOGIN.md's key management starts on the attention menu, live
+since its increment 5's A5. A fresh physical K, before the lifetime's
+operation, opens the key-management screen: `1` enrolls one key, `2`
+two, `A` adds a key and `D` removes keys. On that screen the menu's own
+letters select nothing, and Escape still cancels. Each choice is the
+lifetime's one operation, read under the menu's rules (a fresh press,
+from a device secure attention reads, of a key no other such device
+holds), so a security key's own keyboard neither opens the screen nor
+chooses on it. A screen that fails to paint consumes the lifetime
+instead: a choice the person cannot see is no choice. Nor is one on a
+screen still on its way: each key-management screen names the paint that
+shows it, the first from its setting, as a prompt's presentation does,
+and a press on it chooses nothing until that paint is on glass. With a
+flip in flight the repaint is only owed, so `K` then `1` faster than the
+flip selects nothing; the same `1` once the screen is shown selects.
+Unlike a prompt's confirmation, the gate is read when a press is
+processed, not against its timestamp: where a paint presents
+synchronously (fbdev), a `1` queued in the same read as `K` selects.
+That is typeahead from a device secure attention reads, not an unseen
+screen.
 
 `D` needs the enrolled key list, which td-authd's `1a` answer supplies
 (`td-authd/DESIGN.md`, amendment 1; TOKEN-LOGIN.md increment 4's C3).
@@ -6110,19 +6111,20 @@ The list is the last `1a` answer's, which the authority worker keeps in
 a handle the input bindings read when `D` is pressed; without one `D`
 sends nothing and ends the choice, showing `NO LOGIN KEYS ENROLLED` when
 that answer was unenrolled, or its cause's rows when unavailable, and
-`NOT AVAILABLE IN THIS BUILD` only with no answer at all, which the
-paired profile never has once connected. With a list, the screen shows
+`LOGIN KEY STATE NOT KNOWN` only with no answer at all: the direct
+profile, which has no authority, since the paired profile always has
+one once connected. With a list, the screen shows
 `REMOVE: PRESS 1 TO N THEN ENTER` and the chosen positions; digit 1 to N
 toggles that position, and Enter selects the nonempty set in position
-order, each slot with its listed fingerprint. Root refuses the removal
-(`9b 00`) until TOKEN-LOGIN.md's increment 5. Device-dispatcher tests
+order, each slot with its listed fingerprint. Device-dispatcher tests
 read lists and states through root's `9a` bytes.
 
 The private client sends the choice as `1b`: `07` unlock, `08 01` or
 `08 02` first enrollment, `09` addition, or `0a`, a count and that many
 position-and-fingerprint slots for a removal, exactly as td-authd's
-`login::Selection` decodes it. Root's refusal in this build, `9b 00`,
-shows `NOT AVAILABLE IN THIS BUILD`; `9b 01` keeps the nonce, and no
+`login::Selection` decodes it. Root starts every one (TOKEN-LOGIN.md
+increment 5's A5): `9b 01` keeps the nonce, any other answer, the
+earlier refusal `9b 00` included, is a protocol violation, and no
 description exists until the worker's baseline (`91 0b`). The client
 checks root's descriptions without the record or the device:
 
@@ -6152,7 +6154,7 @@ opens the PIN field (below), and a PIN step's successor (under `04`,
 `03` or an end) or its commit is admitted only after this client sent
 that step's `1c`: root moves past a PIN step only once it has the PIN.
 A `0c` after the `1c`, for a step that asks none or for one not yet
-presented is a violation. Production reaches no PIN step. An end
+presented is a violation. An end
 (`0d`, `0e`) carries a typed
 kind and detail, shown as TOKEN-LOGIN.md's "Failure texts" says. The
 client accepts exactly the ends root's supervisor can produce where it
@@ -6204,11 +6206,10 @@ a security key's own keyboard, and none before the screen is on glass.
 
 #### The PIN field
 
-TOKEN-LOGIN.md's PIN entry. Only a login unlock reaches it in
-production, since root refuses every operation that writes, and only
-the lock surface's chord sends an unlock's `1b`, only while the login
-state is enrolled ("The lock surface" below): on a machine holding a
-record, which nothing in production writes.
+TOKEN-LOGIN.md's PIN entry. Every login operation's PIN steps reach
+it: an enrollment's, an addition's and a removal's from the `K` screen,
+and an unlock's, whose `1b` only the lock surface's chord sends, only
+while the login state is enrolled ("The lock surface" below).
 
 It opens when root answers a poll with `0c` for the current step, which
 must ask for a PIN (consent's `asks_pin`) and have this client's
@@ -6541,7 +6542,7 @@ item 5's lock surface and unlock are "The lock surface" above, and its
 open lifetime (C9), a lid close and a resume (C10, items 6 and 7), and
 request 19's refusal text are implemented.
 [td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md)
-owns the planned login-key tier, including when the session locks and what
+owns the login-key tier, including when the session locks and what
 clients receive while locked ("Session lock"). The rules in this section
 change as follows; increment numbers are TOKEN-LOGIN.md's. A security key's
 own keyboard ("Physical secure attention") is already excluded, and stays
@@ -6551,8 +6552,8 @@ excluded from every selection, confirmation and field below.
    screen and the lock surface, whose chord opens a login unlock with no
    selection at all. A disclosure's approval key ("Elevation consent")
    confirms its operation at its first step (TOKEN-LOGIN.md increment
-   5's A4), implemented and inert until that increment's A5.
-2. **The PIN field (3).** Implemented, inert: "The PIN field" above.
+   5's A4), implemented and live since that increment's A5.
+2. **The PIN field (3).** Implemented: "The PIN field" above.
    "The screen accepts no credential bytes" gains
    one exception. The field opens only after the current step has its
    presentation receipt and root has asked for that step's PIN. It reads

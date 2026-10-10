@@ -56,7 +56,8 @@ the later complete encrypted boot, hardware-backed PIN, recovery and
 session-authentication cutover. No account secret is needed to install.
 After installation the account may enroll FIDO2 login keys from its
 desktop, which turns automatic login off
-([td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md), not implemented);
+([td-login/TOKEN-LOGIN.md](../td-login/TOKEN-LOGIN.md), implemented,
+and not usable until the acceptance evidence its opening names);
 the installer collects no key and its disclosures describe the installed
 default.
 Networking can be configured after booting the installed system.

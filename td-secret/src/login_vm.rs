@@ -91,8 +91,8 @@ fn names() -> Vec<String> {
 }
 
 /// `run`'s context but for the versions: both retained deployments read
-/// this build's, as increment 4's tier marker will say. Until then
-/// production passes none, and every write that leaves a record refuses.
+/// this build's, standing for the tier markers a volume carries, which
+/// these diskless guests lack.
 fn context() -> Context<'static> {
     writing(&write)
 }
@@ -1166,6 +1166,18 @@ fn qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token() {
 // (recipes/src/fixtures/secret_vm.rs, LOGIN_DESKTOP_SCREENS), and the
 // guest acts only once the host has seen it.
 
+/// Keeps every kernel message but a KERN_EMERG one, a panic's among them,
+/// off the console. Each guest test calls it first, before it creates any
+/// UHID device: printk reaches ttyS0 beneath the tty layer, so a probe
+/// could otherwise land inside a request (`Host::ask`) or any other line
+/// the host checks, however it is written. Nothing the host checks of
+/// these guests is a kernel line but the panic.
+fn quiet_kernel_console() {
+    fs::write("/proc/sys/kernel/printk", b"1\n").unwrap();
+    let levels = fs::read_to_string("/proc/sys/kernel/printk").unwrap();
+    assert_eq!(levels.split_whitespace().next(), Some("1"), "{levels}");
+}
+
 /// The host's question on the console and its answer on ttyS0.
 const SCREEN: &str = "TD-LOGIN-SCREEN";
 const SHOWN: &str = "TD-LOGIN-SHOWN";
@@ -1208,7 +1220,24 @@ impl Host {
 
     /// Asks the host to see screen `name` and waits for its answer.
     fn screen(&mut self, name: &str, arguments: &[&str]) {
-        let mut request = format!("{SCREEN} {name}");
+        let read = self.ask(name, arguments);
+        assert_eq!(read, None, "screen {name} answered with a reading");
+    }
+
+    /// Asks the host to see screen `name` and returns what it read off
+    /// the screen, which it answers with.
+    fn read(&mut self, name: &str, arguments: &[&str]) -> String {
+        self.ask(name, arguments)
+            .unwrap_or_else(|| panic!("screen {name} answered without a reading"))
+    }
+
+    /// Asks for screen `name` and waits for the host's answer, which
+    /// carries one word it read off that screen or none.
+    fn ask(&mut self, name: &str, arguments: &[&str]) -> Option<String> {
+        // A line of its own even after another program's unfinished one
+        // on the console, such as a client's message as its compositor
+        // dies.
+        let mut request = format!("\n{SCREEN} {name}");
         for argument in arguments {
             request.push(' ');
             request.push_str(argument);
@@ -1217,7 +1246,7 @@ impl Host {
         request.push('\n');
         self.console.write_all(request.as_bytes()).unwrap();
         self.console.flush().unwrap();
-        let request = request.trim_end();
+        let request = request.trim();
         let answer = format!("{SHOWN} {name}");
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut chunk = [0; 256];
@@ -1234,7 +1263,14 @@ impl Host {
                 let line = String::from_utf8_lossy(&line);
                 let line = line.trim();
                 if line == answer {
-                    return;
+                    return None;
+                }
+                if let Some(word) = line
+                    .strip_prefix(&answer)
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .filter(|word| !word.is_empty() && !word.contains(' '))
+                {
+                    return Some(word.to_string());
                 }
                 assert!(!line.starts_with(SHOWN), "{line:?} answered {request:?}");
             }
@@ -1462,6 +1498,7 @@ fn uncut(reduced: crate::cutover::Reduced) {
 #[ignore = "requires qemu-secret with a disposable guest, UHID and the paired desktop"]
 fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() {
     guard("login-desktop");
+    quiet_kernel_console();
     let _diagnostics = Diagnostics;
     applet(&["hostname", HOSTNAME]);
     let mut host = Host::open();

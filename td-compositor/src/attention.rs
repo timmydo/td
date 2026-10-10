@@ -44,8 +44,9 @@ pub(crate) enum Notice {
         keys: u8,
         chosen: u8,
     },
-    /// A selection this build refuses.
-    NotAvailable,
+    /// A login selection (`K`'s keys, `D`, `L`) with no login state from
+    /// root's `1a` answer: the direct profile, which has no authority.
+    StateUnknown,
     /// A login-key operation's end (td-login/TOKEN-LOGIN.md, "Failure
     /// texts").
     Login(&'static [&'static str]),
@@ -602,7 +603,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::Failed => "REQUEST FAILED",
         Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
         Notice::LoginKeys => "LOGIN KEYS",
-        Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
+        Notice::StateUnknown => "LOGIN KEY STATE NOT KNOWN",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
         Notice::Restarting => RESTARTING_NOTICE,
         Notice::Login(rows) => return rows.iter().map(|row| String::from(*row)).collect(),
@@ -1220,7 +1221,7 @@ mod tests {
         Notice::Failed,
         Notice::Busy,
         Notice::LoginKeys,
-        Notice::NotAvailable,
+        Notice::StateUnknown,
         Notice::Removing {
             keys: 8,
             chosen: 0xff,
@@ -1297,7 +1298,7 @@ mod tests {
     fn login_screens_and_ends_fit_and_draw_every_glyph() {
         let notices = [
             Notice::LoginKeys,
-            Notice::NotAvailable,
+            Notice::StateUnknown,
             Notice::Removing {
                 keys: 8,
                 chosen: 0xff,

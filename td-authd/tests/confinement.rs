@@ -150,16 +150,12 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .split("#[cfg(test)]")
         .next()
         .unwrap();
-    // Writes stay out of production until activation; a login cancel kills
-    // and reaps the one fixed worker and never relocks the secret session.
-    assert_eq!(
-        login
-            .matches("pub(crate) const WRITES: bool = cfg!(test);")
-            .count(),
-        1
-    );
-    // In login.rs: the `const WRITES` definition and Login::start's check.
-    assert_eq!(login.matches("WRITES").count(), 2);
+    // Since activation (TOKEN-LOGIN.md increment 5's A5) every login
+    // selection, a write included, starts the one fixed worker, whose
+    // baseline decides; no build switch refuses one first. A login cancel
+    // kills and reaps that worker and never relocks the secret session.
+    assert!(!login.contains("WRITES"));
+    assert!(!login.contains("cfg!(test)"));
     assert_eq!(
         login.matches("command(\"login-operation\", owner)").count(),
         1
@@ -188,7 +184,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0x3911f2716b9a330c,
+        0xe713a5be359ae7cb,
         "login worker supervisor changed"
     );
     assert_eq!(
@@ -201,9 +197,17 @@ fn the_production_source_and_raw_boundary_are_closed() {
         SESSION_FINGERPRINT,
         "paired secret controller changed"
     );
+    // `1b` has one answer that starts nothing, the generation's end: no
+    // `9b 00` refusal remains.
+    let session = include_str!("../src/session.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(!session.contains("WRITES"));
+    assert!(!session.contains("0x9b, 0]"));
     assert_eq!(
-        include_str!("../src/session.rs")
-            .matches("crate::login::WRITES")
+        session
+            .matches("Request::Login(selection) => self.begin_login(selection, Login::start),")
             .count(),
         1
     );
@@ -1045,7 +1049,7 @@ const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
 const MAIN_FINGERPRINT: u64 = 0xb0adcdeec79e50ac;
-const SESSION_FINGERPRINT: u64 = 0x8fd83ef1314188f9;
+const SESSION_FINGERPRINT: u64 = 0x73ac3a99626cb8e7;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

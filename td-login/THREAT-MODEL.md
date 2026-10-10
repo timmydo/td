@@ -47,7 +47,7 @@ Adversaries considered:
   argv, the environment, the current directory, and the open file
   descriptors, including which file is on fd 0.
 - **A4 — a person at a locked machine** without an enrolled login key and
-  its PIN. This adversary exists only under the planned login-key tier in
+  its PIN. This adversary exists only under the login-key tier in
   [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), which owns that tier's scope, and
   only where a key is enrolled or the login directory is invalid, the
   states the compositor starts locked on; td-login's part is the console
@@ -419,7 +419,8 @@ Consequences worth stating plainly:
 
 **Login keys: the console refusal.** Under
 [`TOKEN-LOGIN.md`](TOKEN-LOGIN.md), enrolling a FIDO2 login key publishes
-`/var/lib/td/login/1000`; nothing in production enrolls one yet. td-login
+`/var/lib/td/login/1000`; since its increment 5 (A5) the session owner
+enrolls one through the compositor's attention screen. td-login
 reads no CTAP and does not parse that record; it asks only whether one may
 exist, through the directory-and-name predicate it shares with firstboot
 and td-authd, on the real root and before anything else that could start
@@ -470,13 +471,15 @@ started before enrollment does not survive it: td-authd's cutover
 restarts the greeter, whose stop ends every process holding the line as
 its controlling terminal, and `sshd`, whose stop ends its whole leaf,
 before it records the enforced form; a revocation that fails reboots
-once, guarded, or holds. TOKEN-LOGIN.md's "Cutover" owns how. The stock image never contains a record and
-firstboot ensures the directory at every boot, so its console behaviour
-and the table above stand; the refusal acts only where a record or an
-invalid directory exists. Since TOKEN-LOGIN.md's increment 4 (C7) the
-compositor starts every generation locked on exactly those states, so
-this refusal and the enforced SSH form are what keep the serial line and
-SSH from passing a lock screen there.
+once, guarded, or holds. TOKEN-LOGIN.md's "Cutover" owns how. The stock
+image ships no record and firstboot ensures the directory at every boot,
+so until its owner enrolls a key its console behaviour and the table
+above stand; the refusal acts only where a record or an invalid
+directory exists, and removing the last key cuts back over to that
+behaviour (TOKEN-LOGIN.md, "Cutover"). Since TOKEN-LOGIN.md's increment
+4 (C7) the compositor starts every generation locked on exactly those
+states, so this refusal and the enforced SSH form are what keep the
+serial line and SSH from passing a lock screen there.
 
 The future hardware-backed disk and session unlock contract lives in
 [`td-install/ENCRYPTION.md`](../td-install/ENCRYPTION.md). It binds primary

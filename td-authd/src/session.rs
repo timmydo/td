@@ -416,9 +416,7 @@ impl Session {
             Request::LoginState => Err("login state before session preparation".into()),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
-            Request::Login(selection) => {
-                self.begin_login(selection, crate::login::WRITES, Login::start)
-            }
+            Request::Login(selection) => self.begin_login(selection, Login::start),
             Request::Pin(description, pin) => {
                 let Some(Active::Login(operation)) = &mut self.operation else {
                     return Err("no login operation takes a PIN".into());
@@ -744,18 +742,13 @@ impl Session {
         Ok(answer)
     }
 
-    /// A login operation from the worker's baseline on. Until activation a
-    /// production build refuses every one that may write (`active` false)
-    /// before any worker starts.
+    /// A login operation from the worker's baseline on: an unlock,
+    /// enrollment, addition or removal (TOKEN-LOGIN.md increment 5's A5).
     fn begin_login(
         &mut self,
         selection: Selection,
-        active: bool,
         start: impl FnOnce(u32, Selection) -> Result<Login, String>,
     ) -> Result<Vec<u8>, String> {
-        if selection.writes() && !active {
-            return Ok(vec![0x9b, 0]);
-        }
         if !self.prepared
             || self.cleanup.is_some()
             || self.operation.is_some()

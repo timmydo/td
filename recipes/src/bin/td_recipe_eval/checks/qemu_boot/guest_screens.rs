@@ -14,7 +14,9 @@
 //! accepted, or the boot ends, every capture must satisfy the wake's own
 //! hold, but for the capture taken while it slept, which is admitted only
 //! until the first capture after the wake that differs from it; and the
-//! wake's inactive output must show at least once after the wake.
+//! wake's inactive output must show at least once after the wake. A
+//! screen the plan reads, such as a prompt's approval key, is answered
+//! `ANSWER NAME WORD`, the word read off the capture its check accepted.
 
 use super::serial_shell::SerialPort;
 use super::update::{ppm, read_capture};
@@ -36,6 +38,9 @@ const SUSPEND_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) type Check<'a> = &'a dyn Fn(&[u8], &[&str]) -> Result<bool, String>;
 /// What every capture must satisfy until the next screen is accepted.
 pub(super) type Holds<'a> = &'a dyn Fn(&[u8]) -> Result<bool, String>;
+/// The one word a screen's answer carries, read off the capture its check
+/// accepted, given the screen's arguments.
+pub(super) type Reads<'a> = &'a dyn Fn(&[u8], &[&str]) -> Result<String, String>;
 
 pub(super) struct Screen<'a> {
     pub(super) name: &'a str,
@@ -54,7 +59,8 @@ pub(super) struct Wake<'a> {
 
 /// One boot's screens: the console words, what each name checks, the
 /// names the guest must ask for in exactly this order, where the capture
-/// a check refused is kept for the operator, and the suspension, if any.
+/// a check refused is kept for the operator, the suspension, if any, and
+/// the screens whose answers carry what the host read off them.
 pub(super) struct GuestScreens<'a> {
     pub(super) prompt: &'a str,
     pub(super) answer: &'a str,
@@ -62,6 +68,7 @@ pub(super) struct GuestScreens<'a> {
     pub(super) order: &'a [&'a str],
     pub(super) keep: Option<&'a Path>,
     pub(super) wake: Option<Wake<'a>>,
+    pub(super) reads: &'a [(&'a str, Reads<'a>)],
 }
 
 struct Pending<'a> {
@@ -303,6 +310,12 @@ impl<'a> ScreenSteps<'a> {
         self.lost = captured.is_err();
         let bytes = captured?;
         let pixels = ppm(&bytes)?;
+        let arguments = self
+            .judge
+            .pending
+            .as_ref()
+            .map(|pending| pending.arguments.clone())
+            .unwrap_or_default();
         // The first capture once QEMU reports the guest suspended is the
         // display as it slept.
         if let (Some(Sleep { since: Some(_), .. }), None, Some(wake)) =
@@ -330,7 +343,18 @@ impl<'a> ScreenSteps<'a> {
                 {
                     self.sleep = Some(Sleep::new(now)?);
                 }
-                port.send(&format!("{} {name}", self.plan.answer))
+                let mut answer = format!("{} {name}", self.plan.answer);
+                if let Some((_, reads)) = self.plan.reads.iter().find(|(read, _)| *read == name) {
+                    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+                    let word = reads(pixels, &arguments)
+                        .and_then(|word| answer_word(&word).map(|()| word))
+                        .map_err(|error| {
+                            self.refused(&bytes, format!("screen {name:?}: {error}"))
+                        })?;
+                    answer.push(' ');
+                    answer.push_str(&word);
+                }
+                port.send(&answer)
             }
             Ok(None) => Ok(()),
             Err(error) => Err(self.refused(&bytes, error)),
@@ -493,6 +517,15 @@ impl<'a> ScreenSteps<'a> {
     }
 }
 
+/// A word an answer may carry: printable ASCII with no space, so the
+/// guest reads it whole as one line's last word.
+fn answer_word(word: &str) -> Result<(), String> {
+    if word.is_empty() || word.len() > 64 || !word.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(format!("cannot answer with {word:?}"));
+    }
+    Ok(())
+}
+
 /// Whether a `query-status` reply names the suspended run state.
 fn suspended(reply: &[u8]) -> bool {
     let compact: String = String::from_utf8_lossy(reply)
@@ -533,6 +566,7 @@ mod tests {
             order: &["first", "second", "first"],
             keep: None,
             wake: None,
+            reads: &[],
         };
         let qmp = || PathBuf::from("/nonexistent/qmp");
         let mut steps = ScreenSteps::new(&plan, qmp(), 4096);
@@ -578,6 +612,7 @@ mod tests {
             order: &["only"],
             keep: None,
             wake: None,
+            reads: &[],
         };
         let qmp = || PathBuf::from("/nonexistent/qmp");
         let console = b"ASK only\nSEEN only\n";
@@ -825,6 +860,7 @@ mod tests {
             order: &[],
             keep: None,
             wake: None,
+            reads: &[],
         };
         let mut steps = ScreenSteps::new(&plan, PathBuf::from("/nonexistent/qmp"), 4096);
         steps.judge = suspended_judge(true);

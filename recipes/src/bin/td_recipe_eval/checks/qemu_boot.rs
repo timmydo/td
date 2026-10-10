@@ -13575,6 +13575,7 @@ mod tests {
             order: &[],
             keep: None,
             wake: None,
+            reads: &[],
         };
         let check = |_: &[u8]| Ok(true);
         let shell: [serial_shell::ShellStep; 0] = [];

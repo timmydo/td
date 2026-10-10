@@ -1,6 +1,6 @@
 //! The root login-key worker (td-login/TOKEN-LOGIN.md): session unlock,
-//! first enrollment, key addition and key removal. Nothing in production
-//! starts it yet.
+//! first enrollment, key addition and key removal, each started by
+//! td-authd on the compositor's physical selection.
 
 use crate::consent::{Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_LONGEST};
 use crate::fido_ctap;
