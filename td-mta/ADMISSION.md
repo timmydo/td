@@ -133,6 +133,108 @@ a scheduler must establish quiescence without canceling durable effects.
 Whole-service recovery and quota reconciliation remain
 unimplemented; do not infer them from pure accounting helper tests.
 
+### First reserved upload transaction
+
+This is the next M08 implementation boundary, not a running service.
+Start with one device-authorized upload that commits a fresh Upload-kind
+BlobRow and its device-bound LeaseRow atomically. The adapter constructs
+these rows from its actual prepared input; it accepts neither an
+arbitrary transaction batch nor caller-supplied proof of a body digest.
+HTTP handling, credential verification, general object mutations and
+request idempotence remain their own increments.
+
+The coordinator owns one IndexStore and the single logical ledger seeded
+by its consuming usage_fence initialization. Auxiliary owners are
+quiescent and pending effects settled during that cold capture. Its
+service-facing interface does not expose the mutable persistence core or
+another ledger. The initial adapter permits one outstanding upload job.
+This serializes its mutations and physical accounting without holding a
+SQLite writer fence while bytes arrive. Existing native views and
+ingress slot limits continue to apply; this is not a runtime fairness
+claim.
+
+Authentication remains upstream. A trusted authorization provider binds
+account, device and upload permission to current policy. Access is
+context, not a credential. Reserve checks that policy and binds the
+resulting reservation to account/device, coordinator instance, checked
+generation, maximum length, original deadline and captured ViewIdentity.
+At commit, authorization is checked again under a guard that also
+excludes policy publication/revocation until the synchronous transaction
+finishes. Guard acquisition has bounded refusal under the original
+deadline. A pinned old configuration alone grants no current permission.
+The provider must not call back into the coordinator while that guard is
+held.
+
+The reservation owns the actual SpoolWriter and then SpoolInput through
+exclusive custody; its borrowed staging handle cannot be used
+concurrently with commit. Before each write, its wrapper checks
+cumulative length against the reservation maximum as well as the spool
+ceiling. The coordinator generates a fresh BlobId through admitted
+entropy, preserving permanent-ID collision refusal. Input account, ID,
+length and digest must match that live reservation. Finishing staging is
+preparation only. Discard/abandonment follows IngressSpool cleanup,
+including its conservative retired-slot charge when deletion cannot be
+proven.
+
+The first upload lease uses LeaseUse::Both for that same account/device.
+Its expiry is trusted commit UTC plus 24 hours with checked arithmetic,
+matching DESIGN section 5; callers cannot supply arbitrary expiry or
+lease rights. The original monotonic deadline remains unchanged across
+staging and commit. A stale epoch invalidates the reservation. An early
+sequence conflict proven by the core within the same epoch retains the
+prepared input and unused reservation; another Conflict code alone
+cannot authorize that replan. An explicit bounded replan captures a
+fresh identity and revalidates policy before retry, without renewing the
+deadline. No old epoch is rewritten to force admission.
+
+Reserve maximum BodyBytes, one BlobCount and maximum UploadBytes before
+staging. IngressSpool separately reserves its entire temporary slot.
+These are different resources. Existing global category quotas are used;
+per-account enforcement must precede advertising the eventual
+per-account limits. Before SQL, reserve database/WAL headroom in this
+same ledger and pin logical and physical effect tickets. The initial
+single mutation lane may conservatively reserve all remaining physical
+headroom. There is no second quota-used table or public
+release-used-by-kind operation.
+
+A core-controlled completion disposition may prove that no
+storage-changing work began. Only that proof permits zero physical
+effect and release of unused physical headroom without measurement;
+Rejected or an Error variant alone is insufficient. After an attempt
+that may have changed extents, measure validated database/WAL lengths
+under the same exclusive mutation/maintenance ownership, using the
+StoreFileUsage validation rules and original operation scope. This does
+not repeat the cold whole-account reconciliation scan. A private trusted
+ledger transition replaces those measured physical buckets, settling its
+physical tickets and pending balances atomically, without disturbing
+other kinds or reservations. Rollback may grow extents; checkpoint may
+grow the database while shrinking WAL. A proven logical rejection
+therefore never supplies a zero physical charge. If the scope has
+expired or measurement/reconciliation fails, retain conservative
+physical charges and stop mutation admission until locked recovery and
+reconciliation.
+
+Reserve typed outcome storage before effects. Known COMMIT success
+retains its durable receipt and exact logical increments (length, one,
+length), even when later physical accounting or spool cleanup fails. The
+result separately reports whether admission is stopped; an accounting
+error cannot relabel that receipt as rejection or indeterminate COMMIT.
+Proven rejection adds no logical body/category usage. Indeterminate
+COMMIT conservatively charges planned logical effects, stops admission
+and forbids duplicate retry until recovery. Completion and unused-charge
+release may run after deadline; expiry cannot undo a durable result.
+
+Acceptance uses real ingress and native commits: exact body/lease
+reopening from nonempty reconciled usage; reservation/source ownership
+and stale identity refusals; policy revocation between reserve and
+commit; unchanged deadlines and quota/slot refusal before effects;
+sequence-conflict replan; logical rejection with measured physical
+usage; expiry between the coordinator precheck and native admission
+leaving admission usable; and known durable versus
+indeterminate/accounting-failed completion through existing fault seams.
+Tests answer these behavior and ownership questions. No new byte-exact
+memory layout or resource permutation matrix is a prerequisite.
+
 ## 3. Work budgets and deadlines
 
 WorkLimits retains finite job budgets: foreground 120s/8 GiB/2000000 records;

@@ -2394,10 +2394,14 @@ Complete outcome transition and worker validation, reply updates by active
 attempts, phase changes outside InFlight, transport ordering, entropy/collision
 checks, changed-object coverage, category quota reconciliation and request
 idempotence remain service work.
-Bind the implemented bounded
-IngressSpool ownership to authorized reservations before wiring body sources
-to service commits. Native indexes serve metadata
-queries; parsed-body/search caches remain disposable. Authoritative database
+The next concrete adapter is the first reserved upload transaction in
+ADMISSION.md section 2: bind authorized device context and captured store
+identity to actual IngressSpool custody, then atomically publish the body
+and upload lease. That section owns the authorization fence, replanning,
+quota reconciliation and durable-result rules. This adapter is planned;
+it is neither a generic ports::Store implementation nor an HTTP endpoint.
+Native indexes serve metadata queries; parsed-body/search caches remain
+disposable. Authoritative database
 values must survive cache rebuilds. Maintenance respects captured SQLite
 snapshots, fixed disk/heap ceilings and atomic body/metadata commits.
 
