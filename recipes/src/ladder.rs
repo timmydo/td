@@ -702,7 +702,7 @@ pub fn post_rust_inputs<'a>(awk_input: &'a str, extras: &[&'a str]) -> Vec<&'a s
         .collect()
 }
 
-/// The exact line the bootable-kernel rung's busybox `/init` prints on ttyS0 once
+/// The exact line the bootable-kernel rung's td-sh `/init` prints on ttyS0 once
 /// the kernel has reached userspace, and that the host-side `qemu-boot` tool asserts
 /// on. SINGLE SOURCE OF TRUTH shared by the `/init` script, both initramfs shape
 /// checks, and the boot tool (`checks/qemu_boot.rs`, via `td_recipe::ladder`), so the
@@ -1467,35 +1467,29 @@ pub const KEXEC_STAGE1_MARKER: &str = "TD-KEXEC-BOOT1";
 pub const KEXEC_STAGE2_MARKER: &str = "TD-KEXEC-BOOT2";
 
 /// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
-/// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
+/// carrying the bootable td-sh userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.
 ///
-/// Uses `busybox cpio -t` for a REAL newc parse whose listing is exact MEMBER NAMES —
-/// unlike the previous payload greps (`grep -a TRAILER` / `grep -a busybox`), which are
-/// satisfied by strings EMBEDDED IN THE BUSYBOX BINARY itself (it contains both
-/// "TRAILER!!!" and "busybox"), so an archive truncated after the marker but before its
-/// real trailer passed every assertion. What actually guarantees COMPLETENESS is
-/// requiring EVERY expected member name in the listing: any truncation that drops a
-/// member (busybox, /init, …) reds on the missing name. `cpio -t`'s exit code is a
-/// secondary signal — it reds on a mid-record `short read`, but can still exit 0 on an
-/// archive truncated cleanly at a header boundary (no TRAILER), which is exactly why the
-/// member-name assertions, not the exit code, carry the load. The `{marker}` and
-/// `{erofs_marker}` payload greps additionally prove the /init script's CONTENT (not
-/// just its name) is packed — cpio -t validates structure, not bytes — covering both
-/// the userland marker and the read-only-erofs probe marker the boot oracles assert on.
+/// Uses td-util `cpio -t` for a REAL newc parse whose listing is exact MEMBER NAMES,
+/// not payload greps, which strings embedded in a packed binary can satisfy. td-util
+/// reds on a truncated header, name or member and on a missing or short TRAILER, and
+/// requiring EVERY expected member name in the listing also reds on any archive that
+/// drops one. The `{marker}` and `{erofs_marker}` payload greps additionally prove the
+/// /init script's CONTENT (not just its name) is packed — cpio -t validates structure,
+/// not bytes — covering both markers the boot oracles assert on.
 ///
-/// `busybox` is the absolute path to the busybox multi-call binary; `grep`/`od`/`wc`
-/// come from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.
-pub fn initramfs_cpio_shape_check(initramfs: &str, busybox: &str) -> String {
+/// `td_util` is the absolute path to the td-util multicall; `grep`/`od`/`wc` come
+/// from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.
+pub fn initramfs_cpio_shape_check(initramfs: &str, td_util: &str) -> String {
     let marker = USERLAND_MARKER;
     let erofs_marker = EROFS_MARKER;
     format!(
         "sz=$(wc -c < '{initramfs}'); \
-         [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio: implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }}; \
+         [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio: implausibly small ($sz bytes) — its static td-sh alone is over 1 MiB\" >&2; exit 1; }}; \
          set -- $(od -An -tx1 -N 6 '{initramfs}'); \
          [ \"$1$2$3$4$5$6\" = 303730373031 ] || {{ echo 'initramfs.cpio: missing the newc cpio magic 070701' >&2; exit 1; }}; \
-         list=$('{busybox}' cpio -t < '{initramfs}' 2>/dev/null) || {{ echo 'initramfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream — no valid TRAILER)' >&2; exit 1; }}; \
-         for m in init bin/busybox bin/sh dev/console; do \
+         list=$('{td_util}' cpio -t < '{initramfs}' 2>/dev/null) || {{ echo 'initramfs.cpio: td-util cpio -t could not parse the archive (truncated/corrupt newc stream — no valid TRAILER)' >&2; exit 1; }}; \
+         for m in init bin/td-sh bin/sh bin/td-init bin/td-util dev/console; do \
              printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || {{ echo \"initramfs.cpio: cpio member '$m' missing — the bootable userland is incomplete\" >&2; exit 1; }}; \
          done; \
          grep -q -a {marker} '{initramfs}' || {{ echo 'initramfs.cpio: /init marker not packed — the boot script the qemu tool asserts on is missing' >&2; exit 1; }}; \
@@ -1871,8 +1865,6 @@ mod tests {
         "glibc-241",
         "hello",
         "hello-test",
-        "linux-x86-64",
-        "linux-x86-64-test",
         "make-test",
         "sed-mesboot",
     ];
@@ -1883,13 +1875,31 @@ mod tests {
         ("rust-userland-auto-test", "rust-stage0"),
         ("gcc-x86-64-self-test", "gcc-x86-64-native"),
         ("gcc-x86-64-self-test", "binutils-x86-64-native"),
-        // Later boot artifacts consume the pre-self kernel and its cpio packer.
-        ("kexec-spike-x86-64", "linux-x86-64"),
-        ("system-x86-64", "linux-x86-64"),
-        ("system-secret-vm-test", "linux-x86-64"),
-        // The native installation oracle boots this kernel in its disposable
-        // guest.
-        ("td-install-qemu-test", "linux-x86-64"),
+        // The kernel stays built by the native GCC 14 toolchain and mesboot0
+        // userland it was proven with; only the tools BusyBox supplied (bc,
+        // td-util, uutils, and td-sh and td-init for its initramfs) come from
+        // past the boundary, which puts it there. Its test reads the same
+        // artifacts with the same userland.
+        ("linux-x86-64", "bash-mesboot"),
+        ("linux-x86-64", "binutils-x86-64-native"),
+        ("linux-x86-64", "bison-mesboot"),
+        ("linux-x86-64", "coreutils-mesboot0"),
+        ("linux-x86-64", "diffutils-mesboot0"),
+        ("linux-x86-64", "elfutils-x86-64"),
+        ("linux-x86-64", "flex-x86-64"),
+        ("linux-x86-64", "gawk-mesboot0"),
+        ("linux-x86-64", "gcc-x86-64-native"),
+        ("linux-x86-64", "grep-mesboot0"),
+        ("linux-x86-64", "m4-mesboot"),
+        ("linux-x86-64", "make-x86-64"),
+        ("linux-x86-64", "sed-mesboot0"),
+        ("linux-x86-64-test", "bash-mesboot"),
+        ("linux-x86-64-test", "binutils-x86-64-native"),
+        ("linux-x86-64-test", "coreutils-mesboot0"),
+        ("linux-x86-64-test", "diffutils-mesboot0"),
+        ("linux-x86-64-test", "gawk-mesboot0"),
+        ("linux-x86-64-test", "grep-mesboot0"),
+        ("linux-x86-64-test", "sed-mesboot0"),
         // Rebuild GNU Make once with the final compiler. The preceding Make is
         // only the build driver; later packages consume make-x86-64-self.
         // The frozen UAPI input is a fixed-output source governed by the seed
@@ -2581,7 +2591,7 @@ mod tests {
     /// Only the Rust-toolchain closure and explicitly reviewed bootstrap-side
     /// consumers may declare an internal tool rung. Every other catalog recipe
     /// defaults to the far side of the boundary. The exact exceptions are
-    /// separately reviewed audit, transition, or boot-artifact edges.
+    /// separately reviewed audit, transition, or kernel-toolchain edges.
     #[test]
     fn post_bootstrap_recipes_use_only_reviewed_boundary_inputs() {
         let back_edges = post_bootstrap_back_edges(&catalog::all());
@@ -2691,8 +2701,12 @@ mod tests {
             && canonical.matches(&copied_kernel).count() == copied_kernel_references
     }
 
+    /// linux-x86-64 is past the boundary only for the tools BusyBox supplied;
+    /// its gen_init_cpio and bzImage are still native GCC 14 output, and the
+    /// boundary guard cannot see what its readers take from it. The boot
+    /// recipes may take only those two.
     #[test]
-    fn linux_boundary_exceptions_are_boot_artifacts_only() {
+    fn boot_recipes_use_the_kernel_only_for_boot_artifacts() {
         let recipes = catalog::all();
         for (stem, cpio_references, packed_kernel_references, copied_kernel_references) in
             [("kexec-spike-x86-64", 2, 1, 1), ("system-x86-64", 2, 0, 1)]

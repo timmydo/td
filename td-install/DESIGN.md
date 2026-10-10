@@ -2066,7 +2066,7 @@ the bytes. Firmware is solely a host test input.
 
 The initial `td-recipe-eval qemu-boot-uefi [linux-x86-64]` increment
 proves the firmware entry and initrd handoff with the recipe's tiny
-BusyBox initramfs. It builds and runs the source-built `td-install` on
+td-sh initramfs. It builds and runs the source-built `td-install` on
 an exclusively created private 6 GiB sparse disk, populating the ESP
 from the kernel recipe. It starts q35, on KVM alone unless
 `TD_QEMU_ACCEL=tcg` (`checks/accel.rs`), with cold per-run variables

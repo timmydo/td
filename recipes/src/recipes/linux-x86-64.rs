@@ -12,18 +12,18 @@ use crate::types::{Recipe, Step, TextEdit};
 // Three artifacts land in {out}: the uncompressed `vmlinux` ELF, the compressed,
 // bootable `bzImage`, and a tiny `initramfs.cpio` userland (see BOOTABLE below).
 // bzImage's self-extracting payload is gzip-compressed
-// (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`); td ships no
-// gzip executable — the builder only DEcompresses, in-process — so the compressor
-// is the busybox gzip applet's `bin/gzip` link, which accepts the kernel's exact
-// `-n -f -9` directly (busybox gzip's options include `-n` and `-1..-9`).
+// (kbuild's `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`), and the
+// compressor is td-util's gzip through a `{tools}/gzip` link (td-util dispatches
+// on argv[0]), which takes the kernel's exact `-n -f -9`. It emits fixed-Huffman
+// deflate only, so the payload is about 15% larger than GNU gzip -9's.
 // CONFIG_KERNEL_GZIP is pinned so the compressor is always gzip (never xz/zstd,
 // which would need a different tool).
 //
 // BOOTABLE (re #529): the config also turns on the 8250 serial console
 // (SERIAL_8250 + SERIAL_8250_CONSOLE, PRINTK/TTY), ELF + #! exec (BINFMT_ELF,
 // BINFMT_SCRIPT), and initramfs load (BLK_DEV_INITRD), and the recipe packs a
-// tiny EXTERNAL initramfs (gen_init_cpio) holding the td-built STATIC busybox
-// plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
+// tiny EXTERNAL initramfs (gen_init_cpio) holding td's STATIC td-sh, td-init and
+// td-util plus a /init that prints a marker on ttyS0 and reboots. A THIRD {out} artifact
 // (initramfs.cpio) lands alongside vmlinux/bzImage.
 //
 // USABLE (re #541): the config also turns on the pseudo-filesystems a real
@@ -84,13 +84,14 @@ use crate::types::{Recipe, Step, TextEdit};
 //     td's static libelf.a is not self-contained, so a pkg-config shim feeds
 //     kbuild `-lelf -leu -lz` from the elfutils-x86-64 output (libelf + libeu +
 //     the bundled static zlib).
-//   - bc (busybox-x86-64 applet): timeconst.h, as in the 4.14 rung.
+//   - bc (bc-x86-64-self, GNU bc built only for this): timeconst.h, as in the
+//     4.14 rung.
 // Avoided by config (audited): perl (C recordmcount; ftrace off), openssl (no
 // module signing / trusted keys), pahole (BTF off), python/cpio/rsync. The
 // initramfs below is packed by the in-tree gen_init_cpio HOSTCC hostprog (not the
 // external `cpio` tool), INITRAMFS_SOURCE stays "", and IKHEADERS/modules stay
 // off — so none of python, the `cpio` tool, or rsync is pulled in. The ONE
-// compressor used is gzip (busybox applet) for the bzImage payload —
+// compressor used is gzip (td-util) for the bzImage payload —
 // CONFIG_KERNEL_GZIP pinned; xz/lzma/zstd and their host tools stay off.
 //
 // HOSTCC (the Kbuild host programs fixdep/conf/objtool/modpost — ordinary
@@ -105,7 +106,8 @@ pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let nbin = "{in:binutils-x86-64-native}/bin";
-    let bb = "{in:busybox-x86-64}/bin/busybox";
+    let tu = "{in:td-util}/bin/td-util";
+    let uu = "{in:uutils}/bin/coreutils";
     let elfinc = "{in:elfutils-x86-64}/include";
     let elflib = "{in:elfutils-x86-64}/lib";
     // {root}/wb first so the libelf pkg-config shim also answers a bare
@@ -183,9 +185,10 @@ pub fn recipe() -> Recipe {
         "/td/store/glibc-2.41-x86_64",
     ));
 
-    // BusyBox applets the kernel's host build execs that neither mesboot0 nor the
-    // native toolchain provides, linked by name into the {tools} farm that
-    // mesboot0_path() lays on PATH (BusyBox dispatches on argv[0]). {tools} precedes
+    // Tools the kernel's host build execs that neither mesboot0 nor the native
+    // toolchain provides, linked by name into the {tools} farm that
+    // mesboot0_path() lays on PATH: GNU bc, td-util's xargs, uname, find and gzip,
+    // and uutils' mktemp and dd (both multicalls dispatch on argv[0]). {tools} precedes
     // coreutils-mesboot0 on PATH, so ONLY names ABSENT from coreutils-mesboot0 are
     // farmed here — none of these shadow a mesboot0 tool:
     //   - bc:     timeconst.h parse-time `bc -q timeconst.bc` (as in the 4.14 rung).
@@ -200,20 +203,22 @@ pub fn recipe() -> Recipe {
     //   - dd:     arch/x86/boot/Makefile's cmd_image pads setup.bin with `dd` when
     //             assembling bzImage; coreutils-mesboot0 omits dd.
     //   - find:   usr/gen_initramfs.sh print_mtime. Non-fatal for our empty source (it
-    //             sits in a `| sort | head` pipeline → blank mtime), and BusyBox find
-    //             lacks -printf, but farm it so the probe execs rather than erroring;
+    //             sits in a `| sort | head` pipeline → blank mtime), and td-util find
+    //             refuses -printf, but farm it so the probe execs rather than erroring;
     //             the -printf dir_filelist path is only reached by a DIRECTORY
     //             INITRAMFS_SOURCE, which this rung does not use.
-    // Only `bc` is feature-probed below (a POSIX-only bc silently mis-builds
-    // timeconst.h); the rest fail loudly as "command not found" if the applet is gone.
+    //   - gzip:   KGZIP for the bzImage payload, named by its link (see below).
+    // Only `bc` and `gzip` are probed below; the rest fail loudly as "command not
+    // found" if a link is gone.
     steps.push(Step::ToolFarm {
         links: vec![
-            ("bc".into(), bb.into()),
-            ("xargs".into(), bb.into()),
-            ("uname".into(), bb.into()),
-            ("mktemp".into(), bb.into()),
-            ("dd".into(), bb.into()),
-            ("find".into(), bb.into()),
+            ("bc".into(), "{in:bc-x86-64-self}/bin/bc".into()),
+            ("xargs".into(), tu.into()),
+            ("uname".into(), tu.into()),
+            ("mktemp".into(), uu.into()),
+            ("dd".into(), uu.into()),
+            ("find".into(), tu.into()),
+            ("gzip".into(), tu.into()),
         ],
     });
     // Fail FAST if that bc cannot do what timeconst.h needs (read()/arithmetic/
@@ -238,19 +243,16 @@ pub fn recipe() -> Recipe {
     );
 
     // gzip compressor for the bzImage payload. The pinned CONFIG_KERNEL_GZIP rule
-    // is `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`. td ships no gzip
-    // executable — only the builder's in-process DECOMPRESSORS — so KGZIP is the
-    // busybox gzip applet's `bin/gzip` link (busybox is already a kernel input).
-    // BusyBox 1.37 gzip's option set includes `-n` (a GNU-compat no-op), `-f`, and
-    // `-1..-9`, so it accepts the kernel's exact `-n -f -9` invocation directly —
-    // no wrapper needed, and this keeps real max compression, `-n` reproducibility
-    // (alongside SOURCE_DATE_EPOCH), and fail-closed behaviour on an unexpected
-    // operand. cmd_gzip always pipes the payload stdin->stdout (no file operand),
-    // exactly what the applet expects when invoked with no file. Wired as KGZIP=
-    // on the build step below.
+    // is `cat vmlinux.bin | $(KGZIP) -n -f -9 > vmlinux.bin.gz`, and KGZIP is the
+    // farm's `gzip` link to td-util, which must be named by a link because td-util
+    // dispatches on argv[0]. td-util gzip takes `-n` (it writes no name or time
+    // anyway), `-f` and `-1..-9`, so it accepts the kernel's exact `-n -f -9`
+    // directly, and refuses an unexpected option. cmd_gzip always pipes the
+    // payload stdin->stdout (no file operand). Wired as KGZIP= on the build step
+    // below.
     //
     // Fail FAST (parity with the bc probe) with the EXACT flags kbuild uses, so a
-    // busybox that lacked the gzip applet or rejected `-n -f -9` reds HERE with a
+    // gzip that was missing or rejected `-n -f -9` reds HERE with a
     // named error instead of deep inside arch/x86/boot/compressed. Assert the
     // output carries the gzip magic `1f 8b 08` (id1/id2 + CM=deflate).
     steps.push(
@@ -259,8 +261,8 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "if ! printf 'td-gzip-probe' | '{in:busybox-x86-64}/bin/gzip' -n -f -9 > {root}/gzprobe.gz 2>/dev/null; then echo 'gzip probe: busybox gzip -n -f -9 failed (applet missing or rejects the kernel flags)' >&2; exit 1; fi; \
-                 [ -s {root}/gzprobe.gz ] || { echo 'gzip probe: busybox gzip produced no output' >&2; exit 1; }; \
+                "if ! printf 'td-gzip-probe' | '{tools}/gzip' -n -f -9 > {root}/gzprobe.gz 2>/dev/null; then echo 'gzip probe: td-util gzip -n -f -9 failed (link missing or rejects the kernel flags)' >&2; exit 1; fi; \
+                 [ -s {root}/gzprobe.gz ] || { echo 'gzip probe: td-util gzip produced no output' >&2; exit 1; }; \
                  set -- $(od -An -tx1 -N3 {root}/gzprobe.gz); \
                  [ \"$1$2$3\" = 1f8b08 ] || { echo \"gzip probe: not a gzip/deflate stream (magic $1$2$3, want 1f8b08)\" >&2; exit 1; }",
             ],
@@ -269,7 +271,7 @@ pub fn recipe() -> Recipe {
     );
 
     // Some glibc host helpers popen(3)/system(3) hardcode /bin/sh; the host-free
-    // sandbox has none, so provide it from the declared bash input (busybox parity).
+    // sandbox has none, so provide it from the declared bash input.
     steps.push(
         Step::run(
             "{root}",
@@ -950,7 +952,7 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &"grep -q '^CONFIG_UNWINDER_FRAME_POINTER=y' .config || { echo 'frame-pointer unwinder not selected' >&2; exit 1; }; \
                  grep -q '^CONFIG_KERNEL_GZIP=y' .config || { echo 'gzip kernel compression not selected (bzImage would need another compressor)' >&2; exit 1; }; \
-                 grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the busybox userland' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BINFMT_ELF=y' .config || { echo 'BINFMT_ELF off — the kernel could not exec the initramfs userland' >&2; exit 1; }; \
                  grep -q '^CONFIG_BINFMT_SCRIPT=y' .config || { echo 'BINFMT_SCRIPT off — the kernel could not exec the #! /init script' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_INITRD=y' .config || { echo 'BLK_DEV_INITRD off — the kernel could not load the initramfs' >&2; exit 1; }; \
                  grep -q '^CONFIG_SERIAL_8250_CONSOLE=y' .config || { echo '8250 serial console off — no ttyS0 boot output for the qemu check' >&2; exit 1; }; \
@@ -1119,8 +1121,8 @@ pub fn recipe() -> Recipe {
     );
 
     // 5) Build vmlinux + the bootable bzImage. binutils tools passed explicitly
-    //    (native as/ld/ar/nm/…), host make env scrubbed (busybox parity), and
-    //    KGZIP pointed at the busybox gzip applet link for the bzImage payload.
+    //    (native as/ld/ar/nm/…), host make env scrubbed, and KGZIP pointed at
+    //    the farm's td-util gzip link for the bzImage payload.
     //    (`bzImage` builds `vmlinux` as a prerequisite; both are listed so a
     //    kbuild change that stops re-emitting the raw ELF still lands it.)
     steps.push(
@@ -1132,7 +1134,7 @@ pub fn recipe() -> Recipe {
             &format!("OBJCOPY={nbin}/objcopy"),
             &format!("OBJDUMP={nbin}/objdump"),
             &format!("STRIP={nbin}/strip"),
-            "KGZIP={in:busybox-x86-64}/bin/gzip",
+            "KGZIP={tools}/gzip",
             "vmlinux",
             "bzImage",
         ])
@@ -1142,7 +1144,7 @@ pub fn recipe() -> Recipe {
         .env("MAKELEVEL", ""),
     );
 
-    // ---- Bootable userland: a static-busybox initramfs (re #529) ----
+    // ---- Bootable userland: a static td-sh initramfs (re #529) ----
     // The kernel is now serial-console + initramfs capable (the config deltas
     // above add the 8250 console, BINFMT_ELF/SCRIPT, and BLK_DEV_INITRD). Pack a
     // tiny initramfs whose /init prints a marker on ttyS0, optionally mounts an
@@ -1155,27 +1157,22 @@ pub fn recipe() -> Recipe {
     // gen_init_cpio (usr/gen_init_cpio, a HOSTCC hostprog) packs the newc cpio
     // from a spec WITHOUT needing mknod privilege: the `nod /dev/console` entry
     // is written straight into the archive, which the unprivileged host-free
-    // sandbox could not create on a real filesystem. busybox is the td-built
-    // STATIC busybox (CONFIG_STATIC=y), so the initramfs is self-contained — no
-    // glibc closure, no host bytes.
+    // sandbox could not create on a real filesystem. td-sh, td-init and td-util
+    // are STATIC, so the initramfs is self-contained — no glibc closure, no host
+    // bytes.
 
     // The /init the kernel execs (rdinit=/init): a #! script (BINFMT_SCRIPT) that
     // prints the userland marker the boot check greps for, THEN — if a virtio-blk
     // erofs disk is attached (the `qemu-boot-erofs` tool, re #549) — mounts it
     // read-only and prints a second marker on success, then `reboot -f` so qemu
-    // (-no-reboot) exits cleanly. echo is a busybox-sh builtin, so the userland
-    // marker prints even if the reboot applet were unavailable (the boot check's
+    // (-no-reboot) exits cleanly. echo is a td-sh builtin, so the userland
+    // marker prints even if the reboot were unavailable (the boot check's
     // wall-clock ceiling then bounds the run).
     //
-    // Applet reachability: this initramfs packs only /bin/busybox + a /bin/sh
-    // symlink (no per-applet symlinks — the busybox recipe's own /bin symlink farm
-    // is NOT what gets packed here) and busybox is NOT built standalone-shell, so
-    // EVERY applet (`mkdir`/`mount`/`sleep`/`cat`/`test`/`reboot`) is reached as
-    // `/bin/busybox <applet>` explicitly, never bare (a bare `mount` would not
-    // resolve on PATH). Only `echo` is used bare — it is an ash SHELL BUILTIN, not
-    // an applet, so it needs no symlink. `test` is invoked via busybox (not the `[`
-    // builtin) so it does not depend on CONFIG_ASH_TEST being set in the busybox
-    // config.
+    // Applet reachability: this initramfs packs td-sh (as /bin/sh), td-init and
+    // td-util and no per-applet symlinks, so every applet is reached explicitly:
+    // `mount` and `reboot` as `/bin/td-init <applet>`, `mkdir`, `sleep` and `cat`
+    // as `/bin/td-util <applet>`. `echo` and `[` are td-sh builtins.
     //
     // Disk probe (gated on /dev/vda so a diskless boot is unaffected — the plain
     // `qemu-boot` check kills qemu on USERLAND_MARKER, printed first, before this
@@ -1193,28 +1190,30 @@ pub fn recipe() -> Recipe {
         content: format!(
             "#!/bin/sh\n\
              echo {USERLAND_MARKER}\n\
-             /bin/busybox mkdir -p /mnt\n\
-             /bin/busybox mount -t devtmpfs dev /dev\n\
+             /bin/td-util mkdir -p /mnt\n\
+             /bin/td-init mount -t devtmpfs dev /dev\n\
              n=0\n\
-             while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
-             if /bin/busybox test -b /dev/vda; then \
-             if /bin/busybox mount -t erofs -o ro /dev/vda /mnt; then \
-             if /bin/busybox test \"$(/bin/busybox cat /mnt/{EROFS_PROBE_SENTINEL})\" = {EROFS_PROBE_CONTENT}; then echo {EROFS_MARKER}; fi; \
+             while [ \"$n\" -lt 5 ] && ! [ -b /dev/vda ]; do /bin/td-util sleep 1; n=$((n+1)); done\n\
+             if [ -b /dev/vda ]; then \
+             if /bin/td-init mount -t erofs -o ro /dev/vda /mnt; then \
+             if [ \"$(/bin/td-util cat /mnt/{EROFS_PROBE_SENTINEL})\" = {EROFS_PROBE_CONTENT} ]; then echo {EROFS_MARKER}; fi; \
              fi; \
              fi\n\
-             exec /bin/busybox reboot -f\n"
+             exec /bin/td-init reboot -f\n"
         ),
         exec: true,
     });
-    // gen_init_cpio spec: /dev/console for init's stdio, the static busybox, a
-    // /bin/sh -> busybox multi-call symlink for the #! interpreter, and /init.
+    // gen_init_cpio spec: /dev/console for init's stdio, static td-sh with a
+    // /bin/sh -> td-sh symlink for the #! interpreter, td-init, td-util, and /init.
     steps.push(Step::WriteFile {
         path: "{root}/initramfs/spec".into(),
         content: "dir /dev 0755 0 0\n\
                   nod /dev/console 0600 0 0 c 5 1\n\
                   dir /bin 0755 0 0\n\
-                  file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n\
-                  slink /bin/sh /bin/busybox 0777 0 0\n\
+                  file /bin/td-sh {in:td-sh}/bin/td-sh 0755 0 0\n\
+                  slink /bin/sh /bin/td-sh 0777 0 0\n\
+                  file /bin/td-init {in:td-init}/bin/td-init 0755 0 0\n\
+                  file /bin/td-util {in:td-util}/bin/td-util 0755 0 0\n\
                   file /init {root}/initramfs/init 0755 0 0\n"
             .into(),
         exec: false,
@@ -1241,7 +1240,7 @@ pub fn recipe() -> Recipe {
     );
 
     // Land the uncompressed ELF + its symbol map + the bootable bzImage + the
-    // external busybox initramfs.
+    // external initramfs.
     steps.push(Step::MkDir {
         path: "{out}".into(),
     });
@@ -1320,14 +1319,15 @@ pub fn recipe() -> Recipe {
     // [initramfs] the packed userland must be a real, COMPLETE newc cpio carrying
     // the whole bootable userland — not merely a well-formed header. The shared
     // `initramfs_cpio_shape_check` helper (recipes/src/ladder.rs) parses the archive
-    // with busybox `cpio -t` — a real newc walk that reds on a truncated/corrupt
-    // stream and yields the exact member names — then asserts init/bin/busybox/
-    // bin/sh/dev/console are all present and the `TD-USERLAND-OK` /init marker is
+    // with td-util `cpio -t` — a real newc walk that reds on a truncated/corrupt
+    // stream and yields the exact member names — then asserts init, bin/td-sh,
+    // bin/sh, bin/td-init, bin/td-util and dev/console are all present and the
+    // `TD-USERLAND-OK` /init marker is
     // packed. The producer rung and the fast `linux-x86-64-test` tier run the SAME
     // check so they cannot drift. The sibling qemu boot tool is the behavioural proof
     // (it boots this cpio); this is the fast producer-rung shape check.
     let initramfs_check =
-        initramfs_cpio_shape_check("{out}/initramfs.cpio", "{in:busybox-x86-64}/bin/busybox");
+        initramfs_cpio_shape_check("{out}/initramfs.cpio", "{in:td-util}/bin/td-util");
     steps.push(Step::run("{out}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
 
     Recipe::mesboot("linux-x86-64", "7.1.4")
@@ -1337,7 +1337,11 @@ pub fn recipe() -> Recipe {
             "binutils-x86-64-native",
             "glibc-x86-64",
             "make-x86-64",
-            "busybox-x86-64",
+            "bc-x86-64-self",
+            "td-sh",
+            "td-init",
+            "td-util",
+            "uutils",
             "flex-x86-64",
             "bison-mesboot",
             "m4-mesboot",

@@ -17,9 +17,10 @@
 //!
 //! Trust model — host qemu is a control-plane TEST tool, not a target input.
 //! Every byte of the ARTIFACT under test is td-built and host-free: the bzImage
-//! is compiled by td's native GCC/binutils/glibc ladder, and the initramfs is a
-//! statically-linked td-built busybox plus a shell /init. `qemu-system-x86_64`
-//! only supplies the virtual machine that RUNS that artifact — exactly as the
+//! is compiled by td's native GCC/binutils/glibc ladder, and the initramfs is
+//! td's statically-linked td-sh, td-init and td-util plus a shell /init.
+//! `qemu-system-x86_64` only supplies the virtual machine that RUNS that
+//! artifact — exactly as the
 //! host Rust toolchain is a control-plane SEED that compiles td's control-plane
 //! programs yet never enters a target closure. qemu is never on a recipe's PATH
 //! or argv and contributes nothing to any /td/store output. Adding host qemu as a
@@ -65,8 +66,8 @@ use crate::check_runner::{is_executable, RecipeCheckRunner};
 
 use td_recipe::td_boot_protocol;
 
-/// The busybox /init prints this exact line on ttyS0 once the kernel has reached
-/// userspace and executed the static busybox userland. Sourced from the SHARED
+/// The initramfs /init prints this exact line on ttyS0 once the kernel has reached
+/// userspace and executed its static td-sh. Sourced from the SHARED
 /// `ladder::USERLAND_MARKER` const so the /init script (linux-x86-64.rs), the cpio
 /// shape check (ladder.rs), and this boot oracle can never disagree on the string.
 const MARKER: &str = td_recipe::ladder::USERLAND_MARKER;
@@ -693,7 +694,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     let (bzimage, initramfs) = build_kernel(runner)?;
 
     println!(
-        "   [qemu-boot] {qemu} boots the td-source-built bzImage with the busybox initramfs\n              kernel:    {}\n              initramfs: {}",
+        "   [qemu-boot] {qemu} boots the td-source-built bzImage with the td-sh initramfs\n              kernel:    {}\n              initramfs: {}",
         bzimage.display(),
         initramfs.display()
     );
@@ -727,7 +728,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     if !result.evidence.target {
         return Err(format!(
             "kernel did not reach the userland marker {MARKER:?} on ttyS0 — {} \
-             (no console output, a kernel panic before userspace, or the busybox /init did not run). \
+             (no console output, a kernel panic before userspace, or the initramfs /init did not run). \
              Last serial output:\n{}",
             result.reason,
             tail(&result.console, 60)
@@ -735,7 +736,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     println!(
         "PASS: linux-x86-64 boots under qemu — the td-source-built kernel reaches userspace and \
-         runs the static busybox userland ({MARKER} on ttyS0)"
+         runs the static td-sh userland ({MARKER} on ttyS0)"
     );
     Ok(())
 }
@@ -2779,7 +2780,7 @@ fn require_selected_deployment(
 fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<(), String> {
     if !result.evidence.shutdown {
         return Err(format!(
-            "the {context} reached its userspace markers but BusyBox init did not complete \
+            "the {context} reached its userspace markers but td-init did not complete \
              the persistent shutdown action ({SYSTEM_SHUTDOWN_MARKER:?} absent) — @var was \
              not synced and unmounted before reboot. Last serial output:\n{}",
             tail(&result.console, 80)
@@ -5080,7 +5081,7 @@ fn boot_source(
     // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
     // -no-user-config: ignore the host's qemu config files for a hermetic run.
-    // -no-reboot: BusyBox init ultimately issues reboot(2); qemu exits on the guest
+    // -no-reboot: the guest's init ultimately issues reboot(2); qemu exits on the guest
     //   reset instead of looping, so a healthy boot terminates on its own.
     // console=ttyS0: kernel printk + the /init echo land on the 8250 UART.
     // panic=-1: on a kernel panic, reboot immediately (=> qemu exits) rather than

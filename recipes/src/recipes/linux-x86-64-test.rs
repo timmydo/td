@@ -14,8 +14,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      linux_banner[], always obj-y) — proof the kernel actually compiled and
 //      linked, not just that some ELF exists,
 //   3. vmlinux embeds no `/gnu/store` bytes — the no-guix host-free leg, mirroring
-//      busybox-test (td's native toolchain is /td/store; a /gnu/store byte would
-//      mean a host-guix compiler/lib leaked into the image),
+//      the other native-toolchain tests (td's native toolchain is /td/store; a
+//      /gnu/store byte would mean a host-guix compiler/lib leaked into the image),
 //   4. bzImage is well-formed: a size floor (>= 64 KiB) rejects a header-only or
 //      truncated image; the 0xAA55 boot signature at 0x1fe and the "HdrS" magic at
 //      0x202 (arch/x86/boot/header.S, read with od's offset seek since mesboot0
@@ -28,11 +28,12 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //   6. initramfs.cpio is a real, COMPLETE newc cpio carrying the whole bootable
 //      userland — via the shared `initramfs_cpio_shape_check` helper (ladder.rs)
 //      that the producer rung runs too, so the two cannot drift. It parses the
-//      archive with busybox `cpio -t` (a real newc walk that reds on a truncated/
-//      corrupt stream) and asserts init/bin/busybox/bin/sh/dev/console are all
-//      present plus the `TD-USERLAND-OK` /init marker. The behavioural proof that it
-//      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool
-//      (host qemu), which cannot run in this host-free BuildOnly rung.
+//      archive with td-util `cpio -t` (a real newc walk that reds on a truncated/
+//      corrupt stream) and asserts init, bin/td-sh, bin/sh, bin/td-init,
+//      bin/td-util and dev/console are all present plus the `TD-USERLAND-OK`
+//      /init marker. The behavioural proof that it actually boots is the
+//      host-side `td-recipe-eval qemu-boot linux-x86-64` tool (host qemu), which
+//      cannot run in this host-free BuildOnly rung.
 //   7. The linked vmlinux contains dm-crypt, generic/accelerated AES-XTS,
 //      HMAC, SHA-256 and the AF_ALG hash/skcipher entry
 //      points. Checking the ELF rejects a kernel built without them even if
@@ -110,7 +111,7 @@ pub fn recipe() -> Recipe {
     steps.push(Step::AssertEfiApplication {
         path: bzimage.into(),
     });
-    let initramfs_check = initramfs_cpio_shape_check(initramfs, "{in:busybox-x86-64}/bin/busybox");
+    let initramfs_check = initramfs_cpio_shape_check(initramfs, "{in:td-util}/bin/td-util");
     steps.push(Step::run("{root}", &[SH, "-c", &initramfs_check]).env("PATH", &mesboot0_path()));
 
     steps.push(
@@ -135,7 +136,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static busybox userland\n".into(),
+        content: "PASS: Linux 7.1.4, source-built by the native /td/store x86_64 toolchain — vmlinux is a well-formed ELF64 x86-64 image carrying the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, bzImage carries the x86 boot-setup header (0xAA55 + HdrS) and x86-64 PE headers, and initramfs.cpio is a newc cpio carrying the static td-sh, td-init and td-util userland\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -144,12 +145,12 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("linux-x86-64-test", "1.0")
-        .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "busybox-x86-64"])
+        .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "td-util"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + busybox initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static busybox userland"
+echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + td-sh initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner and built-in dm-crypt with generic/accelerated AES-XTS and the AF_ALG hash/skcipher interfaces, a bzImage carrying x86 boot-setup and EFI application headers, and a newc initramfs.cpio carrying the static td-sh, td-init and td-util userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,
