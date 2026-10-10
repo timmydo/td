@@ -3,7 +3,8 @@
 //! and unsealing it, the PCR 12 release cap, the recovery key and the td
 //! LUKS2 tokens with their bounded header reader, the cryptsetup runner,
 //! the transition planner and the selector's release orchestration
-//! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default").
+//! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
+//! protected tier's PIN primitives, which nothing in production calls yet.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -23,6 +24,7 @@ use td_tpm::{Client, PcrPolicy, PcrReadError, PcrSelection, Refusal, SealedObjec
 
 pub mod cryptsetup;
 pub mod luks2;
+pub mod pin;
 pub mod recovery;
 pub mod release;
 pub mod token;
@@ -496,7 +498,7 @@ mod tests {
         pub(crate) skew_extend: bool,
         pub(crate) refuse_extend: bool,
         /// Run the command but lose its reply: these exchanges, from one.
-        lose: Vec<usize>,
+        pub(crate) lose: Vec<usize>,
         /// A cleared TPM: its new storage primary seed loads no object
         /// sealed before.
         pub(crate) cleared: bool,

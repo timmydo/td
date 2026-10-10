@@ -555,33 +555,87 @@ its owner seeing it. And a header td refuses is still capped, with
 nothing tried: the cap closes release on an encrypted volume whatever
 its header holds.
 
+## PIN and tpm-pin policy
+
+ENCRYPTION.md increment 8a's first td-protector commit: library code
+that nothing in production calls until 8c, in the `pin` module, over
+td-tpm's existing commands.
+
+**PIN.** `pin::Pin` holds 6 to 63 bytes, each 0x20 to 0x7e, as typed;
+`parse` refuses any other entry, naming the byte offset or the length
+and never a byte, and is the only constructor. It judges the length
+first, then each byte, and names a refused byte by its one-based
+offset, as the recovery-key entry does; it copies the entry into one
+allocation of exactly its length, and the caller zeroes its own. It is
+zeroed on drop and neither `Debug`, `Display` nor `Clone`.
+`auth_value(salt)` is HMAC-SHA256 keyed with the 32-byte salt over
+`td/disk-protector/pin/v1`, a zero byte and the PIN, returned whole in
+`AuthValue`, a zeroing owner that is neither `Debug`, `Display` nor
+`Clone`. Removing an authValue's trailing zero bytes where TPM 2.0 does
+is td-tpm's (td-tpm/DESIGN.md, "HMAC policy sessions"), not the
+derivation's. The HMAC is td-fido's `hmac_sha256`, its `hmac.rs`
+compiled by path beside a mount of the engine's SHA-256, as td-secret's
+store crypto compiles it (td-fido/DESIGN.md, "Shared HMAC-SHA256"),
+rather than a dependency on the td-fido crate, so the td-boot and
+td-install recipes, which stage td-protector file by file, stage that
+one file and build no td-fido rlib. It streams the parts, so the PIN is
+copied into no hash input buffer.
+
+**tpm-pin policy.** `PinPolicy` is PolicyPCR over the SHA-256 bank
+selecting PCRs 4, 9 and 12 (and 7 when the seal names it), with the
+composite of the expected PCR 4, PCR 9 (and PCR 7) and a literal-zero
+PCR 12, then PolicyAuthValue (`POLICY_AUTH_VALUE`, 0x16b), then
+PolicyCommandCode(Unseal), each extended from the zero digest as TPM
+2.0 Part 3 specifies; `PinPcrs` names the token's two selections,
+`4,9` and `4,7,9`. td-protector computes the digest itself: td-tpm's
+`policy_digest` has no PolicyAuthValue step. When td-tpm's session
+commit, which runs PolicyAuthValue in a session, lands, td-protector's
+`POLICY_AUTH_VALUE` and digest builder give way to td-tpm's, and these
+literal tests stay as the cross-check. The sealed object has
+`PROTECTED_ATTRIBUTES` (0x92): fixedTPM, fixedParent and
+adminWithPolicy, with userWithAuth and noDA clear, and the authValue
+`auth_value` gives. Whether a new seal names PCR 7 is td-boot's reading
+of the measured boot (ENCRYPTION.md, "Firmware authentication"), never a
+header field. `PinPolicy::new` and `release_pin_policy` admit an
+unmeasured, all-zero PCR 4, 7 or 9, as release must; 8c's seal therefore
+owes a tpm-pin counterpart of `observe` that refuses an unmeasured PCR
+before it seals, as the device-bound seal does.
+
+**Chain check.** `chain_check` takes its own client, the token's
+`PinPcrs`, the storage primary's 34-byte Name the token recorded and
+the sealed pair. It refuses a public area other than a SHA-256
+keyed-hash object with `PROTECTED_ATTRIBUTES`, a 32-byte authPolicy, no
+scheme and a 32-byte unique digest before any command
+(`NotProtected`); reads the token's PCRs in one PCR_Read, measured or
+not, PCR 12 entering as the literal zero and never read (`NoSha256Bank`
+typed as td-tpm types it); creates the storage primary
+(`PrimaryRefused` when the TPM refuses CreatePrimary, such as an owner
+authorization another system set, 0x9a2); refuses another Name, after
+flushing the primary, without loading (`OtherPrimary`); loads the object
+under that primary with td-tpm's `load`, sending no authorization
+(`LoadRefused` when the TPM refuses the Load, such as TPM_RC_INTEGRITY
+for a private area that does not verify); flushes the object and the
+primary; and only then compares the digest over the PCRs as they read
+now with the sealed authPolicy (`ChangedChain`). Each refusal keeps its
+command and response code, read from td-tpm's `last_refusal` straight
+after the refused command; a transport error, a malformed reply and a
+failed flush, also one after a Load that succeeded, are `Other` and
+never read as a refusal. The Load runs whatever the digest, so that
+ENCRYPTION.md's warning can tell a changed chain the TPM still loads
+from a cleared, replaced or intercepted TPM; which of `PrimaryRefused`,
+`LoadRefused` and `Other` leads to which line is 8c's. `Ok` answers
+that the PIN may be asked.
+
 ## Protected roles (planned)
 
-Nothing in this section is current. ENCRYPTION.md increment 8 adds the
+ENCRYPTION.md increment 8 adds the
 protected tier's roles here ("Protected tier" there owns the flows and
 the shapes; this section owns the formats, policies and plan rules),
 each landing in the sub-increment ENCRYPTION.md names.
 
-**PIN.** `pin::Pin` holds 6 to 63 bytes, each 0x20 to 0x7e, as typed;
-`parse` refuses any other entry, naming the byte offset or the length
-and never a byte, and is the only constructor. It is zeroed on drop and
-neither `Debug`, `Display` nor `Clone`. `auth_value(salt)` is
-HMAC-SHA256 keyed with the 32-byte salt over `td/disk-protector/pin/v1`,
-a zero byte and the PIN, returned in a zeroing owner.
-
-**tpm-pin policy.** PolicyPCR over the SHA-256 bank selecting PCRs 4, 9
-and 12 (and 7 when the seal names it), with the composite of the
-expected PCR 4, PCR 9 (and PCR 7) and a literal-zero PCR 12, then
-PolicyAuthValue, then PolicyCommandCode(Unseal). The sealed object has
-`PROTECTED_ATTRIBUTES`: fixedTPM, fixedParent and adminWithPolicy, with
-userWithAuth and noDA clear, and the authValue `auth_value` gives. A
-literal test pins the digest for fixed PCR values. Whether a new seal
-names PCR 7 is td-boot's reading of the measured boot (ENCRYPTION.md,
-"Firmware authentication"), never a header field. `chain_check`
-computes the release-time digest from a PCR_Read, compares it with the
-sealed public area's authPolicy, requires the storage primary's Name to
-equal the token's, and loads the object with `load_and_flush`, sending
-no authorization; it answers whether the PIN may be asked.
+The PIN codec, the authValue and the tpm-pin policy with its chain
+check are current ("PIN and tpm-pin policy"); the rest of this section
+is not.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -702,10 +756,11 @@ sealed areas are at most 256 and 512 bytes, and a header carries at most
 four td tokens, orphans included, among 32. A plan has at most 39
 steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
-A release tries at most four tokens, seals at most one protector, caps
-once, and runs at most one plan per released token, each of whose
-fall-backs follows a failed first step. A reseal seals one protector
-and runs at most one plan.
+A PIN is at most 63 bytes, and a chain check sends one PCR_Read, one
+CreatePrimary, one Load and two flushes. A release tries at most four
+tokens, seals at most one protector, caps once, and runs at most one
+plan per released token, each of whose fall-backs follows a failed
+first step. A reseal seals one protector and runs at most one plan.
 
 ## Evidence
 
@@ -830,5 +885,39 @@ refused at Unseal, and a fresh TPM state's Load refusal (0x1df):
 ```
 TD_TEST_SWTPM=/absolute/path/to/swtpm cargo test --frozen --manifest-path td-protector/Cargo.toml emulator_ -- --ignored
 ```
+
+PIN tests pin the codec's bounds (0, 5, 6, 63 and 64 bytes, the length
+judged before the bytes, every byte value at one offset, 0x1f and 0x7f
+refused, a space admitted at either end and inside, a multi-byte
+character refused at its first byte) and its refusals' text, which
+names no byte; the authValue for three PINs (6 bytes, one with a space,
+and the 63 printable bytes from 0x20) and a second salt; and the
+tpm-pin policy's selection, composite and digest for PCRs 4, 9 and 12
+and for PCRs 4, 7, 9 and 12 at fixed values, as literals that
+`tests/pin_vectors.py`, a stdlib-only host tool and no build input,
+computes independently (Python's `hmac`, and the policy formulas from
+TPM 2.0 Part 3). Through the scripted TPM the chain check passes for
+both selections, also after the cap, with its exact command stream; is
+`ChangedChain` for each changed PCR the token names, for a 4,7,9 check
+of a 4,9 object, and not for a changed PCR 7 a 4,9 token does not name;
+`OtherPrimary` with no Load; `LoadRefused` with Load's 0x1df for a
+cleared TPM and a private area that does not verify; `PrimaryRefused`
+for CreatePrimary refused with 0x9a2 and 0x185, with no Load;
+`Other` for a flush refused after a successful Load and for a lost
+reply to CreatePrimary or the Load; `NoSha256Bank` after the read
+alone; and `NotProtected` with no command for noDA or userWithAuth set,
+the device-bound attributes, adminWithPolicy clear, another type, name
+algorithm or scheme, a short authPolicy, a trailing byte and a truncated
+area. The ignored emulator test has the pinned swtpm compute both
+policy digests in trial sessions, equal to the literals; with PCRs 4, 7
+and 9 extended and PCR 12 still at reset, a real policy session's
+PolicyPCR with an empty pcrDigest, where the TPM takes the composite of
+its own PCRs, then PolicyAuthValue and PolicyCommandCode, gives
+`release_pin_policy`'s digest for both selections, which ties the
+literal-zero PCR 12 to the TPM's own reading. It then runs the chain
+check over an object the test creates with `PROTECTED_ATTRIBUTES` and
+an authValue: it passes, a 4,7,9 check and a changed PCR 4 are
+`ChangedChain`, a corrupted private area is a Load `LoadRefused`, and a
+fresh TPM state is `OtherPrimary`.
 
 A normal cargo pass with it ignored is not TPM integration evidence.

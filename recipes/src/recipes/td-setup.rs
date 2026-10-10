@@ -6,7 +6,8 @@ use crate::types::Recipe;
 /// toolkit's font, notices and Wayland codec reach the compositor tree by
 /// relative source paths. The protector's own dependencies, the TPM client
 /// and td-json, are in its lock, and the TPM client includes the engine's
-/// SHA-256 by relative path, so those trees are staged too.
+/// SHA-256 by relative path, as the protector does with td-fido's
+/// HMAC-SHA256, so those trees are staged too.
 /// The system image carries it, and a live boot's session starts it
 /// (td-install/INSTALLER.md "Live startup").
 pub fn recipe() -> Recipe {
@@ -18,6 +19,7 @@ pub fn recipe() -> Recipe {
             "td-compositor",
             "td-protector",
             "td-tpm",
+            "td-fido",
             "td-json",
             "engine",
             "td-test-compositor",
@@ -52,6 +54,7 @@ mod tests {
                 "td-compositor".into(),
                 "td-protector".into(),
                 "td-tpm".into(),
+                "td-fido".into(),
                 "td-json".into(),
                 "engine".into(),
                 "td-test-compositor".into(),

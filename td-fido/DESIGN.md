@@ -64,8 +64,9 @@ directly; any other dependent is an amendment here and to
 refuses the rest. Crates that reach it through td-secret, as td-pass
 does, are not dependents.
 
-Three crates compile some of its files as shared source instead, as
-they compiled td-secret's: td-firstboot and td-portal read td-secret's
+Four crates compile some of its files as shared source instead:
+td-protector compiles `hmac.rs` for its PIN's authValue (below); as
+they compiled td-secret's, td-firstboot and td-portal read td-secret's
 token-protected store through `fido_cbor`, `fido_ctap`, `fido_enroll`,
 `fido_hid`, and `hmac.rs` and `root.rs` through td-secret's store
 crypto and store (below), and td-crypto's tests compile `fido_p256.rs`
@@ -76,7 +77,9 @@ provide.
 The td-secret recipe builds td-fido's rlib twice, with the shipped
 profile and for the test harness, links td-secret against them, and
 runs td-fido's own tests; the td-firstboot, td-portal and td-pass
-recipes stage its tree or the files they compile.
+recipes stage its tree or the files they compile, as the td-setup
+recipe stages its tree and the td-boot and td-install recipes
+`hmac.rs` for td-protector.
 
 ## Shared HMAC-SHA256
 
@@ -86,8 +89,9 @@ recipes stage its tree or the files they compile.
 compiles it by path beside that mount instead of keeping a second copy.
 td-fido's `crypto.rs` re-exports `hmac_sha256` as `td_fido::hmac_sha256`
 and its digest, HMAC and HKDF to the CTAP code. td-secret's store crypto
-compiles it the same way, and td-firstboot and td-portal reach it through
-td-secret's `crypto.rs`. Its tests pin RFC 4231 cases 1 to 4, 6 and 7
+compiles it the same way, as does td-protector's `pin` module beside
+its own mount of the engine's SHA-256, and td-firstboot and td-portal
+reach it through td-secret's `crypto.rs`. Its tests pin RFC 4231 cases 1 to 4, 6 and 7
 (each whole and split at every offset), keys of 64 and 65 bytes on either
 side of the block size, RFC 5869 case 1 and FIPS 180's "abc".
 

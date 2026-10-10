@@ -314,6 +314,14 @@ impl<T: Transport> Client<T> {
         self.handles.len()
     }
 
+    /// The TPM's refusal of the last command this client sent, if the TPM
+    /// refused it; `None` after a command the TPM answered, a transport
+    /// error or a malformed reply. Read it straight after the failed call:
+    /// every command, a flush included, resets it.
+    pub fn last_refusal(&self) -> Option<Refusal> {
+        self.refused
+    }
+
     /// One command; `auth` adds a single empty-password or policy session.
     /// A returned handle is owned until `flush`, Unseal or drop.
     pub fn call(
@@ -737,8 +745,10 @@ impl<T: Transport> Client<T> {
         loaded.and(flushed)
     }
 
-    /// TPM2_Load under `parent`, checking the returned Name.
-    fn load(&mut self, parent: u32, public: &[u8], private: &[u8]) -> Result<u32, String> {
+    /// TPM2_Load under `parent`, checking the returned Name. The loaded
+    /// handle is owned until `flush` or drop; a refused Load leaves
+    /// `last_refusal` naming it.
+    pub fn load(&mut self, parent: u32, public: &[u8], private: &[u8]) -> Result<u32, String> {
         let mut parameters = Vec::new();
         put_blob(&mut parameters, private)?;
         put_blob(&mut parameters, public)?;
@@ -1839,6 +1849,64 @@ mod tests {
         );
         assert_eq!(client.owned_handles(), 0);
         assert_eq!(tpm.codes(), [CREATE_PRIMARY, LOAD, FLUSH_CONTEXT]);
+    }
+
+    /// `load` and `last_refusal` let a caller tell which command failed:
+    /// a refused Load names itself until the next command, a flush
+    /// included, and a command the TPM answered names nothing.
+    #[test]
+    fn load_owns_its_handle_and_a_refusal_is_kept_until_the_next_command() {
+        let tpm = Scripted::new();
+        let policy = PcrPolicy {
+            selection: PcrSelection::new(1 << 12).unwrap(),
+            pcr_digest: pcr_digest(&[[0; 32]]),
+        };
+        let mut payload = [0x21; 32];
+        let sealed = tpm
+            .client()
+            .seal_object(&policy, None, &mut payload)
+            .unwrap();
+        let mut client = tpm.client();
+        assert_eq!(client.last_refusal(), None);
+        let (parent, _) = client.storage_primary(None).unwrap();
+        let object = client
+            .load(parent, &sealed.public, &sealed.private)
+            .unwrap();
+        assert_eq!(client.last_refusal(), None);
+        assert_eq!(client.owned_handles(), 2);
+        client.flush(object).unwrap();
+        let mut private = sealed.private.clone();
+        private[2] ^= 1;
+        client.load(parent, &sealed.public, &private).unwrap_err();
+        assert_eq!(
+            client.last_refusal(),
+            Some(Refusal {
+                command: LOAD,
+                rc: 0x1df
+            })
+        );
+        assert_eq!(client.owned_handles(), 1);
+        client.flush(parent).unwrap();
+        assert_eq!(client.last_refusal(), None);
+        assert_eq!(client.owned_handles(), 0);
+        // A transport error is no refusal.
+        struct Lost;
+        impl Transport for Lost {
+            fn exchange(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
+                Err("lost reply".into())
+            }
+        }
+        let (mut refusing, _) = Fixed::client(response(NO_SESSIONS, 0x1df, &[]));
+        refusing
+            .load(0x8000_0000, &sealed.public, &sealed.private)
+            .unwrap_err();
+        assert_eq!(refusing.last_refusal().map(|r| r.rc), Some(0x1df));
+        let mut lost = Client::new(Lost);
+        assert_eq!(
+            lost.load(0x8000_0000, &sealed.public, &sealed.private),
+            Err("lost reply".into())
+        );
+        assert_eq!(lost.last_refusal(), None);
     }
 
     #[test]

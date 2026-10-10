@@ -73,7 +73,14 @@ The crate owns the protocol and nothing a consumer persists or decides:
   `load_and_flush` loads a public and private pair under that primary,
   checks the Name and flushes the object and the primary, so the TPM
   verifies the private area without an unseal; the public area's format
-  is the caller's to check.
+  is the caller's to check. `load` is its Load alone, under a parent
+  the caller created, the handle owned until `flush` or drop, for a
+  caller that must tell which command failed: td-protector's chain
+  check (td-protector/DESIGN.md "PIN and tpm-pin policy").
+  `last_refusal` is the `Refusal` of the last command the client sent
+  if the TPM refused it, and `None` after a command it answered, a
+  transport error or a malformed reply; every command, a flush included,
+  resets it, so a caller reads it straight after the failed call.
 - **PCR read and extend.** `read_pcrs` returns the selected values in
   ascending order after checking the bank, bitmap and count; it does not
   judge the values. `read_pcr` reads one. `read_pcrs_typed` and
@@ -175,7 +182,9 @@ caller rather than read), an Unseal refused for a mismatched session
 policy, `unseal_object`'s refusal carried for PolicyPCR, Unseal and
 Load, none for a public area outside the format (refused before any
 I/O) or a transport error, `load_and_flush` leaving no handle and
-refusing a private area the TPM will not load, and extend then read. td-secret's tests pin
+refusing a private area the TPM will not load, `load` owning its handle
+and `last_refusal` naming a refused Load until the next command and
+nothing after a transport error, and extend then read. td-secret's tests pin
 the complete seal and unseal command stream against a scripted TPM and
 its persisted envelope bytes, and its pinned-emulator and QEMU guest
 oracles exercise this client against a TPM.

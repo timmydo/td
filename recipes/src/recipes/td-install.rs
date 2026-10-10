@@ -40,6 +40,10 @@ const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_arr
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
+const PROTECTOR_PIN_RS: &str = include_str!("../../../td-protector/src/pin.rs");
+// td-protector's PIN derivation compiles td-fido's shared HMAC-SHA256 by
+// `#[path]` beside the engine SHA-256 staged above.
+const FIDO_HMAC_RS: &str = include_str!("../../../td-fido/src/hmac.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
@@ -88,6 +92,9 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{src}/td-protector/src".into(),
         },
+        Step::MkDir {
+            path: "{src}/td-fido/src".into(),
+        },
         Step::WriteFile {
             path: "{src}/td-tpm/src/lib.rs".into(),
             content: TPM_RS.into(),
@@ -126,6 +133,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/luks2.rs".into(),
             content: PROTECTOR_LUKS2_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/pin.rs".into(),
+            content: PROTECTOR_PIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-fido/src/hmac.rs".into(),
+            content: FIDO_HMAC_RS.into(),
             exec: false,
         },
         Step::WriteFile {
