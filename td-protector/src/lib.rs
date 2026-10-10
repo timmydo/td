@@ -4,7 +4,8 @@
 //! LUKS2 tokens with their bounded header reader, the cryptsetup runner,
 //! the transition planner and the selector's release orchestration
 //! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
-//! protected tier's PIN primitives, which nothing in production calls yet.
+//! protected tier's PIN primitives, token codecs and lockout token
+//! encryption, which nothing in production calls yet.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -23,12 +24,34 @@ use std::path::Path;
 use td_tpm::{Client, PcrPolicy, PcrReadError, PcrSelection, Refusal, SealedObject, Transport};
 
 pub mod cryptsetup;
+pub mod lockout;
 pub mod luks2;
 pub mod pin;
+pub mod protected;
 pub mod recovery;
 pub mod release;
 pub mod token;
 pub mod transition;
+
+/// The engine's SHA-256, which td-fido's `hmac.rs` names as
+/// `super::sha256`.
+#[path = "../../engine/src/sha256.rs"]
+#[allow(
+    dead_code,
+    reason = "the shared hash also supports build artifact files"
+)]
+mod sha256;
+
+/// td-fido's HMAC-SHA256 and HKDF, compiled by path as td-secret's store
+/// crypto compiles them (td-fido/DESIGN.md, "Shared HMAC-SHA256"). They
+/// stream their parts, so a PIN or volume key is copied into no hash input
+/// buffer.
+#[path = "../../td-fido/src/hmac.rs"]
+#[allow(
+    dead_code,
+    reason = "the PIN derivation calls `hmac_sha256` and the lockout token `hkdf_expand` alone"
+)]
+mod hmac;
 
 /// The firmware's measurement of the selector EFI image.
 pub const SELECTOR_IMAGE_PCR: u8 = 4;
@@ -1299,7 +1322,9 @@ mod tests {
                 .spawn()
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
-            while !socket.exists() {
+            // The socket path appears at bind(), before swtpm listens: wait
+            // for a connection it accepts, not for the path.
+            while std::os::unix::net::UnixStream::connect(socket).is_err() {
                 assert!(child.try_wait().unwrap().is_none(), "swtpm exited");
                 assert!(Instant::now() < deadline, "swtpm startup timeout");
                 std::thread::sleep(Duration::from_millis(10));

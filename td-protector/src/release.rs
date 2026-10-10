@@ -831,6 +831,7 @@ mod tests {
                 tokens,
                 orphans,
                 foreign: Vec::new(),
+                protected: Vec::new(),
             }
         }
 

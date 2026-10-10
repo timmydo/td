@@ -115,23 +115,7 @@ impl AuthValue {
     }
 }
 
-/// The engine's SHA-256, which td-fido's `hmac.rs` names as
-/// `super::sha256`.
-#[path = "../../engine/src/sha256.rs"]
-#[allow(
-    dead_code,
-    reason = "the shared hash also supports build artifact files"
-)]
-mod sha256;
-
-/// td-fido's HMAC-SHA256, compiled by path as td-secret's store crypto
-/// compiles it (td-fido/DESIGN.md, "Shared HMAC-SHA256"). It streams the
-/// parts, so the PIN is never copied into a hash input buffer.
-#[path = "../../td-fido/src/hmac.rs"]
-#[allow(dead_code, reason = "the PIN derivation calls `hmac_sha256` alone")]
-mod hmac;
-
-use hmac::hmac_sha256;
+use crate::hmac::hmac_sha256;
 
 /// Which PCRs a tpm-pin policy names besides the literal-zero PCR 12: the
 /// token's `pcrs`, `4,9` or `4,7,9`.
@@ -157,6 +141,23 @@ impl PinPcrs {
         self.pcrs()
             .split_last()
             .map_or(&[][..], |(_, measured)| measured)
+    }
+
+    /// The tpm-pin token's `pcrs` text.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Selector => "4,9",
+            Self::SecureBoot => "4,7,9",
+        }
+    }
+
+    /// The selection a tpm-pin token's `pcrs` text names, exactly.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "4,9" => Some(Self::Selector),
+            "4,7,9" => Some(Self::SecureBoot),
+            _ => None,
+        }
     }
 }
 
@@ -834,6 +835,17 @@ mod tests {
             let policy = release_pin_policy(&mut tpm.client(), PinPcrs::Selector).unwrap();
             let auth = parsed(b"123456").auth_value(&[0x11; 32]);
             let sealed = create(&mut tpm.client(), &policy, &auth);
+            // The object fits a tpm-pin token's bounds (protected.rs).
+            assert_eq!((sealed.public.len(), sealed.private.len()), (78, 158));
+            let token = crate::protected::Token::TpmPin(crate::protected::TpmPin {
+                keyslot: Some(1),
+                pcrs: PinPcrs::Selector,
+                primary: name,
+                salt: [0x11; 32],
+                sealed: sealed.clone(),
+            });
+            let text = token.encode().unwrap();
+            assert_eq!(crate::protected::Token::decode(text.as_bytes()), Ok(token));
             assert_eq!(protected_auth_policy(&sealed.public), Ok(policy.digest()));
             chain_check(tpm.client(), PinPcrs::Selector, &name, &sealed).unwrap();
             assert_eq!(

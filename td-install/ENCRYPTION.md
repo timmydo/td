@@ -1779,8 +1779,10 @@ while the header is in state U0.
      (`token import --token-replace`), testing each; in the TPM shape
      add the tpm-pin keyslot, import its token and test it, then take
      the lockout ("Lockout"). When the TPM has become unusable for td
-     since phase 1 (absent, without a SHA-256 bank, or with a lockout
-     authorization td cannot prove), the console says so and U4 ends
+     since phase 1 (absent, without a SHA-256 bank, with a lockout
+     authorization td cannot prove, or creating a tpm-pin object over
+     the token's bounds, refused at its seal before the cap), the
+     console says so and U4 ends
      without a tpm-pin or lockout token: the volume completes as a
      TPM-primary volume with no tpm-pin protector, as after a TPM clear,
      whose boots ask for a token or the recovery key and offer the
@@ -1814,12 +1816,28 @@ hold the largest state the upgrade or a protected volume reaches: four
 fido2 tokens at the 255-byte credential bound, the `td-upgrade` token,
 the marker, two tpm-pin tokens, the lockout, Secure Boot, config and
 update-retry tokens, a request, their keyslots, and in U2 cryptsetup's
-reencryption keyslot, segments and second digest. It is estimated at
-about 9.5 KiB. 8a's codec tests and 8f's planner tests build each worst
-case with the pinned cryptsetup on a header file, the U2 one by
-`reencrypt --init-only`, and require at least 1 KiB to spare; if the
-measurement leaves less, the credential bound or the token counts shrink
-in that commit, amending this section. The planner computes each step's
+reencryption keyslot, segments and second digest. 8a's codec tests and
+8f's planner tests build each worst case with the pinned cryptsetup on a
+header file, the U2 one by `reencrypt --init-only`, and require at least
+1 KiB to spare. 8a measured 10360 bytes for the largest protected
+header and 9732 for the largest U2 (td-protector/DESIGN.md, "Protected
+roles"), with a tpm-pin token's sealed areas bounded at 128 and 256
+bytes rather than the device-bound token's 256 and 512, at which the
+protected header would leave under 1 KiB. A smaller credential bound or
+fewer tokens would refuse real keys or shapes; the tpm-pin object is
+td's own. Its public area is exactly 78 bytes, which td-protector's
+chain check enforces (a SHA-256 keyed-hash object with a 32-byte
+authPolicy and unique). Its private area follows the TCG reference
+layout every commercial TPM derives from: an integrity HMAC (2 + 32
+bytes), an IV (2 + 16) and the encrypted sensitive area (106: its size,
+type, a 32-byte authValue, a 32-byte seed and the 32-byte secret), 158
+bytes, which the pinned swtpm also writes. A TPM whose object exceeds
+either bound is refused at the seal, before the cap and before any
+keyslot is added or header written, and is a TPM unusable for td: the
+FIDO2 shape and the recovery key remain, as for one without a SHA-256
+bank, and 8c pins that ordering. If a later measurement leaves less
+than 1 KiB, a bound or the token counts shrink in that commit, amending
+this section. The planner computes each step's
 resulting JSON size and refuses a step whose header would not fit,
 before writing.
 
@@ -2113,8 +2131,11 @@ commit.
    header by anyone who can write the disk, so 8c and every later
    selector commit test that forged headers fail closed. Selectors from
    8a to 8e read a `td-upgrade` token and its pending tokens through
-   td-protector's reader and boot such a header as a device-bound one,
-   leaving them untouched, so a later selector can still upgrade it. A
+   td-protector's reader and boot such a header as a device-bound one
+   without a reseal, leaving them untouched, so a later selector can
+   still upgrade it: a reseal would hold a second device-bound token
+   beside `td-upgrade`, over the reader's bound, so before 8f a U0
+   header whose PCRs changed opens with the recovery key alone. A
    commit that changes the shipped selector or deployment initramfs runs
    `check integration` by hand, and `qemu-boot-encrypted` keeps passing
    unchanged on device-bound headers. Its commits, in order:

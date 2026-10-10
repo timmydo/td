@@ -55,7 +55,7 @@ pub(crate) fn slot_number(text: &str) -> Option<u8> {
     text.parse::<u8>().ok().filter(|slot| *slot <= MAX_SLOT)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -77,7 +77,7 @@ fn nibble(digit: u8) -> Option<u8> {
 }
 
 /// Lowercase hexadecimal of 1 to `max` bytes.
-fn unhex(field: &str, text: &str, max: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn unhex(field: &str, text: &str, max: usize) -> Result<Vec<u8>, String> {
     if text.is_empty() || !text.len().is_multiple_of(2) || text.len() / 2 > max {
         return Err(format!(
             "td token {field} is not 1 to {max} bytes of hexadecimal"

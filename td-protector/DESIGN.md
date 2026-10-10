@@ -228,8 +228,10 @@ decimal string without leading zeros. `role` is `first-boot` or
 `device-bound`. `public` and `private` are the sealed object's
 TPM2B_PUBLIC and TPM2B_PRIVATE contents in lowercase hexadecimal, bounded
 to 256 and 512 bytes. A missing, extra or duplicated key, another type in
-any field, or a value outside these bounds refuses the token. Other token
-types are ignored.
+any field, or a value outside these bounds refuses the token. A
+`td-protector` token with a protected role and the `td-upgrade` and
+`td-request` types are the protected tier's ("Protected roles"); other
+token types are ignored.
 
 A td token whose `keyslots` array is empty is an orphan. cryptsetup
 strips a destroyed keyslot from every token that names it and keeps the
@@ -574,8 +576,8 @@ zeroed on drop and neither `Debug`, `Display` nor `Clone`.
 `Clone`. Removing an authValue's trailing zero bytes where TPM 2.0 does
 is td-tpm's (td-tpm/DESIGN.md, "HMAC policy sessions"), not the
 derivation's. The HMAC is td-fido's `hmac_sha256`, its `hmac.rs`
-compiled by path beside a mount of the engine's SHA-256, as td-secret's
-store crypto compiles it (td-fido/DESIGN.md, "Shared HMAC-SHA256"),
+compiled by path at the crate root beside a mount of the engine's
+SHA-256, as td-secret's store crypto compiles it (td-fido/DESIGN.md, "Shared HMAC-SHA256"),
 rather than a dependency on the td-fido crate, so the td-boot and
 td-install recipes, which stage td-protector file by file, stage that
 one file and build no td-fido rlib. It streams the parts, so the PIN is
@@ -634,16 +636,31 @@ the shapes; this section owns the formats, policies and plan rules),
 each landing in the sub-increment ENCRYPTION.md names.
 
 The PIN codec, the authValue and the tpm-pin policy with its chain
-check are current ("PIN and tpm-pin policy"); the rest of this section
-is not.
+check are current ("PIN and tpm-pin policy"), as are, from 8a's last
+commit, the lockout token's encryption, the codecs of the tokens 8a
+names and the reader's protected bounds below, library code nothing in
+production calls. The lockout's TPM sequences, the secure-boot, config
+and update-retry tokens, the plans, the runner's new shapes and the
+release are not.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
-with the info `td/disk-protector/lockout/v1`, a zero byte, the UUID and
-the nonce, 64 bytes split into `k_enc` and `k_mac`; the ciphertext is
-`L` XOR `k_enc`; the tag is HMAC-SHA256 under `k_mac` over the nonce,
-ciphertext and Name, compared in constant time; `L` is td-tpm's
-`LockoutAuth`, which `open` builds with `from_bytes`. `take`, `prove`,
+with an empty salt and the info `td/disk-protector/lockout/v1`, a zero
+byte, the UUID and the nonce, 64 bytes split into `k_enc` and `k_mac`;
+the ciphertext is `L` XOR `k_enc`; the tag is HMAC-SHA256 under `k_mac`
+over the nonce, ciphertext and Name. The HKDF is td-fido's
+`hkdf_expand` from the same `hmac.rs` the PIN's HMAC compiles. `seal`
+draws the nonce from `/dev/random`, as a secret is drawn, since two
+writes under one volume key sharing a nonce would share a key stream;
+the UUID is the header's text as 16 bytes (`lockout::volume_uuid`,
+8-4-4-4-12 hexadecimal digits of either case), and an empty volume key
+is refused. `open` takes this TPM's storage-primary Name and verifies
+the tag in constant time before anything else (`OpenError::Tag`), then
+requires the token's Name to be that one (`OtherPrimary`); only then
+does it decrypt, into the buffer td-tpm's `LockoutAuth::from_bytes`
+zeroes, whose refusal of an authorization that trims to nothing is
+`Invalid`. `k_enc` and `k_mac` are zeroed on drop. The token carries no
+secret in clear, so its codec keeps nothing to zero. `take`, `prove`,
 `reset` and `clear` are the sequences that section gives, over td-tpm's
 lockout commands (td-tpm/DESIGN.md "Lockout hierarchy"), the
 parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
@@ -684,10 +701,38 @@ until a take's LockReset or a proof under the lockout token succeeds
 and `1` after (ENCRYPTION.md "Lockout"), outside the tag, since
 whoever can write the header can remove the token anyway; marking a
 token over a wrong `L` proven costs only one refused proof per boot,
-bounded by the lockout hierarchy's own recovery. `salt`, `x`, `y`,
-`nonce`, `ciphertext` and `tag` are 32 bytes, `public` and `private`
-keep the device-bound bounds (the secure-boot token's sized for an
-RSA-2048 key), and `credential` is 1 to 255 bytes. The `td-upgrade` and
+bounded by the lockout hierarchy's own recovery. `seal` writes `0`,
+and nothing else is admitted. `salt`, `x`, `y`,
+`nonce`, `ciphertext` and `tag` are 32 bytes, and `credential` is 1 to
+255 bytes. A tpm-pin token's `public` and `private` are 1 to 128 and 1
+to 256 bytes, tighter than the device-bound token's 256 and 512 so that
+the largest protected header leaves 1 KiB of the JSON area spare
+("Headers"). td creates the object: its public area is exactly 78
+bytes, which `protected_auth_policy` enforces, and its private area
+follows the TCG reference layout every commercial TPM derives from, an
+integrity HMAC (2 + 32), an IV (2 + 16) and the encrypted sensitive area
+(106), 158 bytes, which swtpm 0.10.1 also writes (the emulator test pins
+both and encodes the token). A TPM whose object exceeds either bound is
+refused at the seal, before the cap and before any keyslot is added or
+header written, and is a TPM unusable for td (ENCRYPTION.md
+"Re-encrypting upgrade"): 8c's seal pins that ordering. The secure-boot
+token's are sized for an RSA-2048 key, at most 320 and 256 bytes (its
+TPM2B_PUBLIC holds 316 bytes; its private area 236 before the IV), the
+sizes the header measurement takes and 8i's codec pins against the
+emulator. `keyslots` names at most one keyslot; the lockout,
+`td-upgrade` and `td-request` tokens name none, a tpm-pin token or the
+marker naming none is an orphan, and a fido2 one is pending or an
+orphan. `protected::Token` carries the tokens 8a
+names: `encode` writes the compact JSON in the order above and refuses
+a value outside these bounds, and `decode` (4096 bytes at most) and
+`from_json` admit exactly the format, each key once in any order,
+refusing an unknown, missing or repeated key, another type, role,
+account, `pcrs`, shape or operation, a keyslot text that is not a
+canonical number up to 31, more than one keyslot or one where none
+belongs, and uppercase, odd or wrongly sized hexadecimal. No field
+carries a version: the role, the type and the `/v1` derivation domains
+carry it. A role td does not know yet, such as 8e's and 8i's, falls to
+the device-bound codec, which refuses it. The `td-upgrade` and
 `td-request` types are their own, so that a selector from before
 increment 8 ignores them as foreign tokens; their empty `keyslots`, the
 lockout's, the secure-boot, config and update-retry tokens' make none of
@@ -695,18 +740,58 @@ them an orphan. `config::tag(volume_key, uuid, bytes)` is
 ENCRYPTION.md's configuration tag ("Firmware authentication"), checked
 in constant time; the secure-boot and config tokens land with 8i.
 
-**Headers.** The reader classifies a header as device-bound (first-boot
-or device-bound td tokens), protected (tpm-pin, fido2 or recovery-key
-tokens) or upgrading (a `td-upgrade` token beside either kind); one
-holding both kinds without a `td-upgrade` token refuses, as does a
-second `td-upgrade` or `td-request` token. A device-bound header keeps
-the four-token bound for its own td tokens. A protected or upgrading
-header admits at most fourteen tokens of td's types, orphans included:
-at most two tpm-pin, four fido2, one recovery-key marker, one lockout,
-one secure-boot, one config, one update-retry, one `td-upgrade`, one
-`td-request` and one first-boot or device-bound during U0. `decode`
-keeps its 4096-byte bound per token, which the largest fido2 and
-secure-boot tokens fit.
+**Headers.** The reader returns the protected tier's tokens with their
+numbers in `Header::protected` (and `Metadata::protected`, so a plan's
+confirmation compares them too), and `Header::kind` classifies a header
+as device-bound (first-boot or device-bound td tokens, or none),
+protected (a tpm-pin token, a fido2 token naming a keyslot, the
+recovery-key marker, the lockout or a `td-request` token) or upgrading
+(a `td-upgrade` token beside either kind). A keyslot-less fido2 token
+alone leaves a header device-bound, since a pending fido2 token without
+a `td-upgrade` token is an orphan (phase 1 interrupted before its last
+write). One holding device-bound td tokens, orphans included, beside
+protected ones without a `td-upgrade` token refuses. A device-bound
+header keeps the four-token bound for its own td tokens. A protected or
+upgrading header admits at most fourteen tokens of td's types, orphans
+included: at most two tpm-pin, four fido2, one recovery-key marker, one
+lockout, one secure-boot, one config, one update-retry, one
+`td-upgrade`, one `td-request` and one first-boot or device-bound during
+U0; the reader enforces each class's bound, the device-bound one's
+beside a `td-upgrade` token included, which bounds the sum. `decode`
+keeps its 4096-byte bound per token, which the largest tokens fit (a
+tpm-pin token at its bounds is 1038 bytes, a fido2 one 824).
+
+The device-bound planner plans only device-bound headers
+(`Refusal::NotDeviceBound`), so before 8c and 8f a selector boots a
+protected or upgrading header with no plan: a device-bound token
+releases and the volume opens after its keyslot's test, every token and
+keyslot left as it is. In a device-bound header it treats the protected
+tier's tokens as it treats foreign ones, their keyslots and token
+numbers taken and never removed; the pending tokens an interrupted
+phase 1 leaves are removed by 8f's planner.
+
+Measured with the pinned cryptsetup 2.8.8 on header files the test
+builds (`tests/header_fit.rs`, ENCRYPTION.md "Re-encrypting upgrade"),
+the largest protected header, keyslot 0 and six more, four fido2
+tokens with 255-byte credentials, two tpm-pin tokens, the marker, the
+lockout, `td-upgrade` and `td-request` tokens at their bounds, and the
+secure-boot, config (two tags) and update-retry tokens at theirs, holds
+10360 bytes of JSON of the 12288; the largest U2, every token naming no
+keyslot and `reencrypt --init-only` adding its keyslots, segments and
+digest, 9696 bytes with journal resilience and 9732 with checksum. At
+the device-bound sealed-area bounds each tpm-pin token would be 768
+bytes longer and the protected header would hold 11896, under 1 KiB
+spare. The U2 headers are measured at `reencrypt --init-only`. A
+reencryption interrupted part-way splits its first segment in two and a
+multi-terabyte volume writes longer offsets and sizes: probed by hand
+on a 20 GiB file with no tokens, an offline reencryption interrupted
+after its first GiB grew the JSON from 1976 bytes to 2114, and 14-digit
+byte counts add a few bytes per field, which the 2.5 KiB margin absorbs.
+The pinned sizes hold for the test's fixture, a 20 MiB file, and 8f's
+planner computes each step's real size before writing. The protected
+header, before 8e's and 8i's tokens are added, and a U2 header holding
+only what U2 holds are read back through `luks2::read` and agree with
+cryptsetup's own metadata dump.
 
 **Plans on protected headers.** The recovery keyslot is the one the
 `recovery-key` marker names; an orphan is any keyslot no token of any
@@ -764,7 +849,12 @@ header, 128 KiB of a metadata dump, and bounds
 nesting. `decode` admits a token text of at most 4096 bytes; a token from
 either path has only bounded fields and encodes in under 1700 bytes. Its
 sealed areas are at most 256 and 512 bytes, and a header carries at most
-four td tokens, orphans included, among 32. A plan has at most 39
+four device-bound td tokens, orphans included, among 32. A protected
+token encodes in at most 1038 bytes (a tpm-pin token's sealed areas at
+most 128 and 256 bytes, a fido2 token's credential at most 255), and a
+header carries at most two tpm-pin, four fido2 and one each of the
+marker, lockout, `td-upgrade` and `td-request` tokens. The lockout's
+HKDF expands two blocks. A plan has at most 39
 steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
 A PIN is at most 63 bytes, and a chain check sends one PCR_Read, one
@@ -875,9 +965,10 @@ offering no reseal over a header with a td token naming keyslot 0 or
 no free keyslot, a td token naming keyslot 0 never
 tried and suppressing the plan, a failed import or kill and the boot
 that completes it, no TPM device, a refused header still capped, and
-the order tokens are tried in. No test reads a header cryptsetup wrote: that needs the source-built
-cryptsetup and its kernel crypto interfaces, which the host
-gate does not provide, so increment 5's encrypted-installation oracle
+the order tokens are tried in. No gate test reads a header cryptsetup
+wrote: that needs the source-built cryptsetup and its kernel crypto
+interfaces, which the host gate does not provide; the protected tier's
+header measurement below does, ignored by default. Increment 5's encrypted-installation oracle
 (`qemu-install-encrypted`) reads one in the guest: the installer's
 verifying-boot check runs this reader and `verify_first_boot_object` on
 the header cryptsetup wrote, under the pinned swtpm, and the oracle
@@ -932,3 +1023,45 @@ an authValue: it passes, a 4,7,9 check and a changed PCR 4 are
 fresh TPM state is `OtherPrimary`.
 
 A normal cargo pass with it ignored is not TPM integration evidence.
+
+Protected-token tests pin each 8a token's exact encoding for fixed
+values and the largest encoding of each kind (tpm-pin 1038 bytes, fido2
+824, marker 63, lockout 376, `td-upgrade` 125, `td-request` 60) as
+literals that `tests/token_vectors.py`, a stdlib-only host tool and no
+build input, computes independently (Python's `json`, `hmac` and
+`hashlib`), round trip them, and refuse every key, type, role, keyslot,
+value and length rule above, a constructed repeated key and oversized
+text, and an encoding outside the bounds. Lockout tests pin the
+ciphertext, tag and token text of a fixed volume key, UUID, nonce,
+authorization and Name against the same tool's HKDF and HMAC, open it
+back, and refuse another volume key or UUID, a flipped byte of the
+nonce, ciphertext, tag or Name (the Name under the tag, so moving it to
+this TPM's fails the tag), another primary's Name, an empty volume key,
+and a verifying tag over an authorization of zeros; the nonce is one
+exact read of an injected source, and UUID texts of either case parse
+while malformed ones refuse. Reader tests read protected, U0, U5 and
+interrupted-phase-1 headers, with two tpm-pin tokens on one keyslot and
+a foreign token's keyslot, compare `metadata`, and refuse each class
+over its bound, every mixture of a device-bound token or orphan with a
+protected one, two device-bound tokens beside `td-upgrade`, a
+malformed protected token, a lockout naming a keyslot, a role td does
+not know yet and a token naming an absent keyslot. Planner tests refuse
+protected and upgrading headers and leave pending fido2 tokens beside a
+device-bound header with their numbers taken. td-fido's `hkdf_expand`
+is pinned to RFC 5869's three SHA-256 cases at their whole lengths,
+with the info split at every offset, one block agreeing with `hkdf`, and
+an output over 8160 bytes refused untouched.
+
+The header measurement (`tests/header_fit.rs`) runs the pinned
+cryptsetup on 20 MiB files with td's own `luksFormat`, `luksAddKey` and
+`token import` argument lists and pins the JSON sizes above, each at
+least 1 KiB under the 12 KiB area, the two copies equal:
+
+```
+TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored
+```
+
+It needs the host kernel's AF_ALG hash and skcipher interfaces and no
+privilege. The cryptsetup is the `cryptsetup-x86-64` recipe's output,
+`bin/cryptsetup.static` under the path `td-recipe-eval build-run
+cryptsetup-x86-64` prints.

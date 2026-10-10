@@ -99,6 +99,10 @@ impl Step {
 /// volume still opens with the released secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
+    /// The header is protected or upgrading (`luks2::Kind`): this planner
+    /// plans device-bound headers only, so their tokens and keyslots stay
+    /// as they are.
+    NotDeviceBound,
     /// The header has no keyslot 0.
     NoRecoveryKeyslot,
     /// A td token names keyslot 0, which no td protector may hold.
@@ -124,6 +128,7 @@ pub enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotDeviceBound => write!(f, "the LUKS2 header is not a device-bound one"),
             Self::NoRecoveryKeyslot => write!(f, "the LUKS2 header has no recovery keyslot 0"),
             Self::RecoveryKeyslotNamed { token } => {
                 write!(f, "td token {token} names the recovery keyslot 0")
@@ -180,9 +185,13 @@ impl Plan {
     }
 }
 
-/// The header's own rules, before any plan: keyslot 0 present and named by
-/// no td token, and every td token's keyslot named by no other token.
+/// The header's own rules, before any plan: a device-bound header, keyslot
+/// 0 present and named by no td token, and every td token's keyslot named
+/// by no other token.
 fn check(header: &Header) -> Result<(), Refusal> {
+    if header.kind() != luks2::Kind::DeviceBound {
+        return Err(Refusal::NotDeviceBound);
+    }
     if !header.keyslots.contains(&RECOVERY_SLOT) {
         return Err(Refusal::NoRecoveryKeyslot);
     }
@@ -556,6 +565,7 @@ mod tests {
                 tokens,
                 orphans,
                 foreign,
+                protected: Vec::new(),
             }
         }
 
@@ -1526,6 +1536,53 @@ mod tests {
         assert_eq!(
             classify(&named_zero.header(), &[0]),
             Ok(Released::FirstBoot { token: 0 })
+        );
+    }
+
+    /// This planner plans device-bound headers only: a protected or
+    /// upgrading header has no plan, and a pending fido2 token beside a
+    /// device-bound header is left as it is, its token number taken.
+    #[test]
+    fn protected_tier_tokens_are_left_alone() {
+        use crate::protected::fixtures;
+        use crate::protected::FidoRole;
+        let model = Model::new(&[0, 1, 2], &[(0, td(1, Role::DeviceBound, 1))]);
+        let reseal = Transition::Reseal {
+            sealed: sealed(2, 9),
+        };
+        let keep = Transition::Keep { token: 0 };
+        for extra in [
+            vec![fixtures::tpm_pin(None)],
+            vec![fixtures::lockout()],
+            vec![fixtures::request()],
+            vec![fixtures::upgrade()],
+            vec![
+                fixtures::fido2(None, FidoRole::Recovery),
+                fixtures::upgrade(),
+            ],
+        ] {
+            let mut header = model.header();
+            header.protected = (10..).zip(extra).collect();
+            assert_ne!(header.kind(), luks2::Kind::DeviceBound);
+            for transition in [&reseal, &keep] {
+                assert_eq!(plan(&header, transition), Err(Refusal::NotDeviceBound));
+            }
+        }
+        let mut header = model.header();
+        header.protected = (1..=4)
+            .map(|number| (number, fixtures::fido2(None, FidoRole::Primary)))
+            .collect();
+        assert_eq!(header.kind(), luks2::Kind::DeviceBound);
+        let steps = plan(&header, &reseal).unwrap().steps().to_vec();
+        assert!(!steps
+            .iter()
+            .any(|step| matches!(step, Step::RemoveToken { token } if (1..=4).contains(token))));
+        // Keyslot 2, which no token names, is still an orphan.
+        assert!(steps.contains(&Step::KillSlot { slot: 2, by: 0 }));
+        assert_eq!(header.token_numbers(), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            Refusal::NotDeviceBound.to_string(),
+            "the LUKS2 header is not a device-bound one"
         );
     }
 

@@ -3,6 +3,7 @@
 //! sequence rule, refuses copies that disagree, and returns the td tokens
 //! of the copy it used. It runs before any C parser has seen the header.
 
+use crate::protected::{self, REQUEST_TYPE, UPGRADE_TYPE};
 use crate::token::{slot_number, Role, Token, MAX_SLOT, TOKEN_TYPE};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use td_json::Json;
@@ -25,6 +26,45 @@ pub const JSON_AREA_LEN: usize = 0x4000 - BINARY_HEADER_LEN;
 /// and a device-bound protector, one superseded and one an interrupted
 /// transition left.
 pub const MAX_TD_TOKENS: usize = 4;
+/// The protected tier's bounds per token class (DESIGN.md "Protected
+/// roles"): tpm-pin, fido2, `recovery-key`, `lockout`, `td-upgrade` and
+/// `td-request` tokens, orphans and pending tokens included. Beside a
+/// `td-upgrade` token at most one first-boot or device-bound token
+/// remains.
+pub const MAX_TPM_PIN_TOKENS: usize = 2;
+pub const MAX_FIDO2_TOKENS: usize = 4;
+pub const MAX_UPGRADE_DEVICE_BOUND_TOKENS: usize = 1;
+
+/// What a header's td tokens make it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// First-boot or device-bound tokens, or no td token but keyslot-less
+    /// fido2 ones: a pending fido2 token without a `td-upgrade` token is
+    /// an orphan.
+    DeviceBound,
+    /// tpm-pin, fido2 tokens naming a keyslot, the `recovery-key` marker,
+    /// the `lockout` or a `td-request` token, and no device-bound one.
+    Protected,
+    /// A `td-upgrade` token, beside either kind.
+    Upgrading,
+}
+
+/// The kind the protected-tier tokens of a header give it.
+fn kind_of(protected: &[(u8, protected::Token)]) -> Kind {
+    if protected
+        .iter()
+        .any(|(_, token)| matches!(token, protected::Token::Upgrade { .. }))
+    {
+        Kind::Upgrading
+    } else if protected
+        .iter()
+        .any(|(_, token)| !matches!(token, protected::Token::Fido2(fido) if fido.keyslot.is_none()))
+    {
+        Kind::Protected
+    } else {
+        Kind::DeviceBound
+    }
+}
 
 const PRIMARY_MAGIC: &[u8] = b"LUKS\xba\xbe";
 const SECONDARY_MAGIC: &[u8] = b"SKUL\xba\xbe";
@@ -82,15 +122,25 @@ pub struct Header {
     /// Each token of another type with its token number and the keyslots
     /// it names, ascending: the transition leaves them alone.
     pub foreign: Vec<(u8, Vec<u8>)>,
+    /// Each protected-tier token of td's types with its token number,
+    /// ascending: the device-bound transition leaves them alone, as it
+    /// leaves foreign tokens.
+    pub protected: Vec<(u8, protected::Token)>,
 }
 
 impl Header {
-    /// The keyslots tokens of other types name, ascending.
+    /// The keyslots tokens of other types and protected-tier tokens name,
+    /// ascending: every keyslot the device-bound transition leaves alone.
     pub fn foreign_keyslots(&self) -> Vec<u8> {
         let mut slots: Vec<u8> = self
             .foreign
             .iter()
             .flat_map(|(_, slots)| slots.iter().copied())
+            .chain(
+                self.protected
+                    .iter()
+                    .filter_map(|(_, token)| token.keyslot()),
+            )
             .collect();
         slots.sort_unstable();
         slots.dedup();
@@ -105,9 +155,15 @@ impl Header {
             .map(|(number, _)| *number)
             .chain(self.orphans.iter().map(|(number, _)| *number))
             .chain(self.foreign.iter().map(|(number, _)| *number))
+            .chain(self.protected.iter().map(|(number, _)| *number))
             .collect();
         numbers.sort_unstable();
         numbers
+    }
+
+    /// Whether the header is device-bound, protected or upgrading.
+    pub fn kind(&self) -> Kind {
+        kind_of(&self.protected)
     }
 
     /// The keyslots and tokens of every type, to compare with cryptsetup's
@@ -118,6 +174,7 @@ impl Header {
             tokens: self.tokens.clone(),
             orphans: self.orphans.clone(),
             foreign: self.foreign.clone(),
+            protected: self.protected.clone(),
         }
     }
 }
@@ -129,6 +186,7 @@ pub struct Metadata {
     pub tokens: Vec<(u8, Token)>,
     pub orphans: Vec<(u8, Role)>,
     pub foreign: Vec<(u8, Vec<u8>)>,
+    pub protected: Vec<(u8, protected::Token)>,
 }
 
 /// The most text `metadata` parses: cryptsetup's indented rendering of a
@@ -318,6 +376,7 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
         tokens,
         orphans,
         foreign,
+        protected,
     } = contents(&json)?;
     let text = |at, len| -> Result<String, String> {
         Ok(String::from_utf8_lossy(text_at(&copy.binary, at, len)?).into_owned())
@@ -332,6 +391,7 @@ fn header_from(copy: &ValidCopy, which: HeaderCopy) -> Result<Header, String> {
         tokens,
         orphans,
         foreign,
+        protected,
     })
 }
 
@@ -345,6 +405,7 @@ fn contents(json: &Json) -> Result<Metadata, String> {
     let mut tokens = Vec::new();
     let mut orphans = Vec::new();
     let mut foreign = Vec::new();
+    let mut protected = Vec::new();
     for (number, value) in numbered(json, "tokens")? {
         let kind = value
             .get("type")
@@ -365,6 +426,16 @@ fn contents(json: &Json) -> Result<Metadata, String> {
                 })?;
             slots.push(slot);
         }
+        let protected_role = value
+            .get("role")
+            .and_then(Json::as_str)
+            .is_some_and(protected::is_protected_role);
+        if kind == UPGRADE_TYPE || kind == REQUEST_TYPE || (kind == TOKEN_TYPE && protected_role) {
+            let token = protected::Token::from_json(value)
+                .map_err(|e| format!("LUKS2 token {number}: {e}"))?;
+            protected.push((number, token));
+            continue;
+        }
         if kind != TOKEN_TYPE {
             slots.sort_unstable();
             foreign.push((number, slots));
@@ -384,12 +455,62 @@ fn contents(json: &Json) -> Result<Metadata, String> {
         let token = Token::from_json(value).map_err(|e| format!("LUKS2 token {number}: {e}"))?;
         tokens.push((number, token));
     }
+    protected_bounds(tokens.len() + orphans.len(), &protected)?;
     Ok(Metadata {
         keyslots,
         tokens,
         orphans,
         foreign,
+        protected,
     })
+}
+
+/// The protected tier's per-class bounds and the kinds a header may mix:
+/// device-bound and protected td tokens only beside a `td-upgrade` token,
+/// and then at most one device-bound one.
+fn protected_bounds(
+    device_bound: usize,
+    protected: &[(u8, protected::Token)],
+) -> Result<(), String> {
+    use protected::Token as T;
+    let count = |class: &dyn Fn(&T) -> bool| protected.iter().filter(|(_, t)| class(t)).count();
+    let bounds = [
+        (
+            "tpm-pin",
+            count(&|t| matches!(t, T::TpmPin(_))),
+            MAX_TPM_PIN_TOKENS,
+        ),
+        (
+            "fido2",
+            count(&|t| matches!(t, T::Fido2(_))),
+            MAX_FIDO2_TOKENS,
+        ),
+        (
+            "recovery-key",
+            count(&|t| matches!(t, T::RecoveryKey { .. })),
+            1,
+        ),
+        ("lockout", count(&|t| matches!(t, T::Lockout(_))), 1),
+        ("td-upgrade", count(&|t| matches!(t, T::Upgrade { .. })), 1),
+        ("td-request", count(&|t| matches!(t, T::Request { .. })), 1),
+    ];
+    for (class, count, most) in bounds {
+        if count > most {
+            return Err(format!(
+                "LUKS2 header carries more than {most} {class} tokens"
+            ));
+        }
+    }
+    match kind_of(protected) {
+        Kind::Protected if device_bound > 0 => Err(
+            "LUKS2 header mixes device-bound and protected td tokens without a td-upgrade token"
+                .into(),
+        ),
+        Kind::Upgrading if device_bound > MAX_UPGRADE_DEVICE_BOUND_TOKENS => Err(format!(
+            "LUKS2 header carries more than {MAX_UPGRADE_DEVICE_BOUND_TOKENS} device-bound td token beside a td-upgrade token"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// What one binary header claims, unverified.
@@ -892,6 +1013,162 @@ mod tests {
             read_bytes(device(7, &json, 7, &json)).unwrap_err(),
             "LUKS2 token 0: td token does not name exactly one keyslot"
         );
+    }
+
+    /// A header JSON with keyslots 0 to 5 and these numbered tokens.
+    fn six_slots(tokens: &[(u8, String)]) -> String {
+        let tokens: Vec<String> = tokens
+            .iter()
+            .map(|(number, token)| format!(r#""{number}":{token}"#))
+            .collect();
+        let slots: Vec<String> = (0..6).map(|n| format!(r#""{n}":{{}}"#)).collect();
+        format!(
+            r#"{{"keyslots":{{{}}},"tokens":{{{}}},"segments":{{}},"digests":{{}},"config":{{}}}}"#,
+            slots.join(","),
+            tokens.join(",")
+        )
+    }
+
+    fn read_json(json: &str) -> Result<Header, String> {
+        read_bytes(device(7, json, 7, json))
+    }
+
+    fn encoded(token: &protected::Token) -> String {
+        token.encode().unwrap()
+    }
+
+    #[test]
+    fn protected_headers_are_read_and_classified() {
+        use crate::protected::fixtures::*;
+        use crate::protected::FidoRole::{Primary, Recovery};
+        let systemd = r#"{"type":"systemd-tpm2","keyslots":["5"]}"#.to_owned();
+        let tokens = [
+            (0, encoded(&tpm_pin(Some(2)))),
+            (1, encoded(&fido2(Some(3), Primary))),
+            (2, encoded(&fido2(Some(4), Recovery))),
+            (
+                3,
+                encoded(&protected::Token::RecoveryKey { keyslot: Some(0) }),
+            ),
+            (4, encoded(&lockout())),
+            (5, encoded(&request())),
+            (6, systemd),
+            // Two tpm-pin tokens on one keyslot: an update's pre-seal.
+            (7, encoded(&tpm_pin(Some(2)))),
+        ];
+        let json = six_slots(&tokens);
+        let header = read_json(&json).unwrap();
+        assert_eq!(header.kind(), Kind::Protected);
+        assert!(header.tokens.is_empty() && header.orphans.is_empty());
+        assert_eq!(header.foreign, [(6, vec![5])]);
+        let numbers: Vec<u8> = header.protected.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [0, 1, 2, 3, 4, 5, 7]);
+        assert_eq!(header.protected[1].1, fido2(Some(3), Primary));
+        assert_eq!(header.protected[4].1, lockout());
+        assert_eq!(header.foreign_keyslots(), [0, 2, 3, 4, 5]);
+        assert_eq!(header.token_numbers(), [0, 1, 2, 3, 4, 5, 6, 7]);
+        // cryptsetup's metadata dump is read under the same rules.
+        assert_eq!(metadata(json.as_bytes()).unwrap(), header.metadata());
+        // Pending fido2 tokens and the upgrade's token beside one
+        // device-bound protector: U0.
+        let mut u0: Vec<(u8, String)> = (0..4)
+            .map(|n| (n, encoded(&fido2(None, Recovery))))
+            .collect();
+        u0.push((4, td_token(1, Role::DeviceBound)));
+        u0.push((9, encoded(&upgrade())));
+        let header = read_json(&six_slots(&u0)).unwrap();
+        assert_eq!(header.kind(), Kind::Upgrading);
+        assert_eq!((header.tokens.len(), header.protected.len()), (1, 5));
+        // Every protected kind beside the upgrade's token: U4 and U5.
+        let mut u5 = tokens.to_vec();
+        u5.retain(|(n, _)| *n != 5);
+        u5.push((9, encoded(&upgrade())));
+        assert_eq!(read_json(&six_slots(&u5)).unwrap().kind(), Kind::Upgrading);
+        // Pending fido2 tokens without the upgrade's token are orphans of
+        // a device-bound header: an interrupted phase 1.
+        u0.retain(|(n, _)| *n != 9);
+        let header = read_json(&six_slots(&u0)).unwrap();
+        assert_eq!(header.kind(), Kind::DeviceBound);
+        assert_eq!(header.protected.len(), 4);
+        // No td token at all is device-bound, as before.
+        assert_eq!(
+            read_json(&six_slots(&[])).unwrap().kind(),
+            Kind::DeviceBound
+        );
+    }
+
+    #[test]
+    fn protected_headers_are_bounded() {
+        use crate::protected::fixtures::*;
+        use crate::protected::FidoRole::Primary;
+        let refused = |tokens: &[(u8, String)]| read_json(&six_slots(tokens)).unwrap_err();
+        let many = |token: &protected::Token, count: u8| -> Vec<(u8, String)> {
+            (0..count).map(|n| (n, encoded(token))).collect()
+        };
+        let marker = protected::Token::RecoveryKey { keyslot: Some(0) };
+        let cases: &[(Vec<(u8, String)>, &str)] = &[
+            (many(&tpm_pin(Some(2)), 3), "more than 2 tpm-pin tokens"),
+            (many(&fido2(None, Primary), 5), "more than 4 fido2 tokens"),
+            (many(&marker, 2), "more than 1 recovery-key tokens"),
+            (many(&lockout(), 2), "more than 1 lockout tokens"),
+            (many(&upgrade(), 2), "more than 1 td-upgrade tokens"),
+            (many(&request(), 2), "more than 1 td-request tokens"),
+        ];
+        for (tokens, expected) in cases {
+            let error = refused(tokens);
+            assert!(error.contains(expected), "{error}");
+        }
+        // At the bounds every class is admitted together.
+        let mut most = many(&fido2(Some(3), Primary), 4);
+        most.extend([
+            (4, encoded(&tpm_pin(Some(2)))),
+            (5, encoded(&tpm_pin(Some(1)))),
+            (6, encoded(&marker)),
+            (7, encoded(&lockout())),
+            (8, encoded(&upgrade())),
+            (9, encoded(&request())),
+            (10, td_token(5, Role::DeviceBound)),
+        ]);
+        assert_eq!(read_json(&six_slots(&most)).unwrap().protected.len(), 10);
+        // Device-bound and protected tokens mix only beside the upgrade's.
+        let mixture = "mixes device-bound and protected td tokens";
+        for token in [
+            tpm_pin(Some(2)),
+            fido2(Some(3), Primary),
+            marker,
+            lockout(),
+            request(),
+        ] {
+            let tokens = [(0, td_token(1, Role::DeviceBound)), (1, encoded(&token))];
+            assert!(refused(&tokens).contains(mixture), "{token:?}");
+        }
+        let orphan = td_token(1, Role::FirstBoot).replacen(r#"["1"]"#, "[]", 1);
+        assert!(refused(&[(0, orphan.clone()), (1, encoded(&lockout()))]).contains(mixture));
+        // Beside it, one device-bound token at most, an orphan included.
+        let two = [
+            (0, td_token(1, Role::DeviceBound)),
+            (1, orphan),
+            (2, encoded(&upgrade())),
+        ];
+        assert!(refused(&two).contains("more than 1 device-bound td token beside a td-upgrade"));
+        // A protected token that is not its format refuses the header, as
+        // does a role td does not know yet (8e's and 8i's).
+        let bad = encoded(&lockout()).replacen(r#""keyslots":[]"#, r#""keyslots":["1"]"#, 1);
+        assert_eq!(
+            refused(&[(3, bad)]),
+            "LUKS2 token 3: td token of this kind names no keyslot"
+        );
+        let bad = encoded(&upgrade()).replacen("tpm", "both", 1);
+        assert!(refused(&[(3, bad)]).starts_with("LUKS2 token 3: td token shape"));
+        let config = r#"{"type":"td-protector","keyslots":[],"role":"config","tags":[]}"#;
+        assert!(refused(&[(3, config.into())]).starts_with("LUKS2 token 3: td token"));
+        let later = r#"{"type":"td-protector","keyslots":[],"role":"update-retry","public":"00","private":"00"}"#;
+        assert_eq!(
+            refused(&[(3, later.into())]),
+            "LUKS2 token 3: td token role is unknown"
+        );
+        let absent = encoded(&tpm_pin(Some(9)));
+        assert!(refused(&[(3, absent)]).contains("names a keyslot the header does not have"));
     }
 
     #[test]

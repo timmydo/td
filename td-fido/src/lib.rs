@@ -15,7 +15,7 @@
 
 mod crypto;
 mod root;
-pub use crypto::hmac_sha256;
+pub use crypto::{hkdf_expand, hmac_sha256, HKDF_MAX_OKM};
 pub mod fido_aes;
 pub mod fido_cbor;
 pub mod fido_ctap;

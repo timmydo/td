@@ -1,11 +1,13 @@
-//! SHA-256 digest, HMAC-SHA256 (RFC 2104) and one-block HKDF (RFC 5869),
+//! SHA-256 digest, HMAC-SHA256 (RFC 2104) and HKDF (RFC 5869), one block
+//! (`hkdf`) or any length up to RFC 5869's bound (`hkdf_expand`),
 //! the one copy td's std-only crates share (td-fido/DESIGN.md, "Shared
 //! HMAC-SHA256"), over the engine's SHA-256 its includer mounts as
 //! `super::sha256`: td-fido's `crypto.rs`, and td-secret's store crypto,
 //! which compiles this file by path.
 //!
 //! The key-derived buffers this file owns are zeroed before return: the
-//! normalized key, the hashed long key, each pad and the inner hash. The
+//! normalized key, the hashed long key, each pad, the inner hash and
+//! HKDF's pseudorandom key and output blocks. The
 //! engine's `Sha256` keeps its chaining state and block buffer private and
 //! consumes itself in `finalize`, so the key-derived midstates inside it
 //! are not cleared; zeroing is best effort in safe Rust either way.
@@ -19,6 +21,12 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
 
 /// HMAC-SHA256 under `key` over the concatenation of `parts`.
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    hmac_stream(key, parts.iter().copied())
+}
+
+/// HMAC-SHA256 over parts as an iterator yields them, so a caller
+/// assembling parts per block allocates nothing.
+fn hmac_stream<'a>(key: &[u8], parts: impl Iterator<Item = &'a [u8]>) -> [u8; 32] {
     let mut normalized = [0u8; 64];
     if key.len() > 64 {
         let mut hashed = digest(key);
@@ -65,6 +73,42 @@ pub fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     let result = hmac_sha256(&prk, &[info, &[1]]);
     clear(&mut prk);
     result
+}
+
+/// RFC 5869's longest output, 255 SHA-256 blocks.
+pub const HKDF_MAX_OKM: usize = 255 * 32;
+
+/// RFC 5869 HKDF-SHA256 filling `okm`, of at most `HKDF_MAX_OKM` bytes,
+/// with `info` the concatenation of `info_parts`. A longer `okm` is
+/// refused and left untouched.
+pub fn hkdf_expand(
+    ikm: &[u8],
+    salt: &[u8],
+    info_parts: &[&[u8]],
+    okm: &mut [u8],
+) -> Result<(), &'static str> {
+    if okm.len() > HKDF_MAX_OKM {
+        return Err("HKDF-SHA256 gives at most 8160 bytes");
+    }
+    let mut prk = hmac_sha256(salt, &[ikm]);
+    let mut block = [0u8; 32];
+    for (index, chunk) in okm.chunks_mut(32).enumerate() {
+        // At most 255 chunks, so the counter is 1 to 255.
+        let counter = [u8::try_from(index + 1).unwrap_or(u8::MAX)];
+        let previous: &[u8] = if index == 0 { &[] } else { &block };
+        let parts = std::iter::once(previous)
+            .chain(info_parts.iter().copied())
+            .chain(std::iter::once(&counter[..]));
+        let mut next = hmac_stream(&prk, parts);
+        block = next;
+        clear(&mut next);
+        for (out, byte) in chunk.iter_mut().zip(&block) {
+            *out = *byte;
+        }
+    }
+    clear(&mut block);
+    clear(&mut prk);
+    Ok(())
 }
 
 fn clear(bytes: &mut [u8]) {
@@ -163,6 +207,60 @@ mod tests {
             .to_vec(),
             hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf")
         );
+    }
+
+    /// RFC 5869's three SHA-256 cases at their whole output lengths, the
+    /// info split into parts, one block agreeing with `hkdf`, and the
+    /// length bound.
+    #[test]
+    fn hkdf_expand_matches_rfc_5869() {
+        let info: Vec<u8> = (0xb0..=0xff).collect();
+        let ikm: Vec<u8> = (0x00..=0x4f).collect();
+        let salt: Vec<u8> = (0x60..=0xaf).collect();
+        // Input keying material, salt, info and the expected output.
+        type Case<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a str);
+        let cases: &[Case] = &[
+            (
+                &[0x0b; 22],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                &[0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9],
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+            ),
+            (
+                &ikm,
+                &salt,
+                &info,
+                "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87",
+            ),
+            (
+                &[0x0b; 22],
+                &[],
+                &[],
+                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
+            ),
+        ];
+        for (ikm, salt, info, expected) in cases {
+            let expected = hex(expected);
+            let mut okm = vec![0; expected.len()];
+            hkdf_expand(ikm, salt, &[info], &mut okm).unwrap();
+            assert_eq!(okm, expected);
+            for at in 0..=info.len() {
+                let (head, tail) = info.split_at(at);
+                let mut split = vec![0; expected.len()];
+                hkdf_expand(ikm, salt, &[head, tail], &mut split).unwrap();
+                assert_eq!(split, expected);
+            }
+            let mut one = [0; 32];
+            hkdf_expand(ikm, salt, &[info], &mut one).unwrap();
+            assert_eq!(one, hkdf(ikm, salt, info));
+        }
+        let mut most = vec![0; HKDF_MAX_OKM];
+        hkdf_expand(b"k", b"", &[], &mut most).unwrap();
+        let mut over = vec![7; HKDF_MAX_OKM + 1];
+        assert!(hkdf_expand(b"k", b"", &[], &mut over).is_err());
+        assert!(over.iter().all(|byte| *byte == 7));
+        let mut empty = [0u8; 0];
+        hkdf_expand(b"k", b"", &[], &mut empty).unwrap();
     }
 
     #[test]

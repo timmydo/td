@@ -128,8 +128,10 @@ const JSON_STRING_RS: &str = include_str!("../../../td-json/src/string.rs");
 const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_array.rs");
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
+const PROTECTOR_LOCKOUT_RS: &str = include_str!("../../../td-protector/src/lockout.rs");
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
 const PROTECTOR_PIN_RS: &str = include_str!("../../../td-protector/src/pin.rs");
+const PROTECTOR_PROTECTED_RS: &str = include_str!("../../../td-protector/src/protected.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
@@ -212,6 +214,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-protector/src/lockout.rs".into(),
+            content: PROTECTOR_LOCKOUT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-protector/src/luks2.rs".into(),
             content: PROTECTOR_LUKS2_RS.into(),
             exec: false,
@@ -219,6 +226,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/pin.rs".into(),
             content: PROTECTOR_PIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/protected.rs".into(),
+            content: PROTECTOR_PROTECTED_RS.into(),
             exec: false,
         },
         Step::WriteFile {

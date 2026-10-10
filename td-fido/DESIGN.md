@@ -37,7 +37,9 @@ prerequisites" onward):
   under `/run/td-fido` (or the desktop runtime directory), the Session
   that drives a token through a HID worker, and that worker.
 - `hmac_sha256(key, parts)`: HMAC-SHA256 (RFC 2104) under `key` over
-  the concatenation of `parts`, pinned to RFC 4231's vectors.
+  the concatenation of `parts`, pinned to RFC 4231's vectors, and
+  `hkdf_expand(ikm, salt, info_parts, okm)`: HKDF-SHA256 (RFC 5869)
+  filling up to `HKDF_MAX_OKM`, 8160 bytes.
 - `root.rs`: the root console's admission, every user ID 0, which
   `fido_device::require_root` re-exports. td-secret's store compiles
   the same file by path for its own admission, with its refusal text.
@@ -70,7 +72,8 @@ that reach it only through td-secret or td-tpm, as td-pass does, are
 not dependents.
 
 Four crates compile some of its files as shared source instead:
-td-protector compiles `hmac.rs` for its PIN's authValue (below); as
+td-protector compiles `hmac.rs` for its PIN's authValue and its lockout
+token's HKDF (below); as
 they compiled td-secret's, td-firstboot and td-portal read td-secret's
 token-protected store through `fido_cbor`, `fido_ctap`, `fido_enroll`,
 `fido_hid`, and `hmac.rs` and `root.rs` through td-secret's store
@@ -89,21 +92,29 @@ for cargo.
 
 ## Shared HMAC-SHA256
 
-`hmac.rs` is the one SHA-256 digest, HMAC-SHA256 and one-block HKDF
-(RFC 5869) the std-only crates share. It names the hash only as
+`hmac.rs` is the one SHA-256 digest, HMAC-SHA256 and HKDF (RFC 5869)
+the std-only crates share: `hkdf` gives one 32-byte block, and
+`hkdf_expand` fills an output of any length up to RFC 5869's 255
+blocks, its info the concatenation of parts, refusing a longer output
+and leaving it untouched. td-protector's lockout token takes 64 bytes
+from it. It names the hash only as
 `super::sha256`, so a crate that already mounts the engine's SHA-256
 compiles it by path beside that mount instead of keeping a second copy.
 td-fido's `crypto.rs` re-exports `hmac_sha256` as `td_fido::hmac_sha256`
 and its digest, HMAC and HKDF to the CTAP code. td-secret's store crypto
-compiles it the same way, as does td-protector's `pin` module beside
-its own mount of the engine's SHA-256, and td-firstboot and td-portal
+compiles it the same way, as does td-protector's crate root beside its
+own mount of the engine's SHA-256, for its PIN's authValue and its
+lockout token, and td-firstboot and td-portal
 reach it through td-secret's `crypto.rs`. Its tests pin RFC 4231 cases 1 to 4, 6 and 7
 (each whole and split at every offset), keys of 64 and 65 bytes on either
-side of the block size, RFC 5869 case 1 and FIPS 180's "abc".
+side of the block size, RFC 5869 case 1 for `hkdf`, its cases 1 to 3
+at their whole lengths for `hkdf_expand` (the info split at every
+offset, one block agreeing with `hkdf`, and the length bound) and FIPS
+180's "abc".
 
 It zeroes the key-derived buffers it owns before returning: the
 normalized key, the hashed long key, each pad, the inner hash and HKDF's
-pseudorandom key. The engine's `Sha256` keeps its chaining state and
+pseudorandom key and output blocks. The engine's `Sha256` keeps its chaining state and
 block buffer private and consumes itself in `finalize`, so the
 key-derived midstates inside it are not cleared. Zeroing is best effort
 in safe Rust, as td-tpm's `zero` is. td-tpm keeps its own SHA-256 for

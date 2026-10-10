@@ -12,8 +12,8 @@ mod sha256;
 #[path = "hmac.rs"]
 mod sha256_hmac;
 
-pub use sha256_hmac::hmac_sha256;
 pub(crate) use sha256_hmac::{digest, hkdf, hmac};
+pub use sha256_hmac::{hkdf_expand, hmac_sha256, HKDF_MAX_OKM};
 
 /// Overwrites a secret before it is dropped. Best effort in safe Rust:
 /// `black_box` keeps the stores, not a guarantee about the optimizer.

@@ -76,7 +76,9 @@ fn spawn(state: &Path, socket: &Path) -> Child {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
+    // The socket path appears at bind(), before swtpm listens: wait
+    // for a connection it accepts, not for the path.
+    while std::os::unix::net::UnixStream::connect(socket).is_err() {
         assert!(child.try_wait().unwrap().is_none(), "swtpm exited");
         assert!(Instant::now() < deadline, "swtpm startup timeout");
         std::thread::sleep(Duration::from_millis(10));
