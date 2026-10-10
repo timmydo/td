@@ -1,5 +1,5 @@
 use crate::ladder::{
-    post_bootstrap_path, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_BOOTSTRAP_SH,
+    post_rust_inputs, post_rust_tool_farm, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_RUST_SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -21,21 +21,23 @@ use crate::types::{Recipe, Step};
 // RELOCATABLE); the outer initramfs simply embeds a copy of it as /kernel/bzImage.
 //
 // Everything in both initramfs is td-built and STATIC, so each cpio is self-contained
-// (the kexec'd inner kernel has no /td/store, only its initramfs): busybox and
-// td-kexec are static ELFs packed as real `file` entries (not slinks into the store,
-// unlike system-x86-64's stage-1), and the packer is the linux-x86-64-exported
-// gen_init_cpio (itself HOSTCC `-static`). The inner cpio is packed first, then
+// (the kexec'd inner kernel has no /td/store, only its initramfs): td-sh (the /init
+// interpreter, as /bin/sh), td-init (for `reboot`) and td-kexec are static ELFs
+// packed as real `file` entries (not slinks into the store, unlike system-x86-64's
+// stage-1), and the packer is the linux-x86-64-exported gen_init_cpio (itself
+// HOSTCC `-static`). The inner cpio is packed first, then
 // embedded as a `file` in the outer cpio.
 pub fn recipe() -> Recipe {
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
-    // ── Inner initramfs: static busybox + a /init that prints STAGE2 then resets. ──
+    // ── Inner initramfs: static td-sh and td-init + a /init that prints STAGE2 then
+    //    resets. td-init's `reboot` issues reboot(2) directly; `-f` is a no-op. ──
     steps.push(Step::WriteFile {
         path: "{root}/inner-init".into(),
         content: format!(
             "#!/bin/sh\n\
              echo {KEXEC_STAGE2_MARKER}\n\
-             exec /bin/busybox reboot -f\n"
+             exec /bin/td-init reboot -f\n"
         ),
         exec: true,
     });
@@ -44,8 +46,9 @@ pub fn recipe() -> Recipe {
         content: "dir /dev 0755 0 0\n\
                   nod /dev/console 0600 0 0 c 5 1\n\
                   dir /bin 0755 0 0\n\
-                  file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n\
-                  slink /bin/sh /bin/busybox 0777 0 0\n\
+                  file /bin/td-sh {in:td-sh}/bin/td-sh 0755 0 0\n\
+                  slink /bin/sh /bin/td-sh 0777 0 0\n\
+                  file /bin/td-init {in:td-init}/bin/td-init 0755 0 0\n\
                   file /init {root}/inner-init 0755 0 0\n"
             .into(),
         exec: false,
@@ -58,15 +61,15 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/inner-spec' > '{root}/inner.cpio'",
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
-    // ── Outer initramfs: static busybox + td-kexec + a copy of the bzImage + the
+    // ── Outer initramfs: static td-sh, td-init and td-kexec + a copy of the bzImage + the
     //    inner cpio + a /init that prints STAGE1 then execs td-kexec. The inner cmdline
     //    mirrors the qemu-boot base (console=ttyS0 panic=-1 rdinit=/init) so STAGE2
     //    lands on the same serial and an inner panic resets (=> qemu exits). If td-kexec
@@ -80,7 +83,7 @@ pub fn recipe() -> Recipe {
              echo {KEXEC_STAGE1_MARKER}\n\
              /bin/td-kexec /kernel/bzImage /inner.cpio 'console=ttyS0 panic=-1 rdinit=/init'\n\
              echo TD-KEXEC-STAGE1-FAILED\n\
-             exec /bin/busybox reboot -f\n"
+             exec /bin/td-init reboot -f\n"
         ),
         exec: true,
     });
@@ -89,8 +92,9 @@ pub fn recipe() -> Recipe {
         content: "dir /dev 0755 0 0\n\
                   nod /dev/console 0600 0 0 c 5 1\n\
                   dir /bin 0755 0 0\n\
-                  file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n\
-                  slink /bin/sh /bin/busybox 0777 0 0\n\
+                  file /bin/td-sh {in:td-sh}/bin/td-sh 0755 0 0\n\
+                  slink /bin/sh /bin/td-sh 0777 0 0\n\
+                  file /bin/td-init {in:td-init}/bin/td-init 0755 0 0\n\
                   file /bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n\
                   dir /kernel 0755 0 0\n\
                   file /kernel/bzImage {in:linux-x86-64}/bzImage 0644 0 0\n\
@@ -103,12 +107,12 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/outer-spec' > '{root}/outer-initramfs.cpio'",
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     // ── Land the bootable bzImage + the outer initramfs. ──
@@ -128,6 +132,11 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("kexec-spike-x86-64", "0.1")
-        .native_inputs(&["linux-x86-64", "busybox-x86-64", "td-kexec"])
+        // post_rust_inputs adds the tool farm's providers, td-sh among them,
+        // which both initramfs also pack.
+        .native_inputs(&post_rust_inputs(
+            "gawk-x86-64-self",
+            &["linux-x86-64", "td-kexec", "td-init"],
+        ))
         .steps(steps)
 }

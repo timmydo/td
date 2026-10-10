@@ -626,15 +626,6 @@ pub fn debug_line_validator_regression_steps() -> Vec<Step> {
     ]
 }
 
-/// BusyBox's shell and userland, for its last post-Rust consumers. BusyBox is
-/// a bootstrap-side consumer, so each recipe using these paths declares it and
-/// is a named exception in the ladder's boundary guard.
-pub const POST_BOOTSTRAP_SH: &str = "{in:busybox-x86-64}/bin/sh";
-
-pub fn post_bootstrap_path() -> String {
-    "{in:busybox-x86-64}/bin".into()
-}
-
 /// The shell beyond rust-toolchain: td-sh, built by direct rustc from the
 /// stage2 toolchain, so no recipe that uses it can be on its own input path.
 pub const POST_RUST_SH: &str = "{in:td-sh}/bin/td-sh";
@@ -1914,13 +1905,8 @@ mod tests {
         // its grep td-txt, so the tests of those two take the root's.
         ("td-sh-test", "bash-mesboot"),
         ("td-txt-test", "grep-mesboot0"),
-        // BusyBox left the Rust bootstrap; these are its last consumers, each
-        // retired from this list as it moves to td's userland.
-        ("kexec-spike-x86-64", "busybox-x86-64"),
-        ("kexec-spike-x86-64-test", "busybox-x86-64"),
     ];
-    const RECIPE_SHEBANG_INTERPRETERS: &[&str] =
-        &[super::SH, super::POST_BOOTSTRAP_SH, super::POST_RUST_SH];
+    const RECIPE_SHEBANG_INTERPRETERS: &[&str] = &[super::SH, super::POST_RUST_SH];
     const GUEST_LITERAL_SHEBANGS: &[(&str, &str)] = &[
         ("linux-x86-64", "{root}/initramfs/init"),
         ("kexec-spike-x86-64", "{root}/inner-init"),

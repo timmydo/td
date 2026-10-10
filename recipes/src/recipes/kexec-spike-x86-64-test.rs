@@ -1,5 +1,5 @@
 use crate::ladder::{
-    post_bootstrap_path, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_BOOTSTRAP_SH,
+    post_rust_inputs, post_rust_tool_farm, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_RUST_SH,
 };
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
@@ -10,31 +10,32 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // complete WITHOUT booting it. Four things, mirroring linux-x86-64-test:
 //   1. {out}/bzImage carries the x86 boot-setup header (0xAA55 at 0x1fe, "HdrS" at
 //      0x202) — it is a real bootable image, the one qemu -kernel loads,
-//   2. {out}/outer-initramfs.cpio is a COMPLETE newc cpio (070701 magic; busybox
+//   2. {out}/outer-initramfs.cpio is a COMPLETE newc cpio (070701 magic; td-util
 //      `cpio -t` parses it — reds on a truncated stream) carrying every spike member:
-//      init, bin/busybox, bin/sh, bin/td-kexec, dev/console, kernel/bzImage (the
-//      embedded second-boot kernel), and inner.cpio (the embedded inner initramfs).
+//      init, bin/td-sh, bin/sh, bin/td-init, bin/td-kexec, dev/console,
+//      kernel/bzImage (the embedded second-boot kernel), and inner.cpio (the
+//      embedded inner initramfs).
 //      A dropped member (a gen_init_cpio spec typo, a missing input) reds on its name.
 //   3. the outer /init is extracted and checked for STAGE1; then inner.cpio is
 //      extracted, `cpio -t`-parsed (reds on a truncated/corrupt stream), checked
-//      for its own members (init, bin/busybox, bin/sh, dev/console), and its /init
-//      extracted and checked for STAGE2. Binding each marker to its own extracted
+//      for its own members (init, bin/td-sh, bin/sh, bin/td-init, dev/console), and
+//      its /init extracted and checked for STAGE2. Binding each marker to its own extracted
 //      /init prevents an adjacent archive member from satisfying either check.
 // The behavioural proof that it actually kexecs is `qemu-boot-kexec`, which cannot run
 // in this host-free BuildOnly rung.
 pub fn recipe() -> Recipe {
     let bzimage = "{in:kexec-spike-x86-64}/bzImage";
     let initramfs = "{in:kexec-spike-x86-64}/outer-initramfs.cpio";
-    let bb = "{in:busybox-x86-64}/bin/busybox";
+    let tu = "{in:td-util}/bin/td-util";
     let stage1 = KEXEC_STAGE1_MARKER;
     let stage2 = KEXEC_STAGE2_MARKER;
-    let mut steps = Vec::new();
+    let mut steps = vec![post_rust_tool_farm("{in:gawk-x86-64-self}/bin/gawk")];
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "sz=$(wc -c < '{bzimage}'); \
@@ -46,41 +47,41 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                POST_BOOTSTRAP_SH,
+                POST_RUST_SH,
                 "-c",
                 &format!(
                     "sz=$(wc -c < '{initramfs}'); \
                      [ \"$sz\" -ge 65536 ] || {{ echo \"outer-initramfs.cpio implausibly small ($sz bytes)\" >&2; exit 1; }}; \
                      set -- $(od -An -tx1 -N 6 '{initramfs}'); \
                      [ \"$1$2$3$4$5$6\" = 303730373031 ] || {{ echo 'outer-initramfs.cpio missing the newc cpio magic 070701' >&2; exit 1; }}; \
-                     list=$('{bb}' cpio -t < '{initramfs}' 2>/dev/null) || {{ echo 'outer-initramfs.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }}; \
-                     for m in init bin/busybox bin/sh bin/td-kexec dev/console kernel/bzImage inner.cpio; do \
+                     list=$('{tu}' cpio -t < '{initramfs}' 2>/dev/null) || {{ echo 'outer-initramfs.cpio: td-util cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }}; \
+                     for m in init bin/td-sh bin/sh bin/td-init bin/td-kexec dev/console kernel/bzImage inner.cpio; do \
                          printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || {{ echo \"outer-initramfs.cpio: cpio member '$m' missing — the two-kernel spike is incomplete\" >&2; exit 1; }}; \
                      done; \
                      rm -f init inner.cpio; \
-                     '{bb}' cpio -i init < '{initramfs}' >/dev/null 2>&1 || {{ echo 'outer-initramfs.cpio: could not extract outer /init' >&2; exit 1; }}; \
+                     '{tu}' cpio -i init < '{initramfs}' >/dev/null 2>&1 || {{ echo 'outer-initramfs.cpio: could not extract outer /init' >&2; exit 1; }}; \
                      [ -f init ] || {{ echo 'outer-initramfs.cpio: could not extract outer /init' >&2; exit 1; }}; \
                      grep -q -F {stage1} init || {{ echo 'outer-initramfs.cpio: outer /init STAGE1 marker not packed' >&2; exit 1; }}; \
                      rm -f init; \
-                     '{bb}' cpio -i inner.cpio < '{initramfs}' >/dev/null 2>&1 || {{ echo 'outer-initramfs.cpio: could not extract the embedded inner.cpio member' >&2; exit 1; }}; \
+                     '{tu}' cpio -i inner.cpio < '{initramfs}' >/dev/null 2>&1 || {{ echo 'outer-initramfs.cpio: could not extract the embedded inner.cpio member' >&2; exit 1; }}; \
                      [ -f inner.cpio ] || {{ echo 'outer-initramfs.cpio: could not extract the embedded inner.cpio member' >&2; exit 1; }}; \
-                     ilist=$('{bb}' cpio -t < inner.cpio 2>/dev/null) || {{ echo 'inner.cpio is not a parseable newc archive (truncated/corrupt embedded inner initramfs)' >&2; exit 1; }}; \
-                     for m in init bin/busybox bin/sh dev/console; do \
+                     ilist=$('{tu}' cpio -t < inner.cpio 2>/dev/null) || {{ echo 'inner.cpio is not a parseable newc archive (truncated/corrupt embedded inner initramfs)' >&2; exit 1; }}; \
+                     for m in init bin/td-sh bin/sh bin/td-init dev/console; do \
                          printf '%s\\n' \"$ilist\" | grep -q -x -F \"$m\" || {{ echo \"inner.cpio: member '$m' missing — the embedded inner initramfs is incomplete\" >&2; exit 1; }}; \
                      done; \
-                     '{bb}' cpio -i init < inner.cpio >/dev/null 2>&1 || {{ echo 'inner.cpio: could not extract inner /init' >&2; exit 1; }}; \
+                     '{tu}' cpio -i init < inner.cpio >/dev/null 2>&1 || {{ echo 'inner.cpio: could not extract inner /init' >&2; exit 1; }}; \
                      [ -f init ] || {{ echo 'inner.cpio: could not extract inner /init' >&2; exit 1; }}; \
                      grep -q -F {stage2} init || {{ echo 'inner.cpio: STAGE2 marker not inside the embedded inner initramfs (the nested second-stage init is not packed)' >&2; exit 1; }}"
                 ),
             ],
         )
-        .env("PATH", &post_bootstrap_path()),
+        .env("PATH", "{tools}"),
     );
 
     steps.push(Step::MkDir {
@@ -88,7 +89,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: kexec-spike-x86-64 is a well-formed two-kernel boot artifact — a bootable bzImage (0xAA55 + HdrS) plus a complete newc outer initramfs carrying the static busybox, td-kexec, an embedded second-boot bzImage, and a nested inner initramfs, with both the STAGE1 and STAGE2 /init markers packed. The behavioural kexec boot is the operator qemu-boot-kexec oracle.\n".into(),
+        content: "PASS: kexec-spike-x86-64 is a well-formed two-kernel boot artifact — a bootable bzImage (0xAA55 + HdrS) plus a complete newc outer initramfs carrying static td-sh, td-init and td-kexec, an embedded second-boot bzImage, and a nested inner initramfs, with both the STAGE1 and STAGE2 /init markers packed. The behavioural kexec boot is the operator qemu-boot-kexec oracle.\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -97,11 +98,11 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("kexec-spike-x86-64-test", "1.0")
-        .native_inputs(&["kexec-spike-x86-64", "busybox-x86-64"])
+        .native_inputs(&post_rust_inputs("gawk-x86-64-self", &["kexec-spike-x86-64"]))
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check kexec-spike-x86-64-test: build-plan --auto builds kexec-spike-x86-64 (the two-kernel kexec spike artifact: a bootable bzImage + an outer initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner initramfs) and asserts a complete newc archive carrying every spike member and both /init markers"
+echo ">> recipe-check kexec-spike-x86-64-test: build-plan --auto builds kexec-spike-x86-64 (the two-kernel kexec spike artifact: a bootable bzImage + an outer initramfs embedding static td-sh, td-init, td-kexec, a second-boot bzImage, and a nested inner initramfs) and asserts a complete newc archive carrying every spike member and both /init markers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run kexec-spike-x86-64-test 1
 "#,
