@@ -166,7 +166,7 @@ pub struct DeliveryRequest {
 /// Carries its connection authorization adapter between storage worker turns.
 /// Owning the adapter does not cache permission: publication authorizes again.
 /// Retire terminal failures with discard or Drop on a storage worker.
-/// CoordinationBusy retains the job for retry under its original deadline.
+/// CoordinationBusy retains the job under its unchanged finalization deadline.
 pub struct Delivery<'c, 's, 'r, 'a, C: Crypto, P, A: DeliveryAuthorization> {
     coordinator: &'c StoreCoordinator<'r, 'a, P>,
     authorization: A,
@@ -458,10 +458,13 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
     }
     /// Finish only after the session's terminating dot. This is preparation, not
     /// acceptance. Header-only and empty messages take their EOF decision here.
-    pub fn prepare(&mut self) -> Result<(), DeliveryError> {
+    /// Capture the queued finalization deadline once; it cannot extend the
+    /// original receiving lease. Publication retries retain this same cap.
+    pub fn prepare(&mut self, deadline: Deadline) -> Result<(), DeliveryError> {
         if self.failed {
             return Err(ports::Error::Invalid.into());
         }
+        self.deadline = self.deadline.min(deadline);
         let result = self.prepare_inner();
         self.failed |= result.is_err();
         result
@@ -491,6 +494,7 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
             return Err(ports::Error::Invalid.into());
         };
         self.stage = Stage::Prepared(writer.finish()?);
+        check_time(&self.coordinator.store, self.deadline, &mut self.last)?;
         Ok(())
     }
     pub fn discard(mut self) -> Result<(), DeliveryError> {
@@ -599,6 +603,10 @@ impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {
         if self.failed || !matches!(self.stage, Stage::Prepared(_)) {
             self.failed = true;
             return Err(ports::Error::Invalid.into());
+        }
+        if let Err(error) = check_time(&self.coordinator.store, self.deadline, &mut self.last) {
+            self.failed = true;
+            return Err(error.into());
         }
         let coordinator = self.coordinator;
         let mut state = coordinator.try_state().map_err(|error| match error {

@@ -21,12 +21,15 @@ use std::{
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const INBOX: MailboxId = MailboxId::from_bytes([2; 16]);
 const MAXIMUM: usize = 32768;
-struct Timer(AtomicU64);
+struct Timer(AtomicU64, AtomicU64);
 impl Clock for Timer {
     fn sample(&self) -> Result<Time, ports::Error> {
         Ok(Time {
             utc_ms: 0,
-            monotonic: Tick(self.0.load(Ordering::Relaxed)),
+            monotonic: Tick(
+                self.0
+                    .fetch_add(self.1.load(Ordering::Relaxed), Ordering::Relaxed),
+            ),
         })
     }
 }
@@ -146,7 +149,7 @@ fn fixture_with_peer(
     let mut root = fixture.locked();
     let spool_fixture = Fixture::new();
     let mut spool_root = spool_fixture.locked();
-    let clock = Arc::new(Timer(AtomicU64::new(1)));
+    let clock = Arc::new(Timer(AtomicU64::new(1), AtomicU64::new(0)));
     let resources = Limits {
         message_bytes: maximum,
         header_bytes: headers,
@@ -379,7 +382,7 @@ fn deliver<'r, 'a>(
     }
     assert_eq!(session.feed(b".\r\n").unwrap(), 3);
     assert_eq!(session.pending(), Pending::Commit);
-    delivery.prepare().unwrap();
+    delivery.prepare(deadline()).unwrap();
     let completion = delivery.commit().unwrap();
     session.committed(completion.outcome).unwrap();
     assert!(
@@ -601,7 +604,7 @@ fn header_limit_is_permanent_and_work_exhaustion_is_temporary() {
             assert!(
                 matches!(session.pending(), Pending::Reply { bytes, close:true } if bytes.starts_with(if resource { b"451" } else { b"552" }))
             );
-            assert!(delivery.prepare().is_err());
+            assert!(delivery.prepare(deadline()).is_err());
             delivery.discard().unwrap();
             assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
             assert_eq!(
@@ -686,7 +689,7 @@ fn quotas_refuse_before_354_and_revocation_refuses_before_commit() {
         delivery.write(bytes).unwrap();
         session.data_written(Ok(())).unwrap();
         assert_eq!(session.feed(b".\r\n").unwrap(), 3);
-        delivery.prepare().unwrap();
+        delivery.prepare(deadline()).unwrap();
         *policy.0.lock().unwrap() = false;
         assert!(matches!(
             delivery.commit(),
@@ -745,7 +748,7 @@ fn commit_uncertainty_never_accepts_and_known_success_survives_accounting_failur
             delivery.write(bytes).unwrap();
             session.data_written(Ok(())).unwrap();
             assert_eq!(session.feed(b".\r\n").unwrap(), 3);
-            delivery.prepare().unwrap();
+            delivery.prepare(deadline()).unwrap();
             let result = delivery.commit().unwrap();
             session.committed(result.outcome).unwrap();
             assert!(result.admission_stopped);
@@ -855,7 +858,7 @@ fn receiving_guard_spans_native_publication_and_sql_failure_never_accepts() {
             session.data_ready(Ok(())).unwrap();
             session.reply_sent().unwrap();
             assert_eq!(session.feed(b".\r\n").unwrap(), 3);
-            delivery.prepare().unwrap();
+            delivery.prepare(deadline()).unwrap();
             let result = delivery.commit().unwrap();
             session.committed(result.outcome).unwrap();
             drop(delivery);
@@ -915,7 +918,7 @@ fn large_folded_field_streams_through_spool_and_reopens_exactly() {
                 session.data_written(Ok(())).unwrap();
             }
             session.feed(b".\r\n").unwrap();
-            delivery.prepare().unwrap();
+            delivery.prepare(deadline()).unwrap();
             let result = delivery.commit().unwrap();
             session.committed(result.outcome).unwrap();
             assert!(
@@ -1019,7 +1022,7 @@ fn eof_trace_header_limit_is_a_permanent_commit_state_refusal() {
         session.feed(b".\r\n").unwrap();
         assert_eq!(session.pending(), Pending::Commit);
         assert!(matches!(
-            delivery.prepare(),
+            delivery.prepare(deadline()),
             Err(DeliveryError::HeaderLimit)
         ));
         session.message_too_large().unwrap();
@@ -1188,7 +1191,7 @@ fn delivery_rechecks_inbox_after_body_preparation() {
         delivery.write(bytes).unwrap();
         session.data_written(Ok(())).unwrap();
         session.feed(b".\r\n").unwrap();
-        delivery.prepare().unwrap();
+        delivery.prepare(deadline()).unwrap();
         // Inject an intervening native mutation; the public coordinator does not
         // currently expose another mutation while this job is outstanding.
         delivery
@@ -1284,7 +1287,7 @@ fn idle_delivery_does_not_block_a_worker_and_commit_uses_new_thread_anchor() {
             MAXIMUM as u64
         );
         waiting.write(b"second\r\n").unwrap();
-        waiting.prepare().unwrap();
+        waiting.prepare(deadline()).unwrap();
         let second = waiting.commit().unwrap();
         assert_eq!(second.thread, first.thread);
         assert!(second.outcome.unwrap().sequence > first.outcome.unwrap().sequence);
@@ -1321,7 +1324,7 @@ fn busy_publication_can_be_rescheduled_without_losing_prepared_delivery() {
             )
             .unwrap();
         job.write(b"\r\n").unwrap();
-        job.prepare().unwrap();
+        job.prepare(deadline()).unwrap();
         let guard = coordinator.state.lock().unwrap();
         let (mut job, result) = std::thread::scope(|scope| {
             scope
@@ -1424,7 +1427,7 @@ fn policy_busy_is_a_failed_delivery_not_a_coordination_retry() {
             )
             .unwrap();
         job.write(b"\r\n").unwrap();
-        job.prepare().unwrap();
+        job.prepare(deadline()).unwrap();
         let guard = policy.0.lock().unwrap();
         assert!(matches!(
             job.commit(),
@@ -1623,7 +1626,7 @@ fn real_tcp_delivery_acknowledges_only_recoverable_mail() {
                                 }
                                 Pending::Commit => {
                                     let mut job = delivery.take().unwrap();
-                                    job.prepare().unwrap();
+                                    job.prepare(deadline()).unwrap();
                                     let result = job.commit().unwrap();
                                     assert!(result.outcome.is_ok());
                                     if let Some(tick) = late {
@@ -1680,37 +1683,41 @@ fn owned_policy(policy: &Policy, retired: &Arc<AtomicU64>) -> OwnedPolicy {
 fn delivery_carries_worker_local_authorization_to_later_publication() {
     fixture(|coordinator, spool, policy, _, routes| {
         let coordinator = &*coordinator;
-        let retired = Arc::new(AtomicU64::new(0));
         let session = session(routes);
-        let result = std::thread::scope(|scope| {
-            let job = scope
+        let (result, retired) = std::thread::scope(|scope| {
+            let (job, retired) = scope
                 .spawn(|| {
-                    let authorization = owned_policy(policy, &retired);
-                    coordinator
-                        .reserve_delivery(
-                            &td_crypto::Provider,
-                            &mut Random(10),
-                            spool,
-                            authorization,
-                            &session,
-                            request(),
-                        )
-                        .unwrap()
+                    retry_reservation(|| {
+                        let retired = Arc::new(AtomicU64::new(0));
+                        let authorization = owned_policy(policy, &retired);
+                        coordinator
+                            .reserve_delivery(
+                                &td_crypto::Provider,
+                                &mut Random(10),
+                                spool,
+                                authorization,
+                                &session,
+                                request(),
+                            )
+                            .map(|job| (job, retired))
+                    })
+                    .unwrap()
                 })
                 .join()
                 .unwrap();
             assert_eq!(retired.load(Ordering::SeqCst), 0);
-            scope
+            let result = scope
                 .spawn(move || {
                     let mut job = job;
                     job.write(b"Subject: worker transfer\r\n").unwrap();
                     job.write(b"\r\n").unwrap();
                     job.write(b"body\r\n").unwrap();
-                    job.prepare().unwrap();
+                    job.prepare(deadline()).unwrap();
                     job.commit().unwrap()
                 })
                 .join()
-                .unwrap()
+                .unwrap();
+            (result, retired)
         });
         assert_eq!(retired.load(Ordering::SeqCst), 1);
         assert_eq!(spool.status().unwrap().occupied_slots, 0);
@@ -1726,20 +1733,23 @@ fn owned_delivery_authorization_still_rechecks_revocation_and_releases_on_refusa
     for discard in [false, true] {
         fixture(|coordinator, spool, policy, _, routes| {
             let coordinator = &*coordinator;
-            let retired = Arc::new(AtomicU64::new(0));
             let session = session(routes);
-            let mut job = coordinator
-                .reserve_delivery(
-                    &td_crypto::Provider,
-                    &mut Random(10),
-                    spool,
-                    owned_policy(policy, &retired),
-                    &session,
-                    request(),
-                )
-                .unwrap();
+            let (mut job, retired) = retry_reservation(|| {
+                let retired = Arc::new(AtomicU64::new(0));
+                coordinator
+                    .reserve_delivery(
+                        &td_crypto::Provider,
+                        &mut Random(10),
+                        spool,
+                        owned_policy(policy, &retired),
+                        &session,
+                        request(),
+                    )
+                    .map(|job| (job, retired))
+            })
+            .unwrap();
             job.write(b"\r\n").unwrap();
-            job.prepare().unwrap();
+            job.prepare(deadline()).unwrap();
             *policy.0.lock().unwrap() = false;
             std::thread::scope(|scope| {
                 let retired = &retired;
@@ -1804,4 +1814,103 @@ fn retry_reservation<T>(
     Err(DeliveryError::Storage(UploadError::Ledger(
         logical::Error::Slot(crate::ownership::Error::Contended),
     )))
+}
+
+#[test]
+fn finalization_deadline_cannot_extend_receiving_or_renew_on_busy() {
+    for (receiving, finalization) in [(100, 10), (10, 100)] {
+        fixture(|coordinator, spool, policy, clock, routes| {
+            let session = session(routes);
+            let mut random = Random(10);
+            let request = DeliveryRequest {
+                deadline: Deadline::after(Tick(0), receiving).unwrap(),
+                ..request()
+            };
+            let mut job = retry_reservation(|| {
+                coordinator.reserve_delivery(
+                    &td_crypto::Provider,
+                    &mut random,
+                    spool,
+                    policy,
+                    &session,
+                    request,
+                )
+            })
+            .unwrap();
+            job.write(b"\r\n").unwrap();
+            job.prepare(Deadline::after(Tick(0), finalization).unwrap())
+                .unwrap();
+            let guard = coordinator.state.lock().unwrap();
+            assert!(matches!(job.commit(), Err(DeliveryError::CoordinationBusy)));
+            clock.0.store(10, Ordering::Relaxed);
+            assert!(matches!(
+                job.commit(),
+                Err(DeliveryError::Storage(UploadError::Store(
+                    ports::Error::Deadline
+                )))
+            ));
+            drop(guard);
+            job.discard().unwrap();
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+            Vec::new()
+        });
+    }
+}
+
+#[test]
+fn finalization_refuses_expiry_during_spool_finish_and_repeated_preparation() {
+    for expire_during_finish in [false, true] {
+        fixture(|coordinator, spool, policy, clock, routes| {
+            let session = session(routes);
+            let mut random = Random(10);
+            let request = request();
+            let mut job = retry_reservation(|| {
+                coordinator.reserve_delivery(
+                    &td_crypto::Provider,
+                    &mut random,
+                    spool,
+                    policy,
+                    &session,
+                    request,
+                )
+            })
+            .unwrap();
+            job.write(b"\r\n").unwrap();
+            let cap = Deadline::after(Tick(0), 4).unwrap();
+            if expire_during_finish {
+                // Native spool checks still use the enclosing receiving deadline.
+                // Cross the shorter cap only after finish has produced its input.
+                clock.1.store(1, Ordering::Relaxed);
+                assert!(matches!(
+                    job.prepare(cap),
+                    Err(DeliveryError::Storage(UploadError::Store(
+                        ports::Error::Deadline
+                    )))
+                ));
+                clock.1.store(0, Ordering::Relaxed);
+                assert!(matches!(job.stage, Stage::Prepared(_)));
+            } else {
+                job.prepare(cap).unwrap();
+                assert!(matches!(
+                    job.prepare(deadline()),
+                    Err(DeliveryError::Storage(UploadError::Store(
+                        ports::Error::Invalid
+                    )))
+                ));
+                assert_eq!(job.deadline, cap);
+            }
+            assert!(job.failed);
+            assert!(matches!(
+                job.commit(),
+                Err(DeliveryError::Storage(UploadError::Store(
+                    ports::Error::Invalid
+                )))
+            ));
+            job.discard().unwrap();
+            assert_eq!(spool.status().unwrap().occupied_slots, 0);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+            Vec::new()
+        });
+    }
 }

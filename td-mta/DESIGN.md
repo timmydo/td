@@ -1517,6 +1517,16 @@ transition without exposing a mutable session. Storage and TLS handoffs
 yield without further socket work. Client idle timing pauses during
 dispatched work and restarts on completion; the worker still owes its
 original DATA/session deadline and its own execution budget.
+The native delivery preparation call requires its trusted caller to
+supply the finalization deadline captured when that work is queued. A
+production dispatcher is not implemented yet. The call narrows the job's
+enforcement deadline once, covering header completion and publication;
+coordination retries retain that cap and refuse once it expires even
+while the lock is busy. The ledger reservation, work meter and spool
+retain their original receiving bounds. It checks again after spool
+preparation; only the native transaction can accept the message. A known
+successful commit remains successful when completion is observed after
+that deadline.
 
 Accepted MAIL commands count toward the fixed 100-transaction limit even
 after RSET, EHLO or STARTTLS. Expiry at a legal command boundary queues

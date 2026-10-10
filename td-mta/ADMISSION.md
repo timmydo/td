@@ -160,15 +160,19 @@ preparing its body.
 Reserve, replan, commit and checkpoint/expiry maintenance try to acquire
 that mutex. Contention returns Busy before effects, except delivery
 commit returns its distinct CoordinationBusy variant. Only that variant
-promises a retryable prepared delivery under the original deadline;
-policy or storage Busy remains an ordinary failed attempt. Once acquired,
-the mutex covers planning, native publication and ledger settlement.
-Delivery plans against the then-current account snapshot, so an earlier
-concurrent delivery can supply its thread anchor. Uploads retain the
-existing one-time explicit sequence-conflict replan and refresh that
-retry's account endpoint under the commit lock, closing the gap between
-replan and retry. Their fresh body/lease rows do not depend on earlier
-account contents.
+promises a retryable prepared delivery under its captured deadline;
+policy or storage Busy remains an ordinary failed attempt. Delivery
+preparation narrows the job's enforcement deadline to the finalization
+cap its trusted caller must capture at dispatch. The ledger reservation,
+work meter and spool retain their original receiving bounds; retries
+cannot renew either deadline. Expired publication refuses even while
+coordination is busy. Once acquired, the mutex covers planning, native
+publication and ledger settlement. Delivery plans against the then-
+current account snapshot, so an earlier concurrent delivery can supply
+its thread anchor. Uploads retain the existing one-time explicit
+sequence-conflict replan and refresh that retry's account endpoint under
+the commit lock, closing the gap between replan and retry. Their fresh
+body/lease rows do not depend on earlier account contents.
 
 Drop/discard retirement and passive usage/status inspection may wait for
 the mutex;
