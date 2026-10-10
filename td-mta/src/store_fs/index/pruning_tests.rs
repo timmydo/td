@@ -429,7 +429,7 @@ fn native_failures_roll_back_deletion_and_floor_together() {
             let hit = Arc::new(AtomicU64::new(0));
             {
                 let writer = lock(&store.writer).unwrap();
-                let budget = Arc::clone(&writer.native.budget);
+                let budget = Arc::clone(&writer.native.scope.budget);
                 let seen = Arc::clone(&hit);
                 lock(&writer.native.connection)
                     .unwrap()

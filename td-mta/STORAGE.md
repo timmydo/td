@@ -19,7 +19,7 @@ LOCK                            cooperative process writer lock
 ```
 
 Complete immutable message, upload and transmitted-copy bytes live in the
-`blob_chunks.body` rows. Relational columns store mailbox names, membership,
+`blobs.body` column. Relational columns store mailbox names, membership,
 keywords, object IDs, lengths, SHA-256 digests, threading, SMTP envelopes,
 submissions, recipients, leases, import mappings and retained changes.
 No generic binary record table or generic reference table is persisted.
@@ -34,9 +34,9 @@ SQLite uses its bundled Unix VFS; td-owned Rust adds no direct syscall
 or unsafe allowance. A database or sidecar symlink, wrong owner/mode,
 extra hard link or oversized file refuses startup. Creation refuses
 preexisting database/WAL/SHM paths. Application ID, exact schema version
-3, closed schema and 4096-byte pages are checked before accepting the
+4, closed schema and 4096-byte pages are checked before accepting the
 store. Full integrity_check, foreign_key_check, per-Email anchor
-cardinality and complete blob chunk geometry are explicit
+cardinality and body-length constraints are explicit
 validate_integrity maintenance, not an opening scan. SQLite validates
 physical pages on access and body pins verify their full digest. Earlier
 formats are refused; no automatic migration or overwrite is provided.
@@ -47,8 +47,12 @@ root; the disposable ingress section below owns its cleanup contract.
 
 ## 2. SQLite and resource policy
 
+Measurement reports below identify historical fixtures and artifacts. Results
+from the former chunk-row schema do not qualify this BLOB layout; retain the
+existing fixtures and rerun those relevant to a release or changed boundary.
+
 The private dependency is rusqlite 0.40.2 with bundled SQLite 3.53.2 and
-hooks and limits features. Exact manifests, locks, active features and
+blob, hooks and limits features. Exact manifests, locks, active features and
 archive checksums are pinned by builder/src/crypto_policy.rs. No system SQLite, extension, attachment,
 external SQL or ambient pkg-config selection is accepted. Runtime statements
 are closed, parameterized queries. Public interfaces expose typed rows, keys,
@@ -61,16 +65,32 @@ connection requests a 128 KiB page-cache target, not a hard ceiling. Spilling
 permits a maximum body write without retaining its dirty pages in RAM.
 Compile-time limits cap SQLite's shared requested heap at 16 MiB and each
 allocation at 9 MiB. These limits do not measure allocator overhead or RSS.
-SQL values are bounded to 69632 bytes (64 KiB chunks plus row headroom); SQL text is at most 8192 bytes. Application batches contain at most
+SQL values are bounded to 33558528 bytes (32 MiB plus row headroom);
+SQL text is at most 8192 bytes. Application batches contain at most
 4096 operations and 1 MiB transient encoded metadata, with 1024-byte keys and
 65536-byte row values. Body content never enters these metadata buffers.
 
 The complete encoded message or upload has a hard 32 MiB ceiling. Configured
 message_bytes may reduce it. Body writes and reads use chunks of at most
-64 KiB, with fixed caller/writer scratch and indexed chunk rows. At most two
-chunk reads serve an unaligned 64 KiB request; no handle repeatedly walks a
-message-sized overflow chain. Chunk insertion and final durable commit are
-synchronous native operations: checks before and after them do not promise a
+64 KiB, with fixed caller/writer scratch and a retained incremental BLOB
+handle. The body is the last column so zeroblob insertion can retain its
+zero-filled tail without materializing a message-sized SQL record. The SQL
+value limit admits that representation; the native heap limits are unchanged.
+Blob rows are immutable: production inserts, reads or deletes them; it never
+updates their metadata. An SQL UPDATE can materialize the complete record
+and exceed the native allocation cap for a large body. zeroblob also writes
+zero-filled pages before the incremental writer replaces them. Cache spill
+can therefore add a page read and rewrite to initial allocation; bounded
+caller buffers do not imply a single physical write pass.
+
+Keeping content in the same row makes metadata leaf pages less dense:
+SQLite retains a prefix of each body in its leaf cell. Metadata enumeration,
+usage accounting and foreign-key maintenance can touch more pages than a
+separate metadata table would. We accept that locality tradeoff for one
+immutable row and no additional body-reference lifecycle; VM fuel is not
+an I/O cost measurement.
+Allocation of its pages and final durable commit are synchronous native
+operations: checks before and after them do not promise a
 scheduling yield inside each page allocation or fsync. A supplied Read implementation must
 itself obey its admitted I/O deadline; a synchronous call cannot forcibly
 interrupt an arbitrary reader.
@@ -136,7 +156,9 @@ The caller retains input/slot admission and prepared-source ownership.
 Local framing validation grants no account or reservation authority.
 Each source identifies a BlobId and supplies a std::io::Read. Each source matches exactly one Blob PUT. The matching
 BlobRow supplies the exact expected length, SHA-256, kind and creation time.
-The writer admits the maximum length before inserting a row, then inserts and hashes bounded chunk rows. Exact length, physical
+The writer admits the maximum length before inserting a row, then inserts
+a zeroblob and fills it through one writable incremental handle while hashing.
+The handle closes before COMMIT. Exact length, physical
 source EOF and digest must agree before COMMIT. Readers may wrap caller-owned
 provisional files, but those files carry no durable store authority.
 
@@ -159,9 +181,9 @@ and metadata. No separate publication proof, body rename or permanent-body orpha
 collection is required. The separate provisional ingress store below supplies
 prepared file inputs; service admission remains separate. Existing body
 identity and bytes are immutable; an identical Blob PUT is a
-no-op that retains its original changed sequence. Every chunk has at most
-65536 bytes and a consecutive ordinal; empty bodies have no chunks. No SQL
-statement assembles a complete message or rewrites an existing body. Blob IDs have a
+no-op that retains its original changed sequence. Each row contains one BLOB
+whose byte length equals the declared length; empty bodies use an empty BLOB.
+No statement assembles or rewrites an existing message. Blob IDs have a
 permanent native registry and cannot be reused after deletion.
 
 Native deferred foreign keys enforce final owning relationships even when a
@@ -442,21 +464,18 @@ body; already captured views remain usable. ViewIdentity contains account,
 epoch, committed sequence and history floor. SQL columns are decoded into
 caller buffers, without loading a mailbox into RAM.
 
-A verified body input and completed PinnedBlob borrow the live view.
-Indexed chunk reads use the retained read transaction to preserve
-identity. A read error that ends that transaction permanently fails the
-view; later operations cannot silently switch snapshots. Length/digest
-verification precedes completed random access. Before issuing the
-completed pin, one closed query also rejects negative chunk ordinals and
-ordinals beyond the declared body's final chunk. Two primary-key range
-existence probes use the same account/blob and retained snapshot,
-without reading extra body payloads. Empty bodies require no chunk rows.
-The original native deadline and VM allowance cover this check; failure
-grants no completed pin. Together with sequential chunk length/digest
-verification, this checks the selected body's exact extent, not the rest
-of the store. The borrow and explicit destructor keep the pooled
-connection loan live until the body owner is destroyed, including when
-held inside a MIME owner.
+A verified body input and completed PinnedBlob borrow the live view and retain
+one read-only incremental BLOB handle from input construction through final
+random reads. Opening checks its actual byte length; streaming checks the
+complete digest before issuing a completed pin. The handle and view preserve
+the original snapshot across committed deletion. No extent query or repeated
+handle opening is needed. Body owners are worker-local, while an unborrowed
+view remains Send + Sync. Open and use the body on its assigned worker.
+Dropping a body closes its handle before releasing the view borrow. Forgetting
+a body makes that view refuse further work and retire its pool slot rather
+than reuse a connection with an unclosed handle. A close failure also retires
+the slot. The retained handle is private to the native adapter; public body
+interfaces expose neither a native connection nor a native handle.
 The native connection retains one shared sticky snapshot-loss error for
 metadata reads, body-input construction/polls/completion and completed
 pin reads/freshness checks. Each boundary checks SQL transaction liveness
@@ -466,9 +485,12 @@ cannot revive that captured identity. These checks add no SQL or clock
 samples and grant no replacement snapshot. The fixed error cell is part
 of the cold connection owner, with no per-poll allocation.
 Drop rolls back the read transaction before returning the connection;
-snapshot loss or failed cleanup closes and retires the slot. Cleanup
+snapshot loss or failed cleanup retires the slot. A forgotten handle can
+leak native storage, but cleanup still attempts rollback and never reuses it. Cleanup
 bypasses expired request fuel without clearing its sticky failure.
-Reopen restores retired capacity.
+Reopen restores retired capacity after ordinary failures. A deliberately
+forgotten native handle can keep a checkpoint Busy until process exit;
+retiring its slot does not claim to recover leaked native resources.
 
 Deleting an unreferenced blob removes body and metadata transactionally. Old
 views can still read its old bytes through their WAL snapshot. SQLite reuses
@@ -941,7 +963,7 @@ update require the persisted old epoch to match the owner; a missing or
 mismatched row refuses with Corrupt. The ordinary commit classifier
 governs acknowledgement: only known durable success updates the
 in-memory epoch and returns the owner, including success observed after
-the deadline. Accounts, endpoints, floors, objects, body chunks,
+the deadline. Accounts, endpoints, floors, objects, bodies,
 retained changes and the used-blob-ID registry are preserved.
 
 The restored-epoch process-death oracle first creates a real backup
@@ -1548,8 +1570,7 @@ in full into RAM.
 
 | Table | Key | Authoritative value |
 | --- | --- | --- |
-| `blobs` | blob ID | Kind (message/upload), length, SHA-256, creation time |
-| `blob_chunks` | blob ID + chunk ordinal | Immutable body bytes, at most 64 KiB per row |
+| `blobs` | blob ID | Kind (message/upload), length, SHA-256, creation time, immutable body BLOB |
 | `mailboxes` | mailbox ID | Name, parent ID, role, sort order, subscription state |
 | `emails` | email ID | Message blob ID, thread ID, receivedAt, SMTP receipt/envelope metadata |
 | `memberships` | email ID + mailbox ID | Empty; presence means membership |
@@ -1973,21 +1994,22 @@ The separate ignored `maximum_wal_crash_recovery_and_checkpoint` fixture
 qualifies the near-ceiling WAL path. Its test-only producer bypasses normal
 `reserve_wal` admission so it can reach the physical limit with a small
 database: it commits a valid 32 MiB body, checkpoints, holds an old read
-snapshot, then alternates changed 64 KiB rows in separate commits using one
-bounded UPDATE statement per row. It finishes with a metadata commit and
-parks all nine native connections. The producer checks the 34 MiB SHM file
+snapshot, then alternates changed 64 KiB ranges through an incremental
+BLOB handle in separate commits. It fills the final frames with transactions
+that change and restore one body byte before commit, then parks all nine
+native connections. The producer checks the 34 MiB SHM file
 bound. The parent kills that exact child with SIGKILL, checks the complete
 aligned WAL, and reopens the store. Recovery occurs while the first
 connection opens; all eight readers plus the writer are present for the
-subsequent TRUNCATE checkpoint. The parent verifies the final metadata
-commit and full body through the recovered WAL, then checks the zero-length
+subsequent TRUNCATE checkpoint. The parent verifies unchanged metadata
+and the full body through the recovered WAL, then checks the zero-length
 WAL, integrity, metadata and body after checkpoint. The test also checks
 the 8 GiB database bound, but its database is only about
 32 MiB. That small-database fixture does not qualify an 8 GiB database
 checkpoint; the separate maximum-database fixture below covers its own
 body-dominated case. Normal reservation scheduling remains unqualified.
-The producer changes normally immutable body chunks and
-`created_at` without advancing the account sequence; its final state is
+The producer changes normally immutable body ranges without advancing the
+account sequence; its final state is
 valid for this physical WAL oracle but cannot come from the public API.
 The snapshot begins at an empty WAL. With automatic checkpointing disabled,
 the test does not qualify a reader pinned inside a large WAL.
@@ -2097,18 +2119,20 @@ Never apply this reset to a valid database with authoritative bodies.
 The bundled SQLite compile retains upstream optional modules; closed runtime
 queries expose none as an API. Runtime version admission requires 3.53.2.
 
-Small body reads admit one bounded SQLite query per call and fetch at most two
-64 KiB chunks, including for an unaligned request. SQLite may materialize a
-complete chunk for a smaller returned slice; MIME byte meters count returned
-logical bytes, not that native copying or B-tree work. Native VM/heap caps and
-the original deadline apply separately. No per-pin chunk cache is reserved.
-The WITHOUT ROWID chunk table favors one account/blob/ordinal key lookup;
-its 64 KiB payloads may deepen native B-trees. This fixed per-call amplification
-is admitted, not a claim of physical I/O equal to returned MIME bytes.
+Small body reads use the retained incremental handle and return at most 64
+KiB into caller storage. SQLite owns page traversal and its overflow-page
+cache; logical MIME byte meters do not count native page work. Native heap
+caps and the original deadline still apply, and each read consumes one
+unit of the original finite work allowance. No per-pin application body
+buffer is reserved. SQLite retains an overflow-page index for each open
+handle, proportional to its body pages, until close (roughly 64 KiB for a
+32 MiB body at 4096-byte pages). These indexes share the existing native
+heap cap with all connections; eight such handles retain roughly 512 KiB
+there, and exhaustion refuses the operation.
 
 The separate IndexReadView::verify_bodies primitive enumerates all
 returned Blob rows for one account snapshot and reuses PinnedBlobInput
-for complete length, digest and extent verification. Caller-owned
+for complete length and digest verification. Caller-owned
 64 KiB scratch is reused for every body; only fixed cursor/row buffers
 and one digest/input owner are retained. Explicit blob-count and total
 logical-byte limits are checked before opening each body, and every
@@ -2120,15 +2144,15 @@ explicit maintenance views retain their one larger finite allowance.
 Neither kind renews fuel within verification.
 
 CompleteBodies reports the captured ViewIdentity and counts only after
-every enumerated body finishes and enumeration terminates successfully.
-An empty account can complete with zero limits; any native, crypto,
-clock, capacity, corruption or snapshot-loss failure yields no report.
-The report is historical data, not a body pin, authentication credential
-or ongoing freshness proof. Physical/index consistency and orphan chunk
-absence require separate whole-store maintenance; metadata checks and
-body reports must identify the same snapshot before an offline
-coordinator combines them. This primitive alone grants no operational
-authority or complete crash/fault/resource qualification.
+every enumerated body finishes and enumeration terminates successfully. An
+empty account can complete with zero limits; any native, crypto, clock,
+capacity, corruption or snapshot-loss failure yields no report. The report
+is historical data, not a body pin, authentication credential or ongoing
+freshness proof. Physical/index consistency requires separate whole-store
+maintenance; metadata checks and body reports must identify the same
+snapshot before an offline coordinator combines them. This primitive alone
+grants no operational authority or complete crash/fault/resource
+qualification.
 
 The pure account_checks::combine guard packages CompleteMetadata and
 CompleteBodies only after equality of account, epoch, committed sequence
@@ -2166,25 +2190,21 @@ Full validate_integrity maintenance refuses a stopped writer and holds
 the writer fence throughout its scan. Existing read views remain usable;
 new view capture and commits return Busy until it finishes. It reports
 physical SQLite, foreign-key consistency, per-Email anchor cardinality
-and complete blob chunk geometry, not body digests, full domain
+and body lengths, not body digests, full domain
 consistency or protocol authorization.
 
-After the physical, foreign-key and anchor checks, one global blob scan
-uses two chunk primary-key probes scoped to each account/blob. The
-stored count must equal ceil(length/65536), every ordinal must be in that
-extent, and each chunk must have exactly min(65536, length-ordinal*65536)
-bytes. Unique chunk keys plus count and ordinal bounds establish the
-contiguous layout; an empty blob must have no chunks. Malformed geometry
-returns Corrupt. No whole body is buffered or hashed by this query. It
-shares the original maintenance fence, deadline and finite VM allowance;
-resource, clock or I/O refusal cannot grant completion. Selected body
-pins still perform their own length, digest and extent verification.
+SQLite integrity_check validates the length(body)=length CHECK constraint;
+no separate body-layout scan is needed. SQLite obtains BLOB length without
+buffering the whole payload. A mismatch returns Corrupt. Maintenance shares
+one fence, deadline and finite VM allowance; resource, clock or I/O refusal
+cannot grant completion. Selected body pins independently check length and
+digest.
 
 ## Offline verification command
 
 `td-mta store verify --root PATH --account ID [--timeout-seconds N]`
 opens an existing store under its cooperative writer lock, runs full SQLite
-physical/index/foreign-key, anchor-cardinality and chunk-geometry validation,
+physical/index/foreign-key, anchor-cardinality and body-length validation,
 then checks the selected account's metadata references, mailbox forest,
 recipient coverage and every declared body's complete digest. The canonical
 local AccountId is required. Physical checks cover the database; semantic

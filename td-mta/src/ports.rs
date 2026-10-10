@@ -200,7 +200,7 @@ pub enum ChangeStep {
 pub trait ReadView: Send + Sync {
     fn identity(&self) -> ViewIdentity;
     /// Scan strictly after the cursor, within the pinned history and endpoint.
-    /// The backend uses native change indexes and bounded body-chunk rows.
+    /// The backend seeks native change indexes in the captured snapshot.
     fn next_change(&mut self, after: ChangeCursor, kind: ObjectType) -> Result<ChangeStep, Error>;
     /// Decode and validate into caller storage; None means absent in this view.
     fn get<'a>(
@@ -383,8 +383,8 @@ pub trait Store: Send + Sync {
         transaction: TransactionInput<'_>,
     ) -> Result<Commit, CommitFailure>;
 }
-/// The owning view/lease remains live while this reader is used.
-pub trait BlobReader: Send {
+/// The owning view/lease remains live while this worker-local reader is used.
+pub trait BlobReader {
     fn len(&self) -> u64;
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -592,7 +592,7 @@ mod crypto_boundary_tests {
         assert_eq!(
             dependencies,
             [
-                r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }"#,
+                r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
                 r#"td-json = { path = "../td-json" }"#,

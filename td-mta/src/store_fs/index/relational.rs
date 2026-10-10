@@ -630,7 +630,7 @@ mod tests {
             0
         );
         db.execute(
-            "INSERT INTO blob_chunks(account,blob,ordinal,body) VALUES(?1,?2,0,x'616263')",
+            "UPDATE blobs SET body=x'616263' WHERE account=?1 AND id=?2",
             params![ACCOUNT.as_bytes().as_slice(), MESSAGE.as_bytes().as_slice()],
         )
         .unwrap();
@@ -644,7 +644,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.query_row(
-                "SELECT body FROM blob_chunks WHERE account=?1 AND blob=?2 AND ordinal=0",
+                "SELECT body FROM blobs WHERE account=?1 AND id=?2",
                 params![ACCOUNT.as_bytes().as_slice(), MESSAGE.as_bytes().as_slice()],
                 |r| r.get::<_, Vec<u8>>(0)
             )
@@ -844,63 +844,35 @@ mod tests {
         assert!(steps.load(Ordering::Relaxed) < 600_000);
     }
     #[test]
-    fn chunks_are_bounded_account_scoped_and_deleted_with_the_blob() {
+    fn body_length_matches_metadata_and_deletion_removes_payload() {
         let db = database();
         populate(&db);
-        let account = ACCOUNT.as_bytes().as_slice();
-        let blob = UPLOAD.as_bytes().as_slice();
-        for (ordinal, body) in [(0, b"abc".as_slice()), (511, b"x".as_slice())] {
-            db.execute(
-                "INSERT INTO blob_chunks VALUES(?1,?2,?3,?4)",
-                params![account, blob, ordinal, body],
-            )
-            .unwrap();
-        }
         assert!(db
             .execute(
-                "INSERT INTO blob_chunks VALUES(?1,?2,512,x'00')",
-                params![account, blob]
-            )
-            .is_err());
-        assert!(db
-            .execute(
-                "INSERT INTO blob_chunks VALUES(?1,?2,1,x'')",
-                params![account, blob]
-            )
-            .is_err());
-        assert!(db
-            .execute(
-                "INSERT INTO blob_chunks VALUES(?1,?2,1,zeroblob(65537))",
-                params![account, blob]
-            )
-            .is_err());
-        assert!(db
-            .execute(
-                "INSERT INTO blob_chunks VALUES(?1,?2,0,x'00')",
-                params![[42u8; 16].as_slice(), blob]
+                "UPDATE blobs SET body=x'' WHERE account=?1 AND id=?2",
+                params![ACCOUNT.as_bytes().as_slice(), UPLOAD.as_bytes().as_slice()]
             )
             .is_err());
         db.execute_batch("BEGIN").unwrap();
         delete(&db, ACCOUNT, Key::Blob(UPLOAD)).unwrap();
         assert_eq!(
-            db.query_row("SELECT count(*) FROM blob_chunks", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
+            db.query_row(
+                "SELECT count(*) FROM blobs WHERE id=?1",
+                [UPLOAD.as_bytes().as_slice()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             0
         );
         db.execute_batch("ROLLBACK").unwrap();
         assert_eq!(
-            db.query_row("SELECT count(*) FROM blob_chunks", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        delete(&db, ACCOUNT, Key::Blob(UPLOAD)).unwrap();
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM blob_chunks", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
+            db.query_row(
+                "SELECT length(body) FROM blobs WHERE id=?1",
+                [UPLOAD.as_bytes().as_slice()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
         );
     }
     #[test]

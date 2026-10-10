@@ -444,7 +444,7 @@ fn native_failures_at_each_lookup_stage_remain_errors() {
             seed(&store, ACCOUNT, &[(email(0), thread(1), "a@b")]);
             let mut view = store.view(ACCOUNT, deadline()).unwrap();
             let native = view.native().unwrap();
-            let budget = Arc::clone(&native.budget);
+            let budget = Arc::clone(&native.scope.budget);
             let seen = Arc::new(AtomicU64::new(0));
             let reads = Arc::clone(&seen);
             lock(&native.connection)

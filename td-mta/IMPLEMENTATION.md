@@ -556,20 +556,20 @@ store mutations, live reload or filesystem log rotation in this task.
 ## M05 — Relational SQLite metadata and immutable bodies
 
 Private-root validation, bounded database paths and the persistent LOCK remain.
-SQLite owns exact message/upload/transmission bytes as immutable chunk rows
+SQLite owns exact message/upload/transmission bytes as immutable body BLOBs
 alongside explicit relational domain columns and native indexes. Generic
 encoded record and reference tables, permanent raw-file publication and
 committed-body file collection are removed. Application codecs remain
 transient typed operation/read adapters. The private dependency retains its
 existing pinned source closure; no package is added.
 
-Implemented boundaries include fresh create/reopen and schema-3 refusal of older
+Implemented boundaries include fresh create/reopen and schema-4 refusal of older
 stores, expected-sequence transactions, deferred owning foreign keys, parent
 cycle checks, 32 MiB body limit and 64 KiB streaming, exact length/EOF/digest
 verification, snapshot-borrowed body readers, permanent blob IDs, native indexed
 changes and explicit WAL checkpoint. Startup checks the closed schema/header
 and epoch; full integrity_check/foreign_key_check, anchor cardinality and
-complete blob chunk geometry belong to explicit validate_integrity
+body lengths belong to explicit validate_integrity
 maintenance. WAL recovery/checkpoint are
 synchronous native boundaries; deadline checks cannot interrupt their
 individual calls. Body/source failure rolls back metadata
@@ -2861,7 +2861,7 @@ The offline selected-account verification command is implemented:
 combines physical database validation and snapshot-bound account metadata/body
 checks under the cooperative writer lock, with versioned JSON and explicit
 account scope. STORAGE.md defines deadlines, result fields, exit codes and
-SQLite recovery/sidecar effects. Process tests exercise real persisted chunks,
+SQLite recovery/sidecar effects. Process tests exercise real persisted bodies,
 digest corruption, shared object IDs, lock/policy refusal and invalid arguments.
 The stopped-database backup command is also implemented:
 `td-mta backup --root PATH --destination PATH [--timeout-seconds N]`.

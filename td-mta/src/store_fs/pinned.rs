@@ -1,5 +1,5 @@
 //! Snapshot-bound verification and bounded random reads of immutable SQLite bodies.
-use super::{index::Native, IndexReadView};
+use super::{index::BodyRead, IndexReadView};
 use crate::{
     format::{
         key::Key,
@@ -29,10 +29,10 @@ impl Clock for VerifyClock<'_> {
 }
 fn checked<T>(
     clock: &VerifyClock<'_>,
-    native: &Native,
+    body: &BodyRead<'_>,
     run: impl FnOnce() -> Result<T, PolicyError>,
 ) -> Result<T, PolicyError> {
-    native.read_snapshot(|_| {
+    body.read_snapshot(|| {
         clock.sample()?;
         let result = run();
         clock.sample()?;
@@ -59,23 +59,20 @@ impl IndexReadView<'_, '_> {
         if row.length > max_bytes {
             return Err(PolicyError::Capacity);
         }
-        let rowid = self.blob_rowid(id)?;
-        let (native, deadline) = self.blob_scope()?;
+        let body = self.open_body(id, row.length)?;
+        let deadline = body.deadline();
         let clock = VerifyClock {
-            source: native,
+            source: body.clock(),
             deadline,
             last: AtomicU64::new(0),
         };
-        let digest = checked(&clock, native, || {
-            crypto.sha256().map_err(PolicyError::from)
-        })?;
+        let digest = checked(&clock, &body, || crypto.sha256().map_err(PolicyError::from))?;
         Ok(PinnedBlobInput {
-            native,
+            body,
             crypto,
             digest,
             id,
             row,
-            rowid,
             position: 0,
             clock,
             failed: None,
@@ -84,12 +81,11 @@ impl IndexReadView<'_, '_> {
 }
 /// Retains the pooled view borrow; an error retires input without further I/O.
 pub struct PinnedBlobInput<'a, 'c, C: Crypto> {
-    native: &'a Native,
+    body: BodyRead<'a>,
     crypto: &'c C,
     digest: C::Sha256,
     id: BlobId,
     row: BlobRow,
-    rowid: i64,
     position: u64,
     clock: VerifyClock<'c>,
     failed: Option<PolicyError>,
@@ -112,10 +108,8 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, self.native, || {
-            let count =
-                self.native
-                    .read_body(self.rowid, self.row.length, self.position, output)?;
+        let result = checked(&self.clock, &self.body, || {
+            let count = self.body.read_body(self.position, output)?;
             self.digest
                 .update(output.get(..count).ok_or(PolicyError::Corrupt)?)?;
             self.position = self
@@ -134,7 +128,7 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        checked(&self.clock, self.native, || {
+        checked(&self.clock, &self.body, || {
             if self.position != self.row.length {
                 return Err(PolicyError::Invalid);
             }
@@ -146,13 +140,10 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
             }
             Ok(())
         })?;
-        self.native
-            .read_snapshot(|native| native.verify_body_extent(self.rowid, self.row.length))?;
         Ok(PinnedBlob {
-            native: self.native,
+            body: self.body,
             id: self.id,
             row: self.row,
-            rowid: self.rowid,
             clock: self.clock,
             failed: None,
         })
@@ -160,10 +151,9 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
 }
 /// One verified immutable body. Its borrow retains the pooled SQLite snapshot.
 pub struct PinnedBlob<'a, 'c> {
-    native: &'a Native,
+    body: BodyRead<'a>,
     id: BlobId,
     row: BlobRow,
-    rowid: i64,
     clock: VerifyClock<'c>,
     failed: Option<PolicyError>,
 }
@@ -189,7 +179,7 @@ impl PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, self.native, || Ok(()));
+        let result = checked(&self.clock, &self.body, || Ok(()));
         if let Err(error) = result {
             self.failed = Some(error);
         }
@@ -204,9 +194,8 @@ impl BlobReader for PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, self.native, || {
-            self.native
-                .read_body(self.rowid, self.row.length, offset, output)
+        let result = checked(&self.clock, &self.body, || {
+            self.body.read_body(offset, output)
         });
         if let Err(error) = result {
             self.failed = Some(error);
@@ -313,12 +302,12 @@ mod owner_size_tests {
 #[cfg(test)]
 pub(in crate::store_fs) mod snapshot_tests {
     use super::*;
-    pub(in crate::store_fs) fn input_native<'a, C: Crypto>(
-        input: &PinnedBlobInput<'a, '_, C>,
-    ) -> &'a Native {
-        input.native
+    pub(in crate::store_fs) fn input_body<'b, 'a, C: Crypto>(
+        input: &'b PinnedBlobInput<'a, '_, C>,
+    ) -> &'b BodyRead<'a> {
+        &input.body
     }
-    pub(in crate::store_fs) fn pin_native<'a>(pin: &PinnedBlob<'a, '_>) -> &'a Native {
-        pin.native
+    pub(in crate::store_fs) fn pin_body<'b, 'a>(pin: &'b PinnedBlob<'a, '_>) -> &'b BodyRead<'a> {
+        &pin.body
     }
 }

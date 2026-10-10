@@ -24,18 +24,11 @@ CREATE TABLE blobs(
     digest BLOB NOT NULL CHECK(length(digest)=32),
     created_at INTEGER NOT NULL,
     changed BLOB NOT NULL CHECK(length(changed)=8),
+    body BLOB NOT NULL CHECK(length(body)=length),
     UNIQUE(account,id),
     UNIQUE(account,id,kind),
     FOREIGN KEY(account,id) REFERENCES blob_ids(account,id)
 ) STRICT;
-CREATE TABLE blob_chunks(
-    account BLOB NOT NULL CHECK(length(account)=16),
-    blob BLOB NOT NULL CHECK(length(blob)=16),
-    ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 511),
-    body BLOB NOT NULL CHECK(length(body) BETWEEN 1 AND 65536),
-    PRIMARY KEY(account,blob,ordinal),
-    FOREIGN KEY(account,blob) REFERENCES blobs(account,id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
-) STRICT, WITHOUT ROWID;
 CREATE TABLE mailboxes(
     account BLOB NOT NULL CHECK(length(account)=16),
     id BLOB NOT NULL CHECK(length(id)=16),
@@ -413,8 +406,8 @@ delete: "DELETE FROM imports WHERE account=?1 AND source_instance=?2 AND source_
 
 // Identical immutable metadata puts retain the original changed sequence.
 pub(super) const PUT_BLOBS: &str = concat!(
-    "INSERT INTO blobs(account,id,kind,length,digest,created_at,changed) ",
-    "VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(account,id) DO NOTHING",
+    "INSERT INTO blobs(account,id,kind,length,digest,created_at,changed,body) ",
+    "VALUES(?1,?2,?3,?4,?5,?6,?7,zeroblob(?4)) ON CONFLICT(account,id) DO NOTHING",
 );
 
 pub(super) const PUT_MAILBOXES: &str = concat!(

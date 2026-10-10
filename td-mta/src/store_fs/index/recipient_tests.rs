@@ -461,7 +461,7 @@ fn maximum_group_fits_one_original_vm_budget_and_duplicate_mutations_validate_on
     create(&store, 1000, &(0..1000).collect::<Vec<_>>()).unwrap();
     let consumed = {
         let writer = lock(&store.writer).unwrap();
-        let remaining = lock(&writer.native.budget).unwrap().remaining;
+        let remaining = lock(&writer.native.scope.budget).unwrap().remaining;
         VM_STEPS - remaining
     };
     assert!(
@@ -520,7 +520,7 @@ fn validation_seeks_only_the_affected_account_and_group() {
             params![other.as_bytes().as_slice(), BLOB.as_bytes().as_slice()],
         )
         .unwrap();
-        db.execute("INSERT INTO blobs(account,id,kind,length,digest,created_at,changed) SELECT ?1,id,kind,length,digest,created_at,changed FROM blobs WHERE account=?2", params![other.as_bytes().as_slice(), ACCOUNT.as_bytes().as_slice()]).unwrap();
+        db.execute("INSERT INTO blobs(account,id,kind,length,digest,created_at,changed,body) SELECT ?1,id,kind,length,digest,created_at,changed,body FROM blobs WHERE account=?2", params![other.as_bytes().as_slice(), ACCOUNT.as_bytes().as_slice()]).unwrap();
         relational::put(
             &db,
             other,
@@ -539,7 +539,7 @@ fn validation_seeks_only_the_affected_account_and_group() {
         Ok(Sequence::from_u64(2))
     );
     let writer = lock(&store.writer).unwrap();
-    let consumed = VM_STEPS - lock(&writer.native.budget).unwrap().remaining;
+    let consumed = VM_STEPS - lock(&writer.native.scope.budget).unwrap().remaining;
     assert!(
         consumed < 10000,
         "unrelated groups consumed {consumed} VM steps"

@@ -7,8 +7,9 @@ pub const MIB: usize = 1024 * KIB;
 pub const SQLITE_WAL_INDEX_BYTES: usize = 34 * MIB;
 /// Shared physical storage and message bounds; SQL/native literals are pinned in tests.
 pub const MAX_MESSAGE_BYTES: usize = 32 * MIB;
+/// Caller I/O step size, independent of the stored BLOB layout.
 pub const SQLITE_BODY_CHUNK_BYTES: usize = 64 * KIB;
-pub const SQLITE_VALUE_BYTES: i32 = 69_632;
+pub const SQLITE_VALUE_BYTES: i32 = 33_558_528;
 pub const SQLITE_PAGE_BYTES: u64 = 4096;
 pub const SQLITE_MAX_PAGES: u64 = 2_097_152;
 pub const SQLITE_DATABASE_BYTES: u64 = SQLITE_PAGE_BYTES * SQLITE_MAX_PAGES;
@@ -409,14 +410,8 @@ mod tests {
     fn schema_literals_match_shared_storage_bounds() {
         let schema = include_str!("store_fs/index/relational/schema.rs");
         assert!(schema.contains(&format!("length BETWEEN 0 AND {MAX_MESSAGE_BYTES}")));
-        assert!(schema.contains(&format!(
-            "length(body) BETWEEN 1 AND {SQLITE_BODY_CHUNK_BYTES}"
-        )));
-        assert!(schema.contains(&format!(
-            "ordinal BETWEEN 0 AND {}",
-            MAX_MESSAGE_BYTES / SQLITE_BODY_CHUNK_BYTES - 1
-        )));
-        assert_eq!(MAX_MESSAGE_BYTES % SQLITE_BODY_CHUNK_BYTES, 0);
+        assert!(schema.contains("length(body)=length"));
+        assert_eq!(SQLITE_VALUE_BYTES as usize, MAX_MESSAGE_BYTES + 4096);
     }
 
     #[test]

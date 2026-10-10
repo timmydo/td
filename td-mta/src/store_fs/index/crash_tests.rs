@@ -754,17 +754,17 @@ fn backup_preserves_digest_damage_without_granting_account_verification() {
         writer
             .native
             .run(|db| {
-                let changed = db
-                    .execute(
-                        "UPDATE blob_chunks SET body=?3 WHERE account=?1 AND blob=?2 AND ordinal=0",
-                        params![
-                            ACCOUNT.as_bytes().as_slice(),
-                            BLOB.as_bytes().as_slice(),
-                            [0xa5u8; 65536].as_slice()
-                        ],
+                let mut body = db
+                    .blob_open(
+                        "main",
+                        "blobs",
+                        "body",
+                        body_rowid(db, ACCOUNT, BLOB)?,
+                        false,
                     )
                     .map_err(sql)?;
-                assert_eq!(changed, 1);
+                body.write_at(&[0xa5u8; 65536], 0).map_err(sql)?;
+                body.close().map_err(sql)?;
                 Ok(())
             })
             .unwrap();

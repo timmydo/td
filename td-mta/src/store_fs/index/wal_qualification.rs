@@ -125,43 +125,44 @@ fn append_body(writer: &mut Writer, rows: i64, body: &[u8]) {
         .native
         .run(|db| {
             db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
-            let mut statement = db
-                .prepare(
-                    "UPDATE blob_chunks SET body=?1 WHERE account=?2 AND blob=?3 AND ordinal=?4",
+            let mut handle = db
+                .blob_open(
+                    "main",
+                    "blobs",
+                    "body",
+                    body_rowid(db, ACCOUNT, BLOB)?,
+                    false,
                 )
                 .map_err(sql)?;
             for ordinal in 0..rows {
-                assert_eq!(
-                    statement
-                        .execute(params![
-                            body,
-                            ACCOUNT.as_bytes().as_slice(),
-                            BLOB.as_bytes().as_slice(),
-                            ordinal
-                        ])
-                        .map_err(sql)?,
-                    1
-                );
+                handle
+                    .write_at(body, ordinal as usize * body.len())
+                    .map_err(sql)?;
             }
+            handle.close().map_err(sql)?;
             Ok(())
         })
         .unwrap();
     finish_commit(writer).unwrap();
 }
-fn append_metadata(writer: &mut Writer) {
+fn append_tail(writer: &mut Writer) {
     writer.native.begin_work(deadline()).unwrap();
     writer
         .native
         .run(|db| {
             db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
-            assert_eq!(
-                db.execute(
-                    "UPDATE blobs SET created_at=created_at+1 WHERE account=?1 AND id=?2",
-                    params![ACCOUNT.as_bytes().as_slice(), BLOB.as_bytes().as_slice()],
+            let mut handle = db
+                .blob_open(
+                    "main",
+                    "blobs",
+                    "body",
+                    body_rowid(db, ACCOUNT, BLOB)?,
+                    false,
                 )
-                .map_err(sql)?,
-                1
-            );
+                .map_err(sql)?;
+            handle.write_at(&[0x5b], 0).map_err(sql)?;
+            handle.write_at(&[0x5a], 0).map_err(sql)?;
+            handle.close().map_err(sql)?;
             Ok(())
         })
         .unwrap();
@@ -182,8 +183,8 @@ fn produce(root_path: &Path) {
         memory("producer-start");
         let wal = db_path(store.root(), RootEntry::Wal).unwrap();
         let mut frames = 0;
-        let mut metadata_delta = None;
-        let mut metadata_commits = 0i64;
+        let mut tail_delta = None;
+        let mut tail_commits = 0i64;
         for round in 0..MAX_ROUNDS {
             assert!(
                 started.elapsed() < GENERATION_LIMIT,
@@ -193,7 +194,7 @@ fn produce(root_path: &Path) {
             if remaining == 0 {
                 break;
             }
-            if metadata_delta.is_some_and(|delta| remaining < delta) {
+            if tail_delta.is_some_and(|delta| remaining < delta) {
                 break;
             }
             let before = frames;
@@ -215,14 +216,14 @@ fn produce(root_path: &Path) {
                 frames = wal_frames(&wal);
                 assert!(frames > altered && frames <= TARGET_FRAMES);
             } else {
-                append_metadata(&mut lock(&store.writer).unwrap());
-                metadata_commits += 1;
+                append_tail(&mut lock(&store.writer).unwrap());
+                tail_commits += 1;
                 frames = wal_frames(&wal);
                 let delta = frames.checked_sub(before).unwrap();
                 assert!(delta > 0 && frames <= TARGET_FRAMES);
-                match metadata_delta {
+                match tail_delta {
                     Some(expected) => assert_eq!(delta, expected),
-                    None => metadata_delta = Some(delta),
+                    None => tail_delta = Some(delta),
                 }
             }
             if round % 32 == 0 || rows == 0 && (remaining <= 16 || round % 16 == 0) {
@@ -242,7 +243,7 @@ fn produce(root_path: &Path) {
             TARGET_FRAMES - frames <= 2,
             "WAL producer stopped too early"
         );
-        assert!(metadata_commits > 0);
+        assert!(tail_commits > 0);
         assert_eq!(
             snapshot.identity().committed_sequence,
             Sequence::from_u64(1)
@@ -263,7 +264,7 @@ fn produce(root_path: &Path) {
         );
         memory("producer-ready");
         let partial = root_path.join("maximum-wal-ready-partial");
-        fs::write(&partial, format!("{frames} {bytes} {metadata_commits}\n")).unwrap();
+        fs::write(&partial, format!("{frames} {bytes} {tail_commits}\n")).unwrap();
         fs::File::open(&partial).unwrap().sync_all().unwrap();
         fs::rename(partial, root_path.join(READY)).unwrap();
         fs::File::open(root_path).unwrap().sync_all().unwrap();
@@ -324,13 +325,13 @@ fn kill_ready(root: &Path) -> (u64, u64, i64) {
     let mut fields = text.split_ascii_whitespace();
     let frames = fields.next().unwrap().parse().unwrap();
     let bytes = fields.next().unwrap().parse().unwrap();
-    let metadata_commits = fields.next().unwrap().parse().unwrap();
+    let tail_commits = fields.next().unwrap().parse().unwrap();
     assert_eq!(fields.next(), None);
     child.0.kill().unwrap();
     assert_eq!(child.0.wait().unwrap().signal(), Some(9));
-    (frames, bytes, metadata_commits)
+    (frames, bytes, tail_commits)
 }
-fn verify_body(store: &IndexStore<'_>, metadata_commits: i64) {
+fn verify_body(store: &IndexStore<'_>, tail_commits: i64) {
     let mut view = store.view(ACCOUNT, deadline()).unwrap();
     assert_eq!(view.identity().epoch, EPOCH);
     assert_eq!(view.identity().committed_sequence, Sequence::from_u64(1));
@@ -339,7 +340,8 @@ fn verify_body(store: &IndexStore<'_>, metadata_commits: i64) {
         panic!("expected committed blob row")
     };
     assert_eq!(changed, Sequence::from_u64(1));
-    assert_eq!(row.created_at, metadata_commits);
+    assert!(tail_commits > 0);
+    assert_eq!(row.created_at, 0);
     let mut input = view
         .open_blob_input(&td_crypto::Provider, BLOB, BODY_BYTES)
         .unwrap();
@@ -366,7 +368,7 @@ fn maximum_wal_crash_recovery_and_checkpoint() {
     let fixture = Fixture::new();
     eprintln!("maximum-wal root={}", fixture.path.display());
     memory("recovery-baseline");
-    let (frames, bytes, metadata_commits) = kill_ready(&fixture.path);
+    let (frames, bytes, tail_commits) = kill_ready(&fixture.path);
     assert!(TARGET_FRAMES - frames <= 2);
     assert_eq!(bytes, 32 + frames * FRAME_BYTES);
     let mut root = fixture.locked();
@@ -389,7 +391,7 @@ fn maximum_wal_crash_recovery_and_checkpoint() {
     assert!(fs::metadata(&database).unwrap().len() <= MAX_PAGES * PAGE_BYTES);
     assert!(fs::metadata(&shm).unwrap().len() <= MAX_SHM_BYTES);
     let phase = Instant::now();
-    verify_body(&store, metadata_commits);
+    verify_body(&store, tail_commits);
     assert!(phase.elapsed() < READ_LIMIT, "WAL read timeout");
     eprintln!("maximum-wal recovery-read elapsed={:?}", phase.elapsed());
     memory("recovery-read");
@@ -407,7 +409,7 @@ fn maximum_wal_crash_recovery_and_checkpoint() {
     assert!(fs::metadata(&shm).unwrap().len() <= MAX_SHM_BYTES);
     let phase = Instant::now();
     store.validate_integrity(deadline()).unwrap();
-    verify_body(&store, metadata_commits);
+    verify_body(&store, tail_commits);
     assert!(phase.elapsed() < VERIFY_LIMIT, "WAL verification timeout");
     memory("recovery-verified");
     eprintln!(

@@ -26,7 +26,7 @@ pub(crate) fn admitted(name: &str) -> bool {
 pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "4bb2d56662494db1992d719ca8ac882d4d71fc91b37eacfd116a69a980c73793",
+        "td-mta" => "f9bf0543fce3301c2f3031661c7b188b5e873bfd4d175c868e7bce88933d7ad2",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
         "td-nfc" => "39d752d381e239345e4ba213ea2ce2fb4efb723a4ea9f16f1d8aa1f1173359cf",
@@ -158,7 +158,7 @@ const SQLITE_ACTIVE: &str = "bitflags v2.13.2|
 fallible-iterator v0.3.0|alloc,default
 fallible-streaming-iterator v0.1.9|
 libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg
-rusqlite v0.40.2|bundled,hooks,limits,modern_sqlite
+rusqlite v0.40.2|blob,bundled,hooks,limits,modern_sqlite
 smallvec v1.16.2|
 vcpkg v0.2.15|
 ";
@@ -194,7 +194,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     Ok(())
 }
 
-pub(crate) const SQLITE_DEPENDENCY: &str = "rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"bundled\", \"hooks\", \"limits\"] }";
+pub(crate) const SQLITE_DEPENDENCY: &str = "rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"blob\", \"bundled\", \"hooks\", \"limits\"] }";
 
 #[cfg(test)]
 mod tests {
@@ -411,7 +411,7 @@ mod tests {
         .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
         for bad in [
-            mailgraph.replace("rusqlite v0.40.2|bundled,hooks,limits,modern_sqlite", "rusqlite v0.40.2|bundled,hooks,limits,load_extension,modern_sqlite"),
+            mailgraph.replace("rusqlite v0.40.2|blob,bundled,hooks,limits,modern_sqlite", "rusqlite v0.40.2|blob,bundled,hooks,limits,load_extension,modern_sqlite"),
             mailgraph.replace("libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg", "libsqlite3-sys v0.38.2|default,pkg-config,vcpkg"),
             mailgraph.replace("rusqlite v0.40.2", "rusqlite v0.40.1"),
             mailgraph.replace("smallvec v1.16.2|\n", ""),

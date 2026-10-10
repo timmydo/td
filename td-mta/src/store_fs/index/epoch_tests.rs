@@ -818,7 +818,7 @@ fn native_scope_failure_at_epoch_update_refuses_the_transaction() {
     let hit = Arc::new(AtomicU64::new(0));
     {
         let writer = lock(&store.writer).unwrap();
-        let budget = writer.native.budget.clone();
+        let budget = writer.native.scope.budget.clone();
         let seen = hit.clone();
         lock(&writer.native.connection)
             .unwrap()

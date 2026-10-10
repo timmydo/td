@@ -327,7 +327,9 @@ fn usage_preserves_original_deadline_and_vm_failure_without_partial_totals() {
     clock.0.store(1, Ordering::Relaxed);
     assert_eq!(expired.logical_usage(), Err(ports::Error::Deadline));
     let mut exhausted = store.view(ACCOUNT, deadline()).unwrap();
-    lock(&exhausted.native().unwrap().budget).unwrap().remaining = 0;
+    lock(&exhausted.native().unwrap().scope.budget)
+        .unwrap()
+        .remaining = 0;
     assert_eq!(exhausted.logical_usage(), Err(ports::Error::Capacity));
     assert_eq!(exhausted.logical_usage(), Err(ports::Error::Capacity));
 }
@@ -389,9 +391,14 @@ fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
     .unwrap();
     store.create_account(ACCOUNT, deadline()).unwrap();
     let mut empty = store.view(ACCOUNT, deadline()).unwrap();
-    let before = lock(&empty.native().unwrap().budget).unwrap().remaining;
+    let before = lock(&empty.native().unwrap().scope.budget)
+        .unwrap()
+        .remaining;
     empty.logical_usage().unwrap();
-    let empty_steps = before - lock(&empty.native().unwrap().budget).unwrap().remaining;
+    let empty_steps = before
+        - lock(&empty.native().unwrap().scope.budget)
+            .unwrap()
+            .remaining;
     drop(empty);
     let ids: Vec<_> = (0u128..100)
         .map(|id| BlobId::from_bytes(id.to_be_bytes()))
@@ -432,13 +439,17 @@ fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
         .collect();
     commit(&store, ACCOUNT, 0, &puts, &[], &mut sources);
     let mut limited = store.view(ACCOUNT, deadline()).unwrap();
-    lock(&limited.native().unwrap().budget).unwrap().remaining = empty_steps + 32;
+    lock(&limited.native().unwrap().scope.budget)
+        .unwrap()
+        .remaining = empty_steps + 32;
     assert_eq!(limited.logical_usage(), Err(ports::Error::Capacity));
     assert_eq!(limited.logical_usage(), Err(ports::Error::Capacity));
     drop(limited);
     // Calibrate the exact first aggregate's VM cost on the same populated snapshot.
     let mut measured = store.view(ACCOUNT, deadline()).unwrap();
-    let before = lock(&measured.native().unwrap().budget).unwrap().remaining;
+    let before = lock(&measured.native().unwrap().scope.budget)
+        .unwrap()
+        .remaining;
     measured
         .read_snapshot(|native| {
             native.run(|db| {
@@ -449,10 +460,15 @@ fn populated_scan_and_second_aggregate_consume_the_original_vm_allowance() {
             })
         })
         .unwrap();
-    let body_steps = before - lock(&measured.native().unwrap().budget).unwrap().remaining;
+    let body_steps = before
+        - lock(&measured.native().unwrap().scope.budget)
+            .unwrap()
+            .remaining;
     drop(measured);
     let mut second = store.view(ACCOUNT, deadline()).unwrap();
-    lock(&second.native().unwrap().budget).unwrap().remaining = body_steps;
+    lock(&second.native().unwrap().scope.budget)
+        .unwrap()
+        .remaining = body_steps;
     assert_eq!(second.logical_usage(), Err(ports::Error::Capacity));
     assert_eq!(second.logical_usage(), Err(ports::Error::Capacity));
     drop(second);
@@ -724,11 +740,11 @@ fn whole_store_vm_allowance_is_not_refreshed_between_accounts() {
     store.create_account(ACCOUNT, deadline()).unwrap();
     drop(store.usage_fence(deadline()).unwrap());
     let one_account = VM_STEPS
-        - lock(&lock(&store.writer).unwrap().native.budget)
+        - lock(&lock(&store.writer).unwrap().native.scope.budget)
             .unwrap()
             .remaining;
     store.create_account(OTHER, deadline()).unwrap();
-    let budget = Arc::clone(&lock(&store.writer).unwrap().native.budget);
+    let budget = Arc::clone(&lock(&store.writer).unwrap().native.scope.budget);
     let events = Arc::new(AtomicU64::new(0));
     let hits = Arc::clone(&events);
     lock(&lock(&store.writer).unwrap().native.connection)

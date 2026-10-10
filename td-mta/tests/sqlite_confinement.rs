@@ -18,7 +18,7 @@ fn scan(root: &Path, directory: &Path) {
             // The dependency-policy fixture names the admitted crate as data.
             // Remove only that exact literal; scan all other tokens in the file.
             let source = if path.strip_prefix(root).unwrap() == Path::new("src/ports.rs") {
-                let literal = r##"r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits"] }"#"##;
+                let literal = r##"r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }"#"##;
                 assert_eq!(source.matches(literal).count(), 1);
                 source.replace(literal, "")
             } else {

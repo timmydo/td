@@ -353,23 +353,28 @@ there; unavailable work stays queued within its deadline.
 | Resolver | 1 | A/AAAA DNS packet I/O, TTL cache and CNAME parsing with fixed deadlines |
 | Control | 1 | Configuration/device/ACME/administrative jobs and backup coordination |
 
-A configured larger body-job or handshake pool increases resident job slots,
-not thread count. Workers resume bounded steps across those slots. A waiting
-network peer never occupies a worker while idle after dial: retain state in its
-existing slot and return Pending to main. The explicit exception is std's
-blocking connect_timeout: only the sole outbound slot may dial, so at most one
-of the two handshake workers is occupied by it. The other remains available
-for inbound handshakes. A pending handshake is dispatched again after ten
-milliseconds, at most one queued/running step per slot. Each step does bounded
-nonblocking I/O/crypto and returns one completion; it never waits for socket
-readiness. The compiled eight-handshake maximum thus admits at most 800 such
-steps/second, within the fixed queues and global completion-credit rule below.
-This polling cost is an unmeasured M07/M23 acceptance obligation.
-Disk I/O may block its fixed worker; it cannot
-create replacement threads. Deadlines prevent accepting more work behind a
-failed/stalled resource, but cannot promise cancellation of a kernel I/O hang.
-An unexpected worker failure stops new mutations and fails health; no panic
-catching is used as transaction recovery.
+A configured larger body-job or handshake pool increases resident job
+slots, not thread count. Workers resume bounded steps across their
+assigned slots. A job retaining an incremental body handle or a MIME owner
+borrowing it stays on the worker that opened it until close. Pending
+releases execution time, not that job's thread affinity; main exchanges
+only scalar completion data and caller buffers, never the body owner. A
+waiting network peer never occupies a worker while idle after dial: retain
+state in its existing slot and return Pending to main. The explicit
+exception is std's blocking connect_timeout: only the sole outbound slot
+may dial, so at most one of the two handshake workers is occupied by it.
+The other remains available for inbound handshakes. A pending handshake is
+dispatched again after ten milliseconds, at most one queued/running step
+per slot. Each step does bounded nonblocking I/O/crypto and returns one
+completion; it never waits for socket readiness. The compiled
+eight-handshake maximum thus admits at most 800 such steps/second, within
+the fixed queues and global completion-credit rule below. This polling
+cost is an unmeasured M07/M23 acceptance obligation. Disk I/O may block
+its fixed worker; it cannot create replacement threads. Deadlines prevent
+accepting more work behind a failed/stalled resource, but cannot promise
+cancellation of a kernel I/O hang. An unexpected worker failure stops new
+mutations and fails health; no panic catching is used as transaction
+recovery.
 
 Queues carry slot ID + checked reuse generation, work kind and bounded scalar
 arguments, never messages, unbounded closures or cloned response trees. Only
@@ -394,7 +399,8 @@ Body/read workers advance protocol CPU work by at most 16 KiB input/output or
 whole request is not one main-thread operation. Main only does bounded socket
 record work, scheduling, and small HTTP-01/event/health framing from existing
 validated state (at most 2 KiB of that control framing per turn). Worker jobs
-resume in rotating slot order; no request owns a worker across an idle wait.
+resume in rotating order among each worker's assigned slots; an idle job
+retains affinity but does not occupy execution time.
 Use bounded queues with explicit saturation. Sorting must have a complete
 deterministic tie-break and bounded input/scratch; allocation is permitted.
 Typed adapter errors carry
@@ -2608,48 +2614,50 @@ buffer and retains one additional File inside LockedRoot. No per-request
 lock-file open or descriptor cloning is permitted. Cooperative
 process locking does not alter the request pool or worker ledger.
 
-SQLite body I/O uses at most 64 KiB caller/writer chunks. Native cache spilling
-keeps a 32 MiB body transaction from retaining the entire dirty body in RAM.
-The writer's cold scratch is 128 KiB; process-wide SQLite requested heap is
-capped at 16 MiB with a 9 MiB individual allocation cap. The page-cache target
-is 128 KiB per connection, not a hard peak. Bodies are stored in at-most-64-KiB
-chunk rows and seeks use the chunk ordinal; no whole-body zeroblob is created.
-Native page allocation and final durable commit remain synchronous work;
-fixed chunks do not promise per-page scheduling during those operations.
+SQLite body I/O uses at most 64 KiB caller/writer chunks. Native cache
+spilling keeps a 32 MiB body transaction from retaining the entire dirty
+body in RAM. The writer's cold scratch is 128 KiB; process-wide SQLite
+requested heap is capped at 16 MiB with a 9 MiB individual allocation cap.
+The page-cache target is 128 KiB per connection, not a hard peak. Each
+body is stored as one BLOB, initially a zeroblob, and filled or read
+through a retained incremental handle. The body is the final column so the
+zero-filled tail need not be materialized as one allocation. Native page
+allocation and final durable commit remain synchronous work; bounded I/O steps
+do not promise per-page scheduling during those operations.
 
 The physical database ceiling is 8 GiB and the conservative WAL ceiling is
 17280796224 bytes. SQLite's WAL index maps shared-memory pages outside its
 16 MiB requested-heap cap; reserve another 34 MiB for this mapping at the
-maximum WAL. Recovery can read the entire WAL before the application resumes,
-and a TRUNCATE checkpoint can copy up to 8 GiB. Neither operation promises
-mid-call deadline interruption; before/after deadline checks do not establish
-a strict 60-second or 2 GiB checkpoint bound. At the admitted maximum WAL,
-SQLite's x86-64 checkpoint iterator requests 8429736 contiguous bytes,
-including its sorting scratch. The 9 MiB individual cap admits that request;
-the other native requested allocations must remain strictly below 8347480
-bytes under the unchanged shared 16 MiB hard limit.
-This is request arithmetic, not measured allocator overhead or a reservation
-for idle schemas/page caches. The explicit ignored near-ceiling qualification
-in STORAGE.md passed a 17280796192-byte WAL, 32 bytes below this limit,
-through child SIGKILL, reopen/recovery, and TRUNCATE checkpoint. It ran with
-eight readers plus the writer present before the crash and for checkpoint;
-recovery begins on the first reopened connection, before the other readers
-can be created. The fixture checks the 34 MiB SHM file bound and keeps the
-9 MiB individual/16 MiB process-wide SQLite requested-allocation caps.
-Its largest reported child `VmHWM` sample was 39480 KiB, while the
-separate recovery process reported 48244 KiB after checkpoint. Those
-observations do not establish a transient RSS ceiling, native stack peak,
-combined 128 MiB service overlap, or an 8 GiB database checkpoint. The
-test-only producer bypasses normal WAL admission scheduling to reach the
-physical bound; the database is about 32 MiB. Startup avoids a full
-integrity scan; explicit validate_integrity maintenance owns
-integrity_check(1), foreign_key_check, indexed anchor cardinality and
-complete blob chunk geometry with a physical-cap-sized finite VM
-allowance and the caller's deadline. The geometry scan uses two scoped
-chunk primary-key probes per blob, without whole-body buffering or
-hashing. Full table/index comparisons may require O(N log N) work and
-stop after the first physical error. No maximum-database maintenance
-resource qualification is established by the bounded WAL fixture.
+maximum WAL. Recovery can read the entire WAL before the application
+resumes, and a TRUNCATE checkpoint can copy up to 8 GiB. Neither operation
+promises mid-call deadline interruption; before/after deadline checks do
+not establish a strict 60-second or 2 GiB checkpoint bound. At the
+admitted maximum WAL, SQLite's x86-64 checkpoint iterator requests 8429736
+contiguous bytes, including its sorting scratch. The 9 MiB individual cap
+admits that request; the other native requested allocations must remain
+strictly below 8347480 bytes under the unchanged shared 16 MiB hard limit.
+This is request arithmetic, not measured allocator overhead or a
+reservation for idle schemas/page caches. The explicit ignored
+near-ceiling qualification in STORAGE.md passed a 17280796192-byte WAL, 32
+bytes below this limit, through child SIGKILL, reopen/recovery, and
+TRUNCATE checkpoint. It ran with eight readers plus the writer present
+before the crash and for checkpoint; recovery begins on the first reopened
+connection, before the other readers can be created. The fixture checks
+the 34 MiB SHM file bound and keeps the 9 MiB individual/16 MiB
+process-wide SQLite requested-allocation caps. Its largest reported child
+`VmHWM` sample was 39480 KiB, while the separate recovery process reported
+48244 KiB after checkpoint. Those observations do not establish a
+transient RSS ceiling, native stack peak, combined 128 MiB service
+overlap, or an 8 GiB database checkpoint. The test-only producer bypasses
+normal WAL admission scheduling to reach the physical bound; the database
+is about 32 MiB. Startup avoids a full integrity scan; explicit
+validate_integrity maintenance owns integrity_check(1), foreign_key_check,
+indexed anchor cardinality and body lengths with a physical-cap-sized
+finite VM allowance and the caller's deadline. integrity_check validates
+the body-length CHECK constraint without buffering or hashing complete
+bodies. Full table/index comparisons may require O(N log N) work and stop
+after the first physical error. No maximum-database maintenance resource
+qualification is established by the bounded WAL fixture.
 
 Synchronous account-body verification reuses caller-owned 64 KiB
 scratch, fixed 16-byte cursor/key and 64-byte row buffers, and one
@@ -3341,24 +3349,27 @@ whole-worker composition, allocation/RSS bounds, full faults, power loss
 or combined service overlap. No stack reservation or native cap changes.
 td-crypto/PORTABLE.md records the exact artifact and staged inputs.
 
-SQLite setup and query calls may allocate Rust/native memory and are excluded
-from pure MIME zero-allocation claims. MIME fixtures prepare a real verified
-snapshot body pin cold; their existing intervals measure parser/adapter work
-and retained ownership, not SQL read allocations. The separate --sqlite-body
-probes define the explicit maximum-body acceptance scenario. The isolated
-x86-64 musl release run passed its Rust/native allocation and sampled RSS
-thresholds; td-crypto/PORTABLE.md records the exact artifact and measurements.
-This qualifies that bounded body scenario only. Combined service overlap,
-complete worker composition and fault qualification remain activation
-requirements. The resource ledger is planning, not measured combined-process
-usage or proof of durability.
+SQLite setup and query calls may allocate Rust/native memory and are
+excluded from pure MIME zero-allocation claims. MIME fixtures prepare a
+real verified snapshot body pin cold; their existing intervals measure
+parser/adapter work and retained ownership, not SQL read allocations. The
+separate --sqlite-body probes define the explicit maximum-body acceptance
+scenario. The historical x86-64 musl release run used the former chunk-row
+layout and passed its Rust/native allocation and sampled RSS thresholds;
+td-crypto/PORTABLE.md records that artifact and its measurements. Those
+observations qualify only that artifact and layout, not the current
+single-BLOB implementation. Combined service overlap, complete worker
+composition and fault qualification remain activation requirements. The
+resource ledger is planning, not measured combined-process usage or proof
+of durability.
 
-The forced x86-64 GNU host debug build with indexed chunk rows recorded
+Historical measurements of the former chunk-row layout (not qualification
+of the current BLOB layout): the x86-64 GNU host debug build recorded
 these --sqlite-body observations:
 198484 requested Rust peak bytes with 1060 live bytes at the warmed baseline
 and after teardown. Eight unwrapped RSS samples ranged from an 8352 KiB
 baseline to 9328 KiB, with 9032 KiB after teardown. The 32 MiB input and
-oracle both used fixed chunks. These are host observations, not a portable
+oracle both used bounded I/O steps. These are host observations, not a portable
 native-allocation, transient RSS peak or whole-service qualification.
 
 The synchronous core holds its writer while consuming prepared source bytes.
@@ -3983,11 +3994,13 @@ pre-ServerHello case does not bound encrypted TLS 1.3 certificate lists,
 post-handshake messages, concurrent sessions or total service memory. M07e
 retains the aggregate admission requirement.
 
-STORAGE.md section 2 admits up to two full 64 KiB native chunk materializations
-per small or unaligned body read, separately from logical MIME byte meters.
-Those buffers use the existing SQLite heap allowance; there is no per-pin
-chunk cache. Full integrity maintenance holds the writer fence and reports
-Busy to new view capture and commits until it finishes.
+STORAGE.md section 2 retains an incremental BLOB handle per open body.
+Each retained handle's overflow-page index uses SQLite's existing heap
+allowance (roughly 64 KiB per maximum body, or 512 KiB for eight). This
+is retained until handle close and competes with connection/checkpoint
+allocations under the unchanged cap; exhaustion refuses work. Logical MIME
+byte meters count only returned bytes. Full integrity maintenance holds the
+writer fence and reports Busy to new view capture and commits until it finishes.
 
 The offline SQLite backup primitive borrows exactly one caller-owned 64 KiB
 copy buffer and copies at most the fixed 8 GiB database ceiling. SQLite

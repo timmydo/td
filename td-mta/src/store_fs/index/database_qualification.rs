@@ -228,22 +228,33 @@ fn dirty_bodies(store: &IndexStore<'_>, bodies: &[(BlobId, BlobRow)], started: I
         bounded(started);
         let mut writer = lock(&store.writer).unwrap();
         writer.native.begin_work(deadline()).unwrap();
-        writer.native.run(|db| {
-            db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
-            let mut statement = db.prepare("UPDATE blob_chunks SET body=?1 WHERE account=?2 AND blob=?3 AND ordinal=?4").map_err(sql)?;
-            // Restore each chunk before moving on, retaining the original digest.
-            let mut remaining = body.length;
-            let mut ordinal = 0;
-            while remaining > 0 {
-                let count = remaining.min(BODY.len() as u64) as usize;
-                for pattern in [ALTERED.as_slice(), BODY.as_slice()] {
-                    assert_eq!(statement.execute(params![pattern.get(..count).unwrap(), ACCOUNT.as_bytes().as_slice(), id.as_bytes().as_slice(), ordinal]).map_err(sql)?, 1);
+        writer
+            .native
+            .run(|db| {
+                db.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+                let mut handle = db
+                    .blob_open(
+                        "main",
+                        "blobs",
+                        "body",
+                        body_rowid(db, ACCOUNT, *id)?,
+                        false,
+                    )
+                    .map_err(sql)?;
+                let mut position = 0;
+                while position < body.length {
+                    let count = (body.length - position).min(BODY.len() as u64) as usize;
+                    for pattern in [ALTERED.as_slice(), BODY.as_slice()] {
+                        handle
+                            .write_at(pattern.get(..count).unwrap(), position as usize)
+                            .map_err(sql)?;
+                    }
+                    position += count as u64;
                 }
-                remaining -= count as u64;
-                ordinal += 1;
-            }
-            Ok(())
-        }).unwrap();
+                handle.close().map_err(sql)?;
+                Ok(())
+            })
+            .unwrap();
         finish_commit(&mut writer).unwrap();
         drop(writer);
         let wal = db_path(store.root(), RootEntry::Wal).unwrap();

@@ -6498,26 +6498,24 @@ publication, native allocation and stack/RSS remain unqualified.
 
 ## 2. Read views and change history
 
-store_fs::IndexStore owns a locked root, one serialized SQLite writer
-and one to eight cold reader connections. create requires a fresh
-database; open validates the physical files, closed schema, database
-header and store epoch before accepting metadata. It does not run a full
-database integrity or foreign-key scan at startup. SQLite checks pages
-as accessed; the separate validate_integrity(deadline) maintenance
-operation runs integrity_check(1), foreign_key_check and global scans of
-per-Email anchor cardinality and complete blob chunk geometry under an
-explicit deadline and a finite VM allowance sized for the physical
-database cap. Duplicate anchors for one account/Email return Corrupt;
-one Message-ID may still name several Emails. The physical check
-verifies index/table agreement before the indexed domain scan and stops
-after the first physical error; its work may be O(N log N). Every blob
-must have exactly the contiguous chunk ordinals and chunk sizes required
-by its declared length, including no chunks for an empty blob. Malformed
-geometry returns Corrupt. This is not digest or full domain
-verification. Complete body verification still precedes a body pin.
-create and open both borrow LockedRoot exclusively for the owner's
-lifetime, preventing independent owners from bypassing its
-transaction/checkpoint fence.
+store_fs::IndexStore owns a locked root, one serialized SQLite writer and
+one to eight cold reader connections. create requires a fresh database;
+open validates the physical files, closed schema, database header and
+store epoch before accepting metadata. It does not run a full database
+integrity or foreign-key scan at startup. SQLite checks pages as accessed;
+the separate validate_integrity(deadline) maintenance operation runs
+integrity_check(1), foreign_key_check and a global scan of per-Email
+anchor cardinality under an explicit deadline and a finite VM allowance
+sized for the physical database cap. Duplicate anchors for one
+account/Email return Corrupt; one Message-ID may still name several
+Emails. The physical check verifies index/table agreement before the
+indexed domain scan and stops after the first physical error; its work may
+be O(N log N). The row CHECK constraint requires each BLOB's actual length
+to equal its declared length; integrity_check validates this and a
+mismatch returns Corrupt. This is not digest or full domain verification.
+Complete body verification still precedes a body pin. create and open both
+borrow LockedRoot exclusively for the owner's lifetime, preventing
+independent owners from bypassing its transaction/checkpoint fence.
 
 IndexReadView::verify_bodies(crypto, BodyCheckLimits, scratch) performs
 synchronous declared-body verification for one captured account view.
@@ -6563,10 +6561,12 @@ limits. This synchronous account check does not perform physical
 maintenance, acquire a fresh view, grant custody or activate a CLI. Its
 CompleteChecks result retains the historical limitations above.
 
-PinnedBlobInput::finish also refuses negative or trailing stored chunk
-ordinals with Corrupt, including any chunk for an empty body. Its indexed
-extent check shares the original snapshot, deadline and VM fuel; a failed
-check yields no completed pin.
+PinnedBlobInput checks actual BLOB length when opening and retains one
+incremental native handle through finish and completed random reads. The
+complete digest must match before finish grants a pin. Body owners are
+worker-local; BlobReader requires no Send bound. Unborrowed IndexReadView
+remains Send + Sync. Handle close precedes release of the view borrow; a
+forgotten handle or close failure retires the pool slot.
 
 IndexStore::maintenance_view(account, deadline) captures the same pooled
 IndexReadView with the finite full-maintenance VM ceiling instead of the
@@ -6737,11 +6737,12 @@ not account authorization, policy revocation or quota reconciliation.
 Every fresh BlobRow requires a matching source with
 exact length, digest and EOF; a supplied source matches exactly one Blob PUT.
 A 32 MiB hard maximum applies before reading;
-chunks are at most 64 KiB. A permanent SQLite registry prevents deleted blob
-ID reuse. Bodies stream into relational chunk rows keyed by account, blob and
-ordinal inside the transaction; they never enter encoded metadata operation
-buffers. Each stored chunk is at most 64 KiB and readers seek its ordinal
-directly. Native page allocation and durable finalization are synchronous,
+I/O steps are at most 64 KiB. A permanent SQLite registry prevents deleted
+blob ID reuse. One zeroblob is inserted per body, filled through a retained
+writable incremental handle inside the transaction, and closed before COMMIT.
+Body bytes never enter encoded metadata buffers. Readers retain one read-only
+incremental handle in their captured snapshot.
+Native page allocation and durable finalization are synchronous,
 with checks before/after but no guarantee of interruption inside a native
 operation. The core holds the global writer while consuming the source. Its
 Read trait cannot enforce deadlines inside an arbitrary implementation:
@@ -6975,7 +6976,7 @@ future adapter and protocol suites must prove these operational mappings.
 Sources: [JMAP Core, RFC 8620 §5](https://www.rfc-editor.org/rfc/rfc8620.html#section-5)
 and [JMAP Mail, RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html).
 
-Physical chunk-read amplification and the exclusive validate_integrity
+Native body-read work and the exclusive validate_integrity
 maintenance fence are specified in STORAGE.md section 2. Logical MIME byte
 meters do not measure SQLite copying. Full integrity maintenance refuses a
 stopped writer; new view capture and commits return Busy during its scan.

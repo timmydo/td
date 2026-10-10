@@ -18,7 +18,7 @@ Rustls owns TLS, webpki validates certificates, pki-types represents their
 private backend forms; aws-lc-rs/sys supplies native crypto (AWS-LC 5.7.0).
 The remaining active packages are their build tools or small internal support
 libraries. The mail crate additionally selects private rusqlite 0.40.2
-(bundled, hooks, limits) and its bundled SQLite 3.53.2 source. The crypto
+(blob, bundled, hooks, limits) and its bundled SQLite 3.53.2 source. The crypto
 crate does not select SQLite. No async runtime is selected.
 
 The host native build uses the provisioned C compiler, assembler and archiver,
@@ -102,16 +102,17 @@ upstream package declarations, including their original slash spelling.
 The shared offline vendor is prepared from the full mail lock; crypto's active
 graph remains unchanged. Both drivers force LIBSQLITE3_SYS_USE_PKG_CONFIG=0
 and reviewed native flags: OMIT_LOAD_EXTENSION, TEMP_STORE=3, MAX_MEMORY=16 MiB,
-MAX_ALLOCATION_SIZE=9 MiB, MAX_LENGTH=69632, MAX_SQL_LENGTH=8192,
+MAX_ALLOCATION_SIZE=9 MiB, MAX_LENGTH=33558528, MAX_SQL_LENGTH=8192,
 MAX_PAGE_COUNT=2097152 and DEFAULT_CACHE_SIZE=-128. Ambient SQLite selection
 controls fail before Cargo. pkg-config/vcpkg support crates compile without
 selecting system SQLite. The same C frame-pointer/debug/remapping policy
 applies to the bundled amalgamation. Host tests establish neither an isolated
 portable SQLite build nor native maximum-input resource qualification.
 
-Bodies use indexed 64 KiB chunk rows with the existing safe query API.
-The native value ceiling covers one chunk plus bounded row overhead;
-spilling and the 8 GiB combined page ceiling are specified in mail STORAGE.md.
+Bodies use one BLOB per row and the safe incremental BLOB API. The blob
+feature adds no packages. The native value ceiling covers a 32 MiB body
+plus bounded row overhead. Spilling and the 8 GiB combined page ceiling are
+specified in mail STORAGE.md.
 The individual allocation cap accommodates SQLite's contiguous checkpoint
 iterator: at the admitted maximum WAL it requests 8429736 bytes on x86-64,
 inside the unchanged shared 16 MiB heap. Mail [STORAGE.md](../td-mta/STORAGE.md)

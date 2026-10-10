@@ -24,7 +24,7 @@ coordination remains separate. Optional commit completions retain durable
 outcomes separately from database/WAL observations under the original
 writer scope; admission and ledger reconciliation remain service work.
 SQLite owns relational metadata, immutable
-body chunks, atomic transactions, native indexes, WAL snapshots and crash
+body BLOBs, atomic transactions, native indexes, WAL snapshots and crash
 recovery. The store_fs adapter verifies streamed bodies inside their metadata
 transaction and retains the read snapshot through MIME processing. A fixed
 connection pool,
@@ -1406,58 +1406,58 @@ reviewed artifact update. A test trust override must not disable verification.
 ## 8. On-disk store and crash consistency
 
 [STORAGE.md](STORAGE.md) owns the explicit relational schema, immutable body
-chunks, commit ordering, snapshots, checkpoints and operational boundaries.
+BLOBs, commit ordering, snapshots, checkpoints and operational boundaries.
 SQLite stores exact message/upload/transmission bytes together with names,
 membership, flags, IDs, threading, envelopes, submissions and history.
 Parsed-body/search caches are rebuildable; bodies and metadata are authoritative.
 
-A body and its metadata commit atomically through WAL with synchronous FULL.
-Body rows keyed by account, blob and chunk ordinal hold at most 64 KiB each,
-preserving bounded streaming and direct seeks under a 32 MiB hard
-message/upload limit. Existing read transactions preserve old
-body snapshots after deletion. Native foreign keys enforce ownership; an
-expired lease retains its upload until explicit transactional removal.
-An uncertain COMMIT retires writes until reopen/recovery. Never acknowledge
-before COMMIT succeeds. Preserve transmission bytes independently of visible
-email lifetime. A stopped checkpointed database backup captures both bytes
-and metadata. The consuming IndexStore::backup primitive closes all native
-connections, copies through caller-owned 64 KiB scratch under retained source
-and destination locks, and publishes without replacement only after file sync.
-Its receipt follows destination directory sync; explicit failure phases keep
-partial artifacts distinguishable from successful backups. STORAGE.md owns
-the bounded copy and offline recovery contract. The offline `backup` CLI
-exposes this database-only copy without semantic verification or restore
-authority; it does not include configuration or credentials. The offline
-restore command verifies the copied database and renews its epoch before
-completion. It neither starts service nor reconciles external delivery
-outcomes; activation and consistent service configuration remain separate.
-Old schemas are refused; no data migration is required.
-Startup validates the closed schema and store identity without a full integrity
+A body and its metadata commit atomically through WAL with synchronous
+FULL. Each blob row holds one immutable body BLOB. Retained incremental
+handles stream at most 64 KiB per call under a 32 MiB hard message/upload
+limit, without a whole-body memory buffer. Existing read transactions
+preserve old body snapshots after deletion. Native foreign keys enforce
+ownership; an expired lease retains its upload until explicit
+transactional removal. An uncertain COMMIT retires writes until
+reopen/recovery. Never acknowledge before COMMIT succeeds. Preserve
+transmission bytes independently of visible email lifetime. A stopped
+checkpointed database backup captures both bytes and metadata. The
+consuming IndexStore::backup primitive closes all native connections,
+copies through caller-owned 64 KiB scratch under retained source and
+destination locks, and publishes without replacement only after file sync.
+Its receipt follows destination directory sync; explicit failure phases
+keep partial artifacts distinguishable from successful backups. STORAGE.md
+owns the bounded copy and offline recovery contract. The offline `backup`
+CLI exposes this database-only copy without semantic verification or
+restore authority; it does not include configuration or credentials. The
+offline restore command verifies the copied database and renews its epoch
+before completion. It neither starts service nor reconciles external
+delivery outcomes; activation and consistent service configuration remain
+separate. Old schemas are refused; no data migration is required. Startup
+validates the closed schema and store identity without a full integrity
 scan. Explicit validate_integrity maintenance runs SQLite's full
 database/index consistency and foreign-key checks and the per-Email
-anchor-cardinality and complete blob chunk-geometry scans specified in
-STORAGE.md; body pins still require exact length/digest verification.
-The synchronous IndexReadView::verify_bodies primitive verifies every
-enumerated body for one account view under explicit count/byte limits
-and the original snapshot, deadline and VM fuel. Explicit cold
-maintenance_view captures the same pooled snapshot with one finite
-full-maintenance VM allowance; ordinary views retain their smaller cap.
-Neither scope renews while verification runs. Its historical completion
-report grants no body custody or current freshness.
+anchor-cardinality scan specified in STORAGE.md; integrity_check also
+validates the body-length CHECK constraint; body pins still require exact
+length/digest verification. The synchronous IndexReadView::verify_bodies
+primitive verifies every enumerated body for one account view under
+explicit count/byte limits and the original snapshot, deadline and VM
+fuel. Explicit cold maintenance_view captures the same pooled snapshot
+with one finite full-maintenance VM allowance; ordinary views retain their
+smaller cap. Neither scope renews while verification runs. Its historical
+completion report grants no body custody or current freshness.
 account_checks::combine binds historical metadata/body results only for
-matching full view identities and Blob counts; physical completeness
-and full verification remain separate offline-coordinator requirements.
-IndexReadView::verify_account drives bounded metadata and body checks
-and their report guard on one captured view, reusing caller scratch.
-Explicit metadata/body limits and caller-supplied trusted UTC govern
-admission; all stages spend the original deadline and VM allowance.
-Failure returns no combined report. The historical result retains the
-same separate physical, custody and activation requirements.
-SQLite recovery may read the full bounded WAL, and checkpoint may copy the
-entire bounded database in a synchronous native call. Neither promises
-interruption at the application deadline. Native resource and complete
-crash/fault qualification, domain mutation policy and service deployment
-remain activation requirements.
+matching full view identities and Blob counts; physical completeness and
+full verification remain separate offline-coordinator requirements.
+IndexReadView::verify_account drives bounded metadata and body checks and
+their report guard on one captured view, reusing caller scratch. Explicit
+metadata/body limits and caller-supplied trusted UTC govern admission; all
+stages spend the original deadline and VM allowance. Failure returns no
+combined report. The historical result retains the same separate physical,
+custody and activation requirements. SQLite recovery may read the full
+bounded WAL, and checkpoint may copy the entire bounded database in a
+synchronous native call. Neither promises interruption at the application
+deadline. Native resource and complete crash/fault qualification, domain
+mutation policy and service deployment remain activation requirements.
 
 ## 9. SMTP receiving and message representation
 
