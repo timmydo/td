@@ -71,7 +71,8 @@ were the user's to make were made on 2026-10-01, 2026-10-02,
   inherited (§8).
 - **Tool execution:** a jail per workspace (§8), a network policy wider
   than none (§10), and the host directories listed as `shared` in
-  configuration, `~/Downloads` read-only by default, bound in (§8, §15).
+  configuration or in the conversation's template bound in, none by
+  default (§8, §15).
 - **Conversation features:** background processes, a todo list, search
   and reads over a conversation's full log, compaction and
   auto-compaction, and messages between conversations (§3, §12, §14);
@@ -2957,10 +2958,10 @@ conversation exists, and says a refusal by name (§8, Admission). A
 repository's top, a work tree's or a bare one, and anything inside a git
 directory are refused too; a work tree's subdirectory is admitted, since
 its `.git` is out of the jail's reach. The shared directories,
-`[[shared]]` in configuration and `~/Downloads` read-only by default,
-are admitted once at the window's start, each refused one named and left
-out. Without the launch's td-jail and td-txt no workspace is made (As
-built (templates)). A conversation's `meta` records its workspace,
+`[[shared]]` in configuration, none by default, are admitted once at
+the window's start, each refused one named and left out. Without the
+launch's td-jail and td-txt no workspace is made (As built
+(templates)). A conversation's `meta` records its workspace,
 `{"kind": "scratch"}` or `{"kind": "directory", "path": …}`, fixed at
 creation; its jail directory is `$XDG_STATE_HOME/td-agent/jail/<id>/`,
 holding the instances' `home/`, a scratch workspace's `scratch/`, and
@@ -3153,7 +3154,7 @@ Every instance has:
   own mount.
 - **Git metadata:** the mount chain below.
 - **Shared directories:** the configured host directories (`shared`,
-  default `~/Downloads`), read-only by default at their real paths, so the
+  none by default), read-only by default at their real paths, so the
   human can hand the agent files; the agent hands files back in the
   workspace tree, which the human reads. A directory configured
   read-write joins every workspace that shares it, so it is a channel
@@ -6076,9 +6077,9 @@ default; `jev_threshold`'s is calibrated (§11):
 - `workspace_root`; default `~/td-agent`
 - `shared`: the host directories bound into every workspace (§8), an
   array of tables each with a `path` and an optional `write`, default
-  `false`; the default list is `~/Downloads`, read-only. A directory that
-  does not exist is skipped and reported, not created. Setting `shared`
-  replaces the default list, so `shared = []` shares nothing
+  `false`; the default list is empty, so no shared directory is bound
+  unless this list or the workspace's template names one. A directory
+  that does not exist is skipped and reported, not created
 - `template`: the workspace templates of §7, listed in the chooser
   after Empty and Directory…, an array of tables each with:
   - `name`: what the chooser shows, unique among the templates, and

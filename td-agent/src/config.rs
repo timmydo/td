@@ -949,9 +949,10 @@ pub struct Config {
     /// `workspace_root` as the file gives it, `~` unexpanded; none is
     /// `DEFAULT_WORKSPACE_ROOT`.
     pub workspace_root: Option<PathBuf>,
-    /// `[[shared]]` as the file gives them, `~` unexpanded; none is
-    /// `~/Downloads` read-only, and an empty list none at all.
-    pub shared: Option<Vec<Shared>>,
+    /// `[[shared]]` as the file gives them, `~` unexpanded; empty by
+    /// default, so no shared directory is bound unless it is named here
+    /// or in its template.
+    pub shared: Vec<Shared>,
     /// `[[template]]` in the order written (DESIGN.md §7).
     pub templates: Vec<Template>,
     /// `remotes`: the git remotes the human admitted, each a remote or a
@@ -1370,8 +1371,6 @@ fn expand_shared(shared: &[Shared], home: &Path) -> Vec<Shared> {
 
 /// Where repository workspaces live (DESIGN.md §7).
 pub const DEFAULT_WORKSPACE_ROOT: &str = "~/td-agent";
-/// The shared directory every workspace gets unless configured otherwise.
-pub const DEFAULT_SHARED: &str = "~/Downloads";
 
 impl Config {
     /// `workspace_root`, `~` expanded against `home`.
@@ -1387,13 +1386,7 @@ impl Config {
     /// The shared directories as configured, `~` expanded against `home`,
     /// not yet admitted (`workspace::admit_shared`).
     pub fn shared(&self, home: &Path) -> Vec<Shared> {
-        match &self.shared {
-            None => vec![Shared {
-                path: expand(Path::new(DEFAULT_SHARED), home),
-                write: false,
-            }],
-            Some(shared) => expand_shared(shared, home),
-        }
+        expand_shared(&self.shared, home)
     }
 }
 
@@ -1508,7 +1501,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         config.workspace_root = Some(configured_path("workspace_root", root)?);
     }
     if let Some(value) = table.get("shared") {
-        config.shared = Some(shared_list("shared", value)?);
+        config.shared = shared_list("shared", value)?;
     }
     if let Some(value) = table.get("template") {
         config.templates = templates(value)?;
@@ -1755,13 +1748,7 @@ mod tests {
         let home = Path::new("/home/u");
         let config = parse("").unwrap();
         assert_eq!(config.workspace_root(home), Path::new("/home/u/td-agent"));
-        assert_eq!(
-            config.shared(home),
-            [Shared {
-                path: "/home/u/Downloads".into(),
-                write: false
-            }]
-        );
+        assert!(config.shared(home).is_empty());
         let config =
             parse("workspace_root = \"/srv/ws\"\n[[shared]]\npath = \"~\"\nwrite = true\n")
                 .unwrap();
