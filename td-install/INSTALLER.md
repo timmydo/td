@@ -1401,10 +1401,11 @@ covering the branch with no saved username. This does not add a live account
 rename, migrate another home, enroll a PIN or provide the wizard's
 destructive authorization.
 
-`td-firstboot render-primary-sshd ROOT` is a read-only early boot operation
-using the same complete root-owned account admission as home preparation.
-It prints the full fixed SSH server policy with one Match block for that
-primary account, in the form the login state under the same ROOT selects
+`td-firstboot render-primary-sshd ROOT` is an early boot operation using
+the same complete root-owned account admission as home preparation, which
+writes only under ROOT's volatile `/run`. It publishes the full fixed SSH
+server policy with one Match block for that primary account, in the form
+the login state under the same ROOT selects
 (td-login/TOKEN-LOGIN.md, "SSH"): the ordinary policy only where that
 state is unenrolled, and otherwise the enforced form, which admits only
 that account. Neither admits root (td-login/TOKEN-LOGIN.md, "SSH"). A
@@ -1423,10 +1424,10 @@ profile publication, right after `td-firstboot ensure-login-directory
 /sysroot`, whose refusal never stops boot (td-login/TOKEN-LOGIN.md,
 "The login record").
 
-The deployment initramfs writes that output to fresh volatile
-`/run/td-sshd.conf` with a private creation mask and final mode 0600,
-before releasing procfs or starting users.
-Failure stops boot; an incomplete file is never used by a started daemon.
+Stage-1 init runs it before releasing procfs or starting users. It
+publishes `/run/td-sshd.conf` (td-login/THREAT-MODEL.md §1 states how),
+then writes the cutover record (td-authd/DESIGN.md amendment 7). Failure
+stops boot.
 The supervised server explicitly requires that path. There is no optional
 include and no immutable config with a stale human name. Only root can
 modify its file or parent. The complete policy formatter is shared with

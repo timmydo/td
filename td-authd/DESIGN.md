@@ -2335,7 +2335,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
      published, which is the form root records. The account tables are
      read-only binds from `prepare-primary-profile` to shutdown, so
      within a boot it validates the set stage 1 validated. The rename is
-     what serializes publication against `sshd`'s readers. Root
+     what serializes publication against `sshd`'s readers, and an
+     exclusive lock serializes overlapping renders
+     (`td-login/THREAT-MODEL.md` §1). Root
      launches it as it launches its helpers, with an empty environment
      and `/` as its working directory, and reaps it without blocking.
      Its output must be exactly `unenrolled` or `enforced` and a newline,

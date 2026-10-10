@@ -69,6 +69,7 @@ mod saved;
 #[allow(dead_code, reason = "the console and portal share store entry points")]
 mod secret_store;
 mod ssh_policy;
+mod ssh_render;
 #[path = "../../td-secret/src/tpm.rs"]
 #[allow(
     dead_code,
@@ -289,10 +290,13 @@ fn usage() -> String {
          td-firstboot stage-primary-name ROOT NAME OUT prepares new account tables without activating them\n  \
          td-firstboot ensure-login-directory ROOT creates an absent ROOT/var/lib/td/login, refuses an invalid one, and removes its tmp- entries\n  \
          td-firstboot check-login-directory ROOT checks ROOT/var/lib/td/login without writing\n  \
-         td-firstboot render-primary-sshd ROOT prints the validated primary-account server policy in the form ROOT's login state selects\n  \
+         td-firstboot render-primary-sshd ROOT publishes ROOT/{policy} for the validated primary account in the form ROOT's login state selects, then ROOT/{record} naming that form for this boot\n  \
+         td-firstboot render-ssh-policy publishes /{policy} the same way for the running boot and prints the form it published\n  \
          td-firstboot prepare-primary-profile ROOT publishes the selected primary account and prepares its home before users start\n  \
          td-firstboot check-launch-session USER UID COMPOSITOR_UID verifies live reservations\n  \
-         td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n"
+         td-firstboot check-launch-application OWNER APP selects an enrolled active application UID\n",
+        policy = ssh_render::POLICY,
+        record = ssh_render::RECORD,
     )
 }
 
@@ -315,8 +319,21 @@ fn run_with_primary(
         }
         Invocation::RenderPrimarySshd(root) => {
             let primary = principals::primary_in_root(&root).map_err(Failure::Failed)?;
-            let policy = sshd_policy(primary.name(), &root, login_state::Owner::ROOT);
-            return emit(&policy).map_err(Failure::Failed);
+            ssh_render::boot_render(
+                &root,
+                primary.name(),
+                Path::new(ssh_render::BOOT_ID),
+                login_state::Owner::ROOT,
+            )
+            .map_err(Failure::Failed)?;
+            return Ok(());
+        }
+        Invocation::RenderSshPolicy => {
+            let root = Path::new("/");
+            let primary = principals::primary_in_root(root).map_err(Failure::Failed)?;
+            let form = ssh_render::running_render(root, primary.name(), login_state::Owner::ROOT)
+                .map_err(Failure::Failed)?;
+            return emit(&form).map_err(Failure::Failed);
         }
         Invocation::PreparePrimaryProfile(root) => {
             let home = primary_profile::prepare(&root).map_err(Failure::Failed)?;
@@ -488,6 +505,7 @@ enum Invocation {
     EnsureLoginDirectory(PathBuf),
     CheckLoginDirectory(PathBuf),
     RenderPrimarySshd(PathBuf),
+    RenderSshPolicy,
     CheckLaunchSession(String, u32, u32),
     CheckLaunchApplication(u32, String),
     Provision(Config),
@@ -516,6 +534,13 @@ fn parse(args: &[String]) -> Result<Invocation, Failure> {
             return Err(Failure::Usage("render-primary-sshd requires ROOT".into()));
         };
         return Ok(Invocation::RenderPrimarySshd(PathBuf::from(root)));
+    }
+    if args.first().is_some_and(|verb| verb == "render-ssh-policy") {
+        return if args.len() == 1 {
+            Ok(Invocation::RenderSshPolicy)
+        } else {
+            Err(Failure::Usage("render-ssh-policy takes no operands".into()))
+        };
     }
     if args
         .first()
@@ -1494,24 +1519,6 @@ fn write_durably_owned(
         .map_err(Failure::Failed)
 }
 
-/// The server policy for the admitted `primary` account, in the form the
-/// login state under the same `root` selects (td-login/TOKEN-LOGIN.md, "SSH").
-fn sshd_policy(primary: &str, root: &Path, owner: login_state::Owner) -> String {
-    let state = login_state::state_as(root, owner, principals::primary_account::UID);
-    ssh_policy::config(primary, ssh_form(state))
-}
-
-/// Only a verifiably unenrolled machine gets the ordinary form; the
-/// predicate reports every failure to read as unavailable, never unenrolled.
-fn ssh_form(state: login_state::State) -> ssh_policy::Form {
-    match state {
-        login_state::State::Unenrolled => ssh_policy::Form::Ordinary,
-        login_state::State::Enrolled | login_state::State::Unavailable(_) => {
-            ssh_policy::Form::Enforced
-        }
-    }
-}
-
 /// Markers to stdout. A closed reader is a clean exit, not a panic: `println!`
 /// panics on a failed write and Rust leaves SIGPIPE ignored, so `td-firstboot |
 /// head` would abort — which the no-panic rule forbids.
@@ -1658,6 +1665,7 @@ mod tests {
             | Invocation::EnsureLoginDirectory(_)
             | Invocation::CheckLoginDirectory(_)
             | Invocation::RenderPrimarySshd(_)
+            | Invocation::RenderSshPolicy
             | Invocation::StagePrimaryName(_, _, _)
             | Invocation::CheckLaunchApplication(..)
             | Invocation::CheckLaunchSession(..) => Err(Failure::Usage(
@@ -2251,6 +2259,13 @@ mod tests {
 mod ssh_forms {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
+    use ssh_render::ssh_form;
+
+    /// The policy for the admitted `primary` account, in the form the login
+    /// state under the same `root` selects.
+    fn sshd_policy(primary: &str, root: &Path, owner: login_state::Owner) -> String {
+        ssh_policy::config(primary, ssh_render::selected(root, owner))
+    }
 
     /// The policy as rendered before the login-key tier and APPLICATIONS.md
     /// §L.1's L7, for `alice`, written out independently of the formatter.
@@ -2590,6 +2605,19 @@ mod principal_arguments {
         }
         let args = ["render-primary-sshd", "/td-missing-primary-sshd-root"].map(str::to_owned);
         assert!(matches!(run(&args), Err(Failure::Failed(_))));
+    }
+
+    /// The in-boot render is one fixed word: no root, no other operand.
+    #[test]
+    fn the_running_render_takes_no_operand() {
+        assert!(matches!(
+            parse(&["render-ssh-policy".to_owned()]),
+            Ok(Invocation::RenderSshPolicy)
+        ));
+        for extra in ["/", "/sysroot", "--state-dir"] {
+            let args = ["render-ssh-policy", extra].map(str::to_owned);
+            assert!(matches!(parse(&args), Err(Failure::Usage(_))));
+        }
     }
 
     #[test]

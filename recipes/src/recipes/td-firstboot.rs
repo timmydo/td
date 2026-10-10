@@ -50,6 +50,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-firstboot/src/ssh_policy.rs"),
     ),
     (
+        "ssh_render",
+        include_str!("../../../td-firstboot/src/ssh_render.rs"),
+    ),
+    (
         "primary_home",
         include_str!("../../../td-firstboot/src/primary_home.rs"),
     ),

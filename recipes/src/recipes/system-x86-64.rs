@@ -2420,7 +2420,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     init.push_str(&format!(
         "primary_home=$(/bin/td-firstboot prepare-primary-profile /sysroot) || exit 1\n\
          {LOGIN_DIRECTORY_STEP}\n\
-         /bin/sh -c 'umask 077; /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1\n\
+         /bin/td-firstboot render-primary-sshd /sysroot || exit 1\n\
          /bin/umount /proc\n\
          downloads=\"$primary_home/Downloads\"\n\
          if /bin/td-util readlink \"/sysroot$downloads\" >/dev/null 2>&1; then\n\
@@ -11241,16 +11241,25 @@ mod tests {
             .iter()
             .any(|(path, _, _)| *path == "ssh/sshd_config"));
         let init = build_deployment_init(&SYSTEM);
-        let render = format!(
-            "/bin/sh -c 'umask 077; \
-             /bin/td-firstboot render-primary-sshd /sysroot > /sysroot{SSHD_CONFIG} && \
-             /bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}' || exit 1"
-        );
+        // td-firstboot publishes the policy and the cutover record itself
+        // (TOKEN-LOGIN.md increment 5's A2): no shell redirect truncates
+        // the file in place, and a failure stops the boot.
+        let render = "/bin/td-firstboot render-primary-sshd /sysroot || exit 1";
+        assert_eq!(init.lines().filter(|line| line.trim() == render).count(), 1);
         let at = init
-            .find(&render)
+            .find(render)
             .expect("required account-derived server policy");
+        // It writes under the volatile run directory and reads the boot ID
+        // through /proc, so both are mounted first and /proc stays until it ends.
+        assert!(
+            init.find("/bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run")
+                .expect("volatile run")
+                < at
+        );
+        assert!(init.find("/bin/mount -t proc").expect("proc mount") < at);
         assert!(at < init.find("/bin/umount /proc").expect("proc cleanup"));
-        assert!(init.contains(&format!("/bin/td-util chmod 0600 /sysroot{SSHD_CONFIG}")));
+        assert!(!init.contains(SSHD_CONFIG), "{init}");
+        assert!(!init.contains("td-login-cutover"), "{init}");
         assert_eq!(
             unit_key("sshd", "exec"),
             Some(format!("/bin/sshd -D -e -f {SSHD_CONFIG}"))
@@ -11950,9 +11959,10 @@ mod tests {
             .iter()
             .position(|line| *line == LOGIN_DIRECTORY_STEP)
             .expect("the step is a line of its own");
-        assert!(lines
-            .get(at + 1)
-            .is_some_and(|next| next.contains("/bin/td-firstboot render-primary-sshd /sysroot")));
+        assert_eq!(
+            lines.get(at + 1),
+            Some(&"/bin/td-firstboot render-primary-sshd /sysroot || exit 1")
+        );
         let before = lines.get(..at).unwrap_or_default();
         let position = |needle: &str| {
             before

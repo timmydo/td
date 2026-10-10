@@ -66,16 +66,27 @@ not extend td-login's syscall or post-condition claims to OpenSSH; the image
 recipe instead pins its source, configuration, locked account, empty volatile
 chroot, split helpers, seccomp sandbox, and a real unprivileged loopback login.
 Before entering the authenticated deployment, firstboot validates its complete
-root-owned account tables and renders the server policy into root-owned
-mode-0600 `/run/td-sshd.conf`. Only the admitted UID/GID-1000 account name
-selects its self-test Match block and, in the enforced form below, the one
-`AllowUsers` entry. The policy's remaining bytes are compiled from the
-shared source used by the realized OpenSSH recipe test. The daemon
-requires this configuration file explicitly; there is no optional include or
-fallback configuration. Generation failure stops boot before user processes,
-and the caller serializes publication against all account readers. This
-changes no credential transition or authentication method. Neither
-form admits root (`TOKEN-LOGIN.md`, "SSH", states the rule). Since
+root-owned account tables and publishes the server policy itself as root:root
+mode-0600 `/run/td-sshd.conf`, renaming into place a temporary it created
+exclusively without following a link, then writes the volatile cutover
+record naming the form it rendered (`td-authd/DESIGN.md` amendment 7).
+Only the admitted UID/GID-1000 account name selects its self-test Match
+block and, in the enforced form below, the one `AllowUsers` entry. The
+policy's remaining bytes are compiled from the shared source used by the
+realized OpenSSH recipe test. The daemon requires this configuration file
+explicitly; there is no optional include or fallback configuration. A
+failed validation, boot ID read, or either write stops boot before user
+processes. Within a boot, `td-firstboot render-ssh-policy` publishes the
+same way and writes no record; its failure is td-authd's failed revocation
+(amendment 7), not a boot stop. Publication is serialized by the account
+tables' read-only binds, from `prepare-primary-profile` to shutdown; by an
+exclusive lock on a persistent root-only mode-0600 file beside the target
+(`/run/td-sshd.conf.lock`, `/run/td-login-cutover.lock`), held from
+clearing a stale temporary through the rename and the directory's fsync,
+so overlapping renders cannot interleave and no account can stall one;
+and by the rename, which no `sshd` reader sees half done. This changes no
+credential transition or authentication method. Neither form admits root
+(`TOKEN-LOGIN.md`, "SSH", states the rule). Since
 `TOKEN-LOGIN.md`'s increment 4 (C6) the render reads the login state
 through the shared predicate (§3) under the root it renders, and
 renders the ordinary policy only where that state is unenrolled.

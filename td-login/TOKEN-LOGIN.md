@@ -89,15 +89,19 @@ act on the state, and only where a record or an invalid directory
 exists, but for increment 4's live exceptions ("Increments"): on every
 paired machine `Super+l` is consumed and the menu shows `L`, which
 answers `NO LOGIN KEYS ENROLLED` while unenrolled. Of increment 5, A1
-has landed and is live on every machine without acting on the state:
-`sshd`'s unit stops its whole leaf (`stop=leaf`, `td-svc/DESIGN.md`
-§4), so a stop, restart or shutdown of `sshd` ends its OpenSSH
-sessions. Nothing else below is implemented. Until the increments at
-the end land, `THREAT-MODEL.md` §3 is the complete current behaviour:
-the installed account logs in automatically, and a machine with neither
-a record nor an invalid directory, as every stock machine is, never
-locks. No document, UI or release note may describe this tier as
-available before its acceptance evidence exists.
+and A2 have landed and are live on every machine without acting on the
+state: `sshd`'s unit stops its whole leaf (`stop=leaf`,
+`td-svc/DESIGN.md` §4), so a stop, restart or shutdown of `sshd` ends
+its OpenSSH sessions; and at every boot firstboot publishes its SSH
+render by rename and writes the cutover record
+(`/run/td-login-cutover`, `td-authd/DESIGN.md` amendment 7) naming the
+form it rendered. A2's in-boot `td-firstboot render-ssh-policy` exists,
+but nothing runs it before A3. Nothing else below is implemented. Until
+the increments at the end land, `THREAT-MODEL.md` §3 is the complete
+current behaviour: the installed account logs in automatically, and a
+machine with neither a record nor an invalid directory, as every stock
+machine is, never locks. No document, UI or release note may describe
+this tier as available before its acceptance evidence exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
 interactive login, and there is no `su` and root has no login at all,
@@ -1772,7 +1776,7 @@ and the oracle that shows it.
      trampoline's grant, and a guest whose leader forks a session child
      in its own session before anything else and holds it through a
      crash and ends it at a restart.
-   - A2, firstboot's two renders:
+   - A2, landed: firstboot's two renders:
      - Stage-1's `td-firstboot render-primary-sshd /sysroot` publishes
        `/sysroot/run/td-sshd.conf` itself, a root:root mode-0600
        temporary renamed into place, in place of the shell's truncating
