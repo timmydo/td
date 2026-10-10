@@ -621,6 +621,16 @@ impl Left {
     }
 }
 
+/// Whether `name` can be a tool's own name in `mcp__SERVER__TOOL`: 1 to
+/// `MAX_TOOL_NAME` bytes of ASCII letters, digits, `_` and `-`.
+pub fn tool_name_fits(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// `server`'s tools as the prefix offers them, kept to `keep` when it
 /// names any: each checked and bounded, at most `MAX_TOOLS`, and what was
 /// left out and why. A name listed again repeats the first listing,
@@ -648,12 +658,7 @@ pub fn offer(server: &str, tools: &[Json], keep: Option<&[String]>) -> (Vec<Offe
             left.push(format!("{shown}: listed twice"));
             continue;
         }
-        let fits = !name.is_empty()
-            && name.len() <= MAX_TOOL_NAME
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-        if !fits {
+        if !tool_name_fits(name) {
             left.push(format!(
                 "{shown}: a name is 1 to {MAX_TOOL_NAME} bytes of ASCII letters, digits, `_` and `-`"
             ));

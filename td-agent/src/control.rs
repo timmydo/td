@@ -495,6 +495,7 @@ mod tests {
         remote
             .app
             .set_saved_templates(vec![crate::config::Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "td".into(),

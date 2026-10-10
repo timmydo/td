@@ -96,6 +96,7 @@ mod tests {
 
     fn meta(remotes: &[(&str, &str)], archived: bool, removed: bool) -> Meta {
         let template = crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),

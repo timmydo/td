@@ -120,6 +120,8 @@ pub struct TemplateShared {
     pub shared: Option<Vec<Shared>>,
     pub network: Option<Network>,
     pub system: bool,
+    /// Its MCP servers (DESIGN.md §12, MCP servers).
+    pub mcp: Vec<McpServer>,
 }
 
 /// A workspace's network policy (DESIGN.md §10).
@@ -440,6 +442,20 @@ impl Client {
             .any(|t| &t.name == template && t.system)
     }
 
+    /// A workspace's MCP servers: its template's, none when it has no
+    /// template or its template is no longer configured.
+    pub fn mcp_for(&self, workspace: &Workspace) -> &[McpServer] {
+        let template = match workspace {
+            Workspace::Template(name) => name,
+            Workspace::Repositories(repositories) => &repositories.template,
+            Workspace::Scratch | Workspace::Directory(_) => return &[],
+        };
+        self.template_shared
+            .iter()
+            .find(|t| &t.name == template)
+            .map_or(&[], |t| t.mcp.as_slice())
+    }
+
     /// A workspace's network policy: its template's own when it names
     /// one, `network` when it names none or the workspace has no
     /// template, and `off` when its template is no longer configured, so
@@ -581,6 +597,12 @@ impl Client {
                                         .map_or(Json::Null, |n| Json::Str(n.name().into())),
                                 ),
                                 ("system".into(), Json::Bool(template.system)),
+                                (
+                                    "mcp".into(),
+                                    Json::Arr(
+                                        template.mcp.iter().map(McpServer::to_json).collect(),
+                                    ),
+                                ),
                             ])
                         })
                         .collect(),
@@ -787,11 +809,18 @@ impl Client {
                                 format!("template {name:?}: `system` is true or false")
                             })?,
                         };
+                        // A setup from a window before servers: none.
+                        let mcp = match item.get("mcp") {
+                            None => Vec::new(),
+                            Some(servers) => mcp_from_json(servers)
+                                .map_err(|e| format!("template {name:?}: {e}"))?,
+                        };
                         Ok(TemplateShared {
                             system,
                             name: template_name(name)?,
                             shared,
                             network,
+                            mcp,
                         })
                     })
                     .collect::<Result<_, String>>()?,
@@ -1112,6 +1141,240 @@ pub struct Template {
     /// view): `system_status`, which reads the whole machine's processes
     /// outside the jail.
     pub system: bool,
+    /// Its MCP servers (DESIGN.md §12, MCP servers), only ever the
+    /// configuration file's: a template made in the window names none.
+    pub mcp: Vec<McpServer>,
+}
+
+/// One of a template's MCP servers (DESIGN.md §12, MCP servers; §15).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    /// The program and its arguments, as `serve` runs them.
+    pub command: Vec<String>,
+    /// The only tools of it to offer; none offers every tool.
+    pub tools: Option<Vec<String>>,
+    /// A call's timeout, in whole seconds.
+    pub timeout: u64,
+}
+
+/// The most MCP servers a template names.
+pub const MAX_MCP_SERVERS: usize = 4;
+/// The longest MCP server name: `mcp__`, it, `__` and the longest tool
+/// name make a tool name's 64 bytes (`mcp::MAX_TOOL_NAME`).
+pub const MAX_MCP_NAME: usize = 16;
+/// The most strings an MCP server's command holds (§15), the program
+/// and its arguments, within what a `serve` call takes.
+pub const MAX_MCP_COMMAND: usize = 64;
+const _: () = assert!(MAX_MCP_COMMAND <= 1 + crate::host::MAX_SERVE_ARGS);
+/// The most bytes of command and tool names a template's servers hold
+/// together, so that its servers alone cannot fill a setup frame (§7).
+pub const MAX_MCP_BYTES: usize = 16 * 1024;
+/// An MCP call's timeout in seconds: its default and its range.
+pub const DEFAULT_MCP_TIMEOUT: u64 = 120;
+pub const MCP_TIMEOUT: std::ops::RangeInclusive<u64> = 1..=600;
+
+/// Whether `name` can name an MCP server: 1 to `MAX_MCP_NAME` lowercase
+/// ASCII letters, digits and `-`, starting with a letter, so no `_` can
+/// make `mcp__SERVER__TOOL` ambiguous.
+pub fn mcp_server_name(name: &str) -> bool {
+    name.len() <= MAX_MCP_NAME
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// One of a template's MCP servers, checked whole, as the configuration
+/// file gives it and as a conversation's setup carries it (§15): its
+/// name; its command, the program an absolute path or a bare name the
+/// jail's `PATH` finds, every string within a `serve` call's bounds with
+/// no control character; its tools, when named, each a tool name the
+/// prefix could carry and named once; and its timeout.
+pub fn mcp_server(
+    name: &str,
+    command: Vec<String>,
+    tools: Option<Vec<String>>,
+    timeout: Option<u64>,
+) -> Result<McpServer, String> {
+    if !mcp_server_name(name) {
+        return Err(format!(
+            "an MCP server's `name` is 1 to {MAX_MCP_NAME} lowercase ASCII letters, digits and `-`, starting with a letter, not {name:?}"
+        ));
+    }
+    let what = |e: &str| format!("MCP server {name}: {e}");
+    if command.is_empty() || command.len() > MAX_MCP_COMMAND {
+        return Err(what(&format!(
+            "`command` is the program and its arguments, 1 to {MAX_MCP_COMMAND} strings"
+        )));
+    }
+    if command
+        .iter()
+        .any(|word| word.len() > crate::host::MAX_SERVE_WORD || word.contains(char::is_control))
+    {
+        return Err(what(&format!(
+            "each of `command`'s strings is at most {} bytes with no control character",
+            crate::host::MAX_SERVE_WORD
+        )));
+    }
+    let program = command.first().map(String::as_str).unwrap_or_default();
+    let relative = program.contains('/') && !program.starts_with('/');
+    if program.is_empty() || relative || program == "." || program == ".." {
+        return Err(what(
+            "`command`'s program is an absolute path or a name the jail's `PATH` finds",
+        ));
+    }
+    if let Some(tools) = &tools {
+        if tools.is_empty() || tools.len() > crate::mcp::MAX_TOOLS {
+            return Err(what(&format!(
+                "`tools` names 1 to {} tools; leave it out to offer every tool",
+                crate::mcp::MAX_TOOLS
+            )));
+        }
+        for (at, tool) in tools.iter().enumerate() {
+            if !crate::mcp::tool_name_fits(tool) {
+                return Err(what(&format!(
+                    "a tool's name is 1 to {} bytes of ASCII letters, digits, `_` and `-`, not {tool:?}",
+                    crate::mcp::MAX_TOOL_NAME
+                )));
+            }
+            if tools.get(..at).unwrap_or_default().contains(tool) {
+                return Err(what(&format!("`tools` names {tool} twice")));
+            }
+        }
+    }
+    let timeout = timeout.unwrap_or(DEFAULT_MCP_TIMEOUT);
+    if !MCP_TIMEOUT.contains(&timeout) {
+        return Err(what(&format!(
+            "`timeout` is a whole number of seconds from {} to {}",
+            MCP_TIMEOUT.start(),
+            MCP_TIMEOUT.end()
+        )));
+    }
+    Ok(McpServer {
+        name: name.to_string(),
+        command,
+        tools,
+        timeout,
+    })
+}
+
+/// A template's servers, at most `MAX_MCP_SERVERS`, each named once,
+/// within `MAX_MCP_BYTES` together.
+fn mcp_servers(servers: Vec<McpServer>) -> Result<Vec<McpServer>, String> {
+    if servers.len() > MAX_MCP_SERVERS {
+        return Err(format!("at most {MAX_MCP_SERVERS} MCP servers"));
+    }
+    let bytes: usize = servers
+        .iter()
+        .flat_map(|server| server.command.iter().chain(server.tools.iter().flatten()))
+        .map(String::len)
+        .sum();
+    if bytes > MAX_MCP_BYTES {
+        return Err(format!(
+            "the MCP servers' commands and tools are past {MAX_MCP_BYTES} bytes together"
+        ));
+    }
+    for (at, server) in servers.iter().enumerate() {
+        let before = servers.get(..at).unwrap_or_default();
+        if before.iter().any(|other| other.name == server.name) {
+            return Err(format!("two MCP servers are named {}", server.name));
+        }
+    }
+    Ok(servers)
+}
+
+impl McpServer {
+    /// As a conversation's setup carries it.
+    fn to_json(&self) -> Json {
+        let strings = |list: &[String]| Json::Arr(list.iter().cloned().map(Json::Str).collect());
+        Json::Obj(vec![
+            ("name".into(), Json::Str(self.name.clone())),
+            ("command".into(), strings(&self.command)),
+            (
+                "tools".into(),
+                self.tools.as_deref().map_or(Json::Null, strings),
+            ),
+            ("timeout".into(), Json::from(self.timeout)),
+        ])
+    }
+}
+
+/// `McpServer::to_json`'s list back, each checked as the file's is.
+fn mcp_from_json(value: &Json) -> Result<Vec<McpServer>, String> {
+    let wrong = "MCP servers are a list, each a name, a command, its tools or null, and a timeout";
+    let strings = |value: Option<&Json>| -> Option<Vec<String>> {
+        value?
+            .as_arr()?
+            .iter()
+            .map(|word| word.as_str().map(str::to_string))
+            .collect()
+    };
+    let servers = value
+        .as_arr()
+        .ok_or(wrong)?
+        .iter()
+        .map(|server| {
+            let name = server.get("name").and_then(Json::as_str).ok_or(wrong)?;
+            let command = strings(server.get("command")).ok_or(wrong)?;
+            let tools = match server.get("tools") {
+                None | Some(Json::Null) => None,
+                tools => Some(strings(tools).ok_or(wrong)?),
+            };
+            let timeout = server.get("timeout").and_then(Json::as_u64).ok_or(wrong)?;
+            mcp_server(name, command, tools, Some(timeout))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    mcp_servers(servers)
+}
+
+/// `template.mcp`, as the configuration file gives it.
+fn mcp_toml(value: &Toml) -> Result<Vec<McpServer>, String> {
+    let wrong = "`template.mcp` is a list of `[[template.mcp]]` tables";
+    let strings = |value: &Toml, key: &str| -> Result<Vec<String>, String> {
+        value
+            .as_arr()
+            .and_then(|words| {
+                words
+                    .iter()
+                    .map(|word| word.as_str().map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| format!("`template.mcp.{key}` is a list of strings"))
+    };
+    let mut servers = Vec::new();
+    for server in value.as_arr().ok_or(wrong)? {
+        if !server.is_table() {
+            return Err(wrong.into());
+        }
+        server
+            .check_known_keys(&["name", "command", "tools", "timeout"])
+            .map_err(|e| format!("`template.mcp`: {e}"))?;
+        let name = server
+            .optional_str("name")
+            .map_err(|e| format!("`template.mcp`: {e}"))?
+            .ok_or("a `[[template.mcp]]` table has no `name`")?;
+        let command = match server.get("command") {
+            None => return Err(format!("MCP server {name:?} has no `command`")),
+            Some(command) => strings(command, "command")?,
+        };
+        let tools = match server.get("tools") {
+            None => None,
+            Some(tools) => Some(strings(tools, "tools")?),
+        };
+        let timeout = match server.get("timeout") {
+            None => None,
+            // Below 1, refused with the range.
+            Some(Toml::Int(seconds)) => Some(u64::try_from(*seconds).unwrap_or(0)),
+            Some(_) => {
+                return Err(format!(
+                    "MCP server {name:?}: `timeout` is a whole number of seconds"
+                ))
+            }
+        };
+        servers.push(mcp_server(name, command, tools, timeout)?);
+    }
+    mcp_servers(servers)
 }
 
 /// One of a template's repositories.
@@ -1227,7 +1490,7 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
         if !item.is_table() {
             return Err(wrong.into());
         }
-        item.check_known_keys(&["name", "repos", "shared", "network", "system"])
+        item.check_known_keys(&["name", "repos", "shared", "network", "system", "mcp"])
             .map_err(|e| format!("`template`: {e}"))?;
         let name = item
             .optional_str("name")
@@ -1282,12 +1545,17 @@ fn templates(value: &Toml) -> Result<Vec<Template>, String> {
                 .as_bool()
                 .ok_or_else(|| format!("template {name:?}: `system` is true or false"))?,
         };
+        let mcp = match item.get("mcp") {
+            None => Vec::new(),
+            Some(value) => mcp_toml(value).map_err(|e| format!("template {name:?}: {e}"))?,
+        };
         templates.push(Template {
             system,
             name,
             repos,
             shared,
             network,
+            mcp,
         });
     }
     Ok(templates)
@@ -1581,12 +1849,15 @@ pub fn templates_from_json(value: &Json) -> Result<Vec<Template>, String> {
             })
             .collect::<Result<Vec<_>, String>>()
             .map_err(|e| format!("template {name:?}: {e}"))?;
+        // A template made in the window names no MCP server; its file's
+        // keys leave no room for one.
         let template = Template {
             system,
             network,
             name,
             repos,
             shared,
+            mcp: Vec::new(),
         };
         if !template.repos.is_empty() {
             crate::workspace::plan(&template, &id, &place, &place, 0)?;
@@ -2102,6 +2373,7 @@ mod tests {
         assert_eq!(
             config.templates,
             [Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "td".into(),
@@ -2408,6 +2680,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(n, network)| Template {
+            mcp: Vec::new(),
             system: false,
             network,
             name: format!("t{n}"),
@@ -2456,6 +2729,7 @@ mod tests {
         let e = parse("[[template]]\nname = \"x\"\nsystem = \"yes\"\n").unwrap_err();
         assert!(e.contains("true or false"), "{e}");
         let on = Template {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2489,12 +2763,14 @@ mod tests {
         let client = Client {
             template_shared: vec![
                 TemplateShared {
+                    mcp: Vec::new(),
                     name: "sys".into(),
                     shared: None,
                     network: None,
                     system: true,
                 },
                 TemplateShared {
+                    mcp: Vec::new(),
                     name: "plain".into(),
                     shared: None,
                     network: None,
@@ -2509,6 +2785,181 @@ mod tests {
         assert!(!back.system_for(&Workspace::Template("plain".into())));
         assert!(!back.system_for(&Workspace::Template("gone".into())));
         assert!(!back.system_for(&Workspace::Scratch));
+    }
+
+    /// A template's MCP servers: read from `[[template.mcp]]` with their
+    /// timeout's default, each checked whole (§15) and refused with why;
+    /// carried to conversations and back, a setup from before them
+    /// naming none; only a workspace whose template is still listed has
+    /// them; and a template made in the window can name none.
+    #[test]
+    fn a_templates_mcp_servers_are_checked_and_carried() {
+        let config = parse(
+            "[[template]]\nname = \"t\"\n[[template.mcp]]\nname = \"gh\"\ncommand = [\"/usr/bin/gh-mcp\", \"--stdio\"]\ntools = [\"list_issues\", \"get-issue\"]\n[[template.mcp]]\nname = \"files2\"\ncommand = [\"mcp-files\"]\ntimeout = 600\n",
+        )
+        .unwrap();
+        let servers = &config.templates.first().unwrap().mcp;
+        assert_eq!(
+            servers,
+            &[
+                McpServer {
+                    name: "gh".into(),
+                    command: vec!["/usr/bin/gh-mcp".into(), "--stdio".into()],
+                    tools: Some(vec!["list_issues".into(), "get-issue".into()]),
+                    timeout: DEFAULT_MCP_TIMEOUT,
+                },
+                McpServer {
+                    name: "files2".into(),
+                    command: vec!["mcp-files".into()],
+                    tools: None,
+                    timeout: 600,
+                },
+            ]
+        );
+        let server = |body: &str| parse(&format!("[[template]]\nname = \"t\"\n{body}"));
+        let one = |fields: &str| server(&format!("[[template.mcp]]\n{fields}\n"));
+        let long_word = format!("command = [\"x\", \"{}\"]", "a".repeat(4097));
+        let many_words = format!(
+            "command = [{}]",
+            vec!["\"x\""; MAX_MCP_COMMAND + 1].join(", ")
+        );
+        let many_tools = format!(
+            "command = [\"x\"]\ntools = [{}]",
+            (0..=crate::mcp::MAX_TOOLS)
+                .map(|i| format!("\"t{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (fields, why) in [
+            ("name = \"GH\"\ncommand = [\"x\"]", "lowercase"),
+            ("name = \"g_h\"\ncommand = [\"x\"]", "lowercase"),
+            (
+                "name = \"1gh\"\ncommand = [\"x\"]",
+                "starting with a letter",
+            ),
+            ("name = \"abcdefghijklmnopq\"\ncommand = [\"x\"]", "1 to 16"),
+            ("name = \"gh\"", "no `command`"),
+            ("name = \"gh\"\ncommand = []", "1 to 64 strings"),
+            ("name = \"gh\"\ncommand = [\"bin/gh\"]", "absolute path"),
+            ("name = \"gh\"\ncommand = [\"\"]", "absolute path"),
+            ("name = \"gh\"\ncommand = [\"x\", \"a\\u0007\"]", "control"),
+            ("name = \"gh\"\ncommand = \"x\"", "list of strings"),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntools = []",
+                "leave it out",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntools = [\"a.b\"]",
+                "a tool's name",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntools = [\"a\", \"a\"]",
+                "twice",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntimeout = 0",
+                "from 1 to 600",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntimeout = 601",
+                "from 1 to 600",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntimeout = \"60\"",
+                "a whole number",
+            ),
+            (
+                "name = \"gh\"\ncommand = [\"x\"]\ntimeout = -5",
+                "from 1 to 600",
+            ),
+            ("name = \"gh\"\ncommand = [\"..\"]", "absolute path"),
+            ("name = \"gh\"\ncommand = [\"x\"]\nenv = {}", "env"),
+        ] {
+            let e = one(fields).unwrap_err();
+            assert!(e.contains(why), "{fields}: {e}");
+        }
+        for (fields, why) in [
+            (&long_word, "at most 4096 bytes"),
+            (&many_words, "1 to 64 strings"),
+        ] {
+            let e = one(&format!("name = \"gh\"\n{fields}")).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        // Four servers within every bound of their own, past what one
+        // template may hold together.
+        let heavy = (0..4)
+            .map(|i| {
+                format!(
+                    "[[template.mcp]]\nname = \"s{i}\"\ncommand = [\"x\", \"{}\"]\n",
+                    "a".repeat(MAX_MCP_BYTES / 4)
+                )
+            })
+            .collect::<String>();
+        assert!(server(&heavy).unwrap_err().contains("together"));
+        let e = one(&format!("name = \"gh\"\n{many_tools}")).unwrap_err();
+        assert!(e.contains("1 to 128 tools"), "{e}");
+        let twice = "[[template.mcp]]\nname = \"gh\"\ncommand = [\"x\"]\n".repeat(2);
+        assert!(server(&twice).unwrap_err().contains("two MCP servers"));
+        let five = (0..5)
+            .map(|i| format!("[[template.mcp]]\nname = \"s{i}\"\ncommand = [\"x\"]\n"))
+            .collect::<String>();
+        assert!(server(&five).unwrap_err().contains("at most 4"));
+        // Carried to conversations, each checked again; a setup from
+        // before servers names none.
+        let client = Client {
+            template_shared: vec![TemplateShared {
+                name: "t".into(),
+                shared: None,
+                network: None,
+                system: false,
+                mcp: servers.clone(),
+            }],
+            ..Client::default()
+        };
+        let json = client.to_json();
+        let back = Client::from_json(&json).unwrap();
+        assert_eq!(back.template_shared, client.template_shared);
+        let at = Workspace::Template("t".into());
+        assert_eq!(back.mcp_for(&at), servers.as_slice());
+        assert!(back.mcp_for(&Workspace::Template("gone".into())).is_empty());
+        let repositories = |template: &str| {
+            Workspace::Repositories(crate::workspace::Repositories {
+                template: template.into(),
+                name: "w".into(),
+                entries: Vec::new(),
+            })
+        };
+        assert_eq!(back.mcp_for(&repositories("t")), servers.as_slice());
+        assert!(back.mcp_for(&repositories("gone")).is_empty());
+        assert!(back.mcp_for(&Workspace::Scratch).is_empty());
+        let old = td_json::parse(&json.to_string().replace("\"mcp\":", "\"was\":")).unwrap();
+        let old = Client::from_json(&old).unwrap();
+        assert!(old.mcp_for(&at).is_empty());
+        // A setup that leaves `tools` out offers every tool, as `null`.
+        let bare = td_json::parse(&json.to_string().replace("\"tools\":null,", "")).unwrap();
+        assert_eq!(
+            Client::from_json(&bare).unwrap().template_shared,
+            client.template_shared
+        );
+        let wrong = td_json::parse(&json.to_string().replace("\"gh\"", "\"G H\"")).unwrap();
+        assert!(Client::from_json(&wrong).unwrap_err().contains("lowercase"));
+        // A template made in the window names none, and its file cannot.
+        let written = templates_json(&[Template {
+            name: "w".into(),
+            repos: Vec::new(),
+            shared: None,
+            network: None,
+            system: false,
+            mcp: Vec::new(),
+        }]);
+        assert!(!written.to_string().contains("mcp"));
+        let with = td_json::parse(
+            &written
+                .to_string()
+                .replace("\"name\":\"w\"", "\"name\":\"w\",\"mcp\":[]"),
+        )
+        .unwrap();
+        assert!(templates_from_json(&with).is_err());
     }
 
     /// The dialog's shared folders: paths parted by spaces, read-only
@@ -2560,6 +3011,7 @@ mod tests {
     fn a_scratch_template_made_in_the_window_keeps_its_shared_folders() {
         let templates = vec![
             Template {
+                mcp: Vec::new(),
                 system: false,
                 network: Some(Network::Off),
                 name: "system".into(),
@@ -2570,6 +3022,7 @@ mod tests {
                 }]),
             },
             Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "plain".into(),
@@ -2686,6 +3139,7 @@ mod tests {
         }
         let templates = vec![
             Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "td".into(),
@@ -2693,6 +3147,7 @@ mod tests {
                 shared: None,
             },
             Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "notes".into(),
@@ -2777,6 +3232,7 @@ mod tests {
         // Planned as a workspace: one branch of a remote named twice, and
         // a record past its bound, refused; no sparse path reads back.
         let twice = Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -2798,6 +3254,7 @@ mod tests {
         )
         .unwrap();
         let long = Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -2808,6 +3265,7 @@ mod tests {
             .unwrap_err()
             .contains("fewer sparse paths"));
         let none = vec![Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -3074,12 +3532,14 @@ mod tests {
         let mut client = config.client.clone();
         client.template_shared = vec![
             TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 name: "open".into(),
                 shared: None,
                 network: Some(Network::Open),
             },
             TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 name: "plain".into(),
                 shared: None,
@@ -3274,12 +3734,14 @@ mod tests {
             }],
             template_shared: vec![
                 TemplateShared {
+                    mcp: Vec::new(),
                     system: false,
                     name: "notes".into(),
                     shared: Some(own.clone()),
                     network: None,
                 },
                 TemplateShared {
+                    mcp: Vec::new(),
                     system: false,
                     name: "plain".into(),
                     shared: None,

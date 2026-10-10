@@ -1182,6 +1182,7 @@ impl App {
                     name: template.name.clone(),
                     shared: None,
                     network: template.network,
+                    mcp: Vec::new(),
                 })
                 .collect(),
             ..crate::config::Client::default()
@@ -9313,12 +9314,14 @@ pub mod tests {
             network: Network::Allowlist,
             template_shared: vec![
                 crate::config::TemplateShared {
+                    mcp: Vec::new(),
                     system: false,
                     name: "open".into(),
                     shared: None,
                     network: Some(Network::Open),
                 },
                 crate::config::TemplateShared {
+                    mcp: Vec::new(),
                     system: false,
                     name: "plain".into(),
                     shared: None,

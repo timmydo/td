@@ -219,6 +219,7 @@ fn a_workspace_reaches_the_conversation_and_stale_specs_are_cleared() {
 /// A repository workspace's record, as the window makes it.
 fn repositories(id: &Id, base: &Path) -> Workspace {
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -487,6 +488,7 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
         "https://example.org/a/docs".to_string(),
     );
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),

@@ -638,6 +638,7 @@ fn a_repository_conversation_prepares_its_workspace() {
     plain(&up, &["commit", "--quiet", "-m", "one"]);
     let id = Id::random().unwrap();
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),

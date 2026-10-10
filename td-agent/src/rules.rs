@@ -23,8 +23,9 @@ pub const MAX_CARRIED: usize = 32 * 1024;
 /// and git's cut to it, so none carries the file's.
 pub const MAX_WHY: usize = 256;
 
-/// The tools a rule may name: those the tool host runs, `git_push`, and
-/// `network`, a command's connections (DESIGN.md §10).
+/// The tools a rule may name: those the tool host runs, `git_push`,
+/// `network`, a command's connections (DESIGN.md §10), and `mcp`, an MCP
+/// server's tools (§12, MCP servers).
 pub const TOOLS: &[&str] = &[
     "read_file",
     "write_file",
@@ -36,6 +37,7 @@ pub const TOOLS: &[&str] = &[
     "shell",
     "git_push",
     "network",
+    "mcp",
 ];
 
 /// What a rule does with the calls it matches.
@@ -122,9 +124,34 @@ impl Rule {
                 prefix,
             });
         }
+        // A template's server and one of its tools. An allow names the
+        // tool: a server's every tool is whatever its program makes of
+        // them, now and after it changes.
+        if tool == "mcp" {
+            let (Some(server), tool_name) = (prefix.first(), prefix.get(1)) else {
+                return Err("names no MCP server".into());
+            };
+            if prefix.len() > 2 {
+                return Err("gives mcp more than a server and a tool".into());
+            }
+            if !crate::config::mcp_server_name(server) {
+                return Err(format!("{server:?} cannot name an MCP server"));
+            }
+            if tool_name.is_some_and(|t| !crate::mcp::tool_name_fits(t)) {
+                return Err("names an MCP tool no server's tool name could be".into());
+            }
+            if tool_name.is_none() && effect == Effect::Allow {
+                return Err("allows an MCP server's every tool; name one".into());
+            }
+            return Ok(Self {
+                effect,
+                tool: tool.to_string(),
+                prefix,
+            });
+        }
         if !prefix.is_empty() && tool != "shell" {
             return Err(format!(
-                "gives {tool} words, which only shell, git_push and network take"
+                "gives {tool} words, which only shell, git_push, network and mcp take"
             ));
         }
         if let Some(at) = prefix.iter().position(|w| !plain(w)) {
@@ -799,7 +826,9 @@ fn subcommand(word: &str) -> bool {
 /// program with no subcommand to name; nothing for a command with no
 /// program a rule can name.
 pub fn proposals(tool: &str, command: Option<&str>) -> Option<Always> {
-    if !TOOLS.contains(&tool) {
+    // `mcp` alone is no rule: its answers name a server and a tool,
+    // which the servers' step offers.
+    if !TOOLS.contains(&tool) || tool == "mcp" {
         return None;
     }
     if tool == "shell" && command.is_none() {
@@ -2143,7 +2172,7 @@ mod tests {
             ),
             (
                 "deny read_file x",
-                "line 1: gives read_file words, which only shell, git_push and network take",
+                "line 1: gives read_file words, which only shell, git_push, network and mcp take",
             ),
             (
                 "deny git_push https://h/r main x",
@@ -2730,6 +2759,42 @@ mod tests {
             assert_eq!(parse_human(text).unwrap_err(), why, "{text:?}");
         }
         assert!(parse_human(&"#".repeat(MAX_HUMAN_FILE + 1)).is_err());
+    }
+
+    /// An MCP rule names a template's server and, for an allow always, one
+    /// of its tools; a deny or an ask may name the server alone. Names are
+    /// checked as the configuration and the prefix check them, and a
+    /// repository may deny or ask. No call is named `mcp`, so none matches
+    /// until td-agent runs servers.
+    #[test]
+    fn mcp_rules_name_a_server_and_a_tool() {
+        for line in [
+            "deny mcp github",
+            "ask mcp github",
+            "ask mcp github list_issues",
+            "allow mcp github list_issues",
+            "allow mcp web-2 fetch-Page",
+        ] {
+            assert_eq!(Rule::parse(line).map(|r| r.text()), Ok(line.to_string()));
+        }
+        for (line, why) in [
+            ("deny mcp", "names no MCP server"),
+            ("allow mcp github", "name one"),
+            ("deny mcp github a b", "more than a server and a tool"),
+            ("deny mcp GitHub", "cannot name an MCP server"),
+            ("deny mcp git_hub", "cannot name an MCP server"),
+            ("deny mcp github a.b", "no server's tool name"),
+            ("deny mcp github $(x)", "no server's tool name"),
+        ] {
+            let e = Rule::parse(line).unwrap_err();
+            assert!(e.contains(why), "{line}: {e}");
+        }
+        assert!(parse("deny mcp github\nask mcp github list\n", true).is_ok());
+        assert!(parse("allow mcp github list\n", true).is_err());
+        assert_eq!(proposals("mcp", None), None);
+        let rule = Rule::parse("deny mcp github").unwrap();
+        assert!(!matches(&rule, "shell", None));
+        assert!(!matches(&rule, "mcp__github__list", None));
     }
 
     /// A network rule names one destination, written as an allowlist

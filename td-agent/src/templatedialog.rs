@@ -541,7 +541,7 @@ impl TemplateDialog {
         } else {
             match self.first_repo(&remote) {
                 Ok(repo) => std::iter::once(repo).chain(others).collect(),
-                Err(reply) => return reply,
+                Err((at, why)) => return self.refuse(at, why),
             }
         };
         let network = match network.to_ascii_lowercase().as_str() {
@@ -572,25 +572,26 @@ impl TemplateDialog {
                 name,
                 repos,
                 shared,
+                mcp: Vec::new(),
             },
             replacing: self.editing().map(str::to_string),
         }
     }
 
     /// The first repository the fields name, `remote` given: checked as
-    /// preparing it would, else the refusal of the first field at fault.
-    fn first_repo(&mut self, remote: &str) -> Result<crate::config::Repo, Reply> {
+    /// preparing it would, else the first field at fault and why.
+    fn first_repo(&mut self, remote: &str) -> Result<crate::config::Repo, (usize, String)> {
         let text = |at: usize| self.text(at).trim().to_string();
         if let Err(why) = crate::git::Remote::parse(remote) {
-            return Err(self.refuse(REMOTE, why));
+            return Err((REMOTE, why));
         }
         let base = text(BASE);
         if let Err(why) = crate::git::branch_name(&base) {
-            return Err(self.refuse(BASE, format!("the base: {why}")));
+            return Err((BASE, format!("the base: {why}")));
         }
         let branch = text(BRANCH);
         if let Err(why) = crate::git::push_branch(&branch) {
-            return Err(self.refuse(BRANCH, format!("the branch: {why}")));
+            return Err((BRANCH, format!("the branch: {why}")));
         }
         // Unchanged, the paths stay as they were: one holding a space, or
         // none at all rather than the whole tree, reads back the same.
@@ -611,8 +612,8 @@ impl TemplateDialog {
         // too long once recorded.
         match crate::config::checked_repo(remote, &base, &branch, sparse) {
             Ok(repo) => Ok(repo),
-            Err(why) if why.contains("sparse") => Err(self.refuse(SPARSE, why)),
-            Err(why) => Err(self.refuse(REMOTE, why)),
+            Err(why) if why.contains("sparse") => Err((SPARSE, why)),
+            Err(why) => Err((REMOTE, why)),
         }
     }
 
@@ -1083,6 +1084,7 @@ mod tests {
             dialog.key("Return", false, &mut NoClipboard),
             Reply::Save {
                 template: Template {
+                    mcp: Vec::new(),
                     system: false,
                     network: None,
                     name: "td".into(),
@@ -1251,6 +1253,7 @@ mod tests {
         let second =
             crate::config::checked_repo("https://example.org/a/b", "main", "agent", None).unwrap();
         let template = Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -1308,6 +1311,7 @@ mod tests {
         for sparse in [Some(vec!["docs/API guide".to_string()]), Some(Vec::new())] {
             let repo = crate::config::checked_repo("/srv/td", "main", "a", sparse.clone()).unwrap();
             let template = Template {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "td".into(),
@@ -1338,6 +1342,7 @@ mod tests {
     #[test]
     fn the_pointer_presses_buttons_and_focuses_fields() {
         let template = Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),

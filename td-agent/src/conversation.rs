@@ -7900,6 +7900,7 @@ mod tests {
             sparse: None,
         };
         let template = crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -7967,6 +7968,7 @@ mod tests {
     #[test]
     fn a_call_into_a_worktree_not_ready_is_told_its_state() {
         let template = crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),

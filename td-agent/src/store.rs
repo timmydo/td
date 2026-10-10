@@ -3825,6 +3825,7 @@ pub mod tests {
         let state = scratch.state();
         assert!(state.load_templates().unwrap().is_empty());
         let templates = vec![crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
@@ -3836,6 +3837,7 @@ pub mod tests {
         state.save_templates(&[]).unwrap();
         assert!(state.load_templates().unwrap().is_empty());
         let unchecked = vec![crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),

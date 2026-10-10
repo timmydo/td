@@ -2124,6 +2124,7 @@ fn a_template_workspace_binds_its_own_shared_directories() {
                 write: false,
             }],
             template_shared: vec![TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 network: None,
                 name: "notes".into(),
@@ -2173,6 +2174,7 @@ fn only_a_system_view_template_offers_and_runs_system_status() {
             template_shared: ["sys", "plain"]
                 .into_iter()
                 .map(|template| TemplateShared {
+                    mcp: Vec::new(),
                     system: template == "sys",
                     network: None,
                     name: template.into(),
@@ -2228,6 +2230,7 @@ fn a_task_runs_a_sub_agent_whose_report_is_its_result() {
     );
     h.setup(Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2347,6 +2350,7 @@ fn an_explore_sub_agent_reads_alone_on_its_own_model() {
     );
     h.setup(Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2425,6 +2429,7 @@ fn an_explore_sub_agent_reads_alone_on_its_own_model() {
     );
     h.setup(Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "sys".into(),
@@ -2474,6 +2479,7 @@ fn a_sub_agent_at_a_limit_is_told_its_last_request_is_its_last() {
     );
     h.setup(Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2551,6 +2557,7 @@ fn a_stop_during_a_sub_agent_ends_the_callers_turn() {
     use td_agent::config::TemplateShared;
     let shared = || Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2616,6 +2623,7 @@ fn a_sub_agents_rate_limit_is_waited_out_and_its_failure_reported() {
     use td_agent::config::TemplateShared;
     let shared = || Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: true,
             network: None,
             name: "sys".into(),
@@ -2700,6 +2708,7 @@ fn a_system_view_taken_away_mid_turn_is_taken_at_once() {
     use td_agent::config::TemplateShared;
     let client = |system: bool| Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system,
             network: None,
             name: "sys".into(),
@@ -2984,6 +2993,7 @@ fn a_workspace_gone_with_its_archive_refuses_its_tools() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -3054,6 +3064,7 @@ fn a_repositorys_rules_ask_for_a_read_and_refuse_a_command() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -3181,6 +3192,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -3363,6 +3375,7 @@ fn a_call_into_a_worktree_not_prepared_is_told_so_without_a_card() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -5203,6 +5216,7 @@ fn a_review_is_of_a_repository_workspace_alone() {
     );
     h.setup(Client {
         template_shared: vec![TemplateShared {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "sys".into(),
@@ -6616,6 +6630,7 @@ fn the_classifier_is_given_the_project_instructions_only_when_trusted() {
         td_agent::store::random_hex(4).unwrap()
     ));
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -8449,6 +8464,7 @@ fn git_push_is_refused_until_it_can_export() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -8607,6 +8623,7 @@ fn prepared(
     git_in(&up, &["commit", "--quiet", "-m", "one"]);
     let remote = "https://example.org/a/td".to_string();
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),
@@ -9386,6 +9403,7 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     ));
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
+        mcp: Vec::new(),
         system: false,
         network: None,
         name: "td".into(),

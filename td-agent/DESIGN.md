@@ -2610,13 +2610,14 @@ top-level list; a conversation finds its template's list by name, so
 an edited list applies from the next start. A template that names no
 list binds the top-level one, as Empty does; one no longer configured,
 removed or renamed, binds none, so that no edit widens what its old
-conversations reach without the human choosing it. When the lists
-would take more than half of a setup frame they are not handed on,
-said in a note, and template workspaces bind none. The list's
-Workspace column and the `conversations` tool name the workspace
-`template NAME`, and the
-question before a deletion says, by the workspace's kind and not its
-name, that a template's scratch directory goes with the conversation.
+conversations reach without the human choosing it. When the lists,
+with the templates' network policies and MCP servers, would take more
+than half of a setup frame they are not handed on, said in a note, and
+template workspaces bind none, reach no network and run no server.
+The list's Workspace column and the `conversations` tool name the
+workspace `template NAME`, and the question before a deletion says,
+by the workspace's kind and not its name, that a template's scratch
+directory goes with the conversation.
 A template naming repositories was listed then, the finder's note
 saying it was refused until increment 11, and choosing it made nothing;
 increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
@@ -4622,23 +4623,25 @@ human's and the workspace's. Then the human-only rows, which no rule can
 lower. Then the human's allow rules. Then the table.
 
 **Rules.** A rule names a tool and, for `shell`, an argv prefix matched
-against every pipeline element and every `&&`, `||` and `;` segment of the
-parsed command; for network, a host and port; for `git_push`, a remote and
-branch. A rule never matches the raw string. Shell rules are syntactic, so
-they are not a boundary; the jail is. The matcher treats this exact set as
-opaque: a command it cannot split; a function definition; an `alias` or
-`trap`; a leading `NAME=value` assignment; `sh`, `bash`, `dash`, `zsh`,
-`ksh`, `fish` or `td-sh` given `-c`, alone or clustered (`-lc`); `busybox`
-with any applet; `eval`, `exec`, `command`, `builtin`, `.`, `source`,
-`env`, `xargs`, `nohup`, `nice`, `ionice`, `taskset`, `chrt`, `setsid`,
-`stdbuf`, `flock`, `time`, `timeout`, `unshare`, `chroot`, `nsenter`,
-`sudo`, `doas`, `su`, `script`, `watch`, `strace`, `setpriv`, `prlimit`,
-`systemd-run`, `bwrap` and `parallel` as command words; `find` with
-`-exec`, `-execdir`, `-ok` or `-okdir`; `git` with `-c`, `-C`,
-`--config-env`, `--exec-path`, `--git-dir`, `--work-tree` or
-`--namespace`; command or process substitution; and backticks. The list
-is reviewed code and stays closed; a wrapper it does not name is not
-opaque, which is one more reason a deny rule is only advisory.
+against every pipeline element and every `&&`, `||` and `;` segment of
+the parsed command; for network, a host and port; for `git_push`, a
+remote and branch; for `mcp`, a template's server and one of its tools
+(§12, MCP servers). A rule never matches the raw string. Shell rules are
+syntactic, so they are not a boundary; the jail is. The matcher treats
+this exact set as opaque: a command it cannot split; a function
+definition; an `alias` or `trap`; a leading `NAME=value` assignment;
+`sh`, `bash`, `dash`, `zsh`, `ksh`, `fish` or `td-sh` given `-c`, alone
+or clustered (`-lc`); `busybox` with any applet; `eval`, `exec`,
+`command`, `builtin`, `.`, `source`, `env`, `xargs`, `nohup`, `nice`,
+`ionice`, `taskset`, `chrt`, `setsid`, `stdbuf`, `flock`, `time`,
+`timeout`, `unshare`, `chroot`, `nsenter`, `sudo`, `doas`, `su`,
+`script`, `watch`, `strace`, `setpriv`, `prlimit`, `systemd-run`,
+`bwrap` and `parallel` as command words; `find` with `-exec`,
+`-execdir`, `-ok` or `-okdir`; `git` with `-c`, `-C`, `--config-env`,
+`--exec-path`, `--git-dir`, `--work-tree` or `--namespace`; command or
+process substitution; and backticks. The list is reviewed code and stays
+closed; a wrapper it does not name is not opaque, which is one more
+reason a deny rule is only advisory.
 Accordingly:
 
 - an allow rule never matches a command containing an opaque construct;
@@ -5752,6 +5755,30 @@ retries it in short slices as it waits, since a `took` frees room on
 the reader thread without waking a wait, and turns a wait with no call
 open, or the `serve` call's end, into the server's end.
 
+**As built (MCP, configuration and rules).** `[[template.mcp]]` is read
+and checked as §15 says, `name`, `command`, `tools` and `timeout` its
+only keys: a command of 1 to 64 strings, within a `serve` call's
+program and arguments, each at most 4 KiB with no control character,
+the program absolute or with no `/` and neither `.` nor `..`; `tools`,
+when given, 1 to 128 names, each once; a timeout a whole number from 1
+to 600; and a template's commands and tools at most 16 KiB together. A
+template's servers go to every conversation process in its template
+settings, each checked again as it is read (a `tools` left out read as
+every tool), and `Client::mcp_for` gives a workspace its template's,
+none when the template is no longer configured, as `shared_for` gives
+directories; a setup from before servers names none. A template made in
+the window names none, and its file has no key for them. A new
+conversation's template is found and refused in one place, `chosen`,
+which `start_from` goes through for every way a conversation is made
+from a template: one that names servers makes nothing and says so in a
+note, until td-agent runs them (the next step). A conversation made
+before its template named servers runs on without them. The rules
+grammar takes `mcp SERVER [TOOL]`, the server's name as a template's
+and the tool's as the prefix would carry it, at most those two words;
+an allow names the tool, and a repository's rules may deny or ask. No
+call is named `mcp` yet, so no such rule matches one, and a card
+offers no `mcp` answer to remember.
+
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
 offered after the conversation tools to a conversation with a workspace;
@@ -6592,17 +6619,21 @@ default; `jev_threshold`'s is calibrated (§11):
   - `system`: `true` gives its conversations `system_status`, which
     reads every process's CPU and memory use and command line outside
     the jail (§8, System view); default `false`
-  - `mcp` (planned): MCP servers for its conversations (§12, MCP
-    servers), at most 4, only in a template of this file, never one
-    made in the window; an array of tables each with a `name`, 1 to 16
-    lowercase ASCII letters, digits and `-`, starting with a letter and
-    unique in the template; a `command`, the program and its
-    arguments, 1 to 64 strings of at most 4 KiB with no control
-    character, the program an absolute path or a name the jail's
-    `PATH` finds; an optional `tools`, the only tools of it to offer,
-    each name 1 to 41 bytes of ASCII letters, digits, `_` and `-`, one
-    the server does not list said in its record; and an optional
-    `timeout`, a call's whole seconds, default 120, at most 600
+  - `mcp`: MCP servers for its conversations (§12, MCP servers; read
+    and checked, though a template naming any starts no conversation
+    until td-agent runs them, §18), at most 4, only in a template of
+    this file, never one made in the window; an array of tables each
+    with a `name`, 1 to 16 lowercase ASCII letters, digits and `-`,
+    starting with a letter and unique in the template; a `command`,
+    the program and its arguments, 1 to 64 strings of at most 4 KiB
+    with no control character, the program an absolute path or a name
+    the jail's `PATH` finds; an optional `tools`, the only tools of it
+    to offer, 1 to 128 names, each once and 1 to 41 bytes of ASCII
+    letters, digits, `_` and `-`, one the server does not list said in
+    its record (left out, every tool is offered); and an optional
+    `timeout`, a call's whole seconds, default 120, at most 600. A
+    template's servers' commands and tools are at most 16 KiB
+    together, so its servers alone cannot fill a conversation's setup
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is

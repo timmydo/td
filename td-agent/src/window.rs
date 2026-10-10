@@ -810,8 +810,9 @@ impl Session {
             Ok(places) => places.root.clone(),
             Err(why) => return self.app.note(why.clone()),
         };
-        let Some(template) = self.templates.iter().find(|t| t.name == name).cloned() else {
-            return self.app.note(format!("no template is named {name:?}"));
+        let template = match chosen(&self.templates, name) {
+            Ok(template) => template,
+            Err(why) => return self.app.note(why),
         };
         if template.repos.is_empty() {
             return self.start(Some(Workspace::Template(name.to_string())));
@@ -932,6 +933,7 @@ impl Session {
                     name: template.name.clone(),
                     shared: own.clone(),
                     network: template.network,
+                    mcp: template.mcp.clone(),
                 }),
                 // Every other as held, or none, binding nothing and
                 // reaching no network, when start withheld the lists.
@@ -943,7 +945,7 @@ impl Session {
         );
         if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
             return Err(
-                "the templates' shared directories and network policies would be too many to hand to conversations"
+                "the templates' shared directories, network policies and MCP servers would be too many to hand to conversations"
                     .into(),
             );
         }
@@ -2608,6 +2610,7 @@ pub fn run(
                     name: template.name.clone(),
                     shared,
                     network: template.network,
+                    mcp: template.mcp.clone(),
                 });
             }
             for note in &notes {
@@ -2627,7 +2630,7 @@ pub fn run(
             // workspaces bind none, rather than no process starting.
             if client.to_json().to_string().len() > SETUP_CLIENT_BYTES {
                 client.template_shared.clear();
-                let note = "the templates' shared directories and network policies are too many to hand to conversations; their workspaces bind none and reach no network";
+                let note = "the templates' shared directories, network policies and MCP servers are too many to hand to conversations; their workspaces bind none, reach no network and run no server";
                 eprintln!("td-agent: {note}");
                 app.note(note);
             }
@@ -2916,6 +2919,24 @@ fn local_paths(remotes: &[crate::git::Admission]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The configured template `name` a new conversation starts from, or
+/// why none may: none is named so, or it names MCP servers, which no
+/// new conversation starts with until td-agent runs them (DESIGN.md §18,
+/// MCP's last step). One made before its template named them runs on
+/// without them.
+fn chosen(templates: &[Template], name: &str) -> Result<Template, String> {
+    let template = templates
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| format!("no template is named {name:?}"))?;
+    if !template.mcp.is_empty() {
+        return Err(format!(
+            "template {name:?} names MCP servers, which this td-agent does not run yet; nothing was made"
+        ));
+    }
+    Ok(template.clone())
+}
+
 /// Where a workspace reaches: a conversation's own directory, or a
 /// shared directory, the top level's or a template's.
 fn reached(metas: &[crate::store::Meta], client: &Client) -> Vec<PathBuf> {
@@ -3185,6 +3206,7 @@ mod tests {
     fn a_template_saved_in_the_window_is_named_once_and_shares_the_top_level() {
         let repo = crate::config::checked_repo("/srv/td", "main", "a", None).unwrap();
         let template = |name: &str| crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: name.into(),
@@ -3229,12 +3251,14 @@ mod tests {
         let own = Some(Vec::new());
         let held = vec![
             TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 name: "td".into(),
                 shared: own.clone(),
                 network: None,
             },
             TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 name: "notes".into(),
                 shared: None,
@@ -3247,6 +3271,7 @@ mod tests {
         let listed = [listed.as_slice(), &[template("gone")]].concat();
         let shared = template_shared(&held, &configured, &listed, |t| {
             (t.name != "gone").then(|| TemplateShared {
+                mcp: Vec::new(),
                 system: t.system,
                 name: t.name.clone(),
                 shared: t.shared.as_ref().map(|_| {
@@ -3270,6 +3295,7 @@ mod tests {
     #[test]
     fn templates_made_in_the_window_follow_the_configurations() {
         let template = |name: &str| crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: name.into(),
@@ -3308,6 +3334,7 @@ mod tests {
             write,
         };
         let template = |own: Option<Vec<crate::workspace::Shared>>| crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "own".into(),
@@ -3340,6 +3367,37 @@ mod tests {
             own_shared(&template(Some(vec![shared("~/notes", false)])), None),
             (Some(Vec::new()), Vec::new())
         );
+    }
+
+    /// The template a new conversation starts from, as `start_from`
+    /// finds it: one naming MCP servers is refused until td-agent runs
+    /// them, and says so; one naming none is chosen, and a name no
+    /// template has is refused.
+    #[test]
+    fn a_template_with_mcp_servers_starts_nothing_yet() {
+        let mut template = crate::config::Template {
+            name: "tools".into(),
+            repos: Vec::new(),
+            shared: None,
+            network: None,
+            system: false,
+            mcp: Vec::new(),
+        };
+        let chosen = |templates: &[crate::config::Template], name: &str| {
+            crate::window::chosen(templates, name)
+        };
+        let plain = template.clone();
+        assert_eq!(
+            chosen(std::slice::from_ref(&plain), "tools"),
+            Ok(plain.clone())
+        );
+        assert!(chosen(&[plain], "other")
+            .unwrap_err()
+            .contains("no template is named"));
+        template.mcp =
+            vec![crate::config::mcp_server("gh", vec!["gh-mcp".into()], None, None).unwrap()];
+        let why = chosen(&[template], "tools").unwrap_err();
+        assert!(why.contains("\"tools\" names MCP servers"), "{why}");
     }
 
     /// Conversations whose workspace names a template, by the exact name
@@ -3419,6 +3477,7 @@ mod tests {
         assert!(local_remote(&remote, &places, &reached(&[], &top)).is_err());
         let templated = Client {
             template_shared: vec![crate::config::TemplateShared {
+                mcp: Vec::new(),
                 system: false,
                 name: "t".into(),
                 shared: Some(vec![shared(repo.join("refs"))]),
@@ -3436,6 +3495,7 @@ mod tests {
     #[test]
     fn a_conversation_asks_only_what_its_record_names() {
         let template = crate::config::Template {
+            mcp: Vec::new(),
             system: false,
             network: None,
             name: "td".into(),
