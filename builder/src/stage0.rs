@@ -1406,11 +1406,9 @@ mod tests {
     }
 
     /// A shebang line naming a POSIX shell that EXISTS here: a dev host's
-    /// `/bin/sh`, else `sh` resolved from PATH — the loop host-sandbox is
-    /// pivot_root'd with no `/bin/sh`, but its busybox userland puts `sh` on PATH.
-    /// The fixture rustc/cc stubs `provision_rust`/`provision_cc` exec need a real
-    /// interpreter in both, so they run for real in the sandbox rather than
-    /// exec-failing.
+    /// `/bin/sh`, else `sh` resolved from PATH. The fixture rustc/cc stubs
+    /// `provision_rust`/`provision_cc` exec need a real interpreter, so they
+    /// run for real rather than exec-failing.
     fn sh_shebang() -> String {
         if Path::new("/bin/sh").exists() {
             return "#!/bin/sh\n".to_string();

@@ -5136,8 +5136,8 @@ impl RecipeCheckRunner {
     /// whole closure. A cold climb incidentally leaves every rung's output in
     /// tdstore as a byproduct of building; a warm hit stages only the requested
     /// roots. Every consumer depends only on the requested roots: `run` reads the
-    /// self-contained `<system>/deployment` bundle, loop-userland reads the static
-    /// busybox/make trees, and the CLI prints the paths. Recipe binaries reference
+    /// self-contained `<system>/deployment` bundle, and the CLI prints the
+    /// paths. Recipe binaries reference
     /// absolute `/td/store`, never the per-invocation scratch tdstore, so the
     /// incidental cold closure is not a consumer contract; a caller that needs
     /// more outputs staged names them explicitly (`build-run TARGET A B ...`).
@@ -5224,8 +5224,7 @@ impl RecipeCheckRunner {
     /// The compiled-plan fingerprint for TARGET: sha256 over the running evaluator
     /// binary, the staged builder's engine fingerprint, every
     /// `seed/patches/*.patch`, and every committed `Cargo.lock` a rung in
-    /// TARGET's closure vendors from. Mirrors the loop-userland fingerprint
-    /// (check_loop.rs), extended with the builder's engine fingerprint (its
+    /// TARGET's closure vendors from, and the builder's engine fingerprint (its
     /// engine equally determines the output bytes a reuse skips; its host
     /// tooling determines none of them) and the closure's
     /// cargoLocks (the one build input read from the repo, not compiled in — a lock
@@ -5789,7 +5788,7 @@ impl RecipeCheckRunner {
         // this dir) is shared across all worktrees, whose distinct evaluator
         // binaries fingerprint differently, so deleting other-fingerprint maps
         // would clobber a concurrent worktree's live memo. Per-fingerprint maps sit
-        // side by side (mirroring the loop-userland map, check_loop.rs); a stale one
+        // side by side; a stale one
         // is inert (its fingerprint never matches, so it is never read) and is
         // cleaned wholesale by `clear-store`, or by `gc-store` once nothing has
         // read it for the window — which is why a hit stamps the map it read.
@@ -7315,8 +7314,7 @@ fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
     }
     // Nothing built yet — do the host `cargo build` rather than print it as an
     // instruction: this is the same host-brings-cargo seed the stage0 provision
-    // uses, and the same fallback check_loop::resolve_recipe_eval_bin already does
-    // for this binary's sibling. A host WITHOUT cargo still gets the manual line,
+    // uses. A host WITHOUT cargo still gets the manual line,
     // and the probe comes FIRST so it is not preceded by a "building it" notice
     // for a build that never starts.
     let Some(cargo) = cargo_on_path(env::var_os("PATH").as_deref()) else {
@@ -11455,7 +11453,7 @@ chmod 755 '{}'
 
     #[test]
     fn recipe_closure_is_derived_from_catalog_edges() {
-        let graph = recipe_closure_full(&["busybox-test"]).unwrap();
+        let graph = recipe_closure_full(&["hello-test"]).unwrap();
         let stems: Vec<&str> = graph.iter().map(|node| node.stem.as_str()).collect();
 
         for expected in [
@@ -11465,33 +11463,27 @@ chmod 755 '{}'
             "gcc-x86-64-native",
             "binutils-x86-64-native",
             "make-x86-64",
-            "busybox-x86-64",
-            "busybox-test",
+            "hello",
+            "hello-test",
         ] {
             assert!(
                 stems.iter().any(|stem| stem == &expected),
-                "missing {expected} from busybox-test closure: {stems:?}"
+                "missing {expected} from hello-test closure: {stems:?}"
             );
         }
 
-        let busybox_pos = stems
-            .iter()
-            .position(|stem| stem == &"busybox-x86-64")
-            .unwrap();
-        let test_pos = stems
-            .iter()
-            .position(|stem| stem == &"busybox-test")
-            .unwrap();
+        let hello_pos = stems.iter().position(|stem| stem == &"hello").unwrap();
+        let test_pos = stems.iter().position(|stem| stem == &"hello-test").unwrap();
         assert!(
-            busybox_pos < test_pos,
+            hello_pos < test_pos,
             "dependency should be emitted before dependent: {stems:?}"
         );
 
         // With a pinned root the same target's build graph stops at the cut.
         if crate::bootstrap_root::root().unwrap().is_pinned() {
-            let cut = recipe_closure(&["busybox-test"]).unwrap();
+            let cut = recipe_closure(&["hello-test"]).unwrap();
             let cut: Vec<&str> = cut.iter().map(|node| node.stem.as_str()).collect();
-            assert!(cut.contains(&"busybox-x86-64"), "{cut:?}");
+            assert!(cut.contains(&"hello"), "{cut:?}");
             for below in ["stage0", "mes", "gcc-14", "glibc-mesboot"] {
                 assert!(!cut.contains(&below), "{below} in the cut graph: {cut:?}");
             }
@@ -11508,7 +11500,6 @@ chmod 755 '{}'
     fn real_bootstrap_graph_is_host_free_at_planning() {
         for target in [
             "make-test",
-            "busybox-test",
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
             "gcc-x86-64-self-test",
@@ -11733,7 +11724,7 @@ chmod 755 '{}'
         assert!(firefox.contains_key("td-jail-test"), "{firefox:?}");
         let why = &firefox["openssh-x86-64-test"];
         assert!(why.contains("system-x86-64's module"), "{why}");
-        assert!(!firefox.contains_key("busybox-test"), "{firefox:?}");
+        assert!(!firefox.contains_key("hello-test"), "{firefox:?}");
         // A data file reaches what builds on the recipe embedding it: with a
         // pinned root, only the checks that still build the ladder.
         let mk = checks_reaching(&["recipes/src/recipes/bash-mesboot.mk"]).unwrap();
@@ -11743,7 +11734,7 @@ chmod 755 '{}'
             "{mk:?}"
         );
         if crate::bootstrap_root::root().unwrap().is_pinned() {
-            assert!(!mk.contains_key("busybox-test"), "{mk:?}");
+            assert!(!mk.contains_key("hello-test"), "{mk:?}");
             for stem in mk.keys() {
                 let roots = owner_roots(stem, &catalog::lookup(stem).unwrap());
                 let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
@@ -11755,7 +11746,7 @@ chmod 755 '{}'
                 );
             }
         } else {
-            assert!(mk.contains_key("busybox-test"), "{mk:?}");
+            assert!(mk.contains_key("hello-test"), "{mk:?}");
         }
         for scope in [
             "recipes/src/types.rs",
@@ -13348,7 +13339,7 @@ chmod 755 '{}'
             .is_none());
         // MISS: a requested output not recorded in the memo — and a miss is not a use.
         assert!(runner
-            .reuse_build_run("system-x86-64", "fp1", &["busybox-x86-64"])
+            .reuse_build_run("system-x86-64", "fp1", &["hello"])
             .unwrap()
             .is_none());
         assert_eq!(mtime(&memo), long_ago, "a miss leaves the memo unstamped");
@@ -13402,16 +13393,14 @@ chmod 755 '{}'
         runner
             .write_build_run_memo("system-x86-64", "bbb", &steps)
             .unwrap();
-        runner
-            .write_build_run_memo("busybox-x86-64", "ccc", &steps)
-            .unwrap();
+        runner.write_build_run_memo("hello", "ccc", &steps).unwrap();
 
         assert!(
             dir.join("system-x86-64.aaa.map").exists(),
             "a prior-fingerprint map for the same target must survive (could be a live worktree's)"
         );
         assert!(dir.join("system-x86-64.bbb.map").exists());
-        assert!(dir.join("busybox-x86-64.ccc.map").exists());
+        assert!(dir.join("hello.ccc.map").exists());
         let _ = fs::remove_dir_all(&lw);
     }
 

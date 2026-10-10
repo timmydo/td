@@ -197,10 +197,9 @@ pub enum Step {
     ///
     /// A disk image is a file of a declared SIZE and almost entirely hole, and
     /// the shell spelling of that is `dd … count=0 seek=N` — which needs a `dd`
-    /// no roster declares. `busybox-x86-64` serves a curated applet set and `dd`
-    /// is not in it, so a recipe reaching for one depends on the multicall
-    /// carrying an applet nothing checks. This is `set_len(2)`, which is what
-    /// that `dd` does and what an installer's destination needs.
+    /// no roster declares, so a recipe reaching for one depends on a tool
+    /// nothing checks. This is `set_len(2)`, which is what that `dd` does and
+    /// what an installer's destination needs.
     ///
     /// Sparse where the filesystem has holes, which every filesystem td builds
     /// on does; a filesystem without them would allocate `bytes` for real.

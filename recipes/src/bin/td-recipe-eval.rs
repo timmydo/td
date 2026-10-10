@@ -647,7 +647,6 @@ mod tests {
     fn checked_recipes_own_their_check_bodies() {
         for stem in [
             "make-test",
-            "busybox-test",
             "gcc-10-bridge-test",
             "gcc-x86-64-stage2-test",
             "gcc-x86-64-native-test",
@@ -678,7 +677,6 @@ mod tests {
     fn recipe_check_bodies_delegate_to_the_rust_runner() {
         for (stem, count) in [
             ("make-test", 1),
-            ("busybox-test", 1),
             ("rust-toolchain", 1),
             ("gcc-10-bridge-test", 1),
             ("gcc-x86-64-stage2-test", 1),
@@ -741,8 +739,9 @@ mod tests {
         // nine licence notices + cryptsetup 2.8.8 with json-c 0.18, popt 1.19
         // and LVM2 2.03.43 (the LUKS2 userspace and its static libraries) +
         // gawk 5.4.1 (the build-only awk after rust-toolchain) + bc 1.08.2 (the
-        // build-only bc for the kernel's timeconst.bc).
-        assert_eq!(pins.len(), 80);
+        // build-only bc for the kernel's timeconst.bc). BusyBox's pin left with
+        // its last consumer.
+        assert_eq!(pins.len(), 79);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "ca-certificates-source"));
         assert!(pins.iter().any(|pin| pin.key == "tzdata-source"));
@@ -896,12 +895,12 @@ mod tests {
     fn a_mismatched_recipe_is_discriminated() {
         let make = catalog::lookup("make-test")
             .expect("make-test recipe must exist (negative-control fixture)");
-        let busybox = catalog::lookup("busybox-test")
-            .expect("busybox-test recipe must exist (negative-control fixture)");
+        let hello = catalog::lookup("hello-test")
+            .expect("hello-test recipe must exist (negative-control fixture)");
         assert_ne!(
             make.to_json().to_canonical(),
-            busybox.to_json().to_canonical(),
-            "make-test and busybox-test canon-equal — a JSON comparison would not discriminate a mismatch"
+            hello.to_json().to_canonical(),
+            "make-test and hello-test canon-equal — a JSON comparison would not discriminate a mismatch"
         );
     }
 }

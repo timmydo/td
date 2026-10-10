@@ -92,8 +92,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Stream-hash a tree/file in NAR form — one implementation, shared with the
-/// staging boundary's verifier (`sandbox::verify_staged_item`) and the
-/// loop-userland cache so every `sha256:<hex>` record is produced identically.
+/// staging boundary's verifier (`sandbox::verify_staged_item`) so every
+/// `sha256:<hex>` record is produced identically.
 fn nar_hash_path(path: &Path) -> Result<String, std::io::Error> {
     sandbox::nar_hash_of(path)
 }
@@ -678,7 +678,7 @@ fn subst_export_members(
 
 /// The fixed logical store path under which the guix-less-runner harness ships as a single
 /// whole-tree substitute (issue #314). Unlike the lock-keyed toolchain CLOSURES (whose name a
-/// consumer recomputes from the lock), the /td/store harness — the busybox+make set, the staged
+/// consumer recomputes from the lock), the /td/store harness — the staged
 /// C toolchain, the /td/store/ld loader, and the `rel`/`toolchain` metadata — is a
 /// content-addressed BUILD OUTPUT with no derivable lock name, so it ships as ONE nar of the
 /// whole `.td-build-cache/harness` tree under this fixed name. Integrity is the signed NarHash;
@@ -9088,8 +9088,8 @@ struct HostSandboxArgs {
     /// `--store-item PATH` (repeatable): bind ONE store item (dir or file)
     /// read-only at its own path, and `--store-item-at SRC DEST` (repeatable):
     /// bind SRC read-only at DEST — for items whose durable host home is not
-    /// their canonical store path (the td-built loop userland lives in a
-    /// loop-owned host dir but is hashed for, and must appear at, its
+    /// their canonical store path (the loop's stage0 td-builder is placed
+    /// in a loop-owned host dir but is hashed for, and must appear at, its
     /// /td/store path). Together these are the loop's input-only store
     /// exposure (`td-builder check` passes its declared input set item by
     /// item; no store DIRECTORY is ever mounted, mirroring the drv build
@@ -9209,93 +9209,6 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     }
 }
 
-fn run_mount_applet(args: &[String]) -> Result<i32, String> {
-    if args.get(1).map(String::as_str) != Some("--bind") || args.len() != 4 {
-        return Err("usage: mount --bind SRC DEST".to_string());
-    }
-    let src = args
-        .get(2)
-        .ok_or_else(|| "missing bind source".to_string())?;
-    let dest = args
-        .get(3)
-        .ok_or_else(|| "missing bind target".to_string())?;
-    if !Path::new(dest).exists() && std::env::var("TD_HOST_SANDBOX").as_deref() == Ok("1") {
-        let src_md = std::fs::metadata(src).map_err(|e| format!("bind source `{src}`: {e}"))?;
-        if src_md.is_dir() {
-            std::fs::create_dir_all(dest)
-                .map_err(|e| format!("create sandbox bind target dir `{dest}`: {e}"))?;
-        } else {
-            if let Some(parent) = Path::new(dest).parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "create sandbox bind target parent `{}`: {e}",
-                        parent.display()
-                    )
-                })?;
-            }
-            std::fs::File::create(dest)
-                .map_err(|e| format!("create sandbox bind target file `{dest}`: {e}"))?;
-        }
-    }
-    let src_c = CString::new(src.as_str()).map_err(|e| format!("bind source `{src}`: {e}"))?;
-    let dest_c = CString::new(dest.as_str()).map_err(|e| format!("bind target `{dest}`: {e}"))?;
-    sys::mount(Some(&src_c), &dest_c, None, sys::MS_BIND, None)
-        .map_err(|e| format!("bind-mount `{src}` on `{dest}`: {e}"))?;
-    Ok(0)
-}
-
-fn take_flock(fd: i32, nonblock: bool) -> Result<bool, String> {
-    if nonblock {
-        sys::flock_try_exclusive(fd).map_err(|e| format!("flock fd {fd}: {e}"))
-    } else {
-        sys::flock_exclusive(fd).map_err(|e| format!("flock fd {fd}: {e}"))?;
-        Ok(true)
-    }
-}
-
-fn run_flock_applet(args: &[String]) -> Result<i32, String> {
-    let mut i = 1usize;
-    let nonblock = if args.get(i).map(String::as_str) == Some("-n") {
-        i += 1;
-        true
-    } else {
-        false
-    };
-    let target = args
-        .get(i)
-        .ok_or_else(|| "usage: flock [-n] FD | flock [-n] PATH COMMAND [ARG...]".to_string())?;
-    i += 1;
-
-    if let Ok(fd) = target.parse::<i32>() {
-        if i != args.len() {
-            return Err("usage: flock [-n] FD".to_string());
-        }
-        return Ok(if take_flock(fd, nonblock)? { 0 } else { 1 });
-    }
-
-    let cmd = args
-        .get(i)
-        .ok_or_else(|| "usage: flock [-n] PATH COMMAND [ARG...]".to_string())?;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(target)
-        .map_err(|e| format!("open lock `{target}`: {e}"))?;
-    if !take_flock(lock.as_raw_fd(), nonblock)? {
-        return Ok(1);
-    }
-    let cmd_args = args
-        .get(i + 1..)
-        .ok_or_else(|| "usage: flock [-n] PATH COMMAND [ARG...]".to_string())?;
-    let status = Command::new(cmd)
-        .args(cmd_args)
-        .status()
-        .map_err(|e| format!("run `{cmd}` under flock `{target}`: {e}"))?;
-    Ok(status.code().map_or(1, |code| code))
-}
-
 fn applet_exit(name: &str, result: Result<i32, String>) -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code as u8),
@@ -9402,8 +9315,6 @@ fn main() -> ExitCode {
     let applet_code: Option<ExitCode> = match applet {
         Some("td-crypto-host-linker") => crypto_isolated::host_linker_applet(&args).into(),
         Some("td-crypto-decoy") => crypto_isolated::decoy_applet().into(),
-        Some("mount") => Some(applet_exit("mount", run_mount_applet(&args))),
-        Some("flock") => Some(applet_exit("flock", run_flock_applet(&args))),
         _ => None,
     };
     if let Some(code) = applet_code {
@@ -9544,9 +9455,6 @@ fn main() -> ExitCode {
         // double-build that used to share this verb is `check-drv` now — no
         // argument sniffing.)
         Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
-        // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
-        // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
-        Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
         Some("gate-crates") => affected::gate_crates_cli(args.get(2..).unwrap_or(&[])),
         Some("lock") => lock_cli(args.get(2..).unwrap_or(&[])),
         Some("files") => match args.get(2..).filter(|rest| !rest.is_empty()) {
@@ -12285,9 +12193,8 @@ fn main() -> ExitCode {
         //                      mounted — only declared inputs, like the drv
         //                      build jail.
         //   --store-item-at SRC DEST: like --store-item, but bound at DEST
-        //                      (repeatable) — the td-built loop userland's
-        //                      durable host copy appears at its canonical
-        //                      /td/store path.
+        //                      (repeatable) — the loop's stage0 placement
+        //                      appears at its canonical /td/store path.
         // Without --store-from/--store-item the sandbox binds no host store.
         // Usage:
         //   host-sandbox [--expose-cwd] [--store-from DIR [--store-at DEST]] [--store-item PATH]... [--store-item-at SRC DEST]... [--no-daemon] -- CMD ARGS...
@@ -12700,7 +12607,6 @@ fn main() -> ExitCode {
             eprintln!("usage: td-builder            # print the S1 sentinel");
             eprintln!("       td-builder check [GOAL...]             # lazy per-user memory host + sandboxed gate ladder");
             eprintln!("       td-builder gate-run [-j N] [GOAL...]   # the in-sandbox gate scheduler (src/gate_defs/)");
-            eprintln!("       td-builder check-rung HARNESS [ARG...] # dev: run a harness inside the loop sandbox");
             eprintln!("       td-builder lock <op> ...               # typed lock path extraction/rewrites");
             eprintln!("       td-builder gate-crates <op> ...        # the derived crate roster gate 325 runs");
             eprintln!("       td-builder engine-fingerprint          # the engine-source digest the evaluator keys its memos on");
@@ -13774,7 +13680,7 @@ daemon build START (2/2 active)
     // --store-item / --store-item-at (the loop's input-only store exposure):
     // repeatable, order preserved, and independent of --store-from (no store
     // DIRECTORY implied). --store-item-at carries a distinct in-sandbox DEST
-    // (the td-built userland's durable host copy appears at its /td/store path).
+    // (the loop's stage0 placement appears at its /td/store path).
     #[test]
     fn host_sandbox_store_items_repeat_and_stay_directory_free() {
         let p = hs(&[

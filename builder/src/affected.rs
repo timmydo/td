@@ -6064,17 +6064,15 @@ pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> 
         // here" machine signal. It is explained loudly here but PROPAGATED UNCHANGED —
         // never rewritten to success: the run did not validate the targets,
         // and the exit code must say so (PR review); the caller decides what
-        // PARTIAL means for its tier. Today EVERY host is in that state: the
-        // bootstrap graph cannot build the loop userland without host
-        // scaffolding, which planning rejects (re #469) — the preflights
+        // PARTIAL means for its tier: the loop reports it when this host has
+        // no toolchain to place the stage0 td-builder with, and the preflights
         // above (cargo test, on the AGENTS.md rust-toolchain control plane)
-        // are the per-PR validation until the chain is self-hosting.
+        // are then the per-PR validation.
         if code == crate::check_loop::EXIT_UNPROVISIONED {
             println!(
-                "affected-checks: check targets [{}] exited UNPROVISIONED (69) — the loop \
-                 cannot run until the bootstrap graph builds its own userland (re #469); \
-                 preflights above are the coverage until then; exit code 69 propagated \
-                 unchanged",
+                "affected-checks: check targets [{}] exited UNPROVISIONED (69) — this host \
+                 has no toolchain to place the loop's stage0 td-builder with; the \
+                 preflights above are the coverage; exit code 69 propagated unchanged",
                 sel.targets.join(" ")
             );
         }
@@ -10377,7 +10375,8 @@ mod tests {
     #[test]
     fn cargo_groups_run_every_group_and_report_the_first_failure_in_order() {
         // The stand-ins run through `bash -c`, as the cargo lines do. The
-        // in-sandbox cargo-test gate has BusyBox `sh` and no bash, so there
+        // in-sandbox cargo-test gate has no bash (its PATH holds only the
+        // toolchain), so there
         // every stand-in would fail to spawn and the verdict would be a 1
         // that proves nothing; the test says so and stops instead.
         let bash = Command::new("bash")

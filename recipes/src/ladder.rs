@@ -89,8 +89,7 @@ pub const BASH: &str = "bash-mesboot";
 ///
 /// GNU findutils is deliberately absent as an evidenced DEAD axis for this
 /// bootstrap toolset. A later build may expose `find`/`xargs` only through a
-/// ToolFarm link to a declared multicall that serves them (td-util, or
-/// BusyBox for its last consumers); the
+/// ToolFarm link to a declared multicall that serves them (td-util); the
 /// `no_bootstrap_step_invokes_host_find_or_xargs` guard below enforces that
 /// provenance instead of permitting an ambient PATH lookup.
 pub const MESBOOT0_TOOLS: &[&str] = &[
@@ -891,7 +890,7 @@ pub const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = "TD-DEPLOY-ROLLBACK-OK";
 /// the deployment successful.
 pub const SYSTEM_BOOT_SUCCESS_MARKER: &str = "TD-BOOT-SUCCESS-OK";
 
-/// Printed by BusyBox init's shutdown action after syncing and unmounting @var.
+/// Printed by the system's shutdown script after syncing and unmounting @var.
 pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
 
 /// Printed by `/etc/profile` when the auto-login greeter shell is reached — the login
@@ -1853,8 +1852,6 @@ mod tests {
     // self-hosting but are not ancestors of rust-toolchain. New recipes default
     // to the far side of the boundary and must not grow this list silently.
     const BOOTSTRAP_SIDE_CONSUMERS: &[&str] = &[
-        "busybox-test",
-        "busybox-x86-64",
         "elfutils-x86-64",
         "elfutils-x86-64-test",
         "flex-x86-64",
@@ -2335,7 +2332,7 @@ mod tests {
 
     /// A ToolFarm judged link by link, which the flattened text list cannot do.
     ///
-    /// A name is excused only by ITS OWN target being the declared busybox,
+    /// A name is excused only by ITS OWN target being the declared multicall,
     /// and only while it is a bare filename — `tools.join(name)` puts anything
     /// else outside the farm. A target is never excused at all: it is what the
     /// link resolves TO. Flattening loses both of those, since it keeps
@@ -2354,10 +2351,7 @@ mod tests {
     ) -> Option<(&'static str, String)> {
         // A farm may name find/xargs only as a link to a declared multicall
         // that serves them itself, never as a link to a host path.
-        const MULTICALLS: &[(&str, &str)] = &[
-            ("busybox-x86-64", "{in:busybox-x86-64}/bin/busybox"),
-            ("td-util", "{in:td-util}/bin/td-util"),
-        ];
+        const MULTICALLS: &[(&str, &str)] = &[("td-util", "{in:td-util}/bin/td-util")];
         let declared = |input: &str| {
             recipe
                 .native_inputs
@@ -2967,34 +2961,34 @@ mod tests {
                     "recipe `{stem}' invokes `{cmd}' in `{text}' — \
                      GNU findutils was retired from the tool tier; a rung \
                      must expose this command through a ToolFarm link to \
-                     a declared td-built multicall (td-util or busybox-x86-64)"
+                     a declared td-built multicall (td-util)"
                 );
             }
         }
     }
 
-    /// The busybox exemption excuses a LINK NAME, never a target beside it.
+    /// The multicall exemption excuses a LINK NAME, never a target beside it.
     ///
     /// `command_texts` flattens a ToolFarm to every string in it, names and
     /// targets alike, and the answer used to be step-wide: one declared
     /// `find` link then excused a second link pointing at a host path in the
     /// same step, which is the one shape this exemption must not cover.
     #[test]
-    fn a_busybox_farm_excuses_its_own_link_and_not_a_host_path_beside_it() {
-        const BB: &str = "{in:busybox-x86-64}/bin/busybox";
+    fn a_multicall_farm_excuses_its_own_link_and_not_a_host_path_beside_it() {
+        const MC: &str = "{in:td-util}/bin/td-util";
         let farm = |links: Vec<(String, String)>| {
             Recipe::gnu("probe", "1")
-                .native_inputs(&["busybox-x86-64"])
+                .native_inputs(&["td-util"])
                 .steps(vec![Step::ToolFarm { links }])
         };
 
         // The declared links themselves stay exempt, which is what a rung needs.
-        let ok = farm(vec![("find".into(), BB.into()), ("date".into(), BB.into())]);
+        let ok = farm(vec![("find".into(), MC.into()), ("date".into(), MC.into())]);
         assert_eq!(host_tool_invocation("probe", &ok), None);
 
         // A host path beside one does NOT ride on that exemption.
         let mixed = farm(vec![
-            ("find".into(), BB.into()),
+            ("find".into(), MC.into()),
             ("scan".into(), "/usr/bin/find".into()),
         ]);
         assert_eq!(
@@ -3002,7 +2996,7 @@ mod tests {
             Some(("find", "/usr/bin/find".into()))
         );
 
-        // A link NAMED for the tool but pointing elsewhere is not a busybox
+        // A link NAMED for the tool but pointing elsewhere is not a multicall
         // link, so naming it right does not excuse it.
         let liar = farm(vec![("find".into(), "{root}/tools/find".into())]);
         assert_eq!(
@@ -3011,8 +3005,8 @@ mod tests {
         );
 
         // ...and the exemption is not narrowed to the bare tool name: a link
-        // whose name merely tokenises to it is still a declared busybox link.
-        let hyphen = farm(vec![("find-files".into(), BB.into())]);
+        // whose name merely tokenises to it is still a declared multicall link.
+        let hyphen = farm(vec![("find-files".into(), MC.into())]);
         assert_eq!(host_tool_invocation("probe", &hyphen), None);
 
         // Without the declared input there is no exemption at all — and the
@@ -3021,7 +3015,7 @@ mod tests {
         let undeclared = Recipe::gnu("probe", "1")
             .native_inputs(&["gcc-x86-64-native"])
             .steps(vec![Step::ToolFarm {
-                links: vec![("find".into(), BB.into())],
+                links: vec![("find".into(), MC.into())],
             }]);
         assert_eq!(
             host_tool_invocation("probe", &undeclared),
@@ -3032,7 +3026,7 @@ mod tests {
         // links in order and each replaces the last, so this second one is
         // what `{tools}/find` actually becomes.
         let shadowed = farm(vec![
-            ("find".into(), BB.into()),
+            ("find".into(), MC.into()),
             ("find".into(), "{in:other}/bin/search".into()),
         ]);
         assert_eq!(
@@ -3042,7 +3036,7 @@ mod tests {
 
         // A TARGET spelled as a sibling's link name is still a target.
         let alias = farm(vec![
-            ("find".into(), BB.into()),
+            ("find".into(), MC.into()),
             ("scan".into(), "find".into()),
         ]);
         assert_eq!(
@@ -3054,7 +3048,7 @@ mod tests {
         // of the tool list: dropping one from it would leave every leg above
         // green, the catalog naming only legitimate `xargs` links.
         let both = farm(vec![
-            ("xargs".into(), BB.into()),
+            ("xargs".into(), MC.into()),
             ("scan".into(), "/usr/bin/xargs".into()),
         ]);
         assert_eq!(
@@ -3065,7 +3059,7 @@ mod tests {
         // A name is a BARE filename, not merely a non-absolute one: `sub/find`
         // lands at `{tools}/sub/find` and so is harmless, but refusing it is
         // the fail-closed direction and pins the rule as written.
-        let nested = farm(vec![("sub/find".into(), BB.into())]);
+        let nested = farm(vec![("sub/find".into(), MC.into())]);
         assert_eq!(
             host_tool_invocation("probe", &nested),
             Some(("find", "sub/find".into()))
@@ -3075,7 +3069,7 @@ mod tests {
         // farm, so nothing else can catch it: `tools.join("/usr/bin/find")`
         // discards the farm directory outright, so this link is not a tool
         // named `find` inside it whatever it points at.
-        let escaped = farm(vec![("/usr/bin/find".into(), BB.into())]);
+        let escaped = farm(vec![("/usr/bin/find".into(), MC.into())]);
         assert_eq!(
             host_tool_invocation("probe", &escaped),
             Some(("find", "/usr/bin/find".into()))

@@ -6054,11 +6054,9 @@ mod tests {
     }
 
     /// A POSIX `sh` + a PATH env for the child. The watchdog scripts use only
-    /// shell builtins plus `kill` and INTEGER `sleep` (busybox `sleep` has no
-    /// float applet in defconfig), so they run under any POSIX shell. On a dev
-    /// host that is the system `/bin/sh`; in the loop host-sandbox it is busybox
-    /// `sh` (ash), already on PATH — no seed bash, so these tests RUN there
-    /// without a guix lock.
+    /// shell builtins plus `kill` and INTEGER `sleep` (not every `sleep` takes
+    /// a fraction), so they run under any POSIX shell — on a dev host, the
+    /// system `/bin/sh`.
     fn sh_and_env() -> (String, Vec<(String, String)>) {
         let path = env::var("PATH").unwrap();
         let sh = find_in_path(&path, "sh").expect("sh on PATH");
@@ -7381,8 +7379,8 @@ mod tests {
         // volume alone) reds this while the spin test above still passes.
         let (sh, envs) = sh_and_env();
         // A POSIX `while` counter emits the burst and then EXITS, completing
-        // before the window — no bash `{1..N}` brace expansion (busybox ash lacks
-        // it) and no `yes`/`seq` (absent from the loop's busybox userland). 50000
+        // before the window — no bash `{1..N}` brace expansion (not POSIX) and
+        // no `yes`/`seq` (not every shell host has them). 50000
         // builtin-`echo` iterations finish in well under the 5s window, so it is
         // the DURATION, not the count, that a phase bound could key on.
         let tar_like = "i=0; while [ \"$i\" -lt 50000 ]; do \
@@ -7499,8 +7497,8 @@ mod tests {
         // on a noisy-but-terminating tool. And a changing stderr stream resets
         // the counter, so far more total lines than the limit stay green.
         let (sh, envs) = sh_and_env();
-        // POSIX `while` counters (no `seq`/`yes`, absent from the busybox
-        // userland; no bash C-style `for (( ))`, which busybox ash lacks).
+        // POSIX `while` counters (no `seq`/`yes`, not on every host; no bash
+        // C-style `for (( ))`, which is not POSIX).
         let noisy = "i=0; while [ \"$i\" -lt 24 ]; do echo 'same warning' >&2; i=$((i+1)); done; echo done-ok";
         run_cmd(&sh, &["-c", noisy], ".", &envs, &w(600, 25, 0))
             .expect("sub-limit repeats must stay green");

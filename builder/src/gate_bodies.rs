@@ -286,10 +286,33 @@ fn find_in_path_frags(frags: &str, bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// A faithful copy of a staged tree: types, symlinks and modes, all a NAR
-/// records. Rust, as everything the gates run is: the loop has no `cp`.
+/// A faithful copy of a staged tree: types, symlinks (as symlinks) and modes,
+/// all a NAR records. Rust, as everything the gates run is: the loop has no
+/// `cp`. A directory's mode is set after its children, so a read-only store
+/// item copies.
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    crate::check_loop::copy_tree_preserving(src, dst).map_err(|e| format!("FAIL: {e}"))
+    let md =
+        std::fs::symlink_metadata(src).map_err(|e| format!("FAIL: stat {}: {e}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(src)
+            .map_err(|e| format!("FAIL: readlink {}: {e}", src.display()))?;
+        return std::os::unix::fs::symlink(&target, dst)
+            .map_err(|e| format!("FAIL: symlink {}: {e}", dst.display()));
+    }
+    if ft.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| format!("FAIL: mkdir {}: {e}", dst.display()))?;
+        let rd =
+            std::fs::read_dir(src).map_err(|e| format!("FAIL: readdir {}: {e}", src.display()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("FAIL: readdir {}: {e}", src.display()))?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return std::fs::set_permissions(dst, md.permissions())
+            .map_err(|e| format!("FAIL: chmod {}: {e}", dst.display()));
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("FAIL: copy {}: {e}", src.display()))?;
+    Ok(())
 }
 
 /// `chmod -R u+w`: make a staged store writable, so it can be removed.
@@ -2738,8 +2761,12 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     let cargo_target_s = path_str(&cargo_target)?;
     let cargo_bin_s = path_str(&cargo_bin)?;
 
-    let old_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{rustpath}:{ccpath}:{old_path}");
+    // An empty inherited PATH (the loop's) must not leave a trailing `:`,
+    // which a PATH search reads as the current directory.
+    let new_path = match std::env::var("PATH") {
+        Ok(p) if !p.is_empty() => format!("{rustpath}:{ccpath}:{p}"),
+        _ => format!("{rustpath}:{ccpath}"),
+    };
     // Every control-plane helper uses this same static target configuration.
     // Encoded flags outrank Cargo wrappers; explicit --target leaves host-kind
     // build scripts dynamic. Clear inherited wrappers and pin their C linker.
@@ -5004,7 +5031,7 @@ fn stage0_cold_start(root: &Path) -> Result<(), String> {
 // --- gate-probe: what the own-root and sandbox gates run inside their roots ----
 
 /// `td-builder gate-probe <probe> ...` — the programs the own-root and sandbox
-/// gates run inside the roots they build, where BusyBox's sh once ran their
+/// gates run inside the roots they build, where a shell once ran their
 /// scripts. The stage0 td-builder is static with a self-only closure, so it
 /// runs with nothing but its own store item bound.
 pub fn gate_probe(args: &[String]) -> ExitCode {

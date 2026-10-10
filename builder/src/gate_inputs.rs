@@ -7,8 +7,8 @@
 //!
 //! (The #353 typed gate-input mechanism that also lived here — LockEntry /
 //! ClosureMember resolution binding guix lock members into gate sandboxes — was
-//! removed with the guix seed store: every gate now resolves its tools from the
-//! td-built userland on PATH, so no gate declares a lock input.)
+//! removed with the guix seed store: every gate body is now typed Rust that
+//! names each program it runs by path, so no gate declares a lock input.)
 
 /// Does a store path name package `stem`? The basename after the 32-char
 /// digest (the shape rule lives in `store::name_from_store_path` — one source,

@@ -72,13 +72,6 @@ const PINS: &[PinDef] = &[
         file: "btrfs-progs-v7.0.tar.xz",
     },
     PinDef {
-        key: "busybox-x86-64-source",
-        aliases: &[],
-        url: "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
-        sha256: "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4",
-        file: "busybox-1.37.0.tar.bz2",
-    },
-    PinDef {
         key: "ca-certificates-source",
         aliases: &[],
         // Mozilla's trust store as rendered in PEM form by curl. Pin the dated
@@ -834,8 +827,9 @@ mod tests {
         // the archive and nine licence notices. cryptsetup 2.8.8 with json-c
         // 0.18, popt 1.19 and LVM2 2.03.43 add the LUKS2 userspace closure.
         // gawk 5.4.1 is the build-only awk after rust-toolchain, and bc 1.08.2
-        // the build-only bc for the kernel's timeconst.bc.
-        assert_eq!(all().len(), 80);
+        // the build-only bc for the kernel's timeconst.bc. BusyBox's pin left
+        // with its last consumer.
+        assert_eq!(all().len(), 79);
     }
 
     /// A roster keyed by NAME can name nothing, and this workstream has twice

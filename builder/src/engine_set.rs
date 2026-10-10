@@ -73,7 +73,6 @@ pub const HOST_ONLY: &[&str] = &[
 pub const HOST_ONLY_VERBS: &[&str] = &[
     "affected-checks",
     "check",
-    "check-rung",
     "gate-body",
     "gate-crates",
     "gate-probe",

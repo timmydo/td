@@ -1350,8 +1350,7 @@ pub type StageManifest = std::collections::BTreeMap<String, StagedInput>;
 
 /// Stream-hash a tree/file in NAR form — `sha256:<hex>`, the `ValidPaths.hash`
 /// wire format every td store registration records. `pub(crate)` because the
-/// loop-userland cache (check_loop.rs) verifies its durable items with the
-/// same hash before mounting them.
+/// staging boundary and the gate bodies verify items with the same hash.
 pub(crate) fn nar_hash_of(path: &Path) -> io::Result<String> {
     struct W(crate::sha256::Sha256);
     impl io::Write for W {

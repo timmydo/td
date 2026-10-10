@@ -118,10 +118,11 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         // The engine's process-supervision unit tests (build::tests::watchdog_*)
-        // now spawn a POSIX `sh` resolved from PATH — busybox `sh` (ash) in the
-        // loop host-sandbox, the system `/bin/sh` on a dev host — and their
-        // scripts use only shell builtins plus `kill`/integer `sleep`, so no seed
-        // bash (and no guix lock) is bound here anymore.
+        // spawn a POSIX `sh` resolved from PATH (the system `/bin/sh` on a dev
+        // host) and use only shell builtins plus `kill`/integer `sleep`, so no
+        // seed bash (and no guix lock) is bound here. The loop sandbox has an
+        // empty PATH, so a toolchain reaching it would also have to bring a
+        // shell for these tests.
         //
         // In the guix-free loop sandbox no toolchain is reachable, so
         // provision-{rust,cc} exit EXIT_UNPROVISIONED (69) (passed through as
