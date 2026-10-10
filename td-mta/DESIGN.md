@@ -165,7 +165,8 @@ its tests in one named child directory. The previous nested response module
 tree is removed in the same change.
 
 Use `td-mta/` for the service library and installed binary named `td-mta`.
-The packaging entry point supports `--version`, `--help`, offline
+The packaging entry point supports `--version`, `--help`, `config check`
+of an operator file and its protected inputs (CONFIG.md), offline
 `store init` of a new store holding one account and its Inbox, offline
 `store verify` for an explicitly selected account or all accounts,
 stopped-database `backup`, and verified fresh-epoch `restore` to a fresh
@@ -1339,7 +1340,7 @@ Planned commands, with stable JSON output and exit codes:
 
 | Command | Contract |
 | --- | --- |
-| `config check` | Offline syntax, references, permission, and resource validation |
+| `config check` | Offline syntax, references, permission, and resource validation; implemented for file inputs, no ACME state |
 | `config show --redacted` | Effective values, defaults, and configuration generation |
 | `serve` | Foreground service, no daemonization |
 | `status --json`, `doctor --json` | Health, bounds, certificates, storage, queue; no mutation |

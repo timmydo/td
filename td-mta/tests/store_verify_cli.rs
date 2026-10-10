@@ -1094,3 +1094,263 @@ fn init_refuses_arguments_roots_and_locks_before_creation() {
     assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
     assert!(database.exists());
 }
+
+#[path = "support/tls_certificate_fixture.rs"]
+mod certificate_fixture;
+
+struct ConfigFixture {
+    data: Fixture,
+    etc: Fixture,
+}
+impl ConfigFixture {
+    fn new() -> Self {
+        let fixture = Self {
+            data: Fixture::new(),
+            etc: Fixture::new(),
+        };
+        let provider = td_crypto::Provider;
+        let mut raw = [0; td_crypto::P256_PKCS8_CAPACITY];
+        let count = provider.generate_p256(&mut raw).unwrap();
+        let root = provider.load_p256(&raw[..count]).unwrap();
+        let ca = certificate_fixture::pem(
+            "CERTIFICATE",
+            &certificate_fixture::certificate_names(&root, &root, true, 1, &[], false),
+        );
+        let count = provider.generate_p256(&mut raw).unwrap();
+        let leaf = provider.load_p256(&raw[..count]).unwrap();
+        let chain = [
+            certificate_fixture::pem(
+                "CERTIFICATE",
+                &certificate_fixture::certificate_names(
+                    &leaf,
+                    &root,
+                    false,
+                    2,
+                    &["localhost"],
+                    false,
+                ),
+            ),
+            ca.clone(),
+        ]
+        .concat();
+        let key = certificate_fixture::pem("PRIVATE KEY", &raw[..count]);
+        for (name, bytes, mode) in [
+            ("password", &b"relay-secret\n"[..], 0o600),
+            ("relay-ca", &ca[..], 0o644),
+            ("chain", &chain[..], 0o644),
+            ("key", &key[..], 0o600),
+            ("signature", &b"-- \nsignature\n"[..], 0o644),
+        ] {
+            fixture.write(name, bytes, mode);
+        }
+        fixture.configure("");
+        fixture
+    }
+    fn path(&self, name: &str) -> PathBuf {
+        self.etc.0.join(name)
+    }
+    fn write(&self, name: &str, bytes: &[u8], mode: u32) {
+        let path = self.path(name);
+        let _ = fs::remove_file(&path);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fn mode(&self, name: &str, mode: u32) {
+        fs::set_permissions(self.path(name), fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fn configure(&self, extra: &str) {
+        let etc = self.etc.0.to_str().unwrap();
+        let source = format!(
+            r#"version = 1
+[server]
+hostname = "localhost"
+jmap_origin = "https://localhost:8443"
+[paths]
+data = "{data}"
+[account "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+username = "private-user"
+[domain "example.test"]
+[alias "main@example.test"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[identity "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+email = "main@example.test"
+text_signature_file = "{etc}/signature"
+[resolver "primary"]
+address = "127.0.0.1:53"
+[relay]
+host = "localhost"
+port = 465
+username = "private-relay"
+password_file = "{etc}/password"
+ca_file = "{etc}/relay-ca"
+[certificate "public"]
+mode = "files"
+chain_file = "{etc}/chain"
+key_file = "{etc}/key"
+[listener "smtp"]
+kind = "direct_smtp"
+bind = "127.0.0.1:2525"
+server_name = "localhost"
+certificate = "public"
+session_limit = 1
+per_peer_limit = 1
+[listener "https"]
+kind = "https"
+bind = "127.0.0.1:8443"
+certificate = "public"
+{extra}"#,
+            data = self.data.0.to_str().unwrap(),
+        );
+        self.write("td-mta.conf", source.as_bytes(), 0o644);
+    }
+    fn check(&self, code: i32) -> td_json::Json {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(["config", "check", "--config"])
+            .arg(self.path("td-mta.conf"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains(self.etc.0.to_str().unwrap()), "{stdout}");
+        assert!(!stdout.contains(self.data.0.to_str().unwrap()), "{stdout}");
+        assert!(!stdout.contains("relay-secret"), "{stdout}");
+        assert_eq!(output.status.code(), Some(code), "{stdout}");
+        report_command(&output, code, "config.check")
+    }
+    fn refuses(&self, stage: &str, error: &str, target: Option<&str>) -> td_json::Json {
+        let json = self.check(1);
+        assert_eq!(json.get("status").unwrap().as_str(), Some("error"));
+        assert_eq!(json.get("stage").unwrap().as_str(), Some(stage), "{json:?}");
+        assert_eq!(json.get("error").unwrap().as_str(), Some(error), "{json:?}");
+        assert_eq!(
+            json.get("target").and_then(td_json::Json::as_str),
+            target,
+            "{json:?}"
+        );
+        json
+    }
+}
+
+#[test]
+fn config_check_opens_every_protected_input_and_separates_secrets() {
+    if private_case("config_check_opens_every_protected_input_and_separates_secrets") {
+        return;
+    }
+    let fixture = ConfigFixture::new();
+    let json = fixture.check(0);
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    // The configuration, signature, password, relay CA, chain and key; one
+    // profile serves both listeners.
+    assert_eq!(json.get("inputs").unwrap().as_u64(), Some(6));
+
+    let input = Some("certificate-key");
+    for (name, mode, error, target) in [
+        ("key", 0o640, "input-private-mode", input),
+        ("key", 0o400, "", input),
+        ("key", 0o700, "input-mode", input),
+        (
+            "password",
+            0o644,
+            "input-private-mode",
+            Some("relay-password"),
+        ),
+        ("chain", 0o664, "input-writable", Some("certificate-chain")),
+        ("chain", 0o4644, "input-mode", Some("certificate-chain")),
+        ("relay-ca", 0o646, "input-writable", Some("relay-ca")),
+        ("signature", 0o744, "input-mode", Some("text-signature")),
+    ] {
+        let original = fs::metadata(fixture.path(name)).unwrap().mode() & 0o7777;
+        fixture.mode(name, mode);
+        if error.is_empty() {
+            fixture.check(0);
+        } else {
+            fixture.refuses("input", error, target);
+        }
+        fixture.mode(name, original);
+    }
+    fixture.check(0);
+
+    // A hard link makes the private key also a signature: refused by inode.
+    fs::remove_file(fixture.path("signature")).unwrap();
+    fs::hard_link(fixture.path("key"), fixture.path("signature")).unwrap();
+    fixture.refuses("input", "input-secret-alias", input);
+    fs::remove_file(fixture.path("signature")).unwrap();
+    fixture.write("signature", b"plain", 0o644);
+
+    let ca = fs::read(fixture.path("relay-ca")).unwrap();
+    fs::rename(fixture.path("relay-ca"), fixture.path("relay-ca-real")).unwrap();
+    std::os::unix::fs::symlink(fixture.path("relay-ca-real"), fixture.path("relay-ca")).unwrap();
+    fixture.refuses("input", "input-type", Some("relay-ca"));
+    fs::remove_file(fixture.path("relay-ca")).unwrap();
+    fixture.write("relay-ca", &ca, 0o644);
+
+    let key = fs::read(fixture.path("key")).unwrap();
+    fs::remove_file(fixture.path("key")).unwrap();
+    fixture.refuses("input", "input-not-found", input);
+    fixture.write("key", &key[..key.len() / 2], 0o600);
+    fixture.refuses("tls", "tls", input);
+    fixture.write("key", &key, 0o000);
+    fixture.refuses("input", "input-private-mode", input);
+    fixture.mode("key", 0o200);
+    fixture.refuses("input", "input-private-mode", input);
+    fixture.write("key", &key, 0o600);
+
+    fixture.write("password", b"", 0o600);
+    fixture.refuses("input", "config_material_password", Some("relay-password"));
+    fixture.write("password", b"relay-secret\n", 0o600);
+
+    fixture.mode("td-mta.conf", 0o664);
+    fixture.refuses("configuration-file", "input-writable", None);
+    fixture.mode("td-mta.conf", 0o644);
+    fs::set_permissions(&fixture.etc.0, fs::Permissions::from_mode(0o770)).unwrap();
+    fixture.refuses("configuration-file", "input-writable", None);
+    fs::set_permissions(&fixture.etc.0, fs::Permissions::from_mode(0o700)).unwrap();
+
+    fs::set_permissions(&fixture.data.0, fs::Permissions::from_mode(0o750)).unwrap();
+    fixture.refuses("data-root", "root-policy-or-io", None);
+    fs::set_permissions(&fixture.data.0, fs::Permissions::from_mode(0o700)).unwrap();
+
+    fixture.configure("[unknown]\n");
+    let json = fixture.refuses("configuration", "config_schema", None);
+    assert!(json
+        .get("detail")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("line 39"));
+    fixture.configure("");
+    fixture.check(0);
+}
+
+#[test]
+fn config_check_refuses_malformed_arguments_before_file_access() {
+    for args in [
+        vec!["config"],
+        vec!["config", "check"],
+        vec!["config", "check", "--config"],
+        vec!["config", "check", "--root", "/etc/td-mta.conf"],
+        vec!["config", "check", "--config", "/a", "--config", "/b"],
+        vec!["config", "show", "--config", "/a"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .args(args)
+            .output()
+            .unwrap();
+        let json = report_command(&output, 2, "config.check");
+        assert_eq!(json.get("stage").unwrap().as_str(), Some("arguments"));
+        assert_eq!(
+            json.get("error").unwrap().as_str(),
+            Some("invalid-arguments")
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_td-mta"))
+        .args(["config", "check", "--config", "relative.conf"])
+        .output()
+        .unwrap();
+    let json = report_command(&output, 1, "config.check");
+    assert_eq!(
+        json.get("stage").unwrap().as_str(),
+        Some("configuration-file")
+    );
+    assert_eq!(json.get("error").unwrap().as_str(), Some("input-path"));
+}

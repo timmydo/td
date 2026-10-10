@@ -9,8 +9,9 @@ additionally builds checked resource plans. [SCHEMA.md](SCHEMA.md) specifies
 the complete operator schema and snapshot partitions. `config::load::read`
 owns whole-reader structural loading, with the portable stack qualification
 below. `config::material` decodes bounded signature and relay-password bytes.
-Protected file access, effective output and CLI remain M04b3/M05/M19 work
-as assigned in IMPLEMENTATION.md.
+`operator_files` opens protected inputs and `config check` composes every
+loading stage, as specified below. Effective output, publication and the
+remaining CLI stay M04b3/M19 work as assigned in IMPLEMENTATION.md.
 A syntactically accepted statement is not a valid service configuration.
 DESIGN.md §6 owns the administration contract; RESOURCES.md owns the aggregate
 memory budget.
@@ -1565,7 +1566,7 @@ allocations, truthful read results, blocking and later M05 descriptor trust
 remain trusted adapter obligations. M05 must check every operator input's
 ownership, modes and secret/public inode separation before any content can
 leave the trusted configuration worker; checking only text references is
-insufficient.
+insufficient. `operator_files`, specified below, performs these checks.
 
 Two resolved spans occupy the previously reserved sixteen bytes per identity
 cell, with two completion flags inside the existing 128-byte ceiling.
@@ -1684,3 +1685,65 @@ compiled-path changes, including the loader, inventory, material decoder,
 materializer, preimage assembly and identity encoder. `ready` does not enforce
 this evidence freshness. A prior artifact does not qualify later code, but
 a new generic instance alone does not mandate another resource fixture.
+
+## Protected operator inputs
+
+`operator_files::Inputs` opens the main configuration and every inventory
+reference under SCHEMA.md's referenced-file requirements and STORAGE.md's
+trusted stable-path contract. For an absolute path it checks each ancestor
+with `symlink_metadata`: a directory, owned by root or the expected UID,
+without group/other write (so sticky shared directories refuse). The final
+entry must be a regular file under the same owner and write rules, with
+no execute, setuid, setgid or sticky bit. Relay passwords and private keys
+must be exactly 0400 or 0600. It then opens the file read-only, repeats
+the file checks on the opened handle and refuses a device/inode change.
+
+Each opened identity is recorded with its secrecy. A file used both as a
+secret and as any non-secret input, including the main configuration, is
+refused; hard links share the identity, so they cannot bypass this.
+Two roles of equal secrecy may share a file. Capacity is the inventory's
+179 slots plus the configuration, so a distinct-identity overflow refuses.
+
+The expected UID comes from the checked private data root, never an input.
+Only the main configuration may open before `bind`: the non-root owners
+of it and its ancestors must be one UID, which `bind` then requires the
+root to have. After binding, owners are root or that UID. Errors are fixed
+codes without paths, bytes or I/O payloads; missing and permission-denied
+inputs have their own codes and other I/O kinds share one. These checks
+are not atomic against a hostile namespace writer, std does not verify the
+process UID, and bounded reading, not metadata length, enforces each raw
+limit.
+
+`td-mta config check --config PATH` composes the stages a service start
+needs before touching the store. It protected-opens and structurally loads
+the file, validates `[paths] data` as a PrivateRoot and binds its owner. It
+then materializes text, prepares complete TLS policies with private keys
+opened as secrets and other provider inputs as public, and validates the
+identity preimage into a discarding sink. It contacts no network, reads
+no service state, locks nothing and publishes nothing; the prepared tables
+are dropped. ACME chains and keys are service state, so a configuration
+naming an ACME profile refuses with `acme-material-unavailable`. Run it
+as the service user; a privileged check is not a substitute. The runtime
+and log roots are not opened; `serve` owns their checks.
+
+Schema-1 JSON success is `{"schema":1,"command":"config.check",
+"status":"ok","inputs":N}`, where N counts distinct opened identities.
+A refusal has `status: "error"`, a `stage` (`arguments`,
+`configuration-file`, `configuration`, `data-root`, `input`, `text`, `tls`
+or `identities`) and a fixed `error` code. Input refusals add `target`, the
+role name (`text-signature`, `html-signature`, `relay-password`,
+`relay-ca`, `acme-ca`, `certificate-chain`, `certificate-key` or
+`gateway-ca`). A provider refusal names the most recently read role as a
+hint, not attribution: a chain/key pair can fail on either, and a
+refusal after reading, such as a name the certificate does not cover,
+still names that role. Text-stage refusals of the arena or
+inventory carry the active role, if any. Structural refusals add `detail`,
+the loader's fixed-code text with section, field and physical location.
+Exit status is 0 on success, 2 for arguments and 1 otherwise. No output
+names a path or echoes input bytes.
+
+This production reader/finalizer/provider instance runs on the process
+main thread under its RLIMIT_STACK, not the qualified control-worker
+mapping above; a later service worker running these stages keeps that
+256 KiB reservation and its own stack assessment. The scratch buffer is
+the stream's, reused for text decoding as M04b3b requires.

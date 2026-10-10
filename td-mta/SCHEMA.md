@@ -10,13 +10,14 @@ unimplemented. CONFIG.md owns physical syntax,
 resource fields, local routing and stream completion. API.md owns visible
 identity encoding. This document owns the remaining fields, cross-references
 and candidate construction. M04b3a implements bounded signature/password
-content decoding. Protected file loading and redacted effective output remain
-M04b3/M05; M19 owns publication.
+content decoding. CONFIG.md specifies protected file loading and the
+`config check` command; redacted effective output remains M04b3 and M19
+owns publication.
 
 No ordinary configuration load contacts DNS, a relay, a CA or a listening
 socket. Structural acceptance does not prove file permissions, certificate
-validity, DNS ownership or reachability. A successful public `config check`
-requires the later protected-file and provider checks as well.
+validity, DNS ownership or reachability. A successful `config check`
+additionally passes the protected-file and provider checks.
 
 ## 1. File structure and common values
 
@@ -422,7 +423,8 @@ service; secret files normally belong to the service UID. The ownership
 rules exclude other UIDs, not compromise of the trusted service UID itself.
 Use physical paths: symlink aliases under `/etc` gain no special exception.
 
-These are adapter requirements, not properties established by the inventory.
+These are adapter requirements, not properties established by the inventory;
+`operator_files` implements them as CONFIG.md specifies.
 Under STORAGE.md's trusted stable-path contract, check each component with
 `symlink_metadata`, reject non-regular final files before read-capable open,
 then validate opened metadata and compare identity. These checks are not atomic

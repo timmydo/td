@@ -477,8 +477,8 @@ Split at these concrete boundaries before dependent milestones start:
     precede M04b3/M19 consumption; M19 tests active generation publication.
 - **M04b3:** protected-file reference requirements and redacted effective
   configuration library output. Actual trusted file opening and permission
-  evidence use M05 adapters; no successful full `config check` before that
-  integration. Consume a structural candidate, resolve signatures/credentials
+  evidence use M05 adapters; `config check` succeeds only through them
+  (M04b3b2b2b1). Consume a structural candidate, resolve signatures/credentials
   within its remaining text capacity, materialize identities with bounded
   injected protected-input fixtures, then encode from temporary borrowed views.
   Any late failure drops the candidate. M19 owns atomic runtime publication.
@@ -505,11 +505,14 @@ Split at these concrete boundaries before dependent milestones start:
     within a guarded 256 KiB portable worker mapping, including full tables,
     maximum signatures, independent limits, late errors and storage reuse.
     CONFIG.md scopes the evidence; this is not heap/RSS qualification.
-  - **M04b3b2b2b:** remaining M05 adapter integration, M07 provider validation
-    and streamed redacted effective output. Preserve enforced input/layout
-    guards and assess concrete reader/finalizer/provider stack risks under
-    DESIGN section 5. M23 measures integrated memory; every compiled instance
-    does not require a separate qualification fixture.
+  - **M04b3b2b2b1:** implemented `operator_files` protected input opening
+    with owner binding to the data root and secret/public identity
+    separation, and `config check` composing load, text, TLS provider
+    preparation and identity validation. CONFIG.md specifies both.
+  - **M04b3b2b2b2:** streamed redacted effective output. Preserve enforced
+    input/layout guards and assess concrete reader/finalizer/provider stack
+    risks under DESIGN section 5. M23 measures integrated memory; every
+    compiled instance does not require a separate qualification fixture.
 - **M04c1:** checked u64 disk/work settings and capacity-derived maintenance
   validation in `admission.rs`; configuration uses this committed plan.
 - **M04c2:** charged work meters in `admission/work.rs` and checked
@@ -2939,10 +2942,11 @@ atomic reload. Add size-based log rotation, suppression counters and fallback
 diagnostics. Ensure a restart-required change does not partly apply.
 M20 owns verify/repair/backup/restore; M21 owns migrate. Those commands remain
 unavailable until their owning increment lands; M19 supplies shared CLI wiring.
-The standalone offline `store init`, `store verify`, database `backup`
-and `restore` commands have landed independently and require no serving
-runtime or control socket. STORAGE.md specifies `store init`; M11 records
-why it exists.
+The standalone offline `config check`, `store init`, `store verify`,
+database `backup` and `restore` commands have landed independently and
+require no serving runtime or control socket. STORAGE.md specifies
+`store init`; M11 records why it exists. CONFIG.md specifies
+`config check`.
 
 **Acceptance:** unauthorized socket access fails by filesystem policy; stale
 IDs and concurrent controls cannot duplicate delivery. Health reports disk,

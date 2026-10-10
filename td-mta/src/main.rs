@@ -9,18 +9,22 @@ use std::{
 };
 use td_mta::{
     account_checks::CompleteChecks,
-    clock::RuntimeClock,
+    clock::{RuntimeClock, TlsClockSource},
+    config::{inputs::Target, load, materialize, preimage, stanza::Pending, storage, stream},
+    generations::GenerationSet,
     ids::{AccountId, MailboxId, StoreEpoch},
     limits::SQLITE_DATABASE_BYTES,
     metadata_sweep,
+    operator_files::{Inputs, Role},
     ports::{self, Clock, Deadline, Entropy as _},
     store_fs::{
         AccountCheckError, AccountCheckLimits, BackupError, BackupReceipt, BodyCheckLimits,
         IndexStore, LockError, LockedRoot, PrivateRoot,
     },
+    tls_policy::{MaterialKind, TlsPolicies},
 };
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nNo repair or serving commands are available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nNo repair or serving commands are available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -350,6 +354,174 @@ fn init_failure(output: &mut impl Write, error: InitFailure) -> io::Result<()> {
     writeln!(output, "{{\"schema\":1,\"command\":\"store.init\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\",\"progress\":\"{}\"}}", error.failure.stage, error.failure.code, error.progress)
 }
 
+fn config_arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Option<String> {
+    if args.next()?.to_str()? != "--config" {
+        return None;
+    }
+    let path = args.next()?.into_string().ok()?;
+    args.next().is_none().then_some(path)
+}
+
+/// A fixed-code refusal; detail is the loader's own path- and byte-free text.
+struct ConfigFailure {
+    failure: Failure,
+    target: Option<&'static str>,
+    detail: Option<String>,
+}
+impl From<Failure> for ConfigFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            target: None,
+            detail: None,
+        }
+    }
+}
+fn config_failure(stage: &'static str, code: &'static str) -> ConfigFailure {
+    Failure { stage, code }.into()
+}
+fn input_failure(code: &'static str, target: &'static str) -> ConfigFailure {
+    ConfigFailure {
+        target: Some(target),
+        ..config_failure("input", code)
+    }
+}
+
+fn input_target(target: Target) -> &'static str {
+    match target {
+        Target::TextSignature(_) => "text-signature",
+        Target::HtmlSignature(_) => "html-signature",
+        Target::RelayPassword => "relay-password",
+        Target::RelayCa => "relay-ca",
+        Target::AcmeCa => "acme-ca",
+        Target::CertificateChain(_) => "certificate-chain",
+        Target::CertificateKey(_) => "certificate-key",
+        Target::GatewayCa(_) => "gateway-ca",
+    }
+}
+fn material_target(kind: MaterialKind) -> &'static str {
+    match kind {
+        MaterialKind::Chain => "certificate-chain",
+        MaterialKind::Key => "certificate-key",
+        MaterialKind::GatewayCa => "gateway-ca",
+        MaterialKind::RelayCa => "relay-ca",
+        MaterialKind::AcmeCa => "acme-ca",
+    }
+}
+
+/// Every stage a service start needs before touching the store: protected
+/// opening of the file and all references, structural load, text decoding,
+/// TLS provider construction and identity encoding. Returns distinct inputs.
+fn config_check(path: &str) -> Result<usize, ConfigFailure> {
+    let mut files = Inputs::new();
+    let mut source = files
+        .open(path, Role::Configuration)
+        .map_err(|error| config_failure("configuration-file", error.code()))?;
+    let mut scratch = vec![0; stream::SCRATCH_BYTES];
+    let storage =
+        storage::Storage::try_new().map_err(|_| config_failure("configuration", "capacity"))?;
+    let loaded =
+        load::read(storage, &mut Pending::new(), &mut scratch, &mut source).map_err(|failure| {
+            let (code, detail) = match failure.error() {
+                storage::BuildError::Input(stream::Error::Handler(error))
+                | storage::BuildError::Configuration(error) => ("config_schema", error.to_string()),
+                storage::BuildError::Input(error) => (error.name(), error.to_string()),
+            };
+            ConfigFailure {
+                detail: Some(detail),
+                ..config_failure("configuration", code)
+            }
+        })?;
+    drop(source);
+    let root = loaded
+        .candidate()
+        .globals()
+        .ok()
+        .and_then(|globals| globals.data().ok())
+        .ok_or_else(|| config_failure("configuration", "invariant"))
+        .and_then(|data| {
+            PrivateRoot::open(data).map_err(|_| config_failure("data-root", "root-policy-or-io"))
+        })?;
+    files
+        .bind(&root)
+        .map_err(|error| config_failure("data-root", error.code()))?;
+    drop(root);
+    let resolved = materialize::read_text(loaded, &mut scratch, |reference| {
+        files.open(reference.path(), Role::of(reference.target()))
+    })
+    .map_err(|failure| {
+        let (stage, code) = match failure.error() {
+            materialize::Error::Input(error) => ("input", error.code()),
+            materialize::Error::Content(error) => ("input", error.name()),
+            // Arena, inventory and invariant refusals are not one input's.
+            error => ("text", error.name()),
+        };
+        ConfigFailure {
+            target: failure.target().map(input_target),
+            ..config_failure(stage, code)
+        }
+    })?;
+    let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
+    let tls_clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(clock)));
+    let set = GenerationSet::<TlsPolicies>::at_startup();
+    let reserved = set.reserve().map_err(|error| adapter("tls", error))?;
+    let (mut refused, mut last) = (None, None);
+    // A check publishes nothing; the prepared tables are discarded below.
+    let prepared = TlsPolicies::prepare(reserved, &resolved, tls_clock, |request| {
+        let target = material_target(request.kind());
+        last = Some(target);
+        // ACME chains and keys are service state; this check reads no state.
+        let Some(path) = request.path() else {
+            refused = Some(input_failure("acme-material-unavailable", target));
+            return Err(ports::Error::NotFound);
+        };
+        let role = if request.kind() == MaterialKind::Key {
+            Role::Secret
+        } else {
+            Role::Public
+        };
+        files.open(path, role).map_err(|error| {
+            refused = Some(input_failure(error.code(), target));
+            ports::Error::Forbidden
+        })
+    })
+    .map_err(|error| {
+        refused.take().unwrap_or_else(|| ConfigFailure {
+            // Content is parsed after reading; a key pair may fail on either.
+            target: last,
+            ..adapter("tls", error).into()
+        })
+    })?;
+    drop(prepared);
+    preimage::write(&resolved, |_| Ok::<(), std::convert::Infallible>(()))
+        .map_err(|error| config_failure("identities", error.name()))?;
+    Ok(files.count())
+}
+
+fn json_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            c if c.is_control() => output.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => output.push(c),
+        }
+    }
+    output
+}
+
+fn config_check_failure(output: &mut impl Write, error: ConfigFailure) -> io::Result<()> {
+    write!(output, "{{\"schema\":1,\"command\":\"config.check\",\"status\":\"error\",\"stage\":\"{}\",\"error\":\"{}\"", error.failure.stage, error.failure.code)?;
+    if let Some(target) = error.target {
+        write!(output, ",\"target\":\"{target}\"")?;
+    }
+    if let Some(detail) = error.detail {
+        write!(output, ",\"detail\":\"{}\"", json_text(&detail))?;
+    }
+    writeln!(output, "}}")
+}
+
 fn verify(options: Verify) -> Result<Verification, Failure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     verify_with_clock(options, clock)
@@ -545,6 +717,31 @@ fn run() -> io::Result<ExitCode> {
             Err(error) => {
                 let code = error.failure.exit_code();
                 backup_failure(&mut io::stdout().lock(), error)?;
+                Ok(code)
+            }
+        };
+    }
+    if first.as_deref() == Some(OsStr::new("config")) {
+        let path = if args.next().as_deref() == Some(OsStr::new("check")) {
+            config_arguments(args)
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            config_check_failure(
+                &mut io::stdout().lock(),
+                config_failure("arguments", "invalid-arguments"),
+            )?;
+            return Ok(ExitCode::from(2));
+        };
+        return match config_check(&path) {
+            Ok(inputs) => {
+                writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"config.check\",\"status\":\"ok\",\"inputs\":{inputs}}}")?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                let code = error.failure.exit_code();
+                config_check_failure(&mut io::stdout().lock(), error)?;
                 Ok(code)
             }
         };

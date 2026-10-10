@@ -67,6 +67,7 @@ pub use td_mime::nfc;
 pub use td_mime::parameter_value as mime_value;
 pub use td_mime::unfold as mime_unfold;
 pub mod observability;
+pub mod operator_files;
 pub mod ownership;
 pub mod ports;
 pub mod recipient_sweep;
