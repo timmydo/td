@@ -73,7 +73,8 @@ fn usage() -> String {
          FILE defaults to {DEFAULT_PATH}; everything but check/run talks to {socket}\n\
          ({sentinel} is internal: `run` spawns it to catch Ctrl-Alt-Del, and it \
          blocks on stdin until its parent lets go)\n\
-         (pair-run is internal: `run` uses it to launch pair-exec daemons)",
+         (pair-run is internal: `run` uses it to launch pair-exec daemons)\n\
+         (leaf-exec is internal: `run` launches stop=leaf units through it)",
         socket = control::PATH,
         sentinel = cad::SENTINEL_VERB
     )
@@ -95,6 +96,10 @@ enum Route {
     PairRun {
         left: Vec<String>,
         right: Vec<String>,
+    },
+    /// A `stop=leaf` leader's trampoline: exec `argv` once td-svc grants it.
+    LeafExec {
+        argv: Vec<String>,
     },
     /// A request for the RUNNING supervisor, sent over the control socket.
     /// The verb and its argument travel verbatim — this process parses only
@@ -118,6 +123,12 @@ fn route(args: &[String]) -> Route {
     if verb == pair::VERB {
         return match pair::parse(args.get(1..).unwrap_or(&[])) {
             Ok((left, right)) => Route::PairRun { left, right },
+            Err(why) => Route::Usage(why),
+        };
+    }
+    if verb == pair::LEAF_VERB {
+        return match pair::parse_leaf(args.get(1..).unwrap_or(&[])) {
+            Ok(argv) => Route::LeafExec { argv },
             Err(why) => Route::Usage(why),
         };
     }
@@ -249,6 +260,11 @@ fn main() -> ExitCode {
                 )),
                 Err(why) => emit_err(&format!("td-svc: {why}\n")),
             }
+            ExitCode::FAILURE
+        }
+        Route::LeafExec { argv } => {
+            let why = pair::leaf_exec(&argv, &mut std::io::stdin().lock());
+            emit_err(&format!("td-svc: {why}\n"));
             ExitCode::FAILURE
         }
         Route::Ctl { request } => match control::ask(control::PATH, &request) {

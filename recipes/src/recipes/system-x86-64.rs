@@ -2146,6 +2146,11 @@ fn build_td_svc_conf() -> String {
          # missing; capturing alone would take sshd's reason out of exactly the\n\
          # text that gets printed when sshd is why the boot failed.\n\
          console=yes\n\
+         # A stop, restart or shutdown kills its whole leaf and waits for it to\n\
+         # empty, so OpenSSH sessions, which start sessions of their own and so\n\
+         # leave sshd's process group, end with it. A listener crash restarts in\n\
+         # place and keeps them (td-svc/DESIGN.md §4, `stop=leaf`).\n\
+         stop=leaf\n\
          \n\
          # The auto-login greeter. tty= hands it /dev/ttyS0 and, per td-svc/DESIGN.md,\n\
          # exempts it from process_group(0) so getty's setsid() succeeds — grouping it\n\
@@ -7691,6 +7696,24 @@ mod tests {
             "sshd is captured but no longer reaches the console; the boot oracle's \
              'Last serial output' would stop carrying the reason sshd failed: {sshd}"
         );
+    }
+
+    /// sshd stops its whole service leaf, so a stop, restart or shutdown ends
+    /// the OpenSSH sessions that left its process group
+    /// (td-login/TOKEN-LOGIN.md, increment 5's A1). The key needs the leaf
+    /// sshd already owns: the default `cgroup=service` and no terminal.
+    #[test]
+    fn the_sshd_unit_stops_its_whole_leaf() {
+        assert_eq!(unit_key("sshd", "stop").as_deref(), Some("leaf"));
+        assert_eq!(unit_key("sshd", "cgroup"), None);
+        assert_eq!(unit_key("sshd", "tty"), None);
+        assert_eq!(unit_key("sshd", "pair-exec"), None);
+        let leaf_units: Vec<String> = parse_td_svc_conf()
+            .into_iter()
+            .filter(|(_, keys)| keys.iter().any(|(k, _)| k == "stop"))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(leaf_units, ["sshd"], "another unit declares stop=");
     }
 
     /// Every oneshot carries an explicit `timeout=`.

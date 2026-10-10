@@ -269,7 +269,8 @@ login directory, the login state root reports, the key-management
 screen's refusals, and the update, console and SSH refusals and the
 compositor's locked start, `Super+l` and attention `L`, which act only
 once a key is enrolled or the login directory is not valid, though every
-paired session consumes `Super+l` and shows `L`) lets the installed
+paired session consumes `Super+l` and shows `L`; `sshd`'s unit stopping
+its whole leaf (`stop=leaf`) is live on every machine) lets the installed
 account trade auto-login for a FIDO2 key plus PIN at boot and session
 lock; that document states what it does not protect.
 

@@ -48,6 +48,8 @@ pub struct Unit {
     pub stop_timeout: Duration,
     /// Which cgroup this unit's processes are accounted in.
     pub cgroup: Cgroup,
+    /// What a requested stop, restart or shutdown ends (DESIGN.md §4).
+    pub stop: Stop,
     /// What this unit's own leaf bounds. Refused unless `cgroup=service`, so a
     /// limit is never written where the unit's processes will not be.
     pub limits: Limits,
@@ -70,6 +72,19 @@ pub enum Cgroup {
     /// privilege, so the process leaves any leaf td-svc might have made — which
     /// is why declaring this refuses limits rather than writing inert ones.
     Session,
+}
+
+/// What a requested stop ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Stop {
+    /// The unit's containment: TERM, then KILL at `stop-timeout`.
+    #[default]
+    Group,
+    /// The containment as for `Group`, then the whole service leaf through
+    /// its `cgroup.kill` at the KILL deadline; the stop finishes only once
+    /// `cgroup.events` reads `populated 0`. Reaches descendants that left the
+    /// process group, such as sessions that `setsid()`.
+    Leaf,
 }
 
 /// The controls written into a unit's leaf before it starts.
@@ -153,6 +168,7 @@ impl Default for Unit {
             ready_timeout: DEFAULT_READY_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             cgroup: Cgroup::Service,
+            stop: Stop::Group,
             limits: Limits::default(),
             unless_exists: None,
         }
@@ -429,6 +445,7 @@ pub fn parse(text: &str) -> (Vec<Unit>, Vec<String>) {
 struct Stanza {
     saw_type: bool,
     saw_restart: bool,
+    saw_stop: bool,
     had_error: bool,
 }
 
@@ -495,6 +512,14 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
                     return Err(format!("unknown cgroup '{other}' (service, session)"));
                 }
             };
+        }
+        "stop" => {
+            unit.stop = match value {
+                "group" => Stop::Group,
+                "leaf" => Stop::Leaf,
+                other => return Err(format!("unknown stop '{other}' (group, leaf)")),
+            };
+            stanza.saw_stop = true;
         }
         "memory-max" => unit.limits.memory_max = Some(parse_bytes(value)?),
         "pids-max" => unit.limits.pids_max = Some(parse_count(value)?),
@@ -615,6 +640,22 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
             problems.push(format!("{name}: paired exec: {why}"));
             ok = false;
         }
+    }
+    // DESIGN.md §4. The leaf is what a leaf stop kills, so the unit needs one
+    // of its own, and a console's login tree is not the unit's to end. A pair
+    // already stops through its leaf whatever it declares, so any `stop=` on
+    // one would be accepted and ignored.
+    if unit.stop == Stop::Leaf && (unit.cgroup != Cgroup::Service || unit.is_console()) {
+        problems.push(format!(
+            "{name}: stop=leaf requires cgroup=service and no tty="
+        ));
+        ok = false;
+    }
+    if unit.pair_argv.is_some() && stanza.saw_stop {
+        problems.push(format!(
+            "{name}: stop= is refused on a pair-exec= unit, which already stops its leaf"
+        ));
+        ok = false;
     }
     // DESIGN.md I5. `requires` is what makes a unit skippable, and a console
     // that can be skipped is a machine that cannot be repaired from itself.
@@ -766,7 +807,8 @@ mod tests {
              restart=always\n\
              ready=/bin/td-netd reach 127.0.0.1 22\n\
              ready-timeout=45\n\
-             stop-timeout=5\n",
+             stop-timeout=5\n\
+             stop=leaf\n",
         );
         assert!(problems.is_empty(), "{problems:?}");
         let u = &units[0];
@@ -780,6 +822,65 @@ mod tests {
         assert_eq!(u.ready, ["/bin/td-netd", "reach", "127.0.0.1", "22"]);
         assert_eq!(u.ready_timeout, Duration::from_secs(45));
         assert_eq!(u.stop_timeout, Duration::from_secs(5));
+        assert_eq!(u.stop, Stop::Leaf);
+    }
+
+    /// `stop=` takes the two scopes, defaults to today's group stop, and a
+    /// leaf stop needs a leaf the unit owns: not a session handoff, not a
+    /// console, and not a pair, which already stops this way.
+    #[test]
+    fn a_leaf_stop_needs_a_service_leaf_and_no_console_or_pair() {
+        let (units, problems) = parse("[d]\ntype=daemon\nexec=/x\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(units.first().map(|u| u.stop), Some(Stop::Group));
+        for (value, wanted) in [("group", Stop::Group), ("leaf", Stop::Leaf)] {
+            for kind in ["daemon", "oneshot"] {
+                let (units, problems) = parse(&format!(
+                    "[d]\ntype={kind}\nexec=/x\ncgroup=service\nstop={value}\n"
+                ));
+                assert!(problems.is_empty(), "{kind} stop={value}: {problems:?}");
+                assert_eq!(units.first().map(|u| u.stop), Some(wanted));
+            }
+        }
+        for value in ["", "Leaf", "session", "tree", "leaf "] {
+            let (units, problems) = parse(&format!("[d]\ntype=daemon\nexec=/x\nstop={value}x\n"));
+            assert!(units.is_empty(), "stop={value}x was admitted");
+            assert!(
+                problems.iter().any(|p| p.contains("unknown stop")),
+                "{problems:?}"
+            );
+        }
+        for extra in ["cgroup=session", "tty=ttyS0"] {
+            let (units, problems) =
+                parse(&format!("[d]\ntype=daemon\nexec=/x\nstop=leaf\n{extra}\n"));
+            assert!(units.is_empty(), "stop=leaf admitted with {extra}");
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("stop=leaf requires cgroup=service and no tty=")),
+                "{problems:?}"
+            );
+            // The same unit with the default stop is fine: the scope is what
+            // conflicts, not the other key.
+            let (units, problems) =
+                parse(&format!("[d]\ntype=daemon\nexec=/x\nstop=group\n{extra}\n"));
+            assert_eq!(units.len(), 1, "{extra}: {problems:?}");
+        }
+        // A pair stops its leaf whatever it says, so either spelling would be
+        // accepted and ignored.
+        let pair = "[d]\ntype=daemon\nexec=/x\npair-exec=/y\nready=/probe\n";
+        let (units, problems) = parse(pair);
+        assert_eq!(units.len(), 1, "{problems:?}");
+        for value in ["leaf", "group"] {
+            let (units, problems) = parse(&format!("{pair}stop={value}\n"));
+            assert!(units.is_empty(), "a pair admitted stop={value}");
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains("already stops its leaf")),
+                "{problems:?}"
+            );
+        }
     }
 
     /// A bad stanza must not take the good ones with it — that is the whole

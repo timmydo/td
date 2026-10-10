@@ -88,13 +88,16 @@ Those three refusals, the locked start and those four locks are all that
 act on the state, and only where a record or an invalid directory
 exists, but for increment 4's live exceptions ("Increments"): on every
 paired machine `Super+l` is consumed and the menu shows `L`, which
-answers `NO LOGIN KEYS ENROLLED` while unenrolled. Nothing else below is
-implemented. Until the increments at the end land, `THREAT-MODEL.md` §3
-is the complete current behaviour: the installed account logs in
-automatically, and a machine with neither a record nor an invalid
-directory, as every stock machine is, never locks. No document, UI or
-release note may describe this tier as available before its acceptance
-evidence exists.
+answers `NO LOGIN KEYS ENROLLED` while unenrolled. Of increment 5, A1
+has landed and is live on every machine without acting on the state:
+`sshd`'s unit stops its whole leaf (`stop=leaf`, `td-svc/DESIGN.md`
+§4), so a stop, restart or shutdown of `sshd` ends its OpenSSH
+sessions. Nothing else below is implemented. Until the increments at
+the end land, `THREAT-MODEL.md` §3 is the complete current behaviour:
+the installed account logs in automatically, and a machine with neither
+a record nor an invalid directory, as every stock machine is, never
+locks. No document, UI or release note may describe this tier as
+available before its acceptance evidence exists.
 
 **Enrollment requires §L.1 elevation.** Enrolling a key refuses every
 interactive login, and there is no `su` and root has no login at all,
@@ -1749,22 +1752,26 @@ and the oracle that shows it.
    atomic publication and record are live on every machine and change
    no admitted login. A1 and A2 each add their live piece to AGENTS.md
    principle 7's list and to this document's opening when they land.
-   - A1, td-svc `stop=leaf` (`td-svc/DESIGN.md`):
+   - A1, landed: td-svc `stop=leaf` (`td-svc/DESIGN.md`):
      - the key, and its validation: `cgroup=service`, no `tty=`, not
        `pair-exec`;
-     - a requested stop, restart or shutdown that kills the whole leaf
-       and waits for it to empty, through the pair's `cgroup.kill` and
-       `cgroup.events` reader; the stop path opens both controls at the
+     - the leader's launch behind the pair's start gate, so every
+       process of an instance starts in the leaf;
+     - a requested stop, restart or shutdown that TERMs the leaf's
+       members, kills the whole leaf at the KILL deadline and waits for
+       it to empty, through the pair's `cgroup.kill` and
+       `cgroup.events` reader; the stop path opens the controls at the
        stop, since a leaf whose leader restarted in place is not empty;
      - a leader crash, which restarts the leader in place;
      - the shipped `sshd` unit, which sets it.
 
      Stopping `sshd` now ends the OpenSSH sessions in its leaf, as
-     shutdown already did by killing everything. A stock machine whose
-     placement failed keeps `sshd` in `stopping` after a requested stop
-     or restart, as that section's fail-closed rule says, until a
-     reboot. The evidence is table and supervisor fixtures, and a guest
-     that holds a session child in its own session through a restart.
+     shutdown already did by killing everything. A machine where
+     `sshd`'s placement fails does not start it, as for a pair. The
+     evidence is table and supervisor fixtures, host tests of the
+     trampoline's grant, and a guest whose leader forks a session child
+     in its own session before anything else and holds it through a
+     crash and ends it at a restart.
    - A2, firstboot's two renders:
      - Stage-1's `td-firstboot render-primary-sshd /sysroot` publishes
        `/sysroot/run/td-sshd.conf` itself, a root:root mode-0600

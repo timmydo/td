@@ -202,7 +202,10 @@ that writes its own pid into the leaf and then `exec`s the real program, the
 way td-login already joins the session leaf before it drops privilege. **The
 triggers that would change the answer, recorded so the decision is not
 rediscovered: a service that forks descendants before it is placed; or a
-measured accounting gap that matters.** Readiness probes are a known part of
+measured accounting gap that matters.** Pairs and `stop=leaf` units meet the
+first (below), and take the gate rather than a self-placing trampoline:
+td-svc still places the leader from outside, and the trampoline only waits
+for its grant. Readiness probes are a known part of
 that gap — `ready=` runs as a separate child of td-svc and is not placed in
 the unit's leaf, so `memory.peak` and `pids.peak` exclude it.
 
@@ -211,8 +214,23 @@ coordinator forks two children. Its stdin therefore carries a one-byte start
 grant, withheld until the parent has placed the coordinator, recorded it, and
 installed its waiter. EOF without that grant launches neither daemon. Both
 inherit the established leaf; the coordinator's own early allocation remains
-in the ordinary spawn-to-placement accounting window. This changes only the
-paired path. Ordinary services retain the placement contract above.
+in the ordinary spawn-to-placement accounting window.
+
+A `stop=leaf` unit (§4) meets the trigger too: its stop must prove that
+everything the unit started is in its leaf, and a leader that forked, or a
+session that `setsid()`ed, before placement would escape both the group
+TERM and the leaf's `cgroup.kill` while the leaf read `populated 0`. So
+its leader is launched through the same gate: td-svc spawns its own
+`leaf-exec` verb, through `/proc/self/exe` as for the pair coordinator,
+with the unit's literal argv, held to a paired argv's bounds (at most 256
+arguments and 32 KiB of argument bytes, no NUL; a longer one does not
+start), and the grant pipe as its stdin. The trampoline reads exactly the
+grant and EOF, refuses without exec'ing on anything else, then `exec`s the
+program in place with the null stdin an ungated unit gets and the stdout,
+stderr and process group td-svc gave it. Nothing of the instance runs
+before it is placed, so a verified placement covers everything the
+instance starts. These are the only gated paths; ordinary services retain
+the placement contract above.
 
 A unit whose leader hands its processes to another cgroup declares
 `cgroup=session` and gets no leaf. Its limits are refused rather than written
@@ -246,10 +264,14 @@ parent's absence, below. The parent's absence is reported once, at startup,
 rather than by every unit in turn — except by a unit that declared a limit,
 which is that unit's own fact and is said rather than inferred.
 
-A paired unit is the explicit exception: failed placement closes its start
-gate and starts neither peer. Paired units cannot provide a console, so this
-does not weaken I5. They require a service leaf even without resource limits;
-the gate makes their descendant placement an enforceable launch contract.
+A paired unit and a `stop=leaf` unit are the explicit exceptions: failed
+placement, or a pid and starttime that could not be recorded, closes the
+start gate, so the leader exits without running the unit's program and the
+restart policy treats that as any failed run; a unit with no leaf of its own
+is not spawned at all and settles as a failed start. Neither can provide a
+console (the table refuses `tty=` on both), so this does not weaken I5. Both
+require a service leaf even without resource limits; the gate makes their
+descendants' placement an enforceable launch contract.
 
 Every operation here is safe filesystem I/O; I1 remains exactly one syscall.
 
@@ -286,9 +308,9 @@ restart=always
 
 Keys: `type` (`oneshot` | `daemon`), `exec`, `after`, `requires`, `restart`
 (`always` | `on-failure` | `never`), `tty`, `log`, `console` (`yes` | `no`),
-`timeout`, `ready`, `ready-timeout`, `stop-timeout`, `cgroup`
-(`service` | `session`), `memory-max`, `pids-max`, `cpu-weight`, `pair-exec`,
-`unless-exists`.
+`timeout`, `ready`, `ready-timeout`, `stop-timeout`, `stop` (`group` |
+`leaf`, §4), `cgroup` (`service` | `session`), `memory-max`, `pids-max`,
+`cpu-weight`, `pair-exec`, `unless-exists`.
 
 `unless-exists` names an absolute path. When the unit is first eligible to
 start, its ordering satisfied and no strict dependency failed, td-svc asks
@@ -538,25 +560,51 @@ restart never reuses the old socket. This uses the cgroup v2 kernel contract
 documented in `Documentation/admin-guide/cgroup-v2.rst`, not numeric process
 group identity after its leader has been reaped.
 
-**Planned, not implemented: `stop=leaf`.** The login-key tier's activation
-(`td-login/TOKEN-LOGIN.md`, "Cutover"; its increment 5's A1) adds a
-unit key `stop`, with values
-`group` (the default, today's behaviour) and `leaf`. It is valid only with
+**`stop=leaf`.** The unit key `stop` takes `group` (the default: the
+containment below, "Stopping") or `leaf`. `leaf` is valid only with
 `cgroup=service` and without `tty=`; a `pair-exec` unit already stops this
-way and does not declare it. A requested stop or restart of a `stop=leaf`
-unit TERMs its group as usual, then writes its leaf's `cgroup.kill` at the
-KILL deadline and stays `stopping` until `cgroup.events` reports
-`populated 0`, so descendants that left the group, such as OpenSSH
-sessions that start their own sessions, end too. Shutdown stops it the
-same way. An unexpected exit of the leader is not a stop: the leaf keeps
-its other processes, and the restart policy starts a new leader in the
-same leaf without waiting for it to empty, so live sessions survive a
-listener crash exactly as they do today. Placement failure never fails a
-start, so a `stop=leaf` unit whose leaf membership was never verified, or
-whose `cgroup.events` cannot be read, counts as not empty: it stays
-`stopping`, and a revocation waiting on it fails closed. Shutdown stays
+way and may not declare `stop` at all. Its leader starts behind the start
+gate (§2 I7), so every process of an instance starts in the leaf. A
+requested stop or restart TERMs the group as usual, opens the leaf's
+`cgroup.kill`, `cgroup.events` and `cgroup.procs` with the pair's reader
+(at the stop, without the launch's `populated 0` precondition, since a
+leaf whose leader restarted in place is not empty), and TERMs every pid
+`cgroup.procs` lists, bounded at 64 KiB of it, other than the leader and
+the rest of its process group, which the group's TERM reached, so sessions
+that left the group, such as OpenSSH sessions that start their own
+sessions, get the grace too. That TERM is best effort, with one log line
+for what it missed: an entry that is not a pid is skipped, a member that
+exits between the read and its signal may have its pid reused, and td-svc
+itself and broadcast targets are refused. At the KILL deadline, which the
+leader's exit does not move, it writes `cgroup.kill`, and it stays
+`stopping` until `cgroup.events` reports `populated 0`; a restart starts
+the next leader only then. A unit whose leader is not running but whose
+leaf may still hold processes has no group to TERM: its stop TERMs the
+leaf's members and writes `cgroup.kill` at the KILL deadline. Shutdown and
+a reload that retires the unit stop it the same way (§8). An unexpected
+exit of the leader is not a stop: the leaf keeps its other processes, and
+the restart policy starts a new leader in the same leaf without waiting
+for it to empty, so live sessions survive a listener crash exactly as they
+do under `group`.
+
+What cannot be read is not emptiness, in two kinds. An unreadable,
+malformed or missing `cgroup.events` keeps the unit `stopping`, and a
+later read that shows `populated 0` finishes the stop; controls that could
+not be opened at the stop are opened again at each sweep, and TERM the
+members they list once they open. But a leaf no read can prove empty keeps
+the unit `stopping` until td-svc is replaced, by a reboot or by PID 1
+respawning it: one in which some instance ran ungated since the leaf was
+last proven empty (one started before a reload declared `stop=leaf`, which
+may have forked before it was placed). Its stop still opens the leaf the
+instance was meant for, TERMs the leaf's members and writes `cgroup.kill`
+at the KILL deadline beside the group's KILL, but never finishes.
+Reloading a unit stuck in either kind back to `stop=group` does not end
+its stop. `status` appends ` leaf=unproven` to its line while either kind
+holds, and a revocation waiting on the unit fails closed. Shutdown stays
 bounded: at the shutdown deadline it proceeds past such a unit as it does
-for any other. The shipped `sshd` unit sets `stop=leaf`.
+for any other. A oneshot's `timeout=` still stops its group alone. The
+shipped `sshd` unit sets `stop=leaf`, which the login-key tier's
+revocation relies on (`td-login/TOKEN-LOGIN.md`, "Cutover").
 
 Paired commands and their descendants must remain in their service leaf.
 They must not use the uid-1000 login/session handoff that moves work out of
@@ -594,8 +642,16 @@ attached disk. Compile it as a static executable with the test host's Rust
 toolchain (or td's target toolchain), then run:
 
 ```text
-pair-vm --run-vm /absolute/bzImage /absolute/td-svc /absolute/busybox /absolute/new-serial.log
+pair-vm --run-vm /absolute/bzImage /absolute/td-svc /absolute/busybox /absolute/new-serial.log [pair|leaf]
 ```
+
+`leaf` runs the `stop=leaf` scenario instead: the first leader starts a
+child through busybox `setsid` before anything else, so it leaves the
+leader's group and session, then requires that it and the child are both
+in the leaf (the start gate), and crashes. The leader restarted in place
+must find that child alive in the same leaf and asks for a `restart`; the
+next leader must find it gone. `TD_QEMU_ACCEL=kvm` boots under KVM; unset or `tcg`
+keeps TCG.
 
 The runner uses the host's `qemu-system-x86_64`, creates and removes its own
 initramfs, attaches no disks or network, and enforces a 120-second / 2-MiB
@@ -720,7 +776,10 @@ reported a stopped service with a live console.
 The containment a stop was issued against is therefore RECORDED, because
 once the leader is reaped its pid is gone and nothing could otherwise be
 asked. On the leader's exit that scope is re-scanned: empty means stopped;
-anything remaining keeps the unit stopping with its KILL still armed. An
+anything remaining keeps the unit stopping with its KILL still armed. A
+pair and a `stop=leaf` stop read their leaf's `cgroup.events` instead,
+and with its controls open keep the KILL deadline the stop began with
+(§4). An
 unreadable scan is not an empty one (**I3**) — `proven_empty` is the only
 reading that fails closed, and a ZOMBIE is not a member: it has already
 exited and holds nothing, but it keeps its pgrp and session, so counting
@@ -778,10 +837,11 @@ spawn, because it is read from td-svc's own open descriptor rather than
 from the child, and because what the child got is not recoverable later.
 
 Sequence per service, in reverse topological order: `TERM` the set, sweep
-until **I4** is satisfied or `stop-timeout` elapses, `KILL` the set, sweep
-again. Then close log handles, then `/etc/shutdown`, then the power applet.
-("Sweep" is the scheduled re-scan above, not a busy poll: the loop keeps
-serving events between them.)
+until **I4** is satisfied or `stop-timeout` elapses, `KILL` the set (for a
+pair or a `stop=leaf` unit, its leaf's `cgroup.kill`), sweep again. Then
+close log handles, then `/etc/shutdown`, then the power applet. ("Sweep"
+is the scheduled re-scan above, not a busy poll: the loop keeps serving
+events between them.)
 
 The `timeout=` path already uses the first half of that sequence, and must
 use both: a `TERM` alone leaks a process that ignores it, and its waiter
@@ -1022,7 +1082,10 @@ immediate EOF, exited, and turned a missing device into a restart spin.
 
 `/run/td-svc/control`, a `UnixListener` inside a `0700` directory created
 *before* bind. Newline-delimited commands: `status [NAME]`, `start|stop|restart
-NAME`, `reload`, and `reboot|poweroff|halt`.
+NAME`, `reload`, and `reboot|poweroff|halt`. `status` answers one line per
+unit, `NAME STATE pid=PID failures=N`, with ` leaf=unproven` appended only
+while a `stop=leaf` stop cannot prove its leaf empty (§4); the prefix never
+changes shape.
 
 The directory carries the protection, not the socket: a path that cannot be
 traversed cannot be connected to whatever the socket's own bits say. It is
@@ -1081,7 +1144,11 @@ claim a death that has not happened, so the reply says what was sent.
 Nothing is recorded unless the signal actually went out. An earlier draft
 set `stopping` and armed the KILL before knowing whether the containment
 could be derived or would be refused, so a stop that signalled nothing
-still replied without an `error:` prefix and the client exited 0.
+still replied without an `error:` prefix and the client exited 0. The one
+stop with no group to TERM is a `stop=leaf` unit's whose leader is not
+running: it TERMs what its leaf lists, however many that is, and is
+recorded either way, since the leaf's `cgroup.kill` at the KILL deadline is
+what it relies on (§4).
 
 `Stopped` settles for `after=`, which asks whether a decision has been
 reached, and an operator's stop is one. It does NOT satisfy `requires=`,
@@ -1117,14 +1184,17 @@ forever is a hung machine. Two constraints make that hold:
   handshake racing, are the ordinary way it arrives twice — so the second
   reply reports the transition already under way rather than an error.
 
-The teardown walks BACKWARDS, one unit at a time, through
-the ordinary `stop` path — the same TERM, recorded containment, scheduled
-KILL and I4 sweep an operator's `stop` uses. A second teardown path would be
-a second set of bugs, and this one is already the harder-won code. A unit
-that will not go is waited for `stop-timeout`, doubled and with the sweep
-interval and a little slack added, and then left behind with a log line: a
-machine that refuses to power off because one service will not die is worse
-than one that powers off with it still running.
+The teardown walks BACKWARDS, one unit at a time, through the ordinary
+`stop` path, over every unit with a leader, a stop in flight, or a
+`stop=leaf` leaf that may still hold processes (what a reload also keeps,
+retired, for its stop) — the same TERM, recorded
+containment, scheduled KILL and I4 sweep an operator's `stop` uses. A
+second teardown path would be a second set of bugs, and this one is
+already the harder-won code. A unit that will not go is waited for
+`stop-timeout`, doubled and with the sweep interval and a little slack
+added, and then left behind with a log line: a machine that refuses to
+power off because one service will not die is worse than one that powers
+off with it still running.
 
 What it walks is captured once, when the request arrives, and it is NOT simply
 the start order. A unit a `reload` dropped from the table is in no plan and no

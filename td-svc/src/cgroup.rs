@@ -4,7 +4,7 @@
 use crate::table::{Limits, Unit};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{chown, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,9 @@ const SYSTEM: &str = "/sys/fs/cgroup/system";
 const SESSION_UID: u32 = 1000;
 const SESSION_GID: u32 = 1000;
 const MAX_CONTROL_BYTES: u64 = 4096;
+/// How much of a leaf's `cgroup.procs` a stop reads to TERM its members: a
+/// few thousand pids. Past it the rest wait for `cgroup.kill`.
+const MAX_MEMBERS_BYTES: u64 = 64 * 1024;
 /// The controllers enabled at every level td-svc creates.
 const CONTROLLERS: &[&str] = &["cpu", "memory", "pids"];
 /// What cgroup v2 spells "no limit". Written explicitly for every limit a unit
@@ -280,6 +283,145 @@ fn membership_of(leaf: &Path) -> String {
 /// which is why this is a membership check and not a parser.
 fn read_membership(pid: i32) -> io::Result<String> {
     read_control(Path::new(&format!("/proc/{pid}/cgroup")))
+}
+
+/// A service leaf's `cgroup.kill` and `cgroup.events`, held open.
+///
+/// The open descriptors pin the kernel cgroup, so neither PID reuse nor a
+/// replaced path can redirect the kill or the population read. A paired unit
+/// opens them at launch; a `stop=leaf` unit at its stop (DESIGN.md §4).
+pub(crate) struct Cohort {
+    kill: fs::File,
+    events: fs::File,
+    procs: fs::File,
+    killed: bool,
+}
+
+impl Cohort {
+    /// Open both controls of the root-owned leaf `create_service` made,
+    /// whatever it holds now. A stop attaches to a leaf that is still running.
+    pub(crate) fn attach(leaf: &Path) -> Result<Self, String> {
+        Ok(Self {
+            kill: OpenOptions::new()
+                .write(true)
+                .open(leaf.join("cgroup.kill"))
+                .map_err(|e| format!("cgroup kill control: {e}"))?,
+            events: fs::File::open(leaf.join("cgroup.events"))
+                .map_err(|e| format!("cgroup events: {e}"))?,
+            procs: fs::File::open(leaf.join("cgroup.procs"))
+                .map_err(|e| format!("cgroup procs: {e}"))?,
+            killed: false,
+        })
+    }
+
+    /// The leaf's member pids as `cgroup.procs` lists them now, for a stop's
+    /// TERM. Best effort, like the session scan: a member may exit between
+    /// this read and its signal, and `cgroup.kill` is what ends the leaf. So
+    /// an entry that is not a positive pid is skipped and counted, and the
+    /// list is cut at `MAX_MEMBERS_BYTES`, whole lines only.
+    pub(crate) fn members(&mut self) -> Result<Members, String> {
+        self.procs
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("cgroup procs: {e}"))?;
+        let mut bytes = Vec::new();
+        (&mut self.procs)
+            .take(MAX_MEMBERS_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cgroup procs: {e}"))?;
+        let cut = bytes.len() as u64 > MAX_MEMBERS_BYTES;
+        if cut {
+            // Only whole lines: the last one may be a pid cut in half.
+            let whole = bytes
+                .iter()
+                .take(MAX_MEMBERS_BYTES as usize)
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |at| at + 1);
+            bytes.truncate(whole);
+        }
+        let mut members = Members {
+            pids: Vec::new(),
+            skipped: 0,
+            cut,
+        };
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            match std::str::from_utf8(line)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                Some(pid) if pid > 0 => members.pids.push(pid),
+                _ => members.skipped += 1,
+            }
+        }
+        Ok(members)
+    }
+}
+
+/// What one read of a leaf's `cgroup.procs` found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Members {
+    pub(crate) pids: Vec<i32>,
+    /// Entries that were not a positive pid.
+    pub(crate) skipped: usize,
+    /// The list was longer than one bounded read.
+    pub(crate) cut: bool,
+}
+
+impl Cohort {
+    /// `attach`, refusing a leaf that is not proven empty: a paired launch
+    /// never shares its leaf with what an earlier generation left.
+    pub(crate) fn open(leaf: &Path) -> Result<Self, String> {
+        let mut cohort = Self::attach(leaf)?;
+        if !cohort.empty()? {
+            return Err("cgroup already contains live processes".into());
+        }
+        Ok(cohort)
+    }
+
+    /// Kill everything in the leaf, once. A kill is not emptiness: `empty`
+    /// is what says it took.
+    pub(crate) fn kill(&mut self) -> Result<(), String> {
+        if !self.killed {
+            self.kill
+                .write_all(b"1")
+                .map_err(|e| format!("cgroup kill: {e}"))?;
+            self.killed = true;
+        }
+        Ok(())
+    }
+
+    /// `populated 0`, read from the pinned control. Missing, malformed,
+    /// ambiguous, oversized or unreadable state is an error, never emptiness.
+    pub(crate) fn empty(&mut self) -> Result<bool, String> {
+        self.events
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("cgroup events: {e}"))?;
+        let mut text = String::new();
+        (&mut self.events)
+            .take(MAX_CONTROL_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("cgroup events: {e}"))?;
+        if text.len() as u64 > MAX_CONTROL_BYTES {
+            return Err(format!("cgroup events exceeded {MAX_CONTROL_BYTES} bytes"));
+        }
+        let mut populated = None;
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("populated") {
+                continue;
+            }
+            let value = match words.next() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => return Err("cgroup has a malformed populated value".into()),
+            };
+            if words.next().is_some() || populated.replace(value).is_some() {
+                return Err("cgroup has an ambiguous populated value".into());
+            }
+        }
+        populated
+            .map(|value| !value)
+            .ok_or("cgroup has no populated value".into())
+    }
 }
 
 /// Enable this cgroup's controllers for its children, and read back that they
@@ -568,6 +710,135 @@ mod tests {
             ..Unit::default()
         };
         assert!(matches!(leaf_for(&unit), Leaf::Elsewhere));
+    }
+
+    struct Controls(std::path::PathBuf);
+    impl Controls {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            // Tests run in parallel, and a clock stamp alone can repeat.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "td-cgroup-controls-{}-{stamp}-{serial}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("cgroup.kill"), "").unwrap();
+            std::fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+            std::fs::write(path.join("cgroup.procs"), "").unwrap();
+            Self(path)
+        }
+        fn events(&self, text: &str) {
+            std::fs::write(self.0.join("cgroup.events"), text).unwrap();
+        }
+    }
+    impl Drop for Controls {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn cohort_does_not_claim_a_kill_is_emptiness() {
+        let controls = Controls::new();
+        let mut cohort = Cohort::open(&controls.0).unwrap();
+        controls.events("populated 1\nfrozen 0\n");
+        cohort.kill().unwrap();
+        cohort.kill().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(controls.0.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        assert!(!cohort.empty().unwrap());
+        controls.events("populated 0\nfrozen 0\n");
+        assert!(cohort.empty().unwrap());
+    }
+
+    #[test]
+    fn cohort_refuses_unknown_state_and_occupied_launches() {
+        let controls = Controls::new();
+        for text in [
+            "",
+            "frozen 0\n",
+            "populated 2\n",
+            "populated 0\npopulated 0\n",
+            "populated 0 extra\n",
+            "populated 1\n",
+        ] {
+            controls.events(text);
+            assert!(Cohort::open(&controls.0).is_err(), "{text:?}");
+        }
+        controls.events("populated 0\n");
+        let mut cohort = Cohort::open(&controls.0).unwrap();
+        controls.events("frozen 0\n");
+        assert!(cohort.empty().is_err());
+        controls.events(&"x".repeat(4097));
+        assert!(cohort.empty().is_err());
+    }
+
+    #[test]
+    fn cohort_keeps_the_original_kernel_objects_after_path_replacement() {
+        let controls = Controls::new();
+        let mut cohort = Cohort::open(&controls.0).unwrap();
+        controls.events("populated 1\n");
+        std::fs::rename(
+            controls.0.join("cgroup.events"),
+            controls.0.join("old-events"),
+        )
+        .unwrap();
+        controls.events("populated 0\n");
+        assert!(!cohort.empty().unwrap());
+    }
+
+    /// A stop attaches to a leaf that is still running, which a launch must
+    /// refuse; both then read the same population.
+    #[test]
+    fn a_stop_attaches_to_an_occupied_leaf_that_a_launch_refuses() {
+        let controls = Controls::new();
+        controls.events("populated 1\n");
+        assert!(Cohort::open(&controls.0).is_err());
+        let mut cohort = Cohort::attach(&controls.0).unwrap();
+        assert!(!cohort.empty().unwrap());
+        cohort.kill().unwrap();
+        controls.events("populated 0\n");
+        assert!(cohort.empty().unwrap());
+        // Attaching needs both controls; a leaf missing one is no leaf to stop.
+        std::fs::remove_file(controls.0.join("cgroup.kill")).unwrap();
+        assert!(Cohort::attach(&controls.0).is_err());
+    }
+
+    /// A stop TERMs what the pinned `cgroup.procs` lists: whole, positive
+    /// pids, the rest skipped and counted.
+    #[test]
+    fn a_leafs_members_are_read_whole_and_bounded() {
+        let controls = Controls::new();
+        let procs = controls.0.join("cgroup.procs");
+        let mut cohort = Cohort::attach(&controls.0).unwrap();
+        let found = |pids: Vec<i32>, skipped, cut| Members { pids, skipped, cut };
+        assert_eq!(cohort.members().unwrap(), found(vec![], 0, false));
+        std::fs::write(&procs, "12\n345\n").unwrap();
+        assert_eq!(cohort.members().unwrap(), found(vec![12, 345], 0, false));
+        // Past the bound: whole lines only, and said so.
+        let line = "1234567\n";
+        let count = (MAX_MEMBERS_BYTES as usize) / line.len() + 2;
+        std::fs::write(&procs, line.repeat(count)).unwrap();
+        let members = cohort.members().unwrap();
+        assert!(members.cut);
+        assert_eq!(
+            members.pids.len(),
+            (MAX_MEMBERS_BYTES as usize) / line.len()
+        );
+        assert!(members.pids.iter().all(|pid| *pid == 1_234_567));
+        // An entry that is not a positive pid is skipped, not the whole list.
+        std::fs::write(&procs, "x\n0\n7\n-1\n12 13\n8\n").unwrap();
+        assert_eq!(cohort.members().unwrap(), found(vec![7, 8], 4, false));
+        // A stop needs this control too.
+        std::fs::remove_file(&procs).unwrap();
+        assert!(Cohort::attach(&controls.0).is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Standalone static VM fixture and host runner. --run-vm builds a temporary
 //! initramfs and boots it with explicit kernel, supervisor and busybox inputs.
+//! Two scenarios: `pair` (the default) and `leaf`, a `stop=leaf` unit.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
@@ -16,6 +17,25 @@ fn park() -> ! {
     }
 }
 
+/// Live and not a zombie: nothing in the guest reaps reparented processes.
+fn alive(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            let (_, fields) = stat.rsplit_once(") ").unwrap();
+            !matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("liveness of {pid} unknown: {e}"),
+    }
+}
+
+/// `/proc/PID/stat` field `index` after the command, counted from state = 0.
+fn stat_field(pid: &str, index: usize) -> String {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let (_, fields) = stat.rsplit_once(") ").unwrap();
+    fields.split_whitespace().nth(index).unwrap().to_string()
+}
+
 fn first() {
     let mut socket = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
     socket
@@ -23,14 +43,7 @@ fn first() {
         .unwrap();
     if let Ok(text) = fs::read_to_string("/run/old-grandchild") {
         let pid: u32 = text.parse().unwrap();
-        let live = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let (_, fields) = stat.rsplit_once(") ").unwrap();
-                !matches!(fields.split_whitespace().next(), Some("Z" | "X"))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => panic!("grandchild liveness unknown: {e}"),
-        };
+        let live = alive(pid);
         fs::write(
             "/run/pair-result",
             if live {
@@ -92,8 +105,82 @@ fn second() {
     // A clean peer exit is still a paired-service failure.
 }
 
-fn init() {
-    assert_eq!(std::process::id(), 1, "VM init only");
+fn leaf_result(text: &str) -> ! {
+    fs::write("/run/leaf-result", text).unwrap();
+    park();
+}
+
+/// One leader generation of the `stop=leaf` unit. The first starts a session
+/// child at once, before anything else, as a daemon that forks before td-svc
+/// could place it would; the child leaves the leader's process group and
+/// session as an OpenSSH session does, and the leader then crashes. The
+/// start gate must have put both in the leaf. The second, restarted in place,
+/// must find that session alive in its own leaf and asks for a restart. The
+/// third, started only once the leaf is empty, must find it gone.
+fn leader() {
+    let first = !Path::new("/run/leaf-session").exists();
+    let early = first.then(|| {
+        Command::new("/bin/busybox")
+            .args(["setsid", "/pair-probe", "session"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    });
+    // The start gate (DESIGN.md I7): a `stop=leaf` leader runs only once
+    // td-svc has placed it, so it is in its leaf from its first instruction.
+    let own = fs::read_to_string("/proc/self/cgroup").unwrap();
+    if own.trim() != "0::/system/leafd" {
+        leaf_result("FAIL: the leader ran before it was placed in its leaf");
+    }
+    let Some(mut child) = early else {
+        let pid: u32 = fs::read_to_string("/run/leaf-session")
+            .unwrap()
+            .parse()
+            .unwrap();
+        if Path::new("/run/leaf-crashed").exists() {
+            if alive(pid) {
+                leaf_result("FAIL: the session survived a requested restart");
+            }
+            leaf_result("PASS: the session survived a crash and ended before the next generation");
+        }
+        if !alive(pid) {
+            leaf_result("FAIL: a leader crash ended the session");
+        }
+        if fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap() != own {
+            leaf_result("FAIL: the restarted leader is not in the session's leaf");
+        }
+        fs::write("/run/leaf-crashed", "").unwrap();
+        fs::write("/run/restart-wanted", "").unwrap();
+        park();
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = fs::read_to_string("/run/session-running") {
+            break pid;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "session exited before it started"
+        );
+        assert!(Instant::now() < deadline, "session did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mine = std::process::id().to_string();
+    // Fields 2 and 3 after the state: process group and session.
+    if stat_field(&pid, 2) == stat_field(&mine, 2) || stat_field(&pid, 3) == stat_field(&mine, 3) {
+        leaf_result("FAIL: the session child did not leave the leader's group");
+    }
+    if fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap() != own {
+        leaf_result("FAIL: the early session started outside the leaf");
+    }
+    fs::write("/run/leaf-session", pid).unwrap();
+    // A crash, not a stop: the restart policy brings the next leader back.
+    std::process::exit(1);
+}
+
+fn mount_pseudo_filesystems() {
     for path in ["/proc", "/sys", "/run", "/etc"] {
         fs::create_dir_all(path).unwrap();
     }
@@ -110,6 +197,50 @@ fn init() {
         .status()
         .unwrap()
         .success());
+}
+
+/// Supervise the `stop=leaf` unit, and restart it once its second leader
+/// asks: the requested restart is what must end the session.
+fn init_leaf() -> ! {
+    fs::write(
+        "/etc/leaf.conf",
+        "[leafd]\ntype=daemon\nexec=/pair-probe leader\nrestart=always\nstop=leaf\nstop-timeout=1\n",
+    )
+    .unwrap();
+    let mut supervisor = Command::new("/bin/td-svc")
+        .args(["run", "-f", "/etc/leaf.conf"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut restarted = false;
+    loop {
+        if let Ok(result) = fs::read_to_string("/run/leaf-result") {
+            println!("TD-PAIR-VM: {result}");
+            park();
+        }
+        if !restarted && Path::new("/run/restart-wanted").exists() {
+            restarted = true;
+            assert!(Command::new("/bin/td-svc")
+                .args(["restart", "leafd"])
+                .status()
+                .unwrap()
+                .success());
+        }
+        if supervisor.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            println!("TD-PAIR-VM: FAIL: supervisor exited or the leaf scenario timed out");
+            park();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn init() {
+    assert_eq!(std::process::id(), 1, "VM init only");
+    mount_pseudo_filesystems();
+    if fs::read_to_string("/td-vm-scenario").unwrap() == "leaf" {
+        init_leaf();
+    }
     fs::write("/etc/pair.conf", "[paired]\ntype=daemon\nexec=/pair-probe first\npair-exec=/pair-probe second\nready=/pair-probe ready\nrestart=on-failure\nstop-timeout=1\n").unwrap();
     let mut supervisor = Command::new("/bin/td-svc")
         .args(["run", "-f", "/etc/pair.conf"])
@@ -160,6 +291,11 @@ fn main() {
             park();
         }
         Some("ready") => (),
+        Some("leader") => leader(),
+        Some("session") => {
+            fs::write("/run/session-running", std::process::id().to_string()).unwrap();
+            park();
+        }
         None => init(),
         Some(other) => panic!("unknown VM fixture mode: {other}"),
     }
@@ -225,10 +361,32 @@ fn artifact(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_vm(arguments: &[String]) -> std::io::Result<()> {
-    let [_verb, kernel, supervisor, busybox, log_path] = arguments else {
-        return Err(std::io::Error::other(
-            "usage: pair-vm --run-vm KERNEL TD-SVC BUSYBOX NEW-LOG",
-        ));
+    let (kernel, supervisor, busybox, log_path, scenario) = match arguments {
+        [_verb, kernel, supervisor, busybox, log_path] => {
+            (kernel, supervisor, busybox, log_path, "pair")
+        }
+        [_verb, kernel, supervisor, busybox, log_path, scenario]
+            if scenario == "pair" || scenario == "leaf" =>
+        {
+            (kernel, supervisor, busybox, log_path, scenario.as_str())
+        }
+        _ => {
+            return Err(std::io::Error::other(
+                "usage: pair-vm --run-vm KERNEL TD-SVC BUSYBOX NEW-LOG [pair|leaf]",
+            ))
+        }
+    };
+    let passed = match scenario {
+        "leaf" => {
+            "TD-PAIR-VM: PASS: the session survived a crash and ended before the next generation"
+        }
+        _ => "TD-PAIR-VM: PASS: old grandchild gone before next generation",
+    };
+    // TCG unless the caller asks for KVM; nothing falls back between them.
+    let accel = match std::env::var("TD_QEMU_ACCEL").as_deref() {
+        Ok("kvm") => "kvm",
+        Ok("tcg") | Err(std::env::VarError::NotPresent) => "tcg",
+        _ => return Err(std::io::Error::other("TD_QEMU_ACCEL must be kvm or tcg")),
     };
     for input in [kernel, supervisor, busybox, log_path] {
         if !Path::new(input).is_absolute() {
@@ -260,6 +418,13 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
         ("dev/null", 0o20666, Vec::new(), 1, 3),
         ("td-pair-test-vm", 0o100600, Vec::new(), 0, 0),
         (
+            "td-vm-scenario",
+            0o100600,
+            scenario.as_bytes().to_vec(),
+            0,
+            0,
+        ),
+        (
             "pair-probe",
             0o100755,
             artifact(&std::env::current_exe()?)?,
@@ -290,7 +455,7 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
                 "-machine",
                 "q35",
                 "-accel",
-                "tcg",
+                accel,
                 "-m",
                 "512",
                 "-smp",
@@ -328,7 +493,7 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
         saved.write_all(chunk)?;
         report.extend_from_slice(chunk);
         let text = String::from_utf8_lossy(&report);
-        if text.contains("TD-PAIR-VM: PASS: old grandchild gone before next generation") {
+        if text.contains(passed) {
             break Ok(());
         }
         let complete = text.get(..text.rfind('\n').unwrap_or(0)).unwrap_or("");

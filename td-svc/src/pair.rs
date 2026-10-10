@@ -1,14 +1,15 @@
-//! One service lifecycle, two daemons, and a private descriptor on each stdin.
+//! One service lifecycle, two daemons, and a private descriptor on each stdin;
+//! and the start gate they share with a `stop=leaf` leader's launch.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 pub const VERB: &str = "pair-run";
+/// The trampoline a `stop=leaf` leader runs through (DESIGN.md I7).
+pub const LEAF_VERB: &str = "leaf-exec";
 const MAX_ARGS: usize = 256;
 const MAX_BYTES: usize = 32 * 1024;
 const START: u8 = 1;
@@ -17,16 +18,21 @@ pub fn validate_command(argv: &[String]) -> Result<(), String> {
     if !argv.first().is_some_and(|program| program.starts_with('/')) {
         return Err("paired command needs an absolute executable path".into());
     }
-    if argv.len() > MAX_ARGS
-        || argv.iter().any(|arg| arg.contains('\0'))
-        || argv
-            .iter()
-            .try_fold(0usize, |size, arg| size.checked_add(arg.len()))
-            .is_none_or(|size| size > MAX_BYTES)
-    {
+    if !within_bounds(argv) {
         return Err("paired command exceeds argument bounds or contains NUL".into());
     }
     Ok(())
+}
+
+/// The bounds every command td-svc hands to itself through `/proc/self/exe`
+/// keeps, a pair's two and a `stop=leaf` leader's.
+fn within_bounds(argv: &[String]) -> bool {
+    argv.len() <= MAX_ARGS
+        && !argv.iter().any(|arg| arg.contains('\0'))
+        && argv
+            .iter()
+            .try_fold(0usize, |size, arg| size.checked_add(arg.len()))
+            .is_some_and(|size| size <= MAX_BYTES)
 }
 
 pub fn parse(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
@@ -63,15 +69,63 @@ pub fn command(left: &[String], right: &[String]) -> Result<Command, String> {
     Ok(command)
 }
 
-/// EOF without the exact grant prevents both commands from starting.
+/// A `stop=leaf` leader: the unit's literal argv behind the start gate, so
+/// nothing of the instance runs, or forks, before td-svc has placed it.
+pub fn leaf_command(argv: &[String]) -> Result<Command, String> {
+    if argv.is_empty() {
+        return Err("empty exec".into());
+    }
+    if !within_bounds(argv) {
+        return Err("exec exceeds argument bounds or contains NUL".into());
+    }
+    let mut command = Command::new("/proc/self/exe");
+    command.arg(LEAF_VERB).arg("--").args(argv);
+    command.stdin(Stdio::piped());
+    Ok(command)
+}
+
+/// `leaf-exec -- PROGRAM [ARG...]`, exactly, within a pair's bounds.
+pub fn parse_leaf(args: &[String]) -> Result<Vec<String>, String> {
+    match args.split_first() {
+        Some((separator, argv)) if separator == "--" && !argv.is_empty() => {
+            if !within_bounds(argv) {
+                return Err(format!(
+                    "{LEAF_VERB} command exceeds argument bounds or contains NUL"
+                ));
+            }
+            Ok(argv.to_vec())
+        }
+        _ => Err(format!("{LEAF_VERB} needs -- PROGRAM [ARG...]")),
+    }
+}
+
+/// The trampoline: wait for the grant, then become the unit's program, with
+/// the null stdin an ungated unit gets and the stdout and stderr td-svc gave
+/// this process. Returns only on failure, having exec'd nothing.
+pub fn leaf_exec(argv: &[String], grant: &mut impl Read) -> String {
+    use std::os::unix::process::CommandExt;
+    if let Err(why) = await_start(grant) {
+        return why;
+    }
+    let Some(program) = argv.first() else {
+        return "empty exec".into();
+    };
+    let error = Command::new(program)
+        .args(argv.get(1..).unwrap_or(&[]))
+        .stdin(Stdio::null())
+        .exec();
+    format!("{program}: {error}")
+}
+
+/// EOF without the exact grant prevents the gated commands from starting.
 pub fn await_start(input: &mut impl Read) -> Result<(), String> {
     let mut grant = Vec::new();
     input
         .take(2)
         .read_to_end(&mut grant)
-        .map_err(|e| format!("pair start gate: {e}"))?;
+        .map_err(|e| format!("start gate: {e}"))?;
     if grant != [START] {
-        return Err("pair start gate refused or supervisor disconnected".into());
+        return Err("start gate refused or supervisor disconnected".into());
     }
     Ok(())
 }
@@ -79,14 +133,14 @@ pub fn await_start(input: &mut impl Read) -> Result<(), String> {
 /// Called only after placement, recording, and installing the supervisor waiter.
 pub fn release_start(pipe: Option<ChildStdin>, placed: bool, recorded: bool) -> Result<(), String> {
     if !placed {
-        return Err("paired daemons refused: coordinator was not placed in its cgroup".into());
+        return Err("start refused: its leader was not placed in its cgroup".into());
     }
     if !recorded {
-        return Err("paired daemons refused: coordinator pid/starttime was not recorded".into());
+        return Err("start refused: its leader's pid/starttime was not recorded".into());
     }
-    let mut pipe = pipe.ok_or("pair start gate is missing")?;
+    let mut pipe = pipe.ok_or("start gate is missing")?;
     pipe.write_all(&[START])
-        .map_err(|e| format!("pair start gate: {e}"))
+        .map_err(|e| format!("start gate: {e}"))
 }
 
 fn spawn(argv: &[String], endpoint: UnixStream) -> Result<Child, String> {
@@ -161,78 +215,34 @@ pub fn run(left: &[String], right: &[String]) -> Result<Ended, String> {
     }
 }
 
-/// Pins the paired unit's kernel containment across coordinator death and PID reuse.
-pub struct Cohort {
-    kill: File,
-    events: File,
-    killed: bool,
-}
-
-impl Cohort {
-    /// The caller supplies the root-owned service leaf established by cgroup::create_service.
-    pub fn open(leaf: &Path) -> Result<Self, String> {
-        let mut cohort = Self {
-            kill: OpenOptions::new()
-                .write(true)
-                .open(leaf.join("cgroup.kill"))
-                .map_err(|e| format!("paired cgroup kill control: {e}"))?,
-            events: File::open(leaf.join("cgroup.events"))
-                .map_err(|e| format!("paired cgroup events: {e}"))?,
-            killed: false,
-        };
-        if !cohort.empty()? {
-            return Err("paired cgroup already contains live processes".into());
-        }
-        Ok(cohort)
-    }
-
-    pub fn kill(&mut self) -> Result<(), String> {
-        if !self.killed {
-            self.kill
-                .write_all(b"1")
-                .map_err(|e| format!("paired cgroup kill: {e}"))?;
-            self.killed = true;
-        }
-        Ok(())
-    }
-
-    pub fn empty(&mut self) -> Result<bool, String> {
-        self.events
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| format!("paired cgroup events: {e}"))?;
-        let mut text = String::new();
-        (&mut self.events)
-            .take(4097)
-            .read_to_string(&mut text)
-            .map_err(|e| format!("paired cgroup events: {e}"))?;
-        if text.len() > 4096 {
-            return Err("paired cgroup events exceeded 4096 bytes".into());
-        }
-        let mut populated = None;
-        for line in text.lines() {
-            let mut words = line.split_whitespace();
-            if words.next() != Some("populated") {
-                continue;
-            }
-            let value = match words.next() {
-                Some("0") => false,
-                Some("1") => true,
-                _ => return Err("paired cgroup has malformed populated value".into()),
-            };
-            if words.next().is_some() || populated.replace(value).is_some() {
-                return Err("paired cgroup has ambiguous populated value".into());
-            }
-        }
-        populated
-            .map(|value| !value)
-            .ok_or("paired cgroup has no populated value".into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// A leaf leader's argv keeps the bounds a pair's does, at both ends.
+    #[test]
+    fn a_leaf_command_keeps_a_pairs_bounds() {
+        let leaf = |argv: Vec<String>| {
+            let mut args = vec!["--".to_string()];
+            args.extend(argv);
+            parse_leaf(&args)
+        };
+        let most = vec!["a".to_string(); MAX_ARGS];
+        assert_eq!(leaf(most.clone()), Ok(most.clone()));
+        assert!(leaf_command(&most).is_ok());
+        let too_many = vec!["a".to_string(); MAX_ARGS + 1];
+        assert!(leaf(too_many.clone()).is_err());
+        assert!(leaf_command(&too_many).is_err());
+        let largest = vec!["a".repeat(MAX_BYTES)];
+        assert!(leaf(largest.clone()).is_ok());
+        let too_large = vec!["a".repeat(MAX_BYTES + 1)];
+        assert!(leaf(too_large.clone()).is_err());
+        assert!(leaf_command(&too_large).is_err());
+        let nul = vec!["a\0b".to_string()];
+        assert!(leaf(nul.clone()).is_err());
+        assert!(leaf_command(&nul).is_err());
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
@@ -290,82 +300,6 @@ mod tests {
                 "{output}"
             );
         }
-    }
-
-    struct Controls(std::path::PathBuf);
-    impl Controls {
-        fn new() -> Self {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("td-pair-controls-{}-{stamp}", std::process::id()));
-            std::fs::create_dir(&path).unwrap();
-            std::fs::write(path.join("cgroup.kill"), "").unwrap();
-            std::fs::write(path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
-            Self(path)
-        }
-        fn events(&self, text: &str) {
-            std::fs::write(self.0.join("cgroup.events"), text).unwrap();
-        }
-    }
-    impl Drop for Controls {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn cohort_does_not_claim_a_kill_is_emptiness() {
-        let controls = Controls::new();
-        let mut cohort = Cohort::open(&controls.0).unwrap();
-        controls.events("populated 1\nfrozen 0\n");
-        cohort.kill().unwrap();
-        cohort.kill().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(controls.0.join("cgroup.kill")).unwrap(),
-            "1"
-        );
-        assert!(!cohort.empty().unwrap());
-        controls.events("populated 0\nfrozen 0\n");
-        assert!(cohort.empty().unwrap());
-    }
-
-    #[test]
-    fn cohort_refuses_unknown_state_and_occupied_launches() {
-        let controls = Controls::new();
-        for text in [
-            "",
-            "frozen 0\n",
-            "populated 2\n",
-            "populated 0\npopulated 0\n",
-            "populated 0 extra\n",
-            "populated 1\n",
-        ] {
-            controls.events(text);
-            assert!(Cohort::open(&controls.0).is_err(), "{text:?}");
-        }
-        controls.events("populated 0\n");
-        let mut cohort = Cohort::open(&controls.0).unwrap();
-        controls.events("frozen 0\n");
-        assert!(cohort.empty().is_err());
-        controls.events(&"x".repeat(4097));
-        assert!(cohort.empty().is_err());
-    }
-
-    #[test]
-    fn cohort_keeps_the_original_kernel_objects_after_path_replacement() {
-        let controls = Controls::new();
-        let mut cohort = Cohort::open(&controls.0).unwrap();
-        controls.events("populated 1\n");
-        std::fs::rename(
-            controls.0.join("cgroup.events"),
-            controls.0.join("old-events"),
-        )
-        .unwrap();
-        controls.events("populated 0\n");
-        assert!(!cohort.empty().unwrap());
     }
 
     #[test]

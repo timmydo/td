@@ -14,7 +14,7 @@ use crate::backoff;
 use crate::cgroup;
 use crate::order;
 use crate::procfs::{self, Containment};
-use crate::table::{Kind, Restart, Unit};
+use crate::table::{Kind, Restart, Stop, Unit};
 use std::io;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,8 +262,19 @@ pub struct Service {
     /// timer a unit whose containment outlived its leader would sit `stopping`
     /// forever, never reaching `Stopped` however long the console stayed idle.
     next_sweep: Option<Instant>,
-    /// Open kernel controls for the running pair, retained until its whole tree is empty.
-    pair: Option<crate::pair::Cohort>,
+    /// Open kernel controls of the unit's leaf, retained until its whole tree
+    /// is empty: a pair's from its launch, a `stop=leaf` unit's from its stop.
+    /// So outside a stop it is only ever a pair's.
+    cohort: Option<cgroup::Cohort>,
+    /// What a `stop=leaf` stop can prove about this unit's leaf.
+    membership: Membership,
+    /// The `stop=leaf` stop in flight cannot prove the leaf empty, so it never
+    /// finishes (DESIGN.md §4): fail closed, and only a shutdown's deadline
+    /// goes on without it.
+    leaf_unproven: bool,
+    /// The leaf stop in flight last failed to read `cgroup.events`; cleared
+    /// by the next read that succeeds. Shown by `status` with the above.
+    leaf_events_unread: bool,
     /// Automatic restart policy is applied only after paired containment drains.
     pair_resume: Option<(Phase, Option<Instant>)>,
     /// `unless-exists=` has been asked; it is asked once.
@@ -295,7 +306,10 @@ impl Service {
             tty_dev: None,
             killed: false,
             next_sweep: None,
-            pair: None,
+            cohort: None,
+            membership: Membership::Clear,
+            leaf_unproven: false,
+            leaf_events_unread: false,
             pair_resume: None,
             retired: false,
             skip_decided: false,
@@ -351,6 +365,116 @@ impl Service {
             return Ok(None);
         };
         Ok(Some(classify(pid, &stat)))
+    }
+}
+
+/// Where everything a unit's instances left can be found, for a `stop=leaf`
+/// stop (DESIGN.md §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Membership {
+    /// No instance has run since the leaf was last proven empty.
+    Clear,
+    /// Every instance since then was verified in this leaf before it ran
+    /// anything — a `stop=leaf` leader waits behind its start gate — so the
+    /// leaf holds whatever they left: its emptiness is the unit's.
+    Placed(std::path::PathBuf),
+    /// Some instance since then ran ungated — one started before a reload
+    /// declared `stop=leaf` — so what it forked before it was placed may be
+    /// outside, and no read of the leaf proves the unit gone. Sticky: a later
+    /// verified instance does not bring back what escaped. Carries the leaf
+    /// last meant for an instance, if any, which a stop still TERMs and KILLs.
+    Unverified(Option<std::path::PathBuf>),
+}
+
+impl Membership {
+    /// After a spawn meant for `leaf`, `placed` when its membership was
+    /// verified there. Only a `gated` instance is proof: an ungated one ran,
+    /// and could fork, before it was placed. A gated one that was not placed
+    /// never got its grant, so it ran nothing and changes nothing.
+    fn after_spawn(&self, leaf: Option<&std::path::Path>, placed: bool, gated: bool) -> Membership {
+        let known = || leaf.or(self.leaf()).map(std::path::Path::to_path_buf);
+        match (self, leaf) {
+            (Membership::Unverified(_), _) => Membership::Unverified(known()),
+            (_, Some(leaf)) if gated && placed => Membership::Placed(leaf.to_path_buf()),
+            _ if gated => self.clone(),
+            _ => Membership::Unverified(known()),
+        }
+    }
+
+    /// The leaf a stop opens, verified or not.
+    fn leaf(&self) -> Option<&std::path::Path> {
+        match self {
+            Membership::Clear => None,
+            Membership::Placed(leaf) => Some(leaf),
+            Membership::Unverified(leaf) => leaf.as_deref(),
+        }
+    }
+}
+
+impl Service {
+    /// Might this `stop=leaf` unit's leaf hold something a stop must end,
+    /// whether or not its leader is running?
+    fn leaf_may_hold(&self) -> bool {
+        self.unit.stop == Stop::Leaf && self.membership != Membership::Clear
+    }
+
+    /// Is anything of this unit still up for a stop to end? What a reload
+    /// keeps for its retiring stop and what a shutdown walks.
+    fn is_up(&self) -> bool {
+        self.pid.is_some() || self.stopping || self.leaf_may_hold()
+    }
+
+    /// Open the leaf's controls for the `stop=leaf` stop just begun, without
+    /// requiring it empty: a stop attaches to a leaf that is still running.
+    /// An unverified leaf is opened too, so its stop still TERMs and KILLs
+    /// what it holds, but it is never proven empty; nor is one that cannot be
+    /// opened. Either is a stop that does not finish.
+    fn attach_leaf(&mut self) {
+        if self.unit.stop != Stop::Leaf || self.cohort.is_some() {
+            return;
+        }
+        // Said once per stop: a sweep retries controls that did not open.
+        let retried = self.leaf_unproven;
+        let attached = match self.membership.leaf() {
+            Some(leaf) => cgroup::Cohort::attach(leaf),
+            None if self.membership == Membership::Clear => {
+                Err("no instance was placed in it".to_string())
+            }
+            None => Err("it has no leaf of its own".to_string()),
+        };
+        let failed = match attached {
+            Ok(cohort) => {
+                self.cohort = Some(cohort);
+                if retried {
+                    log(&format!("{}: its leaf's controls opened", self.unit.name));
+                }
+                None
+            }
+            Err(why) => Some(why),
+        };
+        let unverified = matches!(self.membership, Membership::Unverified(_));
+        let unproven = failed.or_else(|| {
+            unverified.then(|| "an instance's placement in it was never verified".to_string())
+        });
+        match unproven {
+            Some(why) => {
+                if !retried {
+                    log(&format!(
+                        "{}: its leaf cannot be proven empty ({why}); it stays stopping",
+                        self.unit.name
+                    ));
+                }
+                self.leaf_unproven = true;
+            }
+            None => self.leaf_unproven = false,
+        }
+    }
+
+    /// Does the stop in flight keep its KILL deadline past the leader's
+    /// exit? A pair's and a `stop=leaf` stop's do, for what survives the
+    /// leader, whether or not the leaf's controls have opened yet.
+    fn keeps_kill_at(&self) -> bool {
+        self.stopping && (self.cohort.is_some() || self.unit.stop == Stop::Leaf)
     }
 }
 
@@ -704,6 +828,10 @@ fn build(unit: &Unit, report: bool, captured: bool) -> Result<(Command, Vec<Stri
     let prog = unit.argv.first().ok_or_else(|| "empty exec".to_string())?;
     let mut cmd = if let Some(peer) = &unit.pair_argv {
         crate::pair::command(&unit.argv, peer)?
+    } else if unit.stop == Stop::Leaf {
+        // Behind the start gate: nothing of the instance runs before it is
+        // placed, so nothing it forks starts outside its leaf (DESIGN.md I7).
+        crate::pair::leaf_command(&unit.argv)?
     } else {
         let mut command = Command::new(prog);
         command.args(unit.argv.get(1..).unwrap_or(&[]));
@@ -1312,11 +1440,20 @@ impl Runtime {
             }
         };
 
+        // A `stop=leaf` leader is gated as a pair is: without a leaf to place
+        // it in, nothing a stop could prove empty, so it is not started.
+        if unit.stop == Stop::Leaf && unit.pair_argv.is_none() && leaf.is_none() {
+            self.record_start_failure(
+                index,
+                &format!("{}: stop=leaf unit has no cgroup of its own", unit.name),
+            );
+            return;
+        }
         let cohort = if unit.pair_argv.is_some() {
             let result = leaf
                 .as_deref()
                 .ok_or("paired service has no cgroup".to_string())
-                .and_then(crate::pair::Cohort::open);
+                .and_then(cgroup::Cohort::open);
             match result {
                 Ok(cohort) => Some(cohort),
                 Err(why) => {
@@ -1331,18 +1468,20 @@ impl Runtime {
         match cmd.spawn() {
             Ok(mut child) => {
                 let pid = child.id() as i32;
-                let pair_start = child.stdin.take();
-                let mut pair_placed = false;
-                // Paired children wait for placement behind the start gate.
-                // Ordinary services retain their existing accounting fallback.
+                let start_gate = child.stdin.take();
+                // Paired children and a `stop=leaf` leader wait for placement
+                // behind the start gate. Ordinary services retain their
+                // existing accounting fallback.
+                let gated = unit.pair_argv.is_some() || unit.stop == Stop::Leaf;
+                let mut placed = false;
                 if let Some(leaf) = &leaf {
                     match cgroup::place(leaf, pid) {
                         // Already exited. Nothing was accounted and nothing is
                         // left to bound, so there is no loss to report.
-                        Ok(cgroup::Placed::Yes) => pair_placed = true,
+                        Ok(cgroup::Placed::Yes) => placed = true,
                         Ok(cgroup::Placed::ProcessGone) => {}
-                        Err(error) if unit.pair_argv.is_some() => log(&format!(
-                            "{}: coordinator placement failed ({error}); paired daemons refused",
+                        Err(error) if gated => log(&format!(
+                            "{}: leader placement failed ({error}); its start gate stays closed",
                             unit.name
                         )),
                         Err(error) => log(&format!(
@@ -1359,8 +1498,15 @@ impl Runtime {
                 let starttime = procfs::stat_of(pid).ok().flatten().map(|s| s.starttime);
                 if let Some(service) = self.services.get_mut(index) {
                     service.pid = Some(pid);
-                    service.pair = cohort;
+                    service.cohort = cohort;
                     service.pair_resume = None;
+                    // An unexpected exit restarts in the same leaf without
+                    // waiting for it to empty, so one unverified instance
+                    // taints every later stop until the leaf is proven empty.
+                    service.membership =
+                        service
+                            .membership
+                            .after_spawn(leaf.as_deref(), placed, gated);
                     service.starttime = starttime;
                     service.tty_dev = attached.device;
                     service.killed = false;
@@ -1392,9 +1538,8 @@ impl Runtime {
                     self.abandon(index, pid, &unit.name);
                     return;
                 }
-                if unit.pair_argv.is_some() {
-                    if let Err(why) = crate::pair::release_start(pair_start, pair_placed, recorded)
-                    {
+                if gated {
+                    if let Err(why) = crate::pair::release_start(start_gate, placed, recorded) {
                         log(&format!("{}: {why}", unit.name));
                         return;
                     }
@@ -1439,7 +1584,7 @@ impl Runtime {
             service.phase = Phase::Failed;
             service.pid = None;
             // A pair has not received its start grant when watch fails.
-            service.pair = None;
+            service.cohort = None;
             service.pair_resume = None;
             service.starttime = None;
             service.started = None;
@@ -1651,16 +1796,23 @@ impl Runtime {
         // when a containment drains, so the stop would wait on whatever
         // unrelated deadline happens to be nearest — a crash-looper parked at
         // the 5-minute backoff cap, with the console down for all of it.
-        for service in &self.services {
-            for at in [service.deadline, service.kill_at, service.next_sweep]
-                .into_iter()
-                .flatten()
-            {
-                next_wake = Some(match next_wake {
-                    Some(w) if w < at => w,
-                    _ => at,
-                });
-            }
+        // So is the shutdown's per-unit deadline: a stop that never proves
+        // empty keeps rescheduling its own timers past it.
+        let walk = self
+            .shutdown
+            .as_ref()
+            .and_then(|s| s.current)
+            .map(|(_, at)| at);
+        let timers = self
+            .services
+            .iter()
+            .flat_map(|s| [s.deadline, s.kill_at, s.next_sweep])
+            .chain([walk]);
+        for at in timers.flatten() {
+            next_wake = Some(match next_wake {
+                Some(w) if w < at => w,
+                _ => at,
+            });
         }
         next_wake
     }
@@ -1742,12 +1894,22 @@ impl Runtime {
     /// waiter, and had its pid handed to something new — which this would then
     /// kill. `/proc` field 22 is what a pid alone cannot tell us.
     fn escalate(&mut self, index: usize) {
-        if self.services.get(index).is_some_and(|s| s.pair.is_some()) {
-            self.kill_pair(index);
-            if self.services.get(index).is_some_and(|s| s.pid.is_none()) {
-                self.finish_stop(index);
+        // A pair, or a `stop=leaf` stop that attached its leaf: the leaf's
+        // `cgroup.kill` reaches what left the group, the leader included.
+        if self.services.get(index).is_some_and(|s| s.cohort.is_some()) {
+            self.kill_cohort(index);
+            // An unverified leaf may not hold all of the unit: its group gets
+            // the KILL below as well.
+            let unverified = self
+                .services
+                .get(index)
+                .is_some_and(|s| matches!(s.membership, Membership::Unverified(_)));
+            if !unverified {
+                if self.services.get(index).is_some_and(|s| s.pid.is_none()) {
+                    self.finish_stop(index);
+                }
+                return;
             }
-            return;
         }
         let Some(service) = self.services.get_mut(index) else {
             return;
@@ -1979,13 +2141,47 @@ impl Runtime {
         // pid would ask `/proc` about a pid that is no longer ours — and a
         // recycled one answers, keeping the containment occupied for good.
         let scope = without_reaped_leader(scope);
-        let pair_empty = self
-            .services
-            .get_mut(index)
-            .and_then(|service| service.pair.as_mut())
-            .map(crate::pair::Cohort::empty);
-        let paired = pair_empty.is_some();
-        let remaining = match pair_empty {
+        // A leaf whose controls could not be opened at the stop is asked
+        // again; an unverified one opens but still proves nothing.
+        let reattached = match self.services.get_mut(index) {
+            Some(service)
+                if service.leaf_unproven && service.cohort.is_none() && service.leaf_may_hold() =>
+            {
+                service.attach_leaf();
+                service.cohort.is_some()
+            }
+            _ => false,
+        };
+        // What left the group still gets its TERM before `cgroup.kill`.
+        if reattached {
+            self.term_leaf(index);
+        }
+        // A pair, or a `stop=leaf` stop: the leaf's population decides, and a
+        // leaf stop that could not attach is never proven empty.
+        let leaf_empty = match self.services.get_mut(index) {
+            Some(service) if service.leaf_unproven => Some(Ok(false)),
+            Some(service) => service.cohort.as_mut().map(cgroup::Cohort::empty),
+            None => return,
+        };
+        // Such a stop never finishes, so its group must stop being a KILL
+        // target once proven empty: an empty group's id can name a new one.
+        if self.services.get(index).is_some_and(|s| s.leaf_unproven) {
+            let drained = match scope {
+                None => true,
+                Some(mode) => procfs::members(mode, self.self_pid).is_ok_and(scan_is_empty),
+            };
+            if drained {
+                if let Some(service) = self.services.get_mut(index) {
+                    service.stop_scope = None;
+                }
+            }
+        }
+        let leafed = leaf_empty.is_some();
+        let unread = matches!(leaf_empty, Some(Err(_)));
+        if let Some(service) = self.services.get_mut(index) {
+            service.leaf_events_unread = unread;
+        }
+        let remaining = match leaf_empty {
             Some(Ok(true)) => 0,
             Some(Ok(false)) => 1,
             Some(Err(why)) => {
@@ -1994,9 +2190,7 @@ impl Runtime {
                     .get(index)
                     .is_some_and(|s| s.next_sweep.is_none())
                 {
-                    log(&format!(
-                        "{name}: cannot confirm paired containment is empty: {why}"
-                    ));
+                    log(&format!("{name}: cannot confirm its leaf is empty: {why}"));
                 }
                 1
             }
@@ -2028,9 +2222,9 @@ impl Runtime {
             let first = service.next_sweep.is_none();
             service.next_sweep = Instant::now().checked_add(STOP_SWEEP_INTERVAL);
             if first {
-                if paired {
+                if leafed {
                     log(&format!(
-                        "{name}: paired containment is not proven empty; not stopped yet"
+                        "{name}: its leaf is not proven empty; not stopped yet"
                     ));
                 } else {
                     log(&format!(
@@ -2045,7 +2239,13 @@ impl Runtime {
         service.stop_scope = None;
         service.kill_at = None;
         service.next_sweep = None;
-        service.pair = None;
+        service.cohort = None;
+        service.leaf_unproven = false;
+        service.leaf_events_unread = false;
+        // The leaf was proven empty, so nothing an instance left remains.
+        if leafed {
+            service.membership = Membership::Clear;
+        }
         let pair_resume = service.pair_resume.take();
         if service.start_after_stop {
             service.start_after_stop = false;
@@ -2130,15 +2330,10 @@ impl Runtime {
         // its writer would wait forever on a queue nothing can reach — still
         // holding the /var descriptor that makes `umount` fail, and no longer
         // reachable from `captures()` for `close_logs` to stop.
-        for service in self
-            .services
-            .iter()
-            .filter(|s| s.retired && s.pid.is_none() && !s.stopping)
-        {
+        for service in self.services.iter().filter(|s| s.retired && !s.is_up()) {
             release_capture(service);
         }
-        self.services
-            .retain(|s| !(s.retired && s.pid.is_none() && !s.stopping));
+        self.services.retain(|s| !(s.retired && !s.is_up()));
 
         // Carry each surviving unit's RUNTIME state across, keyed by
         // name, and swap in its new definition.
@@ -2189,7 +2384,9 @@ impl Runtime {
         // will not override — and the re-added unit would never start.
         let leftover: Vec<Service> = std::mem::take(&mut self.services);
         for mut service in leftover {
-            if service.pid.is_none() && !service.stopping {
+            // A `stop=leaf` unit whose crashed leader left its leaf occupied is
+            // still up: its retiring stop is what ends the leaf.
+            if !service.is_up() {
                 log(&format!("{}: no longer in the table", service.unit.name));
                 release_capture(&service);
                 continue;
@@ -2267,7 +2464,7 @@ impl Runtime {
             let undeclared = self
                 .services
                 .get(index)
-                .is_some_and(|s| s.retired && (s.pid.is_some() || s.stopping));
+                .is_some_and(|s| s.retired && s.is_up());
             if undeclared && !walk.contains(&index) {
                 walk.push(index);
             }
@@ -2320,11 +2517,7 @@ impl Runtime {
             }
         }
         // Reverse plan order: a dependent is stopped before what it depends on.
-        let live: Vec<bool> = self
-            .services
-            .iter()
-            .map(|s| s.pid.is_some() || s.stopping)
-            .collect();
+        let live: Vec<bool> = self.services.iter().map(Service::is_up).collect();
         while let Some((index, next)) = next_to_stop(&walk, cursor, &live) {
             cursor = next;
             let Some(name) = self.services.get(index).map(|s| s.unit.name.clone()) else {
@@ -3116,8 +3309,15 @@ impl Runtime {
         } else {
             service.phase.label()
         };
+        // Appended only while it applies, so the fixed prefix still parses.
+        let unproven = if service.stopping && (service.leaf_unproven || service.leaf_events_unread)
+        {
+            " leaf=unproven"
+        } else {
+            ""
+        };
         format!(
-            "{} {} pid={} failures={}\n",
+            "{} {} pid={} failures={}{unproven}\n",
             service.unit.name, state, pid, service.fast_failures
         )
     }
@@ -3211,6 +3411,31 @@ impl Runtime {
                      containment is not empty yet\n"
                 );
             }
+            // A `stop=leaf` unit's leader is not a stop's whole scope: a leader
+            // that exited unexpectedly left its leaf running. With no group
+            // left to TERM, the leaf's members get it, and `cgroup.kill` the
+            // rest at the KILL deadline.
+            if service.leaf_may_hold() {
+                let Some(service) = self.services.get_mut(index) else {
+                    return unknown(name);
+                };
+                service.stopping = true;
+                service.start_after_stop = then_start;
+                service.pair_resume = None;
+                service.stop_scope = None;
+                service.deadline = None;
+                service.retry_at = None;
+                service.next_sweep = None;
+                service.killed = false;
+                service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
+                service.attach_leaf();
+                let termed = self.term_leaf(index);
+                self.finish_stop(index);
+                return format!(
+                    "{name}: {verb} requested; its leader is not running, TERM sent to \
+                     {termed} process(es) in its leaf\n"
+                );
+            }
             // Nothing to signal. A `restart` still has to honour its intent, or
             // restarting a crashed daemon would quietly leave it down.
             if then_start {
@@ -3292,20 +3517,86 @@ impl Runtime {
         if let Some(cancel) = service.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
+        // Opened at the stop: the leaf of a leader that restarted in place is
+        // not empty, so this cannot be the launch's emptiness-checked open.
+        service.attach_leaf();
+        // Sessions that left the group get the same TERM, so they can end
+        // cleanly inside the grace rather than meet `cgroup.kill` at its end.
+        self.term_leaf(index);
         format!("{name}: {verb} requested; TERM sent to {containment:?}\n")
     }
 
-    fn kill_pair(&mut self, index: usize) {
+    /// TERM every member a `stop=leaf` stop's attached leaf lists, and say
+    /// how many. Best effort, with one summary line for what it could not
+    /// reach: `cgroup.kill` at the deadline is what ends the leaf regardless.
+    /// A pair's stop does not use it: its coordinator ends its own peers.
+    fn term_leaf(&mut self, index: usize) -> usize {
+        let Some(service) = self.services.get_mut(index) else {
+            return 0;
+        };
+        if service.unit.stop != Stop::Leaf {
+            return 0;
+        }
+        let name = service.unit.name.clone();
+        // The group's TERM already reached the leader and its group.
+        let leader = service.pid;
+        let group = match service.stop_scope {
+            Some(Containment::Group(group)) => Some(group),
+            _ => None,
+        };
+        let Some(cohort) = service.cohort.as_mut() else {
+            return 0;
+        };
+        let listed = match cohort.members() {
+            Ok(listed) => listed,
+            Err(why) => {
+                log(&format!("{name}: cannot list its leaf to TERM it: {why}"));
+                return 0;
+            }
+        };
+        let mut sent = 0;
+        let mut refused = 0;
+        for pid in listed.pids {
+            let grouped = group.is_some_and(|group| {
+                procfs::stat_of(pid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stat| stat.pgrp == group)
+            });
+            if Some(pid) == leader || grouped {
+                continue;
+            }
+            // The checks `signal` makes, without its line per refusal.
+            if self.contains_self(Containment::Process(pid)) {
+                refused += 1;
+            } else if send_signal(pid, crate::sys::SIGTERM).is_ok() {
+                sent += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        if refused > 0 || listed.skipped > 0 || listed.cut {
+            log(&format!(
+                "{name}: TERM reached {sent} member(s) of its leaf; {refused} refused, \
+                 {} unreadable entr(ies){}; the rest wait for its KILL",
+                listed.skipped,
+                if listed.cut { ", list cut short" } else { "" }
+            ));
+        }
+        sent
+    }
+
+    fn kill_cohort(&mut self, index: usize) {
         let Some(service) = self.services.get_mut(index) else {
             return;
         };
-        let Some(cohort) = service.pair.as_mut() else {
+        let Some(cohort) = service.cohort.as_mut() else {
             return;
         };
         if let Err(why) = cohort.kill() {
             if !service.killed {
                 log(&format!(
-                    "{}: {why}; paired containment remains held",
+                    "{}: {why}; its leaf remains held",
                     service.unit.name
                 ));
             }
@@ -3323,12 +3614,14 @@ impl Runtime {
         let Some(service) = self.services.get_mut(index) else {
             return;
         };
-        if service.pair.is_some() && !service.stopping {
+        // Outside a stop only a pair holds a cohort; a `stop=leaf` unit's
+        // leader exit is not a stop, and restarts in its occupied leaf.
+        if service.cohort.is_some() && !service.stopping {
             service.pair_resume = Some((service.phase, service.retry_at.take()));
             service.stopping = true;
             service.start_after_stop = false;
             service.next_sweep = None;
-            self.kill_pair(index);
+            self.kill_cohort(index);
             self.finish_stop(index);
         }
     }
@@ -3349,8 +3642,9 @@ impl Runtime {
         service.pid = None;
         service.started = None;
         service.deadline = None;
-        // A pair retains the requested grace deadline for its surviving peers.
-        if service.pair.is_none() || !service.stopping {
+        // A pair or a leaf stop retains the requested grace deadline for what
+        // survives its leader: the KILL at it is the leaf's `cgroup.kill`.
+        if !service.keeps_kill_at() {
             service.kill_at = None;
         }
         // The instance this probe was following is gone; stop it forking.
@@ -3550,7 +3844,11 @@ impl Runtime {
                 let index = self.services.iter().position(|s| s.unit.name == name);
                 if let Some(service) = self.lookup_mut(&name) {
                     if service.kill_at.is_some() {
-                        service.kill_at = None;
+                        // As in `record_exit`: a pair's or a leaf stop keeps
+                        // the KILL deadline it began with.
+                        if !service.keeps_kill_at() {
+                            service.kill_at = None;
+                        }
                         service.pid = None;
                         service.starttime = None;
                     }
@@ -3667,19 +3965,29 @@ mod tests {
     struct PairControls(std::path::PathBuf);
     impl PairControls {
         fn new() -> Self {
+            // Tests run in parallel, and a clock stamp alone can repeat.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path =
-                std::env::temp_dir().join(format!("td-svc-pair-{}-{stamp}", std::process::id()));
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "td-svc-pair-{}-{stamp}-{serial}",
+                std::process::id()
+            ));
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("cgroup.kill"), "").unwrap();
             std::fs::write(path.join("cgroup.events"), "populated 0\n").unwrap();
+            std::fs::write(path.join("cgroup.procs"), "").unwrap();
             Self(path)
         }
         fn events(&self, text: &str) {
             std::fs::write(self.0.join("cgroup.events"), text).unwrap();
+        }
+        fn procs(&self, pids: &[i32]) {
+            let text: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+            std::fs::write(self.0.join("cgroup.procs"), text).unwrap();
         }
     }
     impl Drop for PairControls {
@@ -3696,9 +4004,28 @@ mod tests {
         mark_running(&mut rt, "paired", Duration::from_millis(1));
         let service = rt.lookup_mut("paired").unwrap();
         service.pid = Some(777_777);
-        service.pair = Some(crate::pair::Cohort::open(&controls.0).unwrap());
+        service.cohort = Some(crate::cgroup::Cohort::open(&controls.0).unwrap());
         controls.events("populated 1\n");
         (rt, controls)
+    }
+
+    /// `stop=leaf`'s member TERM is not a pair's: a pair's stop signals its
+    /// coordinator's group and leaves the peers it lists to the coordinator.
+    #[test]
+    fn a_pair_stop_sends_no_term_to_its_leafs_members() {
+        let (leader, member) = (live_group_leader(), live_group_leader());
+        let (mut rt, controls) = running_pair("never");
+        let service = rt.lookup_mut("paired").unwrap();
+        service.pid = Some(leader.pid);
+        service.starttime = Some(leader.starttime);
+        controls.procs(&[member.pid]);
+        let reply = rt.control("stop paired");
+        assert!(reply.contains("stop requested"), "{reply}");
+        assert!(gone_within(leader.pid, Duration::from_secs(5)));
+        assert!(
+            !gone_within(member.pid, Duration::from_millis(300)),
+            "a pair's stop TERMed a member of its leaf"
+        );
     }
 
     #[test]
@@ -3742,7 +4069,7 @@ mod tests {
         controls.events("populated 0\n");
         rt.finish_stop(0);
         let service = rt.lookup("paired").unwrap();
-        assert!(!service.stopping && service.pair.is_none());
+        assert!(!service.stopping && service.cohort.is_none());
         assert!(matches!(service.phase, Phase::Failed));
         assert!(service.retry_at.is_some());
         assert_eq!(service.fast_failures, 1);
@@ -3759,12 +4086,12 @@ mod tests {
         controls.events("populated 0\n");
         rt.start_eligible();
         let service = rt.lookup("paired").unwrap();
-        assert!(service.stopping && service.pid.is_none() && service.pair.is_some());
+        assert!(service.stopping && service.pid.is_none() && service.cohort.is_some());
         assert_eq!(service.fast_failures, 13);
         assert!(matches!(service.phase, Phase::Held));
         rt.finish_stop(0);
         let service = rt.lookup("paired").unwrap();
-        assert!(!service.stopping && service.pair.is_none());
+        assert!(!service.stopping && service.cohort.is_none());
         assert!(service.retry_at.is_some());
         assert!(matches!(service.phase, Phase::Held));
     }
@@ -3827,6 +4154,601 @@ mod tests {
         let service = rt.lookup("paired").unwrap();
         assert!(!service.stopping && service.retry_at.is_none());
         assert!(matches!(service.phase, Phase::Failed));
+    }
+
+    /// A `stop=leaf` unit whose live leader was verified in `controls`' leaf.
+    /// The leaf's file fixture reads `populated 1` and lists the leader.
+    fn running_leaf(restart: &str, leader: &Live) -> (Runtime, PairControls) {
+        let controls = PairControls::new();
+        let mut rt = runtime(&format!(
+            "[sshd]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\nrestart={restart}\nstop=leaf\n"
+        ));
+        let service = rt.lookup_mut("sshd").unwrap();
+        service.phase = Phase::Ready;
+        service.pid = Some(leader.pid);
+        service.starttime = Some(leader.starttime);
+        service.started = Some(Instant::now());
+        service.membership = Membership::Placed(controls.0.clone());
+        controls.events("populated 1\n");
+        controls.procs(&[leader.pid]);
+        (rt, controls)
+    }
+
+    /// A `stop=leaf` leader is launched through the start-gate trampoline
+    /// with its literal argv; an ordinary unit is not.
+    #[test]
+    fn building_a_leaf_unit_goes_through_its_start_gate() {
+        let rt = runtime(
+            "[sshd]\ntype=daemon\nexec=/bin/sshd -D '' 'two words'\nstop=leaf\n\
+             [plain]\ntype=daemon\nexec=/bin/x\n",
+        );
+        let unit = &rt.lookup("sshd").unwrap().unit;
+        let (command, _) = build(unit, false, false).unwrap();
+        assert_eq!(command.get_program(), "/proc/self/exe");
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|s| s.to_str().unwrap().to_string())
+            .collect();
+        assert!(
+            matches!(crate::route(&argv), crate::Route::LeafExec { argv } if argv == unit.argv)
+        );
+        let (command, _) = build(&rt.lookup("plain").unwrap().unit, false, false).unwrap();
+        assert_eq!(command.get_program(), "/bin/x");
+    }
+
+    fn leaf_killed(controls: &PairControls) -> bool {
+        std::fs::read_to_string(controls.0.join("cgroup.kill")).unwrap() == "1"
+    }
+
+    fn alive(pid: i32) -> bool {
+        procfs::stat_of(pid)
+            .ok()
+            .flatten()
+            .is_some_and(|stat| !stat.zombie)
+    }
+
+    /// Make every pending stop deadline and sweep due now.
+    fn come_due(rt: &mut Runtime, name: &str) {
+        let service = rt.lookup_mut(name).unwrap();
+        let past = Instant::now().checked_sub(SWEPT_AGO);
+        if service.kill_at.is_some() {
+            service.kill_at = past;
+        }
+        if service.next_sweep.is_some() {
+            service.next_sweep = past;
+        }
+    }
+
+    /// The A1 case: a restart of a `stop=leaf` unit whose descendants left
+    /// the process group, as `setsid()` sessions do. The group TERM misses
+    /// them, so the stop TERMs what the leaf lists: one that honours TERM
+    /// ends inside the grace, and one that ignores it holds the restart until
+    /// the KILL deadline writes `cgroup.kill`. The new leader starts only once
+    /// the leaf reads empty. The file fixture is not the kernel, so the test
+    /// plays the kernel's part when `cgroup.kill` is written.
+    #[test]
+    fn a_leaf_restart_waits_for_a_descendant_that_left_the_group() {
+        let mut leader = live_group_leader();
+        let graceful = live_group_leader();
+        let mut stubborn = stubborn_group_leader();
+        let (mut rt, controls) = running_leaf("always", &leader);
+        controls.procs(&[leader.pid, graceful.pid, stubborn.pid]);
+        rt.lookup_mut("sshd").unwrap().fast_failures = 3;
+        let reply = rt.control("restart sshd");
+        assert!(reply.contains("restart requested"), "{reply}");
+        let service = rt.lookup("sshd").unwrap();
+        assert!(service.stopping && service.start_after_stop);
+        assert!(service.cohort.is_some(), "the stop did not attach its leaf");
+        let grace = service.kill_at;
+        assert!(grace.is_some());
+        assert!(
+            gone_within(leader.pid, Duration::from_secs(5)),
+            "the group TERM did not reach the leader"
+        );
+        assert!(
+            gone_within(graceful.pid, Duration::from_secs(5)),
+            "a session that left the group got no TERM"
+        );
+        let _ = leader.child.wait();
+        rt.on_exit("sshd", None);
+
+        let service = rt.lookup("sshd").unwrap();
+        assert!(
+            service.stopping,
+            "the restart finished over an occupied leaf"
+        );
+        assert_eq!(
+            service.phase,
+            Phase::Ready,
+            "the phase moved before the stop"
+        );
+        assert_eq!(
+            service.kill_at, grace,
+            "the grace deadline was dropped with the leader"
+        );
+        assert!(alive(stubborn.pid), "the fixture's descendant ignores TERM");
+        assert!(
+            !leaf_killed(&controls),
+            "the leaf was killed before its grace"
+        );
+        // Nothing unproven, so status keeps its fixed shape.
+        assert_eq!(rt.status_line(0), "sshd stopping pid=- failures=3\n");
+        rt.start_eligible();
+        assert_eq!(
+            rt.lookup("sshd").unwrap().fast_failures,
+            3,
+            "a new leader was attempted before the leaf emptied"
+        );
+
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(
+            leaf_killed(&controls),
+            "the KILL deadline did not kill the leaf"
+        );
+        assert!(rt.lookup("sshd").unwrap().stopping);
+        // The kernel's half: everything in the leaf dies, and it reads empty.
+        let _ = stubborn.child.kill();
+        let _ = stubborn.child.wait();
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        let service = rt.lookup("sshd").unwrap();
+        assert!(!service.stopping && service.cohort.is_none());
+        assert_eq!(
+            service.phase,
+            Phase::Down,
+            "the restart did not start again"
+        );
+        assert_eq!(service.fast_failures, 0);
+        assert_eq!(service.membership, Membership::Clear);
+    }
+
+    /// A unit some instance of which ran ungated may have left processes
+    /// outside the leaf, so an empty leaf proves nothing: the stop stays in
+    /// `stopping`, says why in `status`, a restart never starts the next
+    /// leader, and the KILL still goes to the recorded group until that group
+    /// is empty.
+    #[test]
+    fn a_leaf_stop_whose_placement_was_never_verified_stays_stopping() {
+        let mut leader = live_group_leader();
+        let (mut rt, controls) = running_leaf("always", &leader);
+        rt.lookup_mut("sshd").unwrap().membership =
+            Membership::Unverified(Some(controls.0.clone()));
+        controls.events("populated 0\n");
+        let member = live_group_leader();
+        controls.procs(&[leader.pid, member.pid]);
+        let reply = rt.control("restart sshd");
+        assert!(reply.contains("restart requested"), "{reply}");
+        let service = rt.lookup("sshd").unwrap();
+        assert!(service.leaf_unproven && service.cohort.is_some());
+        assert!(gone_within(leader.pid, Duration::from_secs(5)));
+        assert!(
+            gone_within(member.pid, Duration::from_secs(5)),
+            "an unverified leaf's member got no TERM"
+        );
+        let _ = leader.child.wait();
+        rt.on_exit("sshd", None);
+        for _ in 0..3 {
+            come_due(&mut rt, "sshd");
+            rt.enforce_deadlines();
+            let service = rt.lookup("sshd").unwrap();
+            assert!(service.stopping, "an unverified leaf was read as empty");
+            assert_eq!(service.phase, Phase::Ready);
+            assert!(service.next_sweep.is_some() || service.kill_at.is_some());
+            // The leader's group is empty, so its id may be reissued: a stop
+            // that never finishes must not keep it as a KILL target.
+            assert_eq!(service.stop_scope, None, "an empty group is still a target");
+            assert!(service.leaf_unproven, "an unverified leaf was proven");
+        }
+        assert_eq!(
+            rt.status_line(0),
+            "sshd stopping pid=- failures=0 leaf=unproven\n"
+        );
+        assert!(leaf_killed(&controls), "an unverified leaf was not killed");
+        // An operator's start cannot bypass it either.
+        let reply = rt.control("start sshd");
+        assert!(reply.contains("stop in progress"), "{reply}");
+        rt.start_eligible();
+        assert!(rt.lookup("sshd").unwrap().pid.is_none());
+    }
+
+    /// A leaderless stop of an unverified leaf has no group left to TERM or
+    /// KILL, so the leaf's controls are what reach it: its members get the
+    /// TERM and the leaf its `cgroup.kill`, and the stop still never finishes.
+    #[test]
+    fn a_leaderless_unverified_leaf_is_still_termed_and_killed() {
+        let leader = live_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        {
+            let service = rt.lookup_mut("sshd").unwrap();
+            service.pid = None;
+            service.starttime = None;
+            service.phase = Phase::Stopped;
+            service.membership = Membership::Unverified(Some(controls.0.clone()));
+        }
+        let member = live_group_leader();
+        controls.procs(&[member.pid]);
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("TERM sent to 1 process(es)"), "{reply}");
+        assert!(gone_within(member.pid, Duration::from_secs(5)));
+        for _ in 0..2 {
+            come_due(&mut rt, "sshd");
+            rt.enforce_deadlines();
+        }
+        assert!(leaf_killed(&controls), "the KILL deadline reached nothing");
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert_eq!(
+            rt.status_line(0),
+            "sshd stopping pid=- failures=0 leaf=unproven\n"
+        );
+    }
+
+    /// An unverified leaf may not hold its whole unit, so its KILL deadline
+    /// reaches the leader's group as well as the leaf.
+    #[test]
+    fn an_unverified_leafs_kill_reaches_its_group_too() {
+        let mut leader = stubborn_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        rt.lookup_mut("sshd").unwrap().membership =
+            Membership::Unverified(Some(controls.0.clone()));
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(leaf_killed(&controls));
+        assert!(
+            gone_within(leader.pid, Duration::from_secs(5)),
+            "the unverified leaf's group got no KILL"
+        );
+        let _ = leader.child.wait();
+    }
+
+    /// A stop's member TERM skips what the group's TERM already reached: the
+    /// leader the leaf lists, and its group's other members.
+    #[test]
+    fn a_leaf_stop_terms_only_what_left_the_group() {
+        let leader = stubborn_group_leader();
+        let groupmate = stubborn_in(leader.pid);
+        let outsider = stubborn_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        rt.lookup_mut("sshd").unwrap().membership = Membership::Placed(controls.0.clone());
+        controls.procs(&[leader.pid, groupmate.pid, outsider.pid]);
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        let index = rt.index_of("sshd").unwrap();
+        assert_eq!(rt.term_leaf(index), 1);
+    }
+
+    /// Unverified is sticky: a later verified instance shares the leaf, but
+    /// cannot bring back what an earlier one may have left outside it. Only a
+    /// leaf proven empty clears it.
+    #[test]
+    fn leaf_membership_is_verified_per_spawn_and_an_unverified_one_sticks() {
+        let leaf = std::path::Path::new("/sys/fs/cgroup/system/sshd");
+        let placed = Membership::Placed(leaf.to_path_buf());
+        // A gated leader placed before it ran anything is proof.
+        assert_eq!(
+            Membership::Clear.after_spawn(Some(leaf), true, true),
+            placed
+        );
+        assert_eq!(placed.after_spawn(Some(leaf), true, true), placed);
+        for prior in [Membership::Clear, placed.clone()] {
+            // A gated leader that was not placed got no grant and ran
+            // nothing, so it changes nothing.
+            assert_eq!(prior.after_spawn(Some(leaf), false, true), prior);
+            assert_eq!(prior.after_spawn(None, false, true), prior);
+            // An ungated one ran before placement, placed or not. The leaf
+            // it was meant for is kept for the stop to TERM and KILL.
+            for (meant, placed) in [(Some(leaf), true), (Some(leaf), false)] {
+                assert_eq!(
+                    prior.after_spawn(meant, placed, false),
+                    Membership::Unverified(Some(leaf.to_path_buf()))
+                );
+            }
+            assert_eq!(
+                prior.after_spawn(None, false, false),
+                Membership::Unverified(prior.leaf().map(std::path::Path::to_path_buf))
+            );
+        }
+        let unverified = Membership::Unverified(Some(leaf.to_path_buf()));
+        assert_eq!(unverified.after_spawn(Some(leaf), true, true), unverified);
+        assert_eq!(unverified.after_spawn(None, false, false), unverified);
+    }
+
+    /// A leaf whose `cgroup.events` cannot be read is not an empty one, and
+    /// neither is one whose controls could not be opened at the stop. Both
+    /// recover: a later read that shows `populated 0` finishes the stop, and a
+    /// sweep opens a verified leaf's controls again.
+    #[test]
+    fn a_leaf_stop_that_cannot_read_its_leaf_stays_stopping_until_it_can() {
+        // Attached, then unreadable: it stays stopping until the leaf reads
+        // empty again.
+        let mut leader = live_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        assert!(gone_within(leader.pid, Duration::from_secs(5)));
+        let _ = leader.child.wait();
+        rt.on_exit("sshd", None);
+        for text in [
+            "",
+            "frozen 0\n",
+            "populated 2\n",
+            "populated 0\npopulated 0\n",
+        ] {
+            controls.events(text);
+            come_due(&mut rt, "sshd");
+            rt.enforce_deadlines();
+            assert!(
+                rt.lookup("sshd").unwrap().stopping,
+                "{text:?} read as empty"
+            );
+            assert_eq!(
+                rt.status_line(0),
+                "sshd stopping pid=- failures=0 leaf=unproven\n",
+                "{text:?}"
+            );
+        }
+        // A read that succeeds clears it, though the leaf is not yet empty.
+        controls.events("populated 1\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert_eq!(rt.status_line(0), "sshd stopping pid=- failures=0\n");
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert_eq!(rt.lookup("sshd").unwrap().phase, Phase::Stopped);
+
+        // Not attached at the stop: the controls were gone. While they stay
+        // gone the stop cannot finish, and says so.
+        let mut leader = live_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        std::fs::remove_file(controls.0.join("cgroup.events")).unwrap();
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        assert!(rt.lookup("sshd").unwrap().leaf_unproven);
+        let armed = rt.lookup("sshd").unwrap().kill_at;
+        assert!(armed.is_some());
+        assert!(gone_within(leader.pid, Duration::from_secs(5)));
+        let _ = leader.child.wait();
+        rt.on_exit("sshd", None);
+        assert_eq!(
+            rt.lookup("sshd").unwrap().kill_at,
+            armed,
+            "the stop's KILL deadline did not survive its leader"
+        );
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(rt.lookup("sshd").unwrap().stopping);
+        assert!(rt.status_line(0).ends_with(" leaf=unproven\n"));
+        // Back: the next sweep opens them, TERMs what the leaf lists (here a
+        // session that left the group), and the stop goes on as usual.
+        let session = live_group_leader();
+        controls.procs(&[session.pid]);
+        controls.events("populated 1\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(
+            gone_within(session.pid, Duration::from_secs(5)),
+            "the re-attached leaf's member got no TERM"
+        );
+        let service = rt.lookup("sshd").unwrap();
+        assert!(service.cohort.is_some() && !service.leaf_unproven);
+        assert!(service.stopping);
+        assert_eq!(rt.status_line(0), "sshd stopping pid=- failures=0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(leaf_killed(&controls), "the reopened leaf was not killed");
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert_eq!(rt.lookup("sshd").unwrap().phase, Phase::Stopped);
+    }
+
+    /// An unexpected exit of the leader is not a stop: nothing is killed, the
+    /// leaf keeps its descendant, and the restart policy starts the next
+    /// leader without waiting for the leaf to empty — live sessions survive a
+    /// listener crash. A requested stop afterwards still ends the leaf: with
+    /// no group left, it TERMs the leaf's members and kills the leaf at the
+    /// KILL deadline.
+    #[test]
+    fn a_leader_crash_restarts_in_place_keeping_the_descendant() {
+        let mut descendant = stubborn_group_leader();
+        let controls = PairControls::new();
+        let mut rt = runtime(
+            "[sshd]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\nrestart=always\nstop=leaf\n",
+        );
+        mark_running(&mut rt, "sshd", Duration::from_secs(60));
+        {
+            let service = rt.lookup_mut("sshd").unwrap();
+            service.pid = Some(i32::MAX);
+            service.membership = Membership::Placed(controls.0.clone());
+        }
+        controls.events("populated 1\n");
+        controls.procs(&[descendant.pid]);
+        rt.on_exit("sshd", Some(1));
+        let service = rt.lookup("sshd").unwrap();
+        assert!(!service.stopping && service.cohort.is_none());
+        assert_eq!(service.phase, Phase::Failed);
+        assert!(service.retry_at.is_some());
+        assert_eq!(service.fast_failures, 1);
+        assert!(!leaf_killed(&controls), "a crash killed the leaf");
+        assert!(alive(descendant.pid));
+        // The retry comes due over the occupied leaf. On this host the unit
+        // has no leaf of its own to be placed in, so its gated start is
+        // refused at once, which counts the attempt.
+        rt.lookup_mut("sshd").unwrap().retry_at = Instant::now().checked_sub(SWEPT_AGO);
+        rt.start_eligible();
+        assert_eq!(
+            rt.lookup("sshd").unwrap().fast_failures,
+            2,
+            "the next leader waited for the leaf to empty"
+        );
+        assert!(!leaf_killed(&controls));
+        assert!(alive(descendant.pid));
+
+        // Leaderless now, but the leaf still holds the descendant.
+        let reply = rt.control("stop sshd");
+        assert!(
+            reply.contains("TERM sent to 1 process(es) in its leaf"),
+            "{reply}"
+        );
+        assert!(rt.lookup("sshd").unwrap().stopping);
+        rt.enforce_deadlines();
+        assert!(!leaf_killed(&controls), "the leaf got no grace");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(leaf_killed(&controls), "a leaderless stop left its leaf");
+        let _ = descendant.child.kill();
+        let _ = descendant.child.wait();
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        let service = rt.lookup("sshd").unwrap();
+        assert_eq!(service.phase, Phase::Stopped);
+        assert!(service.retry_at.is_none());
+        assert_eq!(service.membership, Membership::Clear);
+        // With the leaf proven empty, a stop is the ordinary one again.
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("was not running"), "{reply}");
+    }
+
+    /// A reload that drops a `stop=leaf` unit whose crashed leader left its
+    /// leaf occupied keeps it, retired, and stops it: dropping it would leave
+    /// the leaf to nobody, and a shutdown with nothing to walk.
+    #[test]
+    fn a_reload_retires_a_leaderless_leaf_through_its_stop() {
+        let controls = PairControls::new();
+        let (mut rt, dir) = reloadable(
+            "[a]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\n\
+             [sshd]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\nstop=leaf\n",
+            "leaf",
+        );
+        rt.marker_path = format!("{dir}/shutdown");
+        rt.lookup_mut("sshd").unwrap().membership = Membership::Placed(controls.0.clone());
+        controls.events("populated 1\n");
+        std::fs::write(
+            &rt.table_path,
+            "[a]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\n",
+        )
+        .unwrap();
+        let reply = rt.control("reload");
+        assert!(!reply.starts_with("error:"), "{reply}");
+        let service = rt.lookup("sshd").expect("the occupied leaf was dropped");
+        assert!(service.retired && service.stopping);
+        assert!(rt.begin_shutdown(Power::Off).contains("requested"));
+        assert!(
+            rt.shutdown
+                .as_ref()
+                .is_some_and(|s| s.walk.contains(&rt.index_of("sshd").unwrap())),
+            "the shutdown would not walk the retired leaf"
+        );
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(leaf_killed(&controls));
+        controls.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(!rt.lookup("sshd").unwrap().is_up());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shutdown stops a `stop=leaf` unit the same way, including one whose
+    /// leader crashed, and stays bounded: a leaf that never proves empty is
+    /// left behind at the shutdown's deadline as any other unit is, and that
+    /// deadline wakes the loop even when the unit's own timers lie past it.
+    #[test]
+    fn a_shutdown_ends_the_leaf_and_stays_bounded_past_an_unproven_one() {
+        let held = PairControls::new();
+        let (mut rt, dir) = shutdown_runtime(
+            "[net]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\n\
+             [sshd]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\nstop=leaf\nafter=net\n\
+             [lost]\ntype=daemon\nexec=/nonexistent/td-svc-fixture\nstop=leaf\nafter=sshd\n",
+            "leaf",
+        );
+        // Both leaders crashed; sshd's leaf still holds a session, and lost
+        // ran ungated.
+        rt.lookup_mut("sshd").unwrap().membership = Membership::Placed(held.0.clone());
+        held.events("populated 1\n");
+        rt.lookup_mut("lost").unwrap().membership = Membership::Unverified(None);
+        assert!(rt.begin_shutdown(Power::Off).contains("requested"));
+
+        // Reverse plan order: lost first. It never proves empty...
+        assert_eq!(rt.advance_shutdown(), None);
+        let lost = rt.index_of("lost").unwrap();
+        assert!(rt.lookup("lost").unwrap().stopping);
+        assert_eq!(rt.advance_shutdown(), None, "the shutdown did not wait");
+        let deadline = rt
+            .shutdown
+            .as_ref()
+            .and_then(|s| s.current)
+            .map(|(index, at)| {
+                assert_eq!(index, lost);
+                at
+            })
+            .unwrap();
+        // ...and its own timers lie past the deadline, which still wakes.
+        {
+            let later = deadline.checked_add(Duration::from_secs(3600));
+            let service = rt.lookup_mut("lost").unwrap();
+            service.kill_at = later;
+            service.next_sweep = later;
+        }
+        assert_eq!(
+            rt.start_eligible(),
+            Some(deadline),
+            "slept past the deadline"
+        );
+        // At its deadline the shutdown goes on without it.
+        if let Some(state) = rt.shutdown.as_mut() {
+            state.current = Some((lost, Instant::now()));
+        }
+        assert_eq!(rt.advance_shutdown(), None);
+        assert!(
+            rt.lookup("lost").unwrap().stopping,
+            "lost was called stopped"
+        );
+        // sshd is next, leaderless: its leaf is killed at its KILL deadline
+        // and must empty.
+        assert!(rt.lookup("sshd").unwrap().stopping);
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert!(leaf_killed(&held));
+        held.events("populated 0\n");
+        come_due(&mut rt, "sshd");
+        rt.enforce_deadlines();
+        assert_eq!(rt.lookup("sshd").unwrap().phase, Phase::Stopped);
+        // net was never running and holds no leaf, so the walk is done.
+        assert_eq!(rt.advance_shutdown(), Some(Power::Off));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A timed-out `stop=leaf` oneshot that an operator then stops keeps the
+    /// grace its stop began with when the exit arrives one generation late.
+    #[test]
+    fn a_stale_exit_keeps_a_leaf_stops_grace() {
+        let mut leader = live_group_leader();
+        let (mut rt, controls) = running_leaf("never", &leader);
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        let grace = rt.lookup("sshd").unwrap().kill_at;
+        let generation = rt.lookup("sshd").unwrap().generation;
+        // What `time_out` leaves: the generation bumped, the pid kept.
+        rt.lookup_mut("sshd").unwrap().generation = generation.wrapping_add(1);
+        assert!(gone_within(leader.pid, Duration::from_secs(5)));
+        let _ = leader.child.wait();
+        rt.dispatch(Event::Exited {
+            name: "sshd".into(),
+            generation,
+            code: None,
+        });
+        let service = rt.lookup("sshd").unwrap();
+        assert!(service.stopping && service.pid.is_none());
+        assert_eq!(service.kill_at, grace, "the stale exit reset the grace");
+        assert!(!leaf_killed(&controls));
     }
 
     /// Simulate a spawn so exit handling can be tested without a real process.
@@ -4403,10 +5325,7 @@ mod tests {
     /// why.)
     #[test]
     fn a_negative_target_reaches_a_whole_process_group() {
-        let Some(leader) = live_group_leader() else {
-            eprintln!("note: cannot spawn a group leader here; skipping");
-            return;
-        };
+        let leader = live_group_leader();
         // The leader leads its own group, so the group id IS its pid.
         send_signal(-leader.pid, crate::sys::SIGTERM).unwrap();
         assert!(
@@ -4519,24 +5438,64 @@ mod tests {
     /// so a reaped leader empties it by construction. A group can, and it is
     /// the shape the real cases have: the greeter's console and any
     /// `process_group` unit outlive their leader through exactly this.
-    fn live_group_leader() -> Option<Live> {
+    fn live_group_leader() -> Live {
+        live_running("read x", 0)
+    }
+
+    /// A group leader that ignores TERM.
+    fn stubborn_group_leader() -> Live {
+        stubborn_in(0)
+    }
+
+    /// A process in `group` (0: its own) that ignores TERM, returned once the
+    /// shell has set that up: a TERM that lands before the `trap` runs still
+    /// kills it.
+    fn stubborn_in(group: i32) -> Live {
+        let live = live_running("trap '' TERM; read x", group);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", live.pid))
+                .expect("a stubborn fixture's /proc status");
+            let ignored = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .is_some_and(|mask| mask & (1 << (crate::sys::SIGTERM - 1)) != 0);
+            if ignored {
+                return live;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stubborn fixture never ignored TERM"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A process running `script`, which blocks on its stdin, in process
+    /// group `group` (0: its own). A fixture that cannot be made fails the
+    /// test rather than skipping it.
+    fn live_running(script: &str, group: i32) -> Live {
         use std::os::unix::process::CommandExt;
         let child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("read x")
+            .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .process_group(0)
+            .process_group(group)
             .spawn()
-            .ok()?;
-        let pid = i32::try_from(child.id()).ok()?;
-        let starttime = procfs::stat_of(pid).ok()??.starttime;
-        Some(Live {
+            .expect("cannot spawn a fixture process");
+        let pid = i32::try_from(child.id()).expect("a fixture pid out of range");
+        let starttime = procfs::stat_of(pid)
+            .expect("cannot read a fixture's /proc stat")
+            .expect("a fixture exited at once")
+            .starttime;
+        Live {
             child,
             pid,
             starttime,
-        })
+        }
     }
 
     /// `stop` on a `restart=always` daemon must make it STAY stopped.
@@ -4866,9 +5825,7 @@ mod tests {
     #[test]
     fn a_stop_is_not_finished_while_its_containment_still_has_members() {
         let mut rt = runtime("[greeter]\ntype=daemon\nexec=/x\nrestart=always\n");
-        let Some(mut live) = live_group_leader() else {
-            return;
-        };
+        let mut live = live_group_leader();
         {
             let service = rt.lookup_mut("greeter").unwrap();
             service.phase = Phase::Ready;
@@ -6287,11 +7244,7 @@ mod tests {
     #[test]
     fn an_orphan_from_a_previous_supervisor_is_evicted() {
         let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-live");
-        let Some(orphan) = live_group_leader() else {
-            eprintln!("note: cannot spawn a child here; skipping");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        };
+        let orphan = live_group_leader();
         let pid = orphan.pid;
         crate::evict::write(
             &rt.started_path,
@@ -6340,11 +7293,7 @@ mod tests {
     #[test]
     fn a_recorded_pid_whose_starttime_differs_is_not_touched() {
         let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-reuse");
-        let Some(bystander) = live_group_leader() else {
-            eprintln!("note: cannot spawn a child here; skipping");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        };
+        let bystander = live_group_leader();
         let pid = bystander.pid;
         // The same pid, a different process: exactly what pid reuse looks like
         // from a record written before the reuse.

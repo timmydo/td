@@ -149,7 +149,7 @@ fn no_grant_and_malformed_grants_launch_neither_peer() {
         );
         assert!(String::from_utf8(output.stderr)
             .unwrap()
-            .contains("pair start gate refused"));
+            .contains("start gate refused"));
     }
 }
 
@@ -203,4 +203,66 @@ fn second_spawn_failure_reaps_the_first() {
     assert!(String::from_utf8(output.stderr)
         .unwrap()
         .contains("paired executable /nonexistent/td-pair-peer"));
+}
+
+fn leaf_command() -> Command {
+    let binary = option_env!("TD_SVC_TEST_BINARY")
+        .or(option_env!("CARGO_BIN_EXE_td-svc"))
+        .expect("test must name the td-svc binary it exercises");
+    let mut command = Command::new(binary);
+    command
+        .arg("leaf-exec")
+        .arg("--")
+        .args(fixture("leaf_program"));
+    command.env("TD_SVC_LEAF_FIXTURE", "1");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+#[test]
+fn leaf_program() {
+    if std::env::var_os("TD_SVC_LEAF_FIXTURE").is_none() {
+        return;
+    }
+    println!(
+        "LEAF-RAN {} {}",
+        std::process::id(),
+        std::fs::read_link("/proc/self/fd/0").unwrap().display()
+    );
+}
+
+/// A `stop=leaf` leader runs nothing until td-svc grants it: no grant, a
+/// wrong one, or an open pipe with none yet execs nothing; the exact grant
+/// execs the program in the same process, with the null stdin an ungated
+/// unit gets.
+#[test]
+fn a_leaf_leader_execs_only_after_its_grant() {
+    for grant in [vec![], vec![0], vec![1, 0]] {
+        let mut child = leaf_command().spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&grant).unwrap();
+        let output = wait(child);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty(), "ran without a valid grant");
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("start gate refused"));
+    }
+    let mut child = leaf_command().spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "did not wait for a grant"
+    );
+    let pid = child.id();
+    child.stdin.take().unwrap().write_all(&[1]).unwrap();
+    let output = wait(child);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("LEAF-RAN {pid} /dev/null")),
+        "{stdout}"
+    );
 }
