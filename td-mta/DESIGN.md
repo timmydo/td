@@ -1487,10 +1487,12 @@ the adapter does not retain permission. Tests between workers verify
 durable publication and refusal after revocation. Transcript fixtures
 connect actual outcomes to the session and verify reopened mail. The
 receiving network driver additionally exercises real local TCP delivery
-and reopened storage. Worker scheduling and listener activation remain
-M11 work. The engine binds routing for its lifetime, accepts only
-configured recipients, retains accepted envelope spellings, and exposes
-one account for one atomic delivery. It advertises SIZE, 8BITMIME and
+and reopened storage. The direct receiving runtime described below
+connects these adapters with fixed workers on caller-bound listeners.
+Command-line service activation remains M11 work. The engine binds routing
+for its lifetime, accepts only configured recipients, retains accepted
+envelope spellings, and exposes one account for one atomic delivery. It
+advertises SIZE, 8BITMIME and
 enhanced status codes; optional STARTTLS hands the original command to
 the transport owner without generating 220. Only successful TLS
 completion resets SMTP state. No PIPELINING or other unimplemented
@@ -1518,8 +1520,10 @@ yield without further socket work. Client idle timing pauses during
 dispatched work and restarts on completion; the worker still owes its
 original DATA/session deadline and its own execution budget.
 The native delivery preparation call requires its trusted caller to
-supply the finalization deadline captured when that work is queued. A
-production dispatcher is not implemented yet. The call narrows the job's
+supply the finalization deadline captured when that work is queued. The
+direct receiving runtime captures the configured commit budget at that
+dispatch and takes the minimum with the enclosing DATA/session deadline.
+The call narrows the job's
 enforcement deadline once, covering header completion and publication;
 coordination retries retain that cap and refuse once it expires even
 while the lock is busy. The ledger reservation, work meter and spool
@@ -1527,6 +1531,38 @@ retain their original receiving bounds. It checks again after spool
 preparation; only the native transaction can accept the message. A known
 successful commit remains successful when completion is observed after
 that deadline.
+
+The `smtp_receiving` runtime accepts caller-bound IPv4 direct listeners
+and retains one immutable routing/TLS configuration snapshot. It verifies
+the actual local socket address and complete TLS listener binding,
+including listener limits, greeting/trace compatibility and ingress spool
+capacity, and checks the account's single Inbox before readiness. It does
+not serve the configuration's HTTPS listener, enable gateway receiving
+or implement hot reload. A connection-specific direct
+adapter binds the real socket peer and actual negotiated TLS version;
+plaintext and TLS direct SMTP grant no remote identity authentication.
+
+One network loop visits bounded connection slots in rotating order. One
+fixed storage worker performs admission, streaming writes and publication;
+one fixed TLS worker constructs sessions and advances handshakes. Idle
+connections and pending handshakes retain slots but do not occupy a worker.
+Each slot retains its own queued operation and completion, so dispatch
+reserves result capacity before effects without a separate completion
+queue. Main uses try_lock and skips slots owned by workers. Known native
+results are applied to the retained protocol owner before releasing the
+slot, including when ancillary accounting stops further admission.
+
+Global, per-listener and per-peer counts include queued, handshaking,
+closing and retiring connections. Saturation attempts one bounded 421
+write before closure. Runtime status distinguishes startup, ready,
+stopping, stopped and failed. Shutdown stops accepting and permits up to
+five seconds of existing connection progress before retirement; a known
+final DATA reply retains its existing bounded finishing allowance. It never
+accepts incomplete DATA. Native cleanup runs on fixed workers during
+normal operation. An unexpected worker failure stops new mutations and
+fails status; terminal teardown after joining workers may block and never
+resumes a poisoned transaction. No thread replacement or kernel-I/O
+cancellation is promised. RESOURCES records the concrete slot ownership.
 
 Accepted MAIL commands count toward the fixed 100-transaction limit even
 after RSET, EHLO or STARTTLS. Expiry at a legal command boundary queues

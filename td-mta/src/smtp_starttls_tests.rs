@@ -359,7 +359,8 @@ impl Clock for MovingClock {
 }
 fn ended(client: &mut TcpTransport) {
     let mut byte = [0];
-    for _ in 0..100_000 {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < until {
         match client.read(&mut byte) {
             Ok(IoProgress::Closed) | Err(_) => return,
             Ok(IoProgress::Pending) => std::thread::yield_now(),

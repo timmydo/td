@@ -1,4 +1,4 @@
-//! Service foundations and receiving protocol state; no listeners or capabilities.
+//! Service foundations and direct SMTP receiving; no automatic listener activation.
 #![forbid(unsafe_code)]
 
 pub mod account_checks;
@@ -73,6 +73,7 @@ pub mod recipient_sweep;
 pub mod reference_sweep;
 pub mod row_references;
 pub mod smtp_network;
+pub mod smtp_receiving;
 pub mod smtp_session;
 pub mod smtp_starttls;
 pub mod smtp_wire;

@@ -336,8 +336,8 @@ receiving. Delivery captures the validated session's DATA envelope, reserves
 maximum stored BodyBytes and one BlobCount before 354, and owns one ingress
 slot. It consumes no UploadBytes. Receiving and upload jobs can remain
 admitted concurrently under the shared coordination rules above. The
-runtime still owes fair scheduling and actual credential verification
-before enabling listeners.
+direct receiving runtime now supplies bounded scheduling and socket/TLS
+facts. Gateway and device credential verification remain separate consumers.
 
 A connection-specific DeliveryAuthorization supplies actual peer/TLS/gateway
 facts and receiving permission. Its commit guard rechecks current policy and
@@ -472,8 +472,12 @@ transport cap. Additional reads stop after 64 KiB or EOF; buffered tails
 are discarded immediately. This bounds shutdown work and is best effort,
 not a guarantee that the peer receives a refusal: unread input can still
 cause a reset. No discarded bytes return to parsing. The caller disposes
-uncommitted jobs on workers, and the final scheduler must still enforce
-bounded slots, queues and peer fairness.
+uncommitted jobs on workers. The direct receiving runtime enforces bounded
+connection/work slots and global, listener and per-peer admission; its
+retained slot reserves completion capacity before dispatch. Finalization
+captures the configured commit deadline once, before queueing, and retries
+keep it. Begin-DATA ticket contention may retry only before admission,
+under the original queued admission cap.
 
 For an HTTP transfer of admitted maximum B bytes, use
 `max(120 seconds, 30 seconds + ceil(B / minimum_rate))`. The default minimum

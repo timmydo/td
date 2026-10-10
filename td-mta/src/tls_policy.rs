@@ -242,6 +242,17 @@ impl TlsPolicies {
             |policy| matches!(&policy.binding, Binding::Listener(b) if b.name == name),
         )
     }
+    /// Cold validation of the complete listener binding, including its limits.
+    pub fn bound_listener(
+        lease: &GenerationLease<Self>,
+        row: listener::Listener<'_>,
+    ) -> Result<TlsPolicyId, Error> {
+        let expected = listener_binding(row)?;
+        Self::find(lease, |policy| {
+            matches!((&policy.binding, &expected),
+                (Binding::Listener(actual), Binding::Listener(expected)) if actual == expected)
+        })
+    }
     pub fn relay(lease: &GenerationLease<Self>) -> Result<TlsPolicyId, Error> {
         Self::find(lease, |policy| {
             matches!(policy.binding, Binding::Relay { .. })

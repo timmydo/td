@@ -2754,9 +2754,16 @@ and STARTTLS plaintext refusal. The receiving STARTTLS owner now
 consumes the exact command and same socket through 220 flushing and an
 actual handshake, then resets SMTP and returns the TLS transport. Real
 TLS fixtures verify encrypted commands, EHLO reset, retained deadlines,
-failed-upgrade closure, cancellation and capacity release. Bounded
-worker dispatch, peer admission, readiness and listener activation
-remain unimplemented. Those integrations form the next M11 increment.
+failed-upgrade closure, cancellation and capacity release. The direct
+receiving runtime now attaches these owners to caller-bound IPv4 listeners,
+with fixed storage/TLS workers, global/listener/peer counts, retained
+completion slots, queued deadlines and observable readiness/shutdown/failure.
+Local fixtures cover durable plaintext and TLS receiving beside an idle
+peer, overload, failed TLS slot reuse and worker failure. The runtime
+retains one static configuration and checks Inbox and exact TLS bindings
+before readiness. Command-line initialization and serve activation, graceful
+operational control and complete crash/restart process fixtures remain M11
+work; HTTPS and gateway serving are not enabled by this API.
 
 Bind configured test/high ports first, attach the M10 engine to TLS/plain
 transports and impose peer/global fairness limits. Reset state after STARTTLS,

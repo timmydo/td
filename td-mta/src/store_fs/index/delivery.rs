@@ -191,6 +191,21 @@ pub struct Delivery<'c, 's, 'r, 'a, C: Crypto, P, A: DeliveryAuthorization> {
     failed: bool,
 }
 impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
+    /// Cold receiving startup check; never call from the network event loop.
+    pub fn receiving_ready(
+        &self,
+        account: AccountId,
+        deadline: Deadline,
+    ) -> Result<(), ports::Error> {
+        let state = self.try_state()?;
+        if state.stopped {
+            return Err(ports::Error::WriterStopped);
+        }
+        let mut view = self.store.view(account, deadline)?;
+        inbox(&mut view)?;
+        Ok(())
+    }
+
     /// Reserve only after this validated session requests DATA admission. The
     /// trusted driver supplies its connection policy and configured header bound.
     /// Transfer the adapter into the job, or pass a reference for an outer owner.

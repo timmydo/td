@@ -446,6 +446,48 @@ failure. Raw blobs stream under message_bytes. ADMISSION.md fixes finite transfe
 deadlines suitable for an offline import rather than ACME's 60-second lease.
 M21 must measure this separate process and its bounded page/body lifecycle.
 
+## Direct receiving runtime
+
+The initial `smtp_receiving` runtime implements direct IPv4 SMTP with two
+fixed workers: storage and TLS. It does not instantiate the other roles in
+the proposed whole-service table above. Standard worker stacks and bounded
+per-connection allocations are permitted under DESIGN section 5; this
+increment makes no new whole-service memory claim.
+
+A startup-reserved vector holds at most the configured SMTP connection
+count (compiled maximum 32). Each mutex-protected slot owns its protocol,
+transport, optional ingress job and one phase: empty, network, queued,
+completed, retry or retiring. Worker scans replace separate work queues:
+each worker performs at most one operation per eligible slot per pass.
+Only the matching worker executes a queued operation. Main acknowledges
+completed phases before further socket work or redispatch. Reuse requires
+worker retirement followed by main releasing the peer/listener count.
+There are no queued references that can outlive this phase, so these slots
+need neither scalar reuse tokens nor a separate completion-credit ledger.
+The retained slot is the completion reservation before every effect.
+
+Main uses nonblocking slot locks and a round-robin socket scan. Threads
+use park/unpark with a maximum five-millisecond wait. Pending TLS turns
+are rescheduled no sooner than ten milliseconds after completion and keep
+the original handshake deadline. Storage coordination retries retain the
+captured operation deadline and wait at least five milliseconds after a
+contention result. Plain/TLS socket progress and SMTP parsing
+use the existing bounded Network turns. Storage consumes one decoded
+line per turn; header completion and atomic native publication retain
+their existing configured byte/work/time bounds, not a new parser quantum.
+
+The storage worker creates and retains its worker-local entropy handle.
+TLS session construction precedes 220; the single shared handshake pool
+and connection slots bound native owners and fixed wire buffers. The storage
+worker retires normal connections; the TLS worker disposes failed upgrades
+it owns. Movable TLS state has no thread identity requirement, and ordinary
+spool cleanup cannot hold the TLS worker behind a storage commit. Main
+never drops a live delivery or native TLS owner during its network loop.
+After worker failure, the loop stops and joins both workers before
+terminal cleanup, including disposal of poisoned
+slots without resuming their operations. Blocking kernel I/O remains a
+host failure that no timeout can forcibly cancel.
+
 ## Scratch partitions
 
 Partitions below are proposed capacity estimates. Implementers may reuse
@@ -3411,8 +3453,9 @@ refuses issuance before wraparound. Generations do not authorize account data
 and cannot be persisted or accepted from peers.
 
 These primitives add no worker, locks or payload ownership enforcement.
-M11's scheduler uses this lock protocol: briefly lock the pool and resolve the
-token to locate its payload lock, then release the pool lock before acquiring
+A scheduler using these token primitives must use this lock protocol:
+briefly lock the pool and resolve the token to locate its payload lock, then
+release the pool lock before acquiring
 the payload lock. With that payload lock held, briefly acquire the pool lock
 again and revalidate the complete token before accessing the payload. Reject a
 stale token and release both locks without touching payload data. Never wait
