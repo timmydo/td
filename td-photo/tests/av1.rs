@@ -655,10 +655,10 @@ fn compare_with_jpeg() {
     use td_photo::jpeg;
     let data = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/z8-thumb.jpg"
+        "/../td-jpeg/tests/fixtures/z8-thumb.jpg"
     ))
     .unwrap();
-    let source = jpeg::decode(&data, jpeg::Scale::Full).unwrap();
+    let source = td_jpeg::decode(&data, td_jpeg::Scale::Full).unwrap();
     let (w, h) = (source.width, source.height);
     eprintln!("source {w}x{h}");
     for quality in [30, 50, 70, 85, 92, 97] {
@@ -670,7 +670,7 @@ fn compare_with_jpeg() {
         let mut je = jpeg::Encoder::new(w, h, quality, 1).unwrap();
         je.encode_rows(&source.data).unwrap();
         let jpg = je.finish().unwrap();
-        let back = jpeg::decode(&jpg, jpeg::Scale::Full).unwrap();
+        let back = td_jpeg::decode(&jpg, td_jpeg::Scale::Full).unwrap();
         let mut sse = 0f64;
         for (a, b) in source
             .data

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Independent baseline JPEG decoder, written from ITU-T T.81 and not from
-td-photo's Rust, as the oracle for td-photo's preview decoder.
+td-jpeg's Rust, as the oracle for td-jpeg's decoder.
 
     python3 jpeg_ref.py FILE.jpg [SCALE]   SCALE in 8 (1/1), 4 (1/2), 2 (1/4), 1 (1/8)
 
@@ -8,7 +8,7 @@ Prints the image geometry, the FNV-1a-64 hash of every dequantised
 coefficient in decode order (each as a little-endian i32; an integer-exact check of the entropy decoder
 and quantisation), and the FNV-1a-64 hash of the decoded RGB bytes.  With
 `--ppm OUT` it also writes the decoded image.  With `--table` it prints the
-IDCT constants td-photo's Rust must carry as literals.
+IDCT constants td-jpeg's Rust must carry as literals.
 
 Arithmetic contract shared with the Rust decoder, so the pixel hash is
 exact and not a tolerance:

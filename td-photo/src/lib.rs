@@ -3,8 +3,9 @@
 //! td's photo tool: the pure decoding and development core. `tiff` reads the
 //! container, `nef` the Nikon layout and codec over it, `camera` is the table
 //! of supported bodies, `color` the linear colour math and transfer, `develop`
-//! the demosaic, resampler and pipeline, `jpeg` the baseline decoder for the
-//! camera's embedded previews, `image` the RGB buffers and PPM writer,
+//! the demosaic, resampler and pipeline, `jpeg` the thumbnail rule over
+//! td-jpeg's preview decoder and the export encoder, `image` the PPM reader
+//! and writer and the shrinker over td-jpeg's RGB buffer,
 //! `library` the sidecar grammar, roll rules and dating rule, `look` the look
 //! format with its built-in set, `auto` the auto exposure and contrast rule,
 //! `settings` the export settings' grammar, `transform`, `cdf`, `deblock`,

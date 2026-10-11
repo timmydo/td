@@ -79,16 +79,10 @@ fn source_inventory_is_closed() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(names("tests/support", "rs"), support);
-    let fixtures: BTreeSet<String> = [
-        "README.md",
-        "jpeg_ref.py",
-        "nikon_ref.py",
-        "z8-rows.bin",
-        "z8-thumb.jpg",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let fixtures: BTreeSet<String> = ["README.md", "nikon_ref.py", "z8-rows.bin"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let actual: BTreeSet<String> = std::fs::read_dir(root().join("tests/fixtures"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -111,15 +105,15 @@ fn the_crate_forbids_unsafe_and_includes_nothing() {
 }
 
 #[test]
-fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
+fn the_manifest_declares_the_calendar_the_decoder_and_the_toolkit_and_joins_the_gate() {
     let manifest = read("Cargo.toml");
     assert!(manifest.contains("[workspace]\n"), "own workspace root");
-    // The two siblings, in the one spelling the lock guard admits.
+    // The three siblings, in the one spelling the lock guard admits.
     assert!(
         manifest.contains(
-            "\n[dependencies]\ntd-civil = { path = \"../td-civil\" }\ntd-ui = { path = \"../td-ui\" }\n"
+            "\n[dependencies]\ntd-civil = { path = \"../td-civil\" }\ntd-jpeg = { path = \"../td-jpeg\" }\ntd-ui = { path = \"../td-ui\" }\n"
         ),
-        "the civil calendar and the toolkit by path"
+        "the civil calendar, the JPEG decoder and the toolkit by path"
     );
     // And the native harness, for the tests alone.
     assert!(
@@ -128,7 +122,7 @@ fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
         ),
         "the native harness by path, for the tests"
     );
-    assert_eq!(manifest.matches("path =").count(), 3, "three dependencies");
+    assert_eq!(manifest.matches("path =").count(), 4, "four dependencies");
     assert_eq!(manifest.matches("[dependencies]").count(), 1);
     assert_eq!(manifest.matches("[dev-dependencies]").count(), 1);
     assert!(!manifest.contains("[build-dependencies]"));
@@ -153,8 +147,9 @@ fn the_manifest_declares_the_calendar_and_the_toolkit_and_joins_the_gate() {
         assert!(manifest.contains(&format!("{lint} = \"deny\"")), "{lint}");
     }
     let lock = read("Cargo.lock");
-    assert_eq!(lock.matches("[[package]]").count(), 4);
+    assert_eq!(lock.matches("[[package]]").count(), 5);
     assert!(lock.contains("name = \"td-civil\""));
+    assert!(lock.contains("name = \"td-jpeg\""));
     assert!(lock.contains("name = \"td-photo\""));
     assert!(lock.contains("name = \"td-test-compositor\""));
     assert!(lock.contains("name = \"td-ui\""));
@@ -377,8 +372,6 @@ fn budgets_are_the_documented_values() {
     assert_eq!(td_photo::image::MAX_AXIS, td_photo::nef::MAX_AXIS);
     assert_eq!(td_photo::image::MAX_IMAGE_PIXELS, 64 << 20);
     assert_eq!(td_photo::nef::MAX_RANGE, 32768);
-    assert_eq!(td_photo::jpeg::MAX_PREVIEW_SAMPLES, 128 << 20);
-    assert_eq!(td_photo::jpeg::MAX_TABLE_DEFINITIONS, 32);
     assert_eq!(td_photo::jpeg::QUALITY, 92);
     // The cache unlinks only names of its own shape inside directories of
     // its own, never a tree; fills go through per-process temporaries; a
@@ -465,21 +458,4 @@ fn the_fixture_is_the_documented_slice() {
     assert!(readme.contains("0x44df96cc9a8684a0"));
     assert!(readme.contains("0xe09ae870943b71be"));
     assert!(readme.contains("18192"));
-    let thumb = std::fs::read(root().join("tests/fixtures/z8-thumb.jpg")).unwrap();
-    assert_eq!(thumb.len(), 13063);
-    assert!(thumb.starts_with(&[0xFF, 0xD8]) && thumb.ends_with(&[0xFF, 0xD9]));
-    for hash in [
-        "0x4012c2335efb6bfa",
-        "0x15cf1df123ee575d",
-        "0x164a0dbefb89395d",
-        "0x7c9a6f6b601504ab",
-        "0x8e6c3e050993ae30",
-    ] {
-        assert!(readme.contains(hash), "README lacks {hash}");
-    }
-    // The oracle's contract is stated where the constants live.
-    let jpeg = read("src/jpeg.rs");
-    assert!(jpeg.contains("floor(v + 128 + 0.5)"));
-    assert!(jpeg.contains("1.402") && jpeg.contains("0.344136") && jpeg.contains("0.714136"));
-    assert!(jpeg.contains("1.772"));
 }

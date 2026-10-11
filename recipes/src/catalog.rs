@@ -524,6 +524,7 @@ mod tests {
                 "td-fs",
                 "td-html",
                 "td-install",
+                "td-jpeg",
                 "td-json",
                 "td-kv",
                 "td-mail",

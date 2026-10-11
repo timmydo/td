@@ -1786,7 +1786,7 @@ fn the_command_line_exports_into_the_rolls_folder() {
     assert!(stdout.contains("DSC_0001.jpg"), "{stdout}");
     assert_eq!(listing(), ["DSC_0001.jpg"]);
     let first = std::fs::read(exported.join("DSC_0001.jpg")).unwrap();
-    let decoded = td_photo::jpeg::decode(&first, td_photo::jpeg::Scale::Full).unwrap();
+    let decoded = td_jpeg::decode(&first, td_jpeg::Scale::Full).unwrap();
     assert_eq!((decoded.width, decoded.height), (60, 28));
     // Against the in-process export of the same frame, whole, at the
     // camera's white balance and defaults: the verb is the pipeline the
@@ -1861,9 +1861,9 @@ fn the_command_line_exports_into_the_rolls_folder() {
     let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("DSC_0001-4.jpg"), "{stdout}");
-    let brighter = td_photo::jpeg::decode(
+    let brighter = td_jpeg::decode(
         &std::fs::read(exported.join("DSC_0001-4.jpg")).unwrap(),
-        td_photo::jpeg::Scale::Full,
+        td_jpeg::Scale::Full,
     )
     .unwrap();
     assert!(mean(&brighter.data) > mean(&decoded.data) + 10);
@@ -1871,9 +1871,9 @@ fn the_command_line_exports_into_the_rolls_folder() {
     let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("DSC_0001-5.jpg"), "{stdout}");
-    let mono = td_photo::jpeg::decode(
+    let mono = td_jpeg::decode(
         &std::fs::read(exported.join("DSC_0001-5.jpg")).unwrap(),
-        td_photo::jpeg::Scale::Full,
+        td_jpeg::Scale::Full,
     )
     .unwrap();
     assert!(mono.data.chunks(3).all(|p| p[0] == p[1] && p[1] == p[2]));
@@ -1882,9 +1882,9 @@ fn the_command_line_exports_into_the_rolls_folder() {
     let (ok, stdout, stderr) = run(&[OsStr::new("export"), file.as_os_str()]);
     assert!(ok, "{stderr}");
     assert!(stdout.contains("DSC_0001-6.jpg"), "{stdout}");
-    let steep = td_photo::jpeg::decode(
+    let steep = td_jpeg::decode(
         &std::fs::read(exported.join("DSC_0001-6.jpg")).unwrap(),
-        td_photo::jpeg::Scale::Full,
+        td_jpeg::Scale::Full,
     )
     .unwrap();
     let spread = |image: &[u8]| {
@@ -2017,9 +2017,10 @@ fn the_thumb_verb_and_the_cache_follow_the_rules() {
     let dir = scratch("thumb");
     let (w, h) = (16, 8);
     let samples = random_frame(w, h, 14, 88);
-    let jpeg =
-        std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/z8-thumb.jpg"))
-            .unwrap();
+    let jpeg = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../td-jpeg/tests/fixtures/z8-thumb.jpg"),
+    )
+    .unwrap();
     let mut synth = Synth::lossless(w, h, &samples);
     synth.preview_bytes = jpeg.clone();
     let file = dir.join("DSC_0007.NEF");
@@ -2239,10 +2240,8 @@ fn the_thumb_verb_and_the_cache_follow_the_rules() {
         stdout.contains("thumbnail 120x160 from preview 0 (160x120)"),
         "{stdout}"
     );
-    let expected = td_photo::develop::orient(
-        td_photo::jpeg::decode(&jpeg, td_photo::jpeg::Scale::Full).unwrap(),
-        6,
-    );
+    let expected =
+        td_photo::develop::orient(td_jpeg::decode(&jpeg, td_jpeg::Scale::Full).unwrap(), 6);
     let got = std::fs::read(&out6).unwrap();
     assert_eq!(&got["P6\n120 160\n255\n".len()..], &expected.data[..]);
 
@@ -2305,9 +2304,9 @@ fn the_command_line_exports_at_a_quality_and_a_long_edge_and_every_pick() {
         names
     };
     let decode = |name: &str| {
-        td_photo::jpeg::decode(
+        td_jpeg::decode(
             &std::fs::read(exported.join(name)).unwrap(),
-            td_photo::jpeg::Scale::Full,
+            td_jpeg::Scale::Full,
         )
         .unwrap()
     };

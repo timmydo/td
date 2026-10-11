@@ -19,53 +19,53 @@ Efficiency codec are later increments, not silent partial support.
 
 ## Status and scope
 
-Implemented: the bounded TIFF container reader (`tiff`), the NEF reader over it
-(`nef`: the raw sub-image, the embedded previews, the exposure facts, and the
-maker-note white balance, black level, sensor crop and linearization table), the
-Nikon Huffman decoder for every tree dcraw names with the 14-bit lossless tree
-verified against a real Z 8 frame and the others against the test encoder only,
-the camera table with the Z 8's colour matrix (`camera`), the linear colour math
-and the sRGB transfer (`color`), the look format with its built-in set (`look`),
-the superpixel demosaic, area resampler and headless development pipeline with
-the look in it, and the full-resolution bilinear demosaic export runs in row
-bands (`develop`), the RGB image buffers and PPM writer and reader
-(`image`), the baseline JPEG decoder for the embedded previews with its
-reduced-transform scaling and the baseline encoder export writes through
-(`jpeg`), the AV1 still-picture encoder (`av1` over `transform`, `cdf`,
-`deblock` and `cdef`) and the AVIF container (`avif`) export writes through
-instead when asked, the thumbnail rule and the thumbnail cache,
-the library's sidecar grammar, roll rules and dating rule (`library`), the cull
-and develop controller over td-ui's driven seam with its action table and scene
-(`ui`), the
-window over it with its thumbnail pool and control socket (`window`), and the
-command line `td-photo probe FILE`, `td-photo develop FILE OUT.ppm`, `td-photo
-export FILE`, `td-photo auto-picks ROLL`, `td-photo thumb FILE OUT.ppm`,
-`td-photo cache`, `td-photo
+Implemented: the bounded TIFF container reader (`tiff`), the NEF reader
+over it (`nef`: the raw sub-image, the embedded previews, the exposure
+facts, and the maker-note white balance, black level, sensor crop and
+linearization table), the Nikon Huffman decoder for every tree dcraw
+names with the 14-bit lossless tree verified against a real Z 8 frame
+and the others against the test encoder only, the camera table with the
+Z 8's colour matrix (`camera`), the linear colour math and the sRGB
+transfer (`color`), the look format with its built-in set (`look`), the
+superpixel demosaic, area resampler and headless development pipeline
+with the look in it, and the full-resolution bilinear demosaic export
+runs in row bands (`develop`), the PPM writer and reader over td-jpeg's
+RGB buffer (`image`), the thumbnail rule over td-jpeg's preview decoder
+and the baseline encoder export writes through (`jpeg`), the AV1
+still-picture encoder (`av1` over `transform`, `cdf`, `deblock` and
+`cdef`) and the AVIF container (`avif`) export writes through instead
+when asked, the thumbnail rule and the thumbnail cache, the library's
+sidecar grammar, roll rules and dating rule (`library`), the cull and
+develop controller over td-ui's driven seam with its action table and
+scene (`ui`), the window over it with its thumbnail pool and control
+socket (`window`), and the command line `td-photo probe FILE`, `td-photo
+develop FILE OUT.ppm`, `td-photo export FILE`, `td-photo auto-picks
+ROLL`, `td-photo thumb FILE OUT.ppm`, `td-photo cache`, `td-photo
 looks`, `td-photo import SRC DEST`, `td-photo list ROLL`, `td-photo flag
-FILE`, `td-photo edit FILE`, `td-photo open [ROLL]` (a bare `td-photo` is
-`open`), `td-photo --replay`, `td-photo --preview` and `td-photo --help
-actions`. Every read of a camera
-file is bounded by `MAX_FILE_BYTES`, of a sidecar by `MAX_SIDECAR_BYTES` and
-of a look by `MAX_LOOK_BYTES`, trusting neither the length the file system
-reported; `develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
-already exists rather than replace it, `export` takes the first free numbered
-name and refuses a stale `STEM.jpg.tmp`, and `import` a copy that differs,
-publishing the finished temporary by a hard link so a name that appeared
-meanwhile is not replaced either; the sidecar is the one file td-photo
-replaces, and only through its own temporary. The crate depends on
-td-ui, by path, for the driven seam, the raster and bands the scene is laid out
-with, the pinned outline face the live window draws its text in and the
-Wayland client the window runs on; the window's develop mode
-lands over its own slices: the mode, its keys and the develop edits over the
-seam and the socket are in, as are the developed preview and the crop drag
-with its edge and corner handles and the look palette; the `export` verb and
-the window's `export` action are in, `delete-rejected` with them, and the
-export view with its settings and the picks' export close the export
-increment, AVIF included. The crate is packaged: the `td-photo`
-target recipe builds it static over the staged td-civil, td-ui and
-td-compositor trees, the image copies its output and links
-`/bin/td-photo`, and `td-photo-test` runs the built binary's verbs over a synthetic frame
-(Packaging below).
+FILE`, `td-photo edit FILE`, `td-photo open [ROLL]` (a bare `td-photo`
+is `open`), `td-photo --replay`, `td-photo --preview` and `td-photo
+--help actions`. Every read of a camera file is bounded by
+`MAX_FILE_BYTES`, of a sidecar by `MAX_SIDECAR_BYTES` and of a look by
+`MAX_LOOK_BYTES`, trusting neither the length the file system reported;
+`develop` and `thumb` refuse an `OUT.ppm` (or `OUT.ppm.tmp`) that
+already exists rather than replace it, `export` takes the first free
+numbered name and refuses a stale `STEM.jpg.tmp`, and `import` a copy
+that differs, publishing the finished temporary by a hard link so a name
+that appeared meanwhile is not replaced either; the sidecar is the one
+file td-photo replaces, and only through its own temporary. The crate
+depends on td-ui, by path, for the driven seam, the raster and bands the
+scene is laid out with, the pinned outline face the live window draws
+its text in and the Wayland client the window runs on; the window's
+develop mode lands over its own slices: the mode, its keys and the
+develop edits over the seam and the socket are in, as are the developed
+preview and the crop drag with its edge and corner handles and the look
+palette; the `export` verb and the window's `export` action are in,
+`delete-rejected` with them, and the export view with its settings and
+the picks' export close the export increment, AVIF included. The crate
+is packaged: the `td-photo` target recipe builds it static over the
+staged td-civil, td-jpeg, td-ui and td-compositor trees, the image
+copies its output and links `/bin/td-photo`, and `td-photo-test` runs
+the built binary's verbs over a synthetic frame (Packaging below).
 
 The rules below define version 1; the increments identify the order of
 implementation, not choices left to each implementing agent.
@@ -90,9 +90,10 @@ malformed file is an error naming what was refused, never a panic or an
 unbounded read.
 
 Production code has no `unwrap`, `expect`, panics or panicking indexing;
-the crate root forbids `unsafe`, and its confinement tests pin that td-ui
-and td-civil (the calendar the EXIF date is checked against) are its only
-dependencies and which files name which of td-ui's modules.
+the crate root forbids `unsafe`, and its confinement tests pin that
+td-ui, td-civil (the calendar the EXIF date is checked against) and
+td-jpeg (the preview decoder) are its only dependencies and which files
+name which of td-ui's modules.
 
 ## Workflow
 
@@ -1101,41 +1102,11 @@ camera pins them.
 
 ### Embedded previews (`jpeg`)
 
-The preview decoder is a baseline JPEG decoder: 8-bit, one or three
-components, horizontal and vertical sampling factors 1 or 2, Huffman DC/AC
-tables and restart intervals, one interleaved scan, component planes of at
-most 128 Mi samples together with their block padding
-(`MAX_PREVIEW_SAMPLES`, what a decode allocates), axes within `MAX_AXIS`,
-pixels within `MAX_IMAGE_PIXELS` and at most 32 table definitions
-(`MAX_TABLE_DEFINITIONS`), refusing progressive, arithmetic, lossless,
-hierarchical (a DHP, EXP or DAC marker anywhere before the scan), 12-bit and
-multi-scan streams by name. SOF1 at 8 bits and 16-bit quantisers in an SOF0
-stream are read as baseline; a lone component's sampling factors are
-ignored, one block per MCU, as T.81 A.2.2 codes it and libjpeg reads it. It
-decodes at 1/1, 1/2, 1/4 or 1/8 scale by a reduced inverse DCT over the
-first N coefficients of each axis (`Scale::covering` picks the coarsest
-scale whose long edge still covers what was asked).
-
-Its arithmetic is a contract shared with `tests/fixtures/jpeg_ref.py`, an
-independent transcription of T.81, so a decode is held to the oracle's
-hash and not to a tolerance: the transform is separable `f64` over
-literal constants, rows then columns, sums in ascending frequency; a
-sample is `floor(v + 128 + 0.5)` clamped to 0..=255; chroma is replicated
-to the luma grid, not interpolated; and the JFIF constants (1.402,
-0.344136, 0.714136, 1.772) are applied with `floor(x + 0.5)`.
-
-It is strict where leniency would hide corruption, and the oracle refuses
-the same streams: a Huffman table with an over-full tree or a code of all
-ones (T.81 C.2, which is what tells padding from a symbol), a DC category
-past 11 or an AC size past 10, a DC predictor outside 16 bits, an AC
-symbol without magnitude other than EOB and ZRL, a run or a ZRL past the
-block, a scan that lists the frame's components out of order, a restart
-marker out of sequence or preceded by more than a byte's padding, and a
-scan followed by anything but EOI (a second scan, an unread byte,
-nothing) are each refused by name; what follows EOI is not read. A stream
-that ends early decodes to its end on zero bits and is reported as
-truncated after the MCU row it ran out in, so a cut file is an error and
-not a partial picture.
+The previews decode through td-jpeg (`td-jpeg/DESIGN.md`), a baseline
+decoder with reduced-transform scaling held to an independent oracle's
+hashes; td-photo's `jpeg` module holds the thumbnail rule over it and
+the export encoder, which shares the decoder's basis and zigzag order
+(`td_jpeg::T8`, `td_jpeg::ZIGZAG`).
 
 The thumbnail rule: for a long edge N, take the smallest preview whose
 long edge covers N (else the largest), decode it at the coarsest covering
@@ -1986,15 +1957,14 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
   stays the window's oracle.
 - Budgets are named constants the tests pin: `RAW_CACHE_BYTES` 512 MiB,
   `THUMB_CACHE_BYTES` 256 MiB in memory, `MAX_FILE_BYTES` 512 MiB,
-  `MAX_RAW_SAMPLES` 128 Mi, `MAX_PREVIEW_SAMPLES` 128 Mi over a preview's padded
-  component planes, `MAX_TABLE_DEFINITIONS` 32, `MAX_IFDS` 64, `MAX_ENTRIES`
-  4096, `MAX_PHOTOS` 100,000 originals in an open roll and `MAX_SIDECAR_TOTAL`
+  `MAX_RAW_SAMPLES` 128 Mi, `MAX_IFDS` 64, `MAX_ENTRIES` 4096,
+  `MAX_PHOTOS` 100,000 originals in an open roll and `MAX_SIDECAR_TOTAL`
   64 MiB of sidecar text between them, `MAX_WAIT_MS` 4,000 ms for one
-  `wait-idle`, `CONTROL_JOBS_PER_TURN` 8 requests a turn, `MAX_AXIS` 16384 for
-  raw and image axes alike, `MAX_IMAGE_PIXELS` 64 Mi for any one image buffer
-  (768 MiB as `f32` RGB, under a 32-bit target's allocation limit), `MAX_RANGE`
-  32768 for a decoder parameter set's sample range. Eviction is least recently
-  shown.
+  `wait-idle`, `CONTROL_JOBS_PER_TURN` 8 requests a turn, `MAX_AXIS`
+  16384 for raw and image axes alike, `MAX_IMAGE_PIXELS` 64 Mi for any
+  one image buffer (768 MiB as `f32` RGB, under a 32-bit target's
+  allocation limit), `MAX_RANGE` 32768 for a decoder parameter set's
+  sample range. Eviction is least recently shown.
 - Buffers are allocated once per size and reused: the level-2 and level-3
   buffers per canvas size, the decoder's output per raw geometry.
 
@@ -2021,25 +1991,26 @@ thumbnail is not ready paints a neutral placeholder and its name, never blocks.
 - The decoded sample of the 14-bit lossless tree is what dcraw decodes;
   the pinned real-frame fixture is the oracle and a change that moves it
   is a codec change.
-- No `unsafe`, no dependency other than td-ui and td-civil, no
+- No `unsafe`, no dependency other than td-ui, td-civil and td-jpeg, no
   `include!`, no build script.
 
 ## Test contract
 
 `tests/confinement.rs` pins the source inventory, that the crate root
-forbids `unsafe`, that the manifest declares td-ui and td-civil as its
-only dependencies (and a pure module names only td-civil's month length),
-the native case and the trusted test root (the window binds its control
-socket under the harness's directory in `/tmp`, and td-ui's socket refuses
-an ancestor the gate's rootless namespace shows as owned by no one, so the
-gate's cargo-test runs take the builder's caller-owned sticky root, as
-td-editor's do), no build script and no `include!`, that the pure modules
-name no `std::fs`, `std::env`, `std::time`, `std::net` or `std::process`
-path and the window no file of its own (the theme's is td-ui's
-`theme_file`), which files name which toolkit modules, that photo pixels
-reach a frame through `ui::blit` alone and the verb and the window share
-one thumbnail rule, that export develops in bands into the encoder through
-a temporary of its own name and the encoder spreads its transform through
+forbids `unsafe`, that the manifest declares td-ui, td-civil and td-jpeg
+as its only dependencies (and a pure module names only td-civil's month
+length), the native case and the trusted test root
+(the window binds its control socket under the harness's directory in
+`/tmp`, and td-ui's socket refuses an ancestor the gate's rootless
+namespace shows as owned by no one, so the gate's cargo-test runs take
+the builder's caller-owned sticky root, as td-editor's do), no build
+script and no `include!`, that the pure modules name no `std::fs`,
+`std::env`, `std::time`, `std::net` or `std::process` path and the
+window no file of its own (the theme's is td-ui's `theme_file`), which
+files name which toolkit modules, that photo pixels reach a frame
+through `ui::blit` alone and the verb and the window share one thumbnail
+rule, that export develops in bands into the encoder through a temporary
+of its own name and the encoder spreads its transform through
 `develop`'s bands, and the budgets by value.
 
 `tests/nef.rs` carries a synthetic NEF writer and a Nikon Huffman encoder
@@ -2121,32 +2092,16 @@ holds the step to the rule over `develop`'s frame at the measure's edge, whole
 and cropped, the same choice again no step, undone step by step, and a sidecar
 the reader refuses refusing the measure with the file kept.
 
-`tests/jpeg.rs` carries a synthetic baseline JPEG writer (fixed complete
-DC and incomplete AC tables, byte stuffing, restart markers, 8- and
-16-bit quantisers) and an in-test reference of the decoder's arithmetic
-written the long way over a copy of the same literal tables, and pins:
-grey and three-component round trips of every sampling shape, chroma
-coarser and finer than luma, with and without restarts, at every scale,
-exactly; the real Z 8 thumbnail (`tests/fixtures/z8-thumb.jpg`) held
-exactly to the coefficient hash and the four pixel hashes the oracle
-recorded; the scale and thumbnail rules by value; and every refusal by
-name (a non-JPEG, a cut stream, an early EOI, every unsupported frame
-type and the hierarchical and arithmetic markers, a second frame,
-precision, component layout and sampling factor, axes zero or past the
-ceilings and planes past the sample budget, a missing, over-full,
-all-ones or zero-valued table and more definitions than the budget, a
-scan that is not the whole frame or lists it out of order, a missing,
-wrong or out-of-sequence restart marker and an unread byte before one, a
-code no table holds, a reserved AC symbol, a predictor past 16 bits, a
-run or a ZRL past the block, and anything but EOI after the scan); and the
-encoder against the decoder (Export, above): ramps of every partial-block
-shape at `QUALITY` and noise at quality 100 round-tripping within their
-tolerances, a grey frame staying grey, the stream compressing, the bytes
-identical however the rows are fed and on any thread count, the axes
-and rows refused by name, and the headers held to their literal bytes (the
-frame and scan segments whole, each table's counts, the luma quantiser's
-first zigzag entries and the chroma's last at `QUALITY`); the standard
-tables' completeness is an inline unit test in `jpeg`.
+`tests/jpeg.rs` pins the thumbnail rule by value over td-jpeg's Z 8
+thumbnail fixture, and the encoder against the decoder (Export, above):
+ramps of every partial-block shape at `QUALITY` and noise at quality 100
+round-tripping within their tolerances, a grey frame staying grey, the
+stream compressing, the bytes identical however the rows are fed and on
+any thread count, the axes and rows refused by name, and the headers
+held to their literal bytes (the frame and scan segments whole, each
+table's counts, the luma quantiser's first zigzag entries and the
+chroma's last at `QUALITY`); the standard tables' completeness is an
+inline unit test in `jpeg`.
 
 `tests/av1.rs` pins the AV1 encoder: the geometry by value (the mode-info
 and superblock grids, the tile columns the width needs and the rows
@@ -2560,22 +2515,24 @@ all-target Clippy.
 
 ## Packaging
 
-The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds the
-crate with cargo on the source-built toolchain, staging the `td-civil`,
-`td-ui` and `td-compositor` trees beside it so the calendar resolves and
-the toolkit's `#[path]` mounts and embedded notices resolve as the
-sources name them, links the binary fully static and splits its debug
-companion: the td-editor and td-taskmgr shape, with a lock that lists
-only td-photo, td-civil and td-ui. The system image
-(`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe output,
-companion included, into the immutable root and links `/bin/td-photo` to
-it; the tool is run from the terminal or from the launcher's Photos card,
-which the authority-mode compositor starts through fixed request 09 as the
-human, in the account home (td-authd/DESIGN.md). Either way it receives no
-authority, socket or credential of its own. The four trees are a local
-source: their bytes are the checkout, re-derived on every run from the
-paths `seed/local-source-roster.txt` declares, so no committed digest
-moves when one of their files does; DESIGN.md is excluded from staging.
+The target recipe `td-photo` (`recipes/src/recipes/td-photo.rs`) builds
+the crate with cargo on the source-built toolchain, staging the
+`td-civil`, `td-jpeg`, `td-ui` and `td-compositor` trees beside it so
+the calendar and the decoder resolve and the toolkit's `#[path]` mounts
+and embedded notices resolve as the sources name them, links the binary
+fully static and splits its debug companion: the td-editor and
+td-taskmgr shape, with a lock that lists only td-photo, td-civil,
+td-jpeg and td-ui. The system image
+(`recipes/src/recipes/system-x86-64.rs`) copies the complete recipe
+output, companion included, into the immutable root and links
+`/bin/td-photo` to it; the tool is run from the terminal or from the
+launcher's Photos card, which the authority-mode compositor starts
+through fixed request 09 as the human, in the account home
+(td-authd/DESIGN.md). Either way it receives no authority, socket or
+credential of its own. The staged trees are a local source: their bytes
+are the checkout, re-derived on every run from the paths
+`seed/local-source-roster.txt` declares, so no committed digest moves
+when one of their files does; DESIGN.md is excluded from staging.
 
 The realized-output check `td-photo-test` requires and asserts the static
 binary, runs `--help` and an empty `--replay` on the target, then compiles
@@ -2598,7 +2555,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    colour math, superpixel demosaic, resampler, and `probe` and `develop`
    headless. Landed with this document.
 2. Previews: the baseline JPEG decoder with reduced-IDCT scaling and its
-   oracle, the thumbnail rule and cache, `td-photo thumb FILE OUT.ppm`,
+   oracle (since moved to td-jpeg), the thumbnail rule and cache,
+   `td-photo thumb FILE OUT.ppm`,
    `td-photo cache`, and preview facts and hashes in `probe`. Landed.
 3. Library: rolls, the sidecar reader and writer, `import`, `list`,
    `flag` and `edit` headless, with the never-overwrite and never-unlink

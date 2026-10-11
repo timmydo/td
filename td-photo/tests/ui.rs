@@ -4813,7 +4813,7 @@ fn the_binary_exports_over_the_replay_and_notes_the_status_row() {
         ["DSC_0001-2.jpg", "DSC_0001.jpg"]
     );
     let first = fs::read(roll.join("exported/DSC_0001.jpg")).unwrap();
-    let head = td_photo::jpeg::header(&first).unwrap();
+    let head = td_jpeg::header(&first).unwrap();
     assert_eq!((head.width, head.height), (60, 44));
 
     // A frame that cannot be decoded fails on the request: `refused`, the
@@ -4932,8 +4932,7 @@ fn the_binary_keeps_the_export_settings_and_exports_the_picks_over_the_replay() 
         text_of(&b[4][1..])
     );
     assert_eq!(names(&roll.join("exported")), ["DSC_0001.jpg"]);
-    let head =
-        td_photo::jpeg::header(&fs::read(roll.join("exported/DSC_0001.jpg")).unwrap()).unwrap();
+    let head = td_jpeg::header(&fs::read(roll.join("exported/DSC_0001.jpg")).unwrap()).unwrap();
     assert_eq!((head.width, head.height), (32, 23));
     // From the grid too, by the key.
     let c = session.send(&[

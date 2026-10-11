@@ -822,7 +822,7 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
         "| exported DSC_0001.",
     );
     let jpeg = std::fs::read(roll.join("exported/DSC_0001.jpg")).unwrap();
-    let head = td_photo::jpeg::header(&jpeg).unwrap();
+    let head = td_jpeg::header(&jpeg).unwrap();
     assert_eq!((head.width, head.height), (60, 44));
 
     // The picks' auto on the pool: a pick with neither key, written on
@@ -870,7 +870,7 @@ fn the_window_develops_the_cursor_photo_over_the_native_compositor() {
     assert!(client.finish(), "td-photo exited with a failure");
     assert!(!socket.exists(), "the control socket was left behind");
     let jpeg = std::fs::read(roll.join("exported/DSC_0001-2.jpg")).unwrap();
-    let head = td_photo::jpeg::header(&jpeg).unwrap();
+    let head = td_jpeg::header(&jpeg).unwrap();
     assert_eq!((head.width, head.height), (60, 44));
     compositor.stop();
 }

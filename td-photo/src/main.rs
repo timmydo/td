@@ -422,7 +422,7 @@ fn describe(nef: &Nef, data: &[u8], out: &mut impl Write) -> io::Result<()> {
     }
     for p in &nef.previews {
         match data.get(p.offset..p.offset.saturating_add(p.len)) {
-            Some(bytes) => match jpeg::header(bytes) {
+            Some(bytes) => match td_jpeg::header(bytes) {
                 Ok(h) => writeln!(
                     out,
                     "preview: {}+{} {}x{} {} component(s) sampling {}x{}",
@@ -502,7 +502,7 @@ fn probe(path: &Path, rest: &[OsString]) -> Result<(), String> {
                 continue;
             };
             let started = Instant::now();
-            match jpeg::decode(bytes, jpeg::Scale::Full) {
+            match td_jpeg::decode(bytes, td_jpeg::Scale::Full) {
                 Ok(image) => writeln!(
                     out,
                     "preview-decode: {index} {}x{} fnv1a64 {:#018x}, {} ms",
@@ -1677,13 +1677,13 @@ fn choose_preview<'a>(
     nef: &Nef,
     data: &'a [u8],
     long_edge: usize,
-) -> Option<(usize, &'a [u8], jpeg::Header)> {
-    let mut best: Option<(usize, &'a [u8], jpeg::Header)> = None;
+) -> Option<(usize, &'a [u8], td_jpeg::Header)> {
+    let mut best: Option<(usize, &'a [u8], td_jpeg::Header)> = None;
     for (index, p) in nef.previews.iter().enumerate() {
         let Some(bytes) = data.get(p.offset..p.offset.saturating_add(p.len)) else {
             continue;
         };
-        let Ok(header) = jpeg::header(bytes) else {
+        let Ok(header) = td_jpeg::header(bytes) else {
             continue;
         };
         let long = header.width.max(header.height);
