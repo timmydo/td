@@ -773,7 +773,7 @@ terminal-launch success is evidence of FIDO2 authentication or consent.
 
 `td-authd/tests/launch_vm.rs` is a standalone disposable-VM fixture. Compile
 it with host rustc for an installed static target, then run its binary with
-`--run-vm KERNEL AUTHD FIRSTBOOT LOGIN BUSYBOX NEW-LOG`, using absolute
+`--run-vm KERNEL AUTHD FIRSTBOOT LOGIN TD-INIT NEW-LOG`, using absolute
 paths. The supplied production binaries may be source-built target outputs;
 the fixture itself is a host diagnostic, never an input to a target recipe
 or part of an image. It requires td's pidfs-capable kernel and QEMU on the
@@ -1789,7 +1789,7 @@ td-svc's authority cgroup containment apply as for an update. td-install
 opens the channel, so a review a live boot's installer holds is selectable.
 
 The host-only launch VM fixture also accepts `--run-taskmgr-vm`, followed
-by the ordinary kernel/authd/firstboot/login/busybox inputs, compositor,
+by the ordinary kernel/authd/firstboot/login/td-init inputs, compositor,
 task manager, optional deployment EROFS, and a new absolute log path.
 With EROFS it mounts the deployment read-only and resolves every program
 under test through its shipped /bin link and /td/store output. It drives

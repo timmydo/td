@@ -16,8 +16,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // forces libeu.a + libz.a members into the link — a bare elf_getshdrnum() would
 // leave them unreferenced and let an empty/broken libz.a pass (Codex review). If
 // the static archives don't link or don't work, this reds here — cheaply —
-// instead of only in the full vmlinux build. Mirrors make-test / busybox-test
-// (build the producer, run its output) using the make-x86-64 wrapper shape.
+// instead of only in the full vmlinux build. Mirrors make-test (build the
+// producer, run its output) using the make-x86-64 wrapper shape.
 pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";

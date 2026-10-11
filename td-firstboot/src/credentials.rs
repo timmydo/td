@@ -296,12 +296,12 @@ pub(super) fn provision(
 #[cfg(test)]
 mod tests {
     #[test]
-    #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
+    #[ignore = "requires a disposable root VM without a TPM and TD_TEST_ROOT_TD_UTIL=/bin/td-util"]
     fn token_store_boot_stays_locked_and_provisioning_preserves_records() {
         secret_store::require_root().unwrap();
         assert_eq!(
-            std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(),
-            "/bin/busybox"
+            std::env::var("TD_TEST_ROOT_TD_UTIL").unwrap(),
+            "/bin/td-util"
         );
         assert!(!Path::new("/dev/tpmrm0").exists());
         let root = std::env::temp_dir().join(format!("td-token-boot-{}", std::process::id()));
@@ -437,13 +437,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an explicitly selected disposable root VM without a TPM"]
+    #[ignore = "requires a disposable root VM without a TPM and TD_TEST_ROOT_TD_UTIL=/bin/td-util"]
     fn legacy_tpm_boot_never_unseals_and_rejects_a_stale_release() {
         secret_store::require_root().unwrap();
-        assert_eq!(
-            std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap(),
-            "/bin/busybox"
-        );
+        let td_util = std::env::var("TD_TEST_ROOT_TD_UTIL").unwrap();
+        assert_eq!(td_util, "/bin/td-util");
         assert!(!Path::new("/dev/tpmrm0").exists());
         let root = std::env::temp_dir().join(format!("td-isolated-release-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
@@ -524,9 +522,18 @@ mod tests {
             let metadata = fs::metadata(&path).unwrap();
             assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (0, 0o700));
             assert!(secret_store::Store::open_owned(&path, 1000, 991, false).is_err());
+            // The positive control: the probe reads the file as root, so a
+            // td-util that fails for any reason cannot pass the denials below.
+            assert!(std::process::Command::new(&td_util)
+                .arg("cat")
+                .arg(path.join("master"))
+                .output()
+                .unwrap()
+                .status
+                .success());
             for uid in [1000, 991] {
                 use std::os::unix::process::CommandExt;
-                assert!(!std::process::Command::new("/bin/busybox")
+                assert!(!std::process::Command::new(&td_util)
                     .arg("cat")
                     .arg(path.join("master"))
                     .uid(uid)

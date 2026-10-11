@@ -1203,14 +1203,14 @@ mod tests {
         )
     }
 
-    /// Run only in a disposable root VM with TD_TEST_ROOT_BUSYBOX=/bin/busybox.
+    /// Run only in a disposable root VM with TD_TEST_ROOT_TD_UTIL=/bin/td-util.
     #[test]
-    #[ignore = "requires a disposable root VM and explicit busybox fixture"]
+    #[ignore = "requires a disposable root VM and explicit td-util fixture"]
     fn ownership_transfer_preserves_bytes_and_removes_human_access() {
         use std::os::unix::process::CommandExt;
         require_root().unwrap();
-        let busybox = std::env::var("TD_TEST_ROOT_BUSYBOX").unwrap();
-        assert!(Path::new(&busybox).is_absolute());
+        let td_util = std::env::var("TD_TEST_ROOT_TD_UTIL").unwrap();
+        assert!(Path::new(&td_util).is_absolute());
         let root = std::env::temp_dir().join(format!("td-owner-migration-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1223,7 +1223,7 @@ mod tests {
             path
         };
         let read = |uid: u32, path: &Path| {
-            std::process::Command::new(&busybox)
+            std::process::Command::new(&td_util)
                 .arg("cat")
                 .arg(path)
                 .uid(uid)

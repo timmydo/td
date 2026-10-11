@@ -642,13 +642,15 @@ attached disk. Compile it as a static executable with the test host's Rust
 toolchain (or td's target toolchain), then run:
 
 ```text
-pair-vm --run-vm /absolute/bzImage /absolute/td-svc /absolute/busybox /absolute/new-serial.log [pair|leaf]
+pair-vm --run-vm /absolute/bzImage /absolute/td-svc /absolute/td-init /absolute/new-serial.log [pair|leaf]
 ```
 
-`leaf` runs the `stop=leaf` scenario instead: the first leader starts a
-child through busybox `setsid` before anything else, so it leaves the
-leader's group and session, then requires that it and the child are both
-in the leaf (the start gate), and crashes. The leader restarted in place
+`leaf` runs the `stop=leaf` scenario instead: the first leader, before
+anything else, starts a child through td-init's `cttyhack`, which always
+calls `setsid(2)` for a caller with no controlling terminal, so the child
+leaves the leader's group and session (the archive has no `/dev/ttyS0`
+for its console claim, so stdio stays untouched). The leader then requires
+that it and the child are both in the leaf (the start gate), and crashes. The leader restarted in place
 must find that child alive in the same leaf and asks for a `restart`; the
 next leader must find it gone. `TD_QEMU_ACCEL=kvm` boots under KVM; unset or `tcg`
 keeps TCG.

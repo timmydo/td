@@ -2,7 +2,7 @@ use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // flex-x86-64-test: behavioral validation of the source-built `flex` (#529),
-// mirroring make-test / busybox-test (build the producer, RUN its output). The
+// mirroring make-test (build the producer, RUN its output). The
 // kernel rung needs flex to actually GENERATE a scanner — and flex's scanner
 // generation is the one novel runtime path here: flex expands its skeleton
 // (flex.skl) through the m4 whose absolute path was baked in at configure

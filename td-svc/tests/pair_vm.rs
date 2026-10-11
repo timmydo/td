@@ -1,5 +1,5 @@
 //! Standalone static VM fixture and host runner. --run-vm builds a temporary
-//! initramfs and boots it with explicit kernel, supervisor and busybox inputs.
+//! initramfs and boots it with explicit kernel, supervisor and td-init inputs.
 //! Two scenarios: `pair` (the default) and `leaf`, a `stop=leaf` unit.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -120,8 +120,12 @@ fn leaf_result(text: &str) -> ! {
 fn leader() {
     let first = !Path::new("/run/leaf-session").exists();
     let early = first.then(|| {
-        Command::new("/bin/busybox")
-            .args(["setsid", "/pair-probe", "session"])
+        // td-init's cttyhack always setsid(2)s a caller with no controlling
+        // terminal, and the leader has none. It then tries to claim the console
+        // /sys names (ttyS0); the archive has no /dev/ttyS0, so stdio stays
+        // untouched.
+        Command::new("/bin/td-init")
+            .args(["cttyhack", "/pair-probe", "session"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -185,14 +189,14 @@ fn mount_pseudo_filesystems() {
         fs::create_dir_all(path).unwrap();
     }
     for (kind, destination) in [("proc", "/proc"), ("sysfs", "/sys")] {
-        assert!(Command::new("/bin/busybox")
+        assert!(Command::new("/bin/td-init")
             .args(["mount", "-t", kind, kind, destination])
             .status()
             .unwrap()
             .success());
     }
     fs::create_dir_all("/sys/fs/cgroup").unwrap();
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mount", "-t", "cgroup2", "none", "/sys/fs/cgroup"])
         .status()
         .unwrap()
@@ -361,18 +365,16 @@ fn artifact(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_vm(arguments: &[String]) -> std::io::Result<()> {
-    let (kernel, supervisor, busybox, log_path, scenario) = match arguments {
-        [_verb, kernel, supervisor, busybox, log_path] => {
-            (kernel, supervisor, busybox, log_path, "pair")
-        }
-        [_verb, kernel, supervisor, busybox, log_path, scenario]
+    let (kernel, supervisor, init, log_path, scenario) = match arguments {
+        [_verb, kernel, supervisor, init, log_path] => (kernel, supervisor, init, log_path, "pair"),
+        [_verb, kernel, supervisor, init, log_path, scenario]
             if scenario == "pair" || scenario == "leaf" =>
         {
-            (kernel, supervisor, busybox, log_path, scenario.as_str())
+            (kernel, supervisor, init, log_path, scenario.as_str())
         }
         _ => {
             return Err(std::io::Error::other(
-                "usage: pair-vm --run-vm KERNEL TD-SVC BUSYBOX NEW-LOG [pair|leaf]",
+                "usage: pair-vm --run-vm KERNEL TD-SVC TD-INIT NEW-LOG [pair|leaf]",
             ))
         }
     };
@@ -388,7 +390,7 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
         Ok("tcg") | Err(std::env::VarError::NotPresent) => "tcg",
         _ => return Err(std::io::Error::other("TD_QEMU_ACCEL must be kvm or tcg")),
     };
-    for input in [kernel, supervisor, busybox, log_path] {
+    for input in [kernel, supervisor, init, log_path] {
         if !Path::new(input).is_absolute() {
             return Err(std::io::Error::other(
                 "VM artifact and log paths must be absolute",
@@ -439,7 +441,7 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
             0,
             0,
         ),
-        ("bin/busybox", 0o100755, artifact(Path::new(busybox))?, 0, 0),
+        ("bin/td-init", 0o100755, artifact(Path::new(init))?, 0, 0),
         ("TRAILER!!!", 0, Vec::new(), 0, 0),
     ] {
         entry(&mut archive, inode, name, mode, &data, major, minor);

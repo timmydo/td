@@ -6064,15 +6064,15 @@ pub(crate) fn run_selected(root: &Path, args: &[String], defer_checks: bool) -> 
         // here" machine signal. It is explained loudly here but PROPAGATED UNCHANGED —
         // never rewritten to success: the run did not validate the targets,
         // and the exit code must say so (PR review); the caller decides what
-        // PARTIAL means for its tier: the loop reports it when this host has
-        // no toolchain to place the stage0 td-builder with, and the preflights
-        // above (cargo test, on the AGENTS.md rust-toolchain control plane)
-        // are then the per-PR validation.
+        // PARTIAL means for its tier. The loop prints its own reason before it
+        // exits 69, so this line points at that rather than restating it; the
+        // preflights above (cargo test, on the AGENTS.md rust-toolchain control
+        // plane) are then the per-PR validation.
         if code == crate::check_loop::EXIT_UNPROVISIONED {
             println!(
-                "affected-checks: check targets [{}] exited UNPROVISIONED (69) — this host \
-                 has no toolchain to place the loop's stage0 td-builder with; the \
-                 preflights above are the coverage; exit code 69 propagated unchanged",
+                "affected-checks: check targets [{}] exited UNPROVISIONED (69) — the loop \
+                 could not run on this host (its reason is above); the preflights above \
+                 are the coverage; exit code 69 propagated unchanged",
                 sel.targets.join(" ")
             );
         }

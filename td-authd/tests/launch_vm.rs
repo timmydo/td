@@ -6,7 +6,7 @@
     clippy::indexing_slicing
 )]
 //! Standalone host VM fixture; compile with host rustc for an installed static
-//! target. --run-vm takes kernel, authd, firstboot, login, busybox and a new log.
+//! target. --run-vm takes kernel, authd, firstboot, login, td-init and a new log.
 //! Fixture code is never a target recipe input or shipped distribution artifact.
 #[path = "../src/channel.rs"]
 mod channel;
@@ -230,7 +230,7 @@ fn attempt(denied: bool, wrong_sender: bool, placement_denied: bool) {
 }
 
 fn init() {
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mount", "-t", "proc", "proc", "/proc"])
         .status()
         .unwrap()
@@ -240,7 +240,7 @@ fn init() {
         taskmgr::mount_image();
     }
     fs::create_dir_all("/sys/fs/cgroup").unwrap();
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mount", "-t", "cgroup2", "none", "/sys/fs/cgroup"])
         .status()
         .unwrap()
@@ -581,18 +581,18 @@ fn artifact(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn run_vm(arguments: &[String]) -> std::io::Result<()> {
-    let (kernel, authority, firstboot, login, busybox, extra, image, log_path) = match arguments {
-        [verb, kernel, authority, firstboot, login, busybox, log] if verb == "--run-vm" =>
-            (kernel, authority, firstboot, login, busybox, None, None, log),
-        [verb, kernel, authority, firstboot, login, busybox, compositor, taskmgr, log]
+    let (kernel, authority, firstboot, login, init, extra, image, log_path) = match arguments {
+        [verb, kernel, authority, firstboot, login, init, log] if verb == "--run-vm" =>
+            (kernel, authority, firstboot, login, init, None, None, log),
+        [verb, kernel, authority, firstboot, login, init, compositor, taskmgr, log]
             if verb == "--run-taskmgr-vm" =>
-            (kernel, authority, firstboot, login, busybox, Some((compositor, taskmgr)), None, log),
-        [verb, kernel, authority, firstboot, login, busybox, compositor, taskmgr, image, log]
+            (kernel, authority, firstboot, login, init, Some((compositor, taskmgr)), None, log),
+        [verb, kernel, authority, firstboot, login, init, compositor, taskmgr, image, log]
             if verb == "--run-taskmgr-vm" =>
-            (kernel, authority, firstboot, login, busybox, Some((compositor, taskmgr)), Some(image), log),
-        _ => return Err(std::io::Error::other("usage: terminal-vm --run-vm KERNEL AUTHD FIRSTBOOT LOGIN BUSYBOX NEW-LOG; --run-taskmgr-vm adds COMPOSITOR TASKMGR [IMAGE] before NEW-LOG")),
+            (kernel, authority, firstboot, login, init, Some((compositor, taskmgr)), Some(image), log),
+        _ => return Err(std::io::Error::other("usage: terminal-vm --run-vm KERNEL AUTHD FIRSTBOOT LOGIN TD-INIT NEW-LOG; --run-taskmgr-vm adds COMPOSITOR TASKMGR [IMAGE] before NEW-LOG")),
     };
-    for input in [kernel, authority, firstboot, login, busybox, log_path]
+    for input in [kernel, authority, firstboot, login, init, log_path]
         .into_iter()
         .chain(
             extra
@@ -658,7 +658,7 @@ fn run_vm(arguments: &[String]) -> std::io::Result<()> {
             0,
             0,
         ),
-        ("bin/busybox", 0o100755, artifact(Path::new(busybox))?, 0, 0),
+        ("bin/td-init", 0o100755, artifact(Path::new(init))?, 0, 0),
         (
             "bin/td-firstboot",
             0o100755,

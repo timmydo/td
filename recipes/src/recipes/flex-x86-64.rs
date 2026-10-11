@@ -7,7 +7,7 @@ use crate::types::{Recipe, Step};
 // that let the 4.14 rung dodge flex/bison are GONE from the current tree
 // (re #529). Built FROM SOURCE by td's OWN native x86_64 toolchain —
 // gcc-x86-64-native (GCC 14.3.0) + binutils-x86-64-native (2.44) — driven by the
-// td-built make-x86-64, exactly the make-x86-64/busybox-x86-64 shape: STATIC
+// td-built make-x86-64, exactly the make-x86-64 shape: STATIC
 // against the /td/store x86_64 glibc 2.41, so the output has no ELF interpreter
 // and runs in any build sandbox with no glibc staging.
 //
@@ -128,7 +128,7 @@ pub fn recipe() -> Recipe {
     });
     // [native-arch] the produced flex is an ELF64 x86_64 binary — a NATIVE build
     // artifact — asserted by the interned native readelf, parity with
-    // make-x86-64 / busybox-x86-64.
+    // make-x86-64.
     steps.push(
         Step::run(
             "{out}",

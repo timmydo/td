@@ -1333,7 +1333,7 @@ under `/run` would correctly reserve the original Downloads grant and
 refuse application launch.
 
 The ignored `ownership_transfer_preserves_bytes_and_removes_human_access`
-test requires a disposable root VM and `TD_TEST_ROOT_BUSYBOX=/bin/busybox`.
+test requires a disposable root VM and `TD_TEST_ROOT_TD_UTIL=/bin/td-util`.
 It exercises real UID changes, repeat migration, an interrupted transfer,
 unknown files, links, foreign ownership and contention. It checks that the
 old human and an application UID cannot read the master or records, the

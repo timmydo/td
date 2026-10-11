@@ -30,7 +30,7 @@ fn line(output: impl Read + Send + 'static) -> String {
     text
 }
 pub(super) fn mount_image() {
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mount", "-t", "sysfs", "none", "/sys"])
         .status()
         .unwrap()
@@ -44,13 +44,13 @@ pub(super) fn mount_image() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let (major, minor) = device.trim().split_once(':').unwrap();
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mknod", "/dev/vda", "b", major, minor])
         .status()
         .unwrap()
         .success());
     fs::create_dir("/image").unwrap();
-    assert!(Command::new("/bin/busybox")
+    assert!(Command::new("/bin/td-init")
         .args(["mount", "-t", "erofs", "-o", "ro", "/dev/vda", "/image"])
         .status()
         .unwrap()
