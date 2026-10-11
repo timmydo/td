@@ -90,6 +90,10 @@ const TPM_AND_FIDO: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/fido_device.rs"),
     ),
     (
+        "{src}/td-fido/src/fido_disk.rs",
+        include_str!("../../../td-fido/src/fido_disk.rs"),
+    ),
+    (
         "{src}/td-fido/src/fido_enroll.rs",
         include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),

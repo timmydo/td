@@ -70,6 +70,7 @@ impl Pin {
 /// Fixed creation display labels: rp name, user name and display name alike.
 pub(super) const PORTABLE_LABEL: &str = "td personal vault";
 pub(super) const LOGIN_LABEL: &str = "td login";
+pub(super) const DISK_LABEL: &str = "td disk";
 
 /// Login admission's typed capability refusals (TOKEN-LOGIN.md, "Token profile").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,8 +809,11 @@ impl Profile {
     /// the rest must fit the advertised limits whole, one entry when absent.
     /// The client-data hash comes after the PIN prompt, as for a login
     /// assertion: `bind` adds it, and its value never changes the size.
-    pub(super) fn login_enrollment(
+    /// `label` names the domain: the login's, or the disk protector's
+    /// (td-install/ENCRYPTION.md, "FIDO2 protectors").
+    pub(super) fn labelled_enrollment(
         self,
+        label: &'static str,
         user: [u8; 32],
         excluded: &[&[u8]],
     ) -> Result<KeyRequest<UnboundCreation>, LoginFailure> {
@@ -842,7 +846,7 @@ impl Profile {
         if excluded.len() > self.advertised_list.unwrap_or(1) {
             return Err(refused());
         }
-        let intent = self.creation(LOGIN_LABEL, [0; 32], user, &excluded)?;
+        let intent = self.creation(label, [0; 32], user, &excluded)?;
         // Validated IDs leave the message limit as the only encoding failure.
         if !intent.excluded.is_empty() && intent.encode(&self, &self.auth_placeholder().0).is_err()
         {
@@ -2394,7 +2398,11 @@ mod tests {
                 );
                 let request = Profile::parse_login(&info)
                     .unwrap()
-                    .login_enrollment(fixture(label, "user").try_into().unwrap(), excluded)
+                    .labelled_enrollment(
+                        LOGIN_LABEL,
+                        fixture(label, "user").try_into().unwrap(),
+                        excluded,
+                    )
                     .unwrap();
                 assert_eq!(request.bytes(), fixture(label, "key_request"));
                 // The hash arrives after the prompt and changes no request before it.
@@ -2695,7 +2703,7 @@ mod tests {
         let create = |info: Info, excluded: &[&[u8]]| {
             Profile::parse_login(&info_with(label, info))
                 .unwrap()
-                .login_enrollment(user, excluded)
+                .labelled_enrollment(LOGIN_LABEL, user, excluded)
         };
         let too_small = Some(LoginFailure::Refused(LoginRefusal::ListTooSmall));
         assert!(create(Info::default(), &[]).is_ok());
@@ -2733,7 +2741,7 @@ mod tests {
         assert!(!sized.identifiable(&long[0]) && sized.identifiable(&[9; 200]));
         assert_eq!(
             sized
-                .login_enrollment(user, &[&long[0], &long[1]])
+                .labelled_enrollment(LOGIN_LABEL, user, &[&long[0], &long[1]])
                 .map(kept),
             Ok(0)
         );
@@ -2753,12 +2761,17 @@ mod tests {
         ))
         .unwrap();
         small.max_message = 400;
-        assert_eq!(small.login_enrollment(user, &refs[..3]).err(), too_small);
+        assert_eq!(
+            small
+                .labelled_enrollment(LOGIN_LABEL, user, &refs[..3])
+                .err(),
+            too_small
+        );
         // Without exclusions a size failure is not a list refusal.
         let mut tiny = Profile::parse_login(&info_with(label, Info::default())).unwrap();
         tiny.max_message = 100;
         assert!(matches!(
-            tiny.login_enrollment(user, &[]),
+            tiny.labelled_enrollment(LOGIN_LABEL, user, &[]),
             Err(LoginFailure::Protocol(_))
         ));
         for excluded in [&[b"".as_slice()][..], &[b"same", b"same"]] {
@@ -2779,7 +2792,7 @@ mod tests {
         assert!(matches!(
             Profile::parse_login(&algorithms)
                 .unwrap()
-                .login_enrollment(user, &[]),
+                .labelled_enrollment(LOGIN_LABEL, user, &[]),
             Err(LoginFailure::Protocol(_))
         ));
     }

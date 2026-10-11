@@ -8,7 +8,7 @@ use crate::fido_device::{self, Interruption};
 use crate::fido_p256::PublicKey;
 use crate::fido_pin::{EnrolledCredential, LoginRefusal, Pin};
 use crate::fido_transaction::{
-    Assertion, Channel, Error, LoginAssertion, LoginCreation, LoginError, LoginPin, Status,
+    Assertion, Devices, Error, LoginAssertion, LoginCreation, LoginError, LoginPin, Status,
     Transaction,
 };
 use crate::login_record::{self, NewKey, Phase, Record};
@@ -198,16 +198,6 @@ fn write(store: &Store, baseline: Baseline, change: Change<'_>) -> Outcome {
         Change::Publish(record, suffix) => store.publish(baseline, record, &mut &suffix[..]),
         Change::Remove => store.remove(baseline),
     }
-}
-
-/// Token access: the root USB transport, or virtual keys in tests.
-trait Devices {
-    type Node: Copy + Eq;
-    type Channel: Channel;
-    fn discover(&mut self) -> Result<Vec<Self::Node>, String>;
-    fn open(&mut self, node: Self::Node, deadline: Instant) -> Result<Self::Channel, String>;
-    /// Waits between a connect step's discoveries.
-    fn pause(&mut self, time: Duration);
 }
 
 /// Each session's HID worker holds `/run/td-fido/operation.lock`.

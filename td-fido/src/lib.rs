@@ -20,6 +20,7 @@ pub mod fido_aes;
 pub mod fido_cbor;
 pub mod fido_ctap;
 pub mod fido_device;
+pub mod fido_disk;
 pub mod fido_enroll;
 pub mod fido_hid;
 pub mod fido_p256;

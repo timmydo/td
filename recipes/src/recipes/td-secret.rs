@@ -63,6 +63,10 @@ const FIDO_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/fido_device.rs"),
     ),
     (
+        "{src}/td-fido/src/fido_disk.rs",
+        include_str!("../../../td-fido/src/fido_disk.rs"),
+    ),
+    (
         "{src}/td-fido/src/fido_enroll.rs",
         include_str!("../../../td-fido/src/fido_enroll.rs"),
     ),
@@ -104,6 +108,10 @@ const TEST_VECTORS: &[(&str, &str)] = &[
     (
         "{src}/td-fido/tests/aes_vectors.txt",
         include_str!("../../../td-fido/tests/aes_vectors.txt"),
+    ),
+    (
+        "{src}/td-fido/tests/disk_vectors.txt",
+        include_str!("../../../td-fido/tests/disk_vectors.txt"),
     ),
     (
         "{src}/td-fido/tests/login_ctap_vectors.txt",

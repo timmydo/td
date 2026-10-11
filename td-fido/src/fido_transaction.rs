@@ -6,14 +6,27 @@ use super::fido_hid::Message;
 use super::fido_p256::PublicKey;
 use super::fido_pin::{
     Creation, EnrolledCredential, HmacOutput, KeyRequest, LoginFailure, LoginRefusal, Pin, Profile,
-    RetriesRequest,
+    RetriesRequest, DISK_LABEL, LOGIN_LABEL,
 };
+use std::time::{Duration, Instant};
 
 /// A trusted backend supplies one channel and its original lifetime throughout.
 /// Drop must retire the channel; exchange must observe the same revocation state.
 pub trait Channel {
     fn check(&self) -> Result<(), Interruption>;
     fn exchange(&mut self, request: &[u8]) -> Result<Message, String>;
+}
+
+/// Token access over one Channel per transaction: the root USB transport,
+/// or virtual keys in tests. td-secret's login worker and the disk
+/// protector's flows (`fido_disk`) share it.
+pub trait Devices {
+    type Node: Copy + Eq;
+    type Channel: Channel;
+    fn discover(&mut self) -> Result<Vec<Self::Node>, String>;
+    fn open(&mut self, node: Self::Node, deadline: Instant) -> Result<Self::Channel, String>;
+    /// Waits between a connect step's discoveries.
+    fn pause(&mut self, time: Duration);
 }
 
 impl<P: Program> Channel for Session<P> {
@@ -475,7 +488,28 @@ impl<C: Channel> Transaction<C> {
     /// the notebook's requests in its order, each hash bound only once its
     /// PIN step's prompt has presented that step with the reported retries.
     pub fn login_create(
+        self,
+        intent: LoginCreation<'_>,
+        prompt: &mut impl FnMut(LoginPin<'_>, u8) -> Result<(Pin, [u8; 32]), String>,
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<EnrolledCredential, LoginError> {
+        self.create(LOGIN_LABEL, intent, prompt, entropy)
+    }
+
+    /// `login_create` under the disk protector's labels, `td disk`
+    /// (td-install/ENCRYPTION.md, "FIDO2 protectors").
+    pub fn disk_create(
+        self,
+        intent: LoginCreation<'_>,
+        prompt: &mut impl FnMut(LoginPin<'_>, u8) -> Result<(Pin, [u8; 32]), String>,
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<EnrolledCredential, LoginError> {
+        self.create(DISK_LABEL, intent, prompt, entropy)
+    }
+
+    fn create(
         mut self,
+        label: &'static str,
         intent: LoginCreation<'_>,
         prompt: &mut impl FnMut(LoginPin<'_>, u8) -> Result<(Pin, [u8; 32]), String>,
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
@@ -483,8 +517,11 @@ impl<C: Channel> Transaction<C> {
         self.check()?;
         let profile = self.login_profile()?;
         let retries = self.transition(profile.retries())?;
-        let request =
-            self.login_transition(profile.login_enrollment(intent.user, intent.excluded))?;
+        let request = self.login_transition(profile.labelled_enrollment(
+            label,
+            intent.user,
+            intent.excluded,
+        ))?;
         let reply = self.command(request.bytes())?;
         let (pin, challenge) =
             self.login_pin(&retries, |count| prompt(LoginPin::Creation, count))?;

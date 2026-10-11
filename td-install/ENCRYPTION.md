@@ -1390,8 +1390,10 @@ is refused as lacking `FIDO_2_1`. Its creation excludes
 every credential the header's fido2 tokens and the operation already
 name; it is proved, repeated and probed as TOKEN-LOGIN.md's new key is,
 each with its PIN and touch, the repeat reproducing the proof's output
-exactly. A credential ID longer than 255 bytes is refused before any
-PIN, which bounds the header ("Re-encrypting upgrade"). Login, notebook
+exactly. A credential ID longer than 255 bytes is refused as soon as
+makeCredential returns it, before the proof's PIN or any later one,
+which bounds the header ("Re-encrypting upgrade"); a header token's
+longer ID is refused before any token I/O. Login, notebook
 and application-store credentials are separate credentials on the same
 relying party: each domain has its own client-data domain and salt, and
 one physical key may hold any of them.
@@ -1414,7 +1416,20 @@ the signature over the authenticator data and that hash under the
 token's public key with td-fido's software P-256, so FIDO2 release
 needs no TPM; then it decrypts the hmac-secret output. The signature
 binds the assertion to this operation; the keyslot test after the cap
-proves the output.
+proves the output. The silent identify that precedes an assertion, and
+creation's identify probe, carry the hash of their operation's phase
+(unlock or authorize; probe), each over its own fresh random bytes.
+
+Since increment 8b td-fido's `fido_disk` implements these flows over
+one connected key, each step on its own session under the operation's
+absolute deadline, the same device rediscovered before each later
+session: `release` (identify among at most four header tokens, then
+the verified PIN assertion, then the passphrase) and `create` (creation
+and proof, repeat, the identify probe over the excluded credentials
+then the new one, and the no-PIN probe). Its caller owns the header,
+the description and the keyslot; nothing in production calls it until
+8c. One creation fits three PINs, four touches and four sessions into
+its one two-minute deadline, which 8c's console must leave room for.
 
 The selector's FIDO2 client is td-boot's `fido-worker` verb, which
 td-boot starts from `/proc/self/exe` as td-secret starts its

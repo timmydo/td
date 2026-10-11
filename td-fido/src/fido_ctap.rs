@@ -43,6 +43,11 @@ impl Es256PublicKey {
         bytes
     }
 
+    /// The affine coordinates `(x, y)`, unchecked against the curve.
+    pub fn coordinates(&self) -> (&[u8; 32], &[u8; 32]) {
+        (&self.x, &self.y)
+    }
+
     /// Shape validation only; the verifier checks curve membership during use.
     pub fn from_cose(bytes: &[u8]) -> Result<Self, String> {
         let value = cbor::decode(bytes)?;

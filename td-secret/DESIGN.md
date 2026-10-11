@@ -2525,7 +2525,8 @@ or someone holding the disk, can do unseen, which TOKEN-LOGIN.md does
 not claim to stop: a change between the store's last comparison and the
 rename is not seen.
 
-Discovery and sessions go through a private `Devices` trait: production
+Discovery and sessions go through td-fido's `fido_transaction::Devices`
+trait, which the disk protector's flows share: production
 uses the root USB transport, and host tests use in-process virtual keys
 over a real socketpair behind scripted device nodes, playing root with
 consent's own `begin_login` and `admit_login_step`, taking each prove

@@ -42,6 +42,17 @@ prerequisites" onward):
   PIN. The notebook's admission is unchanged.
 - `same(a, b)`: equality of two secrets comparing every byte, which the
   repeat and probe comparisons share.
+- `fido_disk`: the disk protector's flows (td-install/ENCRYPTION.md,
+  "FIDO2 protectors"), since increment 8b: its client-data hash, the
+  keyslot passphrase (HKDF-SHA256 through `hkdf_expand`), `release` and
+  `create`, over `fido_transaction::Devices`, the device access
+  td-secret's login worker shares, and a `Person` that answers PIN steps
+  and is told when the key waits for a touch. Creation is the login
+  creation under the `td disk` labels (`Transaction::disk_create`). It
+  holds no header and no policy; td-boot's selector is its consumer.
+  Its vectors, `tests/disk_vectors.txt`, come from
+  `tests/disk_vectors.py`, which computes them with Python's hashlib and
+  hmac alone.
 - `fido_p256`: software P-256 (ECDH and ES256 verification), its ECDH
   `SecretScalar::agree` public for td-tpm's session salt; `fido_aes`:
   AES-256-CBC for the PIN protocols, and AES-128 in CFB mode, over the
