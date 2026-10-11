@@ -643,11 +643,11 @@ commit, the plans on protected headers and the runner's `token import
 --token-replace`, and from its second the protected release with the
 lockout's take, proof, counter and reset, which td-boot's installed
 selector runs on a protected header from its third, and the deployment
-initramfs's PolicyPCR-only check of tpm-pin tokens. Before item 9 only
-a header root wrote through the worker, or one forged on the disk,
-reaches them. The lockout's clear,
-the secure-boot, config and update-retry tokens and the upgrade's plans
-and `reencrypt` shapes are not.
+initramfs's PolicyPCR-only check of tpm-pin tokens, and, from 8e, the
+update-retry token's codec, reader bound and tag (`update_retry`).
+Before item 9 only a header root wrote through the worker, or one forged
+on the disk, reaches them. The lockout's clear, the secure-boot and
+config tokens and the upgrade's plans and `reencrypt` shapes are not.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -738,21 +738,31 @@ account, `pcrs`, shape or operation, a keyslot text that is not a
 canonical number up to 31, more than one keyslot or one where none
 belongs, and uppercase, odd or wrongly sized hexadecimal. No field
 carries a version: the role, the type and the `/v1` derivation domains
-carry it. A role td does not know yet, such as 8e's and 8i's, falls to
-the device-bound codec, which refuses it. The `td-upgrade` and
+carry it. A role td does not know yet, such as 8i's, falls to the
+device-bound codec, which refuses it. The `td-upgrade` and
 `td-request` types are their own, so that a selector from before
 increment 8 ignores them as foreign tokens; their empty `keyslots`, the
 lockout's, the secure-boot, config and update-retry tokens' make none of
 them an orphan. `config::tag(volume_key, uuid, bytes)` is
 ENCRYPTION.md's configuration tag ("Firmware authentication"), checked
 in constant time; the secure-boot and config tokens land with 8i.
+`update_retry::token(volume_key, uuid, kernel, initrd)` and `verifies`
+are ENCRYPTION.md's retry tag ("Selector update"): a 32-byte key
+HKDF-SHA256 derives from the volume key with an empty salt and the info
+`td/disk-protector/update-retry/v1`, a zero byte and the UUID; `pair`
+is the SHA-256 of the staged kernel's SHA-256 followed by the staged
+initramfs's, and `tag` HMAC-SHA256 under the key over `pair`. `verifies`
+requires both the pair and the tag, each compared in constant time; an
+empty volume key verifies nothing, and the key is zeroed on drop.
+`tests/token_vectors.py` computes both independently.
 
 **Headers.** The reader returns the protected tier's tokens with their
 numbers in `Header::protected` (and `Metadata::protected`, so a plan's
 confirmation compares them too), and `Header::kind` classifies a header
 as device-bound (first-boot or device-bound td tokens, or none),
 protected (a tpm-pin token, a fido2 token naming a keyslot, the
-recovery-key marker, the lockout or a `td-request` token) or upgrading
+recovery-key marker, the lockout, an update-retry or a `td-request`
+token) or upgrading
 (a `td-upgrade` token beside either kind). A keyslot-less fido2 token
 alone leaves a header device-bound, since a pending fido2 token without
 a `td-upgrade` token is an orphan (phase 1 interrupted before its last
@@ -796,7 +806,8 @@ after its first GiB grew the JSON from 1976 bytes to 2114, and 14-digit
 byte counts add a few bytes per field, which the 2.5 KiB margin absorbs.
 The pinned sizes hold for the test's fixture, a 20 MiB file, and 8f's
 planner computes each step's real size before writing. The protected
-header, before 8e's and 8i's tokens are added, and a U2 header holding
+header, 8e's update-retry token included and before 8i's tokens are
+added, and a U2 header holding
 only what U2 holds are read back through `luks2::read` and agree with
 cryptsetup's own metadata dump.
 

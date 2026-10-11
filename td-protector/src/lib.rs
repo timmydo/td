@@ -35,6 +35,7 @@ pub mod recovery;
 pub mod release;
 pub mod token;
 pub mod transition;
+pub mod update_retry;
 
 /// The engine's SHA-256, which td-fido's `hmac.rs` names as
 /// `super::sha256`.

@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use td_protector::cryptsetup::{self, Cryptsetup, KeyFile};
 use td_protector::luks2::{self, Kind, BINARY_HEADER_LEN, JSON_AREA_LEN};
 use td_protector::pin::PinPcrs;
-use td_protector::protected::{Fido2, FidoRole, Lockout, Operation, Shape, Token, TpmPin};
+use td_protector::protected::{
+    Fido2, FidoRole, Lockout, Operation, Shape, Token, TpmPin, UpdateRetry,
+};
 use td_tpm::SealedObject;
 
 /// What every header must leave of the JSON area.
@@ -151,7 +153,15 @@ fn hex(len: usize) -> String {
     "ff".repeat(len)
 }
 
-/// The tokens increments 8e and 8i add, at the bounds their formats take
+/// 8e's update-retry token at its bounds, as the vectors' largest.
+fn largest_retry() -> Token {
+    Token::UpdateRetry(UpdateRetry {
+        pair: [0xff; 32],
+        tag: [0xff; 32],
+    })
+}
+
+/// The tokens increment 8i adds, at the bounds their formats take
 /// (td-protector/DESIGN.md, "Protected roles"): the secure-boot token's
 /// RSA-2048 key, whose TPM2B_PUBLIC holds 316 bytes and private area 236
 /// before its IV, at 320 and 256.
@@ -168,19 +178,14 @@ fn later_tokens() -> Vec<String> {
             hex(32),
             hex(32)
         ),
-        format!(
-            r#"{{"type":"td-protector","keyslots":[],"role":"update-retry","pair":"{}","tag":"{}"}}"#,
-            hex(32),
-            hex(32)
-        ),
     ]
 }
 
 /// The largest protected state: keyslot 0, four fido2 keyslots and two
 /// tpm-pin ones (a PIN change cut between its add and its retirement),
-/// every token at its bound, the upgrade's own token beside them, then
-/// 8e's and 8i's tokens. td's reader reads the header before the last
-/// three, which it does not know yet.
+/// every token at its bound, the upgrade's own token and 8e's update-retry
+/// token beside them, then 8i's tokens. td's reader reads the header
+/// before the last two, which it does not know yet.
 #[test]
 #[ignore = "needs TD_TEST_CRYPTSETUP and the kernel's AF_ALG"]
 fn the_largest_protected_header_fits() {
@@ -206,9 +211,10 @@ fn the_largest_protected_header_fits() {
     next(&lockout());
     next(&upgrade());
     next(&request());
+    next(&largest_retry());
     let header = luks2::read(&mut File::open(&image).unwrap()).unwrap();
     assert_eq!(header.kind(), Kind::Upgrading);
-    assert_eq!(header.protected.len(), 10);
+    assert_eq!(header.protected.len(), 11);
     assert_eq!(header.keyslots, [0, 26, 27, 28, 29, 30, 31]);
     assert_eq!(header.foreign_keyslots(), [0, 26, 27, 28, 29, 30, 31]);
     let theirs = luks2::metadata(&cs.metadata(&image).unwrap()).unwrap();
@@ -305,6 +311,7 @@ fn upgrading_u2(name: &str, resilience: &[&str], expected: usize) {
         Token::RecoveryKey { keyslot: None },
         lockout(),
         request(),
+        largest_retry(),
     ]
     .iter()
     .map(|token| token.encode().unwrap())

@@ -2,7 +2,8 @@
 
 Usage: python3 -I token_vectors.py
 No network or td implementation imports. Not a build/test/runtime
-dependency: src/protected.rs and src/lockout.rs pin the lines it prints
+dependency: src/protected.rs, src/lockout.rs and src/update_retry.rs pin
+the lines it prints
 as literals. Every input below is a public fixture.
 
 Lockout token (td-install/ENCRYPTION.md, "PIN and dictionary-attack
@@ -12,6 +13,12 @@ one zero byte, the volume's 16-byte UUID and the nonce; k_enc is the first
 32 bytes and k_mac the last. The ciphertext is L XOR k_enc and the tag
 HMAC-SHA256 under k_mac over the nonce, the ciphertext and the Name;
 "proven", "0" or "1", lies outside it and a fresh token carries "0".
+
+Update-retry token (td-install/ENCRYPTION.md, "Selector update"): the key
+is 32 bytes of the same HKDF with the info
+b"td/disk-protector/update-retry/v1", one zero byte and the UUID; "pair" is
+the SHA-256 of the staged kernel's SHA-256 followed by the staged
+initramfs's, and "tag" HMAC-SHA256 under the key over "pair".
 
 Token text: compact JSON, keys in td-protector/DESIGN.md's order, every
 byte field lowercase hexadecimal. Printed are the fixture tokens' exact
@@ -72,6 +79,13 @@ def lockout(primary, nonce, ciphertext, tag, proven):
     ])
 
 
+def update_retry(pair, tag):
+    return text([
+        ("type", "td-protector"), ("keyslots", []), ("role", "update-retry"),
+        ("pair", pair.hex()), ("tag", tag.hex()),
+    ])
+
+
 def upgrade(shape, source):
     return text([("type", "td-upgrade"), ("keyslots", []), ("shape", shape), ("from", source.hex())])
 
@@ -91,6 +105,15 @@ tag = hmac.new(okm[32:], nonce + ciphertext + primary, hashlib.sha256).digest()
 print(f"lockout ciphertext {ciphertext.hex()}")
 print(f"lockout tag {tag.hex()}")
 
+RETRY_DOMAIN = b"td/disk-protector/update-retry/v1"
+kernel = bytes(range(0x10, 0x30))
+initrd = bytes(range(0x30, 0x50))
+retry_key = hkdf(volume_key, b"", RETRY_DOMAIN + b"\x00" + uuid, 32)
+pair = hashlib.sha256(kernel + initrd).digest()
+retry_tag = hmac.new(retry_key, pair, hashlib.sha256).digest()
+print(f"update-retry pair {pair.hex()}")
+print(f"update-retry tag {retry_tag.hex()}")
+
 fixtures = [
     ("tpm-pin", tpm_pin(2, "4,9", primary, b"\x22" * 32, bytes.fromhex("0008abcd"), bytes.fromhex("0102fe"))),
     ("fido2", fido2(3, "fido2-primary", b"\x33" * 16, b"\x44" * 32, b"\x55" * 32, b"\x66" * 32)),
@@ -99,6 +122,7 @@ fixtures = [
     ("lockout", lockout(primary, nonce, ciphertext, tag, False)),
     ("upgrade", upgrade("tpm", b"\x77" * 32)),
     ("request", request("pin-change")),
+    ("update-retry", update_retry(pair, retry_tag)),
 ]
 for name, token in fixtures:
     print(f"token {name} {token}")
@@ -110,6 +134,7 @@ largest = [
     ("lockout", lockout(b"\xff" * 34, b"\xff" * 32, b"\xff" * 32, b"\xff" * 32, True)),
     ("upgrade", upgrade("fido2", b"\xff" * 32)),
     ("request", request("pin-change")),
+    ("update-retry", update_retry(b"\xff" * 32, b"\xff" * 32)),
 ]
 for name, token in largest:
     print(f"largest {name} {len(token)}")

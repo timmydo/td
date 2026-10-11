@@ -491,6 +491,11 @@ fn protected_bounds(
             1,
         ),
         ("lockout", count(&|t| matches!(t, T::Lockout(_))), 1),
+        (
+            "update-retry",
+            count(&|t| matches!(t, T::UpdateRetry(_))),
+            1,
+        ),
         ("td-upgrade", count(&|t| matches!(t, T::Upgrade { .. })), 1),
         ("td-request", count(&|t| matches!(t, T::Request { .. })), 1),
     ];
@@ -1113,6 +1118,7 @@ mod tests {
             (many(&lockout(), 2), "more than 1 lockout tokens"),
             (many(&upgrade(), 2), "more than 1 td-upgrade tokens"),
             (many(&request(), 2), "more than 1 td-request tokens"),
+            (many(&update_retry(), 2), "more than 1 update-retry tokens"),
         ];
         for (tokens, expected) in cases {
             let error = refused(tokens);
@@ -1128,8 +1134,9 @@ mod tests {
             (8, encoded(&upgrade())),
             (9, encoded(&request())),
             (10, td_token(5, Role::DeviceBound)),
+            (11, encoded(&update_retry())),
         ]);
-        assert_eq!(read_json(&six_slots(&most)).unwrap().protected.len(), 10);
+        assert_eq!(read_json(&six_slots(&most)).unwrap().protected.len(), 11);
         // Device-bound and protected tokens mix only beside the upgrade's.
         let mixture = "mixes device-bound and protected td tokens";
         for token in [
@@ -1138,6 +1145,7 @@ mod tests {
             marker,
             lockout(),
             request(),
+            update_retry(),
         ] {
             let tokens = [(0, td_token(1, Role::DeviceBound)), (1, encoded(&token))];
             assert!(refused(&tokens).contains(mixture), "{token:?}");
@@ -1152,7 +1160,7 @@ mod tests {
         ];
         assert!(refused(&two).contains("more than 1 device-bound td token beside a td-upgrade"));
         // A protected token that is not its format refuses the header, as
-        // does a role td does not know yet (8e's and 8i's).
+        // does a role td does not know yet (8i's).
         let bad = encoded(&lockout()).replacen(r#""keyslots":[]"#, r#""keyslots":["1"]"#, 1);
         assert_eq!(
             refused(&[(3, bad)]),
@@ -1162,10 +1170,15 @@ mod tests {
         assert!(refused(&[(3, bad)]).starts_with("LUKS2 token 3: td token shape"));
         let config = r#"{"type":"td-protector","keyslots":[],"role":"config","tags":[]}"#;
         assert!(refused(&[(3, config.into())]).starts_with("LUKS2 token 3: td token"));
-        let later = r#"{"type":"td-protector","keyslots":[],"role":"update-retry","public":"00","private":"00"}"#;
+        let later = r#"{"type":"td-protector","keyslots":[],"role":"secure-boot","public":"00","private":"00"}"#;
         assert_eq!(
             refused(&[(3, later.into())]),
             "LUKS2 token 3: td token role is unknown"
+        );
+        let bad = encoded(&update_retry()).replacen(r#""pair""#, r#""public""#, 1);
+        assert_eq!(
+            refused(&[(3, bad)]),
+            "LUKS2 token 3: td token has an unknown key \"public\""
         );
         let absent = encoded(&tpm_pin(Some(9)));
         assert!(refused(&[(3, absent)]).contains("names a keyslot the header does not have"));

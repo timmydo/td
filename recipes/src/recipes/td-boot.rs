@@ -140,6 +140,7 @@ const JSON_STRING_ARRAY_RS: &str = include_str!("../../../td-json/src/string_arr
 const PROTECTOR_RS: &str = include_str!("../../../td-protector/src/lib.rs");
 const PROTECTOR_CRYPTSETUP_RS: &str = include_str!("../../../td-protector/src/cryptsetup.rs");
 const PROTECTOR_LOCKOUT_RS: &str = include_str!("../../../td-protector/src/lockout.rs");
+const PROTECTOR_UPDATE_RETRY_RS: &str = include_str!("../../../td-protector/src/update_retry.rs");
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
 const PROTECTOR_PIN_RS: &str = include_str!("../../../td-protector/src/pin.rs");
 const PROTECTOR_PROTECTED_RS: &str = include_str!("../../../td-protector/src/protected.rs");
@@ -343,6 +344,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/lockout.rs".into(),
             content: PROTECTOR_LOCKOUT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/update_retry.rs".into(),
+            content: PROTECTOR_UPDATE_RETRY_RS.into(),
             exec: false,
         },
         Step::WriteFile {

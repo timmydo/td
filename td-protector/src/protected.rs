@@ -1,9 +1,10 @@
 //! The protected tier's LUKS2 tokens (DESIGN.md "Protected roles"): the
 //! tpm-pin, fido2 and `recovery-key` tokens, the `lockout` token's format
-//! (its encryption is `lockout`'s), and the `td-upgrade` and `td-request`
-//! tokens. Pure codecs: `encode` writes the compact JSON `cryptsetup token
-//! import` takes, keys in the documented order, and `decode` and
-//! `from_json` admit exactly that format, each key once, in any order.
+//! (its encryption is `lockout`'s), the `update-retry` token's (its tag is
+//! `update_retry`'s), and the `td-upgrade` and `td-request` tokens. Pure
+//! codecs: `encode` writes the compact JSON `cryptsetup token import`
+//! takes, keys in the documented order, and `decode` and `from_json`
+//! admit exactly that format, each key once, in any order.
 //! Library code: nothing in production writes one before ENCRYPTION.md
 //! item 9, and the reader only bounds and classifies them.
 
@@ -119,6 +120,15 @@ pub struct Lockout {
     pub proven: bool,
 }
 
+/// A staged selector update's retry (ENCRYPTION.md "Selector update"): the
+/// SHA-256 over the staged pair's two digests and its tag under a key the
+/// volume key derives (`update_retry`). It names no keyslot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRetry {
+    pub pair: [u8; FIELD_LEN],
+    pub tag: [u8; FIELD_LEN],
+}
+
 /// One protected-tier token of td's types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -129,6 +139,7 @@ pub enum Token {
         keyslot: Option<u8>,
     },
     Lockout(Lockout),
+    UpdateRetry(UpdateRetry),
     /// The upgrade's shape and `from`, the SHA-256 of the data segment's
     /// digest and salt before reencryption.
     Upgrade {
@@ -145,7 +156,12 @@ pub enum Token {
 pub fn is_protected_role(role: &str) -> bool {
     matches!(
         role,
-        "tpm-pin" | "fido2-primary" | "fido2-recovery" | "recovery-key" | "lockout"
+        "tpm-pin"
+            | "fido2-primary"
+            | "fido2-recovery"
+            | "recovery-key"
+            | "lockout"
+            | "update-retry"
     )
 }
 
@@ -170,7 +186,10 @@ impl Token {
             Self::TpmPin(TpmPin { keyslot, .. })
             | Self::Fido2(Fido2 { keyslot, .. })
             | Self::RecoveryKey { keyslot } => *keyslot,
-            Self::Lockout(_) | Self::Upgrade { .. } | Self::Request { .. } => None,
+            Self::Lockout(_)
+            | Self::UpdateRetry(_)
+            | Self::Upgrade { .. }
+            | Self::Request { .. } => None,
         }
     }
 
@@ -181,6 +200,7 @@ impl Token {
             Self::Fido2(fido) => (TOKEN_TYPE, Some(fido.role.name())),
             Self::RecoveryKey { .. } => (TOKEN_TYPE, Some("recovery-key")),
             Self::Lockout(_) => (TOKEN_TYPE, Some("lockout")),
+            Self::UpdateRetry(_) => (TOKEN_TYPE, Some("update-retry")),
             Self::Upgrade { .. } => (UPGRADE_TYPE, None),
             Self::Request { .. } => (REQUEST_TYPE, None),
         }
@@ -256,6 +276,9 @@ impl Token {
                 ("tag", bytes(&lockout.tag)),
                 ("proven", text(if lockout.proven { "1" } else { "0" })),
             ],
+            Self::UpdateRetry(retry) => {
+                vec![("pair", bytes(&retry.pair)), ("tag", bytes(&retry.tag))]
+            }
             Self::Upgrade { shape, from } => {
                 vec![("shape", text(shape.name())), ("from", bytes(from))]
             }
@@ -374,6 +397,14 @@ impl Token {
                                 "1" => true,
                                 _ => return Err("td token proven is not 0 or 1".into()),
                             },
+                        })
+                    }
+                    "update-retry" => {
+                        fields.keys(&["type", "keyslots", "role", "pair", "tag"])?;
+                        fields.no_keyslot()?;
+                        Self::UpdateRetry(UpdateRetry {
+                            pair: fixed("pair", fields.text("pair")?)?,
+                            tag: fixed("tag", fields.text("tag")?)?,
                         })
                     }
                     _ => return Err("td token role is not a protected role".into()),
@@ -532,6 +563,18 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// `tests/token_vectors.py`'s update-retry token.
+    pub(crate) fn update_retry() -> Token {
+        Token::UpdateRetry(UpdateRetry {
+            pair: unhex_fixed("05483fb1d64a81bbee3bb71ea3becf9ee94b11fed3753a3bc74c0022f1990ee9"),
+            tag: unhex_fixed("12d6440af0b8aecb63b8d1889e42ff561e478ab367cd9fac0f9089342a4d3dee"),
+        })
+    }
+
+    fn unhex_fixed(text: &str) -> [u8; FIELD_LEN] {
+        fixed("fixture", text).unwrap_or([0; FIELD_LEN])
+    }
+
     pub(crate) fn lockout() -> Token {
         Token::Lockout(Lockout {
             primary: PRIMARY,
@@ -555,6 +598,7 @@ mod tests {
     const MARKER: &str = r#"{"type":"td-protector","keyslots":["0"],"role":"recovery-key"}"#;
     const UPGRADE: &str = r#"{"type":"td-upgrade","keyslots":[],"shape":"tpm","from":"7777777777777777777777777777777777777777777777777777777777777777"}"#;
     const REQUEST: &str = r#"{"type":"td-request","keyslots":[],"operation":"pin-change"}"#;
+    const UPDATE_RETRY: &str = r#"{"type":"td-protector","keyslots":[],"role":"update-retry","pair":"05483fb1d64a81bbee3bb71ea3becf9ee94b11fed3753a3bc74c0022f1990ee9","tag":"12d6440af0b8aecb63b8d1889e42ff561e478ab367cd9fac0f9089342a4d3dee"}"#;
 
     fn cases() -> Vec<(Token, &'static str)> {
         vec![
@@ -564,6 +608,7 @@ mod tests {
             (Token::RecoveryKey { keyslot: Some(0) }, MARKER),
             (upgrade(), UPGRADE),
             (request(), REQUEST),
+            (update_retry(), UPDATE_RETRY),
         ]
     }
 
@@ -668,6 +713,13 @@ mod tests {
                 125,
             ),
             (request(), 60),
+            (
+                Token::UpdateRetry(UpdateRetry {
+                    pair: [0xff; 32],
+                    tag: [0xff; 32],
+                }),
+                206,
+            ),
         ];
         for (token, len) in largest {
             let text = token.encode().unwrap();
@@ -756,6 +808,16 @@ mod tests {
             ),
             (with(UPGRADE, "[]", r#"["1"]"#), "names no keyslot"),
             (with(REQUEST, "[]", r#"["1"]"#), "names no keyslot"),
+            (with(UPDATE_RETRY, "[]", r#"["1"]"#), "names no keyslot"),
+            (
+                with(UPDATE_RETRY, r#""tag":"#, r#""x":"00","tag":"#),
+                "unknown key \"x\"",
+            ),
+            (
+                with(UPDATE_RETRY, r#","tag":"12d6"#, r#","nottag":"12d6"#),
+                "unknown key \"nottag\"",
+            ),
+            (wide(UPDATE_RETRY, "pair", 31), "pair is not 32 bytes"),
             // Values.
             (
                 with(TPM_PIN, r#""1000""#, r#""1001""#),
