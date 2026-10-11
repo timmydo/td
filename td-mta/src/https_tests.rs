@@ -68,7 +68,7 @@ fn client(
     wait(|| matches!(client.handshake(cap).unwrap(), Handshake::Complete(_)));
     client
 }
-fn request(client: &mut impl Transport, request: &[u8]) -> String {
+fn send(client: &mut impl Transport, request: &[u8]) {
     let mut sent = 0;
     wait(|| {
         if sent < request.len() {
@@ -82,6 +82,9 @@ fn request(client: &mut impl Transport, request: &[u8]) -> String {
             client.flush().unwrap() == FlushProgress::Complete
         }
     });
+}
+fn request(client: &mut impl Transport, request: &[u8]) -> String {
+    send(client, request);
     let mut reply = Vec::new();
     let mut scratch = [0; 1024];
     wait(|| {
@@ -263,6 +266,42 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                     waiting.join().unwrap()
                 });
                 assert!(reply.starts_with("HTTP/1.1 404 "));
+                std::thread::sleep(Duration::from_millis(20));
+                // The late body arrives after the server has sent its refusal and close_notify.
+                clock.1.fetch_add(2_000, Ordering::Relaxed);
+                let mut post = client(address, &lease, clock.clone());
+                let body = "x".repeat(32 * 1024);
+                let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: {}\r\n\r\n", body.len());
+                assert!(request(&mut post, head.as_bytes()).starts_with("HTTP/1.1 404 "));
+                std::thread::sleep(Duration::from_millis(100));
+                send(&mut post, body.as_bytes());
+                wait(|| post.close().unwrap() == FlushProgress::Complete);
+                wait(|| post.read(&mut [0; 32]).unwrap() == IoProgress::Closed);
+                std::thread::sleep(Duration::from_millis(20));
+                // Two unfinished bodies occupy the per-peer slots. A trickle must not
+                // renew the shared close/drain deadline when the fake clock advances.
+                clock.1.fetch_add(2_000, Ordering::Relaxed);
+                let mut silent = client(address, &lease, clock.clone());
+                let mut trickle = client(address, &lease, clock.clone());
+                let head = format!("POST /jmap HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\nContent-Length: 65536\r\n\r\n");
+                assert!(request(&mut silent, head.as_bytes()).starts_with("HTTP/1.1 404 "));
+                assert!(request(&mut trickle, head.as_bytes()).starts_with("HTTP/1.1 404 "));
+                std::thread::sleep(Duration::from_millis(100));
+                let mut refused = TcpStream::connect(address).unwrap();
+                refused.set_nonblocking(true).unwrap();
+                wait(|| match refused.read(&mut [0; 1]) {
+                    Ok(0) => true,
+                    Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+                    Ok(_) => false,
+                });
+                clock.1.fetch_add(4_000, Ordering::Relaxed);
+                send(&mut trickle, b"x");
+                std::thread::sleep(Duration::from_millis(50));
+                clock.1.fetch_add(1_001, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(50));
+                let mut released = client(address, &lease, clock.clone());
+                released.abort();
+                drop((silent, trickle, refused, post));
                 std::thread::sleep(Duration::from_millis(20));
                 let oversized = "x".repeat(8192);
                 let wrong_user = base64(b"wrong:password");

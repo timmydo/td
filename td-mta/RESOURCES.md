@@ -4198,8 +4198,9 @@ https_connections mutex-protected slots (compiled maximum 32); each occupied
 slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head, a 16 KiB
 plaintext input buffer, bounded response headers (under 512 bytes), deadlines
 and transport state. Head storage may be owned; retiring it clears credentials.
-Input is cleared after each framing turn and on retirement. These are ordinary
-buffer hygiene measures, not guaranteed erasure of provider/compiler copies.
+Consumed input is cleared after each framing turn; bytes beyond the head
+remain in the same buffer until body dispatch or refusal. All input is cleared
+on retirement. These are ordinary buffer hygiene measures, not guaranteed erasure of provider/compiler copies.
 Native TLS, thread stacks and allocation overhead still require integrated
 M23 measurement; no whole-service memory qualification is added here.
 
@@ -4228,10 +4229,21 @@ The shared handshake pool bounds work, not availability against deliberate
 starvation: one peer sending partial TLS records on two connections can hold
 both default permits until their deadlines, including permits SMTP needs.
 The no-byte peek avoids charging silent TCP peers; it does not validate a
-ClientHello or provide cross-protocol fairness. The refusal-only increment
-also does not drain request bodies: closing with unread records can produce
-a TCP reset instead of a reliably observed HTTP refusal. Body dispatch must
-supply bounded connection draining before client interoperability is claimed.
+ClientHello or provide cross-protocol fairness. After flushing a refusal,
+HTTPS closes the write half and drains at most 64 KiB of plaintext, including
+the retained head tail (or the whole final read after a framing failure),
+within one fixed five-second close/drain deadline
+clipped to the original session deadline. Each turn reads at most 16 KiB;
+received data never extends the deadline or reenters HTTP parsing. A valid
+Content-Length further caps discard to its unread body bytes, so a complete
+or absent body does not wait for peer EOF. Chunked or malformed requests
+use the byte/time/EOF bounds. Draining slots continue to count against both
+global and per-peer connection limits. Pending reads do not clear an already
+empty input buffer. This
+reduces resets caused by unread bodies without waiting for a body before
+sending the final response (including Expect: 100-continue requests). A peer
+that exceeds either bound can still observe a reset. Service shutdown
+retires these refusal-only slots immediately; no body is committed.
 
 ## Private response retention boundary
 

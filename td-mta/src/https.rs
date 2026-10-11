@@ -32,6 +32,8 @@ use std::{
 type Wire = Box<[u8; TLS_WIRE_BYTES]>;
 const SCAN: Duration = Duration::from_millis(5);
 const PER_PEER: usize = 2;
+const DRAIN_BYTES: usize = 64 * 1024;
+const DRAIN_SECONDS: u64 = 5;
 
 pub struct BoundListener {
     socket: TcpListener,
@@ -65,6 +67,7 @@ enum Phase {
     Authorize,
     Response,
     Close,
+    Drain,
 }
 struct Client {
     peer: IpAddr,
@@ -75,6 +78,8 @@ struct Client {
     connection: Option<TlsConnection<Wire>>,
     head: HeadReader<Box<[u8]>>,
     input: Box<[u8]>,
+    input_used: usize,
+    drain_left: usize,
     response: Vec<u8>,
     sent: usize,
     attempt_admitted: bool,
@@ -370,6 +375,8 @@ impl Https<'_, '_> {
                     connection: None,
                     head: HeadReader::new(head),
                     input: input_plain,
+                    input_used: 0,
+                    drain_left: DRAIN_BYTES,
                     response,
                     sent: 0,
                     attempt_admitted: false,
@@ -408,7 +415,20 @@ impl Https<'_, '_> {
                         let result = client
                             .head
                             .feed(client.input.get(..n).ok_or(Error::Invalid)?);
-                        client.input.fill(0);
+                        client.input_used = match result {
+                            Ok(progress) => {
+                                let tail = retain_tail(&mut client.input, n, progress.consumed)?;
+                                if !progress.complete && tail != 0 {
+                                    return Err(Error::Invalid);
+                                }
+                                tail
+                            }
+                            Err(_) => {
+                                client.drain_left = client.drain_left.saturating_sub(n);
+                                client.input.fill(0);
+                                0
+                            }
+                        };
                         client.idle =
                             deadline(time.monotonic, self.timeouts.limits().header_idle_seconds)?
                                 .min(client.phase_deadline);
@@ -474,11 +494,24 @@ impl Https<'_, '_> {
                     }
                 } else if connection.flush()? == FlushProgress::Complete {
                     client.phase = Phase::Close;
+                    let now = self.clock.sample()?.monotonic;
+                    client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
+                    client.idle = client.phase_deadline;
                 }
             }
             Phase::Close => {
-                return Ok(client.connection.as_mut().ok_or(Error::Invalid)?.close()?
-                    != FlushProgress::Complete)
+                if client.connection.as_mut().ok_or(Error::Invalid)?.close()?
+                    == FlushProgress::Complete
+                {
+                    client.phase = Phase::Drain;
+                }
+            }
+            Phase::Drain => {
+                return drain(
+                    client.connection.as_mut().ok_or(Error::Invalid)?,
+                    &mut client.input,
+                    &mut client.drain_left,
+                );
             }
             Phase::Tls => return Err(Error::Invalid),
         }
@@ -506,6 +539,18 @@ impl Https<'_, '_> {
             client.response.extend_from_slice(b"Retry-After: 1\r\n");
         }
         client.response.extend_from_slice(b"\r\n");
+        // A known body boundary releases the slot without waiting for peer EOF.
+        if let Ok(head) = client.head.head() {
+            if let http_request::Framing::Length(bytes) = head.framing {
+                client.drain_left = client
+                    .drain_left
+                    .min(bytes.min(DRAIN_BYTES as u64) as usize);
+            }
+        }
+        // Already-read body bytes count against the same bounded discard allowance.
+        client.drain_left = client.drain_left.saturating_sub(client.input_used);
+        client.input.fill(0);
+        client.input_used = 0;
         // Retire the complete credential head before waiting on a slow reader.
         client.head = HeadReader::new(Vec::new().into_boxed_slice());
         client.phase = Phase::Response;
@@ -521,6 +566,44 @@ impl Https<'_, '_> {
             deadline(now, self.timeouts.limits().response_idle_seconds)?.min(client.phase_deadline);
         Ok(())
     }
+}
+/// No framing or deadline renewal: these bytes can never become another request.
+fn drain(
+    connection: &mut impl Transport,
+    input: &mut [u8],
+    left: &mut usize,
+) -> Result<bool, Error> {
+    if *left == 0 {
+        return Ok(false);
+    }
+    let count = (*left).min(input.len()).min(QUANTUM);
+    let progress = connection.read(input.get_mut(..count).ok_or(Error::Invalid)?);
+    match progress {
+        Ok(IoProgress::Pending) => return Ok(true),
+        Ok(IoProgress::Bytes(n)) if n <= count => {
+            input.get_mut(..n).ok_or(Error::Invalid)?.fill(0);
+        }
+        _ => input.fill(0),
+    }
+    match progress? {
+        IoProgress::Bytes(n) if n > 0 && n <= count => {
+            *left = left.checked_sub(n).ok_or(Error::Invalid)?;
+            Ok(*left != 0)
+        }
+        IoProgress::Bytes(_) => Err(Error::Invalid),
+        IoProgress::Pending => Ok(true),
+        IoProgress::Closed => Ok(false),
+    }
+}
+/// Preserve only the bytes beyond the parsed head, in the existing input buffer.
+fn retain_tail(input: &mut [u8], used: usize, consumed: usize) -> Result<usize, Error> {
+    let tail = used.checked_sub(consumed).ok_or(Error::Invalid)?;
+    if used > input.len() {
+        return Err(Error::Invalid);
+    }
+    input.copy_within(consumed..used, 0);
+    input.get_mut(tail..).ok_or(Error::Invalid)?.fill(0);
+    Ok(tail)
 }
 fn buffer<const N: usize>() -> Result<Box<[u8; N]>, Error> {
     let mut bytes = Vec::new();
@@ -586,6 +669,88 @@ fn http_date(utc_ms: i64) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    fn discarded_data_is_bounded_cleared_and_never_written() {
+        struct Source {
+            calls: usize,
+            maximum: usize,
+            result: Option<Result<IoProgress, Error>>,
+        }
+        impl Transport for Source {
+            fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, Error> {
+                self.calls += 1;
+                self.maximum = self.maximum.max(output.len());
+                let result = self
+                    .result
+                    .take()
+                    .unwrap_or(Ok(IoProgress::Bytes(output.len())));
+                if let Ok(IoProgress::Bytes(n)) = result {
+                    output[..n].fill(0xaa);
+                }
+                result
+            }
+            fn write(&mut self, _: &[u8]) -> Result<IoProgress, Error> {
+                panic!("drain wrote")
+            }
+            fn flush(&mut self) -> Result<FlushProgress, Error> {
+                panic!("drain flushed")
+            }
+            fn close(&mut self) -> Result<FlushProgress, Error> {
+                panic!("drain closed")
+            }
+            fn abort(&mut self) {
+                panic!("drain aborted")
+            }
+        }
+        let mut source = Source {
+            calls: 0,
+            maximum: 0,
+            result: None,
+        };
+        let mut input = [0; QUANTUM + 1];
+        let mut left = DRAIN_BYTES - 7;
+        for expected in [true, true, true, false] {
+            assert_eq!(drain(&mut source, &mut input, &mut left).unwrap(), expected);
+            assert!(input.iter().all(|byte| *byte == 0));
+        }
+        assert_eq!(source.calls, 4);
+        assert_eq!(source.maximum, QUANTUM);
+        assert_eq!(left, 0);
+        assert!(!drain(&mut source, &mut input, &mut left).unwrap());
+        assert_eq!(source.calls, 4);
+        for result in [
+            Ok(IoProgress::Pending),
+            Ok(IoProgress::Closed),
+            Err(Error::Tls),
+        ] {
+            source.result = Some(result);
+            left = 10;
+            let observed = drain(&mut source, &mut input, &mut left);
+            assert_eq!(observed, result.map(|p| p == IoProgress::Pending));
+            assert_eq!(left, 10);
+            assert!(input.iter().all(|byte| *byte == 0));
+        }
+    }
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    fn coalesced_body_survives_header_consumption_and_consumed_bytes_are_cleared() {
+        let head = b"POST /jmap HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n";
+        let mut input = [0xaa; QUANTUM];
+        input[..head.len()].copy_from_slice(head);
+        input[head.len()..head.len() + 4].copy_from_slice(b"body");
+        let mut storage = [0; HEAD_BYTES];
+        let mut reader = HeadReader::new(&mut storage[..]);
+        let used = head.len() + 4;
+        let progress = reader.feed(&input[..used]).unwrap();
+        assert!(progress.complete);
+        let remaining = retain_tail(&mut input, used, progress.consumed).unwrap();
+        assert_eq!(remaining, 4);
+        assert_eq!(&input[..remaining], b"body");
+        assert!(input[remaining..].iter().all(|byte| *byte == 0));
+        assert!(retain_tail(&mut input, 1, 2).is_err());
+        assert!(retain_tail(&mut input, QUANTUM + 1, 0).is_err());
+    }
     #[test]
     fn date_uses_imf_fixdate_across_leap_and_century_boundaries() {
         for (millis, expected) in [

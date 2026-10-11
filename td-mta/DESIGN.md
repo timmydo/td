@@ -1838,7 +1838,9 @@ All socket operations
 are nonblocking. Request-head parsing uses at most 16 KiB per turn. The current
 profile permits one request per connection and sends Connection: close with
 all responses. It performs no mail/body mutation and can reject without
-consuming a request body. It never emits 100 Continue, accepts an upload or
+consuming a request body. After responding it applies RESOURCES.md's bounded
+write-half closure and unread-data drain; those slots remain active for
+connection admission until retired. It never emits 100 Continue, accepts an upload or
 claims JMAP conformance yet. A valid authenticated discovery request gets 503;
 other authenticated targets get 404. Missing, invalid and revoked credentials
 receive the same 401 Basic challenge. No credential enters error output. A failed local credential publication
