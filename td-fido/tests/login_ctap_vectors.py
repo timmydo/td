@@ -5,11 +5,15 @@ Independent of td: hashlib, hmac and a CBOR encoder written here. No
 network. Not a build/test/runtime dependency. Every ID, hash and token
 below is a deterministic PUBLIC fixture. The creation rows reuse
 pin_vectors.py's seed derivations, recomputed here, so they replace only
-the portable display labels in that file's make requests.
+the portable display labels in that file's make requests. The probe
+rows decode pin_vectors.txt's committed assertion requests, whose
+regeneration needs OpenSSL, with the CBOR reader below and drop the PIN
+authorization.
 Byte layout: td-login/TOKEN-LOGIN.md, "Token profile".
 """
 import hashlib
 import hmac
+import os
 
 
 def sha(data):
@@ -39,6 +43,39 @@ def cbor(value):
         pairs = sorted((cbor(k), cbor(v)) for k, v in value.items())
         return head(5, len(pairs)) + b"".join(k + v for k, v in pairs)
     raise ValueError("unsupported CBOR fixture type")
+
+
+def decode(data, at=0):
+    """One canonical CBOR item from data at offset at: (value, next)."""
+    major, info = data[at] >> 5, data[at] & 0x1f
+    at += 1
+    if major == 7:
+        return {20: False, 21: True}[info], at
+    if info < 24:
+        n = info
+    else:
+        size = {24: 1, 25: 2, 26: 4, 27: 8}[info]
+        n, at = int.from_bytes(data[at:at + size], "big"), at + size
+    if major == 0:
+        return n, at
+    if major == 1:
+        return -1 - n, at
+    if major in (2, 3):
+        value = data[at:at + n]
+        return (value if major == 2 else value.decode()), at + n
+    if major == 4:
+        items = []
+        for _ in range(n):
+            item, at = decode(data, at)
+            items.append(item)
+        return items, at
+    if major == 5:
+        pairs = {}
+        for _ in range(n):
+            key, at = decode(data, at)
+            pairs[key], at = decode(data, at)
+        return pairs, at
+    raise ValueError("unsupported CBOR fixture item")
 
 
 def descriptor(credential):
@@ -83,6 +120,22 @@ for protocol, permissions, token_size in [(1, False, 16), (1, True, 32), (2, Fal
     rows.append((label, "login_make_request", b"\x01" + cbor(make)))
     make[5] = [descriptor(b"prior-primary"), descriptor(b"prior-backup")]
     rows.append((label, "login_make_excluded", b"\x01" + cbor(make)))
+
+# The no-PIN probe: each PIN vector's assertion without its
+# pinUvAuthParam (6) and protocol (7), presence still requested.
+pins = {}
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pin_vectors.txt")) as lines:
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 3 and fields[1] == "assertion":
+            pins[fields[0]] = bytes.fromhex(fields[2])
+for label in ["p1-legacy", "p1-scoped", "p2-legacy", "p2-scoped"]:
+    assertion = pins[label]
+    get, end = decode(assertion, 1)
+    assert assertion[0] == 2 and end == len(assertion) and cbor(get) == assertion[1:]
+    del get[6], get[7]
+    assert get[5] == {"up": True}
+    rows.append((label, "probe_request", b"\x02" + cbor(get)))
 
 print("# Public login CTAP vectors; login_ctap_vectors.py, Python stdlib only")
 for label, name, value in rows:

@@ -377,13 +377,23 @@ are separated from notebook and application-store credentials by
 credential, challenge domain and salt. Creation uses fixed login display
 labels and requests no credProtect. Admission also refuses a key whose
 getInfo options carry `alwaysUv` with the value true; one reporting
-false is admitted. Planned with `td-install/ENCRYPTION.md` increment 8
-(8b): admission also requires getInfo's versions to include `FIDO_2_1`,
-since CTAP 2.0's hmac-secret returns the same output with or without the
-PIN, so a stolen key would unlock without it; and the probe step adds
-one assertion with presence and no PIN, which must find no credential or
-return an output different from the repeat's, or the key is refused as
-unable to require its PIN. A key with built-in UV, such as a biometric
+false is admitted. Since `td-install/ENCRYPTION.md` increment 8b,
+admission also requires getInfo's versions to include `FIDO_2_1`, since
+CTAP 2.0's hmac-secret returns the same output with or without the PIN,
+so a stolen key would unlock without it; and the probe step adds one
+assertion with presence and no PIN, which must return a verified,
+device-bound output different from the repeat's, or the key is refused
+as unable to require its PIN. It follows the identify probe, which has
+already selected the credential without UV, so an honest key cannot
+answer it NO_CREDENTIALS, and that answer is refused like any other
+status. Both refusals are FAILED, which names no detail ("Wire
+choices"). Keys reporting only `FIDO_2_1_PRE` (the pre-standard CTAP
+2.1 draft, as some YubiKey 5 firmware from 5.2 before 5.7 does) are
+refused as lacking `FIDO_2_1`. Nothing in production enrolls a login
+key before item 9, so no record needs migrating; a development
+enrollment of a key without `FIDO_2_1` can no longer unlock or remove
+itself and is cleared by removing the record. The disk's FIDO2 protectors share this
+admission and probe. A key with built-in UV, such as a biometric
 key, is used with its PIN only: td never requests built-in UV. A key
 without a configured PIN is refused before any creation, with an
 instruction to set one using another tool, and a key that cannot hold a
@@ -444,7 +454,14 @@ No phase may use it.
   meets exactly the batches an unlock of the new record sends. A
   two-key enrollment's primary is probed before the backup's credential
   exists, so its probe cannot include it; and no test key yet mishandles
-  a foreign ID in an allow list, so that refusal path is untested. Each
+  a foreign ID in an allow list, so that refusal path is untested. The
+  same step then sends the no-PIN probe on another new channel: one
+  hmac-secret assertion for the new credential alone and its salt, with
+  presence and no PIN, under a fresh probe-phase hash of that step. A
+  NO_CREDENTIALS answer passes; any other answer must verify as an
+  assertion does (RP hash, UP and the new key's signature, UV not
+  required) and give an output that differs, in constant time, from the
+  repeat's, or the operation is FAILED. Each
   slot's salt is fresh. In a two-key enrollment the
   backup is kept distinct from the primary by this exclusion list and the
   record's refusal of duplicate credentials, not by td-authd's step
@@ -465,8 +482,15 @@ independent `td-fido/tests/login_ctap_vectors.py`:
   `hmac-secret` extension, including one whose getInfo omits extensions
   or lists none; one whose `alwaysUv` is true; one that cannot hold a PIN,
   whose getInfo omits options or the `clientPin` option; and one with no
-  PIN set (`clientPin` false), which another tool can set. Every other
-  getInfo refusal is the notebook's and untyped.
+  PIN set (`clientPin` false), which another tool can set. Then, untyped,
+  one whose versions lack `FIDO_2_1`, so every key refused before 8b
+  meets the same refusal. Every other getInfo refusal is the notebook's
+  and untyped.
+- The no-PIN probe sends getKeyAgreement, then getAssertion `{1:
+  "td.invalid", 2: hash, 3: [{"id", "type": "public-key"}], 4:
+  {"hmac-secret": {1: keyAgreement, 2: saltEnc, 3: saltAuth[, 4:
+  protocol]}}, 5: {"up": true}}`: a PIN step's assertion without its
+  pinUvAuthParam (6) and protocol (7), and no getPINRetries.
 - A key can identify a credential when its ID is within the key's
   `maxCredentialIdLength` and a silent request naming it alone is within
   the key's message size; every PIN request naming it is larger. Any
@@ -549,7 +573,9 @@ than move, shrink or cover the prompt.
 
 Every creation, proof, repeat, authorization and unlock assertion requires
 user presence; after the PIN is submitted the prompt says TOUCH YOUR KEY.
-Only identify and probe are silent.
+Only identify and the probe's identify are silent; the probe's no-PIN
+assertion requires presence too, and the probe step's prompt says `KEEP
+IT CONNECTED AND TOUCH IT` from the start, since no PIN precedes it.
 
 The authenticator's own retry counter is the only guess limit. td keeps no
 counter of its own: one on an unencrypted disk could be reset by anyone

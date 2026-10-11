@@ -847,7 +847,6 @@ fn tokens_are_rp_bound_and_single_use_and_options_follow_ctap_2_1() {
 fn a_ctap_2_0_pin_token_stays_valid_until_replaced() {
     let key = Virtual::new(
         Config {
-            versions: &["FIDO_2_0"],
             permissions: false,
             protocols: &[1],
             token_length: 16,
@@ -856,11 +855,17 @@ fn a_ctap_2_0_pin_token_stays_valid_until_replaced() {
         Some(PIN),
         "legacy",
     );
+    // Created while the key also claims FIDO_2_1, which login requires.
     let created = create(&key, &[], 1).unwrap();
-    for _ in 0..2 {
-        let output = login(&key, &created, PIN, &mut Vec::new()).unwrap();
-        assert_eq!(output.bytes(), created.output().bytes());
-    }
+    key.configure(|config| config.versions = &["FIDO_2_0"]);
+    let start = key.transcript().len();
+    let mut shown = Vec::new();
+    assert_eq!(
+        login(&key, &created, PIN, &mut shown).err(),
+        Some(LoginError::Refused(LoginRefusal::NoFido21))
+    );
+    assert!(shown.is_empty());
+    assert_eq!(commands(&key, start), [(4, None)]);
     let platform = Platform::agree(&key, 1);
     let token = platform.token(&key, PIN, None).unwrap();
     for _ in 0..2 {
@@ -892,6 +897,213 @@ fn hmac_secret_is_stable_with_uv_and_differs_without() {
         assert_eq!(first.bytes(), crypto::hmac(&with_uv, &SALT));
         assert_eq!(unverified, crypto::hmac(&without_uv, &SALT));
     }
+}
+
+#[test]
+fn a_ctap_2_0_hmac_secret_gives_the_uv_output_without_uv() {
+    for (label, protocol) in [("p1-scoped", 1), ("p2-scoped", 2)] {
+        let key = Virtual::new(
+            Config {
+                one_secret: true,
+                ..config(label)
+            },
+            Some(PIN),
+            label,
+        );
+        let created = create(&key, &[], 7).unwrap();
+        let platform = Platform::agree(&key, protocol);
+        let unverified = platform.unverified_secret(&key, created.id());
+        assert_eq!(unverified, created.output().bytes());
+        let (with_uv, _) = key.state().credentials[0].hmac.unwrap();
+        assert_eq!(unverified, crypto::hmac(&with_uv, &SALT));
+    }
+}
+
+/// The no-PIN probe of `created` against `repeated`, the PIN's output.
+fn probe(
+    key: &Virtual,
+    created: &EnrolledCredential,
+    repeated: &HmacOutput,
+) -> Result<(), LoginError> {
+    Transaction::new(key.link()).unwrap().probe(
+        Assertion {
+            credential: created.id(),
+            key: key_of(created.cose()),
+            challenge: [0x66; 32],
+            salt: SALT,
+        },
+        repeated,
+        &mut entropy(),
+    )
+}
+
+#[test]
+fn the_no_pin_probe_admits_a_key_whose_pin_changes_the_output() {
+    for label in LABELS {
+        let key = Virtual::new(config(label), Some(PIN), label);
+        let created = create(&key, &[], 7).unwrap();
+        let repeated = login(&key, &created, PIN, &mut Vec::new()).unwrap();
+        let start = key.transcript().len();
+        assert_eq!(probe(&key, &created, &repeated), Ok(()));
+        // getInfo, key agreement and one assertion: no PIN, no retries.
+        assert_eq!(commands(&key, start), [(4, None), (6, Some(2)), (2, None)]);
+        let (request, reply) = key.transcript().last().unwrap().clone();
+        let value = cbor::decode(&request[1..]).unwrap();
+        assert_eq!(value.map().unwrap().len(), 5);
+        assert!(field(&value, Value::Unsigned(6)).unwrap().is_none());
+        assert_eq!(options(&value, 5).unwrap(), (None, true, false));
+        assert_eq!(allow_lists(&key, start), [vec![created.id().to_vec()]]);
+        let data = cbor::decode(&reply[1..]).unwrap();
+        let data = bytes(&data, 2).unwrap().unwrap();
+        assert_eq!(data[32], 0x81, "UP and ED, without UV");
+    }
+}
+
+#[test]
+fn the_no_pin_probe_refuses_a_key_that_cannot_require_its_pin() {
+    // A key claiming FIDO_2_1 whose hmac-secret holds one secret, as CTAP
+    // 2.0's does: the probe is the one way to tell.
+    for label in LABELS {
+        let key = Virtual::new(
+            Config {
+                one_secret: true,
+                ..config(label)
+            },
+            Some(PIN),
+            label,
+        );
+        let created = create(&key, &[], 7).unwrap();
+        let repeated = login(&key, &created, PIN, &mut Vec::new()).unwrap();
+        assert_eq!(repeated.bytes(), created.output().bytes());
+        assert_eq!(
+            probe(&key, &created, &repeated),
+            Err(LoginError::Refused(LoginRefusal::PinOptional))
+        );
+    }
+}
+
+#[test]
+fn the_no_pin_probe_fails_closed_on_hidden_credentials_and_statuses() {
+    // credProtect's third level hides the credential without UV. The
+    // identify probe before it already refuses such a key; a key that
+    // hides it only here is refused too.
+    let hidden = Virtual::new(
+        Config {
+            cred_protect: Some(3),
+            ..Config::default()
+        },
+        Some(PIN),
+        "hidden",
+    );
+    let created = create(&hidden, &[], 7).unwrap();
+    let repeated = login(&hidden, &created, PIN, &mut Vec::new()).unwrap();
+    let start = hidden.transcript().len();
+    assert_eq!(
+        probe(&hidden, &created, &repeated),
+        Err(failed(Status::NoCredential))
+    );
+    assert_eq!(hidden.transcript().last().unwrap().1, [NO_CREDENTIALS]);
+    assert_eq!(commands(&hidden, start).len(), 3);
+    let key = Virtual::new(Config::default(), Some(PIN), "probed");
+    let created = create(&key, &[], 7).unwrap();
+    let repeated = login(&key, &created, PIN, &mut Vec::new()).unwrap();
+    for (script, expected) in [
+        (
+            Script {
+                presence: Presence::Denied,
+                ..Script::default()
+            },
+            Some(failed(Status::Denied)),
+        ),
+        (
+            Script {
+                presence: Presence::Timeout,
+                ..Script::default()
+            },
+            Some(failed(Status::TouchTimeout)),
+        ),
+        (
+            Script {
+                signing: Signing::Foreign,
+                ..Script::default()
+            },
+            None,
+        ),
+        (
+            Script {
+                output: Output::Fixed(repeated.bytes().try_into().unwrap()),
+                ..Script::default()
+            },
+            Some(LoginError::Refused(LoginRefusal::PinOptional)),
+        ),
+        // Signed backup flags, BE alone and BE with BS, over a distinct
+        // output that would otherwise pass.
+        (
+            Script {
+                backup: 0x08,
+                ..Script::default()
+            },
+            None,
+        ),
+        (
+            Script {
+                backup: 0x18,
+                ..Script::default()
+            },
+            None,
+        ),
+    ] {
+        key.script(script);
+        let result = probe(&key, &created, &repeated);
+        match expected {
+            Some(expected) => assert_eq!(result, Err(expected)),
+            None => assert!(matches!(
+                result,
+                Err(LoginError::Failed(Error::Protocol(_)))
+            )),
+        }
+    }
+    key.script(Script::default());
+    assert_eq!(probe(&key, &created, &repeated), Ok(()));
+    // A key without FIDO_2_1 is refused before its key agreement.
+    key.configure(|config| config.versions = &["FIDO_2_0"]);
+    let start = key.transcript().len();
+    assert_eq!(
+        probe(&key, &created, &repeated),
+        Err(LoginError::Refused(LoginRefusal::NoFido21))
+    );
+    assert_eq!(commands(&key, start), [(4, None)]);
+}
+
+#[test]
+fn a_key_without_fido_2_1_is_refused_before_any_pin() {
+    let key = Virtual::new(
+        Config {
+            versions: &["FIDO_2_0"],
+            ..Config::default()
+        },
+        Some(PIN),
+        "ctap-2-0",
+    );
+    let refused = Some(LoginError::Refused(LoginRefusal::NoFido21));
+    let mut prompts = 0;
+    let result = Transaction::new(key.link()).unwrap().login_create(
+        LoginCreation {
+            user: [1; 32],
+            salt: SALT,
+            excluded: &[],
+        },
+        &mut |_, _| {
+            prompts += 1;
+            Ok((pin(PIN)?, [2; 32]))
+        },
+        &mut entropy(),
+    );
+    assert_eq!(result.err(), refused);
+    assert_eq!(prompts, 0);
+    assert_eq!(identify(&key, &[&[7; 16]]).err(), refused);
+    assert_eq!(commands(&key, 0), [(4, None), (4, None)]);
+    assert!(key.state().credentials.is_empty());
 }
 
 #[test]

@@ -533,8 +533,8 @@ fn qemu_login_worker_enrolls_one_key_whose_record_unlocks_and_is_then_removed() 
     assert!(matches!(state(), State::Unenrolled));
     assert!(names().is_empty());
     let served = plugged.remove();
-    // Create and prove, repeat, probe; identify, unlock; identify, authorize.
-    assert_eq!(served.channels, 7);
+    // Create and prove, repeat, both probes; identify, unlock; identify, authorize.
+    assert_eq!(served.channels, 8);
     assert_eq!(served.requests, key.transcript().len());
     finish();
 }
@@ -555,7 +555,7 @@ fn qemu_login_worker_enrolls_two_keys_across_a_swap_of_devices() {
     };
     let (result, seen) = watched(plan, &polls);
     assert_eq!(result, Ok(()));
-    assert_eq!(swapped(&changed).channels, 3);
+    assert_eq!(swapped(&changed).channels, 4);
     let (first, second) = (newest(&primary), newest(&backup));
     let (one, two) = (fingerprint(&first), fingerprint(&second));
     let mut frames = vec![
@@ -587,7 +587,7 @@ fn qemu_login_worker_enrolls_two_keys_across_a_swap_of_devices() {
     let order = fingerprints();
     assert_eq!(physical(pin(PIN)), (Ok(()), succeeded(&order, two, 8)));
     let plugged = port.lock().unwrap().take().unwrap();
-    assert_eq!(plugged.remove().channels, 3 + 2);
+    assert_eq!(plugged.remove().channels, 4 + 2);
     let plugged = Plugged::insert(&primary, NAME);
     assert_eq!(physical(pin(PIN)), (Ok(()), succeeded(&order, one, 8)));
     plugged.remove();
@@ -636,8 +636,8 @@ fn qemu_login_worker_adds_a_key_across_a_swap_and_removes_the_authorizing_one() 
     );
     assert_eq!(stored(), Some(vec![id]));
     let plugged = port.lock().unwrap().take().unwrap();
-    // Create and prove, repeat, probe; two unlock sessions; two removal ones.
-    assert_eq!(plugged.remove().channels, 3 + 2 + 2);
+    // Create and prove, repeat, both probes; two unlock sessions; two removal ones.
+    assert_eq!(plugged.remove().channels, 4 + 2 + 2);
     // The removed key no longer unlocks.
     let plugged = Plugged::insert(&first.device, NAME);
     let identified = vec![baseline(&[added]), invitation(0x10, &identify(1))];
@@ -822,9 +822,9 @@ fn qemu_login_worker_ends_on_denied_presence_always_uv_and_a_list_too_small() {
         )
     );
     assert_eq!(pin_tokens(&relaxed), tokens);
-    // Create and prove, repeat, probe; three unlocks of two sessions each;
+    // Create and prove, repeat, both probes; three unlocks of two sessions each;
     // the refused identify.
-    assert_eq!(plugged.remove().channels, 3 + 3 * 2 + 1);
+    assert_eq!(plugged.remove().channels, 4 + 3 * 2 + 1);
     // A new key whose list cannot hold the record's two exclusions: KEY
     // REFUSED 05 after the gated swap, before any PIN, the record untouched.
     let (one, two) = (Key::new(80), Key::new(81));
@@ -976,7 +976,7 @@ fn qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_wri
     assert_eq!(seen, failed(frames, Failure::Changed));
     assert_eq!(swapped(&swapping).channels, 2);
     let plugged = port.lock().unwrap().take().unwrap();
-    assert_eq!(plugged.remove().channels, 3);
+    assert_eq!(plugged.remove().channels, 4);
     assert_eq!(held(), Some(changed.clone()));
     // A removal whose record is removed at its commit round.
     seed(&bytes);
@@ -1017,7 +1017,7 @@ fn qemu_login_worker_refuses_a_changed_record_or_an_unshared_version_without_wri
     let mut frames = committed(frames, make(LoginStep::Probe { key: new }));
     frames.pop();
     assert_eq!(seen, failed(frames, Failure::Changed));
-    assert_eq!(plugged.remove().channels, 3);
+    assert_eq!(plugged.remove().channels, 4);
     assert_eq!(held(), Some(bytes.clone()));
     assert_eq!(writes.get(), 0);
     // No record version this build and both retained deployments read:
@@ -1108,8 +1108,8 @@ fn qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token() {
         let id = newest(&new);
         assert_eq!(seen, addition(&order, by, fingerprint(&id)), "{count}");
         // The authorizer's identify and authorize, after its own create and
-        // prove, repeat and probe when it was added.
-        let authorized = if count == 1 { 2 } else { 3 + 2 };
+        // prove, repeat and both probes when it was added.
+        let authorized = if count == 1 { 2 } else { 4 + 2 };
         assert_eq!(swapped(&changed).channels, authorized, "{count}");
         by = fingerprint(&id);
         keys.push((new, id));
@@ -1118,7 +1118,7 @@ fn qemu_login_worker_adds_keys_to_eight_and_refuses_a_ninth_before_any_token() {
         assert_eq!(stored(), Some(expected), "{count}");
     }
     let last = port.lock().unwrap().take().unwrap();
-    assert_eq!(last.remove().channels, 3);
+    assert_eq!(last.remove().channels, 4);
     // Every key unlocks the eight-key record.
     let order = fingerprints();
     assert_eq!(order.len(), 8);
@@ -1492,9 +1492,9 @@ fn qemu_login_desktop_starts_every_generation_locked_and_unlocks_with_the_key() 
     // A key holding none of the record's credentials ends it at identify,
     // with no PIN step.
     let served = plugged.remove();
-    // Enrollment's three sessions, then the wrong PIN's identify and
+    // Enrollment's four sessions, then the wrong PIN's identify and
     // assertion sessions.
-    assert_eq!(served.channels, 3 + 2);
+    assert_eq!(served.channels, 4 + 2);
     let stranger = blank("stranger");
     let plugged = Plugged::insert(&stranger, NAME);
     chord(&mut keyboard);

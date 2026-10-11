@@ -8,7 +8,8 @@ use crate::fido_device::{self, Interruption};
 use crate::fido_p256::PublicKey;
 use crate::fido_pin::{EnrolledCredential, LoginRefusal, Pin};
 use crate::fido_transaction::{
-    Channel, Error, LoginAssertion, LoginCreation, LoginError, LoginPin, Status, Transaction,
+    Assertion, Channel, Error, LoginAssertion, LoginCreation, LoginError, LoginPin, Status,
+    Transaction,
 };
 use crate::login_record::{self, NewKey, Phase, Record};
 use crate::login_store::{self, Baseline, Cause, Outcome, Owner, State, Store};
@@ -105,6 +106,11 @@ impl Failure {
                     LoginRefusal::PinUnsupported => 3,
                     LoginRefusal::PinNotSet => 4,
                     LoginRefusal::ListTooSmall => 5,
+                    // A key that cannot require its PIN has no typed text
+                    // (TOKEN-LOGIN.md, "Token profile"): FAILED.
+                    LoginRefusal::NoFido21 | LoginRefusal::PinOptional => {
+                        return Self::Failed.frame()
+                    }
                 }),
             ),
             // Detail 6 is reserved for Unprobed: a new refusal skips it.
@@ -812,7 +818,7 @@ impl Ceremony<'_> {
                 )
             });
         let output = ended(wire, result, cause, reported)?;
-        let repeated = same(output.bytes(), created.output().bytes());
+        let repeated = td_fido::same(output.bytes(), created.output().bytes());
         drop(output);
         if !repeated {
             return Err(Failure::Failed);
@@ -841,6 +847,33 @@ impl Ceremony<'_> {
         if ended(wire, selected, None, None)? != new {
             return Err(Failure::Unprobed);
         }
+        // Then one assertion with presence and no PIN, under the same step:
+        // its output must differ from the PIN's, which CTAP 2.0's one
+        // hmac-secret gives without the PIN.
+        if one(devices)? != node {
+            return Err(Failure::OneKey);
+        }
+        let random = fresh(entropy)?;
+        let hash =
+            login_record::client_data_hash(Phase::Probe, &self.current.encode(), None, &random)
+                .map_err(|_| Failure::Internal)?;
+        let key = self::public(&created)?;
+        let channel = open(devices, node, wire, self.context.lifetime)?;
+        let probed = Transaction::new(channel)
+            .map_err(LoginError::from)
+            .and_then(|transaction| {
+                transaction.probe(
+                    Assertion {
+                        credential: created.id(),
+                        key,
+                        challenge: hash,
+                        salt,
+                    },
+                    created.output(),
+                    entropy,
+                )
+            });
+        ended(wire, probed, None, None)?;
         Ok(created)
     }
 
@@ -991,15 +1024,6 @@ fn public(created: &EnrolledCredential) -> Result<PublicKey, Failure> {
     VerificationKey::from_cose(created.cose())
         .and_then(|key| key.public_key())
         .map_err(|_| Failure::Failed)
-}
-
-/// Constant-time equality of two hmac-secret outputs.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    let difference = a
-        .iter()
-        .zip(b)
-        .fold(0u8, |difference, (a, b)| difference | (a ^ b));
-    a.len() == b.len() && std::hint::black_box(difference) == 0
 }
 
 /// Exactly one connected device, refused before any PIN otherwise.
@@ -2043,6 +2067,9 @@ mod tests {
             ),
             (Failure::Refused(LoginRefusal::PinNotSet), &[0x15, 6, 4]),
             (Failure::Refused(LoginRefusal::ListTooSmall), &[0x15, 6, 5]),
+            // A key that cannot require its PIN has no typed text.
+            (Failure::Refused(LoginRefusal::NoFido21), &[0x15, 15]),
+            (Failure::Refused(LoginRefusal::PinOptional), &[0x15, 15]),
             (Failure::Unprobed, &[0x15, 6, 6]),
             (Failure::Denied, &[0x15, 7]),
             (Failure::Timeout, &[0x15, 8]),
@@ -2862,8 +2889,9 @@ mod tests {
         ];
         frames.extend(ceremony(make, new));
         assert_eq!(seen, committed(frames, make(LoginStep::Probe { key: new })));
-        // Create and prove on one session, repeat and probe on new ones.
-        assert_eq!(keys.opened, 3);
+        // Create and prove on one session, the repeat and each probe on new
+        // ones; the no-PIN probe takes no PIN token.
+        assert_eq!(keys.opened, 4);
         assert_eq!(pin_tokens(&key), 3);
         assert_eq!(fixture.stored(), Some(vec![id.clone()]));
         assert_eq!(fixture.names(), ["1000"]);
@@ -2879,9 +2907,16 @@ mod tests {
             None
         ));
         let assertions = sent(&key, 2, 2);
-        let [prove, repeat, probe] = assertions.as_slice() else {
-            panic!("three assertions")
+        let [prove, repeat, probe, presence] = assertions.as_slice() else {
+            panic!("four assertions")
         };
+        // The no-PIN probe has its own hash, of the same step.
+        assert_ne!(probe, presence);
+        let probe_step = login(make(LoginStep::Probe { key: new }));
+        assert!(binds(presence, Phase::Probe, &probe_step, None));
+        let probed = key.transcript().last().unwrap().0.clone();
+        let probed = cbor::decode(&probed[1..]).unwrap();
+        assert!(probed.get(&Value::Unsigned(6)).unwrap().is_none());
         for (hash, phase, step) in [
             (
                 prove,
@@ -2913,13 +2948,13 @@ mod tests {
     fn a_two_key_enrollment_waits_for_the_swap_and_excludes_the_first_key() {
         let (primary, backup) = (blank("enroll-primary"), blank("enroll-backup"));
         let fixture = Fixture::new();
-        // The primary's three sessions, then the backup's; at the second
+        // The primary's four sessions, then the backup's; at the second
         // connect step the primary is still in, then nothing, then the backup.
         let mut keys = Keys::sessions(
             &[&primary, &backup],
-            vec![vec![0], vec![0], vec![0], vec![1]],
+            vec![vec![0], vec![0], vec![0], vec![0], vec![1]],
         );
-        keys.waits = vec![(3, vec![0]), (3, vec![])];
+        keys.waits = vec![(4, vec![0]), (4, vec![])];
         let (result, seen) = operation(
             &fixture,
             &mut keys,
@@ -2961,7 +2996,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut keys = Keys::sessions(
             &[&primary, &backup],
-            vec![vec![0], vec![0], vec![0], vec![0, 1]],
+            vec![vec![0], vec![0], vec![0], vec![0], vec![0, 1]],
         );
         let (result, seen) = operation(
             &fixture,
@@ -2987,7 +3022,10 @@ mod tests {
         let key = blank("enroll-twice");
         let fixture = Fixture::new();
         // The same key, removed and inserted again under a new node.
-        let mut keys = Keys::sessions(&[&key, &key], vec![vec![0], vec![0], vec![0], vec![1]]);
+        let mut keys = Keys::sessions(
+            &[&key, &key],
+            vec![vec![0], vec![0], vec![0], vec![0], vec![1]],
+        );
         let (result, seen) = operation(
             &fixture,
             &mut keys,
@@ -3035,7 +3073,7 @@ mod tests {
                 seen,
                 addition(&order, first.fingerprint(), fingerprint(&id))
             );
-            assert_eq!(keys.opened, 5);
+            assert_eq!(keys.opened, 6);
             // The authorization's hash binds the record it changes.
             if count == 1 {
                 let shown = Record::decode(&record(&[&first], None, None), UID).unwrap();
@@ -3417,8 +3455,10 @@ mod tests {
         ids.sort();
         assert_eq!(fixture.stored(), Some(ids.clone()));
         // Prove and repeat name the new credential alone; the probe sends the
-        // record's batches in order until the one holding it.
-        let lists = allow_lists(&new);
+        // record's batches in order until the one holding it, then the no-PIN
+        // assertion names the new credential alone.
+        let mut lists = allow_lists(&new);
+        assert_eq!(lists.pop(), Some(vec![id.clone()]));
         let (ceremony, probe) = lists.split_at(2);
         assert_eq!(ceremony, [vec![id.clone()], vec![id.clone()]]);
         let batches: Vec<Vec<Vec<u8>>> = ids.chunks(2).map(<[Vec<u8>]>::to_vec).collect();
@@ -3456,6 +3496,53 @@ mod tests {
         frames.extend(ceremony(|step| enrolling(1, 1, step), new));
         assert_eq!(seen, failed(frames, Failure::Unprobed));
         assert_eq!(fixture.stored(), None);
+    }
+
+    #[test]
+    fn a_key_that_cannot_require_its_pin_fails_and_publishes_nothing() {
+        let make = |step| enrolling(1, 1, step);
+        let connected = vec![
+            vec![0x18, 0],
+            invitation(0x10, &login(make(LoginStep::Connect))),
+        ];
+        // CTAP 2.0 alone: refused at the new key's getInfo, before any PIN.
+        let fixture = Fixture::new();
+        let old = Virtual::new(
+            Config {
+                versions: &["FIDO_2_0"],
+                ..Config::default()
+            },
+            Some(PIN),
+            "ctap-2-0",
+        );
+        let (result, seen) = unlock(&fixture, &[&old], begins(make(LoginStep::Connect)));
+        let refused = Failure::Refused(LoginRefusal::NoFido21);
+        assert_eq!(result, Err(refused));
+        assert_eq!(seen, failed(connected.clone(), refused));
+        assert_eq!(seen.last(), Some(&vec![0x15, 15]));
+        assert_eq!(pin_tokens(&old), 0);
+        assert!(sent(&old, 1, 1).is_empty());
+        assert!(fixture.names().is_empty());
+        // FIDO_2_1 claimed over CTAP 2.0's one secret: the ceremony runs to
+        // the probe, whose no-PIN assertion returns the PIN's output.
+        let one = Virtual::new(
+            Config {
+                one_secret: true,
+                ..Config::default()
+            },
+            Some(PIN),
+            "one-secret",
+        );
+        let (result, seen) = unlock(&fixture, &[&one], begins(make(LoginStep::Connect)));
+        let refused = Failure::Refused(LoginRefusal::PinOptional);
+        assert_eq!(result, Err(refused));
+        let new = fingerprint(&newest(&one));
+        let mut frames = connected;
+        frames.extend(ceremony(make, new));
+        assert_eq!(seen, failed(frames, refused));
+        assert_eq!(seen.last(), Some(&vec![0x15, 15]));
+        assert_eq!(fixture.stored(), None);
+        assert!(fixture.names().is_empty());
     }
 
     #[test]

@@ -1513,7 +1513,7 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         }
         LoginStep::Probe { key } => {
             lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
-            lines.push("KEEP IT CONNECTED".into());
+            lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
         }
     }
     if let Some(retries) = login.step.retries() {
@@ -4423,7 +4423,7 @@ mod tests {
             rows(enroll(1, 1, LoginStep::Probe { key: N }))[5..],
             [
                 "CHECKING NEW KEY deadbeef",
-                "KEEP IT CONNECTED",
+                "KEEP IT CONNECTED AND TOUCH IT",
                 "ESC TO CANCEL"
             ]
         );

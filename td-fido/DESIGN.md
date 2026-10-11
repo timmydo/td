@@ -27,7 +27,21 @@ prerequisites" onward):
   and makeCredential with proof of possession.
 - `fido_pin`: PIN protocols one and two, the PIN and pinUvAuthToken
   flows, hmac-secret and the login profile; `fido_transaction`: one
-  owned PIN transaction over a `Channel`.
+  owned PIN transaction over a `Channel`. Since increment 8b the login
+  profile's admission requires getInfo's versions to include
+  `FIDO_2_1`, after its typed refusals (`LoginRefusal::NoFido21`), and
+  `Transaction::probe` is TOKEN-LOGIN.md's no-PIN probe: the
+  PIN-authorized hmac-secret assertion without its pinUvAuthParam and
+  protocol, verified with signed backup flags refused as every login
+  assertion's are, whose output must differ from the PIN's
+  (`LoginRefusal::PinOptional`); any status, NO_CREDENTIALS included, is
+  refused, since the identify probe has already selected the credential
+  without UV. `FIDO_2_1_PRE` alone is not `FIDO_2_1`. CTAP
+  2.0's hmac-secret holds one secret, so a key that has no `FIDO_2_1`,
+  or claims it over one secret, would give the PIN's output without the
+  PIN. The notebook's admission is unchanged.
+- `same(a, b)`: equality of two secrets comparing every byte, which the
+  repeat and probe comparisons share.
 - `fido_p256`: software P-256 (ECDH and ES256 verification), its ECDH
   `SecretScalar::agree` public for td-tpm's session salt; `fido_aes`:
   AES-256-CBC for the PIN protocols, and AES-128 in CFB mode, over the
@@ -132,5 +146,7 @@ authenticator signs, which production never does, so it signs through
 `crate::p256_signer`: this crate's test build of `fido_p256`, and in
 td-secret a test-only copy of `fido_p256.rs` compiled by path. Its own
 tests, `fido_virtual_tests.rs`, are included only here, as a child of
-the authenticator. The vectors and their optional host generators live
-under `tests/`.
+the authenticator. Its CTAP 2.0 mode (`Config::one_secret`) keeps one
+hmac-secret for assertions with and without UV whatever versions it
+claims, so the no-PIN probe's refusal is testable. The vectors and
+their optional host generators live under `tests/`.

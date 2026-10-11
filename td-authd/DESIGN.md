@@ -1076,7 +1076,9 @@ Steps 1 to 7 are the client-data phase bytes of `td-login/TOKEN-LOGIN.md`,
 which reserves 8 for connect. Connect, in which the person connects the
 next new key alone, sends no assertion and has no client-data phase: it is
 the presentation root derives before a create step, whose retries only
-the connected key can answer. Identify and probe are silent. Retries, on
+the connected key can answer. Identify asks nothing of the person; probe
+asks no PIN, but its no-PIN assertion asks for a touch, which its rows
+say (`KEEP IT CONNECTED AND TOUCH IT`). Retries, on
 exactly the PIN steps, are one byte: the key's own getPINRetries answer,
 shown as the key's claim; the codec takes any value and admission refuses
 zero, since the worker reports a key with none left as PIN blocked instead

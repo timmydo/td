@@ -518,6 +518,49 @@ impl<C: Channel> Transaction<C> {
         self.check()?;
         Ok(output)
     }
+
+    /// The no-PIN probe (TOKEN-LOGIN.md, "Token profile"): one hmac-secret
+    /// assertion for a new credential's salt with presence and no PIN. It
+    /// must return a device-bound output other than `repeated`, the PIN's,
+    /// or the key cannot require its PIN: CTAP 2.0's hmac-secret holds one
+    /// secret for both.
+    pub fn probe(
+        mut self,
+        intent: Assertion<'_>,
+        repeated: &HmacOutput,
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<(), LoginError> {
+        let profile = self.login_profile()?;
+        let request = self.transition(profile.probe(
+            intent.credential,
+            intent.key,
+            intent.challenge,
+            intent.salt,
+        ))?;
+        let reply = self.command(request.bytes())?;
+        let request = self.with_entropy(entropy, |entropy| {
+            request.finish(reply.as_ref(), &mut |bytes| entropy(bytes))
+        })?;
+        drop(reply);
+        let reply = self.exchange(request.bytes())?;
+        // NO_CREDENTIALS too: the identify probe has already selected the
+        // credential without UV, so an honest key cannot hide it here.
+        match status(&reply)? {
+            0 => {}
+            other => return Err(Error::Status(Status::decode(other)).into()),
+        }
+        let output = self.transition(request.finish(reply.as_ref()))?;
+        if output.info.backup_eligible || output.info.backed_up {
+            return Err(Error::Protocol("login assertion is not device-bound".into()).into());
+        }
+        let optional = super::crypto::same(output.bytes(), repeated.bytes());
+        drop(output);
+        self.check()?;
+        if optional {
+            return Err(LoginError::Refused(LoginRefusal::PinOptional));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

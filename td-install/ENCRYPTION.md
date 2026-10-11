@@ -1381,9 +1381,12 @@ display name. CTAP 2.0's hmac-secret holds one secret per credential, so
 an assertion without the PIN returns the same output as one with it,
 and a stolen key would open the disk without its PIN; CTAP 2.1 keeps the
 two apart. The profile therefore requires `FIDO_2_1`, and creation's
-probe adds one assertion with presence and no PIN, which must either
-find no credential or return an output different from the repeat's, or
-the key is refused as unable to require its PIN. Its creation excludes
+probe adds one assertion with presence and no PIN, which must return
+a verified, device-bound output different from the repeat's, or the key
+is refused as unable to require its PIN; it follows the identify probe,
+which has already selected the credential without UV, so NO_CREDENTIALS
+is refused like any other status. A key reporting only `FIDO_2_1_PRE`
+is refused as lacking `FIDO_2_1`. Its creation excludes
 every credential the header's fido2 tokens and the operation already
 name; it is proved, repeated and probed as TOKEN-LOGIN.md's new key is,
 each with its PIN and touch, the repeat reproducing the proof's output

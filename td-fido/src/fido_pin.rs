@@ -81,6 +81,12 @@ pub enum LoginRefusal {
     /// clientPin false: a PIN can be set with another tool.
     PinNotSet,
     ListTooSmall,
+    /// getInfo's versions lack `FIDO_2_1`: CTAP 2.0's hmac-secret holds one
+    /// secret, so such a key gives the PIN's output without the PIN.
+    NoFido21,
+    /// The no-PIN probe returned the output the PIN gives: the key cannot
+    /// require its PIN for hmac-secret.
+    PinOptional,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,6 +107,7 @@ struct Claims<'a> {
     hmac_secret: bool,
     client_pin: Option<bool>,
     always_uv: bool,
+    fido_2_1: bool,
 }
 
 pub(super) struct Profile {
@@ -123,7 +130,9 @@ impl Profile {
         Self::admit(claims)
     }
 
-    /// Typed refusals precede the shared policy: TOKEN-LOGIN.md, "Token profile".
+    /// Typed refusals precede the shared policy: TOKEN-LOGIN.md, "Token
+    /// profile". `FIDO_2_1` comes last, so a key refused before 8b required
+    /// it meets the same refusal.
     pub(super) fn parse_login(response: &[u8]) -> Result<Self, LoginFailure> {
         let claims = Self::claims(response, true)?;
         let refusal = if !claims.hmac_secret {
@@ -132,6 +141,7 @@ impl Profile {
             LoginRefusal::AlwaysUv
         } else {
             match claims.client_pin {
+                Some(true) if !claims.fido_2_1 => LoginRefusal::NoFido21,
                 Some(true) => return Ok(Self::admit(claims)?),
                 Some(false) => LoginRefusal::PinNotSet,
                 None => LoginRefusal::PinUnsupported,
@@ -162,8 +172,11 @@ impl Profile {
         let info = response_value(response, cbor::MAX_BYTES)?;
         let versions = array(info.required(&Value::Unsigned(1))?)?;
         let mut supported = false;
+        let mut fido_2_1 = false;
         for version in versions {
-            supported |= matches!(version.text()?, "FIDO_2_0" | "FIDO_2_1" | "FIDO_2_2");
+            let version = version.text()?;
+            supported |= matches!(version, "FIDO_2_0" | "FIDO_2_1" | "FIDO_2_2");
+            fido_2_1 |= version == "FIDO_2_1";
         }
         if !supported {
             return Err("unsupported portable CTAP version".into());
@@ -204,6 +217,7 @@ impl Profile {
             hmac_secret,
             client_pin,
             always_uv,
+            fido_2_1,
         })
     }
 
@@ -297,6 +311,29 @@ impl Profile {
         })
     }
 
+    /// The no-PIN probe (TOKEN-LOGIN.md, "Token profile"): hmac-secret for
+    /// `salt` under presence alone, which a CTAP 2.1 key answers from the
+    /// credential's other secret, or refuses. Its key agreement is the
+    /// assertion's.
+    pub(super) fn probe(
+        self,
+        credential: &[u8],
+        key: PublicKey,
+        challenge: [u8; 32],
+        salt: [u8; 32],
+    ) -> Result<KeyRequest<Probe>, String> {
+        let KeyRequest {
+            profile,
+            intent,
+            bytes,
+        } = self.assertion(credential, key, challenge, salt)?;
+        Ok(KeyRequest {
+            profile,
+            intent: Probe(intent),
+            bytes,
+        })
+    }
+
     /// A login assertion whose client-data hash comes after the PIN prompt:
     /// the step it binds names the retries the key reports after key
     /// agreement. The credential is checked now; `bind` adds the hash.
@@ -375,6 +412,9 @@ impl Drop for Intent {
     }
 }
 
+/// The no-PIN probe's assertion: an `Intent` that asks no PIN.
+pub(super) struct Probe(Intent);
+
 /// A login assertion awaiting its client-data hash. Its owners clear the
 /// credential and salt on drop, as `Intent` does.
 pub(super) struct Unbound {
@@ -442,14 +482,7 @@ impl<I: Operation> KeyRequest<I> {
         pin: Pin,
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<PinRequest<I>, String> {
-        let value = response_value(response, self.profile.max_message)?;
-        let peer = agreement_key(value.required(&Value::Unsigned(1))?)?;
-        let private = fresh_scalar(entropy)?;
-        let public = private.public_key()?;
-        let shared = private.agree(&peer)?;
-        let keys = Keys::derive(self.profile.protocol, shared.bytes());
-        drop(shared);
-        drop(private);
+        let (keys, public) = agree(&self.profile, response, entropy)?;
         let mut hash = crypto::digest(&pin.0 .0);
         drop(pin);
         let encrypted = keys.encrypt(hash.get(..16).ok_or("PIN hash extent")?, entropy);
@@ -479,6 +512,104 @@ impl<I: Operation> KeyRequest<I> {
             bytes,
         })
     }
+}
+impl KeyRequest<Probe> {
+    /// Key agreement for the salt alone: no PIN, token or permission, so
+    /// the assertion carries no pinUvAuthParam and asks for presence only.
+    pub(super) fn finish(
+        self,
+        response: &[u8],
+        entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<HmacRequest, String> {
+        let (keys, public) = agree(&self.profile, response, entropy)?;
+        let Probe(intent) = self.intent;
+        hmac_assertion(self.profile, intent, keys, &public, None, entropy)
+    }
+}
+
+/// The platform's half of a key agreement, from the key's getKeyAgreement
+/// reply: the PIN protocol's shared keys and the public key that names it.
+fn agree(
+    profile: &Profile,
+    response: &[u8],
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<(Keys, PublicKey), String> {
+    let value = response_value(response, profile.max_message)?;
+    let peer = agreement_key(value.required(&Value::Unsigned(1))?)?;
+    let private = fresh_scalar(entropy)?;
+    let public = private.public_key()?;
+    let shared = private.agree(&peer)?;
+    let keys = Keys::derive(profile.protocol, shared.bytes());
+    drop(shared);
+    drop(private);
+    Ok((keys, public))
+}
+
+/// The hmac-secret getAssertion: under a PIN token's `auth`, which gives
+/// UV, or, for the no-PIN probe, presence alone.
+fn hmac_assertion(
+    profile: Profile,
+    intent: Intent,
+    keys: Keys,
+    public: &PublicKey,
+    auth: Option<Secret>,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<HmacRequest, String> {
+    let salt_enc = keys.encrypt(&intent.salt, entropy)?;
+    let salt_auth = profile.protocol.authenticate(&keys.hmac.0, &salt_enc.0);
+    let mut out = Encoder::new();
+    out.head(5, if auth.is_some() { 7 } else { 5 })?;
+    out.head(0, 1)?;
+    out.text(RP_ID)?;
+    out.head(0, 2)?;
+    out.bytes(&intent.challenge)?;
+    out.head(0, 3)?;
+    out.head(4, 1)?;
+    out.head(5, 2)?;
+    out.text("id")?;
+    out.bytes(&intent.credential.0)?;
+    out.text("type")?;
+    out.text("public-key")?;
+    out.head(0, 4)?;
+    out.head(5, 1)?;
+    out.text("hmac-secret")?;
+    out.head(
+        5,
+        if profile.protocol == Protocol::One {
+            3
+        } else {
+            4
+        },
+    )?;
+    out.head(0, 1)?;
+    encode_key(&mut out, public)?;
+    out.head(0, 2)?;
+    out.bytes(&salt_enc.0)?;
+    out.head(0, 3)?;
+    out.bytes(&salt_auth.0)?;
+    if profile.protocol == Protocol::Two {
+        out.head(0, 4)?;
+        out.head(0, 2)?;
+    }
+    out.head(0, 5)?;
+    out.head(5, 1)?;
+    out.text("up")?;
+    out.boolean(true)?;
+    // ClientPIN authorization provides UV; built-in uv is deliberately absent.
+    if let Some(auth) = &auth {
+        out.head(0, 6)?;
+        out.bytes(&auth.0)?;
+        out.head(0, 7)?;
+        out.head(0, profile.protocol.number())?;
+    }
+    let bytes = command(2, out, profile.max_message)?;
+    Ok(HmacRequest {
+        intent,
+        keys,
+        max_message: profile.max_message,
+        verified: auth.is_some(),
+        bytes,
+    })
 }
 
 pub(super) struct PinRequest<I = Intent> {
@@ -517,61 +648,14 @@ impl PinRequest {
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<HmacRequest, String> {
         let auth = self.authorize(response)?;
-        let salt_enc = self.keys.encrypt(&self.intent.salt, entropy)?;
-        let salt_auth = self
-            .profile
-            .protocol
-            .authenticate(&self.keys.hmac.0, &salt_enc.0);
-        let mut out = Encoder::new();
-        out.head(5, 7)?;
-        out.head(0, 1)?;
-        out.text(RP_ID)?;
-        out.head(0, 2)?;
-        out.bytes(&self.intent.challenge)?;
-        out.head(0, 3)?;
-        out.head(4, 1)?;
-        out.head(5, 2)?;
-        out.text("id")?;
-        out.bytes(&self.intent.credential.0)?;
-        out.text("type")?;
-        out.text("public-key")?;
-        out.head(0, 4)?;
-        out.head(5, 1)?;
-        out.text("hmac-secret")?;
-        out.head(
-            5,
-            if self.profile.protocol == Protocol::One {
-                3
-            } else {
-                4
-            },
-        )?;
-        out.head(0, 1)?;
-        encode_key(&mut out, &self.public)?;
-        out.head(0, 2)?;
-        out.bytes(&salt_enc.0)?;
-        out.head(0, 3)?;
-        out.bytes(&salt_auth.0)?;
-        if self.profile.protocol == Protocol::Two {
-            out.head(0, 4)?;
-            out.head(0, 2)?;
-        }
-        out.head(0, 5)?;
-        out.head(5, 1)?;
-        out.text("up")?;
-        out.boolean(true)?;
-        // ClientPIN authorization provides UV; built-in uv is deliberately absent.
-        out.head(0, 6)?;
-        out.bytes(&auth.0)?;
-        out.head(0, 7)?;
-        out.head(0, self.profile.protocol.number())?;
-        let bytes = command(2, out, self.profile.max_message)?;
-        Ok(HmacRequest {
-            intent: self.intent,
-            keys: self.keys,
-            max_message: self.profile.max_message,
-            bytes,
-        })
+        let Self {
+            profile,
+            intent,
+            keys,
+            public,
+            ..
+        } = self;
+        hmac_assertion(profile, intent, keys, &public, Some(auth), entropy)
     }
 }
 
@@ -579,9 +663,12 @@ pub(super) struct HmacRequest {
     intent: Intent,
     keys: Keys,
     max_message: usize,
+    /// Whether a PIN token authorized it, so its answer must carry UV.
+    verified: bool,
     bytes: Secret,
 }
-/// Only produced after the enrolled credential signs UP, UV and extension bytes.
+/// Only produced after the enrolled credential signs UP, UV (but for the
+/// no-PIN probe's) and extension bytes.
 pub struct HmacOutput {
     secret: Secret,
     pub info: AssertionInfo,
@@ -599,7 +686,7 @@ impl HmacRequest {
     pub(super) fn finish(self, response: &[u8]) -> Result<HmacOutput, String> {
         let value = response_value(response, self.max_message)?;
         let parsed = self.intent.verifier.parse(response)?;
-        if !parsed.info.user_verified {
+        if self.verified && !parsed.info.user_verified {
             return Err("portable assertion requires UV".into());
         }
         if self
@@ -1367,6 +1454,7 @@ mod tests {
             intent: intent(label, challenge),
             keys: Keys::derive(protocol, &fixture(label, "shared").try_into().unwrap()),
             max_message: 1024,
+            verified: true,
             bytes: Secret::zeroed(0),
         }
     }
@@ -2694,5 +2782,126 @@ mod tests {
                 .login_enrollment(user, &[]),
             Err(LoginFailure::Protocol(_))
         ));
+    }
+
+    /// The fixture getInfo, whose one version is `FIDO_2_1`, ending in `last`.
+    fn version(label: &str, info: Info, last: u8) -> Vec<u8> {
+        let mut bytes = info_with(label, info);
+        let at = bytes.windows(8).position(|s| s == b"FIDO_2_1").unwrap();
+        bytes[at + 7] = last;
+        bytes
+    }
+
+    #[test]
+    fn login_admission_requires_fido_2_1_after_the_typed_refusals() {
+        for label in LABELS {
+            assert!(Profile::parse_login(&version(label, Info::default(), b'1')).is_ok());
+            for last in *b"02" {
+                let bytes = version(label, Info::default(), last);
+                assert_eq!(
+                    Profile::parse_login(&bytes).err(),
+                    Some(LoginFailure::Refused(LoginRefusal::NoFido21))
+                );
+                // The notebook admits CTAP 2.0 as before.
+                assert!(Profile::parse(&bytes).is_ok());
+            }
+            // Every typed refusal a key met before keeps its place.
+            for (info, refusal) in [
+                (
+                    Info {
+                        extensions: Extensions::Other,
+                        ..Info::default()
+                    },
+                    LoginRefusal::NoHmacSecret,
+                ),
+                (
+                    Info {
+                        always_uv: Some(true),
+                        ..Info::default()
+                    },
+                    LoginRefusal::AlwaysUv,
+                ),
+                (
+                    Info {
+                        client_pin: None,
+                        ..Info::default()
+                    },
+                    LoginRefusal::PinUnsupported,
+                ),
+                (
+                    Info {
+                        client_pin: Some(false),
+                        ..Info::default()
+                    },
+                    LoginRefusal::PinNotSet,
+                ),
+            ] {
+                assert_eq!(
+                    Profile::parse_login(&version(label, info, b'0')).err(),
+                    Some(LoginFailure::Refused(refusal))
+                );
+            }
+        }
+    }
+
+    /// The committed PIN-authorized assertion without its pinUvAuthParam (6)
+    /// and protocol (7): a five-member map ending at `up: true`.
+    fn probe(label: &str) -> HmacRequest {
+        let profile = Profile::parse_login(&fixture(label, "info")).unwrap();
+        let request = profile
+            .probe(
+                b"fixture-id",
+                PublicKey::from_coordinates(
+                    &fixture(label, "x").try_into().unwrap(),
+                    &fixture(label, "y").try_into().unwrap(),
+                )
+                .unwrap(),
+                fixture(label, "challenge").try_into().unwrap(),
+                fixture(label, "salt").try_into().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(request.bytes(), fixture(label, "key_request"));
+        let mut names = vec!["scalar"];
+        if label.starts_with("p2") {
+            names.push("iv_salt");
+        }
+        let mut names = names.into_iter();
+        let request = request
+            .finish(&fixture(label, "key_response"), &mut |bytes| {
+                bytes.copy_from_slice(&fixture(label, names.next().expect("extra entropy")));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(names.next(), None);
+        request
+    }
+
+    #[test]
+    fn the_no_pin_probe_is_the_assertion_without_its_pin_authorization() {
+        for label in LABELS {
+            let request = probe(label);
+            assert_eq!(request.bytes(), login_fixture(label, "probe_request"));
+            // Presence without UV: the output the key keeps for no PIN.
+            let output = request.finish(&fixture(label, "no_uv")).unwrap();
+            assert_eq!(output.bytes(), fixture(label, "output"));
+            assert!(!output.info.user_verified);
+            // UV claimed anyway is admitted; the caller compares the output.
+            assert!(probe(label).finish(&fixture(label, "response")).is_ok());
+            for refused in [
+                "no_up",
+                "missing",
+                "wrong_extension",
+                "short_output",
+                "wrong_rp",
+            ] {
+                assert!(
+                    probe(label).finish(&fixture(label, refused)).is_err(),
+                    "{label} {refused}"
+                );
+            }
+            let mut forged = fixture(label, "no_uv");
+            *forged.last_mut().unwrap() ^= 1;
+            assert!(probe(label).finish(&forged).is_err());
+        }
     }
 }

@@ -271,9 +271,10 @@ The module names below name td-fido's files (`td-fido/src/`, with the
 vectors under `td-fido/tests/`) unless they say otherwise. Its tests
 compile td-fido's virtual authenticator and transcript fixtures by path
 (td-fido/DESIGN.md, "Test support"). The dependency-free boundary
-PORTABLE.md states is unchanged. Increment 8b then requires `FIDO_2_1`
-and a no-PIN probe at login-key creation (TOKEN-LOGIN.md, "Token
-profile").
+PORTABLE.md states is unchanged. Since increment 8b login admission
+requires `FIDO_2_1` and login-key creation runs a no-PIN probe
+(TOKEN-LOGIN.md, "Token profile"), through td-fido's `Transaction::probe`;
+the notebook's admission is unchanged.
 
 `fido_hid.rs` implements the 64-byte CTAP HID report profile from
 [CTAP 2.3 section 11.2](https://fidoalliance.org/specs/fido-v2.3-ps-20260226/fido-client-to-authenticator-protocol-v2.3-ps-20260226.html).
@@ -2106,7 +2107,9 @@ getKeyAgreement, getPinToken and getPinUvAuthTokenUsingPinWithPermissions
 for both PIN protocols; non-resident ES256 makeCredential with
 hmac-secret, an exclusion list, configurable credential-ID length and a
 none or packed self attestation; and getAssertion, silent or
-PIN-authorized, with hmac-secret's separate UV and non-UV secrets. It
+PIN-authorized, with hmac-secret's separate UV and non-UV secrets, or,
+in its CTAP 2.0 mode (`one_secret`), one secret for both whatever
+versions it claims. It
 derives its own ECDH, KDF, AES-CBC and HMAC keys from td's primitives
 and decrypts and verifies every PIN hash, token authorization and salt
 authentication rather than trusting the client. A
@@ -2373,10 +2376,18 @@ step it derives later carries no key.
      enrollment's second key, both, while the first key's probe cannot
      yet name the second's credential. Anything else is KEY REFUSED `06`:
      a key whose default credProtect level hides the credential from a
-     silent assertion could never be selected by an unlock.
+     silent assertion could never be selected by an unlock;
+   - under the same step, a fourth session's no-PIN probe, under a fresh
+     probe-phase hash of that step: one hmac-secret assertion for the new
+     credential alone and its salt with presence and no PIN, which must
+     answer a verified, device-bound output other than the repeat's; any
+     status, NO_CREDENTIALS included, ends the operation.
+     The PIN's output means the key cannot require its PIN (CTAP 2.0's
+     one hmac-secret behind a `FIDO_2_1` claim), and is FAILED, as a key
+     whose getInfo lacks `FIDO_2_1` is at its first getInfo.
 
-   Discovery must find the same device before the repeat and before the
-   probe (ONE KEY). Every key is created, proved, repeated and probed
+   Discovery must find the same device before the repeat and before each
+   probe session (ONE KEY). Every key is created, proved, repeated and probed
    before anything is published.
 6. Every presented step is built from consent's types and admitted by
    the worker's own `admit_login_step` exactly as root admits it, with
@@ -2446,7 +2457,7 @@ byte:
 | `0c` | STATE COULD NOT BE READ | |
 | `0d` | RECORD CHANGED since the baseline | |
 | `0e` | UNCERTAIN: a write's outcome | what the re-read found, as above |
-| `0f` | FAILED: any other token, verification or store failure | |
+| `0f` | FAILED: any other token, verification or store failure, a key without `FIDO_2_1` and one whose no-PIN probe gives the PIN's output included | |
 | `10` | INTERNAL: root's frames, the channel, entropy or unprotected memory | |
 | `11` | EXCLUDED: the key already holds an enrolled credential or one created earlier in this operation | |
 | `12` | VERSION: no record version this build and both retained deployments read | |
@@ -2544,7 +2555,10 @@ additions to eight, whose authorization binds the record, each new key
 then unlocking, and the ninth refused before any token; removal of one
 key, of several including the authorizing one, and of the last, which
 unlinks the record even with no deployment marked; a credProtect default
-failing the probe; an `alwaysUv` key refused as KEY REFUSED `02` before
+failing the probe; a key reporting only `FIDO_2_0` FAILED before any
+PIN and one whose no-PIN probe returns the PIN's output (the virtual
+authenticator's one-secret mode) FAILED at the probe, each publishing
+nothing; an `alwaysUv` key refused as KEY REFUSED `02` before
 any PIN, and one advertising it false enrolling; presence denied at a
 creation and at an unlock's assertion, each after its PIN, as DENIED
 with no retry spent; a list too small for the exclusions; an enrolled
@@ -2614,7 +2628,7 @@ the new key in that order.
 | --- | --- |
 | `login-unlock` | each key of a two-key record unlocks over an identify and an assertion session, every CTAP request crossing the device; WRONG PIN at 8 then 7 and a later unlock at 6; a stranger NOT ENROLLED with no PIN step; no device and two devices ONE KEY with no report to either |
 | `login-blocked` | three wrong PINs end PIN AUTH BLOCKED, and an unlock gets no PIN step until the device is destroyed, the key power-cycled and a new device created, which then unlocks at 5; one retry left blocks for good, across reinsertions |
-| `login-enroll-one` | a one-key enrollment's three sessions publish the record, which a fresh worker then reads and the key unlocks; removing that last key unlinks it |
+| `login-enroll-one` | a one-key enrollment's four sessions publish the record, which a fresh worker then reads and the key unlocks; removing that last key unlinks it |
 | `login-enroll-two` | a two-key enrollment across a gated swap at the second connect step: the worker polls with the first key alone, then with none, then takes the second; the second creation excludes the first credential; each key then unlocks |
 | `login-add-remove` | an addition authorized by the enrolled key, then the same gated swap to the new key; the new key unlocks and removes the authorizing one, which then is NOT ENROLLED |
 | `login-keepalive` | a three-second scripted touch on the unlock assertion: the Session waits through UPNEEDED keepalives and unlocks. Over the touch's measured length, at most one keepalive per period plus two, at least one per observed longest silence less two, and no request silent for a second |

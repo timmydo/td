@@ -84,6 +84,9 @@ pub(crate) struct Config {
     pub(crate) cred_protect: Option<u8>,
     pub(crate) attestation: Attestation,
     pub(crate) aaguid: [u8; 16],
+    /// CTAP 2.0's hmac-secret: one secret, so an assertion without UV
+    /// returns the output one with UV does, whatever versions it claims.
+    pub(crate) one_secret: bool,
 }
 
 impl Default for Config {
@@ -103,6 +106,7 @@ impl Default for Config {
             cred_protect: None,
             attestation: Attestation::None,
             aaguid: [0x5a; 16],
+            one_secret: false,
         }
     }
 }
@@ -1144,7 +1148,11 @@ impl Authenticator {
         let Some((with_uv, without_uv)) = self.state.credentials[index].hmac else {
             return Ok(None);
         };
-        let random = if uv { with_uv } else { without_uv };
+        let random = if uv || self.config.one_secret {
+            with_uv
+        } else {
+            without_uv
+        };
         let mut output: Vec<u8> = salts
             .chunks(32)
             .flat_map(|salt| crypto::hmac(&random, salt))
