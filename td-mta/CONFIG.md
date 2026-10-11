@@ -1939,3 +1939,17 @@ methods. Stop, SIGTERM and SIGINT use the same shared stop flag. HTTPS closes
 its current nonmutating exchanges, then joins its worker; SMTP preserves its
 normal drain and known committed replies. Outbound delivery, reload and ACME
 remain inactive in both profiles.
+
+### Response retention admission
+
+The inert response owner reserves the entire configured response_bytes cap
+before file creation. Thus floor(response_total_bytes / response_bytes)
+bounds concurrent retained requests: two at defaults, possibly one for a
+valid smaller aggregate. This deliberately conservative policy does not
+promise one retained request per HTTPS connection. Future JMAP admission
+and advertised concurrency must also respect HTTPS workers, the 32 response
+file slots and ledger availability. Refuse transient pressure before method
+effects. An uncertain cleanup charges the full cap as used until cold
+recovery, so it may exhaust response admission. Coordinator used-byte
+accounting and RequestSpool status (occupied and retired slot counts)
+expose that state; runtime status and dispatch wiring remain pending.

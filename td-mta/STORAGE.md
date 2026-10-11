@@ -49,6 +49,18 @@ and its separately provisioned `ingress/` child for this disposable root.
 Both locks remain held until process exit; offline store commands continue
 to name the data directory itself.
 
+A third, separate locked root at `tmp/requests` is reserved for disposable
+JMAP response retention. The inert RequestSpool boundary accepts only LOCK
+and request-00 through request-31 directories, each with an optional
+mode-0600 response file (cold cleanup also accepts an owner-only subset
+left by a creation-time umask). No runtime currently opens this root. Activation
+must keep it separate from both database and ingress roots, clean abandoned
+files under its retained lock before initializing zero auxiliary response
+usage, and require process quiescence before recovery. ADMISSION.md owns
+its namespace validation, permissions repair and quota settlement. Future
+response offsets and creation-ID records share this single file with JSON;
+the current raw boundary implements none of those indexes.
+
 ## 2. SQLite and resource policy
 
 Measurement reports below identify historical fixtures and artifacts. Results

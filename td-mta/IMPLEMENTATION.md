@@ -2847,6 +2847,16 @@ needs integration tests. No discovery, dispatch or response retention is
 activated. Disk-backed results and the Core dispatcher remain required before
 advertising JMAP.
 
+**Private response retention.**
+
+The inert request spool and coordinator owner reserve each response's
+full disk cap in the shared ledger before exclusive file creation. A
+published prefix is immutable; read-only methods may discard only their
+unpublished tail. Cleanup closes and unlinks the owned inode before
+releasing quota; uncertain cleanup keeps the full charge until recovery.
+The boundary does not yet serialize or index JMAP responses, evaluate
+references, reserve method outcome framing, or activate HTTP dispatch.
+
 Use ADMISSION.md's exact bounded response spool, creation-ID map, result
 reference evaluation and per-method capacity preflight. Required tests include
 query/mutation/reference ordering and failure after an earlier committed method.

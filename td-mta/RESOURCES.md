@@ -4190,3 +4190,21 @@ ClientHello or provide cross-protocol fairness. The refusal-only increment
 also does not drain request bodies: closing with unread records can produce
 a TCP reset instead of a reliably observed HTTP refusal. Body dispatch must
 supply bounded connection draining before client interoperability is claimed.
+
+## Private response retention boundary
+
+RequestSpool owns 32 fixed filesystem slots with atomic occupied/retired
+bitsets, borrowing a separately locked root. It allocates no response heap.
+StoreCoordinator reserves the full per-request response cap in its existing
+ledger, preserving one lease cell for physical publication or maintenance.
+Default aggregate capacity admits two such reservations; CONFIG.md records
+the deliberate concurrency tradeoff and future advertisement obligation.
+Retired slots remain occupied, and uncertain cleanup retains the full cap
+as used until quiescent cold recovery. Slot status is not another byte quota.
+Append and exact published-prefix reads take caller buffers of at most
+64 KiB and charge the configured foreground I/O/record budgets, including
+replay; truncating a provisional tail charges one record. Retention uses
+the original outer exchange deadline, with tighter phase budgets still the
+future dispatcher's responsibility. Cleanup can outlive that deadline.
+These inert boundaries do not qualify HTTP dispatch, response indexing,
+reference walking or whole-service memory/scheduling integration.

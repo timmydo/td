@@ -259,16 +259,7 @@ fn parse_slot(name: &std::ffi::OsStr) -> Option<u8> {
     (slot < MAX_SLOTS).then_some(slot)
 }
 fn check_cleanup_file(metadata: &Metadata, owner: u32) -> Result<(), ports::Error> {
-    // Creation can die before restoring owner permissions filtered by umask.
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o7777 & !0o600 != 0
-        || metadata.nlink() != 1
-        || metadata.len() > MAX_MESSAGE_BYTES as u64
-    {
-        return Err(ports::Error::Invalid);
-    }
-    Ok(())
+    super::check_temporary(metadata, owner, MAX_MESSAGE_BYTES as u64)
 }
 fn check_file(metadata: &Metadata, owner: u32) -> Result<(), ports::Error> {
     check_cleanup_file(metadata, owner)?;
@@ -278,14 +269,14 @@ fn check_file(metadata: &Metadata, owner: u32) -> Result<(), ports::Error> {
     Ok(())
 }
 
-struct Scope {
+pub(super) struct Scope {
     clock: Arc<dyn Clock>,
     deadline: Deadline,
     last: Tick,
     failed: Option<ports::Error>,
 }
 impl Scope {
-    fn new(clock: Arc<dyn Clock>, deadline: Deadline) -> Result<Self, ports::Error> {
+    pub(super) fn new(clock: Arc<dyn Clock>, deadline: Deadline) -> Result<Self, ports::Error> {
         let last = clock.sample()?.monotonic;
         let mut scope = Self {
             clock,
@@ -300,7 +291,7 @@ impl Scope {
         let first = *self.failed.get_or_insert(error);
         Err(first)
     }
-    fn check(&mut self) -> Result<(), ports::Error> {
+    pub(super) fn check(&mut self) -> Result<(), ports::Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -332,28 +323,23 @@ impl Temporary<'_, '_> {
         if self.released {
             return Ok(());
         }
-        // Unlinked files still occupy storage until the last descriptor closes.
-        drop(self.file.take());
-        let result = (|| {
-            let name = Name::ingress_slot(self.slot).map_err(|_| ports::Error::Invalid)?;
-            let mut path = [0; MAX_PATH_BYTES];
-            let path = self.spool.root.root.directory.join(&name, &mut path)?;
-            let metadata = match fs::symlink_metadata(path) {
-                Err(error)
-                    if self.identity.is_none() && error.kind() == io::ErrorKind::NotFound =>
-                {
-                    return Ok(());
-                }
-                result => result?,
-            };
-            let identity = self.identity.as_ref().ok_or(ports::Error::Invalid)?;
-            if !same_file(identity, &metadata) {
-                return Err(ports::Error::Invalid);
-            }
-            check_cleanup_file(&metadata, self.spool.owner)?;
-            fs::remove_file(path)?;
-            Ok(())
-        })();
+        let mut path = [0; MAX_PATH_BYTES];
+        let name = Name::ingress_slot(self.slot).map_err(|_| ports::Error::Invalid);
+        let path = name.as_ref().map_err(|error| *error).and_then(|name| {
+            self.spool
+                .root
+                .root
+                .directory
+                .join(name, &mut path)
+                .map_err(Into::into)
+        });
+        let result = super::cleanup_temporary(
+            &mut self.file,
+            self.identity.as_ref(),
+            path,
+            self.spool.owner,
+            MAX_MESSAGE_BYTES as u64,
+        );
         let mask = bit(self.slot)?;
         if result.is_ok() {
             self.spool.slots.occupied.fetch_and(!mask, Ordering::SeqCst);

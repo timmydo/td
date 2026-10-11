@@ -6,6 +6,7 @@ use std::{ffi::CStr, fmt, path::Path};
 pub const CAPACITY: usize = 128;
 /// Complete canonical ingress namespace, including abandoned old slots.
 pub const INGRESS_SLOTS: u8 = 64;
+pub const REQUEST_SLOTS: u8 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -66,6 +67,16 @@ impl Name {
             return Err(Error::Encoding);
         }
         Self::encode(format_args!("slot-{slot:02}"))
+    }
+    pub fn request_slot(slot: u8, response: bool) -> Result<Self, Error> {
+        if slot >= REQUEST_SLOTS {
+            return Err(Error::Encoding);
+        }
+        if response {
+            Self::encode(format_args!("request-{slot:02}/response"))
+        } else {
+            Self::encode(format_args!("request-{slot:02}"))
+        }
     }
     pub fn as_bytes(&self) -> Result<&[u8], Error> {
         self.bytes.get(..self.length).ok_or(Error::Encoding)

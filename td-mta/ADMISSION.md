@@ -632,6 +632,61 @@ roll back a durable submission. The same rule applies to Email/copy's implicit
 destroy-original method. Physical response-file loss still uses the connection
 failure path, not fabricated results.
 
+### Private response-file custody
+
+The inert RequestSpool and StoreCoordinator::retain_response boundary
+implement file custody and quota reservation; no HTTP dispatcher invokes
+them yet. Activation requires the supervisor to supply a separate private
+tmp/requests root
+and hold its LOCK. Cold opening validates the complete closed namespace
+before deleting abandoned responses: at most 32 server-named request
+subdirectories, each containing only its optional response file. Directory
+owner read/search permissions filtered by umask may be repaired to permit
+child inspection after validating its type, owner and absence of group,
+other or special permission bits. Remaining owner bits are restored only
+after namespace validation. Unknown entries, links, wrong owners, unsafe
+permissions and files above 1 GiB
+refuse startup. Cleanup and initialization share the original deadline.
+
+Before file creation, the coordinator reserves the full configured
+per-request response cap in its existing ResponseBytes ledger bucket.
+There is no second byte counter. A busy effect ticket owns this entire
+reservation throughout file creation, execution, transmission and cleanup;
+expiry cannot cancel it. Each admitted response leaves a ledger cell for
+durable publication or maintenance. Default aggregate quota admits two
+full response reservations; future HTTP admission must reflect this limit
+and return transient pressure before method effects. Logical reservation
+still does not reserve filesystem blocks or guarantee I/O.
+
+The owner exposes bounded append, immutable-prefix publication, exact reads
+of that prefix and rollback of only its unpublished tail. Each operation
+is at most 64 KiB. Its original clock/deadline and the configured foreground
+I/O/record work ceilings bound file work, including failed attempts and
+replay. Capacity rejection before writing permits tail rollback; I/O,
+clock and work failure are sticky. Dispatcher method budgets must leave
+room within these enclosing limits for already reserved error output.
+This raw boundary does not validate JSON, reserve method error framing,
+index responses, resolve references or publish HTTP headers. Its deadline is
+the original outer exchange deadline, not the shorter execution deadline;
+the dispatcher must additionally enforce execution and transmission phase
+budgets. The failure and work_failure accessors distinguish terminal work
+exhaustion from a recoverable prewrite cap refusal. Output bytes also count
+as I/O; the shared meter's output ceiling adds no independent tighter bound.
+
+Discard/drop keeps the sole owned descriptor open through inode comparison
+and unlink, then closes it before releasing quota or the slot. This prevents
+inode reuse after premature close; it does not remove the stable, trusted
+namespace assumption in STORAGE.md. Proven cleanup settles zero remaining
+physical
+response bytes, then cancels the unused logical reservation. Uncertain
+cleanup settles the entire cap as used and retires the filesystem slot
+until cold recovery; it cannot unlink a replacement inode or refund its
+charge. Ledger settlement failure stops admission and requires recovery.
+Cleanup may outlive the request deadline and waits for coordinator state
+only on a worker. Forgotten owners keep their reservation and descriptor;
+recovery requires process quiescence, not merely opening another root.
+No fsync or durable mail authority is introduced.
+
 ### References and creation IDs
 
 Implement RFC 8620 section 3.7 against immutable retained response bytes:

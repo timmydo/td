@@ -18,8 +18,8 @@ pub use index::{
     CommitError, CommitFileUsage, CommitRequest, Delivery, DeliveryAuthorization,
     DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest,
     HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError, LogicalUsage,
-    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
-    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
+    ResponseError, ResponseRetention, StoreCoordinator, StoreFileUsage, StoreLogicalUsage, Upload,
+    UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
     UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
 };
 #[path = "store_fs/body_verify.rs"]
@@ -32,6 +32,51 @@ pub use account_verify::{AccountCheckError, AccountCheckLimits};
 
 #[path = "store_fs/pinned.rs"]
 mod pinned;
+// Shared temporary-file policy. Namespace writers are trusted and paths stable.
+fn check_temporary(
+    metadata: &Metadata,
+    owner: u32,
+    maximum: u64,
+) -> Result<(), crate::ports::Error> {
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 & !0o600 != 0
+        || metadata.len() > maximum
+    {
+        return Err(crate::ports::Error::Invalid);
+    }
+    Ok(())
+}
+fn cleanup_temporary(
+    file: &mut Option<File>,
+    identity: Option<&Metadata>,
+    path: Result<&Path, crate::ports::Error>,
+    owner: u32,
+    maximum: u64,
+) -> Result<(), crate::ports::Error> {
+    let result = (|| {
+        let path = path?;
+        let metadata = match fs::symlink_metadata(path) {
+            Err(error) if identity.is_none() && error.kind() == io::ErrorKind::NotFound => {
+                return Ok(())
+            }
+            result => result?,
+        };
+        let identity = identity.ok_or(crate::ports::Error::Invalid)?;
+        if !same_file(identity, &metadata) {
+            return Err(crate::ports::Error::Invalid);
+        }
+        check_temporary(&metadata, owner, maximum)?;
+        fs::remove_file(path)?;
+        Ok(())
+    })();
+    // Keep the inode alive through identity comparison/unlink, then close the
+    // sole descriptor before the owner can release its quota or slot.
+    drop(file.take());
+    result
+}
+
 #[cfg(test)]
 pub use pinned::with_pinned_fixture;
 pub use pinned::{PinnedBlob, PinnedBlobInput};
@@ -39,6 +84,10 @@ pub use pinned::{PinnedBlob, PinnedBlobInput};
 #[path = "store_fs/spool.rs"]
 mod spool;
 pub use spool::{IngressSpool, SpoolCapacity, SpoolInput, SpoolStatus, SpoolWriter};
+
+#[path = "store_fs/request_spool.rs"]
+mod request_spool;
+pub use request_spool::{RequestSpool, RequestSpoolStatus};
 
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.
