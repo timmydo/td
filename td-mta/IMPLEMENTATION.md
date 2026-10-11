@@ -2809,6 +2809,17 @@ the upstream peer's hostname/chain checks against its provisioned certificate.
 
 ## M13 — HTTPS, authentication and JMAP Core
 
+M13a implements strict transport-independent request-head and streaming
+body framing in `http_request`. Fixed header/line/count bounds, decoded
+and aggregate wire limits, CRLF-only parsing, checked chunk extensions,
+sticky refusal and exact consumed prefixes are covered by fragmented
+and smuggling fixtures. This is not HTTPS activation or authentication.
+Next: bind it to HTTPS request handling, durable generated device
+credentials and revocation, then authenticated discovery/Core dispatch.
+Mail listing/retrieval/download integration and a real td-mail fixture
+follow in M14. DESIGN section 10 owns the initial framing restrictions
+and the enclosing driver's outstanding admission obligations.
+
 Use ADMISSION.md's exact bounded response spool, creation-ID map, result
 reference evaluation and per-method capacity preflight. Required tests include
 query/mutation/reference ordering and failure after an earlier committed method.

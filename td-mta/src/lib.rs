@@ -32,6 +32,7 @@ pub use td_mime::header_select;
 pub use td_mime::header_text;
 pub use td_mime::header_urls;
 pub use td_mime::header_value;
+pub mod http_request;
 pub mod ids;
 pub use td_mime::json_string;
 pub mod limits;

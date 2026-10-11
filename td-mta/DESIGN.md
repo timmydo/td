@@ -1764,6 +1764,57 @@ separate.
 
 ## 10. HTTP and JMAP
 
+The `http_request` module implements transport-independent HTTP/1.1
+request framing. It does not open HTTPS listeners or grant authentication.
+A caller-owned head buffer admits at most 32 KiB, 8192 bytes per line
+including CRLF, and 100 fields. Parsing requires strict CRLF, one Host,
+origin-form targets and unambiguous framing. Duplicate security/framing
+fields, obs-fold, Content-Length with Transfer-Encoding, request content
+coding, upgrades and declared trailers refuse. Only chunked transfer coding
+is supported. Host is passive syntax, never configured-origin authority.
+Authorization and optional Origin are borrowed without Debug output;
+duplicate Origin fields refuse. Other unrecognized fields are discarded;
+future endpoints needing additional fields must add explicit handling.
+Retiring the reader clears its backing. This is ordinary buffer hygiene,
+not guaranteed erasure of compiler or caller copies; a black_box barrier
+discourages dead-store removal without adding unsafe code. The caller must clear
+consumed TLS/plaintext input too and must not log or retain credentials.
+
+BodyReader streams length-delimited or chunked bytes into caller output,
+with independent decoded and aggregate wire ceilings chosen before reading.
+Chunk-size lines have a 1024-byte cap excluding CRLF, validated ignored
+extensions and checked size arithmetic. The initial profile requires an
+empty trailer section; nonempty trailers terminate the request. Each feed
+consumes at most 16 KiB and leaves the next request's bytes untouched.
+Backpressure does not consume body bytes without output space. Syntax,
+limit and premature-EOF errors are sticky; provisional body bytes cannot
+be committed after a framing error. No parser reset can revive failure.
+
+The enclosing HTTPS driver must enforce TLS, configured authority, route
+and method policy, cross-origin refusal, authentication, deadlines,
+connection/request counts and scheduling. Routes match the raw target;
+only validated endpoint components may be decoded, never used as arbitrary
+filesystem paths. It must authorize and admit
+body storage before sending 100 Continue, check decoder completion before
+publication, and close on framing failure. These integrations, responses,
+device persistence and JMAP remain subsequent increments. Framing tests
+cover split input, pipelined tails, binary bodies, output backpressure,
+smuggling patterns and exact/refused limits without a network listener.
+
+This initial profile deliberately refuses leading empty lines, absolute-form
+and asterisk-form targets, non-ASCII field values and Connection options
+other than close/keep-alive. It is not complete HTTP/1.1 conformance:
+absolute-form support required by RFC 9112 section 3.2.2 remains outstanding.
+Bracketed IPv6 Host values reject zone identifiers. Chunk extensions
+accept grammar-defined whitespace around semicolons and equals signs,
+but refuse standalone trailing whitespace before CRLF. Malformed request-line
+syntax is distinct from a well-formed unsupported HTTP version.
+No proxy, browser compatibility or JMAP conformance is claimed. These fixed
+parser caps are independent of the proposed slot partitions in RESOURCES
+and ADMISSION; no HTTPS runtime pool is allocated by this increment.
+Integrated slot layout and memory measurement remain driver work under
+section 5; the existing Limits::plan arithmetic is unchanged.
+
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous
 header syntax, oversized chunks, invalid request targets, and request smuggling
