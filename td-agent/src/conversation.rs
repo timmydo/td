@@ -5591,19 +5591,13 @@ impl Session {
         question: String,
         options: Vec<String>,
     ) -> Result<String, String> {
-        self.send(&Up::Question {
-            call: started,
-            question,
-            options: options.clone(),
-        });
-        // What waits already, what the window sent before it heard the
-        // question included, was written before the question was seen,
+        // What waits already was written before the question was seen,
         // another question's answer among it: it answers nothing here,
-        // and is taken into the turn in its order as ever.
+        // and is taken into the turn in its order as ever. It is taken
+        // before the question is sent, so an answer that comes at once is
+        // never counted with it; one the window sent as the question
+        // reached it may answer it, as a person cannot tell those apart.
         self.hear();
-        // The person is asked already: a connection held back for the
-        // classifier is put to them too, as the wait below does.
-        self.unclassified();
         let earlier: Vec<String> = self
             .queue
             .iter()
@@ -5612,6 +5606,14 @@ impl Session {
                 _ => None,
             })
             .collect();
+        self.send(&Up::Question {
+            call: started,
+            question,
+            options: options.clone(),
+        });
+        // The person is asked already: a connection held back for the
+        // classifier is put to them too, as the wait below does.
+        self.unclassified();
         let answer = loop {
             if self.gone || self.interrupt {
                 break None;
