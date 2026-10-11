@@ -1,9 +1,12 @@
-//! `mknod` — the one device node the deployment initramfs has to create itself.
+//! `mknod` — the one device node td's initramfs have to create themselves.
 //!
-//! `/dev/loop0` is where td-boot attaches the verified root. `/dev` IS devtmpfs by
-//! then, so the node normally comes from the kernel; this is the fallback for when
-//! the loop driver registered none, and it cannot come from the cpio because the
-//! devtmpfs mount shadows whatever was there.
+//! `/dev/loop0` is where td-boot attaches a verified root: the deployment
+//! initramfs's, and the selector's read-only bind of `current`'s `root.erofs`
+//! when it authenticates a staged selector update (td-install/ENCRYPTION.md
+//! "Selector update"). `/dev` IS devtmpfs in both by then, so the node normally
+//! comes from the kernel; this is the fallback for when the loop driver
+//! registered none, and it cannot come from the cpio because the devtmpfs mount
+//! shadows whatever was there.
 //!
 //! Only BLOCK nodes. `c`, `u` and `p` are refused: nothing on td's boot path
 //! creates one, and the type is the part of `mode` that decides which driver the
@@ -17,9 +20,10 @@ use crate::sys;
 /// `S_IFBLK`. The type half of `mode`; the permission half is below.
 const S_IFBLK: usize = 0o60000;
 
-/// The node exists for exactly one consumer — `td-boot root-loop`, running as root
-/// in the initramfs — and does not survive the switch_root, so nothing is served by
-/// making it group readable. (Like every mknod, the kernel still masks this with the
+/// The node exists for exactly one consumer — td-boot, running as root in the
+/// initramfs: `root-loop` in the deployment's, the staged update's
+/// authentication in the selector's — and does not survive the switch_root or
+/// the kexec, so nothing is served by making it group readable. (Like every mknod, the kernel still masks this with the
 /// umask; `verify` deliberately does not look at permission bits.)
 const MODE: usize = 0o600;
 

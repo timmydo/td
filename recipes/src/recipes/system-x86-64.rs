@@ -4248,9 +4248,12 @@ const LOGIN_TIER_SOURCE: &str = "{root}/td-login-tier";
 ///
 /// The line is drawn at the /bin NAME, not at the binary: since the `mount(2)` amendment
 /// BOTH phases pack td-init, because both mount devtmpfs and proc before doing anything
-/// else. Only the deployment phase links `switch_root` and `losetup` to it — the pivot
-/// and the loop bind are the capabilities the selector must not have — and the same test
-/// that pins those pins the selector's `bin/switch_root` and `bin/losetup` absent.
+/// else. Only the deployment phase links `switch_root` to it — the pivot is the
+/// capability the selector must not have — and the same test that pins it pins the
+/// selector's `bin/switch_root` absent. `losetup` and `mknod` are in both: the
+/// deployment binds its verified root, and the installed selector's staged-update
+/// commit binds `current`'s root.erofs read-only to authenticate the staged pair
+/// (td-install/ENCRYPTION.md "Selector update").
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Selector,
@@ -4300,6 +4303,13 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     s.push_str("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0\n");
     s.push_str("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0\n");
     s.push_str("slink /bin/umount {in:td-init}/bin/td-init 0777 0 0\n");
+    // The loop applet, and `mknod` for its node, in BOTH phases (D6): the
+    // deployment /init binds the verified root with `td-boot root-loop`, and
+    // the installed selector's staged-update commit binds `current`'s
+    // root.erofs read-only to read its selector template, creating
+    // /dev/loop0 first when devtmpfs has none.
+    s.push_str("slink /bin/losetup {in:td-init}/bin/td-init 0777 0 0\n");
+    s.push_str("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0\n");
     // td-util, for the same reason td-init is here: /init needs cat, printf, mkdir,
     // chmod, chown, ln, rm and sleep BEFORE the pivot, and uutils serves every one
     // of those names dynamically — against a closure no loader has been mounted for
@@ -4343,12 +4353,9 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
                 td_boot_protocol::SECRET_LINE_APPLET
             ));
         }
-        // The pivot applet and the loop applet, and ONLY here. /init execs
-        // `/bin/switch_root`, and the selector has no branch that enters a root.
-        // `losetup` is the same shape of decision: only `td-boot root-loop` binds
-        // the verified image, and only the deployment /init runs it — the selector
-        // runs `td-boot boot`, which kexecs. Carrying either name there would give
-        // an initramfs a capability its /init has no branch for.
+        // The pivot applet, and ONLY here. /init execs `/bin/switch_root`, and
+        // the selector has no branch that enters a root: it kexecs. Carrying the
+        // name there would give an initramfs a capability it has no branch for.
         Phase::Deployment => {
             // This static helper validates accounts and creates the primary home
             // before any reader starts and while the initramfs still has procfs.
@@ -4357,10 +4364,6 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str("file {in:td-firstboot}/bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0755 0 0\n");
             s.push_str("slink /bin/td-firstboot {in:td-firstboot}/bin/td-firstboot 0777 0 0\n");
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
-            s.push_str("slink /bin/losetup {in:td-init}/bin/td-init 0777 0 0\n");
-            // `mknod` joins them for the same reason: only this /init creates
-            // /dev/loop0, because only this one has a loop to bind.
-            s.push_str("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0\n");
             // Only a live boot's /init formats anything: its volatile volume on
             // /dev/ram0. Static, so it runs before any root is mounted; its
             // debug companion ships in the real root with the package.
@@ -5139,7 +5142,7 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/cryptsetup[.]static$' || { echo 'deployment initramfs: cryptsetup store member missing - /bin/cryptsetup would dangle' >&2; exit 1; }; \
      for a in \"$selector\" \"$init\"; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F 'bin/cryptsetup -> {in:cryptsetup-x86-64}/bin/cryptsetup.static' || { echo \"initramfs $a: /bin/cryptsetup must link the static cryptsetup td-boot opens volumes with\" >&2; exit 1; }; done; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
-     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
+     for a in \"$selector\" \"$init\"; do for p in losetup mknod; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F \"bin/$p -> {in:td-init}/bin/td-init\" || { echo \"initramfs $a: /bin/$p must link td-init - the deployment binds its verified root with it and a staged selector update's commit binds current's root.erofs\" >&2; exit 1; }; done; done; \
      \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then echo 'deployment initramfs: secret-line must be selector-only - only the selector has a recovery flow' >&2; exit 1; fi; \
      if [ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]; then echo 'root tree: secret-line must be selector-only - no root farm links it' >&2; exit 1; fi; \
@@ -13532,7 +13535,7 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 .collect();
             greps += 1;
             // WHICH archive is asked is part of the claim: td-kexec is
-            // selector-only and losetup deployment-only, so "some spec carries
+            // selector-only and mkfs.btrfs deployment-only, so "some spec carries
             // this file" would let a payload sit in the archive that does not
             // need it while the one that does greps for nothing. The phase comes
             // from the list variable the grep reads, which is the same text.
@@ -14098,16 +14101,11 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 && !selector.contains("switch_root"),
             "only the deployment initramfs may expose the pivot as /bin/switch_root"
         );
-        assert!(
-            deployment.contains("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0")
-                && !selector.contains("mknod"),
-            "only the deployment initramfs creates /dev/loop0, so only it may carry mknod"
-        );
         // td-boot calls mount/umount/losetup by their /bin names, so each must be a
         // td-init farm entry AND actually linked into the cpio of every phase that
-        // runs it. Which phases those are is NOT uniform: `td-boot boot` and
-        // `td-boot root-loop` mount, but only `root-loop` binds the loop, and only
-        // the deployment /init runs it.
+        // runs it: `td-boot root-loop` binds the deployment's root, and the
+        // installed selector's staged-update commit binds `current`'s root.erofs,
+        // each creating /dev/loop0 with `mknod` when devtmpfs has none.
         let td_init = td_init_applets();
         for applet in td_boot_protocol::REQUIRED_TD_INIT_APPLETS {
             assert!(
@@ -14118,6 +14116,8 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         for applet in [
             td_boot_protocol::MOUNT_APPLET,
             td_boot_protocol::UMOUNT_APPLET,
+            td_boot_protocol::LOSETUP_APPLET,
+            "mknod",
         ] {
             for (phase, spec) in [("selector", &selector), ("deployment", &deployment)] {
                 assert!(
@@ -14126,12 +14126,6 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 );
             }
         }
-        let losetup = format!("slink /bin/{} ", td_boot_protocol::LOSETUP_APPLET);
-        assert!(
-            deployment.contains(&losetup) && !selector.contains(&losetup),
-            "the loop bind is a deployment capability: `td-boot root-loop` runs only there, \
-             and the selector must not carry the name that would let it bind one"
-        );
         // The recovery flow's console reader: td-boot runs /bin/secret-line in
         // the installed selector, so td-init must serve it and the selector
         // link it; no other phase and no root farm has a recovery flow.

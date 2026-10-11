@@ -221,6 +221,12 @@ needs `/proc` mounted and takes its operation lock under the root-owned
 mode-0755 `/run` the selector initramfs carries, and the
 image build refuses a selector initramfs whose `/bin/secret-line` does
 not link td-init, and a deployment initramfs or root that carries it.
+`losetup` and `mknod` are in both initramfs: the deployment binds its
+verified root with them, and the installed selector's staged-update
+commit (ENCRYPTION.md "Selector update", from 8e) binds `current`'s
+`root.erofs` read-only to read its template, making `/dev/loop0` first
+when devtmpfs has none; so the image build refuses either initramfs
+whose `/bin/losetup` or `/bin/mknod` does not link td-init.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create

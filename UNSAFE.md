@@ -140,7 +140,8 @@ the admission record rides td-kexec's existing calls (§1, where
 and power-supply reads are file reads, and securityfs and the optional
 Secure Boot enrollment's efivarfs are mounted through td-init's existing
 `mount` applet, and the selector attaches a verified `root.erofs` with
-its existing `losetup` applet; enrollment only creates variables,
+its existing `losetup` applet, creating `/dev/loop0` with the existing
+`mknod` applet when devtmpfs has none (§3); enrollment only creates variables,
 needing no `FS_IOC_SETFLAGS`. A sub-increment that finds it needs a
 syscall, an ioctl request or an allowance amends this file in its own
 commit.
@@ -343,9 +344,12 @@ switch_root's `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` +
 flag uutils lacks), `wait4(2)` (init, which as PID 1 must reap the
 orphans a targeted `Child::wait` cannot see), `mknod(2)` — the tenth,
 and the last privileged busybox job on the boot path — and `poll(2)`,
-the eleventh, secret-line's wait over its two lines (below). The
-deployment initramfs mounts devtmpfs on `/dev` first thing, so
-`/dev/loop0` normally comes from the kernel; this is the fallback for
+the eleventh, secret-line's wait over its two lines (below). Both
+initramfs link `losetup` and `mknod`: the deployment's binds the
+verified root, and the selector's binds `current`'s `root.erofs`
+read-only to authenticate a staged selector update
+(`td-install/ENCRYPTION.md` "Selector update"). Each mounts devtmpfs on
+`/dev` first thing, so `/dev/loop0` normally comes from the kernel; this is the fallback for
 when the loop driver registered none, and it cannot come from a cpio
 `nod` line because the devtmpfs mount shadows whatever was there. Unlike
 `losetup` and `kill`, the busybox spelling here WAS build-time checked —
