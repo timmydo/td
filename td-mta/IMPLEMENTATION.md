@@ -2814,8 +2814,12 @@ body framing in `http_request`. Fixed header/line/count bounds, decoded
 and aggregate wire limits, CRLF-only parsing, checked chunk extensions,
 sticky refusal and exact consumed prefixes are covered by fragmented
 and smuggling fixtures. This is not HTTPS activation or authentication.
-Next: bind it to HTTPS request handling, durable generated device
-credentials and revocation, then authenticated discovery/Core dispatch.
+M13b adds the bounded durable device registry and offline device create/revoke
+commands, with provider-generated passwords, versioned salted verifiers,
+private atomic publication, restart/corruption tests and a real CLI fixture.
+Both commands hold the mail store lock; live control operations remain next.
+Next: bind framing and credentials to HTTPS request handling and local online
+administration, then authenticated discovery/Core dispatch.
 Mail listing/retrieval/download integration and a real td-mail fixture
 follow in M14. DESIGN section 10 owns the initial framing restrictions
 and the enclosing driver's outstanding admission obligations.

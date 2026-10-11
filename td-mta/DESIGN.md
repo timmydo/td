@@ -1372,7 +1372,7 @@ Planned commands, with stable JSON output and exit codes:
 | `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |
 | `queue list`, `queue inspect ID` | Paginated status and redacted reasons |
 | `queue retry ID`, `queue cancel ID` | Named, transactional operation; never repeat accepted recipients |
-| `device create`, `device revoke ID` | Local credential administration |
+| `device create --label LABEL`, `device revoke --id ID`, `device list` | Local credential administration |
 | `store layout`, `store inspect`, `store changes`, `store export` | Bounded read-only decoding/export under local administrator authority |
 | `store init` | Offline creation of a new store with one account and its Inbox; never replaces a store |
 | `store verify`, `store repair` | Read-only verification; explicit offline repair with a manifest |
@@ -1401,6 +1401,13 @@ High-entropy generated tokens do not need a human-password derivation scheme;
 v1 does not accept operator-chosen weak passwords. A device record binds an
 account, label, stable ID, creation/revocation state, and verifier. Labels are
 untrusted display strings. Bound authentication work globally and by peer.
+
+The first credential increment provides offline `device create` and `device
+revoke` commands. Both hold the main store lock, require its sole account,
+and separately lock an operator-provisioned private `devices/` directory.
+Online control-socket administration and HTTPS authentication are subsequent
+increments; these commands cannot race the running receiver. Device storage
+and publication are specified in STORAGE.md, "Device credentials".
 
 Accept HTTP Basic authentication only over verified server HTTPS from clients;
 td-mta presents the certificate and the client verifies it. Credentials do not
@@ -1796,8 +1803,8 @@ connection/request counts and scheduling. Routes match the raw target;
 only validated endpoint components may be decoded, never used as arbitrary
 filesystem paths. It must authorize and admit
 body storage before sending 100 Continue, check decoder completion before
-publication, and close on framing failure. These integrations, responses,
-device persistence and JMAP remain subsequent increments. Framing tests
+publication, and close on framing failure. These integrations, responses and JMAP remain subsequent increments;
+offline device persistence is implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
 

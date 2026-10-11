@@ -1846,3 +1846,97 @@ fn control_requires_explicit_private_runtime_and_json_status() {
         assert_eq!(report.get("stage").unwrap().as_str(), Some("arguments"));
     }
 }
+
+#[test]
+fn device_cli_creates_once_revokes_durably_and_obeys_store_lock() {
+    if private_case("device_cli_creates_once_revokes_durably_and_obeys_store_lock") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let init = Command::new(mail_binary())
+        .args(["store", "init", "--root"])
+        .arg(&fixture.0)
+        .args(["--account", &ACCOUNT.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    let path = fixture.0.join("devices");
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let command = |operation: &str| {
+        let mut command = Command::new(mail_binary());
+        command
+            .args(["device", operation, "--root"])
+            .arg(&fixture.0)
+            .args(["--account", &ACCOUNT.to_string()]);
+        command
+    };
+    let output = command("create")
+        .args(["--label", "td-mail test"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let receipt = String::from_utf8(output.stdout).unwrap();
+    assert!(receipt.contains("\"schema\":1,\"command\":\"device.create\",\"status\":\"ok\""));
+    let id = receipt
+        .split("\"deviceId\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let listed = command("list").output().unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(id));
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("password"));
+    let password = receipt
+        .split("\"password\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let mut devices_root = PrivateRoot::open(path.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let devices = td_mta::store_fs::DeviceStore::open(&mut devices_root, ACCOUNT).unwrap();
+    assert_eq!(
+        devices
+            .authenticate(password.as_bytes())
+            .unwrap()
+            .unwrap()
+            .to_string(),
+        id
+    );
+    drop(devices);
+    drop(devices_root);
+    let held = PrivateRoot::open(fixture.0.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let blocked = command("revoke").args(["--id", id]).output().unwrap();
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stdout).contains("busy"));
+    drop(held);
+    let revoked = command("revoke").args(["--id", id]).output().unwrap();
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&revoked.stdout).contains(password));
+    let mut devices_root = PrivateRoot::open(path.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let devices = td_mta::store_fs::DeviceStore::open(&mut devices_root, ACCOUNT).unwrap();
+    assert_eq!(devices.authenticate(password.as_bytes()).unwrap(), None);
+}

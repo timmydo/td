@@ -26,6 +26,8 @@ pub enum RootEntry {
     Wal,
     SharedMemory,
     BackupPartial,
+    Devices,
+    DevicesPending,
     Lock,
 }
 
@@ -53,6 +55,8 @@ impl Name {
             RootEntry::Wal => "metadata.sqlite3-wal",
             RootEntry::SharedMemory => "metadata.sqlite3-shm",
             RootEntry::BackupPartial => "metadata.sqlite3.backup-partial",
+            RootEntry::Devices => "records.v1",
+            RootEntry::DevicesPending => "records.v1.pending",
             RootEntry::Lock => "LOCK",
         };
         Self::encode(format_args!("{text}"))

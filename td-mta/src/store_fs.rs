@@ -7,6 +7,10 @@ use std::{
     path::Path,
 };
 
+#[path = "store_fs/devices.rs"]
+mod devices;
+pub use devices::{DeviceError, DevicePassword, DeviceStore, DEVICE_CAPACITY, DEVICE_LABEL_BYTES};
+
 #[path = "store_fs/index.rs"]
 mod index;
 pub use index::{

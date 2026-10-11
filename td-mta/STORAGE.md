@@ -2563,3 +2563,59 @@ arguments, both lock roles, root policy and identical roots. Sample epoch
 inequality is a wiring check, not entropy-quality evidence. Existing core
 publication and epoch fault/process-death tests own those unchanged boundaries;
 this command does not add arbitrary native-fault or resource qualification.
+
+## Device credentials
+
+The private `devices/` directory is separate from the SQLite mail database.
+The operator provisions it as mode 0700, under the same owner as the mail
+root. Its own `LOCK` uses the existing exclusive private-root lock contract.
+The offline `device create --root PATH --account ID --label LABEL` and
+`device revoke --root PATH --account ID --id ID` commands additionally hold
+the mail root lock and require the database's sole account. Run commands as
+the service user. `device list --root PATH --account ID` lists all IDs,
+including revocations, under the same locks without revealing secrets.
+They never accept
+an operator-chosen password. Online administration is not implemented yet.
+
+`records.v1` is a bounded, mode-0600, single-link regular file. It contains
+magic `TDDEV001`, the 16-byte account ID, a big-endian u16 record count,
+records, and SHA-256 of all preceding bytes. Each record contains a 16-byte
+device ID, 32-byte salt, 32-byte verifier, u64 creation UTC milliseconds,
+a revocation byte (0 or 1), u64 revocation UTC milliseconds (zero when absent),
+u16 UTF-8 label length, and label bytes. Integers are big-endian. Labels
+contain 1..128 bytes and no Unicode control characters. Duplicate IDs,
+trailing bytes, unknown versions, corruption, wrong account and wrong file
+policy fail closed. The checksum detects accidental corruption; the trusted
+service owner remains authority over these files.
+
+At most 256 records, including revocations, fit in a 64 KiB file. Revocations
+are tombstones; automatic reuse or compaction is not implemented. Device ID,
+salt and secret use provider entropy (16, 32 and 32 bytes respectively).
+The once-displayed token is lowercase hex ID, a dot and lowercase hex secret.
+The verifier hashes the bytes `td-mta device verifier v1` plus NUL, account
+ID, device ID, salt and secret using provider SHA-256. Authentication checks
+canonical token syntax and compares fixed-size digests through the provider.
+No reusable plaintext secret enters the file. Secret buffer clearing is
+best-effort hygiene, not a compiler or process-memory erasure guarantee.
+The caller must enforce HTTPS, username/account binding, bounded global and
+peer authentication work, and recheck revocation before each mutation.
+
+Publication exclusively creates `records.v1.pending`, writes and syncs it,
+renames it over `records.v1`, then syncs the directory before success or
+password disclosure. Any publication error retires the live owner, including
+authentication; recovery requires reopening under the lock. A failed command
+has no durable success receipt and may have published before a sync failure.
+Restart validates and syncs the selected snapshot and its directory before
+serving authentication or an idempotent revocation receipt. This completes
+any preceding uncertain publication. It also removes a private regular
+pending file. Missing selected files fail authentication; only explicit local
+creation initializes an absent registry (an empty, non-authenticating
+snapshot may remain if subsequent token generation or label validation fails). Failed password output cannot be
+replayed: use device list to find and revoke an undisclosed device if
+necessary and create another. Labels remain untrusted display strings; this
+initial listing emits IDs only.
+
+Mail database backup and restore do not copy credential state. Preserve the
+credential directory separately; restoring an older credential snapshot can
+undo revocations. The store lock and stable trusted namespace assumptions
+apply here as to the database. There is no public HTTP administration route.
