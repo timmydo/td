@@ -4,9 +4,11 @@
 //! Library code: nothing in production calls it before ENCRYPTION.md
 //! increment 8c.
 
-use crate::{CAP_PCR, SELECTOR_IMAGE_PCR, SELECTOR_INITRD_PCR};
+use crate::{ObserveError, CAP_PCR, SELECTOR_IMAGE_PCR, SELECTOR_INITRD_PCR};
 use std::fmt;
-use td_tpm::{put32, Client, PcrReadError, PcrSelection, Reader, Refusal, SealedObject, Transport};
+use td_tpm::{
+    put32, Client, PcrPolicy, PcrReadError, PcrSelection, Reader, Refusal, SealedObject, Transport,
+};
 
 /// The shortest PIN the codec admits.
 pub const MIN_PIN_LEN: usize = 6;
@@ -198,6 +200,15 @@ impl PinPolicy {
         self.pcr_digest
     }
 
+    /// The PolicyPCR step td-tpm's sessions take; with PolicyAuthValue
+    /// (`PcrPolicy::auth_digest`) its digest is this policy's.
+    pub fn pcr_policy(&self) -> PcrPolicy {
+        PcrPolicy {
+            selection: self.selection,
+            pcr_digest: self.pcr_digest,
+        }
+    }
+
     /// The policy digest a tpm-pin object carries as its authPolicy, each
     /// step extended from the zero digest as TPM 2.0 Part 3 specifies.
     pub fn digest(&self) -> [u8; 32] {
@@ -223,6 +234,24 @@ pub fn release_pin_policy<T: Transport>(
 ) -> Result<PinPolicy, PcrReadError> {
     let values = client.read_pcrs_typed(crate::selection(pcrs.measured())?)?;
     Ok(PinPolicy::new(pcrs, &values)?)
+}
+
+/// The tpm-pin policy a new seal takes: `pcrs`' measured PCRs as they read
+/// now, in one PCR_Read, each refused at all zeros as unmeasured, as the
+/// device-bound seal's `observe` refuses, and a literal-zero PCR 12.
+pub fn observe_pin<T: Transport>(
+    client: &mut Client<T>,
+    pcrs: PinPcrs,
+) -> Result<PinPolicy, ObserveError> {
+    let values = client
+        .read_pcrs_typed(crate::selection(pcrs.measured()).map_err(ObserveError::Tpm)?)
+        .map_err(|error| ObserveError::Tpm(error.into()))?;
+    for (pcr, value) in pcrs.measured().iter().zip(&values) {
+        if *value == [0; 32] {
+            return Err(ObserveError::Unmeasured { pcr: *pcr });
+        }
+    }
+    PinPolicy::new(pcrs, &values).map_err(ObserveError::Tpm)
 }
 
 /// The authPolicy of a tpm-pin object's public area: a SHA-256 keyed-hash

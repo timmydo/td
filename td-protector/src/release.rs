@@ -7,7 +7,10 @@
 //! command runs through `Runner`, and every secret is zeroed when dropped.
 
 use crate::cryptsetup::{Cryptsetup, KeyFile};
+use crate::lockout;
 use crate::luks2::{Header, MAX_TD_TOKENS};
+use crate::pin::{release_pin_policy, AuthValue, PinPolicy};
+use crate::protected::TpmPin;
 use crate::recovery::RecoveryKey;
 use crate::token::{Role, Token};
 use crate::transition::{self, Input, Refusal, Released as Classified, Step, Transition};
@@ -19,17 +22,118 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;
-use td_tpm::{Client, Device, PcrPolicy, SealedObject, Transport};
+use td_tpm::{
+    AuthSealed, Client, Device, DictionaryAttack, LockoutAuth, LockoutError, PcrPolicy,
+    SealedObject, Transport, UnsealError as TpmUnsealError, DA_SEALED_ATTRIBUTES,
+};
 
 /// The most td tokens one release tries: the reader's bound on td tokens,
 /// so every one a header can carry.
 pub const MAX_ATTEMPTS: usize = MAX_TD_TOKENS;
 
 /// A TPM the release reaches: each operation opens a fresh client, so every
-/// transient handle and session is flushed when it ends.
+/// transient handle and session is flushed when it ends. The protected
+/// tier's operations, whose sessions are salted to the storage primary,
+/// are td-tpm's over `open`; tests stand a model in for them.
 pub trait Tpm {
     type Transport: Transport;
     fn open(&mut self) -> Result<Client<Self::Transport>, String>;
+
+    /// TPMA_PERMANENT and the dictionary-attack properties, read without
+    /// authorization.
+    fn dictionary_attack(&mut self) -> Result<DictionaryAttack, String> {
+        self.open()?.dictionary_attack()
+    }
+
+    /// The owner storage primary's Name, its handle flushed.
+    fn primary_name(&mut self) -> Result<Vec<u8>, String> {
+        let mut client = self.open()?;
+        let (handle, name) = client.storage_primary(None)?;
+        client.flush(handle)?;
+        Ok(name)
+    }
+
+    /// Seal `secret` as a tpm-pin object under `policy` with `auth`, noDA
+    /// clear, its Create in a session salted to the storage primary and
+    /// refused before the salt when that primary's Name is not `expected`.
+    fn seal_pin(
+        &mut self,
+        policy: &PinPolicy,
+        expected: Option<&[u8]>,
+        auth: &AuthValue,
+        secret: &Secret,
+    ) -> Result<AuthSealed, String> {
+        let mut payload = *secret.expose();
+        let sealed = self.open().and_then(|client| {
+            client.seal_with_auth(
+                &policy.pcr_policy(),
+                expected,
+                auth.expose(),
+                DA_SEALED_ATTRIBUTES,
+                &mut payload,
+            )
+        });
+        td_tpm::zero(&mut payload);
+        sealed
+    }
+
+    /// Unseal a tpm-pin token with `auth`, under its policy over its PCRs
+    /// as they read now and a literal-zero PCR 12, in a policy session
+    /// salted to the primary of the token's Name. A wrong `auth` is the
+    /// error's `AuthRefusal::AuthFail`, a locked-out TPM its `Lockout`.
+    fn unseal_pin(&mut self, token: &TpmPin, auth: &AuthValue) -> Result<Secret, TpmUnsealError> {
+        let failed = |message: String| TpmUnsealError {
+            refusal: None,
+            message,
+        };
+        let mut client = self.open().map_err(failed)?;
+        let policy = release_pin_policy(&mut client, token.pcrs)
+            .map_err(|error| failed(String::from(error)))?;
+        let payload = client.unseal_with_auth(
+            &policy.pcr_policy(),
+            &token.primary,
+            auth.expose(),
+            &token.sealed.public,
+            &token.sealed.private,
+        )?;
+        Secret::from_payload(payload).map_err(failed)
+    }
+
+    /// One of the lockout hierarchy's commands under `auth`, in a session
+    /// salted to the primary whose Name is `primary`.
+    fn lockout(
+        &mut self,
+        command: LockoutCommand,
+        primary: &[u8],
+        auth: &LockoutAuth,
+    ) -> Result<(), LockoutError> {
+        let failed = |message: String| LockoutError::Failed {
+            refusal: None,
+            message,
+        };
+        let mut client = self.open().map_err(failed)?;
+        match command {
+            LockoutCommand::Take => client.take_lockout(primary, auth),
+            LockoutCommand::ClearPolicy => client.clear_lockout_policy(primary, auth),
+            LockoutCommand::Parameters => {
+                client.set_dictionary_attack(primary, auth, lockout::DA_PARAMETERS)
+            }
+            LockoutCommand::Reset => client.reset_lockout(primary, auth),
+        }
+    }
+}
+
+/// The lockout hierarchy's commands a release sends (ENCRYPTION.md
+/// "Lockout"): td-tpm's take (TPM2_HierarchyChangeAuth from the empty
+/// authorization, then TPM2_SetPrimaryPolicy), the policy alone,
+/// TPM2_DictionaryAttackParameters with td's values, and
+/// TPM2_DictionaryAttackLockReset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockoutCommand {
+    Take,
+    ClearPolicy,
+    Parameters,
+    Reset,
 }
 
 /// The kernel resource manager, `/dev/tpmrm0`.

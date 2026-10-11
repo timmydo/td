@@ -5,7 +5,7 @@
 //! the transition planner and the selector's release orchestration
 //! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
 //! protected tier's PIN primitives, token codecs, lockout token
-//! encryption and plans, which nothing in production calls yet.
+//! encryption, plans and release, which nothing in production calls yet.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -29,6 +29,7 @@ pub mod luks2;
 pub mod pin;
 pub mod protected;
 pub mod protected_plan;
+pub mod protected_release;
 pub mod recovery;
 pub mod release;
 pub mod token;
@@ -213,8 +214,16 @@ impl Secret {
         Ok(secret)
     }
 
+    /// A copy of `bytes`, a secret released some other way, such as a
+    /// security key's keyslot passphrase. The caller zeroes its own.
+    pub fn copy_of(bytes: &[u8; SECRET_LEN]) -> Self {
+        let mut secret = Self::zeroed();
+        secret.0.copy_from_slice(bytes);
+        secret
+    }
+
     /// Takes an unsealed payload, zeroing it whether or not it is accepted.
-    fn from_payload(mut payload: Vec<u8>) -> Result<Self, String> {
+    pub(crate) fn from_payload(mut payload: Vec<u8>) -> Result<Self, String> {
         let mut secret = Self::zeroed();
         let accepted = payload.len() == SECRET_LEN;
         if accepted {
@@ -531,6 +540,9 @@ mod tests {
         /// Allocate no SHA-256 PCR bank: PCR_Read returns the SHA-256
         /// selection emptied and no values.
         pub(crate) no_sha256_bank: bool,
+        /// The storage primary seed: a cleared TPM's new seed gives its
+        /// primary another Name.
+        pub(crate) seed: u8,
     }
 
     #[derive(Clone)]
@@ -554,6 +566,7 @@ mod tests {
                 cleared: false,
                 refuse: None,
                 no_sha256_bank: false,
+                seed: 0,
             })))
         }
 
@@ -757,7 +770,7 @@ mod tests {
                     assert_eq!(&template[22..], [0, 0, 0, 0]);
                     let mut public = template[..22].to_vec();
                     put_blob(&mut public, &td_tpm::digest(template)).unwrap();
-                    put_blob(&mut public, &[0x0f; 32]).unwrap();
+                    put_blob(&mut public, &[0x0f ^ self.seed; 32]).unwrap();
                     out_handle = Some(0x8000_0000 + self.next);
                     put_blob(&mut out, &public).unwrap();
                     scripted_creation(&mut out);

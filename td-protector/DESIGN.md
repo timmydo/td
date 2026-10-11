@@ -599,9 +599,9 @@ adminWithPolicy, with userWithAuth and noDA clear, and the authValue
 `auth_value` gives. Whether a new seal names PCR 7 is td-boot's reading
 of the measured boot (ENCRYPTION.md, "Firmware authentication"), never a
 header field. `PinPolicy::new` and `release_pin_policy` admit an
-unmeasured, all-zero PCR 4, 7 or 9, as release must; 8c's seal therefore
-owes a tpm-pin counterpart of `observe` that refuses an unmeasured PCR
-before it seals, as the device-bound seal does.
+unmeasured, all-zero PCR 4, 7 or 9, as release must; 8c's seal takes
+`observe_pin`, the tpm-pin counterpart of `observe`, which refuses an
+unmeasured PCR before it seals, as the device-bound seal does.
 
 **Chain check.** `chain_check` takes its own client, the token's
 `PinPcrs`, the storage primary's 34-byte Name the token recorded and
@@ -640,10 +640,11 @@ check are current ("PIN and tpm-pin policy"), as are, from 8a's last
 commit, the lockout token's encryption, the codecs of the tokens 8a
 names and the reader's protected bounds below, and, from 8c's first
 commit, the plans on protected headers and the runner's `token import
---token-replace`: library code nothing in production calls. The
-lockout's TPM sequences, the secure-boot, config and update-retry
-tokens, the upgrade's plans and `reencrypt` shapes and the release are
-not.
+--token-replace`, and from its second the protected release with the
+lockout's take, proof, counter and reset: library code nothing in
+production calls until td-boot dispatches to it. The lockout's clear,
+the secure-boot, config and update-retry tokens and the upgrade's plans
+and `reencrypt` shapes are not.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -662,12 +663,13 @@ requires the token's Name to be that one (`OtherPrimary`); only then
 does it decrypt, into the buffer td-tpm's `LockoutAuth::from_bytes`
 zeroes, whose refusal of an authorization that trims to nothing is
 `Invalid`. `k_enc` and `k_mac` are zeroed on drop. The token carries no
-secret in clear, so its codec keeps nothing to zero. `take`, `prove`,
-`reset` and `clear` are the sequences that section gives, over td-tpm's
-lockout commands (td-tpm/DESIGN.md "Lockout hierarchy"), the
+secret in clear, so its codec keeps nothing to zero. The take, the
+proof and the reset are the protected release's (below), over td-tpm's
+lockout commands (td-tpm/DESIGN.md "Lockout hierarchy") with the
 parameters `DA_MAX_TRIES` 32, `DA_RECOVERY_SECS` 600 and
-`DA_LOCKOUT_RECOVERY_SECS` 86400 pinned by test; none matches
-parameters in place of a proof.
+`DA_LOCKOUT_RECOVERY_SECS` 86400 (`lockout::DA_PARAMETERS`, pinned by
+test); none matches parameters in place of a proof. The clear lands with
+the `tpm-clear` request.
 
 **Tokens.** Each protected token is a LUKS2 token object with exactly
 these keys, in this order, every text a canonical decimal or lowercase
@@ -873,18 +875,89 @@ replacing the token in place. Its
 `luksKillSlot` floor stays 32 bytes, which a FIDO2 passphrase and the
 recovery key's 48 digits meet.
 
-**Release.** `release::release` gains the protected path: its
-`Released` names the method (tpm-pin, fido2-primary, fido2-recovery or
-recovery key) that the admission record follows; FIDO2 comes through a
-`release::Fido` interface that td-boot's worker implements and tests
-script; the chain check, warning and verified reseal run before the cap
-and the lockout's take, proof and reset after the keyslot test, as
-ENCRYPTION.md's "Protected release" says. Its bounds grow by the FIDO2
-attempts, which are the person's, one seal and one verifying unseal per
-reseal, and the lockout's commands: a take's four (HierarchyChangeAuth,
-SetPrimaryPolicy, DictionaryAttackParameters, LockReset) or a proof's
-two (SetPrimaryPolicy, DictionaryAttackParameters), then at most one
-counter reset and one requested clear.
+**Release.** Since 8c the protected path is its own module,
+`protected_release`, beside the device-bound `release::release`, which
+td-boot keeps for device-bound and upgrading headers; `release` refuses
+a header whose `Kind` is not protected. Its `Released` names the method
+(tpm-pin, fido2-primary, fido2-recovery or recovery key) that the
+admission record follows, `Method::admits` the two primary ones; FIDO2
+comes through `protected_release::Fido`, which td-boot's worker
+implements and tests script, and every console entry through `Prompt`,
+one run of secret-line each. The `release::Tpm` trait gains the
+protected tier's operations as default methods over td-tpm's salted
+sessions (`dictionary_attack`, `primary_name`, `seal_pin`, `unseal_pin`
+and `lockout` with a `LockoutCommand`), so the release tests stand a
+model in for the sessions while the chain check, the PCR reads and the
+cap stay on the scripted wire; an emulator test runs the defaults
+against swtpm. `release` runs, before the cap, the chain check, the
+warning, the TPM PIN, another way and the verified reseal, then the cap
+and the released keyslot's test; `finish`, after the selector opened
+the mapping with the volume key, confirms cryptsetup's metadata once
+before the first write and runs the plan, the take or proof, the
+counter and the reset. `policy_pcr_alone` is the deployment
+initramfs's post-cap check. Choices beyond ENCRYPTION.md's text, each
+failing closed:
+
+- A reseal passes the storage-primary Name every tpm-pin token records
+  to `seal_pin`'s `expected`, and is not offered when the tokens record
+  different Names or the chain check found another primary
+  (`ChainError::OtherPrimary`): a primary that appeared since the first
+  seal never receives a new authValue and secret ("Bus"). A cleared or
+  replaced TPM, whose primary is new, therefore gets no reseal at boot;
+  a TPM that refuses the Load under the recorded primary does. With no
+  tpm-pin token the seal is a first one and passes none.
+- After the cap, before a plan adds its keyslot, every seal, a first
+  one included, requires its primary's Name to be the one a lockout
+  token on the header read at release records under a tag that
+  verifies under the volume key. Without one, or under another Name,
+  the object is discarded before its import and the boot continues by
+  the method that released it; a first take's own token anchors the
+  next boot's seal, not this one's. So no reseal is offered before the
+  cap on a header with no lockout token (`NO_ANCHOR`): its seal could
+  only be discarded and would send the new PIN's authValue for nothing.
+- A TPM-primary header with no tpm-pin token naming a keyslot prints
+  the changed-chain warning before any prompt, after the line saying it
+  holds none: a cut update, a TPM clear or a rewritten header removed
+  them, and the warning is what stands between a disk-writing
+  interposer and the owner's key (ENCRYPTION.md "Threat and limits").
+- A take never replaces a lockout token whose tag verifies but names
+  another primary: that TPM, cleared, replaced or intercepted, gets no
+  lockout step at boot (ENCRYPTION.md "Lockout").
+- A keyslot test that fails after the cap discards a confirmed reseal
+  before another way is asked, so a key that opens nothing cannot
+  confirm one that the next key's release installs.
+- With a confirmed reseal the take or proof runs before the reseal's
+  plan, which runs only once it succeeded, so a failed one discards the
+  object before its import; without one the plan runs first. The lockout
+  token's writes are the planner's, at the numbers it names.
+- The counter is read once the release's test passed, before a take's
+  own reset would clear it, and printed after the take or proof, in the
+  TPM-primary shape only, where it counts td's PINs.
+- The TPM is reached after the cap only when this boot's own cap closed
+  PCR 12. An already-closed cap, or a TPM without a SHA-256 bank, after a
+  security-key or recovery-key release opens the volume with the plan
+  but no lockout step; after a TPM PIN release or a verified reseal, any
+  cap error halts, every secret zeroed.
+- A SetPrimaryPolicy refused as a wrong authorization (`AuthFail`)
+  removes an unproven token and keeps a proven one. One refused with
+  `Lockout` checked nothing and keeps either. Its success proves
+  possession and marks the token proven before DictionaryAttackParameters,
+  whose refusal keeps it. A proof refused for another primary, or
+  failing any other way, keeps the token and sends nothing more that
+  boot.
+- A header the planner refuses after a release opens the volume with no
+  write and nothing sent to the lockout hierarchy.
+- A sealed object over the token's bounds is refused at its seal, before
+  the cap, with no keyslot added and no tpm-pin token imported; the
+  boot's lockout step runs as without a reseal.
+
+Its bounds grow by the FIDO2 attempts and the entries, which are the
+person's, one seal and one verifying unseal per reseal, and the
+lockout's commands: a take's three calls (td-tpm's take, which sends
+HierarchyChangeAuth and SetPrimaryPolicy, then
+DictionaryAttackParameters and LockReset) or a proof's two
+(SetPrimaryPolicy, DictionaryAttackParameters), then at most one
+counter reset and, from its increment, one requested clear.
 
 ## Bounds
 
@@ -1121,7 +1194,45 @@ no keyslot; metadata that disagrees; no free keyslot or token number and
 an object over the token's bounds; the lockout token's import, proof
 mark and removal at the numbers the planner names; and every plan, a
 tpm-pin release and the reseal beside one and two old protectors, cut
-after each of its steps, converging over the next boots on one header. td-fido's `hkdf_expand`
+after each of its steps, converging over the next boots on one header.
+Protected-release tests run `release` and `finish` over the scripted
+wire TPM with a model of the salted sessions, a scripted FIDO2 worker,
+scripted secret-line entries, and a cryptsetup model that requires PCR
+12 capped before every command and every state to pass the reader's
+bounds; the model refuses a lockout command before a keyslot's test has
+passed and a seal after the cap. They pin a PIN release and its take
+(token on the header first, then the change, the parameters and the
+reset, then proven) and the next boot's proof (SetPrimaryPolicy before
+DictionaryAttackParameters, no reset, no write); a codec-refused entry
+costing no TPM command; wrong PINs counted and the counter printed
+after the test; a lockout turning to another way and that release's
+reset, and a lockout answered at the Unseal; a changed chain, a fresh
+TPM (a new primary) and another primary each asking no PIN and warning
+before any prompt and offering no reseal, and a Load refused under the
+recorded primary offering one; no SHA-256 bank asking no PIN and taking
+nothing; an unmeasured PCR 4 or 9 offering no reseal; each
+FIDO2 role and the recovery key in both shapes, with no reseal, take or
+write in the FIDO2 shape; a wrong recovery key asking again after the
+cap; the reseal confirmed (verified before the cap, requiring the
+recorded Name, planned after the take, the next boot taking the new
+PIN), declined, and failing at its seal, its verification and the
+token's bounds; the pre-cap lockout rule; a refused take discarding the
+reseal and its unproven token proven on the next boot; a verified
+token's L reused and a forged one replaced; a refused proof removing an
+unproven token and keeping a proven one, a locked lockout hierarchy
+keeping an unproven one, a refused DictionaryAttackParameters after a
+proof keeping it proven, and an interposed take; a seal's keyslot
+added only under the anchored primary (an interposer's primary taking
+nothing, a lockout token whose tag fails anchoring nothing); a failed
+keyslot test discarding the pending reseal; a header with no lockout
+token offering no reseal and its take anchoring the next boot's; no
+tpm-pin token warning before any prompt; no TPM device; end of input and failed applets; every cut of the reseal with
+its take and of a PIN release's plan converging; forged headers (a
+foreign policy, a tpm-pin token on the fido2 or recovery keyslot, a
+lockout token whose tag fails, metadata over the bounds, a mixed shape,
+an upgrading header) releasing nothing unverified and writing nothing;
+the post-cap check's PolicyPCR alone; that every secret is dropped and
+none reaches a console line. td-fido's `hkdf_expand`
 is pinned to RFC 5869's three SHA-256 cases at their whole lengths,
 with the info split at every offset, one block agreeing with `hkdf`, and
 an output over 8160 bytes refused untouched.

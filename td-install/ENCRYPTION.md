@@ -1139,8 +1139,21 @@ The primary's Name is recorded in each tpm-pin and lockout token when
 it is first written and must match at every later use, a re-seal for a
 PIN change or an update included: td-tpm refuses another primary
 before it salts a session to it, so no secret is encrypted to it. That
-is trust on first use. An interposer present at that first seal
-defeats it; one that appears later is refused as a changed TPM. td-tpm takes P-256 and AES from
+is trust on first use, anchored at the lockout take: the tpm-pin tokens
+are unauthenticated header data, so a re-seal's required Name is only
+as good as the header, and a first seal, with no tpm-pin token left,
+requires none and salts its session to whatever primary answers. After
+the cap, before its keyslot is added, every seal, a first one included,
+therefore requires its primary's Name to be the one a lockout token on
+the header records under a tag that verifies under the volume key
+("Lockout"); with no such token, or under another Name, the sealed
+object gets no keyslot and the boot continues by the method that
+released it. What is defended: no keyslot is added for an object
+sealed to a primary other than the one td took the lockout on, and an
+interposer that appears after the take is refused as a changed TPM.
+What is not: an interposer present at the take, and the new PIN of a
+first seal, whose authValue such a session discloses ("Threat and
+limits"). td-tpm takes P-256 and AES from
 td-fido by path ("FIDO2 protectors"); the kernel's own TPM bus
 protection (`TCG_TPM2_HMAC`) stays off as pinned.
 
@@ -1179,8 +1192,14 @@ volume key:
   policy step, through a lockoutPolicy it set. Under a forged clear
   `lockoutAuthSet`, reusing the token's `L` is never worse than drawing
   a fresh one, and it keeps the only copy of an `L` the TPM may hold.
-  Without such a token td imports one with a fresh `L`, replacing any
-  lockout token present, which proves nothing. A fresh token is
+  Without such a token td imports one with a fresh `L`, replacing a
+  lockout token whose tag fails, which proves nothing. A token whose tag
+  verifies but names another primary is the anchor of every seal
+  ("Bus") and no boot replaces it: td takes nothing on that TPM, a
+  cleared, replaced or intercepted one, and says so; protector
+  management's TPM re-enrollment ("Protector management") retires it
+  under fresh authentication, so that a later boot's take writes a
+  token for the new primary. A fresh token is
   imported unproven (`"proven":"0"`, td-protector/DESIGN.md "Tokens");
   a reused one keeps its mark. td then sends TPM2_HierarchyChangeAuth for
   `TPM_RH_LOCKOUT` from the empty authorization to `L`;
@@ -1205,10 +1224,16 @@ volume key:
 - **Proving it**, with `lockoutAuthSet` set, needs a token whose tag
   verifies under this volume key and whose Name is this TPM's primary:
   td sends TPM2_SetPrimaryPolicy with an empty authPolicy under `L`,
-  completing a take a crash or a forged refusal interrupted, then
-  TPM2_DictionaryAttackParameters with the three values under `L`,
-  which also repairs them, and marks an unproven token proven. A
-  refused proof removes an unproven token and keeps a proven one.
+  completing a take a crash or a forged refusal interrupted. Its
+  success, whose response HMAC is keyed with `L`, proves possession and
+  marks an unproven token proven. TPM2_DictionaryAttackParameters with
+  the three values under `L` follows, which also repairs them; its
+  refusal, which an interposer can forge after that success, keeps the
+  proven token and ends this boot's lockout steps. A SetPrimaryPolicy
+  refused as a wrong authorization (`TPM_RC_AUTH_FAIL`) removes an
+  unproven token and keeps a proven one. One refused with
+  `TPM_RC_LOCKOUT`, a lockout hierarchy itself locked out, checked
+  nothing: either token stays, and the boot takes no lockout step.
   Anything else is a TPM td cannot prove:
   `lockoutAuthSet` set without a token (another system, such as a
   Windows installation, provisioned it), a tag that fails, another
@@ -1227,8 +1252,9 @@ volume key:
   nothing. Otherwise it seals and verifies before the cap, and a take or
   proof that then fails after the cap discards the object before its
   import.
-- **Counter.** After any release whose keyslot test passed, a non-zero
-  `TPM_PT_LOCKOUT_COUNTER` is printed (`td: the TPM counted N wrong PINs
+- **Counter.** After any release in the TPM-primary shape whose
+  keyslot test passed, a non-zero `TPM_PT_LOCKOUT_COUNTER`, read before
+  a take's own reset, is printed (`td: the TPM counted N wrong PINs
   since its last reset`), a sign of guessing when the owner made no
   mistakes. After a fido2 or recovery-key release, td then resets the
   counter under `L`, so a person locked out recovers with a token or the
@@ -1305,9 +1331,11 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
      this boot.
    - **Reseal.** When a FIDO2 token or the recovery key was chosen in
      the TPM-primary shape and no tpm-pin object passed (a changed
-     chain, a cleared or different TPM, or none on the header), and the
-     TPM has a SHA-256 bank with PCR 4 and PCR 9 measured and may be
-     sealed to (the pre-cap rule in "Lockout"), the console warns that
+     chain, an object the TPM no longer loads under the recorded
+     primary, or none on the header), and the TPM has a SHA-256 bank
+     with PCR 4 and PCR 9 measured and may be sealed to (the pre-cap
+     rule in "Lockout"), and a lockout token is on the header to anchor
+     the seal ("Bus"), the console warns that
      confirming binds release to this boot chain and retires every
      other tpm-pin protector, and asks, as the device-bound reseal does;
      exactly `reseal` confirms. Confirmed, it prompts `td new PIN: ` and
@@ -1316,7 +1344,23 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
      12, and unseals it once with that PIN, requiring the same secret:
      PCR 12 is still zero, so unlike the device-bound reseal this one is
      verified before the cap. A failed seal or verification says so and
-     keeps nothing. The FIDO2-primary shape has no tpm-pin protector and
+     keeps nothing. A re-seal requires the storage primary the tpm-pin
+     tokens recorded ("Bus"), so a TPM whose primary is another, a
+     cleared or replaced one among them, is offered none and keeps only
+     the security keys and the recovery key at boot until protector
+     management's TPM re-enrollment ("Protector management"). After
+     the cap a sealed object's keyslot is added only under the primary
+     a verified lockout token records ("Bus"), a first seal included.
+     With no lockout token on the header no reseal is offered, since its
+     keyslot would never be added and its seal would send the new PIN's
+     authValue for nothing: the console says that this boot takes the
+     lockout, and the next boot by a security key or the recovery key
+     offers the reseal under the token that take writes. A TPM-primary
+     header with no tpm-pin token shows the changed-chain warning before
+     any prompt, whatever removed them.
+     A key whose keyslot test fails after the cap discards a confirmed
+     reseal, so a key that opens nothing cannot confirm one for the next
+     key's release. The FIDO2-primary shape has no tpm-pin protector and
      offers none.
    - **Requests.** After a PIN release, a requested PIN change
      ("Protector management") or else a staged selector update's
@@ -1341,7 +1385,9 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
    rules (td-protector, "Protected roles"). The lockout take or proof,
    the counter, a requested TPM clear, and a staged update's
    authentication, import and commit follow in that order, each needing
-   the volume key or the open volume. The selector then selects, writes
+   the volume key or the open volume; with a confirmed reseal the take
+   or proof runs before the reseal's plan, which runs only once it
+   succeeded ("Lockout"). The selector then selects, writes
    the admission record ("Verified account handoff"), and hands off as
    today.
 
@@ -1367,7 +1413,19 @@ withstand an attacker with two visits. Secure Boot with a firmware setup
 password closes that path; Secure Boot alone does not ("Firmware
 authentication"). Nor does the tier protect a running or suspended
 machine, whose key is in RAM (Scope), a PIN observed as it is typed, or
-a TPM bus interposer present at the first seal.
+a TPM bus interposer present at the lockout take, which every later
+seal is anchored to ("Bus"). An interposer that can also write the disk
+can delete the tpm-pin tokens, so that the next confirmed reseal is a
+first seal salted to its primary: no keyslot is added for that object,
+but the interposer obtains the new PIN's authValue and can guess that
+PIN offline. Deleting the lockout token as well makes the next take
+trust on first use again: that boot offers no reseal, its take under
+the interposer records the interposer's primary, and a reseal on a
+later boot is then anchored to it. The header is not authenticated, so
+only the owner's reading of the warning stands between such an
+interposer and that later reseal: every such boot shows the
+changed-chain warning before any prompt, since a TPM-primary header
+with no tpm-pin token always does ("Protected release").
 
 ### FIDO2 protectors
 
@@ -1482,10 +1540,16 @@ predicted and sealed ahead ("Selector update"), so the boot after one
 asks only for the PIN. Everything else that moves PCR 4, PCR 7 or PCR 9
 fails the chain check before any PIN is asked and shows the warning: a
 firmware update td does not perform, changed firmware settings, option
-ROMs or Secure Boot state, a load option, a mispredicted update, and a
-cleared or replaced TPM. The owner then releases with an enrolled FIDO2
-token or the recovery key and confirms the reseal ("Protected release"),
-and later boots take the PIN again. There is no PolicyAuthorize, signing
+ROMs or Secure Boot state, a load option, and a mispredicted update.
+The owner then releases with an enrolled FIDO2 token or the recovery
+key and confirms the reseal ("Protected release"), and later boots take
+the PIN again. A cleared or replaced TPM fails the same check and shows
+the warning, but its storage primary is not the one the tpm-pin and
+lockout tokens record, which no boot can tell from an interposer's
+("Bus"): it is offered no reseal and its lockout is not taken. The
+owner releases with a FIDO2 token or the recovery key, then re-adds TPM
+plus PIN through protector management's TPM re-enrollment, trust on
+first use on the new primary ("Protector management"). There is no PolicyAuthorize, signing
 key or NV counter; every seal is exact PolicyPCR over values the genuine
 selector observed or computed.
 
@@ -1814,8 +1878,10 @@ while the header is in state U0.
      console says so and U4 ends
      without a tpm-pin or lockout token: the volume completes as a
      TPM-primary volume with no tpm-pin protector, as after a TPM clear,
-     whose boots ask for a token or the recovery key and offer the
-     reseal once the TPM is eligible again.
+     whose boots ask for a token or the recovery key. Once the TPM is
+     eligible again, the first such boot offers no reseal and takes the
+     lockout, writing the lockout token; the boot after offers the
+     reseal, anchored to it ("Protected release").
    - U5 to protected: remove the `td-upgrade` token.
 
    The selector keeps the mapping it opened, takes the volume key with
@@ -1883,8 +1949,8 @@ root left behind (Scope).
 
 On a protected volume `td-install storage-operation` adds a FIDO2
 token, removes FIDO2 tokens, removes the recovery key, requests a TPM
-PIN change, and requests a TPM clear, each under td-authd's physical
-consent. Addition and removal are authorized either by a fresh
+PIN change, requests a TPM clear, and requests TPM re-enrollment, each
+under td-authd's physical consent. Addition and removal are authorized either by a fresh
 authorize-phase assertion over the operation's canonical description
 from an enrolled FIDO2 token that remains afterwards, whose derived
 passphrase is the key `luksAddKey` and `luksKillSlot` are given, or by
@@ -1896,15 +1962,41 @@ shapes"). These, and the keyslot test of TOKEN-LOGIN.md's disk proof,
 are the running system's only key-bearing cryptsetup commands
 (DESIGN.md "Full-system volume consumers").
 
-The PIN change and the TPM clear need the TPM before the cap or the
-lockout authorization, which only the selector has, so the running
-system imports a key-less request token and the selector carries it out:
+The PIN change, the TPM clear and TPM re-enrollment need the TPM before
+the cap or the lockout authorization, which only the selector has, so the running
+system imports a key-less request token and the selector carries it out.
+The authorization the running system requires binds only td's own
+import, and anyone who can write the disk can import a request, so each
+request carries a tag the selector verifies with the volume key:
+
+- **Request tag.** The running system draws a fresh 32-byte nonce and
+  derives a 32-byte key by HKDF-SHA256 with the volume key, which root
+  reads from the mapping's device-mapper table, as input keying
+  material, an empty salt and the info `td/disk-protector/request/v1`,
+  a zero byte, the volume's 16-byte UUID and the nonce. The token holds
+  the operation, the nonce and HMAC-SHA256 under that key over the
+  operation's name, the nonce and the header state it acts on: the
+  lockout token's nonce (32 zero bytes without one) and SHA-256 over
+  the public areas of every tpm-pin token in token-number order. Each
+  operation changes that state, so a request copied from an older
+  header copy no longer verifies once one like it has run. 8g extends
+  the `td-request` format with these fields and amends td-protector's
+  reader bounds and header measurement with it.
+- **Verification.** The selector verifies the tag in constant time
+  after the cap, with the volume key in hand, before it prompts for a
+  TPM clear or re-enrollment and before any write a PIN change makes. A
+  request whose tag fails, or that names no operation td knows, is
+  removed by the plan with no prompt and a console line saying so.
 
 - **PIN change.** At the next PIN boot, after the release and before the
   cap, the selector says a PIN change was requested and prompts `td new
   PIN (empty to cancel): `; an empty entry declines, and the plan
-  removes the request after the cap, since anyone who can write the disk
-  can plant one. Otherwise it asks the new PIN again, seals a fresh
+  removes the request after the cap. The prompt precedes the volume
+  key, so it cannot wait for the tag: a request whose tag fails after
+  the cap discards the sealed object and any new db-key blob before the
+  plan's first write, and the old PIN stays. A forged request costs the
+  owner a typed PIN and nothing else: it was sealed under the recorded
+  primary to the TPM the PIN release just proved. Otherwise it asks the new PIN again, seals a fresh
   secret under it to the observed values and verifies it by one Unseal,
   and, with a Secure Boot db key present, changes that key's
   authorization from the old PIN to the new (TPM2_ObjectChangeAuth).
@@ -1919,15 +2011,60 @@ system imports a key-less request token and the selector carries it out:
   clearing the TPM destroys every object under its storage hierarchy:
   the tpm-pin protector, the Secure Boot db key and td-secret's TPM
   objects; exactly `clear` confirms, and TPM2_Clear runs under `L`;
-  any other answer declines and the plan removes the request, which
-  anyone who can write the disk could have planted. The
+  any other answer declines and the plan removes the request. Only a
+  request whose tag verifies is asked: an unauthenticated one would let
+  a disk writer, with one confirmation, destroy those objects and reopen
+  trust on first use at the next take ("Bus"). The
   plan then retires the tpm-pin keyslot and token and the lockout token
   and removes the request. The next boot asks for a token or the
-  recovery key and offers the reseal, which takes the lockout anew.
+  recovery key, offers no reseal and takes the lockout anew, writing a
+  lockout token for the cleared TPM's primary; the boot after, by a
+  token or the recovery key, offers the reseal, anchored to that token
+  ("Bus").
+- **TPM re-enrollment.** A cleared or replaced TPM, whose storage
+  primary is not the one the header's tpm-pin and lockout tokens
+  record, gets no reseal and no lockout take at boot ("Changed boot
+  chains and updates"). The owner, booted by a token or the recovery
+  key, requests re-enrollment; the running system imports a key-less
+  request token only under a fresh authorize-phase assertion over the
+  operation's description from an enrolled token, or the recovery key,
+  as an addition is authorized, and tags it ("Request tag"). At the
+  next boot, released by a token or the recovery key, after the cap the
+  selector carries it out only when the tag verifies and this TPM's
+  storage primary is not the one the header's tpm-pin and lockout
+  tokens record (the chain check found another primary, or the lockout
+  token verifies but names another); a request failing either is
+  removed with no prompt, so neither a planted request nor one on a TPM
+  td still recognises can retire the anchor. It then says that this
+  TPM's storage primary is not the one td recorded and asks; exactly
+  `reenroll` confirms, and any other answer declines and the plan
+  removes the request. That release is the operation's fresh hardware
+  authentication. Confirmed, the plan retires the stale tpm-pin
+  keyslots and tokens and the stale lockout token, then that boot's
+  lockout step takes this TPM's lockout with a fresh token ("Lockout"),
+  trust on first use on the new primary, and the request is removed
+  last. A boot never anchors a seal to its own take, so the seal comes
+  one boot later: the next boot by a token or the recovery key offers
+  the reseal, whose keyslot is added only under the primary that token
+  records ("Bus"), and the boot after takes the new PIN. No second TPM
+  clear is needed. A TPM td cannot prove refuses the take, naming the
+  reason, and the request is removed with the stale tokens already
+  retired; a crash before the take leaves no lockout token, so the next
+  boot takes, as after a TPM clear.
 
 **Threat and limits.** A removed protector stays in old header copies;
 TPM2_ObjectChangeAuth leaves the db key's old blob valid under the old
-PIN wherever a copy of it survives.
+PIN wherever a copy of it survives. A request tag binds the request to
+the volume key, so only someone holding it can make one the selector
+honours: td-install under td-authd's consent, and also root on the
+running system, which can read the key from the device-mapper table. A
+compromised running system can therefore request a TPM clear or
+re-enrollment that the owner then confirms with one answer at a later
+boot; it already holds the volume key. Re-enrollment remains trust on
+first use: an interposer present at the confirming boot of a genuine
+request, on a TPM that really changed, takes the anchor, as at the
+first take ("Bus"). A forged PIN-change request still shows its prompt
+before the cap, and is discarded only after it.
 
 ### Firmware authentication (optional)
 
@@ -2195,7 +2332,8 @@ commit.
      for protected headers (pure), forged headers among their tests;
      its protected release orchestration: the chain check and warning,
      the TPM PIN, the security key, the recovery key, the verified
-     pre-cap reseal and the plan, over a `release::Fido` interface; the
+     pre-cap reseal and the plan, over a `protected_release::Fido`
+     interface; the
      lockout take, proof, counter and reset after the cap; td-boot's
      prompts and wiring through secret-line and the worker, with the
      deployment initramfs's PolicyPCR-only check of tpm-pin tokens.
@@ -2232,7 +2370,16 @@ commit.
      request and its selector half; the TPM-clear request and its
      selector half, whose refusal names a TPM with TPM2_Clear disabled
      (td-tpm's `ClearDisabled`, `TPM_RC_DISABLED`), which only firmware
-     can enable.
+     can enable; the request tag over every `td-request` ("Protector
+     management"), with the token format's new fields and the reader's
+     bounds; and TPM re-enrollment for a cleared or replaced TPM: its
+     request under a fresh assertion or the recovery key, and its
+     selector half, confirmed after a token or recovery-key release,
+     which retires the stale tpm-pin keyslots and tokens and the stale
+     lockout token and takes the new TPM's lockout with a fresh token in
+     that boot. The seal is the next boot's
+     ordinary reseal, which that token anchors ("Bus"), since no boot
+     anchors a seal to its own take; no second TPM clear.
    - **8h, the combined oracle.** The host's virtual FIDO2 authenticator
      over QEMU `usb-redir` ("Acceptance evidence"); then
      `qemu-boot-protected` with every leg below. The hardware evidence
@@ -2647,9 +2794,19 @@ Increment 8's evidence, by sub-increment:
   tpm-pin protector.
 - **8g.** Each operation's authorization (a stale assertion, another
   operation's description, a token not enrolled, a wrong recovery key),
-  the minimums, a PIN change and a TPM clear each cut at every commit,
-  and each declined (an empty new PIN, an answer other than `clear`)
-  removing its request.
+  the minimums, a PIN change, a TPM clear and a TPM re-enrollment each
+  cut at every commit, and each declined (an empty new PIN, an answer
+  other than `clear` or `reenroll`) removing its request. Re-enrollment
+  on a TPM with another primary: the confirming boot retires the stale
+  tokens and takes the lockout, offering no reseal; the next boot's
+  reseal adds its keyslot under the new token; a TPM td cannot prove is
+  refused with the request removed. Request tags: a re-enrollment, TPM
+  clear or PIN-change request whose tag fails (planted with no tag, a
+  forged tag, another volume's, or copied from an older header copy
+  after a like operation ran) is removed with no prompt and, for a PIN
+  change, its sealed object discarded before any write; a re-enrollment
+  request with a valid tag on a TPM whose primary is the recorded one is
+  removed with no prompt and the anchor kept.
 - **8h.** `td-recipe-eval qemu-boot-protected --tpm
   /absolute/path/to/swtpm`, outside the integration tier and an
   unprovisioned host gap without `--tpm`, as `qemu-boot-encrypted` is.
@@ -2704,14 +2861,23 @@ Increment 8's evidence, by sub-increment:
     `BOOTX64.EFI` and a load option each print the warning before any
     prompt and ask no PIN; token A releases, the reseal is confirmed
     with a new PIN and verified before the cap, and the next boot takes
-    that PIN. The recovery key does the same. A fresh swtpm state does
-    the same and the reseal takes its lockout. With no TPM attached
-    token A releases and the console says the cap was skipped.
-  - **TPM td cannot prove.** The host sets the lockout authorization of
-    a fresh swtpm state to a value of its own, with td-tpm's command
-    compiled as a host check source; the reseal is refused before any
+    that PIN. The recovery key does the same. A fresh swtpm state, a new
+    storage primary, prints the warning and the TPM line; token A
+    releases, no reseal is offered and no lockout taken, naming the
+    other primary, and the header is unchanged; TPM re-enrollment (8g),
+    requested under token A on the running system, is confirmed at the
+    next boot by token A, which retires the stale tokens and takes the
+    new TPM's lockout; the boot after, by token A, offers the reseal,
+    and the next boot takes that PIN. With no
+    TPM attached token A releases and the console says the cap was
+    skipped.
+  - **TPM td cannot prove.** On the same swtpm state, whose lockout td
+    took, the inspection guest removes the header's lockout token; on a
+    changed chain the reseal is refused by the pre-cap rule before any
     new PIN, naming the reason, and token A and the recovery key still
-    boot.
+    boot. On a fresh swtpm state whose lockout authorization the host
+    set to a value of its own, with td-tpm's command compiled as a host
+    check source, TPM re-enrollment (8g) is refused, naming the reason.
   - **Tokens.** An unenrolled token C is refused as not enrolled; two
     keys at once and none are refused; a no-PIN assertion opens nothing.
   - **FIDO2 primary.** A second installation upgraded with A as primary

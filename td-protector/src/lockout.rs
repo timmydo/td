@@ -10,11 +10,22 @@ use crate::pin::PRIMARY_NAME_LEN;
 use crate::protected::{Lockout, FIELD_LEN};
 use std::fmt;
 use std::path::Path;
-use td_tpm::LockoutAuth;
+use td_tpm::{DaParameters, LockoutAuth};
 
 /// The HKDF info's prefix; a zero byte, the volume UUID and the nonce
 /// follow it.
 pub const LOCKOUT_DOMAIN: &[u8] = b"td/disk-protector/lockout/v1";
+/// td's dictionary-attack parameters, which a take sets and a proof
+/// repairs: 32 tries, one more every 600 seconds, and a day before a
+/// wrong lockout authorization may be tried again.
+pub const DA_MAX_TRIES: u32 = 32;
+pub const DA_RECOVERY_SECS: u32 = 600;
+pub const DA_LOCKOUT_RECOVERY_SECS: u32 = 86400;
+pub const DA_PARAMETERS: DaParameters = DaParameters {
+    max_tries: DA_MAX_TRIES,
+    recovery_time: DA_RECOVERY_SECS,
+    lockout_recovery: DA_LOCKOUT_RECOVERY_SECS,
+};
 /// A LUKS2 UUID's bytes.
 pub const VOLUME_UUID_LEN: usize = 16;
 /// Blocks until the kernel CSPRNG is initialized: two writes under one
@@ -226,6 +237,24 @@ mod tests {
 
     fn sealed() -> Lockout {
         seal_with(&volume_key(), &uuid(), &auth(), &primary(), nonce()).unwrap()
+    }
+
+    /// ENCRYPTION.md "Lockout": the parameters a take sets and a proof
+    /// repairs.
+    #[test]
+    fn td_dictionary_attack_parameters_are_pinned() {
+        assert_eq!(
+            (
+                DA_PARAMETERS.max_tries,
+                DA_PARAMETERS.recovery_time,
+                DA_PARAMETERS.lockout_recovery
+            ),
+            (32, 600, 86400)
+        );
+        assert_eq!(
+            (DA_MAX_TRIES, DA_RECOVERY_SECS, DA_LOCKOUT_RECOVERY_SECS),
+            (32, 600, 86400)
+        );
     }
 
     #[test]
