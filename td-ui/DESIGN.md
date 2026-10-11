@@ -346,7 +346,8 @@ of its own files may name each module.
   trait, `Scrollbar`, `text_run`,
   `hint_run`, `Raster`, `Error`, the axis and frame-byte ceilings, the
   palette constants with the status inks `SUCCESS`, `WARNING` and
-  `ACCENT`, and `rgb` and `ppm`, a painted frame as tight RGB rows
+  `ACCENT` and the message list's `BUBBLE`, and `rgb` and `ppm`, a
+  painted frame as tight RGB rows
   and as a binary PPM. A
   composition reports the surface it was laid out for and streams the draws
   inside a damage rectangle; `Raster::new` validates surface, font, stride and
@@ -577,11 +578,12 @@ of its own files may name each module.
   no row highlighted when nothing is selected. Activation, a double
   press and filtering stay with the consumer.
 - `messages`: `Message` (built from `new` with `text`, `section`,
-  `excerpt`, `status`, `verdict`, `action`, `source` and `collapsed`),
-  `Tone`, `Point`, `Shown`, `Tip`, `Key` with `from_chord`, `Event`,
-  `Outcome`, `Error`, the budgets and `COPY_LABEL`, `COPY_ICON`,
-  `COPY_TIP`, `ICON_CELLS`, `MAX_ACTION_CHARS` and `MORE`, and
-  `Controller`, the message list under "Shared message list" below.
+  `excerpt`, `status`, `verdict`, `action`, `source`, `collapsed`, `side`
+  and `time`), `Side`, `Tone`, `Point`, `Shown`, `Tip` and `Target`, `Key`
+  with `from_chord`, `Event`, `Outcome`, `Error`, the budgets and
+  `COPY_LABEL`, `COPY_ICON`, `COPY_TIP`, `ICON_CELLS`, `MAX_ACTION_CHARS`,
+  `MAX_TIME_CHARS` and `MORE`, and `Controller`, the message list under
+  "Shared message list" below.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output, and `OUTLINE_FACE`, one
@@ -2264,22 +2266,22 @@ frame, and no panel on a surface too small.
 
 A theme gives each role the shared palette names its own colour: paper,
 ink, chrome, border, the selection and the unfocused one, line numbers,
-the misspelling ink, the panel's selected row and disabled ink, and the
-three status inks. `KEYS` lists the palette's colour for each role and
+the misspelling ink, the panel's selected row and disabled ink, the
+three status inks, and the ground of the person's own bubble in a
+message list. `KEYS` lists the palette's colour for each role and
 `Theme::colors` the theme's, in that order. A raster given a theme maps
 every draw before executing it: a colour equal to a key, its top byte
 ignored, becomes the theme's for that role with its top byte kept, and
 any other colour passes through, so an article's or a chart's colours,
 td-dua's treemap and a handler's own fills are left as given. The map is
 by value: a handler's own colour that happened to equal a key would be
-recoloured, so one that must stay as given avoids the thirteen keys;
+recoloured, so one that must stay as given avoids the fourteen keys;
 none in the tree does today. `SAND`'s colours are the keys, and a theme
-whose colours are passes every draw through unmapped. A glyph's
-ink and background are mapped before the raster derives the medium
-fringe or blends an outline's coverage between them, so the fringe is
-the theme's. No widget derives a colour of its own from the palette;
-one that did would escape the map, and the map's tests would not see
-it.
+whose colours are passes every draw through unmapped. A glyph's ink and
+background are mapped before the raster derives the medium fringe or
+blends an outline's coverage between them, so the fringe is the theme's.
+No widget derives a colour of its own from the palette; one that did
+would escape the map, and the map's tests would not see it.
 
 The themes are `SAND`, the palette as it is and the default; the light
 `HARBOR` (blue-grey), `MOSS` (green) and `ROSE` (blush); and the dark
@@ -2291,11 +2293,14 @@ draw: ink on paper (7:1), on chrome (6:1), on the panel's selected row
 and on an unfocused selection (5:1); paper on the selection and each
 status ink on paper (4.5:1); line numbers on paper (3:1) and on chrome,
 and disabled ink on chrome (2.8:1); borders on paper (1.6:1) and chrome
-(1.4:1); disabled ink on paper (3.4:1), the panel's disabled button,
-and on the selected row (2.3:1); and the message list's tone inks, the
+(1.4:1); disabled ink on paper (3.4:1), the panel's disabled button, and
+on the selected row (2.3:1); and the message list's tone inks, the
 selection and the misspelling ink on chrome (4:1, 3.9:1) and on the
-selected row (3.1:1, 3:1), and line numbers on the selected row
-(2.3:1).
+selected row (3.1:1, 3:1), and line numbers on the selected row (2.3:1);
+and on the person's own bubble, set off in hue from chrome, the others'
+bubble, ink (6:1), line numbers (2.8:1), the selection, the misspelling
+ink and the status inks, which the tones are (3.9:1), and the border a
+lit icon is (1.4:1).
 
 A program's theme is kept in `FILE`, `theme`, in its own directory under
 the configuration home: `$XDG_CONFIG_HOME/<app_id>/theme`, else
@@ -3154,13 +3159,40 @@ only a point inside the view counts, so a header cut off at the view's
 foot has no button below it. An icon button under it is lit `BORDER`,
 which stands off both a header's `CHROME` and a focused one's
 `SELECTED_ROW`; a captioned button is not lit. `tip` names the button
-under it, icon or caption: its message, whether it is copy, its
+under it, icon or caption: its message, its `Target`, its
 rectangle and its tooltip's text, `COPY_TIP` (naming the list's own
 `CopyMessage` chord), the action's tip, or its caption without one. The
 list draws no tooltip and keeps no clock: the owner places a
 `chrome::Tooltip` on `tip`'s rectangle after its own delay. An action
 icon is a non-control scalar and its tip a label, counted in the list's
 bytes.
+
+A message sits on a `Side`: `Full`, across the list as above, the
+default, or as a bubble, `Left` for the others' messages and `Right` for
+the person's own. A bubble's text wraps short of its far side by a fifth
+of the list's text columns, its room, and it is as wide as its widest
+laid row, a title row's mark and title and the more row included, kept
+as the message is laid out and widened as text streams in, or as its
+header needs for its label, status, verdict and buttons spaced as a full
+header spaces them, up to the whole view, so a long status is not cut; a
+cell each side, flush to its side of the view. Its rows are drawn, hit
+and read back (`shown`) within it: its text a cell in from its own edge,
+a press and a double click at their columns there, its buttons and fold
+mark at its own right and left; a press beside it on its header or a
+title row focuses it and folds nothing. A bubble has no rule: it is its
+side's ground, `CHROME` for the others' and the palette's `BUBBLE` for
+the person's own, its header the selected row's when focused, and its
+foot too when the header is its only row, its title and more rows in
+line-number ink on that ground; its top corners are stepped round on its
+header and its bottom ones on a foot of `CORNER` pixels taken from the
+gap below it, a pixel row a fill. A message may carry a time
+(`Message::time`, `set_time` on one shown), at most `MAX_TIME_CHARS` of
+a label and a tip, counted in the list's bytes: beside a bubble's
+header, a cell from it on its far side, when the view beside it holds it
+and a cell each side; in a full header after its label and status, when
+it ends before the verdict; in line-number ink. The pointer on it names
+it to `tip` as a `Target::Time` with its tip, beside `Target::Copy` and
+`Target::Action`. The list keeps no clock: its owner formats the time.
 
 Copies go through the window's `Clipboard` (see "Widget window") while
 the event is delivered, the button's at its press and the keys' at

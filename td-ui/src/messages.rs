@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::chrome::{Button, BUTTON_MARGIN, ROW, SELECTED_ROW};
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scrollbar, Surface, BORDER, CHROME,
+    text_run, Draw, GlyphStyle, Primitive, Rect, Scrollbar, Surface, BORDER, BUBBLE, CHROME,
     INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
 };
 use crate::window::{Clipboard, Refusal};
@@ -50,6 +50,8 @@ pub const COPY_TIP: &str = "Copy message (C-S-c)";
 pub const ICON_CELLS: usize = 2;
 /// The most characters an action button's caption has.
 pub const MAX_ACTION_CHARS: usize = 12;
+/// The most characters a message's time shows.
+pub const MAX_TIME_CHARS: usize = 12;
 /// What an excerpt cut short shows below its last row.
 pub const MORE: &str = "\u{2026} excerpt; Copy takes the whole";
 
@@ -59,6 +61,14 @@ const TRACK: usize = 12;
 /// A double click's second press lies within this many font pixels of the
 /// first's release on each axis.
 const NEAR: i64 = 4;
+/// A bubble leaves this share of the list's text columns free on its far
+/// side, as a divisor (a fifth), where its time goes.
+const ROOM_DIVISOR: usize = 5;
+/// A bubble's corner radius, in font pixels.
+const CORNER: i64 = 4;
+/// The ground a bubble takes from the gap below its last row, in font
+/// pixels, so its text clears its foot: as tall as a corner is round.
+const FOOT: i64 = CORNER;
 const OPEN: char = '\u{25be}';
 const SHUT: char = '\u{25b8}';
 
@@ -130,6 +140,27 @@ struct Section {
     excerpt: bool,
 }
 
+/// Where a message sits: across the list, or as a bubble on one side as
+/// wide as its text and header need, up to the list's less a fifth.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Side {
+    #[default]
+    Full,
+    /// The others' side: a `CHROME` bubble.
+    Left,
+    /// The person's own: a `BUBBLE` bubble.
+    Right,
+}
+
+/// What a tooltip names (`Tip`): a header's copy button, its action, or
+/// a message's time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target {
+    Copy,
+    Action,
+    Time,
+}
+
 /// One message: a header label (its role or source), an optional status
 /// and verdict shown in the header, and its sections in order. A section
 /// is untitled body text, or titled, which collapses to its title row; an
@@ -149,6 +180,11 @@ pub struct Message {
     action: Option<String>,
     /// That button's icon and tooltip, where the list shows icons.
     action_icon: Option<(char, String)>,
+    side: Side,
+    /// The time it shows, and its tooltip's text.
+    time: Option<(String, String)>,
+    /// The columns its laid rows take, which a bubble is as wide as.
+    columns: usize,
 }
 
 fn copied(text: &str, bound: usize) -> Result<String, Error> {
@@ -192,7 +228,27 @@ impl Message {
             collapsed: false,
             action: None,
             action_icon: None,
+            side: Side::Full,
+            time: None,
+            columns: 0,
         })
+    }
+
+    /// Shown on `side`: a bubble left or right, or across the list.
+    pub fn side(mut self, side: Side) -> Self {
+        self.side = side;
+        self
+    }
+
+    /// The time it was written: `text`, at most `MAX_TIME_CHARS`, beside
+    /// a bubble's header or in a full message's after its status, and
+    /// `tip` its tooltip (the whole date).
+    pub fn time(mut self, text: &str, tip: &str) -> Result<Self, Error> {
+        if text.chars().count() > MAX_TIME_CHARS {
+            return Err(Error::Limit);
+        }
+        self.time = Some((label(text)?, label(tip)?));
+        Ok(self)
     }
 
     /// A button captioned `caption` before the copy button, whose press
@@ -310,6 +366,10 @@ impl Message {
             + marks
             + self.action.as_ref().map_or(0, String::len)
             + self.action_icon.as_ref().map_or(0, |(_, tip)| tip.len())
+            + self
+                .time
+                .as_ref()
+                .map_or(0, |(text, tip)| text.len() + tip.len())
             + self.source.as_ref().map_or(0, |source| source.len())
     }
 
@@ -565,13 +625,12 @@ pub struct Controller {
     hover_at: Option<(i64, i64)>,
 }
 
-/// The header button the pointer hovers over (`Controller::tip`): its
-/// message, whether it is the copy button or the owner's action, where it
-/// is, and what its tooltip says.
+/// What the pointer hovers over that has a tooltip (`Controller::tip`):
+/// its message, what it is, where it is, and what its tooltip says.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Tip<'a> {
     pub message: usize,
-    pub copy: bool,
+    pub target: Target,
     pub rect: Rect,
     pub text: &'a str,
 }
@@ -658,15 +717,23 @@ impl Controller {
         self.first_line
             .try_reserve(self.messages.len())
             .map_err(|_| Error::Limit)?;
-        let columns = self.columns();
         let mut lines = std::mem::take(&mut self.lines);
         let mut result = Ok(());
-        for (index, message) in self.messages.iter().enumerate() {
-            self.first_line.push(lines.len());
-            let budget = MAX_LINES.saturating_sub(lines.len());
+        for index in 0..self.messages.len() {
+            let Some(message) = self.messages.get(index) else {
+                break;
+            };
+            let start = lines.len();
+            self.first_line.push(start);
+            let budget = MAX_LINES.saturating_sub(start);
+            let columns = self.wrap_columns(message);
             if let Err(error) = layout(index, message, columns, budget, &mut lines) {
                 result = Err(error);
                 break;
+            }
+            let laid = laid_columns(message, lines.get(start..).unwrap_or(&[]), columns);
+            if let Some(message) = self.messages.get_mut(index) {
+                message.columns = laid;
             }
         }
         self.lines = lines;
@@ -727,7 +794,7 @@ impl Controller {
     }
 
     /// Appends a message and returns its index.
-    pub fn push(&mut self, message: Message) -> Result<usize, Error> {
+    pub fn push(&mut self, mut message: Message) -> Result<usize, Error> {
         let index = self.messages.len();
         if index >= MAX_MESSAGES {
             return Err(Error::Limit);
@@ -739,16 +806,17 @@ impl Controller {
             let mut scratch = std::mem::take(&mut self.scratch);
             scratch.clear();
             let budget = MAX_LINES.saturating_sub(self.lines.len());
-            let laid =
-                layout(index, &message, self.columns(), budget, &mut scratch).and_then(|()| {
-                    self.lines
-                        .try_reserve(scratch.len())
-                        .map_err(|_| Error::Limit)
-                });
+            let columns = self.wrap_columns(&message);
+            let laid = layout(index, &message, columns, budget, &mut scratch).and_then(|()| {
+                self.lines
+                    .try_reserve(scratch.len())
+                    .map_err(|_| Error::Limit)
+            });
             if let Err(error) = laid {
                 self.scratch = scratch;
                 return Err(error);
             }
+            message.columns = laid_columns(&message, &scratch, columns);
             let anchor = self.anchor();
             self.first_line.push(self.lines.len());
             self.total_y += scratch.iter().map(|line| line.height()).sum::<u64>();
@@ -891,6 +959,28 @@ impl Controller {
         Ok(())
     }
 
+    /// Sets message `index`'s time and its tip, as `Message::time`; `None`
+    /// takes it off. A time is beside or in the header, so nothing is laid
+    /// out again.
+    pub fn set_time(&mut self, index: usize, time: Option<(&str, &str)>) -> Result<(), Error> {
+        let time = match time {
+            Some((text, _)) if text.chars().count() > MAX_TIME_CHARS => return Err(Error::Limit),
+            Some((text, tip)) => Some((label(text)?, label(tip)?)),
+            None => None,
+        };
+        let message = self.messages.get(index).ok_or(Error::NoMessage)?;
+        let size = |time: &Option<(String, String)>| {
+            time.as_ref()
+                .map_or(0, |(text, tip)| text.len() + tip.len())
+        };
+        let bytes = self.admit(size(&time), size(&message.time))?;
+        if let Some(message) = self.messages.get_mut(index) {
+            message.time = time;
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
     /// Sets the icon and tooltip of message `index`'s action button, which
     /// shows as that icon where the list shows icons (`set_icons`), and as
     /// its caption otherwise; `None` takes them off.
@@ -924,28 +1014,40 @@ impl Controller {
     }
 
     /// Where the pointer hovers with no button held, or `None`: answers
-    /// whether the header button under it changed, which is then lit and
-    /// named by `tip`.
+    /// whether what is under it with a tooltip, a header button or a
+    /// time, changed; a button there is lit, and `tip` names either.
     pub fn hover(&mut self, at: Option<(i64, i64)>) -> bool {
-        let before = self.tip().map(|tip| (tip.message, tip.copy));
+        let before = self.tip().map(|tip| (tip.message, tip.target));
         self.hover_at = at;
-        before != self.tip().map(|tip| (tip.message, tip.copy))
+        before != self.tip().map(|tip| (tip.message, tip.target))
     }
 
-    /// The header button the pointer hovers over, with its tooltip's text:
-    /// `COPY_TIP`, or an action's tip, or its caption when it has none.
+    /// What the pointer hovers over that has a tooltip, with its text: a
+    /// header button, `COPY_TIP`, an action's tip or its caption when it
+    /// has none; or a message's time, its tip.
     pub fn tip(&self) -> Option<Tip<'_>> {
         let (x, y) = self.hovered()?;
-        let (_, line, header) = self
+        let (_, line, row) = self
             .rows()
             .find(|(_, line, rect)| line.kind == Kind::Header && rect.contains(x, y))?;
         let index = line.message as usize;
         let message = self.messages.get(index)?;
+        let header = self.frame(index, row);
+        if let (Some(time), Some((_, tip))) = (self.time_rect(index, header), &message.time) {
+            if time.contains(x, y) {
+                return Some(Tip {
+                    message: index,
+                    target: Target::Time,
+                    rect: time,
+                    text: tip,
+                });
+            }
+        }
         let copy = self.button(header);
         if copy.contains(x, y) {
             return Some(Tip {
                 message: index,
-                copy: true,
+                target: Target::Copy,
                 rect: copy,
                 text: COPY_TIP,
             });
@@ -957,7 +1059,7 @@ impl Controller {
         };
         action.contains(x, y).then_some(Tip {
             message: index,
-            copy: false,
+            target: Target::Action,
             rect: action,
             text,
         })
@@ -1186,6 +1288,133 @@ impl Controller {
         (i64::from(self.view().width) / self.cell()).saturating_sub(2) as usize
     }
 
+    /// The columns a bubble leaves free on its far side, for its time.
+    fn room(&self) -> usize {
+        self.columns() / ROOM_DIVISOR
+    }
+
+    /// The columns `message`'s text wraps to: the list's, or a bubble's,
+    /// less the room.
+    fn wrap_columns(&self, message: &Message) -> usize {
+        match message.side {
+            Side::Full => self.columns(),
+            Side::Left | Side::Right => self.columns().saturating_sub(self.room()),
+        }
+    }
+
+    /// The text columns a bubble's header needs for what it shows: the
+    /// fold mark, the label, the status, the verdict and the buttons, as
+    /// `paint_header` spaces them.
+    fn header_columns(&self, message: &Message) -> usize {
+        let copy = if self.icons {
+            ICON_CELLS
+        } else {
+            COPY_LABEL.chars().count() + 2
+        };
+        let action = message.action.as_ref().map_or(0, |caption| {
+            1 + if self.icons && message.action_icon.is_some() {
+                ICON_CELLS
+            } else {
+                caption.chars().count() + 2
+            }
+        });
+        let mark = |mark: &Option<(String, Tone)>| {
+            mark.as_ref()
+                .map_or(0, |(text, _)| text.chars().count() + 2)
+        };
+        let cells = 3
+            + message.label.chars().count()
+            + mark(&message.status)
+            + 1
+            + mark(&message.verdict)
+            + 1
+            + action
+            + copy
+            + 1;
+        cells.saturating_sub(2)
+    }
+
+    /// Where message `index`'s row at `row` (the view's width) is drawn:
+    /// across the view, or its bubble's part of it, flush to its side: as
+    /// wide as its rows, which wrap short of the far side's room, or as its
+    /// header needs, up to the whole view, so a long status is not cut.
+    fn frame(&self, index: usize, row: Rect) -> Rect {
+        let Some(message) = self.messages.get(index) else {
+            return row;
+        };
+        if message.side == Side::Full {
+            return row;
+        }
+        let view = self.view();
+        let cell = self.cell();
+        let columns = message
+            .columns
+            .min(self.wrap_columns(message))
+            .max(self.header_columns(message))
+            .min(self.columns());
+        let width = ((columns + 2) as i64 * cell).min(i64::from(view.width)) as u32;
+        let x = match message.side {
+            Side::Right => view.x + i64::from(view.width) - i64::from(width),
+            Side::Left | Side::Full => view.x,
+        };
+        Rect { x, width, ..row }
+    }
+
+    /// The x the header's label and status stop before: a cell short of
+    /// its verdict, which ends a cell before its buttons.
+    fn header_limit(&self, index: usize, header: Rect) -> i64 {
+        let cell = self.cell();
+        let buttons = self
+            .action_rect(header, index)
+            .map_or(self.button(header).x, |action| action.x);
+        let right = buttons - cell;
+        let verdict_x = self
+            .messages
+            .get(index)
+            .and_then(|message| message.verdict.as_ref())
+            .map_or(right, |(text, _)| {
+                (right - (text.chars().count() as i64 + 2) * cell).max(header.x + 3 * cell)
+            });
+        verdict_x - cell
+    }
+
+    /// Where message `index`'s time shows, given its header's frame:
+    /// beside a bubble when the view beside it holds it and a cell each
+    /// side, or in a full header after the label and status when it ends
+    /// before the header's limit.
+    fn time_rect(&self, index: usize, header: Rect) -> Option<Rect> {
+        let message = self.messages.get(index)?;
+        let (text, _) = message.time.as_ref()?;
+        let cell = self.cell();
+        let s = self.surface.scale.value() as i64;
+        let chars = text.chars().count();
+        let width = chars as i64 * cell;
+        let x = match message.side {
+            Side::Full => {
+                let status = message
+                    .status
+                    .as_ref()
+                    .map_or(0, |(text, _)| text.chars().count() as i64 + 2);
+                let x = header.x + (3 + message.label.chars().count() as i64 + 2 + status) * cell;
+                if x + width > self.header_limit(index, header) {
+                    return None;
+                }
+                x
+            }
+            _ if i64::from(self.view().width) - i64::from(header.width) < width + 2 * cell => {
+                return None
+            }
+            Side::Left => header.x + i64::from(header.width) + cell,
+            Side::Right => header.x - cell - width,
+        };
+        Some(Rect {
+            x,
+            y: header.y + 4 * s,
+            width: width as u32,
+            height: (CELL_HEIGHT as i64 * s) as u32,
+        })
+    }
+
     fn roomy(&self) -> bool {
         let s = self.surface.scale.value();
         self.rect.width as usize >= (GUTTER + (MIN_COLUMNS + 2) * CELL_WIDTH) * s
@@ -1223,9 +1452,14 @@ impl Controller {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         let budget = MAX_LINES.saturating_sub(self.lines.len().saturating_sub(end - start));
-        if let Err(error) = layout(index, message, self.columns(), budget, &mut scratch) {
+        let columns = self.wrap_columns(message);
+        if let Err(error) = layout(index, message, columns, budget, &mut scratch) {
             self.scratch = scratch;
             return Err(error);
+        }
+        let laid = laid_columns(message, &scratch, columns);
+        if let Some(message) = self.messages.get_mut(index) {
+            message.columns = laid;
         }
         self.splice_rows(index, start, end, scratch)
     }
@@ -1259,11 +1493,9 @@ impl Controller {
         let Some(last) = last else {
             return Ok(());
         };
-        let target = self
-            .messages
-            .get(index)
-            .and_then(|message| message.sections.get(section))
-            .ok_or(Error::NoSection)?;
+        let message = self.messages.get(index).ok_or(Error::NoMessage)?;
+        let target = message.sections.get(section).ok_or(Error::NoSection)?;
+        let columns = self.wrap_columns(message);
         // Only an excerpt counts the rows it already shows, at most its
         // bound of them.
         let first = if target.excerpt {
@@ -1285,13 +1517,18 @@ impl Controller {
             message: index,
             section,
             target,
-            columns: self.columns(),
+            columns,
             budget,
         };
         let laid = wrap_section(wrap, from, last.saturating_sub(first), &mut scratch);
         if let Err(error) = laid {
             self.scratch = scratch;
             return Err(error);
+        }
+        // Rows before the re-wrapped one keep their widths.
+        let laid = laid_columns(message, &scratch, columns);
+        if let Some(message) = self.messages.get_mut(index) {
+            message.columns = message.columns.max(laid);
         }
         self.splice_rows(index, start + last, start + last + 1, scratch)
     }
@@ -1464,6 +1701,11 @@ impl Controller {
     pub fn shown(&self) -> impl Iterator<Item = (Rect, Shown<'_>)> + '_ {
         self.rows().map(|(_, line, rect)| {
             let message = line.message as usize;
+            // A bubble's rows as drawn; the gap below is the view's width.
+            let rect = match line.kind {
+                Kind::Gap => rect,
+                _ => self.frame(message, rect),
+            };
             let section = usize::from(line.section);
             let shown = match line.kind {
                 Kind::Header => Shown::Header { message },
@@ -1519,7 +1761,7 @@ impl Controller {
     pub fn copy_button(&self, index: usize) -> Option<Rect> {
         self.rows()
             .find(|(_, line, _)| line.kind == Kind::Header && line.message as usize == index)
-            .map(|(_, _, rect)| self.button(rect))
+            .map(|(_, _, rect)| self.button(self.frame(index, rect)))
     }
 
     /// The action button of message `message` on a header at `header`,
@@ -1546,14 +1788,14 @@ impl Controller {
     pub fn action_button(&self, index: usize) -> Option<Rect> {
         self.rows()
             .find(|(_, line, _)| line.kind == Kind::Header && line.message as usize == index)
-            .and_then(|(_, _, rect)| self.action_rect(rect, index))
+            .and_then(|(_, _, rect)| self.action_rect(self.frame(index, rect), index))
     }
 
     /// The column a pointer at `x` falls before, rounded to the nearer
     /// cell edge, as a byte of the row.
     fn byte_at(&self, line: Line, x: i64, round: bool) -> usize {
         let cell = self.cell();
-        let left = self.view().x + cell;
+        let left = self.frame(line.message as usize, self.view()).x + cell;
         let offset = x.saturating_sub(left);
         let offset = if round {
             offset.saturating_add(cell / 2)
@@ -1935,6 +2177,7 @@ impl Controller {
         let message = line.message as usize;
         let focus_changed = self.focus != Some(message);
         self.focus = Some(message);
+        let rect = self.frame(message, rect);
         match line.kind {
             Kind::Header => {
                 if self
@@ -1946,7 +2189,7 @@ impl Controller {
                 if self.button(rect).contains(x, y) {
                     return self.copy_message(message, clipboard);
                 }
-                if x < rect.x + 3 * self.cell() {
+                if rect.contains(x, y) && x < rect.x + 3 * self.cell() {
                     let collapsed = self.messages.get(message).is_some_and(|m| m.collapsed);
                     return match self.fold(message, None, !collapsed) {
                         Ok(_) => Outcome::Changed,
@@ -1955,6 +2198,8 @@ impl Controller {
                 }
                 Self::changed(focus_changed)
             }
+            // Beside a bubble's title row, nothing is folded.
+            Kind::Title if !rect.contains(x, y) => Self::changed(focus_changed),
             Kind::Title => {
                 let section = usize::from(line.section);
                 let collapsed = self.section(line).is_some_and(|section| section.collapsed);
@@ -2051,12 +2296,64 @@ impl Controller {
         fill(self.rect, CHROME, damage, sink);
         fill(view, PAPER, damage, sink);
         let selection = self.ordered().filter(|(lo, hi)| lo != hi);
-        for (_, line, rect) in self.rows() {
-            let Some(clip) = rect.intersection(view).and_then(|r| r.intersection(damage)) else {
+        for (at, line, row) in self.rows() {
+            let Some(row_clip) = row.intersection(view).and_then(|r| r.intersection(damage)) else {
                 continue;
             };
+            let index = line.message as usize;
+            let rect = self.frame(index, row);
+            let Some(clip) = rect.intersection(row_clip) else {
+                // Beside a bubble cut off by damage, its time may still
+                // be in the damage.
+                if line.kind == Kind::Header {
+                    self.paint_time(index, rect, row_clip, sink);
+                }
+                continue;
+            };
+            let side = self.messages.get(index).map_or(Side::Full, |m| m.side);
+            let paper = match side {
+                Side::Full => PAPER,
+                Side::Left => CHROME,
+                Side::Right => BUBBLE,
+            };
+            if side != Side::Full {
+                // A bubble's ground, its top corners stepped round on its
+                // header and its bottom ones on its foot, the top of the
+                // gap below it.
+                let s = self.surface.scale.value() as i64;
+                // A focused header is the selected row's, and so is the foot
+                // below it when it is the bubble's only row.
+                let header_led = match line.kind {
+                    Kind::Header => true,
+                    Kind::Gap => at
+                        .checked_sub(1)
+                        .and_then(|before| self.lines.get(before))
+                        .is_some_and(|before| before.kind == Kind::Header),
+                    _ => false,
+                };
+                let ground = if header_led && self.focus == Some(index) {
+                    SELECTED_ROW
+                } else {
+                    paper
+                };
+                let (rect, corners) = match line.kind {
+                    Kind::Gap => (
+                        Rect {
+                            height: (FOOT * s).min(i64::from(rect.height)) as u32,
+                            ..rect
+                        },
+                        (false, true),
+                    ),
+                    kind => (rect, (kind == Kind::Header, false)),
+                };
+                rounded(rect, corners, CORNER * s, ground, clip, sink);
+            }
             match line.kind {
-                Kind::Header => self.paint_header(line, rect, clip, sink),
+                // The time after the header, whose band a full one is in.
+                Kind::Header => {
+                    self.paint_header(line, rect, clip, sink);
+                    self.paint_time(index, rect, row_clip, sink);
+                }
                 Kind::Title => {
                     let collapsed = self.section(line).is_some_and(|section| section.collapsed);
                     let title = self
@@ -2068,7 +2365,7 @@ impl Controller {
                         [mark, ' '].into_iter().chain(title.chars()),
                         rect,
                         0,
-                        GlyphStyle::medium(LINE_NUMBER, PAPER),
+                        GlyphStyle::medium(LINE_NUMBER, paper),
                         clip,
                         sink,
                     );
@@ -2077,11 +2374,11 @@ impl Controller {
                     MORE.chars(),
                     rect,
                     0,
-                    GlyphStyle::medium(LINE_NUMBER, PAPER),
+                    GlyphStyle::medium(LINE_NUMBER, paper),
                     clip,
                     sink,
                 ),
-                Kind::Text => self.paint_text(line, rect, selection, clip, sink),
+                Kind::Text => self.paint_text(line, rect, paper, selection, clip, sink),
                 Kind::Gap => {}
             }
         }
@@ -2090,6 +2387,33 @@ impl Controller {
             bar.thumb,
             if bar.enabled() { LINE_NUMBER } else { BORDER },
             damage,
+            sink,
+        );
+    }
+
+    /// Message `index`'s time, beside its bubble's header or in its full
+    /// header, in line-number ink: `row_clip` is the header row's, since
+    /// beside a bubble is outside its frame.
+    fn paint_time(&self, index: usize, header: Rect, row_clip: Rect, sink: &mut dyn FnMut(Draw)) {
+        let (Some(message), Some(at)) = (self.messages.get(index), self.time_rect(index, header))
+        else {
+            return;
+        };
+        let Some((text, _)) = &message.time else {
+            return;
+        };
+        let ground = match message.side {
+            Side::Full if self.focus == Some(index) => SELECTED_ROW,
+            Side::Full => CHROME,
+            Side::Left | Side::Right => PAPER,
+        };
+        text_run(
+            self.surface.scale,
+            text.chars(),
+            (at.x, at.y),
+            at,
+            GlyphStyle::medium(LINE_NUMBER, ground),
+            row_clip,
             sink,
         );
     }
@@ -2126,13 +2450,14 @@ impl Controller {
         &self,
         line: Line,
         rect: Rect,
+        paper: u32,
         selection: Option<(Point, Point)>,
         clip: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
         let text = self.text(line);
         let start = line.start as usize;
-        let normal = GlyphStyle::medium(INK, PAPER);
+        let normal = GlyphStyle::medium(INK, paper);
         let Some((a, b)) = selection.and_then(|(lo, hi)| self.selected(line, lo, hi)) else {
             return self.run(text.chars(), rect, 0, normal, clip, sink);
         };
@@ -2180,17 +2505,25 @@ impl Controller {
         let s = self.surface.scale.value() as i64;
         let cell = self.cell();
         let focused = self.focus == Some(line.message as usize);
-        let ground = if focused { SELECTED_ROW } else { CHROME };
-        fill(rect, ground, clip, sink);
-        fill(
-            Rect {
-                height: s as u32,
-                ..rect
-            },
-            BORDER,
-            clip,
-            sink,
-        );
+        let ground = match (focused, message.side) {
+            (true, _) => SELECTED_ROW,
+            (false, Side::Right) => BUBBLE,
+            (false, Side::Full | Side::Left) => CHROME,
+        };
+        // A full header is a band under a rule; a bubble's is its top,
+        // its ground already painted round.
+        if message.side == Side::Full {
+            fill(rect, ground, clip, sink);
+            fill(
+                Rect {
+                    height: s as u32,
+                    ..rect
+                },
+                BORDER,
+                clip,
+                sink,
+            );
+        }
         let button = self.button(rect);
         let action = self.action_rect(rect, line.message as usize);
         // What the header's text stops before: the leftmost button.
@@ -2228,11 +2561,9 @@ impl Controller {
         // The verdict ends a cell before the buttons; the label and status
         // stop a cell before the verdict.
         let right = buttons - cell;
-        let verdict_x = message.verdict.as_ref().map_or(right, |(text, _)| {
-            (right - (text.chars().count() as i64 + 2) * cell).max(rect.x + 3 * cell)
-        });
+        let limit = self.header_limit(line.message as usize, rect);
+        let verdict_x = limit + cell;
         let label_x = rect.x + 3 * cell;
-        let limit = verdict_x - cell;
         glyphs(&mut message.label.chars(), label_x, limit, INK, sink);
         if let Some((status, tone)) = &message.status {
             let x = label_x + (message.label.chars().count() as i64 + 2) * cell;
@@ -2289,6 +2620,62 @@ fn fill(rect: Rect, color: u32, damage: Rect, sink: &mut dyn FnMut(Draw)) {
             clip: area,
             primitive: Primitive::Fill { rect: area, color },
         });
+    }
+}
+
+/// Fills `rect` in `color` with its top corners, its bottom ones or both
+/// stepped round to `radius`, a pixel row a step, clipped to `damage`.
+fn rounded(
+    rect: Rect,
+    (top, bottom): (bool, bool),
+    radius: i64,
+    color: u32,
+    damage: Rect,
+    sink: &mut dyn FnMut(Draw),
+) {
+    let height = i64::from(rect.height);
+    let width = i64::from(rect.width);
+    // Round at both ends, a corner takes at most half the height.
+    let tall = if top && bottom { height / 2 } else { height };
+    let radius = radius.min(tall).min(width / 2).max(0);
+    let above = if top { radius } else { 0 };
+    let below = if bottom { radius } else { 0 };
+    fill(
+        Rect {
+            y: rect.y + above,
+            height: (height - above - below).max(0) as u32,
+            ..rect
+        },
+        color,
+        damage,
+        sink,
+    );
+    // A pixel row `step` from the edge is inset where a circle of the
+    // radius, centred `radius` in, crosses it at the row's middle.
+    let inset = |step: i64| {
+        let dy = radius as f64 - step as f64 - 0.5;
+        let dx = ((radius * radius) as f64 - dy * dy).max(0.0).sqrt();
+        (radius as f64 - dx).round() as i64
+    };
+    let row = |y: i64, step: i64, sink: &mut dyn FnMut(Draw)| {
+        let inset = inset(step);
+        fill(
+            Rect {
+                x: rect.x + inset,
+                y,
+                width: (width - 2 * inset).max(0) as u32,
+                height: 1,
+            },
+            color,
+            damage,
+            sink,
+        );
+    };
+    for step in 0..above {
+        row(rect.y + step, step, sink);
+    }
+    for step in 0..below {
+        row(rect.y + height - 1 - step, step, sink);
     }
 }
 
@@ -2391,6 +2778,26 @@ fn wrap_section(
         )?;
     }
     Ok(())
+}
+
+/// The columns `rows` of `message` take, at most `most`: a text row's
+/// scalars, a title row's mark, space and title, the more row's text.
+fn laid_columns(message: &Message, rows: &[Line], most: usize) -> usize {
+    let section = |line: &Line| message.sections.get(usize::from(line.section));
+    rows.iter()
+        .map(|line| match line.kind {
+            Kind::Text => section(line)
+                .and_then(|section| section.text.get(line.start as usize..line.end as usize))
+                .map_or(0, |text| text.chars().count()),
+            Kind::Title => section(line)
+                .and_then(|section| section.title.as_ref())
+                .map_or(0, |title| title.chars().count() + 2),
+            Kind::More => MORE.chars().count(),
+            Kind::Header | Kind::Gap => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(most)
 }
 
 /// Appends message `index`'s rows to `out`, at most `budget` rows in all:

@@ -2810,6 +2810,9 @@ pub fn run(
         mode: config.mode,
         held: Vec::new(),
     };
+    // Before anything is opened: an adopted conversation is replayed as it
+    // opens, and its times are shown in this zone.
+    session.app.set_zone(td_civil::Zone::local());
     session.read_tasks(ids.into_iter().map(|(_, id)| id).collect());
     // Before any conversation starts.
     session.repolicy();

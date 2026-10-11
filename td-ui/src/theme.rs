@@ -12,12 +12,12 @@ use std::path::PathBuf;
 
 use crate::chrome::{DISABLED, SELECTED_ROW};
 use crate::raster::{
-    GlyphStyle, Primitive, ACCENT, BORDER, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER,
+    GlyphStyle, Primitive, ACCENT, BORDER, BUBBLE, CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER,
     MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
 };
 
 /// The roles a theme colours.
-pub const ROLES: usize = 13;
+pub const ROLES: usize = 14;
 
 /// The colour each role is drawn in by the shared palette, in the order a
 /// theme lists its own; `SAND` is these colours.
@@ -35,6 +35,7 @@ pub const KEYS: [u32; ROLES] = [
     SUCCESS,
     WARNING,
     ACCENT,
+    BUBBLE,
 ];
 
 /// The chord that moves a window to the next theme. No consumer
@@ -66,7 +67,7 @@ pub static HARBOR: Theme = Theme {
     name: "harbor",
     colors: [
         0xe4ebf0, 0x2c3a46, 0xd3dee6, 0x9aaebd, 0x2f638c, 0xbccbd6, 0x66798a, 0xa13a3a, 0xb6c8d5,
-        0x66788b, 0x39693a, 0x7a5810, 0x66498a,
+        0x66788b, 0x39693a, 0x7a5810, 0x66498a, 0xd6e6d6,
     ],
 };
 /// Pale green paper with a fern selection.
@@ -74,7 +75,7 @@ pub static MOSS: Theme = Theme {
     name: "moss",
     colors: [
         0xe7ecdc, 0x37402f, 0xd7dfc9, 0xa5b293, 0x4c6b37, 0xc3cdb2, 0x707a63, 0x973f33, 0xbfcaab,
-        0x707a63, 0x3b6630, 0x785a14, 0x6b476b,
+        0x707a63, 0x3b6630, 0x785a14, 0x6b476b, 0xd3e0ea,
     ],
 };
 /// Blush paper with a plum selection.
@@ -82,7 +83,7 @@ pub static ROSE: Theme = Theme {
     name: "rose",
     colors: [
         0xf2e5e7, 0x47363c, 0xe6d4d8, 0xbc9fa6, 0x7a4560, 0xd4bfc4, 0x856c73, 0xa0302b, 0xd9c1c7,
-        0x89727a, 0x42653a, 0x7f5713, 0x674b8b,
+        0x89727a, 0x42653a, 0x7f5713, 0x674b8b, 0xddd8ee,
     ],
 };
 /// Dark blue-slate ground with pale ink.
@@ -90,7 +91,7 @@ pub static DUSK: Theme = Theme {
     name: "dusk",
     colors: [
         0x1e2330, 0xd2d8e2, 0x2a3141, 0x4b5569, 0x8db2d8, 0x3a4457, 0x8590a4, 0xee8f80, 0x37425a,
-        0x7f8aa0, 0x9cc78b, 0xdeb86b, 0xc79fd8,
+        0x7f8aa0, 0x9cc78b, 0xdeb86b, 0xc79fd8, 0x233f40,
     ],
 };
 /// Dark warm-brown ground with an amber selection.
@@ -98,7 +99,7 @@ pub static EMBER: Theme = Theme {
     name: "ember",
     colors: [
         0x28221e, 0xe8ddcf, 0x352d27, 0x5e5148, 0xdba468, 0x4a3f36, 0x9a8b7a, 0xf08f7a, 0x4a3d33,
-        0x948675, 0xabc98d, 0xe8c26c, 0xd6a3cb,
+        0x948675, 0xabc98d, 0xe8c26c, 0xd6a3cb, 0x383f2a,
     ],
 };
 
@@ -233,7 +234,9 @@ mod tests {
         // selected row, an unfocused selection, selected text on its band,
         // line numbers, a disabled entry and button, borders, the status
         // inks, which also band paper-ink rows, and the message list's
-        // tone inks on chrome and on a selected row.
+        // tone inks on chrome and on a selected row; and on the person's
+        // own bubble, ink, line numbers, the tone inks and the border a
+        // lit icon is.
         let pairs = [
             (1, 0, 700),
             (1, 2, 600),
@@ -256,6 +259,14 @@ mod tests {
             (7, 2, 390),
             (7, 8, 300),
             (6, 8, 230),
+            (1, 13, 600),
+            (6, 13, 280),
+            (4, 13, 390),
+            (7, 13, 390),
+            (10, 13, 390),
+            (11, 13, 390),
+            (12, 13, 390),
+            (3, 13, 140),
         ];
         for theme in THEMES {
             for (fore, ground, least) in pairs {

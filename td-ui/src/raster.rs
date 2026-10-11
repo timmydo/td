@@ -32,6 +32,9 @@ pub const MISSPELLED: u32 = 0x9c5548;
 pub const SUCCESS: u32 = 0x4d6b3c;
 pub const WARNING: u32 = 0x86601a;
 pub const ACCENT: u32 = 0x7a4d74;
+/// The ground of a message list's bubble of the person's own messages,
+/// set off in hue from `CHROME`, which the others' bubbles are.
+pub const BUBBLE: u32 = 0xdbe2d3;
 
 /// What the raster refuses: an argument outside its contract, or a size
 /// past a ceiling. Validation precedes every write.

@@ -1092,6 +1092,15 @@ says.
   their result; verdicts; messages from other conversations and
   schedules, labelled with their source; and a divider where compaction
   ran (§14).
+  So the transcript scans at a glance, the person's own messages are
+  bubbles on the right and the replies (a sub-agent's too) and other
+  conversations' messages bubbles on the left (td-ui's `Side`); tool
+  blocks, notices, schedules and the rest stay across the list. Each
+  bubble shows its event's time beside its header, `HH:MM` in the
+  machine's zone (td-civil's `Zone::local`, read once as the window
+  starts; UTC before it, and in the tests), its tooltip the whole date and
+  time; a streamed reply has none until its logged reply settles it, which
+  gives the logged event's.
 - approval cards (§11), composed from the toolkit's existing
   action buttons and wrapped text block, never transcript text.
 - a question the model asks (§12), above the composer until answered.

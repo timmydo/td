@@ -36,7 +36,7 @@ use td_ui::editor::{self, Controller as Pane, Event as PaneEvent, Outcome as Pan
 use td_ui::editor_clipboard::{Paste, Snapshot};
 use td_ui::editor_model::TabId;
 use td_ui::keys::{self, Section};
-use td_ui::messages::{self, Error as MessagesError, Message, Tone};
+use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
 use td_ui::raster::{
     self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK,
     PAPER,
@@ -992,15 +992,17 @@ pub struct App {
     /// never the composer's.
     dialog_paste: Option<Asker>,
     clock: u64,
-    /// The transcript's button the pointer rests on, by message and
-    /// whether it is copy, since when, and whether its tooltip shows.
-    tip_target: Option<(usize, bool)>,
+    /// What in the transcript the pointer rests on that has a tooltip, by
+    /// message and target, since when, and whether its tooltip shows.
+    tip_target: Option<(usize, Target)>,
     tip_since: Option<u64>,
     tip_shown: bool,
     /// Where the pointer was last told to be, and where it was when its
     /// tooltip was put away: none shows again until it moves from there.
     pointer_at: Option<(i64, i64)>,
     tip_held_at: Option<(i64, i64)>,
+    /// The zone a message's time is shown in.
+    zone: td_civil::Zone,
     dirty: bool,
     /// Counts the changes that need a paint, so a driven input can say
     /// whether it changed anything whether or not a paint has happened.
@@ -1127,6 +1129,7 @@ impl App {
             dialog_paste: None,
             clock: 0,
             tip_target: None,
+            zone: td_civil::Zone::utc(),
             tip_since: None,
             tip_shown: false,
             pointer_at: None,
@@ -2460,6 +2463,8 @@ impl App {
         match event.kind {
             Kind::User { text, .. } => {
                 let pushed = Message::new(YOU)
+                    .map(|m| m.side(Side::Right))
+                    .and_then(|m| self.stamped(m, event.time))
                     .and_then(|m| m.text(&text))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
@@ -2692,7 +2697,9 @@ impl App {
                 } else {
                     Some((finish.as_str(), Tone::Neutral))
                 };
-                let mut message = Message::new(self.author(request));
+                let mut message = Message::new(self.author(request))
+                    .map(|m| m.side(Side::Left))
+                    .and_then(|m| self.stamped(m, event.time));
                 if let Some(reasoning) = &reasoning {
                     message = message.and_then(|m| m.section("reasoning", reasoning, true));
                 }
@@ -2723,7 +2730,7 @@ impl App {
                                 .chain([text])
                                 .chain((!calls.is_empty()).then_some(called.as_str()))
                                 .collect();
-                            self.settle_stream(&sections, verdict, message)
+                            self.settle_stream(&sections, verdict, event.time, message)
                         }
                         None => self.push_message(message),
                     },
@@ -2837,6 +2844,8 @@ impl App {
                     Held::Budget => "held: wake budget",
                 });
                 let pushed = Message::new(&header)
+                    .map(|m| m.side(Side::Left))
+                    .and_then(|m| self.stamped(m, event.time))
                     .and_then(|m| m.text(&text))
                     .and_then(|m| match held {
                         Some(held) => m.verdict(held, Tone::Neutral),
@@ -3223,7 +3232,9 @@ impl App {
         reasoning: Option<&str>,
         text: &str,
     ) -> Result<Message, String> {
-        let mut message = Message::new(who).and_then(|m| m.status("streaming", Tone::Neutral));
+        let mut message = Message::new(who)
+            .map(|m| m.side(Side::Left))
+            .and_then(|m| m.status("streaming", Tone::Neutral));
         if let Some(reasoning) = reasoning {
             message = message.and_then(|m| m.section("reasoning", reasoning, true));
         }
@@ -3291,8 +3302,10 @@ impl App {
         &mut self,
         sections: &[&str],
         verdict: Option<(&str, Tone)>,
+        time: u64,
         logged: Message,
     ) -> Result<usize, String> {
+        let (short, whole) = self.stamp(time);
         let same = self.streaming.is_some_and(|streaming| {
             self.transcript
                 .message(streaming.index)
@@ -3308,6 +3321,7 @@ impl App {
             self.edit_stream(|list, index| {
                 list.set_status(index, None)
                     .and_then(|()| list.set_verdict(index, verdict))
+                    .and_then(|()| list.set_time(index, Some((&short, &whole))))
             })
         } else {
             self.edit_stream(|list, index| list.replace(index, logged.clone()))
@@ -3744,7 +3758,7 @@ impl App {
         let target = self
             .transcript
             .tip()
-            .map(|tip| (tip.message, tip.copy))
+            .map(|tip| (tip.message, tip.target))
             .filter(|_| self.tip_held_at.is_none());
         if target != self.tip_target {
             self.tip_target = target;
@@ -3753,6 +3767,28 @@ impl App {
                 self.touch();
             }
         }
+    }
+
+    /// The zone the transcript's times are shown in; UTC until the window
+    /// gives the machine's.
+    pub fn set_zone(&mut self, zone: td_civil::Zone) {
+        self.zone = zone;
+    }
+
+    /// An event's time in the zone: its hour and minute, shown, and the
+    /// whole date, its tooltip.
+    fn stamp(&self, time: u64) -> (String, String) {
+        let (civil, _) = self.zone.to_local(i64::try_from(time).unwrap_or(i64::MAX));
+        (
+            format!("{:02}:{:02}", civil.hour, civil.minute),
+            td_civil::format_ymd_hms(&civil),
+        )
+    }
+
+    /// `message` stamped with an event's `time`.
+    fn stamped(&self, message: Message, time: u64) -> Result<Message, MessagesError> {
+        let (short, whole) = self.stamp(time);
+        message.time(&short, &whole)
     }
 
     /// Whether the face draws icons: the transcript's buttons are then
@@ -6498,7 +6534,7 @@ impl App {
         let Some(tip) = self
             .transcript
             .tip()
-            .filter(|tip| Some((tip.message, tip.copy)) == self.tip_target)
+            .filter(|tip| Some((tip.message, tip.target)) == self.tip_target)
         else {
             return;
         };
@@ -7452,14 +7488,14 @@ pub mod tests {
         app.tick(1_000);
         app.tick(1_500);
         assert!(text(&app).contains(DEBUG_TIP));
-        assert_eq!(app.tip_target, Some((last, false)));
+        assert_eq!(app.tip_target, Some((last, Target::Action)));
         // Another exchange: the view follows the end, and the newest
         // reply's Debug is now under the pointer.
         exchange_at(&mut app, 200);
         let (_, newest) = *app.exchanges.last().unwrap();
         assert_eq!(
-            app.transcript.tip().map(|tip| (tip.message, tip.copy)),
-            Some((newest, false))
+            app.transcript.tip().map(|tip| (tip.message, tip.target)),
+            Some((newest, Target::Action))
         );
         assert!(!text(&app).contains(DEBUG_TIP), "not the old one's");
         app.tick(1_550);
@@ -7468,7 +7504,7 @@ pub mod tests {
         assert!(!text(&app).contains(DEBUG_TIP), "its own delay");
         app.tick(2_050);
         assert!(text(&app).contains(DEBUG_TIP));
-        assert_eq!(app.tip_target, Some((newest, false)));
+        assert_eq!(app.tip_target, Some((newest, Target::Action)));
     }
 
     /// A reply gets a Debug button, a user's message none; its press, or
@@ -7879,6 +7915,83 @@ pub mod tests {
             last.section_text(0),
             Some("this summary does not stand; the model's view is as it was")
         );
+    }
+
+    /// The person's messages sit on the right and replies on the left,
+    /// each with its event's time beside it, in the window's zone, and
+    /// the whole date its tooltip; a streamed reply gets its time as it
+    /// settles; a notice stays across the list.
+    #[test]
+    fn messages_sit_on_their_sides_with_their_times() {
+        let mut app = app();
+        let stamped = |seq, time, kind| Update::Up(Up::Event(Event { seq, time, kind }));
+        let user = Kind::User {
+            delivery: String::new(),
+            text: "hello".into(),
+        };
+        app.update(stamped(1, 1_760_000_000, user), 0);
+        app.update(
+            at(
+                2,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 1,
+                },
+            ),
+            0,
+        );
+        app.update(at(3, request(2, 900)), 0);
+        app.update(delta(3, "", "hi"), 0);
+        assert!(text(&app).contains("08:53") && !text(&app).contains("08:54"));
+        app.update(stamped(4, 1_760_000_060, reply(3, "", "hi", false)), 0);
+        app.update(
+            stamped(
+                5,
+                1_760_000_120,
+                Kind::Notice {
+                    text: "a notice".into(),
+                },
+            ),
+            0,
+        );
+        let shown = text(&app);
+        assert!(
+            shown.contains("08:53") && shown.contains("08:54"),
+            "{shown}"
+        );
+        assert!(!shown.contains("08:55"), "a notice has none: {shown}");
+        let headers: Vec<Rect> = app
+            .transcript
+            .shown()
+            .filter(|(_, shown)| matches!(shown, td_ui::messages::Shown::Header { .. }))
+            .map(|(rect, _)| rect)
+            .collect();
+        let list = app.transcript.rect();
+        let view_right = list.x + i64::from(list.width) - 16;
+        let [mine, theirs, notice] = headers[..] else {
+            panic!("three headers: {headers:?}");
+        };
+        assert_eq!(mine.x + i64::from(mine.width), view_right);
+        assert!(mine.x > list.x);
+        assert_eq!(theirs.x, list.x);
+        assert!(theirs.x + i64::from(theirs.width) < view_right);
+        assert_eq!(
+            (notice.x, notice.x + i64::from(notice.width)),
+            (list.x, view_right)
+        );
+        // The time before mine, its tooltip the whole date.
+        let cell = td_ui::CELL_WIDTH as i64;
+        assert!(app.transcript.hover(Some((mine.x - 3 * cell, mine.y + 6))));
+        let tip = app.transcript.tip().unwrap();
+        assert_eq!(
+            (tip.target, tip.text),
+            (Target::Time, "2025-10-09 08:53:20")
+        );
+        // Rested on, its tooltip shows the whole date.
+        app.motion(Some((mine.x - 3 * cell, mine.y + 6)));
+        app.tick(1_000);
+        app.tick(1_500);
+        assert!(text(&app).contains("2025-10-09 08:53:20"), "{}", text(&app));
     }
 
     /// Deltas draw the reply into one message as they come; the logged

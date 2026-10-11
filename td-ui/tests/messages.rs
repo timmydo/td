@@ -16,13 +16,13 @@ use std::sync::Arc;
 
 use td_ui::chrome::{ROW, SELECTED_ROW};
 use td_ui::messages::{
-    Controller, Error, Event, Key, Message, Outcome, Point, Shown, Tip, Tone, COPY_ICON,
-    COPY_LABEL, COPY_TIP, EXCERPT_ROWS, GAP, ICON_CELLS, MAX_LABEL_BYTES, MAX_LINES, MAX_SECTIONS,
-    MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS, MORE,
+    Controller, Error, Event, Key, Message, Outcome, Point, Shown, Side, Target, Tip, Tone,
+    COPY_ICON, COPY_LABEL, COPY_TIP, EXCERPT_ROWS, GAP, ICON_CELLS, MAX_LABEL_BYTES, MAX_LINES,
+    MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS, MORE,
 };
 use td_ui::raster::{
-    Composition, Draw, Primitive, Raster, Rect, Scale, Surface, BORDER, CHROME, INACTIVE_SELECTION,
-    INK, LINE_NUMBER, PAPER, SELECTED,
+    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, BORDER, BUBBLE, CHROME,
+    INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
 };
 use td_ui::window::{Clipboard, Refusal};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
@@ -1843,7 +1843,7 @@ fn icon_buttons_are_lit_and_named_under_the_pointer() {
             list.tip(),
             Some(Tip {
                 message: 0,
-                copy: true,
+                target: Target::Copy,
                 rect: copy,
                 text: COPY_TIP,
             })
@@ -1851,8 +1851,8 @@ fn icon_buttons_are_lit_and_named_under_the_pointer() {
         assert!(!list.hover(Some((copy.x + 3, copy.y + 2))), "the same one");
         assert!(list.hover(Some((action.x + 2, action.y + 2))));
         assert_eq!(
-            list.tip().map(|tip| (tip.message, tip.copy, tip.text)),
-            Some((0, false, "Debug the exchange"))
+            list.tip().map(|tip| (tip.message, tip.target, tip.text)),
+            Some((0, Target::Action, "Debug the exchange"))
         );
         assert!(list.hover(Some((retry.x + 2, retry.y + 2))));
         assert_eq!(list.tip().map(|tip| tip.text), Some("Retry"));
@@ -1999,4 +1999,398 @@ fn icon_buttons_are_lit_and_named_under_the_pointer() {
             Primitive::Fill { color: BORDER, rect } if rect.width == (ICON_CELLS * CELL_WIDTH) as u32 * scale as u32
         )), "{scale}");
     }
+}
+
+/// Message `message`'s header row and its first text row as shown.
+fn bubble(list: &Controller, message: usize) -> (Rect, Option<Rect>) {
+    let header = list
+        .shown()
+        .find(|(_, shown)| matches!(shown, Shown::Header { message: m } if *m == message))
+        .unwrap()
+        .0;
+    let text = list
+        .shown()
+        .find(|(_, shown)| matches!(shown, Shown::Text { message: m, .. } if *m == message))
+        .map(|(rect, _)| rect);
+    (header, text)
+}
+
+/// The view a list draws its rows across: its rectangle less the
+/// scrollbar's gutter.
+fn view(list: &Controller, scale: u8) -> Rect {
+    Rect {
+        width: list.rect().width - 16 * u32::from(scale),
+        ..list.rect()
+    }
+}
+
+fn drawn(list: &Controller, scale: u8) -> Vec<Draw> {
+    let mut draws = Vec::new();
+    list.emit(surface(scale).bounds(), &mut |draw| draws.push(draw));
+    draws
+}
+
+/// Whether the last fill over the pixel at (x, y) is `color`.
+fn covered(draws: &[Draw], color: u32, (x, y): (i64, i64)) -> bool {
+    draws.iter().rev().find_map(|draw| match draw.primitive {
+        Primitive::Fill { rect, color } if rect.contains(x, y) && draw.clip.contains(x, y) => {
+            Some(color)
+        }
+        _ => None,
+    }) == Some(color)
+}
+
+/// A bubble sits flush to its side, as wide as its widest row or what its
+/// header shows needs, a cell each side, up to the list's text columns
+/// less a fifth; a full message stays across the list. A bubble's text is
+/// laid a cell in from its own edge, and a press, a double click and its
+/// buttons and fold mark act within it; a press beside it folds nothing.
+#[test]
+fn bubbles_sit_on_their_side_as_wide_as_they_need() {
+    for scale in 1..=4 {
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let mut board = Board::default();
+        let mut list = list(scale, 60, 300);
+        let view = view(&list, scale);
+        let right = view.x + i64::from(view.width);
+        list.push(text("you", "a question").side(Side::Right))
+            .unwrap();
+        list.push(text("assistant", &"x".repeat(100)).side(Side::Left))
+            .unwrap();
+        list.push(text("note", "across")).unwrap();
+        // "you" and a Copy button: 3 + 3 + 1 + 1 + 6 + 1 cells, less the
+        // two at its sides, past "a question"'s ten.
+        let (header, body) = bubble(&list, 0);
+        let body = body.unwrap();
+        assert_eq!(i64::from(header.width), 15 * cell, "{scale}");
+        assert_eq!(header.x + i64::from(header.width), right);
+        assert_eq!((body.x, body.width), (header.x, header.width));
+        // The long one wraps to 48 columns, a fifth of 60 left free.
+        let (header, body) = bubble(&list, 1);
+        assert_eq!((header.x, i64::from(header.width)), (view.x, 50 * cell));
+        assert_eq!(
+            rows(&list)
+                .iter()
+                .filter(|row| row.starts_with('x'))
+                .count(),
+            3
+        );
+        assert_eq!(body.unwrap().width, header.width);
+        let (header, _) = bubble(&list, 2);
+        assert_eq!((header.x, header.width), (view.x, view.width));
+        // Its text a cell in from its own edge.
+        let (header, body) = bubble(&list, 0);
+        let body = body.unwrap();
+        let draws = drawn(&list, scale);
+        assert!(draws.iter().any(|draw| matches!(
+            draw.primitive,
+            Primitive::Glyph { x, y, scalar: 'a', style }
+                if x == body.x + cell && y == body.y && style == GlyphStyle::medium(INK, BUBBLE)
+        )));
+        // Its buttons inside it; a double click selects a word of it.
+        let copy = list.copy_button(0).unwrap();
+        assert_eq!(copy.x + i64::from(copy.width) + cell, right);
+        assert!(copy.x > header.x);
+        let word = at(body, 4, scale);
+        press(&mut list, &mut board, word, false, 0);
+        release(&mut list, &mut board, word, 10);
+        press(&mut list, &mut board, word, false, 100);
+        release(&mut list, &mut board, word, 110);
+        assert_eq!(list.selected_text().unwrap().as_deref(), Some("question"));
+        // Beside it, its header row folds nothing; its own fold mark does.
+        press(
+            &mut list,
+            &mut board,
+            (view.x + cell + 1, header.y + 2),
+            false,
+            2000,
+        );
+        assert!(!list.message(0).unwrap().is_collapsed(), "{scale}");
+        press(
+            &mut list,
+            &mut board,
+            (header.x + cell + 1, header.y + 2),
+            false,
+            4000,
+        );
+        assert!(list.message(0).unwrap().is_collapsed(), "{scale}");
+        assert_eq!(
+            press(&mut list, &mut board, (copy.x + 2, copy.y + 2), false, 6000),
+            Outcome::Copied
+        );
+        // A titled section's row: beside it, nothing folds; on it, it does.
+        let titled = list
+            .push(
+                Message::new("you")
+                    .unwrap()
+                    .section("notes", "kept", false)
+                    .unwrap()
+                    .side(Side::Right),
+            )
+            .unwrap();
+        let title = list
+            .shown()
+            .find(|(_, shown)| matches!(shown, Shown::Title { message, .. } if *message == titled))
+            .unwrap()
+            .0;
+        assert!(title.x > view.x + cell);
+        press(
+            &mut list,
+            &mut board,
+            (view.x + cell + 1, title.y + 2),
+            false,
+            8000,
+        );
+        assert!(rows(&list).contains(&format!("T{titled}.0+")), "{scale}");
+        press(
+            &mut list,
+            &mut board,
+            (title.x + cell + 1, title.y + 2),
+            false,
+            10_000,
+        );
+        assert!(rows(&list).contains(&format!("T{titled}.0-")), "{scale}");
+    }
+}
+
+/// A bubble's text wraps to its own columns; streamed text widens it, and
+/// a resize lays it out again at its new columns.
+#[test]
+fn a_bubble_widens_as_its_text_streams_in() {
+    for scale in 1..=4 {
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let mut list = list(scale, 60, 300);
+        let index = list.push(text("assistant", "hi").side(Side::Left)).unwrap();
+        // "assistant" and Copy: 3 + 9 + 1 + 1 + 6 + 1, less two.
+        assert_eq!(i64::from(bubble(&list, index).0.width), 21 * cell);
+        list.append(index, 0, &" there".repeat(5)).unwrap();
+        assert_eq!(i64::from(bubble(&list, index).0.width), 34 * cell);
+        list.append(index, 0, &"y".repeat(80)).unwrap();
+        assert_eq!(i64::from(bubble(&list, index).0.width), 50 * cell);
+        list.resize(surface(scale), rect(scale, 40, 300)).unwrap();
+        // 40 columns leave 32 to wrap to.
+        assert_eq!(i64::from(bubble(&list, index).0.width), 34 * cell);
+        // A long status widens it past them, up to the whole view, so it is
+        // not cut; its text still wraps at 32, and its time, with no room
+        // beside it, is not shown.
+        let status = "in 12k (cached 11k, written 0) out 30";
+        list.set_status(index, Some((status, Tone::Neutral)))
+            .unwrap();
+        list.set_time(index, Some(("14:05", "today"))).unwrap();
+        // 3 + 9 + 2 + 37 + 1 + 1 + 6 + 1 cells.
+        assert_eq!(i64::from(bubble(&list, index).0.width), 42 * cell);
+        let (header, body) = bubble(&list, index);
+        assert_eq!(body.unwrap().width, header.width);
+        assert!(rows(&list).iter().all(|row| row.chars().count() <= 32));
+        assert!(!list.hover(Some((header.x + i64::from(header.width) - 2, header.y + 6))));
+        assert!(!drawn(&list, scale)
+            .iter()
+            .any(|draw| matches!(draw.primitive, Primitive::Glyph { scalar: ':', .. })));
+    }
+}
+
+/// A bubble is its side's ground, the person's own `BUBBLE` and the
+/// others' `CHROME`, its top corners stepped round on its header and its
+/// bottom ones on its foot, taken from the gap below; a focused bubble's
+/// header is the selected row's, and its foot too when the header is its
+/// only row; a full message
+/// is a header band under a rule over paper as before.
+#[test]
+fn a_bubble_is_its_sides_ground_with_stepped_corners() {
+    for scale in 1..=4 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 60, 300);
+        list.push(text("you", "one\ntwo").side(Side::Right))
+            .unwrap();
+        list.push(text("assistant", "three").side(Side::Left))
+            .unwrap();
+        list.push(
+            Message::new("folded")
+                .unwrap()
+                .side(Side::Left)
+                .collapsed(true),
+        )
+        .unwrap();
+        let draws = drawn(&list, scale);
+        let radius = 4 * s;
+        for (message, ground) in [(0, BUBBLE), (1, CHROME), (2, CHROME)] {
+            let (header, _) = bubble(&list, message);
+            let last = list
+                .shown()
+                .filter(|(_, shown)| match shown {
+                    Shown::Header { message: m } | Shown::Text { message: m, .. } => *m == message,
+                    _ => false,
+                })
+                .last()
+                .unwrap()
+                .0;
+            let (left, right) = (header.x, header.x + i64::from(header.width) - 1);
+            // Its foot, four pixels of the gap below, ends it.
+            let bottom = last.y + i64::from(last.height) + 4 * s - 1;
+            for corner in [
+                (left, header.y),
+                (right, header.y),
+                (left, bottom),
+                (right, bottom),
+            ] {
+                assert!(
+                    !covered(&draws, ground, corner),
+                    "{message} {corner:?} {scale}"
+                );
+            }
+            for inside in [
+                (left + radius, header.y),
+                (left, header.y + radius),
+                (right - radius, bottom),
+                (right, bottom - radius),
+                (left + 2 * s, header.y + 2 * s),
+            ] {
+                assert!(
+                    covered(&draws, ground, inside),
+                    "{message} {inside:?} {scale}"
+                );
+            }
+        }
+        // Focused, a bubble's header is the selected row's.
+        assert!(list.focus_on(0));
+        let draws = drawn(&list, scale);
+        let (header, body) = bubble(&list, 0);
+        assert!(covered(
+            &draws,
+            SELECTED_ROW,
+            (header.x + 2 * s, header.y + 2 * s)
+        ));
+        assert!(covered(
+            &draws,
+            BUBBLE,
+            (header.x + 2 * s, body.unwrap().y + 2 * s)
+        ));
+        // No rule over a bubble.
+        assert!(!covered(&draws, BORDER, (header.x + 8 * s, header.y)));
+        // A folded one, focused: its foot is its header's ground.
+        assert!(list.focus_on(2));
+        let draws = drawn(&list, scale);
+        let (header, _) = bubble(&list, 2);
+        let foot = header.y + i64::from(header.height) + 2 * s;
+        assert!(
+            covered(&draws, SELECTED_ROW, (header.x + 6 * s, foot)),
+            "{scale}"
+        );
+    }
+}
+
+/// A time shows beside a bubble's header, after it on the left side and
+/// before it on the right, when its far side has room for it and a cell
+/// each side, or in a full header after its label and status; the pointer
+/// on it names its tip. A time is at most `MAX_TIME_CHARS` and counted.
+#[test]
+fn a_time_sits_beside_a_bubble_or_in_a_full_header() {
+    for scale in 1..=4 {
+        let s = i64::from(scale);
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let mut list = list(scale, 60, 300);
+        let timed =
+            |message: Message, time: &str| message.time(time, "2026-10-11 14:05:09").unwrap();
+        list.push(timed(text("you", "hi").side(Side::Right), "14:05"))
+            .unwrap();
+        list.push(timed(text("assistant", "hello").side(Side::Left), "14:06"))
+            .unwrap();
+        list.push(timed(
+            text("tool", "ran").status("done", Tone::Good).unwrap(),
+            "14:07",
+        ))
+        .unwrap();
+        let draws = drawn(&list, scale);
+        let first = |x: i64, y: i64, scalar: char| {
+            draws.iter().any(|draw| {
+                draw.primitive
+                    == Primitive::Glyph {
+                        x,
+                        y,
+                        scalar,
+                        style: GlyphStyle::medium(
+                            LINE_NUMBER,
+                            if scalar == '1' && x > 0 {
+                                PAPER
+                            } else {
+                                CHROME
+                            },
+                        ),
+                    }
+            })
+        };
+        let (mine, _) = bubble(&list, 0);
+        let (theirs, _) = bubble(&list, 1);
+        let (full, _) = bubble(&list, 2);
+        let mine_at = (mine.x - cell - 5 * cell, mine.y + 4 * s);
+        let theirs_at = (theirs.x + i64::from(theirs.width) + cell, theirs.y + 4 * s);
+        assert!(first(mine_at.0, mine_at.1, '1'), "{scale}");
+        assert!(first(theirs_at.0, theirs_at.1, '1'), "{scale}");
+        // "tool", two cells, "done", two cells.
+        let full_at = (full.x + (3 + 4 + 2 + 4 + 2) * cell, full.y + 4 * s);
+        let glyph = draws.iter().position(|draw| {
+            matches!(
+                draw.primitive,
+                Primitive::Glyph { x, y, scalar: '1', style }
+                    if (x, y) == full_at && style == GlyphStyle::medium(LINE_NUMBER, CHROME)
+            )
+        });
+        let glyph = glyph.unwrap_or_else(|| panic!("the full header's time at {scale}"));
+        // Seen: no fill after it covers it.
+        let inside = (full_at.0 + s, full_at.1 + s);
+        assert!(!draws[glyph..].iter().any(|draw| matches!(
+            draw.primitive,
+            Primitive::Fill { rect, .. } if rect.contains(inside.0, inside.1) && draw.clip.contains(inside.0, inside.1)
+        )), "{scale}");
+        for (message, (x, y)) in [(0, mine_at), (1, theirs_at), (2, full_at)] {
+            assert!(list.hover(Some((x + 2, y + 2))), "{message} {scale}");
+            let tip = list.tip().unwrap();
+            assert_eq!(
+                (tip.message, tip.target, tip.text),
+                (message, Target::Time, "2026-10-11 14:05:09")
+            );
+            assert_eq!((tip.rect.x, i64::from(tip.rect.width)), (x, 5 * cell));
+        }
+        // At the narrowest, a bubble's far side has no room for it.
+        let mut narrow = crate::list(scale, MIN_COLUMNS as u32, 300);
+        narrow
+            .push(timed(text("you", "hi").side(Side::Right), "14:05"))
+            .unwrap();
+        let (mine, _) = bubble(&narrow, 0);
+        assert!(!narrow.hover(Some((mine.x - 3 * cell, mine.y + 6 * s))));
+        assert!(!drawn(&narrow, scale)
+            .iter()
+            .any(|draw| matches!(draw.primitive, Primitive::Glyph { scalar: '4', .. })));
+    }
+    assert!(matches!(
+        Message::new("m").unwrap().time("Thursday 14:05", "tip"),
+        Err(Error::Limit)
+    ));
+    assert!(matches!(
+        Message::new("m").unwrap().time("14:05", ""),
+        Err(Error::Empty)
+    ));
+    let mut list = list(1, 60, 300);
+    let before = list.storage_bytes();
+    list.push(Message::new("m").unwrap().time("14:05", "tip").unwrap())
+        .unwrap();
+    assert_eq!(list.storage_bytes(), before + 1 + 5 + 3);
+    // Set on one shown, refused as built, taken off.
+    list.set_time(0, Some(("09:30", "longer tip"))).unwrap();
+    assert_eq!(list.storage_bytes(), before + 1 + 5 + 10);
+    assert!(matches!(
+        list.set_time(0, Some(("Thursday 14:05", "tip"))),
+        Err(Error::Limit)
+    ));
+    assert!(matches!(
+        list.set_time(0, Some(("09:30", "a\nb"))),
+        Err(Error::Control)
+    ));
+    assert!(matches!(
+        list.set_time(9, Some(("09:30", "tip"))),
+        Err(Error::NoMessage)
+    ));
+    assert_eq!(list.storage_bytes(), before + 1 + 5 + 10);
+    list.set_time(0, None).unwrap();
+    assert_eq!(list.storage_bytes(), before + 1);
 }
