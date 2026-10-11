@@ -1345,7 +1345,7 @@ Planned commands, with stable JSON output and exit codes:
 | `config check` | Offline syntax, references, permission, and resource validation; implemented for file inputs, no ACME state |
 | `config show --redacted` | Effective values, defaults, and configuration generation |
 | `serve` | Foreground service, no daemonization |
-| `status --json`, `doctor --json` | Full health planned; current status requires --runtime and reports SMTP-only lifecycle |
+| `status --json`, `doctor --json` | Full health planned; current status requires --runtime and reports SMTP-only lifecycle; --require-ready makes its exit code a readiness probe |
 | `stop --runtime PATH` | Request orderly shutdown through the private receiving control socket |
 | `dns-plan` | Expected records and MTA-STS policy; no DNS changes |
 | `reload` | Validate candidate, report bounded pending issuance if needed, then atomically install or retain old config; SCHEMA.md owns cancellation/deadline rules |

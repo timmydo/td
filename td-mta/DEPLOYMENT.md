@@ -151,6 +151,21 @@ supervisor's process state when waiting for exit. `stop` returning `requested`
 means the shutdown flag was set. Wait for the serving process to exit
 before maintenance or replacement; native storage I/O can extend that wait.
 A supervisor should keep stdout/stderr consumed throughout the lifetime.
+A supervisor readiness probe can run as the service UID:
+
+```text
+/opt/td-mta/bin/td-mta status --json --require-ready --runtime /run/td-mta
+```
+
+This exits zero only when the current receiver reports ready. It exits one
+for another lifecycle or a control error, and two for invalid arguments.
+It does not wait for readiness; let the supervisor retry within its startup
+deadline, allowing time for cold storage recovery, during which the endpoint
+is absent. Preserve the probe JSON in diagnostics: it distinguishes a
+successful nonready observation from a permissions or configuration error.
+Ordinary status still exits
+zero for any successful query, including a stopping receiver. Neither form
+guarantees that the next delivery will be admitted.
 
 SIGTERM, SIGINT and SIGKILL currently terminate without protocol draining.
 Restart recovers mail that received final SMTP 250 and discards incomplete

@@ -1857,9 +1857,15 @@ other I/O failures remain io. There is a brief starting-to-ready transition
 after the readiness line, which observers may poll. These are receiving
 lifecycle observations, not the full v1 health snapshot,
 queue metrics or proof that the next delivery can be admitted. Unimplemented
-metrics are not reported as zero. Successful queries exit zero regardless
-of the observed lifecycle; fixed redacted errors exit one and malformed
-arguments exit two. OBSERVABILITY.md's version-1 health envelope remains a
+metrics are not reported as zero. Without `--require-ready`, successful
+queries exit zero regardless of the observed lifecycle. Add `--require-ready`
+immediately after `--json`
+for a supervisor probe: exit zero only for state ready, exit one for every
+other lifecycle. The JSON is identical in both modes, including status ok
+when the query succeeded but receiving is not ready. The probe is one
+observation, not a wait or a guarantee about subsequent admission. Fixed
+redacted errors exit one and malformed arguments exit two.
+OBSERVABILITY.md's version-1 health envelope remains a
 separate future service status surface.
 
 Stop returns schema-1 command JSON with command stop, status requested and

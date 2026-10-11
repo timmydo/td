@@ -3599,6 +3599,8 @@ proves accepted-mail recovery across termination during another DATA transfer.
 The private runtime socket now reports receiving lifecycle and requests
 orderly stop; process tests cover its authority/refusal and kill/restart
 cleanup. Signal integration and full health aggregation remain separate.
-Next operational work is deployment packaging; HTTPS/JMAP, gateway, reload,
+The status command now offers --require-ready for supervisor probes, with
+exit zero only for the ready lifecycle and unchanged JSON. Next operational
+work is supervisor deployment examples; HTTPS/JMAP, gateway, reload,
 ACME, outgoing delivery
 and file logging remain unimplemented activation paths.

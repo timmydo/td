@@ -1538,16 +1538,17 @@ fn serve_receives_and_recovers_after_process_death() {
     fs::remove_file(&socket).unwrap();
     let process = ReceivingProcess::start(&fixture);
     assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o7777, 0o600);
-    let status = || {
-        Command::new(mail_binary())
-            .args(["status", "--json", "--runtime"])
-            .arg(&runtime.0)
-            .output()
-            .unwrap()
+    let status = |require_ready| {
+        let mut command = Command::new(mail_binary());
+        command.args(["status", "--json"]);
+        if require_ready {
+            command.arg("--require-ready");
+        }
+        command.arg("--runtime").arg(&runtime.0).output().unwrap()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
-        let report = report_command(&status(), 0, "status");
+        let report = report_command(&status(false), 0, "status");
         if report.get("state").unwrap().as_str() == Some("ready") {
             break;
         }
@@ -1555,9 +1556,13 @@ fn serve_receives_and_recovers_after_process_death() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    let report = report_command(&status(true), 0, "status");
+    assert_eq!(report.get("state").unwrap().as_str(), Some("ready"));
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o644)).unwrap();
-    let report = report_command(&status(), 1, "status");
-    assert_eq!(report.get("error").unwrap().as_str(), Some("socket-policy"));
+    for require_ready in [false, true] {
+        let report = report_command(&status(require_ready), 1, "status");
+        assert_eq!(report.get("error").unwrap().as_str(), Some("socket-policy"));
+    }
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let output = Command::new(mail_binary())
         .args(["serve", "--smtp-only", "--config"])
@@ -1638,40 +1643,72 @@ fn serve_receives_and_recovers_after_process_death() {
     }
     assert!(!socket.exists());
     drop(process);
-    let report = report_command(&status(), 1, "status");
+    let report = report_command(&status(false), 1, "status");
     assert_eq!(report.get("error").unwrap().as_str(), Some("not-running"));
-    // A same-owner bogus endpoint cannot make the client echo arbitrary data.
-    let fake = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-    fake.set_nonblocking(true).unwrap();
-    let responder = std::thread::spawn(move || {
-        use std::io::Read;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let (mut peer, _) = loop {
-            match fake.accept() {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(std::time::Instant::now() < deadline);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                result => break result.unwrap(),
+    // Exercise exit policy deterministically across the private wire states.
+    for (wire, state) in [
+        ("STARTING\n", Some("starting")),
+        ("READY\n", Some("ready")),
+        ("STOPPING\n", Some("stopping")),
+        ("STOPPED\n", Some("stopped")),
+        ("FAILED\n", Some("failed")),
+        ("REQUESTED\n", None),
+        ("INVALID\n", None),
+        // A same-owner bogus endpoint must not make the client echo data.
+        ("SENSITIVE\n", None),
+    ] {
+        let mut ordinary_json = None;
+        for require_ready in [false, true] {
+            let fake = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            fake.set_nonblocking(true).unwrap();
+            let responder = std::thread::spawn(move || {
+                use std::io::Read;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let (mut peer, _) = loop {
+                    match fake.accept() {
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        result => break result.unwrap(),
+                    }
+                };
+                peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                peer.read_to_end(&mut request).unwrap();
+                assert_eq!(request, b"STATUS\n");
+                peer.write_all(wire.as_bytes()).unwrap();
+            });
+            let output = status(require_ready);
+            responder.join().unwrap();
+            if let Some(ordinary) = &ordinary_json {
+                assert_eq!(&output.stdout, ordinary);
+            } else {
+                ordinary_json = Some(output.stdout.clone());
             }
-        };
-        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .unwrap();
-        let mut request = Vec::new();
-        peer.read_to_end(&mut request).unwrap();
-        assert_eq!(request, b"STATUS\n");
-        peer.write_all(b"SENSITIVE\n").unwrap();
-    });
-    let output = status();
-    responder.join().unwrap();
-    let report = report_command(&output, 1, "status");
-    assert_eq!(
-        report.get("error").unwrap().as_str(),
-        Some("invalid-response")
-    );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("SENSITIVE"));
-    fs::remove_file(&socket).unwrap();
+            let code = i32::from(state.is_none() || (require_ready && state != Some("ready")));
+            let report = report_command(&output, code, "status");
+            if let Some(state) = state {
+                assert_eq!(report.get("state").unwrap().as_str(), Some(state));
+                assert_eq!(report.get("status").unwrap().as_str(), Some("ok"));
+                assert_eq!(
+                    report.get("ready").unwrap().as_bool(),
+                    Some(state == "ready")
+                );
+            } else {
+                assert_eq!(
+                    report.get("error").unwrap().as_str(),
+                    Some("invalid-response")
+                );
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("SENSITIVE"));
+            }
+            fs::remove_file(&socket).unwrap();
+        }
+    }
+    let report = report_command(&status(true), 1, "status");
+    assert_eq!(report.get("error").unwrap().as_str(), Some("not-running"));
     let output = Command::new(mail_binary())
         .args(["store", "verify", "--root"])
         .arg(&fixture.data.0)
@@ -1733,6 +1770,27 @@ fn control_requires_explicit_private_runtime_and_json_status() {
     for (command, args) in [
         ("status", vec!["status"]),
         ("status", vec!["status", "--runtime", "/absent"]),
+        (
+            "status",
+            vec!["status", "--require-ready", "--runtime", "/absent"],
+        ),
+        ("status", vec!["status", "--json", "--require-ready"]),
+        (
+            "status",
+            vec![
+                "status",
+                "--json",
+                "--require-ready",
+                "--require-ready",
+                "--runtime",
+                "/a",
+            ],
+        ),
+        (
+            "status",
+            vec!["status", "--json", "--runtime", "/a", "--require-ready"],
+        ),
+        ("stop", vec!["stop", "--require-ready", "--runtime", "/a"]),
         ("stop", vec!["stop"]),
         ("stop", vec!["stop", "--runtime", "/a", "extra"]),
     ] {
