@@ -1071,18 +1071,18 @@ the top rows are the ways to start one, Empty, Directory… and each
 template, and a press on one starts a conversation from it, with no
 dialog between; under each, the conversations started so, most recently
 active first and none pinned. Each conversation's row shows its title,
-its workspace (the template's name or the directory), conversation
-state (idle, running, waiting for approval, failed) and branch, and
-opens to its worktrees with their state
-(fetching, checking out, ready, failed), any forked conversations, and
-its background processes (§12). A row waiting for approval is marked
-distinctly, so a run left in the background is visible from the list,
-and the notifications of §3 are shown on their conversation's row. A
-row's context menu (the context menus step of §18) archives the
-conversation or deletes it (below); archiving hides it from the list,
-which shows archived conversations when the human asks, each with a
-context menu that unarchives it. A repository workspace's worktrees go
-with either as §7 says.
+its workspace (the template's name or the directory), conversation state
+(idle, running, waiting for approval, failed) and branch, and opens to
+its worktrees with their state (fetching, checking out, ready, failed),
+any forked conversations, its background processes and the sub-agents it
+started (§12). A row waiting for approval is marked distinctly, so a run
+left in the background is visible from the list, and the notifications
+of §3 are shown on their conversation's row. A row's context menu (the
+context menus step of §18) archives the conversation or deletes it
+(below); archiving hides it from the list, which shows archived
+conversations when the human asks, each with a context menu that
+unarchives it. A repository workspace's worktrees go with either as §7
+says.
 
 **Right: the active conversation.** From top to bottom:
 
@@ -1187,32 +1187,67 @@ workspace`, while a conversation has none. A group's third column says
 what it starts (`scratch`, `folder`, `repositories`). Under each group
 are its conversations, archived ones only while they show, the most
 recently active first; under each conversation, its background
-processes. A press on a group, or `Return` on one, starts a
-conversation from it at once as the chooser of §7 would: Empty a
-scratch one, a template its own, through the admission card when its
-remotes ask one; Directory… opens the folder chooser. Once one has
-started, however it was started, its composer takes the focus for its
-first message; one refused before it is made leaves the focus where it
-was, so nothing typed for it goes to another. One no longer configured starts
-none and says why in a note, as does `No workspace` while the jail
-runs. Without the jail, the groups listed are those conversations are
-in, in the same order, and `No workspace`, always, which alone starts
-one, with none, as `C-n` does; the others say why. A second press on a
-group within 400 ms is the same start, so a double press makes one
-conversation. The arrow keys move over groups and start nothing. A
-group or a conversation with rows under it folds them away from its
-disclosure box, or `Left` and `Right`, until unfolded, a template's
-fold kept by its name whether it is configured or not; the window keeps
-what is folded until it exits, letting go of a deleted conversation's.
-Opening a conversation unfolds its group, so its row shows and is
-selected. The rows are `ui::Item`s, a group, a conversation or a
-process, each with an id it keeps while it is listed, so the tree
+processes, then its sub-agents, the most recent first. A press on a
+group, or `Return` on one, starts a conversation from it at once as the
+chooser of §7 would: Empty a scratch one, a template its own, through
+the admission card when its remotes ask one; Directory… opens the folder
+chooser. Once one has started, however it was started, its composer
+takes the focus for its first message; one refused before it is made
+leaves the focus where it was, so nothing typed for it goes to another.
+One no longer configured starts none and says why in a note, as does `No
+workspace` while the jail runs. Without the jail, the groups listed are
+those conversations are in, in the same order, and `No workspace`,
+always, which alone starts one, with none, as `C-n` does; the others say
+why. A second press on a group within 400 ms is the same start, so a
+double press makes one conversation. The arrow keys move over groups and
+start nothing. A group or a conversation with rows under it folds them
+away from its disclosure box, or `Left` and `Right`, until unfolded, a
+template's fold kept by its name whether it is configured or not; the
+window keeps what is folded until it exits, letting go of a deleted
+conversation's. Opening a conversation unfolds its group, so its row
+shows and is selected. The rows are `ui::Item`s, a group, a
+conversation, a process, a sub-agent or a conversation's earlier
+sub-agents, each with an id it keeps while it is listed, so the tree
 table's view, which it keeps by id, stays put as rows come and go above
-it; the items and the drawn tree change together, or not at all when
-the tree is refused. The selection is kept by item. `S-F10` with a
-group selected opens the open conversation's menu, and a right press on
-a group opens none. `C-n` keeps the chooser for the keyboard, and
+it; the items and the drawn tree change together, or not at all when the
+tree is refused. The selection is kept by item. `S-F10` with a group
+selected opens the open conversation's menu, and a right press on a
+group opens none. `C-n` keeps the chooser for the keyboard, and
 `C-PageUp`/`C-PageDown` still go by activity, not by the tree.
+
+**As built (sub-agents in the list).** A sub-agent's row
+(`Item::SubAgent`, its conversation and its `Task` event's sequence
+number) reads `KIND: PROMPT`, the prompt's first line that is not blank
+cut to 200 characters (`store::MAX_TASK_PROMPT`), and says `running`
+while its `task` call has no result heard and its conversation's turn
+runs, so one whose process left its turn open is not. At start-up the
+window reads, on a thread of its own and the most recently active
+conversation first, each log's sub-agents (`store::read_tasks`): a line
+at a time, never the log whole, parsing only a line that holds the
+string `"task"`, as a `Task` event's kind must however it is spaced, so
+none is passed over (another event's line may hold it too, and is parsed
+and let be), and finding none in a log not yet made; each poll lists
+what has been read since. Whether one runs is only ever heard. From then
+on they are heard, from the open conversation's events and the others'
+alike, a `Task` adding one and a result to its call ending it; a log
+read and one heard merge by sequence number, so none is listed twice;
+each is kept by its sequence number, and the running ones by their call,
+so neither a merge nor a result looks through the others. A conversation
+shows its 20 most recent (`MAX_SUB_AGENT_ROWS`), then a row, `N earlier
+sub-agent(s), in its log`, which opens the conversation, so a long-lived
+one cannot fill the list past the tree table's bound. While the open
+conversation's log is replayed, to its `last` or as the window reads it,
+the list is rebuilt once, at its end (`relist`), not for each event that
+changes a row; a background conversation's events still rebuild it each,
+as before. A press on one, or `Return`, opens its conversation, the row
+kept selected unless the opening was refused, and once its log has been
+replayed (to the `last` event its process's `Hello` names, or as the
+window reads it) the transcript focuses and shows that message, which
+the messages after it then do not scroll away; one evicted from the
+transcript is said to be in the log alone. A jump not yet made is
+dropped when another conversation opens. Its menus are the open
+conversation's, as a group's are; it is folded away with its
+conversation's processes.
 
 **As built (increment 5).** A row's state may also be `running`, while
 a turn is under way. A reply shows as an `assistant` message: its

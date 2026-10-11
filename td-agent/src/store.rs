@@ -14,7 +14,7 @@
 //! final symbolic link.
 
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -3005,6 +3005,106 @@ pub fn read_prefix(state: &StateDir, id: &Id) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))
 }
 
+/// A sub-agent's start as the window's list shows it (DESIGN.md §4): its
+/// `Task` event's sequence number, the `task` call it answers, its kind,
+/// and its prompt's first line that is not blank, cut to
+/// `MAX_TASK_PROMPT` characters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskStart {
+    pub seq: u64,
+    pub call: u64,
+    pub agent: String,
+    pub prompt: String,
+}
+
+/// How much of a sub-agent's prompt the list keeps.
+pub const MAX_TASK_PROMPT: usize = 200;
+
+/// How much of a sub-agent's kind the list keeps.
+const MAX_TASK_AGENT: usize = 64;
+
+/// A sub-agent's start from its event, its prompt cut for the list.
+pub fn task_start(seq: u64, call: u64, agent: &str, prompt: &str) -> TaskStart {
+    TaskStart {
+        seq,
+        call,
+        agent: agent.chars().take(MAX_TASK_AGENT).collect(),
+        prompt: prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(MAX_TASK_PROMPT)
+            .collect(),
+    }
+}
+
+/// The sub-agents conversation `id`'s log records, as `read_log` would
+/// find them, a line at a time so a long log is never held whole. A line
+/// is parsed only when it holds the string `"task"`, as a `Task` event's
+/// kind must however it is spaced, so none is passed over; another
+/// event's line may hold it too, and is parsed and let be. Its bounds
+/// are `read_log`'s, a torn last line dropped, which, as every write is
+/// a whole line, is shorter than a line's bound; a log not yet made has
+/// none.
+pub fn read_tasks(state: &StateDir, id: &Id) -> Result<Vec<TaskStart>, String> {
+    const NEEDLE: &[u8] = br#""task""#;
+    let path = state.conversation(id).join("log");
+    let said = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(said(&e)),
+    };
+    let length = file.metadata().map_err(|e| said(&e))?.len();
+    if length > MAX_LOG {
+        return Err(said(&format!("longer than {MAX_LOG} bytes")));
+    }
+    let mut reader = std::io::BufReader::new(file.take(MAX_LOG));
+    let bound = u64::try_from(MAX_LINE)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut line = Vec::new();
+    let mut tasks = Vec::new();
+    loop {
+        line.clear();
+        reader
+            .by_ref()
+            .take(bound)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| said(&e))?;
+        let Some(body) = line.strip_suffix(b"\n") else {
+            if line.len() > MAX_LINE {
+                return Err(said(&"a line is past the bound"));
+            }
+            // The end, or a torn last line.
+            break;
+        };
+        if body.len() > MAX_LINE {
+            return Err(said(&"a line is past the bound"));
+        }
+        if !body.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            continue;
+        }
+        let value = td_json::parse_slice(body).map_err(|e| said(&e))?;
+        let event = Event::from_json(&value).map_err(|e| said(&e))?;
+        if let Kind::Task {
+            call,
+            agent,
+            prompt,
+            ..
+        } = &event.kind
+        {
+            tasks.push(task_start(event.seq, *call, agent, prompt));
+        }
+    }
+    Ok(tasks)
+}
+
 /// The events of a log and the length of its whole lines: what follows
 /// the last newline is a torn line for the caller to drop. A whole line
 /// that does not parse, or a sequence that skips, is corruption and
@@ -4560,5 +4660,49 @@ pub mod tests {
         std::fs::remove_file(dir.join("log")).unwrap();
         std::os::unix::fs::symlink(&elsewhere, dir.join("log")).unwrap();
         assert!(Conversation::open(&state, &id, None, LOCK_WAIT).is_err());
+    }
+
+    /// The sub-agents a log records are read a line at a time: a string
+    /// that looks like one is not one, and a torn last line is dropped.
+    #[test]
+    fn a_logs_sub_agents_are_read_a_line_at_a_time() {
+        let scratch = Scratch::new("tasks");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let seq = {
+            let (mut conversation, _) =
+                Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+            conversation
+                .append(Kind::User {
+                    delivery: "d1".into(),
+                    text: r#"{"kind":"task","call":1}"#.into(),
+                })
+                .unwrap();
+            let seq = conversation
+                .append(Kind::Task {
+                    call: 1,
+                    agent: "explore".into(),
+                    model: "m".into(),
+                    prefix: "p".into(),
+                    prompt: "find the parser\nand more".into(),
+                })
+                .unwrap()
+                .seq;
+            conversation.sync().unwrap();
+            seq
+        };
+        let mut log = OpenOptions::new()
+            .append(true)
+            .open(state.conversation(&id).join("log"))
+            .unwrap();
+        log.write_all(br#"{"seq":9,"time":1,"kind":"task","call":2"#)
+            .unwrap();
+        assert_eq!(
+            read_tasks(&state, &id).unwrap(),
+            [task_start(seq, 1, "explore", "find the parser")]
+        );
+        // A log not yet made has none; a prompt's blank lines are passed.
+        assert_eq!(read_tasks(&state, &Id::random().unwrap()), Ok(Vec::new()));
+        assert_eq!(task_start(1, 1, "a", "\n  \nsecond").prompt, "second");
     }
 }

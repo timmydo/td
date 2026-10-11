@@ -56,7 +56,7 @@ use crate::menu;
 use crate::picker::{Offer, Picker};
 use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
-use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TodoItem};
+use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TaskStart, TodoItem};
 use crate::supervisor::Update;
 use crate::templatedialog::{Reply as TemplateReply, TemplateDialog};
 use crate::tools;
@@ -352,7 +352,24 @@ enum Item {
     Group(Group),
     Conversation(Id),
     Process(Id, u64),
+    /// A sub-agent, by its conversation and its `Task` event.
+    SubAgent(Id, u64),
+    /// A conversation's sub-agents past those listed, which its log keeps.
+    Earlier(Id),
 }
+
+/// A conversation's sub-agents as the list knows them (DESIGN.md §4).
+#[derive(Debug, Default)]
+struct Tasks {
+    /// Each start, by its `Task` event's sequence number.
+    starts: BTreeMap<u64, TaskStart>,
+    /// The `task` calls of those whose result is not heard.
+    running: BTreeSet<u64>,
+}
+
+/// How many of a conversation's sub-agents the list shows, the most
+/// recent; a row then says how many more its log keeps.
+const MAX_SUB_AGENT_ROWS: usize = 20;
 
 /// A top row of the list: what its conversations were started from.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -788,6 +805,17 @@ pub struct App {
     started_in: Option<(Instant, Group)>,
     /// A conversation started since, its composer focused.
     composing: bool,
+    /// Each conversation's sub-agents, as its log records them: read at
+    /// start-up, then heard.
+    sub_agents: BTreeMap<Id, Tasks>,
+    /// A rebuild of the list put off until a replay ends.
+    list_stale: bool,
+    /// The sub-agent whose start the transcript is to show once its
+    /// conversation's log has brought it.
+    focus_task: Option<(Id, u64)>,
+    /// The last event of the log the open conversation's process is
+    /// replaying, 0 for none.
+    replaying_to: u64,
     /// The groups and conversations whose rows below are folded away.
     folded: BTreeSet<Item>,
     /// Whether the list shows archived conversations.
@@ -804,9 +832,10 @@ pub struct App {
     /// The open conversation's todo list, and whether it is shown whole.
     todo: Vec<TodoItem>,
     todo_open: bool,
-    /// Each user message's sequence number and its index in the
-    /// transcript, and each started turn's and its user message's.
+    /// Each user message's and sub-agent start's sequence number and its
+    /// index in the transcript.
     messages: Vec<(u64, usize)>,
+    /// Each started turn's sequence number and its user message's.
     turns: Vec<(u64, u64)>,
     /// The started effects that are `/review`s, of no message as a
     /// compaction is (DESIGN.md §15, `/review`).
@@ -990,6 +1019,10 @@ impl App {
             item_labels: BTreeMap::new(),
             started_in: None,
             composing: false,
+            sub_agents: BTreeMap::new(),
+            list_stale: false,
+            focus_task: None,
+            replaying_to: 0,
             folded: BTreeSet::new(),
             show_archived: false,
             show_activity: false,
@@ -1390,6 +1423,29 @@ impl App {
         self.chooser_start = folder;
     }
 
+    /// The sub-agents conversations' logs were read to have: each one the
+    /// window has not heard of is listed; whether it runs is only ever
+    /// heard, from the conversation's process, whose log the window hears
+    /// from its start. A deleted conversation's are let go.
+    pub fn set_sub_agents(&mut self, read: Vec<(Id, Vec<TaskStart>)>) {
+        let mut added = false;
+        for (id, starts) in read {
+            if !self.rows.iter().any(|row| row.id == id) || starts.is_empty() {
+                continue;
+            }
+            let known = &mut self.sub_agents.entry(id).or_default().starts;
+            for start in starts {
+                if let std::collections::btree_map::Entry::Vacant(entry) = known.entry(start.seq) {
+                    entry.insert(start);
+                    added = true;
+                }
+            }
+        }
+        if added {
+            self.refresh_list();
+        }
+    }
+
     /// A conversation just started: its composer takes the focus, for its
     /// first message (DESIGN.md §4).
     pub fn focus_composer(&mut self) {
@@ -1637,6 +1693,7 @@ impl App {
         self.rows.retain(|row| &row.id != id);
         self.background_turns.retain(|(of, _)| of != id);
         self.processes.remove(id);
+        self.sub_agents.remove(id);
         if self.active.as_ref() == Some(id) {
             self.active = None;
             self.clear_transcript();
@@ -1767,6 +1824,7 @@ impl App {
             self.folded.remove(&fold_key(&Item::Group(group)));
         }
         self.active = Some(id);
+        self.focus_task = None;
         self.clear_transcript();
         self.refresh_list();
         // The selection follows the conversation opened.
@@ -1977,6 +2035,7 @@ impl App {
         self.turns.clear();
         self.reviews.clear();
         self.last_seq = 0;
+        self.replaying_to = 0;
         self.meter = Meter::default();
         self.choice = (None, None);
         self.asked.clear();
@@ -1996,6 +2055,7 @@ impl App {
     /// store, its process's later events to follow.
     pub fn replay(&mut self, prefix: Result<&str, &str>, events: Vec<Event>) {
         self.clear_transcript();
+        self.replaying_to = events.last().map_or(0, |event| event.seq);
         // Counted again from the log.
         if let Some(id) = self.active.clone() {
             self.processes.remove(&id);
@@ -2013,6 +2073,7 @@ impl App {
             }
         }
         self.refresh_list();
+        self.show_task();
     }
 
     /// What a conversation that is not open said: only its state and
@@ -2020,7 +2081,7 @@ impl App {
     pub fn background(&mut self, id: &Id, update: &Update, now: u64) {
         match update {
             Update::Up(Up::Event(event)) => {
-                self.heard_process(id, &event.kind);
+                self.heard_process(id, event.seq, &event.kind);
             }
             // Its log, replayed next, counts them again; a failed process
             // took them with it.
@@ -2111,9 +2172,11 @@ impl App {
                 interrupted,
                 paused,
                 prefix,
+                last,
                 ..
             }) => {
                 self.clear_transcript();
+                self.replaying_to = last;
                 // Its log, replayed next, counts its processes again.
                 if let Some(id) = self.active.clone() {
                     self.processes.remove(&id);
@@ -2135,7 +2198,13 @@ impl App {
                 }
                 self.refresh_list();
             }
-            Update::Up(Up::Event(event)) => self.event(event),
+            Update::Up(Up::Event(event)) => {
+                self.event(event);
+                if self.list_stale && self.last_seq >= self.replaying_to {
+                    self.refresh_list();
+                }
+                self.show_task();
+            }
             // The window hands cards to `ask` and `withdraw`, questions to
             // `question`. The window says what the breaker did.
             Update::Up(
@@ -2219,8 +2288,8 @@ impl App {
         }
         self.last_seq = event.seq;
         if let Some(id) = self.active.clone() {
-            if self.heard_process(&id, &event.kind) {
-                self.refresh_list();
+            if self.heard_process(&id, event.seq, &event.kind) {
+                self.relist();
             }
         }
         // From the end: a turn's records follow its message closely, so a
@@ -2262,7 +2331,7 @@ impl App {
                 if let Some(row) = self.active_row() {
                     row.state = RowState::Running;
                 }
-                self.refresh_list();
+                self.relist();
                 if let Some(index) = message_of(&self.messages, &self.turns, event.seq) {
                     let _ = self
                         .transcript
@@ -2297,7 +2366,7 @@ impl App {
                         row.state = RowState::Idle;
                     }
                 }
-                self.refresh_list();
+                self.relist();
                 let replied = outcome.starts_with("replied");
                 // "no model" is how increment 4's turns ended.
                 let status = if replied {
@@ -2353,7 +2422,7 @@ impl App {
                             row.state = RowState::Idle;
                         }
                     }
-                    self.refresh_list();
+                    self.relist();
                 }
                 if let Some(index) = message_of(&self.messages, &self.turns, started) {
                     let _ = self
@@ -2561,8 +2630,9 @@ impl App {
                     .and_then(|m| m.section("prompt", &prompt, true))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
-                if let Err(e) = pushed {
-                    self.note(format!("the transcript refused a sub-agent: {e}"));
+                match pushed {
+                    Ok(index) => self.messages.push((event.seq, index)),
+                    Err(e) => self.note(format!("the transcript refused a sub-agent: {e}")),
                 }
             }
             // A review the person asked for, which the model reads as a
@@ -2750,7 +2820,7 @@ impl App {
                 if let Some(row) = self.active_row() {
                     row.paused = paused;
                 }
-                self.refresh_list();
+                self.relist();
                 self.notice_message(if paused {
                     "paused: messages from other conversations wait, held, until you resume it (C-S-p) or write here"
                 } else {
@@ -3121,6 +3191,7 @@ impl App {
     /// process that ended leaves its conversation selected; else the open
     /// conversation is.
     fn refresh_list(&mut self) {
+        self.list_stale = false;
         let kept = self
             .list
             .selected()
@@ -3197,6 +3268,11 @@ impl App {
                     continue;
                 };
                 let running = self.processes.get(&row.id).filter(|p| !p.is_empty());
+                let tasks = self
+                    .sub_agents
+                    .get(&row.id)
+                    .filter(|t| !t.starts.is_empty());
+                let under = running.is_some() || tasks.is_some();
                 let item = Item::Conversation(row.id.clone());
                 let open = !self.folded.contains(&item);
                 let conversation = id_of(&item);
@@ -3204,8 +3280,8 @@ impl App {
                     id: conversation,
                     parent: Some(parent),
                     depth: 1,
-                    children: running.is_some(),
-                    expanded: open && running.is_some(),
+                    children: under,
+                    expanded: open && under,
                 });
                 let words = [String::new(), workspace_label(row.workspace.as_ref())];
                 labels.insert(conversation, (words, Some(at)));
@@ -3231,6 +3307,45 @@ impl App {
                     labels.insert(process, (words, None));
                     items.insert(process, item);
                 }
+                let starts = tasks.map(|t| &t.starts);
+                let listed = starts.into_iter().flat_map(|s| s.values().rev());
+                for start in listed.take(MAX_SUB_AGENT_ROWS) {
+                    let item = Item::SubAgent(row.id.clone(), start.seq);
+                    let task = id_of(&item);
+                    tree.push(TreeRow {
+                        id: task,
+                        parent: Some(conversation),
+                        depth: 2,
+                        children: false,
+                        expanded: false,
+                    });
+                    let words = [
+                        crate::tools::visible(&format!("{}: {}", start.agent, start.prompt)),
+                        String::new(),
+                    ];
+                    labels.insert(task, (words, None));
+                    items.insert(task, item);
+                }
+                let more = starts
+                    .map_or(0, BTreeMap::len)
+                    .saturating_sub(MAX_SUB_AGENT_ROWS);
+                if more > 0 {
+                    let item = Item::Earlier(row.id.clone());
+                    let earlier = id_of(&item);
+                    tree.push(TreeRow {
+                        id: earlier,
+                        parent: Some(conversation),
+                        depth: 2,
+                        children: false,
+                        expanded: false,
+                    });
+                    let words = [
+                        format!("{more} earlier sub-agent(s), in its log"),
+                        String::new(),
+                    ];
+                    labels.insert(earlier, (words, None));
+                    items.insert(earlier, item);
+                }
             }
         }
         // The items and the drawn rows change together, or not at all: a
@@ -3251,13 +3366,24 @@ impl App {
             .and_then(|kept| {
                 self.listed(&kept).or_else(|| match kept {
                     // A process that ended leaves its conversation selected.
-                    Item::Process(id, _) => self.listed(&Item::Conversation(id)),
+                    Item::Process(id, _) | Item::SubAgent(id, _) | Item::Earlier(id) => {
+                        self.listed(&Item::Conversation(id))
+                    }
                     _ => None,
                 })
             })
             .or_else(|| self.shown_active());
         self.list.select(selected, true);
         self.touch();
+    }
+
+    /// The list rebuilt, or, while a log is replayed, once it has been.
+    fn relist(&mut self) {
+        if self.last_seq < self.replaying_to {
+            self.list_stale = true;
+        } else {
+            self.refresh_list();
+        }
     }
 
     /// The list's id of `item`, when the list shows it.
@@ -3281,8 +3407,9 @@ impl App {
     }
 
     /// The list's row `id` activated: a way to start a conversation
-    /// starts one, a conversation opens, and a background process's
-    /// output shows.
+    /// starts one, a conversation opens, a background process's output
+    /// shows, and a sub-agent's conversation opens at its start, or,
+    /// for those past the list's, at its end.
     fn activate(&mut self, id: usize) {
         match self.items.get(&id).cloned() {
             Some(Item::Process(id, number)) => {
@@ -3290,6 +3417,8 @@ impl App {
                 self.requests.push(Request::Output { id, number });
             }
             Some(Item::Conversation(id)) => self.open(id),
+            Some(Item::SubAgent(id, seq)) => self.open_sub_agent(id, seq),
+            Some(Item::Earlier(id)) => self.open(id),
             Some(Item::Group(group)) => self.start_in(group),
             None => {}
         }
@@ -3353,6 +3482,53 @@ impl App {
             self.composing = false;
         }
         self.touch();
+    }
+
+    /// Opens sub-agent `seq`'s conversation `id`, its transcript then
+    /// showing the sub-agent's start, the sub-agent's row kept selected:
+    /// at once when the transcript has it, else once the log brings it.
+    fn open_sub_agent(&mut self, id: Id, seq: u64) {
+        let item = Item::SubAgent(id.clone(), seq);
+        self.open(id.clone());
+        // Refused, it said why and selected the open conversation.
+        if self.active.as_ref() != Some(&id) {
+            return;
+        }
+        self.focus_task = Some((id, seq));
+        self.show_task();
+        self.list.select(self.listed(&item), true);
+        self.touch();
+    }
+
+    /// The sub-agent start the transcript is to show, shown once the log
+    /// has been replayed, so the messages after it do not take the view
+    /// on; one its log brought but the transcript no longer holds is said
+    /// to be so.
+    fn show_task(&mut self) {
+        let Some((id, seq)) = self.focus_task.clone() else {
+            return;
+        };
+        if self.active.as_ref() != Some(&id) {
+            self.focus_task = None;
+            return;
+        }
+        if self.last_seq < self.replaying_to {
+            return;
+        }
+        match self.messages.iter().find(|(s, _)| *s == seq) {
+            Some(&(_, index)) => {
+                self.focus_task = None;
+                self.transcript.focus_on(index);
+                self.touch();
+            }
+            None if self.last_seq >= seq => {
+                self.focus_task = None;
+                self.note(
+                    "the transcript no longer shows that sub-agent's start; the log keeps it",
+                );
+            }
+            None => {}
+        }
     }
 
     /// The open conversation's row in the list, when it shows it.
@@ -4142,10 +4318,32 @@ impl App {
         }
     }
 
-    /// What conversation `id`'s event `kind` says of its background
-    /// processes: one started, or one ended.
-    fn heard_process(&mut self, id: &Id, kind: &Kind) -> bool {
+    /// What conversation `id`'s event `seq`, `kind`, says of the rows
+    /// under it: a background process started or ended, or a sub-agent
+    /// started or its result heard.
+    fn heard_process(&mut self, id: &Id, seq: u64, kind: &Kind) -> bool {
         match kind {
+            Kind::Task {
+                call,
+                agent,
+                prompt,
+                ..
+            } => {
+                if !self.rows.iter().any(|row| &row.id == id) {
+                    return false;
+                }
+                let known = self.sub_agents.entry(id.clone()).or_default();
+                known
+                    .starts
+                    .entry(seq)
+                    .or_insert_with(|| crate::store::task_start(seq, *call, agent, prompt));
+                known.running.insert(*call);
+                true
+            }
+            Kind::ToolResult { call, .. } => self
+                .sub_agents
+                .get_mut(id)
+                .is_some_and(|known| known.running.remove(call)),
             Kind::Process {
                 number, command, ..
             } => {
@@ -4409,8 +4607,8 @@ impl App {
         }
     }
 
-    /// A right press: over a conversation's row, that row's menu at the
-    /// pointer; anywhere else, nothing.
+    /// A right press: over a conversation's or a background process's
+    /// row, that row's menu at the pointer; anywhere else, nothing.
     fn context(&mut self, x: i64, y: i64) {
         // An open modal or menu has taken the press before this.
         if self.modal() || self.menu.is_open() {
@@ -4436,10 +4634,12 @@ impl App {
             return;
         }
         let selected = match self.focus {
-            Focus::List => self
-                .list
-                .selected()
-                .filter(|id| !matches!(self.items.get(id), Some(Item::Group(_)))),
+            Focus::List => self.list.selected().filter(|id| {
+                !matches!(
+                    self.items.get(id),
+                    Some(Item::Group(_) | Item::SubAgent(..) | Item::Earlier(_))
+                )
+            }),
             _ => None,
         };
         let Some(index) = selected.or_else(|| self.shown_active()) else {
@@ -5849,6 +6049,31 @@ impl App {
             Item::Process(..) => match column {
                 0 => first.as_str(),
                 1 => "running",
+                _ => "",
+            },
+            // Running while its result is not heard and its conversation's
+            // turn runs: a turn its process left open is over.
+            Item::Earlier(_) => match column {
+                0 => first.as_str(),
+                _ => "",
+            },
+            Item::SubAgent(id, seq) => match column {
+                0 => first.as_str(),
+                1 => {
+                    let running = self.sub_agents.get(id).is_some_and(|t| {
+                        t.starts
+                            .get(seq)
+                            .is_some_and(|start| t.running.contains(&start.call))
+                    }) && self
+                        .rows
+                        .iter()
+                        .any(|r| &r.id == id && r.state == RowState::Running);
+                    if running {
+                        "running"
+                    } else {
+                        ""
+                    }
+                }
                 _ => "",
             },
             Item::Conversation(id) => {
@@ -8524,6 +8749,224 @@ pub mod tests {
         assert!(app.listed(&p).is_none());
         key(&mut app, "Right");
         assert!(app.listed(&p).is_some());
+    }
+
+    /// A sub-agent's `Task` event, as conversation `seq` logs it.
+    fn task(seq: u64, call: u64, prompt: &str) -> Event {
+        Event {
+            seq,
+            time: 0,
+            kind: Kind::Task {
+                call,
+                agent: "explore".into(),
+                model: "m".into(),
+                prefix: "p".into(),
+                prompt: prompt.into(),
+            },
+        }
+    }
+
+    /// A conversation's sub-agents are rows under it (DESIGN.md §4): heard
+    /// as they start, running while their result is not and the turn
+    /// runs, the most recent first; those read from its log merged with
+    /// those heard, none twice; a deleted conversation's let go.
+    #[test]
+    fn sub_agents_are_rows_under_their_conversation() {
+        let mut app = app();
+        let started = Kind::Started {
+            effect: crate::store::Effect::Turn,
+            of: 1,
+        };
+        app.background(&id(3), &at(4, started), 0);
+        app.background(
+            &id(3),
+            &Update::Up(Up::Event(task(6, 5, "find it\nmore"))),
+            0,
+        );
+        let sub = Item::SubAgent(id(3), 6);
+        let row = app.listed(&sub).unwrap();
+        let three = app.listed(&Item::Conversation(id(3))).unwrap();
+        let rows = app.list.model().rows();
+        let r = rows.iter().find(|r| r.id == row).unwrap();
+        assert_eq!((r.depth, r.parent), (2, Some(three)));
+        assert_eq!(app.cell(row, 0).text(), "explore: find it");
+        assert_eq!(app.cell(row, 1).text(), "running");
+        let result = Kind::ToolResult {
+            reply: 4,
+            id: "t".into(),
+            name: "task".into(),
+            call: 5,
+            content: "found".into(),
+            error: false,
+            kept: None,
+            digest: None,
+            digests: Vec::new(),
+        };
+        app.background(&id(3), &at(7, result), 0);
+        assert_eq!(app.cell(row, 1).text(), "");
+        // Read from the log: the one heard is not listed twice, nor said
+        // to run again; an older one is listed below it.
+        app.set_sub_agents(vec![(
+            id(3),
+            vec![
+                crate::store::task_start(2, 1, "general", "older"),
+                crate::store::task_start(6, 5, "explore", "find it"),
+            ],
+        )]);
+        let labels: Vec<String> = tree(&app)
+            .into_iter()
+            .filter(|(depth, _)| *depth == 2)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(labels, ["explore: find it", "general: older"]);
+        assert_eq!(app.listed(&sub), Some(row), "its id is kept");
+        // Folded with the conversation's processes.
+        key(&mut app, "F6");
+        app.list.select(Some(three), true);
+        key(&mut app, "Left");
+        assert!(app.listed(&sub).is_none());
+        key(&mut app, "Right");
+        app.remove_row(&id(3));
+        app.set_sub_agents(vec![(
+            id(3),
+            vec![crate::store::task_start(2, 1, "general", "older")],
+        )]);
+        assert!(app.listed(&Item::SubAgent(id(3), 2)).is_none());
+    }
+
+    /// While the open conversation's process replays its log, the list is
+    /// rebuilt once, at the `last` event its `Hello` named: a sub-agent
+    /// started in the log is listed then, not before.
+    #[test]
+    fn a_replay_rebuilds_the_list_at_its_end() {
+        let mut app = app();
+        press_row(&mut app, &Item::Conversation(id(2)), 60);
+        app.update(
+            Update::Up(Up::Hello {
+                title: "t".into(),
+                torn: None,
+                interrupted: vec![],
+                paused: false,
+                prefix: Some(String::new()),
+                last: 4,
+            }),
+            0,
+        );
+        let sub = Item::SubAgent(id(2), 3);
+        app.update(at(3, task(3, 2, "find it").kind), 0);
+        assert!(app.listed(&sub).is_none(), "not until the replay ends");
+        let note = Kind::Notification {
+            text: "n".into(),
+            mcp: false,
+        };
+        app.update(at(4, note), 0);
+        assert!(app.listed(&sub).is_some());
+    }
+
+    /// A conversation shows its 20 most recent sub-agents, then one row
+    /// for those its log keeps besides, which opens the conversation.
+    #[test]
+    fn past_twenty_sub_agents_are_one_row() {
+        let mut app = app();
+        let starts = (1..=25)
+            .map(|seq| crate::store::task_start(seq, seq, "explore", &format!("task {seq}")))
+            .collect();
+        app.set_sub_agents(vec![(id(2), starts)]);
+        let labels: Vec<String> = tree(&app)
+            .into_iter()
+            .filter(|(depth, _)| *depth == 2)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(labels.len(), 21);
+        assert_eq!(labels[0], "explore: task 25");
+        assert_eq!(labels[19], "explore: task 6");
+        assert_eq!(labels[20], "5 earlier sub-agent(s), in its log");
+        key(&mut app, "F6");
+        app.list.select(app.listed(&Item::Earlier(id(2))), true);
+        key(&mut app, "Return");
+        assert_eq!(app.active(), Some(&id(2)));
+    }
+
+    /// A press on a sub-agent's row opens its conversation, and once its
+    /// log has brought the sub-agent's start the transcript shows it, the
+    /// row still selected; one the transcript no longer holds is said.
+    #[test]
+    fn a_sub_agents_row_opens_its_start() {
+        let mut app = app();
+        app.set_sub_agents(vec![(
+            id(2),
+            vec![crate::store::task_start(3, 2, "explore", "find it")],
+        )]);
+        let sub = Item::SubAgent(id(2), 3);
+        press_row(&mut app, &sub, 60);
+        assert_eq!(app.active(), Some(&id(2)));
+        assert!(app.take_requests().contains(&Request::Open(id(2))));
+        assert_eq!(app.transcript.focused_message(), None);
+        let user = Event {
+            seq: 1,
+            time: 0,
+            kind: Kind::User {
+                delivery: "d1".into(),
+                text: "look".into(),
+            },
+        };
+        // Many messages after it, which do not take the view on.
+        let mut events = vec![user, task(3, 2, "find it")];
+        events.extend((4..60).map(|seq| Event {
+            seq,
+            time: 0,
+            kind: Kind::User {
+                delivery: format!("d{seq}"),
+                text: "later\nlater\nlater".into(),
+            },
+        }));
+        app.replay(Ok(""), events.clone());
+        let in_view = |app: &App| {
+            let shown = app.messages.iter().find(|(seq, _)| *seq == 3).unwrap().1;
+            app.transcript.focused_message() == Some(shown)
+                && app.transcript.shown().any(|(_, line)| {
+                    matches!(line, messages::Shown::Header { message } if message == shown)
+                })
+        };
+        assert!(in_view(&app));
+        assert_eq!(app.list.selected(), app.listed(&sub));
+        // So too when its process replays the log, as one just started.
+        press_row(&mut app, &Item::Conversation(id(1)), 60);
+        press_row(&mut app, &sub, 60);
+        app.update(
+            Update::Up(Up::Hello {
+                title: "t".into(),
+                torn: None,
+                interrupted: vec![],
+                paused: false,
+                prefix: Some(String::new()),
+                last: 59,
+            }),
+            0,
+        );
+        for event in events.clone() {
+            app.update(Update::Up(Up::Event(event)), 0);
+        }
+        assert!(in_view(&app));
+        // A jump asked for one conversation is not made in another opened
+        // first, nor when it is opened again.
+        press_row(&mut app, &Item::Conversation(id(1)), 60);
+        press_row(&mut app, &sub, 60);
+        press_row(&mut app, &Item::Conversation(id(1)), 60);
+        press_row(&mut app, &Item::Conversation(id(2)), 60);
+        app.replay(Ok(""), events);
+        assert_eq!(app.transcript.focused_message(), None);
+        // Opened again with its start gone from the transcript.
+        app.set_sub_agents(vec![(
+            id(2),
+            vec![crate::store::task_start(9, 8, "explore", "gone")],
+        )]);
+        app.replay(Ok(""), vec![task(10, 9, "later")]);
+        press_row(&mut app, &Item::SubAgent(id(2), 9), 60);
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("no longer shows that sub-agent")));
     }
 
     /// The conversations the list shows, in its order.

@@ -310,6 +310,9 @@ pub struct Session {
     quit: bool,
     /// The diagnostics export under way, on a thread of its own.
     export: Option<Receiver<Result<Exported, String>>>,
+    /// The sub-agents each conversation's log records, read at start-up
+    /// on a thread of their own for the list (DESIGN.md §4).
+    tasks: Option<Receiver<TasksRead>>,
     /// Every key this window has held, which the export looks for.
     keys: Vec<Secret>,
     /// Help → Keys was chosen by the live pointer or keyboard: td-ui's
@@ -1265,6 +1268,50 @@ impl Session {
         self.fetched();
         self.exported();
         self.surveyed();
+        self.tasks_read();
+    }
+
+    /// Reads, on a thread of its own, the sub-agents each of `ids`'s
+    /// logs records, for the list (DESIGN.md §4), in the order given.
+    fn read_tasks(&mut self, ids: Vec<Id>) {
+        let state = self.state.clone();
+        let (send, receive) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("td-agent-tasks".into())
+            .spawn(move || {
+                for id in ids {
+                    let read = store::read_tasks(&state, &id);
+                    if send.send((id, read)).is_err() {
+                        return;
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => self.tasks = Some(receive),
+            Err(e) => self.app.note(format!("the list's sub-agents: {e}")),
+        }
+    }
+
+    /// The sub-agents read since the last poll, into the list at once.
+    fn tasks_read(&mut self) {
+        let Some(receive) = self.tasks.as_ref() else {
+            return;
+        };
+        let mut read = Vec::new();
+        loop {
+            match receive.try_recv() {
+                Ok((id, Ok(starts))) => read.push((id, starts)),
+                Ok((id, Err(e))) => eprintln!("td-agent: the sub-agents of {id}: {e}"),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tasks = None;
+                    break;
+                }
+            }
+        }
+        if !read.is_empty() {
+            self.app.set_sub_agents(read);
+        }
     }
 
     /// The configuration file, beside the key file.
@@ -2482,6 +2529,9 @@ fn rows(state: &StateDir) -> (Vec<Row>, Vec<String>) {
     (rows, problems)
 }
 
+/// A conversation's sub-agents as its log was read to have them.
+type TasksRead = (Id, Result<Vec<store::TaskStart>, String>);
+
 /// Runs the window process over the state directory until the window
 /// closes: it takes the window lock, opens the most recently active
 /// conversation when there is one, and serves `control` when given.
@@ -2536,6 +2586,9 @@ pub fn run(
     if let Some(problem) = problems.last() {
         app.note(format!("the store: {problem}"));
     }
+    // The most recently active first, whose sub-agents are read first.
+    let mut ids: Vec<(u64, Id)> = rows.iter().map(|r| (r.activity, r.id.clone())).collect();
+    ids.sort_by(|a, b| b.cmp(a));
     app.set_rows(rows);
     let mut remotes = config.remotes.clone();
     match state.load_admitted().and_then(|urls| {
@@ -2718,6 +2771,7 @@ pub fn run(
         key_path,
         quit: false,
         export: None,
+        tasks: None,
         keys: key.iter().cloned().collect(),
         show_keys: false,
         places,
@@ -2752,6 +2806,7 @@ pub fn run(
         mode: config.mode,
         held: Vec::new(),
     };
+    session.read_tasks(ids.into_iter().map(|(_, id)| id).collect());
     // Before any conversation starts.
     session.repolicy();
     // What removals a crash cut short left (`removal::sweep`).
