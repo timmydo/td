@@ -27,7 +27,7 @@
 //! model picker (`picker`), each modal over the window until it closes;
 //! Help → Keys opens the window's key list.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -313,6 +313,79 @@ impl Row {
             _ if self.archived => "archived",
             RowState::Closed | RowState::Idle if self.paused => "paused",
             state => state.word(),
+        }
+    }
+}
+
+/// What `item`'s fold is kept as: a template's by its name, whether it is
+/// configured or not, so a fold outlasts its template's removal.
+fn fold_key(item: &Item) -> Item {
+    match item {
+        Item::Group(Group::Unlisted(name)) => Item::Group(Group::Template(name.clone())),
+        item => item.clone(),
+    }
+}
+
+/// How soon a second press is a double press, which starts one
+/// conversation, not two.
+const DOUBLE_PRESS: Duration = Duration::from_millis(400);
+
+/// A conversation's workspace as the list's third column names it.
+fn workspace_label(workspace: Option<&Workspace>) -> String {
+    match workspace {
+        None => "none".to_string(),
+        // The folder's own name, which the column has room for; the
+        // deletion question names it whole.
+        Some(Workspace::Directory(path)) => path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        Some(workspace) => workspace.label(),
+    }
+}
+
+/// What one of the list's rows is (DESIGN.md §4): a way to start a
+/// conversation, with those started so under it; a conversation; or one
+/// of its background processes.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Item {
+    Group(Group),
+    Conversation(Id),
+    Process(Id, u64),
+}
+
+/// A top row of the list: what its conversations were started from.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Group {
+    /// The Empty built-in: scratch workspaces.
+    Empty,
+    /// Directory…: a folder of the person's.
+    Directory,
+    /// A configured template.
+    Template(String),
+    /// A template no longer configured that conversations still name.
+    Unlisted(String),
+    /// No workspace: made without the jail, or before workspaces.
+    Bare,
+}
+
+impl Group {
+    /// The group conversation `workspace` is listed under, `templates`
+    /// those configured.
+    fn of(workspace: Option<&Workspace>, templates: &[(String, bool)]) -> Self {
+        let named = |name: &str| {
+            if templates.iter().any(|(t, _)| t == name) {
+                Self::Template(name.to_string())
+            } else {
+                Self::Unlisted(name.to_string())
+            }
+        };
+        match workspace {
+            None => Self::Bare,
+            Some(Workspace::Scratch) => Self::Empty,
+            Some(Workspace::Directory(_)) => Self::Directory,
+            Some(Workspace::Template(name)) => named(name),
+            Some(Workspace::Repositories(r)) => named(&r.template),
         }
     }
 }
@@ -701,8 +774,22 @@ pub struct App {
     networks: crate::config::Client,
     /// td-agent's notes, which the Messages window shows.
     log: crate::notes::Log,
-    /// Each row's workspace as the list's third column names it.
-    labels: Vec<String>,
+    /// What each of the list's rows is, by its id in the list.
+    items: BTreeMap<usize, Item>,
+    /// Each listed item's id, which it keeps while it is listed.
+    item_ids: BTreeMap<Item, usize>,
+    /// The last id given an item.
+    next_item: usize,
+    /// Each row's own words, its first column's, for a row that is not a
+    /// conversation, and its third, the workspace a conversation is in;
+    /// and a conversation's place in `rows` when the list was built.
+    item_labels: BTreeMap<usize, ([String; 2], Option<usize>)>,
+    /// When a group last started a conversation, and which.
+    started_in: Option<(Instant, Group)>,
+    /// A conversation started since, its composer focused.
+    composing: bool,
+    /// The groups and conversations whose rows below are folded away.
+    folded: BTreeSet<Item>,
     /// Whether the list shows archived conversations.
     show_archived: bool,
     /// Whether the transcript shows each tool call and result, rather
@@ -821,14 +908,6 @@ pub struct App {
     /// Each conversation's background processes running, as its events
     /// say, by number with its command (DESIGN.md §12).
     processes: BTreeMap<Id, Vec<(u64, String)>>,
-    /// The list's process rows, after its conversations: the row at
-    /// `rows.len() + n` is the `n`th here.
-    process_items: Vec<(Id, u64)>,
-    /// Each process row's label: its number and command.
-    process_labels: Vec<String>,
-    /// The id of the list's first process row: `rows.len()` when the list
-    /// was last built, which a change to `rows` before its rebuild keeps.
-    process_base: usize,
     credit: Option<String>,
     today: Option<u64>,
     limits: cost::Limits,
@@ -905,7 +984,13 @@ impl App {
             without_jev: false,
             networks: crate::config::Client::default(),
             log: crate::notes::Log::default(),
-            labels: Vec::new(),
+            items: BTreeMap::new(),
+            item_ids: BTreeMap::new(),
+            next_item: 0,
+            item_labels: BTreeMap::new(),
+            started_in: None,
+            composing: false,
+            folded: BTreeSet::new(),
             show_archived: false,
             show_activity: false,
             queued: Vec::new(),
@@ -956,9 +1041,6 @@ impl App {
             menu_row: None,
             menu_process: None,
             processes: BTreeMap::new(),
-            process_items: Vec::new(),
-            process_labels: Vec::new(),
-            process_base: 0,
             credit: None,
             today: None,
             limits: cost::Limits {
@@ -1308,15 +1390,24 @@ impl App {
         self.chooser_start = folder;
     }
 
+    /// A conversation just started: its composer takes the focus, for its
+    /// first message (DESIGN.md §4).
+    pub fn focus_composer(&mut self) {
+        self.composing = true;
+        self.set_focus(Focus::Composer);
+    }
+
     /// Why no workspace can be made, or none when they can.
     pub fn set_no_workspaces(&mut self, why: Option<String>) {
         self.no_workspaces = why;
+        self.refresh_list();
     }
 
     /// The configured templates, each a name and whether it names
     /// repositories.
     pub fn set_templates(&mut self, templates: Vec<(String, bool)>) {
         self.templates = templates;
+        self.refresh_list();
     }
 
     /// The templates made in the window, by name, which Edit template…
@@ -1669,6 +1760,11 @@ impl App {
             {
                 row.state = RowState::Closed;
             }
+        }
+        // The conversation opened shows in the list, its group unfolded.
+        if let Some(row) = self.rows.iter().find(|r| r.id == id) {
+            let group = Group::of(row.workspace.as_ref(), &self.templates);
+            self.folded.remove(&fold_key(&Item::Group(group)));
         }
         self.active = Some(id);
         self.clear_transcript();
@@ -3011,93 +3107,152 @@ impl App {
         Ok(streaming.index)
     }
 
-    /// Orders the rows, the most recently active first, and gives the
-    /// list a model of them. The selected row stays selected while it is
-    /// shown, so an update does not move the keyboard's place; else the
-    /// open conversation is.
+    /// Builds the list's tree (DESIGN.md §4): the ways to start a
+    /// conversation at the top, Empty, Directory… and each template in
+    /// its configured order, then any template no longer configured that
+    /// a conversation names, and conversations with no workspace; under
+    /// each, its conversations, the most recently active first; under
+    /// each conversation, its background processes. Without the jail only
+    /// the groups conversations are in are listed, with no workspace
+    /// last. A folded row keeps what is under it out of view. Each item
+    /// keeps its id while it is listed, so the view stays where it was as
+    /// rows come and go above it. The selected row stays selected while
+    /// it is shown, so an update does not move the keyboard's place; a
+    /// process that ended leaves its conversation selected; else the open
+    /// conversation is.
     fn refresh_list(&mut self) {
-        let kept_process = self
-            .list
-            .selected()
-            .and_then(|index| self.process_item(index))
-            .cloned();
         let kept = self
             .list
             .selected()
-            .filter(|index| *index < self.process_base)
-            .and_then(|index| self.rows.get(index))
-            .map(|row| row.id.clone());
+            .and_then(|id| self.items.get(&id))
+            .cloned();
         self.rows
             .sort_by(|a, b| b.activity.cmp(&a.activity).then(a.id.cmp(&b.id)));
-        self.labels = self
-            .rows
-            .iter()
-            .map(|row| match &row.workspace {
-                None => "none".to_string(),
-                // The folder's own name, which the column has room for;
-                // the deletion question names it whole.
-                Some(Workspace::Directory(path)) => path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                ),
-                Some(workspace) => workspace.label(),
-            })
-            .collect();
+        // Folds of conversations since deleted are let go.
+        let ids: BTreeSet<&Id> = self.rows.iter().map(|row| &row.id).collect();
+        self.folded
+            .retain(|item| !matches!(item, Item::Conversation(id) if !ids.contains(id)));
         let show = self.show_archived;
-        // Each conversation's background processes under it, always shown.
-        let mut tree: Vec<TreeRow<usize>> = Vec::new();
-        let mut items: Vec<(Id, u64)> = Vec::new();
-        let mut labels: Vec<String> = Vec::new();
-        for (index, row) in self.rows.iter().enumerate() {
-            if !show && row.archived {
-                continue;
-            }
-            let running = self.processes.get(&row.id).filter(|p| !p.is_empty());
-            tree.push(TreeRow {
-                id: index,
-                parent: None,
-                depth: 0,
-                children: running.is_some(),
-                expanded: running.is_some(),
-            });
-            for (number, command) in running.into_iter().flatten() {
-                let cut: String = command.chars().take(MAX_PROCESS_LABEL).collect();
-                labels.push(format!("p{number} {}", crate::tools::visible(&cut)));
-                tree.push(TreeRow {
-                    id: self.rows.len() + items.len(),
-                    parent: Some(index),
-                    depth: 1,
-                    children: false,
-                    expanded: false,
-                });
-                items.push((row.id.clone(), *number));
+        // Each shown conversation's group, once.
+        let mut under: BTreeMap<Group, Vec<usize>> = BTreeMap::new();
+        for (at, row) in self.rows.iter().enumerate() {
+            if show || !row.archived {
+                let group = Group::of(row.workspace.as_ref(), &self.templates);
+                under.entry(group).or_default().push(at);
             }
         }
-        self.process_items = items;
-        self.process_labels = labels;
-        self.process_base = self.rows.len();
+        let mut groups: Vec<Group> = vec![Group::Empty, Group::Directory];
+        groups.extend(
+            self.templates
+                .iter()
+                .map(|(name, _)| Group::Template(name.clone())),
+        );
+        // Without the jail none starts, so only those with conversations.
+        let jailless = self.no_workspaces.is_some();
+        if jailless {
+            groups.retain(|group| under.contains_key(group));
+        }
+        groups.extend(
+            under
+                .keys()
+                .filter(|group| matches!(group, Group::Unlisted(_)))
+                .cloned(),
+        );
+        if jailless || under.contains_key(&Group::Bare) {
+            groups.push(Group::Bare);
+        }
+        let mut next = self.next_item;
+        let known = &self.item_ids;
+        let mut ids: BTreeMap<Item, usize> = BTreeMap::new();
+        let mut id_of = |item: &Item| {
+            let id = known.get(item).copied().unwrap_or_else(|| {
+                next = next.wrapping_add(1);
+                next
+            });
+            ids.insert(item.clone(), id);
+            id
+        };
+        let mut tree: Vec<TreeRow<usize>> = Vec::new();
+        let mut items: BTreeMap<usize, Item> = BTreeMap::new();
+        let mut labels: BTreeMap<usize, ([String; 2], Option<usize>)> = BTreeMap::new();
+        for group in groups {
+            let conversations = under.get(&group).map_or(&[][..], Vec::as_slice);
+            let item = Item::Group(group.clone());
+            let open = !self.folded.contains(&fold_key(&item));
+            let parent = id_of(&item);
+            tree.push(TreeRow {
+                id: parent,
+                parent: None,
+                depth: 0,
+                children: !conversations.is_empty(),
+                expanded: open && !conversations.is_empty(),
+            });
+            labels.insert(parent, (self.group_labels(&group), None));
+            items.insert(parent, item);
+            if !open {
+                continue;
+            }
+            for &at in conversations {
+                let Some(row) = self.rows.get(at) else {
+                    continue;
+                };
+                let running = self.processes.get(&row.id).filter(|p| !p.is_empty());
+                let item = Item::Conversation(row.id.clone());
+                let open = !self.folded.contains(&item);
+                let conversation = id_of(&item);
+                tree.push(TreeRow {
+                    id: conversation,
+                    parent: Some(parent),
+                    depth: 1,
+                    children: running.is_some(),
+                    expanded: open && running.is_some(),
+                });
+                let words = [String::new(), workspace_label(row.workspace.as_ref())];
+                labels.insert(conversation, (words, Some(at)));
+                items.insert(conversation, item);
+                if !open {
+                    continue;
+                }
+                for (number, command) in running.into_iter().flatten() {
+                    let cut: String = command.chars().take(MAX_PROCESS_LABEL).collect();
+                    let item = Item::Process(row.id.clone(), *number);
+                    let process = id_of(&item);
+                    tree.push(TreeRow {
+                        id: process,
+                        parent: Some(conversation),
+                        depth: 2,
+                        children: false,
+                        expanded: false,
+                    });
+                    let words = [
+                        format!("p{number} {}", crate::tools::visible(&cut)),
+                        String::new(),
+                    ];
+                    labels.insert(process, (words, None));
+                    items.insert(process, item);
+                }
+            }
+        }
+        // The items and the drawn rows change together, or not at all: a
+        // tree refused leaves both, and the ids, as they were.
         match Model::new(&tree, COLUMNS) {
             Ok(model) => {
+                self.items = items;
+                self.item_labels = labels;
+                self.item_ids = ids;
+                self.next_item = next;
                 if let Err(e) = self.list.replace(model) {
                     self.note(format!("the list: {e}"));
                 }
             }
             Err(e) => self.note(format!("the list: {e}")),
         }
-        let selected = kept_process
-            .as_ref()
+        let selected = kept
             .and_then(|kept| {
-                self.process_items
-                    .iter()
-                    .position(|item| item == kept)
-                    .map(|n| self.process_base + n)
-            })
-            // A process that ended leaves its conversation selected.
-            .or_else(|| {
-                kept.or(kept_process.map(|(id, _)| id)).and_then(|id| {
-                    self.rows
-                        .iter()
-                        .position(|r| r.id == id && (show || !r.archived))
+                self.listed(&kept).or_else(|| match kept {
+                    // A process that ended leaves its conversation selected.
+                    Item::Process(id, _) => self.listed(&Item::Conversation(id)),
+                    _ => None,
                 })
             })
             .or_else(|| self.shown_active());
@@ -3105,26 +3260,126 @@ impl App {
         self.touch();
     }
 
-    /// The list's row `index` activated: its conversation opened, or its
-    /// background process's output shown.
-    fn activate(&mut self, index: usize) {
-        if let Some((id, number)) = self.process_item(index).cloned() {
-            self.cancel_pointer();
-            return self.requests.push(Request::Output { id, number });
-        }
-        if let Some(row) = self.rows.get(index) {
-            let id = row.id.clone();
-            self.open(id);
+    /// The list's id of `item`, when the list shows it.
+    fn listed(&self, item: &Item) -> Option<usize> {
+        self.item_ids.get(item).copied()
+    }
+
+    /// The words of group `group`'s row: its name, and what it starts.
+    fn group_labels(&self, group: &Group) -> [String; 2] {
+        let (name, what) = match group {
+            Group::Empty => (crate::config::EMPTY.to_string(), "scratch"),
+            Group::Directory => (crate::config::DIRECTORY.to_string(), "folder"),
+            Group::Template(name) => {
+                let repos = self.templates.iter().any(|(t, repos)| t == name && *repos);
+                (name.clone(), if repos { "repositories" } else { "scratch" })
+            }
+            Group::Unlisted(name) => (format!("{name} (not configured)"), ""),
+            Group::Bare => ("No workspace".to_string(), ""),
+        };
+        [crate::tools::visible(&name), what.to_string()]
+    }
+
+    /// The list's row `id` activated: a way to start a conversation
+    /// starts one, a conversation opens, and a background process's
+    /// output shows.
+    fn activate(&mut self, id: usize) {
+        match self.items.get(&id).cloned() {
+            Some(Item::Process(id, number)) => {
+                self.cancel_pointer();
+                self.requests.push(Request::Output { id, number });
+            }
+            Some(Item::Conversation(id)) => self.open(id),
+            Some(Item::Group(group)) => self.start_in(group),
+            None => {}
         }
     }
 
-    /// The open conversation's index in `rows`, when the list shows it.
+    /// A conversation started from group `group`'s row (DESIGN.md §4): at
+    /// once, the composer then focused to write its first message, but
+    /// for Directory…, which asks for the folder first; a template no
+    /// longer configured, and any group while the jail cannot run but no
+    /// workspace, or no workspace while it can, start none and say why.
+    /// The same group's again within a double press's time is the same
+    /// start, so a double press makes one.
+    fn start_in(&mut self, group: Group) {
+        self.cancel_pointer();
+        let now = Instant::now();
+        if self
+            .started_in
+            .as_ref()
+            .is_some_and(|(at, of)| *of == group && now.duration_since(*at) <= DOUBLE_PRESS)
+        {
+            // Its press took the focus and the selection back to the list.
+            if self.composing {
+                self.list.select(self.shown_active(), false);
+                self.set_focus(Focus::Composer);
+            }
+            return;
+        }
+        let again = group.clone();
+        let started = match (&self.no_workspaces, group) {
+            (Some(_), Group::Bare) => Some(Request::New),
+            (Some(why), _) => {
+                let why = why.clone();
+                self.note(format!(
+                    "no workspace can be made, so only a conversation with none starts: {why}"
+                ));
+                None
+            }
+            (None, Group::Empty) => Some(Request::NewScratch),
+            (None, Group::Directory) => {
+                self.open_chooser();
+                None
+            }
+            (None, Group::Template(name)) => Some(Request::NewFrom(name)),
+            (None, Group::Unlisted(name)) => {
+                self.note(format!(
+                    "template {} is no longer configured, so nothing starts from it; its conversations are kept",
+                    crate::tools::visible(&name)
+                ));
+                None
+            }
+            (None, Group::Bare) => {
+                self.note(
+                    "a conversation with no workspace starts only when the jail cannot run; start one from a template",
+                );
+                None
+            }
+        };
+        if let Some(request) = started {
+            self.requests.push(request);
+            self.started_in = Some((now, again));
+            self.composing = false;
+        }
+        self.touch();
+    }
+
+    /// The open conversation's row in the list, when it shows it.
     fn shown_active(&self) -> Option<usize> {
-        self.active.as_ref().and_then(|id| {
-            self.rows
-                .iter()
-                .position(|r| &r.id == id && (self.show_archived || !r.archived))
-        })
+        let id = self.active.as_ref()?;
+        self.listed(&Item::Conversation(id.clone()))
+    }
+
+    /// The conversation of the list's row `id`, when it is one.
+    fn conversation_at(&self, id: usize) -> Option<Id> {
+        match self.items.get(&id) {
+            Some(Item::Conversation(id)) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Folds away what is under the list's row `id`, or shows it again.
+    fn fold(&mut self, id: usize, expanded: bool) {
+        let Some(item) = self.items.get(&id).map(fold_key) else {
+            return;
+        };
+        if expanded {
+            self.folded.remove(&item);
+        } else {
+            self.folded.insert(item);
+        }
+        self.refresh_list();
     }
 
     // --- input ------------------------------------------------------
@@ -3880,9 +4135,11 @@ impl App {
     }
 
     /// The list's process row `index`: its conversation and number.
-    fn process_item(&self, index: usize) -> Option<&(Id, u64)> {
-        self.process_items
-            .get(index.checked_sub(self.process_base)?)
+    fn process_item(&self, index: usize) -> Option<(Id, u64)> {
+        match self.items.get(&index) {
+            Some(Item::Process(id, number)) => Some((id.clone(), *number)),
+            _ => None,
+        }
     }
 
     /// What conversation `id`'s event `kind` says of its background
@@ -4162,10 +4419,10 @@ impl App {
         let Some(tree_table::Target::Row(index)) = self.list.target(x, y) else {
             return;
         };
-        if let Some((id, number)) = self.process_item(index).cloned() {
+        if let Some((id, number)) = self.process_item(index) {
             return self.open_process_menu(id, number, x, y);
         }
-        if let Some(id) = self.rows.get(index).map(|r| r.id.clone()) {
+        if let Some(id) = self.conversation_at(index) {
             self.open_row_menu(id, x, y);
         }
     }
@@ -4179,7 +4436,10 @@ impl App {
             return;
         }
         let selected = match self.focus {
-            Focus::List => self.list.selected(),
+            Focus::List => self
+                .list
+                .selected()
+                .filter(|id| !matches!(self.items.get(id), Some(Item::Group(_)))),
             _ => None,
         };
         let Some(index) = selected.or_else(|| self.shown_active()) else {
@@ -4195,10 +4455,10 @@ impl App {
             .and_then(|at| self.list.geometry()?.row(at))
             .map(|rect| (rect.x, rect.y.saturating_add(i64::from(rect.height))));
         let (x, y) = under.unwrap_or((regions.list.x, regions.list.y));
-        if let Some((id, number)) = self.process_item(index).cloned() {
+        if let Some((id, number)) = self.process_item(index) {
             return self.open_process_menu(id, number, x, y);
         }
-        let Some(id) = self.rows.get(index).map(|r| r.id.clone()) else {
+        let Some(id) = self.conversation_at(index) else {
             return;
         };
         self.open_row_menu(id, x, y);
@@ -5390,6 +5650,7 @@ impl App {
                     repeated: repeat,
                 }) {
                     tree_table::Outcome::Activate(index) => self.activate(index),
+                    tree_table::Outcome::Disclosure { id, expanded } => self.fold(id, expanded),
                     tree_table::Outcome::Ignored => {}
                     _ => self.touch(),
                 }
@@ -5532,6 +5793,7 @@ impl App {
                     {
                         self.touch()
                     }
+                    tree_table::Outcome::Disclosure { id, expanded } => self.fold(id, expanded),
                     tree_table::Outcome::Selected(index) | tree_table::Outcome::Activate(index) => {
                         self.activate(index)
                     }
@@ -5571,30 +5833,44 @@ impl App {
 
     // --- drawing ----------------------------------------------------
 
-    /// A conversation's cell in the list.
+    /// A cell of the list's row `index`.
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
-        if let Some(label) = index
-            .checked_sub(self.process_base)
-            .and_then(|n| self.process_labels.get(n))
-        {
-            let text = match column {
-                0 => label.as_str(),
-                1 => "running",
-                _ => "",
-            };
-            return Cell::new(text).unwrap_or_else(|_| Cell::empty());
-        }
-        let Some(row) = self.rows.get(index) else {
+        let (Some(item), Some(([first, third], at))) =
+            (self.items.get(&index), self.item_labels.get(&index))
+        else {
             return Cell::empty();
         };
-        let text = match column {
-            0 => row.title.as_str(),
-            1 if self.removals.iter().any(|(of, _, _, _)| of == &row.id) => ASKS,
-            1 if self.closing(&row.id) => self.closing_word(&row.id).unwrap_or_default(),
-            1 if self.cards.iter().any(|c| c.conversation == row.id) => ASKS,
-            1 if self.questions.iter().any(|q| q.conversation == row.id) => ASKS,
-            1 => row.word(),
-            _ => self.labels.get(index).map_or("", String::as_str),
+        let text = match item {
+            Item::Group(_) => match column {
+                0 => first.as_str(),
+                1 => "",
+                _ => third.as_str(),
+            },
+            Item::Process(..) => match column {
+                0 => first.as_str(),
+                1 => "running",
+                _ => "",
+            },
+            Item::Conversation(id) => {
+                // Where it was when the list was built, unless `rows` has
+                // changed since.
+                let row = at
+                    .and_then(|at| self.rows.get(at))
+                    .filter(|row| &row.id == id)
+                    .or_else(|| self.rows.iter().find(|row| &row.id == id));
+                let Some(row) = row else {
+                    return Cell::empty();
+                };
+                match column {
+                    0 => row.title.as_str(),
+                    1 if self.removals.iter().any(|(of, _, _, _)| of == id) => ASKS,
+                    1 if self.closing(id) => self.closing_word(id).unwrap_or_default(),
+                    1 if self.cards.iter().any(|c| &c.conversation == id) => ASKS,
+                    1 if self.questions.iter().any(|q| &q.conversation == id) => ASKS,
+                    1 => row.word(),
+                    _ => third.as_str(),
+                }
+            }
         };
         Cell::new(text).unwrap_or_else(|_| Cell::empty())
     }
@@ -6358,14 +6634,13 @@ pub mod tests {
     #[test]
     fn a_click_on_a_row_opens_it() {
         let mut app = app();
-        let list = app.regions.unwrap().list;
-        // The header's row, then the first, second and third conversation.
-        let y = list.y + (ROW as i64) * 2 + 4;
+        // The third conversation's row, under its group.
+        let (x, y) = row_at(&app, 3);
         for phase in [PointerPhase::Press, PointerPhase::Release] {
             app.input(
                 Input::Pointer {
                     phase,
-                    x: list.x + 20,
+                    x,
                     y,
                     extend: false,
                     follow: false,
@@ -7154,7 +7429,7 @@ pub mod tests {
             options: Vec::new(),
         });
         let says = |app: &App, of: u8| {
-            let at = app.rows().iter().position(|r| r.id == id(of)).unwrap();
+            let at = row_of(app, &Item::Conversation(id(of)));
             app.cell(at, 1).text().to_string()
         };
         assert_eq!(says(&app, 3), ASKS);
@@ -7946,7 +8221,7 @@ pub mod tests {
 
     /// Where conversation `n`'s row is drawn in the list.
     fn row_at(app: &App, n: u8) -> (i64, i64) {
-        let index = app.rows().iter().position(|r| r.id == id(n)).unwrap();
+        let index = row_of(app, &Item::Conversation(id(n)));
         let at = app.list.model().find(index).unwrap();
         let rect = app.list.geometry().unwrap().row(at).unwrap();
         (rect.x + 8, rect.y + 4)
@@ -7956,14 +8231,314 @@ pub mod tests {
         app.input(Input::Context { x, y }, &mut NoClipboard);
     }
 
+    /// The list's rows as depth and first column, in order.
+    fn tree(app: &App) -> Vec<(u16, String)> {
+        app.list
+            .model()
+            .rows()
+            .iter()
+            .map(|r| (r.depth, app.cell(r.id, 0).text().to_string()))
+            .collect()
+    }
+
+    /// The list is a tree of what conversations start from (DESIGN.md
+    /// §4): Empty, Directory… and each template in its configured order,
+    /// then a template no longer configured that a conversation names,
+    /// then no workspace; each conversation under its own, the most
+    /// recently active first; a group a press on starts one.
+    #[test]
+    fn the_list_is_a_tree_of_what_conversations_start_from() {
+        let mut app = app();
+        app.set_templates(vec![("notes".into(), false), ("td".into(), true)]);
+        let mut template = |n: u8, activity: u64, workspace: Workspace| {
+            app.add_row(Row {
+                workspace: Some(workspace),
+                ..row(n, activity)
+            });
+        };
+        template(4, 200, Workspace::Template("notes".into()));
+        template(5, 10, Workspace::Template("gone".into()));
+        template(6, 20, Workspace::Scratch);
+        template(7, 300, Workspace::Template("notes".into()));
+        let depth = |n: u16, s: &str| (n, s.to_string());
+        assert_eq!(
+            tree(&app),
+            [
+                depth(0, "Empty"),
+                depth(1, "title 6"),
+                depth(0, "Directory…"),
+                depth(0, "notes"),
+                depth(1, "title 7"),
+                depth(1, "title 4"),
+                depth(0, "td"),
+                depth(0, "gone (not configured)"),
+                depth(1, "title 5"),
+                depth(0, "No workspace"),
+                depth(1, "title 1"),
+                depth(1, "title 3"),
+                depth(1, "title 2"),
+            ]
+        );
+        // The third column says what each group starts.
+        let notes = row_of(&app, &Item::Group(Group::Template("notes".into())));
+        assert_eq!(app.cell(notes, 2).text(), "scratch");
+        let td = row_of(&app, &Item::Group(Group::Template("td".into())));
+        assert_eq!(app.cell(td, 2).text(), "repositories");
+        // A press on a template's row starts a conversation from it, on
+        // Empty's a scratch one, on Directory…'s the folder chooser.
+        let press = |app: &mut App, group: Group| {
+            let at = row_of(app, &Item::Group(group));
+            let place = app.list.model().find(at).unwrap();
+            let rect = app.list.geometry().unwrap().row(place).unwrap();
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                app.input(
+                    Input::Pointer {
+                        phase,
+                        x: rect.x + 40,
+                        y: rect.y + 4,
+                        extend: false,
+                        follow: false,
+                    },
+                    &mut NoClipboard,
+                );
+            }
+        };
+        press(&mut app, Group::Template("td".into()));
+        assert_eq!(app.take_requests(), [Request::NewFrom("td".into())]);
+        press(&mut app, Group::Empty);
+        assert_eq!(app.take_requests(), [Request::NewScratch]);
+        press(&mut app, Group::Directory);
+        assert!(app.chooser().is_some());
+        key(&mut app, "Escape");
+        // One no longer configured starts none, and says why.
+        press(&mut app, Group::Unlisted("gone".into()));
+        assert!(app.take_requests().is_empty());
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("template gone is no longer configured")));
+        // The keyboard moves over a group without starting anything;
+        // Return on one starts one.
+        assert_eq!(app.focus(), Focus::List);
+        let at = row_of(&app, &Item::Group(Group::Template("td".into())));
+        app.list.select(Some(at), true);
+        key(&mut app, "Up");
+        key(&mut app, "Down");
+        assert!(app.take_requests().is_empty());
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::NewFrom("td".into())]);
+    }
+
+    /// A group folds away its conversations; opening a conversation
+    /// unfolds its group so its row shows.
+    #[test]
+    fn a_group_folds_until_one_of_its_conversations_opens() {
+        let mut app = app();
+        app.set_templates(vec![("notes".into(), false)]);
+        app.add_row(Row {
+            workspace: Some(Workspace::Template("notes".into())),
+            ..row(4, 200)
+        });
+        let notes = row_of(&app, &Item::Group(Group::Template("notes".into())));
+        key(&mut app, "F6");
+        app.list.select(Some(notes), true);
+        key(&mut app, "Left");
+        assert!(!shown(&app).contains(&id(4)), "{:?}", shown(&app));
+        assert!(app.take_requests().is_empty());
+        key(&mut app, "Right");
+        assert!(shown(&app).contains(&id(4)));
+        key(&mut app, "Left");
+        app.set_active(id(4));
+        assert!(shown(&app).contains(&id(4)));
+        assert_eq!(
+            app.list.selected(),
+            Some(row_of(&app, &Item::Conversation(id(4))))
+        );
+    }
+
+    /// Without the jail, every conversation has no workspace, and the one
+    /// group there is starts one, as C-n does.
+    #[test]
+    fn without_the_jail_one_group_starts_a_conversation() {
+        let mut app = app();
+        app.set_no_workspaces(Some("no jail".into()));
+        let groups: Vec<String> = tree(&app)
+            .into_iter()
+            .filter(|(depth, _)| *depth == 0)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(groups, ["No workspace"]);
+        key(&mut app, "F6");
+        app.list
+            .select(Some(row_of(&app, &Item::Group(Group::Bare))), true);
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::New]);
+    }
+
+    /// A press at `dx` into the list's row `item` is, released there.
+    fn press_row(app: &mut App, item: &Item, dx: i64) {
+        let id = app.listed(item).unwrap();
+        let place = app.list.model().find(id).unwrap();
+        let rect = app.list.geometry().unwrap().row(place).unwrap();
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x: rect.x + dx,
+                    y: rect.y + 4,
+                    extend: false,
+                    follow: false,
+                },
+                &mut NoClipboard,
+            );
+        }
+    }
+
+    /// A press on a group's disclosure box folds it and starts nothing; a
+    /// double press on its row starts one conversation, not two, and the
+    /// composer then has the focus to write its first message.
+    #[test]
+    fn a_groups_box_folds_and_a_double_press_starts_one() {
+        let mut app = app();
+        app.set_templates(vec![("notes".into(), false)]);
+        app.add_row(Row {
+            workspace: Some(Workspace::Template("notes".into())),
+            ..row(4, 200)
+        });
+        let notes = Item::Group(Group::Template("notes".into()));
+        press_row(&mut app, &notes, 4);
+        assert!(app.take_requests().is_empty());
+        assert!(!shown(&app).contains(&id(4)));
+        press_row(&mut app, &notes, 4);
+        assert!(shown(&app).contains(&id(4)));
+        press_row(&mut app, &notes, 40);
+        assert_eq!(app.take_requests(), [Request::NewFrom("notes".into())]);
+        // Not started yet, the list keeps the focus: one that fails to
+        // start leaves nothing typed for another.
+        assert_eq!(app.focus(), Focus::List);
+        // As the window starts it.
+        app.add_row(Row {
+            workspace: Some(Workspace::Template("notes".into())),
+            ..row(9, 300)
+        });
+        app.set_active(id(9));
+        app.focus_composer();
+        press_row(&mut app, &notes, 40);
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.focus(), Focus::Composer);
+        assert_eq!(app.list.selected(), app.listed(&Item::Conversation(id(9))));
+    }
+
+    /// A template removed from the configuration while conversations name
+    /// it leaves them under it as no longer configured, its fold kept,
+    /// and starts nothing more; restored, it starts one again.
+    #[test]
+    fn a_removed_templates_conversations_stay_under_it() {
+        let mut app = app();
+        app.set_templates(vec![("notes".into(), false)]);
+        app.add_row(Row {
+            workspace: Some(Workspace::Template("notes".into())),
+            ..row(4, 200)
+        });
+        let notes = Item::Group(Group::Template("notes".into()));
+        key(&mut app, "F6");
+        app.list.select(app.listed(&notes), true);
+        key(&mut app, "Left");
+        app.set_templates(Vec::new());
+        let gone = Item::Group(Group::Unlisted("notes".into()));
+        assert!(app.listed(&gone).is_some());
+        assert!(app.listed(&notes).is_none());
+        assert!(!shown(&app).contains(&id(4)), "its fold is kept by name");
+        // Opening one of its conversations unfolds it.
+        app.set_active(id(4));
+        assert!(shown(&app).contains(&id(4)));
+        assert_eq!(app.list.selected(), app.listed(&Item::Conversation(id(4))));
+        app.list.select(app.listed(&gone), true);
+        key(&mut app, "Left");
+        assert!(!shown(&app).contains(&id(4)));
+        app.list.select(app.listed(&gone), true);
+        key(&mut app, "Right");
+        assert!(shown(&app).contains(&id(4)));
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert!(app
+            .log
+            .last()
+            .is_some_and(|n| n.contains("no longer configured")));
+        app.set_templates(vec![("notes".into(), false)]);
+        assert!(app.listed(&gone).is_none());
+        press_row(&mut app, &notes, 40);
+        assert_eq!(app.take_requests(), [Request::NewFrom("notes".into())]);
+    }
+
+    /// Without the jail a conversation made with a workspace is listed
+    /// under its group, in the configured order, but only no workspace
+    /// starts one: the others say why.
+    #[test]
+    fn without_the_jail_only_no_workspace_starts_one() {
+        let mut app = app();
+        app.set_templates(vec![("b".into(), false), ("a".into(), false)]);
+        for (n, name) in [(4, "a"), (5, "b")] {
+            app.add_row(Row {
+                workspace: Some(Workspace::Template(name.into())),
+                ..row(n, 200)
+            });
+        }
+        app.set_no_workspaces(Some("no jail".into()));
+        let groups: Vec<String> = tree(&app)
+            .into_iter()
+            .filter(|(depth, _)| *depth == 0)
+            .map(|(_, label)| label)
+            .collect();
+        assert_eq!(groups, ["b", "a", "No workspace"]);
+        press_row(&mut app, &Item::Group(Group::Template("a".into())), 40);
+        assert!(app.take_requests().is_empty());
+        assert!(app.log.last().is_some_and(|n| n.contains("no jail")));
+    }
+
+    /// A conversation folds its background processes away, and each item
+    /// keeps its id while listed, so a row coming above another moves no
+    /// id, and the view stays where it was.
+    #[test]
+    fn a_conversation_folds_its_processes_and_ids_stay() {
+        let mut app = app();
+        let process = |seq, number| {
+            at(
+                seq,
+                Kind::Process {
+                    number,
+                    call: 1,
+                    command: "sleep 60".into(),
+                },
+            )
+        };
+        let two = app.listed(&Item::Conversation(id(2))).unwrap();
+        app.background(&id(3), &process(4, 1), 0);
+        assert_eq!(app.listed(&Item::Conversation(id(2))), Some(two));
+        let p = Item::Process(id(3), 1);
+        assert!(app.listed(&p).is_some());
+        key(&mut app, "F6");
+        app.list
+            .select(app.listed(&Item::Conversation(id(3))), true);
+        key(&mut app, "Left");
+        assert!(app.listed(&p).is_none());
+        key(&mut app, "Right");
+        assert!(app.listed(&p).is_some());
+    }
+
     /// The conversations the list shows, in its order.
     fn shown(app: &App) -> Vec<Id> {
         app.list
             .model()
             .rows()
             .iter()
-            .map(|r| app.rows()[r.id].id.clone())
+            .filter_map(|r| app.conversation_at(r.id))
             .collect()
+    }
+
+    /// The list's row `item` is, by its id in the list.
+    fn row_of(app: &App, item: &Item) -> usize {
+        app.listed(item).unwrap()
     }
 
     /// A conversation's background processes are rows under its own,
@@ -8029,7 +8604,7 @@ pub mod tests {
         app.background(&id(3), &process(5, 2, "cargo test"), 0);
         app.update(process(6, 1, "sleep 60"), 0);
         assert!(app.status_line().ends_with("| 3 background"));
-        let three = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        let three = row_of(&app, &Item::Conversation(id(3)));
         let rows = app.list.model().rows();
         let place = rows.iter().position(|r| r.id == three).unwrap();
         let children: Vec<usize> = rows
@@ -8037,7 +8612,7 @@ pub mod tests {
             .unwrap()
             .iter()
             .map(|r| {
-                assert_eq!((r.parent, r.depth), (Some(three), 1));
+                assert_eq!((r.parent, r.depth), (Some(three), 2));
                 r.id
             })
             .collect();
@@ -8147,16 +8722,11 @@ pub mod tests {
         app.set_archived(&id(2), false);
         app.background(&id(2), &process(10, 7, "sleep 60"), 0);
         app.background(&id(2), &process(11, 8, "sleep 60"), 0);
-        let seven = app
-            .process_items
-            .iter()
-            .position(|item| *item == (id(2), 7))
-            .unwrap()
-            + app.process_base;
+        let seven = row_of(&app, &Item::Process(id(2), 7));
         app.list.select(Some(seven), true);
         app.remove_row(&id(3));
         let selected = app.list.selected().unwrap();
-        assert_eq!(app.process_item(selected), Some(&(id(2), 7)));
+        assert_eq!(app.process_item(selected), Some((id(2), 7)));
         assert!(app.status_line().ends_with("| 3 background"));
         app.background(
             &id(2),
@@ -8172,7 +8742,7 @@ pub mod tests {
             0,
         );
         let selected = app.list.selected().unwrap();
-        assert_eq!(app.rows().get(selected).map(|r| &r.id), Some(&id(2)));
+        assert_eq!(app.conversation_at(selected), Some(id(2)));
         // The open one's hello starts its count again from its log; the
         // other's stays.
         assert!(app.status_line().ends_with("| 2 background"));
@@ -8220,7 +8790,7 @@ pub mod tests {
         app.menu_action(menu::Action::ShowArchived);
         assert!(app.shows_archived());
         assert_eq!(shown(&app), [id(1), id(3), id(2)]);
-        let at = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        let at = row_of(&app, &Item::Conversation(id(3)));
         assert_eq!(app.cell(at, 1).text(), "archived");
         let (x, y) = row_at(&app, 3);
         press(&mut app, x, y);
@@ -8231,7 +8801,7 @@ pub mod tests {
         // From the keyboard, S-F10 in the list opens the selected row's,
         // archived or not, and closes it again.
         app.set_focus(Focus::List);
-        let three = app.rows().iter().position(|r| r.id == id(3)).unwrap();
+        let three = row_of(&app, &Item::Conversation(id(3)));
         app.list.select(Some(three), true);
         // An update to the list keeps the selection where it is.
         app.set_rows(app.rows().to_vec());
@@ -9218,8 +9788,8 @@ pub mod tests {
             ..row(9, 1)
         });
         app.set_active(id(9));
-        let at = app.rows().iter().position(|r| r.id == id(9)).unwrap();
-        assert_eq!(app.labels[at], "template notes");
+        let at = row_of(&app, &Item::Conversation(id(9)));
+        assert_eq!(app.item_labels[&at].0[1], "template notes");
         // The columns fit the list at its default share of a window 1024
         // pixels wide: no sideways scrollbar.
         assert!(app.list.geometry().unwrap().horizontal().is_none());
@@ -9228,9 +9798,9 @@ pub mod tests {
             workspace: Some(Workspace::Directory("/home/u/src/notes".into())),
             ..row(8, 2)
         });
-        let at = app.rows().iter().position(|r| r.id == id(8)).unwrap();
-        assert_eq!(app.labels[at], "notes");
-        assert!(app.labels.iter().any(|label| label == "none"));
+        let at = row_of(&app, &Item::Conversation(id(8)));
+        assert_eq!(app.item_labels[&at].0[1], "notes");
+        assert!(app.item_labels.iter().any(|label| label.1 .0[1] == "none"));
         assert!(
             !app.status_line().contains("notes"),
             "{}",
@@ -9620,7 +10190,7 @@ pub mod tests {
         assert_eq!(app.most_recent(), Some(id(3)));
         let entry = app.directory().into_iter().find(|e| e.id == id(1)).unwrap();
         assert!(entry.failed, "nothing is delivered to it meanwhile");
-        let index = app.rows().iter().position(|r| r.id == id(1)).unwrap();
+        let index = row_of(&app, &Item::Conversation(id(1)));
         assert_eq!(app.cell(index, 1).text(), "deleting");
         // Previous and next pass over it: above the next, it is not.
         app.set_active(id(3));
@@ -9678,7 +10248,7 @@ pub mod tests {
         assert_eq!(app.take_requests(), [Request::Open(id(1))]);
         // Archiving says so in the list and on its card.
         app.set_closing(&id(2), Some("archiving"));
-        let index = app.rows().iter().position(|r| r.id == id(2)).unwrap();
+        let index = row_of(&app, &Item::Conversation(id(2)));
         assert_eq!(app.cell(index, 1).text(), "archiving");
         app.open(id(2));
         assert!(app
@@ -9805,7 +10375,7 @@ pub mod tests {
             _ => None,
         };
         let says = |app: &App, of: u8| {
-            let at = app.rows().iter().position(|r| r.id == id(of)).unwrap();
+            let at = row_of(app, &Item::Conversation(id(of)));
             app.cell(at, 1).text().to_string()
         };
         app.ask(card(3, 7));

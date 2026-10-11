@@ -1013,6 +1013,7 @@ impl Session {
             archived: false,
         });
         self.app.set_active(id.clone());
+        self.app.focus_composer();
         match workspace {
             None => self.open(id, Some(Role::Conversation)),
             Some(workspace) => {

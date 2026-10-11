@@ -1065,11 +1065,15 @@ td-agent is a td-ui widget window (td-ui/DESIGN.md, "Widget window"). A
 horizontal `split::Controller` divides it. The preferred share persists in
 the state directory, which the toolkit's widget leaves to the consumer.
 
-**Left: conversations.** Every conversation, most recently active
-first and none pinned, as a tree table (td-ui/DESIGN.md, "Shared tree
-table"): each row shows its title, its workspace (the template's name or
-the directory), conversation state (idle, running, waiting for approval,
-failed) and branch, and opens to its worktrees with their state
+**Left: conversations.** Every conversation as a tree table
+(td-ui/DESIGN.md, "Shared tree table"), under what it was started from:
+the top rows are the ways to start one, Empty, Directory… and each
+template, and a press on one starts a conversation from it, with no
+dialog between; under each, the conversations started so, most recently
+active first and none pinned. Each conversation's row shows its title,
+its workspace (the template's name or the directory), conversation
+state (idle, running, waiting for approval, failed) and branch, and
+opens to its worktrees with their state
 (fetching, checking out, ready, failed), any forked conversations, and
 its background processes (§12). A row waiting for approval is marked
 distinctly, so a run left in the background is visible from the list,
@@ -1174,6 +1178,41 @@ one, `no model`, the mode, `no limits` and `0 background`. The split's
 share is the file `layout` in the state directory. The driven control
 socket is opt-in, `--control-socket PATH`, and its actions are `new`,
 `previous`, `next`, `send`, `focus-next` and `focus-previous`.
+
+**As built (the list's tree).** The list's top rows, groups, are Empty,
+Directory… and each configured template in the order written, always
+shown; then, only while a conversation names one, each template no
+longer configured, `NAME (not configured)`, by name; then `No
+workspace`, while a conversation has none. A group's third column says
+what it starts (`scratch`, `folder`, `repositories`). Under each group
+are its conversations, archived ones only while they show, the most
+recently active first; under each conversation, its background
+processes. A press on a group, or `Return` on one, starts a
+conversation from it at once as the chooser of §7 would: Empty a
+scratch one, a template its own, through the admission card when its
+remotes ask one; Directory… opens the folder chooser. Once one has
+started, however it was started, its composer takes the focus for its
+first message; one refused before it is made leaves the focus where it
+was, so nothing typed for it goes to another. One no longer configured starts
+none and says why in a note, as does `No workspace` while the jail
+runs. Without the jail, the groups listed are those conversations are
+in, in the same order, and `No workspace`, always, which alone starts
+one, with none, as `C-n` does; the others say why. A second press on a
+group within 400 ms is the same start, so a double press makes one
+conversation. The arrow keys move over groups and start nothing. A
+group or a conversation with rows under it folds them away from its
+disclosure box, or `Left` and `Right`, until unfolded, a template's
+fold kept by its name whether it is configured or not; the window keeps
+what is folded until it exits, letting go of a deleted conversation's.
+Opening a conversation unfolds its group, so its row shows and is
+selected. The rows are `ui::Item`s, a group, a conversation or a
+process, each with an id it keeps while it is listed, so the tree
+table's view, which it keeps by id, stays put as rows come and go above
+it; the items and the drawn tree change together, or not at all when
+the tree is refused. The selection is kept by item. `S-F10` with a
+group selected opens the open conversation's menu, and a right press on
+a group opens none. `C-n` keeps the chooser for the keyboard, and
+`C-PageUp`/`C-PageDown` still go by activity, not by the tree.
 
 **As built (increment 5).** A row's state may also be `running`, while
 a turn is under way. A reply shows as an `assistant` message: its
@@ -2621,8 +2660,10 @@ The list's Workspace column and the `conversations` tool name the
 workspace `template NAME`, and the question before a deletion says,
 by the workspace's kind and not its name, that a template's scratch
 directory goes with the conversation.
-A template naming repositories was listed then, the finder's note
-saying it was refused until increment 11, and choosing it made nothing;
+The list's groups start the same conversations with no finder
+(§4, As built (the list's tree)). A template naming repositories was
+listed then, the finder's note saying it was refused until increment
+11, and choosing it made nothing;
 increment 11 prepares it (As built (increment 11, preparation)). Choosing Directory… goes straight to the folder chooser: a card
 that waited behind the template chooser waits behind it too.
 Without the launch's jail no workspace can be made and there is nothing
