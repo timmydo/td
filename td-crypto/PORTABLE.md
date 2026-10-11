@@ -79,9 +79,8 @@ only after confirming that preparer is no longer running.
 
 The aarch64 digest was independently measured from the same pinned upstream
 archive with `make ARCH=aarch64 prefix=DEST install-headers`; the generator
-must reproduce all installed paths and bytes. This prepares headers only.
-The portable Rust kit, native cross compiler and runtime qualification still
-cover x86-64; header preparation alone does not produce an ARM executable.
+must reproduce all installed paths and bytes. This prepares headers only;
+producing an executable requires the matching target kit and compiler below.
 
 ## Rust host kit and target standard library
 
@@ -92,7 +91,7 @@ Rust identifies itself differently and rejects the upstream target library
 with E0514. This host-only exception does not admit any downloaded Rust
 component into td's source-built distribution. No rustup state is changed.
 
-All four archives are under the upstream prefix
+Each build selects four archives under the upstream prefix
 `https://static.rust-lang.org/dist/2026-05-28/`:
 
 | Archive (`.tar.xz`) | Bytes | SHA-256 |
@@ -101,12 +100,14 @@ All four archives are under the upstream prefix
 | `cargo-1.96.0-x86_64-unknown-linux-gnu` | 11154668 | `dee75c3c8f9f600ad75bc0c93249e767d3047845a4dd668327ce43ab039ba266` |
 | `rust-std-1.96.0-x86_64-unknown-linux-gnu` | 29740704 | `c09c7c646248f14f473f5f7a029af15ee57c3a9f9bc93dfa72d9621938586b82` |
 | `rust-std-1.96.0-x86_64-unknown-linux-musl` | 38833276 | `4db24564076c243b377585bec0b938388638301ea5003d6245c4cbf9d86b11d0` |
+| `rust-std-1.96.0-aarch64-unknown-linux-musl` | 27278268 | `e7d89a29abcc2cf2f31cfe3d898c1713fb12f395e788809d3b01b23fdd5813b4` |
 
-These hashes are from the Rust 1.96.0 upstream distribution manifest. Prepare
+These hashes are from the Rust 1.96.0 upstream distribution manifest. Select
+the first three host archives and one target musl standard library. Prepare
 those four files and the musl header archive in one directory, then run:
 
 ```text
-td-builder gate-crates crypto-portable-prepare --archives /path/to/archives
+td-builder gate-crates crypto-portable-prepare --archives /path/to/archives [--arch x86_64|aarch64]
 ```
 
 Archive paths must be regular files, not symlinks, and remain unchanged during
@@ -120,8 +121,10 @@ bits, upstream installed notices and separate root notices for each package, inc
 runs. `PORTABLE-INPUTS` inside the kit records URLs, lengths and hashes.
 
 The kit is published under `.td-build-cache/crypto-rust-1.96.0-<NAR-sha256>`.
-The build additionally requires NAR SHA-256
-`dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1`.
+The x86-64 build additionally requires NAR SHA-256
+`dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1`;
+the aarch64 kit requires
+`b2ae2e0c6027aba063b7f280b7b2cd48710498553eb88b89ad64dbf0b8ede90e`.
 This pins the reconstructed layout and notices as well as archive bytes.
 Update this build pin only with a reviewed reconstruction/input change and
 repeat the isolated artifact qualification.
@@ -143,6 +146,15 @@ it to realize these named outputs from the current checkout's recipes:
 | `gcc-x86-64-self` | `glibc-x86-64` | glibc 2.41 host loader/libraries, `/lib64` |
 | `gcc-x86-64-self` | `gcc-x86-64-stage2` | host libgcc_s, `/gcc-runtime` |
 | `zlib-x86-64` | `zlib-x86-64` | shared zlib 1.3.1 host runtime, `/zlib` |
+
+For aarch64, preparation additionally realizes `gcc-aarch64-cross` and
+mounts its output at `/cross`. It builds native x86-64 static GCC 14.3.0 and
+binutils 2.44 tools targeting `aarch64-linux-musl`, from the existing reviewed
+source pins. It builds no ARM libc or compiler runtime: the matching Rust
+target standard library owns those inputs. Its build probe compiles, archives
+and links an ARM object. GCC selects a generic `none-*` host for its bundled GMP; the explicit
+`--disable-assembly` reinforces that generic C selection without a build-only
+assembler macro dependency.
 
 The recipe graph and its fixed-output source declarations are the authority;
 no caller-supplied compiler path or guessed store hash selects a tool. The
@@ -189,10 +201,65 @@ only when no preparation or build uses it and it is no longer needed; a later
 preparation reconstructs it. The final evaluator scratch tree also remains
 until the evaluator's ordinary later-run cleanup and may occupy several GiB;
 this command does not sweep shared evaluator scratch. Service memory budgets
-do not describe build-time resource use. ARM host and target support requires
-a separate manifest/layout qualification.
+do not describe build-time resource use. Both commands require an x86-64
+build host; aarch64 is a cross-compilation target, not a supported build host.
 
-## Isolated compilation and artifact
+## Aarch64 cross-compilation
+
+```text
+td-builder gate-crates crypto-portable-cross-build --archives /path/to/archives
+```
+
+This command uses the aarch64 kit, headers and source-built cross tools in
+an isolated offline build. It applies the same dependency admission, API
+confinement and fallback refusal as the x86-64 path. Rust uses its generic
+ARM CPU baseline; C uses `-march=armv8-a -mtune=generic` and disables outlined
+atomics so GCC does not introduce a dependency on a separately built target
+libgcc. Both request frame pointers and level-1 debug data. Rustdoc's pinned
+baseline features are `neon` and `outline-atomics`.
+
+Rust's ARM target defaults to a non-PIE static executable. This build uses
+stable `link-self-contained=no`, PIC and explicit linker flags to select the
+pinned target kit's `rcrt1.o`, `crti.o`, `crtbeginS.o`, `crtendS.o` and `crtn.o`.
+The musl static-PIE startup performs relocation; no runtime loader is needed.
+The output must still pass the static-PIE check. Host C build-script compiler
+and archiver selections point to refusal decoys, preventing accidental ARM
+objects in host executables.
+
+The output name is `crypto-artifact-aarch64-cross-<NAR-sha256>`, distinct
+from the x86-64 runtime-qualified artifact. It contains `td-mta`, its
+matching `td-mta.debug`, and four test
+executables: `td-crypto-smoke`, `td-mta-config-smoke`, `td-mta-format-smoke`
+and `td-mta-transport-smoke`. Every executable must be an aarch64 static PIE;
+x86-64 objects fail validation. The runtime/debug pairing, notices and input
+receipt use the same checks and publication rules as the x86-64 artifact.
+
+Cross-compilation does not execute ARM code. Its receipt explicitly records
+`runtime not-run cross-compiled`, and the command's success message says
+runtime was not tested. The test executables are retained for separate native
+or emulated functional validation. It does not run the x86-64 clean-runtime
+process suite or allocation/RSS probes and cannot substitute for that evidence.
+On a native ARM host, run these selected functional cases from the retained
+artifact directory and require a nonzero passing test count for each command:
+
+```text
+./td-crypto-smoke --test-threads=1
+./td-mta-config-smoke host_ --test-threads=1
+./td-mta-format-smoke --test-threads=1
+./td-mta-transport-smoke tls_policy::tests::starttls_tests:: --test-threads=1
+```
+
+Under user-mode emulation, prefix each command with `qemu-aarch64`. Do not
+use `--ignored`: the retained binaries also contain explicitly x86-only
+resource probes, which must continue to refuse ARM. These selected cases
+cover crypto, configuration, stored row formats and the SMTP/TLS adapter;
+they do not launch the installed receiver. The ARM build does not produce
+the x86-only clean-runtime CLI suite. Follow DEPLOYMENT.md's private pilot
+procedure for the executable's configuration, STARTTLS, receiving and restart
+checks before taking production mail. The full td distribution's
+architecture and source-bootstrap claims are unchanged.
+
+## X86-64 isolated compilation and artifact
 
 ```text
 td-builder gate-crates crypto-portable-build --archives /path/to/archives

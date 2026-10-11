@@ -23,6 +23,23 @@ pub fn recipe() -> Recipe {
     let path = format!("{{root}}/wb:{{tools}}:{binutils}");
 
     let mut steps = unpack_into("gawk-x86-64-self-source", "{src}");
+    // Upstream bf85f8a3175a: preserve NODE union layout without MPFR.
+    // Otherwise scalarizing an empty array value corrupts its string cache.
+    steps.push(Step::substitute_text(
+        "{src}/awk.h",
+        vec![
+            TextEdit::new(
+                "\t\t} nodep;\n\n\t\tstruct {\n#ifdef HAVE_MPFR\n\t\t\tunion {\n\t\t\t\tAWKNUM fltnum;\n\t\t\t\tmpfr_t mpnum;\n\t\t\t\tmpz_t mpi;\n\t\t\t} nm;\n\t\t\tint rndmode;\n#else\n\t\t\tAWKNUM fltnum;\n\t\t\tint for_alignment_only;\t// especially on 32-bit\n#endif\n\t\t\tchar *sp;\n\t\t\tsize_t slen;\n\t\t\tint idx;\n",
+                "\t\t} nodep;\n\n\t\tstruct {\n\t\t\tunion {\n\t\t\t\tAWKNUM fltnum;\n#ifdef HAVE_MPFR\n\t\t\t\tmpfr_t mpnum;\n\t\t\t\tmpz_t mpi;\n#else\n\t\t\t\t// 7/2026:\n\t\t\t\t// This is a workaround for systems that build\n\t\t\t\t// gawk without MPFR and GMP.  The NODE struct\n\t\t\t\t// desperately needs to be refactored.\n#if SIZEOF_VOID_P == 4\n\t\t\t\tchar alignment[28];\n#else\t// SIZEOF_VOID_P != 4\n\t\t\t\tchar alignment[48];\n#endif\t// SIZEOF_VOID_P != 4\n#endif\t// HAVE_MPFR\n\t\t\t} nm;\n\t\t\tint rndmode;\t// only used for MPFR.\n\t\t\tchar *sp;\n\t\t\tsize_t slen;\n\t\t\tint idx;\n",
+                1,
+            ),
+            TextEdit::new(
+                "#ifdef HAVE_MPFR\n#define mpg_numbr\tsub.val.nm.mpnum\n#define mpg_i\t\tsub.val.nm.mpi\n#define numbr\t\tsub.val.nm.fltnum\n#else\n#define numbr\t\tsub.val.fltnum\n#endif\n#define typed_re\tsub.val.typre\n\n/*\n",
+                "#ifdef HAVE_MPFR\n#define mpg_numbr\tsub.val.nm.mpnum\n#define mpg_i\t\tsub.val.nm.mpi\n#endif\n#define numbr\t\tsub.val.nm.fltnum\n#define typed_re\tsub.val.typre\n\n/*\n",
+                1,
+            ),
+        ],
+    ));
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     steps.push(post_rust_tool_farm("{in:gawk-mesboot}/bin/gawk"));
     let to_td_sh = |expect| {
@@ -125,6 +142,21 @@ pub fn recipe() -> Recipe {
         &[
             "{out}/bin/gawk",
             "BEGIN { n = split(\"td awk\", w); if (n != 2 || toupper(w[2]) != \"AWK\") exit 1 }",
+        ],
+    ));
+
+    steps.push(Step::run(
+        "{out}",
+        &[
+            "{out}/bin/gawk",
+            r####"BEGIN {
+                if (a["x", "y"] != "") exit 1;
+                a["x", "y"] = a["x", "y"] "Wfoo;";
+                if (a["x", "y"] != "Wfoo;") exit 2;
+                if (b[0] > "###") exit 3;
+                b[0] = b[0] "Driver";
+                if (b[0] != "Driver") exit 4;
+            }"####,
         ],
     ));
 

@@ -21,8 +21,9 @@
 //!     dance; a too-long run-path (or adding one where none exists) errors loudly rather than
 //!     corrupting the file — a deliberate, visible boundary, not a silent truncation.
 //!
-//! Scope: 32- and 64-bit little-endian ELF (i686 + x86-64) — the bootstrap toolchain is
-//! i686, the rust/userland path is x86-64. Any other class/endianness is rejected.
+//! Scope: 32- and 64-bit little-endian ELF. The bootstrap uses i686 and x86-64;
+//! the portable mail build also validates AArch64. Application launch checks
+//! remain explicitly x86-64. Other classes and endiannesses are rejected.
 
 #![allow(
     clippy::unwrap_used,
@@ -52,6 +53,7 @@ const PF_R: u32 = 4; // segment readable
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
 const EV_CURRENT: u32 = 1;
 const DT_NULL: u64 = 0; // end of the dynamic array
                         // Backs the `read_needed`/`assert_static` DT_NEEDED query. assert_static is now
@@ -2240,6 +2242,15 @@ pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
 /// Assert that PATH has the executable structure the x86-64 application launcher
 /// needs. Static PIE is `ET_DYN`; a traditional static binary is `ET_EXEC`.
 fn assert_x86_64_executable_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    assert_64_executable_bytes(path, bytes, EM_X86_64, "EM_X86_64")
+}
+
+fn assert_64_executable_bytes(
+    path: &Path,
+    bytes: &[u8],
+    expected_machine: u16,
+    name: &str,
+) -> Result<(), String> {
     let elf = Elf::parse(bytes)?;
     if !elf.is64 {
         return Err(format!(
@@ -2255,9 +2266,9 @@ fn assert_x86_64_executable_bytes(path: &Path, bytes: &[u8]) -> Result<(), Strin
         ));
     }
     let machine = u16le(bytes, 0x12)?;
-    if machine != EM_X86_64 {
+    if machine != expected_machine {
         return Err(format!(
-            "{}: application entry has ELF machine {machine}, expected EM_X86_64",
+            "{}: application entry has ELF machine {machine}, expected {name}",
             path.display()
         ));
     }
@@ -2360,6 +2371,19 @@ pub fn assert_x86_64_executable(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn assert_x86_64_executable_bounded(path: &Path, max_bytes: u64) -> Result<(), String> {
+    assert_executable_bounded(path, max_bytes, EM_X86_64, "EM_X86_64")
+}
+
+pub(crate) fn assert_aarch64_executable_bounded(path: &Path, max_bytes: u64) -> Result<(), String> {
+    assert_executable_bounded(path, max_bytes, EM_AARCH64, "EM_AARCH64")
+}
+
+fn assert_executable_bounded(
+    path: &Path,
+    max_bytes: u64,
+    machine: u16,
+    name: &str,
+) -> Result<(), String> {
     let file =
         std::fs::File::open(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let length = file
@@ -2381,7 +2405,7 @@ pub(crate) fn assert_x86_64_executable_bounded(path: &Path, max_bytes: u64) -> R
             path.display()
         ));
     }
-    assert_x86_64_executable_bytes(path, &bytes)
+    assert_64_executable_bytes(path, &bytes, machine, name)
 }
 
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
@@ -3585,6 +3609,29 @@ pub(crate) mod tests {
         let err = assert_static_pie(&f).unwrap_err();
         assert!(err.contains("dynamically links"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn portable_arm_executable_does_not_pass_the_x86_launcher_contract() {
+        let dir = std::env::temp_dir().join(format!("elf-arm-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app");
+        let mut valid = synth_static_elf(true);
+        std::fs::write(&file, &valid).unwrap();
+        let limit = u64::try_from(valid.len()).unwrap();
+        assert!(assert_aarch64_executable_bounded(&file, limit).is_err());
+        valid[0x12..0x14].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        std::fs::write(&file, &valid).unwrap();
+        assert!(assert_aarch64_executable_bounded(&file, limit).is_ok());
+        assert!(assert_aarch64_executable_bounded(&file, limit - 1).is_err());
+        assert!(assert_x86_64_executable(&file).is_err());
+        assert!(assert_x86_64_executable_bounded(&file, limit).is_err());
+        valid[0x18..0x20].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&file, &valid).unwrap();
+        assert!(assert_aarch64_executable_bounded(&file, limit)
+            .unwrap_err()
+            .contains("zero ELF entry"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

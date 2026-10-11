@@ -26,10 +26,17 @@ impl Architecture {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::X86_64 => "x86_64",
             Self::Aarch64 => "aarch64",
+        }
+    }
+
+    pub(crate) fn triple(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64-unknown-linux-musl",
+            Self::Aarch64 => "aarch64-unknown-linux-musl",
         }
     }
 

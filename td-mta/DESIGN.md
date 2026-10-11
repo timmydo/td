@@ -91,7 +91,10 @@ mail through JMAP, and submits outgoing messages through a configured smart
 host. It also supports receiving from an upstream gateway MX. It ships as
 one executable with all executable dependencies statically linked against
 musl for x86-64 Linux 5.6 or newer. Files for
-configuration, secrets, trust, and mail remain external. Data formats and interfaces must permit a future aarch64 build.
+configuration, secrets, trust, and mail remain external. The standalone
+aarch64 cross-build uses the same data formats and interfaces;
+`td-crypto/PORTABLE.md` distinguishes its compilation evidence from native
+runtime qualification. Supporting that host does not port the td system image.
 
 Included in v1:
 

@@ -1,6 +1,6 @@
 # Standalone SMTP receiver deployment
 
-This guide covers `serve --smtp-only` on x86-64 Linux. It receives direct
+This guide covers the standalone `serve --smtp-only` receiver. It receives direct
 IPv4 SMTP, offers STARTTLS, and durably stores accepted local mail. It does
 not yet expose JMAP or send mail. The complete v1 configuration is still
 required, including HTTPS, identities and relay inputs, even though those
@@ -10,8 +10,15 @@ services are inactive. [CONFIG.md](CONFIG.md) owns the exact runtime profile.
 
 On the build host, use the pinned archive preparation and isolated build in
 [td-crypto/PORTABLE.md](../td-crypto/PORTABLE.md). The build host needs Linux
-5.12 or newer for its namespace sandbox; the standalone runtime targets
-Linux 5.6 or newer. aarch64 remains unqualified.
+5.12 or newer for its namespace sandbox; the x86-64 standalone runtime
+targets Linux 5.6 or newer. An aarch64 cross-build is also available through
+`crypto-portable-cross-build`; its successful build alone does not qualify
+the runtime. For Amazon Linux 2023 on Graviton, select that ARM artifact;
+on x86-64, select the ordinary portable artifact. Both use static musl and
+carry their own matching debug companion. Native configuration, STARTTLS,
+local delivery and restart validation are still required on the deployment
+host before taking production mail. ARM compilation and emulation do not
+qualify a minimum kernel version or the Amazon Linux 2023 service setup.
 
 The successful build prints a content-addressed artifact directory. Preserve
 that complete directory with its original name as the release archive.
@@ -34,7 +41,8 @@ A release installation can use this layout, outside persistent state:
 
 Install the executable mode 0755, companion and receipt mode 0644, under
 administrator-owned directories. Write the complete original
-`crypto-artifact-<NAR-sha256>` directory name into the installation's
+`crypto-artifact-<NAR-sha256>` (x86-64) or
+`crypto-artifact-aarch64-cross-<NAR-sha256>` directory name into the installation's
 `ARTIFACT-ID`; this is an operator record, not a generated build file.
 Compare the installed runtime and companion byte-for-byte with the archive
 before starting. `BUILD-INPUTS` identifies inputs, not installed output bytes.
@@ -178,6 +186,32 @@ automatic certificate renewal in this profile. Replace material before the
 admitted chain's validity window ends. Expiration or an invalid UTC observation
 stops receiving with a TLS error; restarting with the same invalid material
 does not recover service.
+
+## Private pilot validation
+
+Use a fresh disposable store and private high-port listener on the deployment
+host, with test domains and certificate material. Run as the intended service
+UID. Keep the pilot's configuration and state separate from existing mail.
+
+1. Run the selected functional commands in PORTABLE.md for an ARM artifact.
+   Check that each reports passing tests, rather than zero selected tests.
+2. Initialize the pilot store, run `config check`, start `serve --smtp-only`,
+   and require `status --json --require-ready` to succeed.
+3. From an SMTP client that verifies the pilot certificate, negotiate
+   STARTTLS. Confirm an outside recipient is refused, then deliver a unique
+   message to a configured local alias and require the final SMTP 250.
+4. Start another DATA transaction without completing it. Kill only the
+   recorded pilot server PID, wait for exit, then restart the same store.
+   Require readiness again; incomplete ingress must not become delivered mail.
+5. Request `stop`, wait for process exit, then run `store verify --root PATH
+   --all`. For this fresh one-message fixture, its blob count must be one.
+6. Repeat startup, readiness and stop through the intended supervisor. Keep
+   its logs and the artifact ID with the validation result.
+
+These checks exercise the intended host and storage. They do not establish
+load capacity, a tested minimum kernel, or compatibility with another server's
+store. Preserve the existing server's store until migration is separately
+implemented and verified.
 
 ## Supervisor examples
 

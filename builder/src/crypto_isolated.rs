@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
-const TARGET: &str = "x86_64-unknown-linux-musl";
+use crate::crypto_headers::Architecture;
 const BINARIES: &[&str] = &[
     "td-mta",
     "td-crypto-smoke",
@@ -19,11 +19,31 @@ const BINARIES: &[&str] = &[
     "td-mta-native-allocation-probe",
     "td-mta-rss-probe",
 ];
+const ARM_BINARIES: &[&str] = &[
+    "td-mta",
+    "td-crypto-smoke",
+    "td-mta-config-smoke",
+    "td-mta-format-smoke",
+    "td-mta-transport-smoke",
+];
+
+fn binary_names(architecture: Architecture) -> &'static [&'static str] {
+    match architecture {
+        Architecture::X86_64 => BINARIES,
+        Architecture::Aarch64 => ARM_BINARIES,
+    }
+}
+
 const LIBRARIES: &str = "/lib64:/gcc-runtime:/zlib:/rust/lib";
 const NATIVE_FLAGS: &str = "-nostdinc -isystem /musl/include -isystem /cc/lib/gcc/x86_64-pc-linux-gnu/14.3.0/include -B/binutils/bin/ -march=x86-64 -mtune=generic -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root";
 
+#[cfg(test)]
 pub(crate) fn rust_flags() -> String {
-    [
+    rust_flags_architecture(Architecture::X86_64)
+}
+
+pub(crate) fn rust_flags_architecture(architecture: Architecture) -> String {
+    let mut flags = vec![
         "-C",
         "linker=/rust/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
         "-C",
@@ -31,7 +51,10 @@ pub(crate) fn rust_flags() -> String {
         "-C",
         "target-feature=+crt-static",
         "-C",
-        "target-cpu=x86-64",
+        match architecture {
+            Architecture::X86_64 => "target-cpu=x86-64",
+            Architecture::Aarch64 => "target-cpu=generic",
+        },
         "-C",
         "force-frame-pointers=yes",
         "-C",
@@ -41,8 +64,34 @@ pub(crate) fn rust_flags() -> String {
         "--remap-path-prefix=/source=/td-build",
         "--remap-path-prefix=/vendor=/td-cargo/vendor",
         "--remap-path-prefix=/output=/td-build-root",
-    ]
-    .join("\x1f")
+    ];
+    if architecture == Architecture::Aarch64 {
+        // Rust's ARM target defaults to ET_EXEC. Select the pinned musl
+        // static-PIE startup objects explicitly, using stable linker flags.
+        flags.extend([
+            "-C",
+            "link-self-contained=no",
+            "-C",
+            "relocation-model=pic",
+            "-L",
+            "/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained",
+            "-C",
+            "link-arg=-pie",
+            "-C",
+            "link-arg=--no-dynamic-linker",
+            "-C",
+            "link-arg=/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/rcrt1.o",
+            "-C",
+            "link-arg=/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crti.o",
+            "-C",
+            "link-arg=/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crtbeginS.o",
+            "-C",
+            "link-arg=/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crtendS.o",
+            "-C",
+            "link-arg=/rust/lib/rustlib/aarch64-unknown-linux-musl/lib/self-contained/crtn.o",
+        ]);
+    }
+    flags.join("\x1f")
 }
 
 pub(crate) fn cargo(verb: &str, package: &str) -> Command {
@@ -50,11 +99,25 @@ pub(crate) fn cargo(verb: &str, package: &str) -> Command {
 }
 
 pub(crate) fn cargo_manifest(verb: &str, manifest: &Path) -> Command {
+    cargo_manifest_architecture(verb, manifest, Architecture::X86_64)
+}
+
+pub(crate) fn cargo_manifest_architecture(
+    verb: &str,
+    manifest: &Path,
+    architecture: Architecture,
+) -> Command {
     let mut command = Command::new("/rust/bin/cargo");
     command
         .current_dir("/tmp")
         .env_clear()
-        .args([verb, "--frozen", "--target", TARGET, "--manifest-path"])
+        .args([
+            verb,
+            "--frozen",
+            "--target",
+            architecture.triple(),
+            "--manifest-path",
+        ])
         .arg(manifest)
         .args([
             "--config",
@@ -78,20 +141,43 @@ pub(crate) fn cargo_manifest(verb: &str, manifest: &Path) -> Command {
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER",
             "/td-crypto-host-linker",
         )
-        .env("CARGO_ENCODED_RUSTFLAGS", rust_flags())
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            rust_flags_architecture(architecture),
+        )
         .env("CMAKE", "/td-crypto-decoy")
         .env("PKG_CONFIG", "/td-crypto-decoy")
         .env("OPENSSL_DIR", "/undeclared-openssl")
         .stdin(Stdio::null());
+    let (cc, ar, flags) = match architecture {
+        Architecture::X86_64 => ("/cc/bin/gcc", "/binutils/bin/ar", NATIVE_FLAGS),
+        Architecture::Aarch64 => (
+            "/cross/bin/aarch64-linux-musl-gcc", "/cross/bin/aarch64-linux-musl-ar",
+            "-nostdinc -isystem /musl/include -isystem /cross/lib/gcc/aarch64-linux-musl/14.3.0/include -B/cross/aarch64-linux-musl/bin/ -march=armv8-a -mtune=generic -mno-outline-atomics -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -g1 -ffile-prefix-map=/source=/td-build -ffile-prefix-map=/vendor=/td-cargo/vendor -ffile-prefix-map=/output=/td-build-root"
+        ),
+    };
     for suffix in [
-        "",
-        "_x86_64-unknown-linux-musl",
-        "_x86_64_unknown_linux_musl",
+        String::new(),
+        format!("_{}", architecture.triple()),
+        format!("_{}", architecture.triple().replace('-', "_")),
     ] {
         command
-            .env(format!("CC{suffix}"), "/cc/bin/gcc")
-            .env(format!("AR{suffix}"), "/binutils/bin/ar")
-            .env(format!("CFLAGS{suffix}"), NATIVE_FLAGS);
+            .env(format!("CC{suffix}"), cc)
+            .env(format!("AR{suffix}"), ar)
+            .env(format!("CFLAGS{suffix}"), flags);
+    }
+    if architecture == Architecture::Aarch64 {
+        // Native C build-script outputs are not part of this admitted graph.
+        for key in [
+            "HOST_CC",
+            "HOST_AR",
+            "CC_x86_64-unknown-linux-gnu",
+            "CC_x86_64_unknown_linux_gnu",
+            "AR_x86_64-unknown-linux-gnu",
+            "AR_x86_64_unknown_linux_gnu",
+        ] {
+            command.env(key, "/td-crypto-decoy");
+        }
     }
     for (key, value) in crate::crypto_build::CONTROLS {
         command.env(key, value);
@@ -284,11 +370,20 @@ pub(crate) fn artifact_path(
 }
 
 fn executable(message: &str, package: &str, kind: ArtifactKind) -> Result<PathBuf> {
+    executable_for(message, package, kind, Architecture::X86_64)
+}
+
+fn executable_for(
+    message: &str,
+    package: &str,
+    kind: ArtifactKind,
+    architecture: Architecture,
+) -> Result<PathBuf> {
     let actual = confined_path(
         &artifact_path(message, package, kind)?,
         Path::new("/output/target"),
     )?;
-    qualify_binary(&actual)?;
+    qualify_binary_architecture(&actual, architecture)?;
     Ok(actual)
 }
 
@@ -302,14 +397,29 @@ fn confined_path(path: &Path, parent: &Path) -> Result<PathBuf> {
     Ok(actual)
 }
 
-fn qualify_binary(path: &Path) -> Result<()> {
-    crate::elf::assert_x86_64_executable_bounded(path, 256 * 1024 * 1024)?;
+fn executable_architecture(path: &Path, architecture: Architecture) -> Result<()> {
+    match architecture {
+        Architecture::X86_64 => {
+            crate::elf::assert_x86_64_executable_bounded(path, 256 * 1024 * 1024)
+        }
+        Architecture::Aarch64 => {
+            crate::elf::assert_aarch64_executable_bounded(path, 256 * 1024 * 1024)
+        }
+    }
+}
+
+fn qualify_binary_architecture(path: &Path, architecture: Architecture) -> Result<()> {
+    executable_architecture(path, architecture)?;
     crate::elf::assert_static_pie(path)?;
     let _ = crate::elf::debug_line_requires_debug_str(path)?;
     Ok(())
 }
 
 fn split_mail_debug(receipt: &mut String) -> Result<()> {
+    split_mail_debug_architecture(receipt, Architecture::X86_64)
+}
+
+fn split_mail_debug_architecture(receipt: &mut String, architecture: Architecture) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let runtime = Path::new("/output/artifacts/td-mta");
     let debug = Path::new("/output/artifacts/td-mta.debug");
@@ -331,7 +441,10 @@ fn split_mail_debug(receipt: &mut String) -> Result<()> {
     commands.push(prune);
     commands.push(vec!["--strip-all".into(), path_text(runtime)?]);
     for (index, args) in commands.iter().enumerate() {
-        let mut command = Command::new("/binutils/bin/objcopy");
+        let mut command = Command::new(match architecture {
+            Architecture::X86_64 => "/binutils/bin/objcopy",
+            Architecture::Aarch64 => "/cross/bin/aarch64-linux-musl-objcopy",
+        });
         command.args(args).env_clear().stdin(Stdio::null());
         crate::host_bin::arm_check_child(&mut command);
         let name = format!("mail-debug-{index}");
@@ -343,15 +456,15 @@ fn split_mail_debug(receipt: &mut String) -> Result<()> {
     crate::elf::assert_debug_pair(runtime, debug)
 }
 
-fn qualify_artifacts(directory: &Path) -> Result<()> {
-    for binary in BINARIES {
+fn qualify_artifacts_architecture(directory: &Path, architecture: Architecture) -> Result<()> {
+    for binary in binary_names(architecture) {
         let path = directory.join(binary);
         if *binary == "td-mta" {
-            crate::elf::assert_x86_64_executable_bounded(&path, 256 * 1024 * 1024)?;
+            executable_architecture(&path, architecture)?;
             crate::elf::assert_static_pie(&path)?;
             crate::elf::assert_debug_pair(&path, &directory.join("td-mta.debug"))?;
         } else {
-            qualify_binary(&path)?;
+            qualify_binary_architecture(&path, architecture)?;
         }
     }
     Ok(())
@@ -579,6 +692,120 @@ pub(crate) fn build_inner() -> Result<()> {
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
     split_mail_debug(&mut receipt)?;
     crate::crypto_api::qualify(&mut receipt)?;
+    refuse_decoy(Path::new("/output"))?;
+    write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
+    Ok(())
+}
+
+pub(crate) fn cross_build_inner() -> Result<()> {
+    let architecture = Architecture::Aarch64;
+    require_namespace(&[
+        "/output",
+        "/source/td-mta/Cargo.toml",
+        "/vendor",
+        "/rust/bin/cargo",
+        "/musl/include/stdint.h",
+        "/cc/bin/gcc",
+        "/cross/bin/aarch64-linux-musl-gcc",
+        "/cross/bin/aarch64-linux-musl-ar",
+        "/cross/bin/aarch64-linux-musl-nm",
+        "/cross/bin/aarch64-linux-musl-objcopy",
+        "/lib64",
+        "/gcc-runtime",
+        "/zlib",
+    ])?;
+    fs::create_dir_all("/tmp/home").map_err(|e| format!("portable Cargo home: {e}"))?;
+    let mut receipt = String::from("cargo-environment cleared\nruntime not-run cross-compiled\n");
+    for package in ["td-crypto", "td-mta"] {
+        let manifest = format!("/source/{package}/Cargo.toml");
+        let mut command = cargo_manifest_architecture("tree", Path::new(&manifest), architecture);
+        command.args([
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--no-dedupe",
+            "--format",
+            "{p}|{f}",
+        ]);
+        let name = format!("{package}-graph");
+        command_record(&command, &name, &mut receipt)?;
+        let graph = bounded_output(&mut command, &name, 256 * 1024, 1200)?;
+        crate::crypto_policy::active_graph(Path::new("/source"), package, &graph)?;
+    }
+    fs::create_dir("/output/artifacts").map_err(|e| format!("portable artifacts: {e}"))?;
+    for (package, name, target_args, kind, installed) in [
+        (
+            "td-mta",
+            "td-mta",
+            &["--bin", "td-mta"][..],
+            ArtifactKind::Installed,
+            "td-mta",
+        ),
+        (
+            "td-crypto",
+            "td_crypto",
+            &["--lib"][..],
+            ArtifactKind::LibraryTest,
+            "td-crypto-smoke",
+        ),
+        (
+            "td-mta",
+            "td_mta",
+            &["--lib"][..],
+            ArtifactKind::LibraryTest,
+            "td-mta-transport-smoke",
+        ),
+        (
+            "td-mta",
+            "config_stack",
+            &["--test", "config_stack"][..],
+            ArtifactKind::IntegrationTest,
+            "td-mta-config-smoke",
+        ),
+        (
+            "td-mta",
+            "format_rows",
+            &["--test", "format_rows"][..],
+            ArtifactKind::IntegrationTest,
+            "td-mta-format-smoke",
+        ),
+    ] {
+        let manifest = format!("/source/{package}/Cargo.toml");
+        let test = kind.test();
+        let mut command = cargo_manifest_architecture(
+            if test { "test" } else { "build" },
+            Path::new(&manifest),
+            architecture,
+        );
+        command
+            .args(["--release", "--message-format=json-render-diagnostics"])
+            .args(target_args);
+        if test {
+            command.arg("--no-run");
+        }
+        let label = format!("arm-{installed}-build");
+        command_record(&command, &label, &mut receipt)?;
+        let output = bounded_output(&mut command, &label, 8 * 1024 * 1024, 1200)?;
+        let binary = executable_for(&output, name, kind, architecture)?;
+        let mut symbols = Command::new("/cross/bin/aarch64-linux-musl-nm");
+        symbols
+            .arg("--defined-only")
+            .arg(&binary)
+            .env_clear()
+            .stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut symbols);
+        let label = format!("arm-{installed}-symbols");
+        command_record(&symbols, &label, &mut receipt)?;
+        let symbols = bounded_output(&mut symbols, &label, 8 * 1024 * 1024, 30)?;
+        allocation_symbols(&symbols, false)?;
+        native_allocation_symbols(&symbols, false)?;
+        rss_symbols(&symbols, false)?;
+        copy_binary(&binary, &Path::new("/output/artifacts").join(installed))?;
+    }
+    refuse_decoy(Path::new("/output"))?;
+    split_mail_debug_architecture(&mut receipt, architecture)?;
+    crate::crypto_api::qualify_architecture(&mut receipt, architecture)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
     Ok(())
@@ -1239,7 +1466,16 @@ fn copy_binary(source: &Path, destination: &Path) -> Result<()> {
         .map_err(|e| format!("set artifact executable mode: {e}"))
 }
 
+#[cfg(test)]
 fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
+    collect_artifacts_architecture(output, destination, Architecture::X86_64)
+}
+
+fn collect_artifacts_architecture(
+    output: &Path,
+    destination: &Path,
+    architecture: Architecture,
+) -> Result<String> {
     let source = output.join("artifacts");
     if !fs::symlink_metadata(&source)
         .map_err(|e| format!("inspect build artifacts: {e}"))?
@@ -1259,7 +1495,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
         }
         names.insert(entry.file_name());
     }
-    let expected = BINARIES
+    let expected = binary_names(architecture)
         .iter()
         .copied()
         .chain(["td-mta.debug", "COMMANDS"])
@@ -1268,9 +1504,9 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
     if names != expected {
         return Err("unexpected build artifact inventory".into());
     }
-    let receipt = read_output(&source.join("COMMANDS"), "commands", 64 * 1024)?;
+    let receipt = read_output(&source.join("COMMANDS"), "commands", 256 * 1024)?;
     fs::create_dir(destination).map_err(|e| format!("create private artifact directory: {e}"))?;
-    for name in BINARIES {
+    for name in binary_names(architecture) {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
     let debug = destination.join("td-mta.debug");
@@ -2038,11 +2274,23 @@ pub(crate) fn runtime_inner() -> Result<()> {
 }
 
 pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> {
+    build_architecture(root, archives, Architecture::X86_64)
+}
+
+pub(crate) fn cross_build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> {
+    build_architecture(root, archives, Architecture::Aarch64)
+}
+
+fn build_architecture(
+    root: &Path,
+    archives: &Path,
+    architecture: Architecture,
+) -> Result<std::path::PathBuf> {
     if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
         return Err("portable build host qualification currently covers x86-64 Linux only".into());
     }
     crate::crypto_build::validate(root)?;
-    let inputs = crate::crypto_portable::inputs(root, archives)?;
+    let inputs = crate::crypto_portable::inputs_architecture(root, archives, architecture)?;
     let vendor = crate::host_bin::prepare_mail_vendor(root)?;
     let scratch = Scratch::new(root)?;
     let source = scratch.0.join("source");
@@ -2054,7 +2302,15 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         crate::sandbox::nar_hash_of(&vendor).map_err(|e| format!("hash portable vendor: {e}"))?;
     let kit_digest = crate::sandbox::nar_hash_of(&inputs.rust)
         .map_err(|e| format!("hash portable Rust: {e}"))?;
-    if kit_digest != "sha256:dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1" {
+    let expected_kit = match architecture {
+        Architecture::X86_64 => {
+            "sha256:dce3040c995d6572fd47df15fded5d5e3ea6c87455b5daef82f4dea2503942b1"
+        }
+        Architecture::Aarch64 => {
+            "sha256:b2ae2e0c6027aba063b7f280b7b2cd48710498553eb88b89ad64dbf0b8ede90e"
+        }
+    };
+    if kit_digest != expected_kit {
         return Err("prepared Rust kit differs from the qualified portable kit".into());
     }
     let helper_base = root.join(".td-build-cache/stage0");
@@ -2083,8 +2339,9 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
         .map_err(|e| format!("hash portable headers: {e}"))?;
     let helper_digest =
         crate::sandbox::nar_hash_of(&helper).map_err(|e| format!("hash portable helper: {e}"))?;
+    let target = architecture.triple();
     let mut receipt = format!(
-        "portable-build 1\nsource {source_digest}\nvendor {vendor_digest}\nrust-kit {kit_digest}\nheaders {header_digest}\nhelper {helper_digest}\ntarget {TARGET}\n"
+        "portable-build 1\nsource {source_digest}\nvendor {vendor_digest}\nrust-kit {kit_digest}\nheaders {header_digest}\nhelper {helper_digest}\ntarget {target}\n"
     );
     for input in inputs.native {
         binds.push(bind(&input.directory, input.inside, true)?);
@@ -2092,25 +2349,37 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     }
     enter(
         "/td-builder",
-        &["gate-crates".into(), "crypto-portable-build-inner".into()],
+        &[
+            "gate-crates".into(),
+            match architecture {
+                Architecture::X86_64 => "crypto-portable-build-inner".into(),
+                Architecture::Aarch64 => "crypto-portable-cross-build-inner".into(),
+            },
+        ],
         &binds,
         &scratch.0.join("compile"),
         false,
     )?;
     let artifacts = scratch.0.join("artifacts");
-    receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    qualify_artifacts(&artifacts)?;
-    let runtime = vec![
-        bind(&artifacts, "/artifacts", true)?,
-        bind(&helper, "/td-builder", true)?,
-    ];
-    enter(
-        "/td-builder",
-        &["gate-crates".into(), "crypto-portable-runtime-inner".into()],
-        &runtime,
-        &scratch.0.join("runtime"),
-        true,
-    )?;
+    receipt.push_str(&collect_artifacts_architecture(
+        &output,
+        &artifacts,
+        architecture,
+    )?);
+    qualify_artifacts_architecture(&artifacts, architecture)?;
+    if architecture == Architecture::X86_64 {
+        let runtime = vec![
+            bind(&artifacts, "/artifacts", true)?,
+            bind(&helper, "/td-builder", true)?,
+        ];
+        enter(
+            "/td-builder",
+            &["gate-crates".into(), "crypto-portable-runtime-inner".into()],
+            &runtime,
+            &scratch.0.join("runtime"),
+            true,
+        )?;
+    }
     for package in fs::read_dir(&vendor).map_err(|e| format!("read vendor notices: {e}"))? {
         let package = package.map_err(|e| format!("vendor notice entry: {e}"))?;
         if !package
@@ -2137,7 +2406,10 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     crate::crypto_portable::publish_tree(
         &artifacts,
         &root.join(".td-build-cache"),
-        "artifact",
+        match architecture {
+            Architecture::X86_64 => "artifact",
+            Architecture::Aarch64 => "artifact-aarch64-cross",
+        },
         &digest,
     )
 }
@@ -3101,6 +3373,13 @@ mod tests {
         assert!(collect_artifacts(&output, &scratch.0.join("bad-link")).is_err());
         fs::remove_file(source.join("COMMANDS")).unwrap();
         fs::write(source.join("COMMANDS"), vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert_eq!(
+            collect_artifacts(&output, &scratch.0.join("expanded"))
+                .unwrap()
+                .len(),
+            64 * 1024 + 1
+        );
+        fs::write(source.join("COMMANDS"), vec![b'x'; 256 * 1024 + 1]).unwrap();
         assert!(collect_artifacts(&output, &scratch.0.join("large")).is_err());
         fs::write(source.join("COMMANDS"), b"ok").unwrap();
         symlink(&outside, source.join("notices")).unwrap();
@@ -3308,6 +3587,55 @@ mod tests {
         assert!(!target.join("third_party/fiat/implementation.c").exists());
         symlink("LICENSE", source.join("NOTICE")).unwrap();
         assert!(retain_notices(&source, &scratch.0.join("bad"), 0).is_err());
+    }
+
+    #[test]
+    fn arm_cargo_selects_cross_tools_but_keeps_the_host_linker() {
+        let command = cargo_manifest_architecture(
+            "build",
+            Path::new("/source/td-mta/Cargo.toml"),
+            Architecture::Aarch64,
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.contains(&std::ffi::OsStr::new("aarch64-unknown-linux-musl")));
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for key in [
+            "CC",
+            "CC_aarch64-unknown-linux-musl",
+            "CC_aarch64_unknown_linux_musl",
+        ] {
+            assert_eq!(
+                env.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsStr::new(
+                    "/cross/bin/aarch64-linux-musl-gcc"
+                )))
+            );
+        }
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
+            )),
+            Some(&Some(std::ffi::OsStr::new("/td-crypto-host-linker")))
+        );
+        let flags = env
+            .get(std::ffi::OsStr::new("CFLAGS"))
+            .unwrap()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(flags.contains("/cross/lib/gcc/aarch64-linux-musl/14.3.0/include"));
+        assert!(flags.contains("-march=armv8-a"));
+        assert!(!flags.contains("-march=x86-64"));
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HOST_CC")),
+            Some(&Some(std::ffi::OsStr::new("/td-crypto-decoy")))
+        );
+        let rust_flags = rust_flags_architecture(Architecture::Aarch64);
+        assert!(rust_flags.contains("link-self-contained=no"));
+        assert!(rust_flags.contains("/self-contained/rcrt1.o"));
+        assert!(rust_flags.contains("link-arg=--no-dynamic-linker"));
+        assert!(rust_flags_architecture(Architecture::Aarch64).contains("target-cpu=generic"));
+        assert!(rust_flags_architecture(Architecture::Aarch64).contains("force-frame-pointers=yes"));
     }
 
     #[test]

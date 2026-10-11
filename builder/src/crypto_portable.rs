@@ -1,5 +1,6 @@
 //! Host-only, pinned inputs for the standalone musl artifact.
 
+use crate::crypto_headers::Architecture;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -10,7 +11,6 @@ use std::process::Command;
 type Result<T> = std::result::Result<T, String>;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
-const TARGET: &str = "x86_64-unknown-linux-musl";
 const DIST: &str = "https://static.rust-lang.org/dist/2026-05-28";
 
 struct Archive {
@@ -53,6 +53,32 @@ struct NativeInput {
     directory: &'static str,
     inside: &'static str,
 }
+
+const ARM_RUST: &[Archive] = &[Archive {
+    name: "rust-std-1.96.0-aarch64-unknown-linux-musl",
+    component: "rust-std-aarch64-unknown-linux-musl",
+    bytes: 27_278_268,
+    sha256: "e7d89a29abcc2cf2f31cfe3d898c1713fb12f395e788809d3b01b23fdd5813b4",
+}];
+
+fn rust_archives(architecture: Architecture) -> impl Iterator<Item = &'static Archive> {
+    RUST.iter()
+        .filter(move |pin| {
+            architecture == Architecture::X86_64
+                || pin.component != "rust-std-x86_64-unknown-linux-musl"
+        })
+        .chain(match architecture {
+            Architecture::X86_64 => [].iter(),
+            Architecture::Aarch64 => ARM_RUST.iter(),
+        })
+}
+
+const ARM_NATIVE: &[NativeInput] = &[NativeInput {
+    graph: "gcc-aarch64-cross",
+    recipe: "gcc-aarch64-cross",
+    directory: "",
+    inside: "/cross",
+}];
 
 const NATIVE: &[NativeInput] = &[
     NativeInput {
@@ -312,7 +338,7 @@ fn retain_native(
     Ok((destination, expected))
 }
 
-fn native_outputs(root: &Path) -> Result<Vec<NativeTree>> {
+fn native_outputs(root: &Path, architecture: Architecture) -> Result<Vec<NativeTree>> {
     let parent = root.join(".td-build-cache");
     let evaluator = crate::stage0::recipe_eval_place(root, &parent.join("recipe-eval"))?;
     let scratch = Scratch::new(&parent)?;
@@ -320,13 +346,24 @@ fn native_outputs(root: &Path) -> Result<Vec<NativeTree>> {
     eprintln!(
         "portable: realizing the declared td GNU inputs (a cold source bootstrap can take hours)"
     );
+    let selected: Vec<_> = NATIVE
+        .iter()
+        .chain(match architecture {
+            Architecture::X86_64 => [].iter(),
+            Architecture::Aarch64 => ARM_NATIVE.iter(),
+        })
+        .collect();
     let mut trees = Vec::new();
-    for graph in NATIVE
+    for graph in selected
         .iter()
         .map(|input| input.graph)
         .collect::<BTreeSet<_>>()
     {
-        let inputs: Vec<_> = NATIVE.iter().filter(|input| input.graph == graph).collect();
+        let inputs: Vec<_> = selected
+            .iter()
+            .copied()
+            .filter(|input| input.graph == graph)
+            .collect();
         let log =
             fs::File::create(&log_path).map_err(|e| format!("create native build log: {e}"))?;
         let mut command = Command::new(&evaluator);
@@ -461,9 +498,10 @@ fn copy_archive(source: &Path, destination: &Path, pin: &Archive) -> Result<()> 
         .map_err(|e| format!("flush private archive: {e}"))
 }
 
-fn rust_receipt() -> String {
-    let mut text = format!("portable-inputs 1\nhost {HOST}\ntarget {TARGET}\n");
-    for pin in RUST {
+fn rust_receipt(architecture: Architecture) -> String {
+    let target = architecture.triple();
+    let mut text = format!("portable-inputs 1\nhost {HOST}\ntarget {target}\n");
+    for pin in rust_archives(architecture) {
         text.push_str(&format!(
             "archive {DIST}/{}.tar.xz {} {}\n",
             pin.name, pin.bytes, pin.sha256
@@ -551,11 +589,11 @@ fn install_component(package: &Path, pin: &Archive, kit: &Path) -> Result<()> {
     Ok(())
 }
 
-fn prepare_rust(root: &Path, archives: &Path) -> Result<PathBuf> {
+fn prepare_rust(root: &Path, archives: &Path, architecture: Architecture) -> Result<PathBuf> {
     let parent = root.join(".td-build-cache");
     let scratch = Scratch::new(&parent)?;
     let kit = scratch.0.join("kit");
-    for pin in RUST {
+    for pin in rust_archives(architecture) {
         let filename = format!("{}.tar.xz", pin.name);
         let private = scratch.0.join(&filename);
         copy_archive(&archives.join(filename), &private, pin)?;
@@ -566,7 +604,7 @@ fn prepare_rust(root: &Path, archives: &Path) -> Result<PathBuf> {
         fs::remove_dir_all(&unpacked).map_err(|e| format!("remove extracted Rust input: {e}"))?;
         fs::remove_file(&private).map_err(|e| format!("remove private Rust archive: {e}"))?;
     }
-    fs::write(kit.join("PORTABLE-INPUTS"), rust_receipt())
+    fs::write(kit.join("PORTABLE-INPUTS"), rust_receipt(architecture))
         .map_err(|e| format!("write portable Rust receipt: {e}"))?;
     let expected = tree_hash(&kit)?;
     publish_tree(&kit, &parent, "rust-1.96.0", &expected)
@@ -578,16 +616,32 @@ pub(crate) struct Inputs {
     pub(crate) native: Vec<NativeTree>,
 }
 
-pub(crate) fn inputs(root: &Path, archives: &Path) -> Result<Inputs> {
+pub(crate) fn inputs_architecture(
+    root: &Path,
+    archives: &Path,
+    architecture: Architecture,
+) -> Result<Inputs> {
     Ok(Inputs {
-        rust: prepare_rust(root, archives)?,
-        headers: crate::crypto_headers::prepare(root, &archives.join("musl-1.2.5.tar.gz"))?,
-        native: native_outputs(root)?,
+        rust: prepare_rust(root, archives, architecture)?,
+        headers: crate::crypto_headers::prepare_architecture(
+            root,
+            &archives.join("musl-1.2.5.tar.gz"),
+            architecture,
+        )?,
+        native: native_outputs(root, architecture)?,
     })
 }
 
 pub(crate) fn prepare(root: &Path, archives: &Path) -> Result<()> {
-    let inputs = inputs(root, archives)?;
+    prepare_architecture(root, archives, Architecture::X86_64)
+}
+
+pub(crate) fn prepare_architecture(
+    root: &Path,
+    archives: &Path,
+    architecture: Architecture,
+) -> Result<()> {
+    let inputs = inputs_architecture(root, archives, architecture)?;
     println!("portable-rust {}", inputs.rust.display());
     println!("portable-musl-headers {}", inputs.headers.display());
     for tree in inputs.native {
@@ -607,6 +661,28 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn target_manifests_select_the_matching_standard_library() {
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let pins: Vec<_> = rust_archives(architecture).collect();
+            assert_eq!(pins.len(), 4);
+            assert_eq!(
+                pins.iter().filter(|pin| pin.component == "rustc").count(),
+                1
+            );
+            let component = format!("rust-std-{}", architecture.triple());
+            assert_eq!(
+                pins.iter().filter(|pin| pin.component == component).count(),
+                1
+            );
+            let receipt = rust_receipt(architecture);
+            assert!(receipt.contains(&format!("target {}\n", architecture.triple())));
+        }
+        assert!(!rust_receipt(Architecture::Aarch64)
+            .contains("rust-std-1.96.0-x86_64-unknown-linux-musl"));
+        assert!(!rust_receipt(Architecture::X86_64).contains("aarch64"));
+    }
 
     #[test]
     fn private_archive_bytes_must_match_the_pin() {

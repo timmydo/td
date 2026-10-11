@@ -3455,6 +3455,20 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
+        [op, flag, archives, arch_flag, arch]
+            if op == "crypto-portable-prepare" && flag == "--archives" && arch_flag == "--arch" =>
+        {
+            match crate::crypto_headers::Architecture::parse(arch).and_then(|architecture| {
+                crate::crypto_portable::prepare_architecture(
+                    &root,
+                    Path::new(archives),
+                    architecture,
+                )
+            }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         [op] if op == "crypto-portable-runtime-inner" => {
             match crate::crypto_isolated::runtime_inner() {
                 Ok(()) => ExitCode::SUCCESS,
@@ -3464,6 +3478,29 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
         [op] if op == "crypto-portable-build-inner" => {
             match crate::crypto_isolated::build_inner() {
                 Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op] if op == "crypto-portable-cross-build-inner" => {
+            match crate::crypto_isolated::cross_build_inner() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
+        [op, flag, archives] if op == "crypto-portable-cross-build" && flag == "--archives" => {
+            if let Err(e) = crate::crypto_build::validate(&root)
+                .and_then(|()| crate::check_loop::warm_mail_sources(&root))
+            {
+                return fail(&e);
+            }
+            match crate::crypto_isolated::cross_build(&root, Path::new(archives)) {
+                Ok(path) => {
+                    println!(
+                        "aarch64 cross-compiled artifact (runtime not tested by this command): {}",
+                        path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
                 Err(e) => fail(&e),
             }
         }
@@ -3525,8 +3562,11 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!(
                 "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz [--arch x86_64|aarch64]"
             );
-            eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY");
+            eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY [--arch x86_64|aarch64]");
             eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
+            eprintln!(
+                "       td-builder gate-crates crypto-portable-cross-build --archives DIRECTORY"
+            );
             eprintln!(concat!(
                 "       td-builder gate-crates native-compositor ",
                 "--manifest-path CRATE/Cargo.toml"

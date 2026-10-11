@@ -1032,12 +1032,16 @@ contact no external service and add no fixture dependency.
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.
 M03b2a implements checksum-pinned x86-64 musl header preparation as specified
-in `PORTABLE.md`. Its aarch64 extension prepares headers for the planned ARM
-artifact. Neither invokes a compiler or upstream script. M03b2b adds the
+in `PORTABLE.md`. Its aarch64 extension prepares the matching ARM headers.
+Neither header preparer invokes a compiler or upstream script. M03b2b adds the
 pinned host Rust kit and retained td GNU recipe outputs. M03b2c implements the
 isolated static musl build, packaging binary and clean-runtime smoke specified
 in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;
 M03b2d2 adds the bounded local TLS smoke specified in PORTABLE.md.
+The aarch64 cross-build uses the separately pinned target library and
+source-built cross tools described there. It checks static ELF architecture
+and API confinement but reports runtime untested; successful compilation
+is not x86-64 runtime or resource qualification.
 Reuse compatible reviewed pins without inheriting td-net's dependency set.
 Rustls and aws-lc-rs are direct dependencies only of td-crypto, resolving one
 AWS-LC version pair for entropy, comparison, P-256 signing and TLS. The owned

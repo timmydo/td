@@ -1,4 +1,5 @@
 //! Inspect the resolved public surface of the pinned compiler's diagnostic graph.
+use crate::crypto_headers::Architecture;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -184,14 +185,19 @@ impl<'a> Surface<'a> {
         }
     }
 }
+#[cfg(test)]
 pub(crate) fn inspect(document: &Json) -> Result<usize> {
+    inspect_architecture(document, Architecture::X86_64)
+}
+
+fn inspect_architecture(document: &Json, architecture: Architecture) -> Result<usize> {
     if number(field(document, "format_version")?)? != "57"
         || *field(document, "includes_private")? != Json::Bool(true)
     {
         return Err("API diagnostic requires Rust 1.96 schema 57 with private items".into());
     }
     let target = field(document, "target")?;
-    if text(field(target, "triple")?)? != "x86_64-unknown-linux-musl" {
+    if text(field(target, "triple")?)? != architecture.triple() {
         return Err("API diagnostic target differs from the portable target".into());
     }
     let mut enabled = BTreeSet::new();
@@ -204,8 +210,12 @@ pub(crate) fn inspect(document: &Json) -> Result<usize> {
             _ => return Err("API target feature lacks a boolean state".into()),
         }
     }
-    if enabled != BTreeSet::from(["fxsr", "sse", "sse2", "x87"]) {
-        return Err("API diagnostic CPU features differ from baseline x86-64".into());
+    let expected: BTreeSet<_> = cpu_features(architecture).iter().copied().collect();
+    if enabled != expected {
+        return Err(format!(
+            "API diagnostic CPU features {enabled:?} differ from {} baseline {expected:?}",
+            architecture.name()
+        ));
     }
     let index = table(field(document, "index")?)?;
     let root = field(document, "root")?;
@@ -261,7 +271,14 @@ fn parse(input: &str) -> Result<Json> {
     td_engine::json::parse(input).map_err(|e| format!("API JSON: {e}"))
 }
 
-fn compiler(program: &str, name: &str) -> Command {
+fn cpu_features(architecture: Architecture) -> &'static [&'static str] {
+    match architecture {
+        Architecture::X86_64 => &["fxsr", "sse", "sse2", "x87"],
+        Architecture::Aarch64 => &["neon", "outline-atomics"],
+    }
+}
+
+fn compiler(program: &str, name: &str, architecture: Architecture) -> Command {
     let mut command = Command::new(format!("/rust/bin/{program}"));
     command
         .current_dir("/tmp")
@@ -271,14 +288,14 @@ fn compiler(program: &str, name: &str) -> Command {
             "--edition",
             "2021",
             "--target",
-            "x86_64-unknown-linux-musl",
+            architecture.triple(),
             "--crate-name",
             name,
             "-Copt-level=3",
             "-Cdebug-assertions=off",
             "-Ldependency=/output/api",
         ])
-        .args(crate::crypto_isolated::rust_flags().split('\x1f'))
+        .args(crate::crypto_isolated::rust_flags_architecture(architecture).split('\x1f'))
         .stdin(Stdio::null());
     crate::host_bin::arm_check_child(&mut command);
     command
@@ -291,8 +308,14 @@ const CFG_GUARD: &[&str] = &[
 ];
 const PRIVATE_DEPENDENCIES: &[&str] = &["rustls", "aws_lc_rs", "webpki_roots"];
 
-fn diagnostic(name: &str, source: &Path, destination: &Path, library: &Path) -> Command {
-    let mut command = compiler("rustdoc", name);
+fn diagnostic(
+    name: &str,
+    source: &Path,
+    destination: &Path,
+    library: &Path,
+    architecture: Architecture,
+) -> Command {
+    let mut command = compiler("rustdoc", name, architecture);
     command
         .env("RUSTC_BOOTSTRAP", name)
         .args(CFG_GUARD)
@@ -311,9 +334,9 @@ fn diagnostic(name: &str, source: &Path, destination: &Path, library: &Path) -> 
     command
 }
 
-fn inspect_file(path: &Path) -> Result<usize> {
+fn inspect_file(path: &Path, architecture: Architecture) -> Result<usize> {
     let output = crate::crypto_isolated::read_output(path, "API JSON", 16 * 1024 * 1024)?;
-    inspect(&parse(&output)?)
+    inspect_architecture(&parse(&output)?, architecture)
 }
 
 fn cargo_diagnostic(
@@ -321,8 +344,10 @@ fn cargo_diagnostic(
     manifest: &Path,
     package: &str,
     structured_messages: bool,
+    architecture: Architecture,
 ) -> Command {
-    let mut command = crate::crypto_isolated::cargo_manifest(verb, manifest);
+    let mut command =
+        crate::crypto_isolated::cargo_manifest_architecture(verb, manifest, architecture);
     command
         .env("CARGO_TARGET_DIR", "/output/api-target")
         .args([
@@ -344,7 +369,7 @@ fn cargo_diagnostic(
             .env("RUSTC_BOOTSTRAP", package.replace('-', "_"))
             .env(
                 "CARGO_ENCODED_RUSTDOCFLAGS",
-                crate::crypto_isolated::rust_flags(),
+                crate::crypto_isolated::rust_flags_architecture(architecture),
             )
             .args([
                 "-Copt-level=3",
@@ -370,13 +395,17 @@ fn private_dependencies(command: &mut Command, package: &str, dependencies: &[&s
 
 /// Diagnose a second compilation; unstable options never produce shipping bytes.
 pub(crate) fn qualify(receipt: &mut String) -> Result<()> {
+    qualify_architecture(receipt, Architecture::X86_64)
+}
+
+pub(crate) fn qualify_architecture(receipt: &mut String, architecture: Architecture) -> Result<()> {
     let root = Path::new("/output/api");
     fs::create_dir(root).map_err(|e| format!("API scratch: {e}"))?;
     let manifest = Path::new("/source/td-mta/Cargo.toml");
-    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false);
+    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, architecture);
     crate::crypto_isolated::command_record(&command, "api-compile", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-compile", 8 * 1024 * 1024, 1200)?;
-    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false);
+    let mut command = cargo_diagnostic("rustc", manifest, "td-crypto", false, architecture);
     private_dependencies(&mut command, "td-crypto", PRIVATE_DEPENDENCIES);
     crate::crypto_isolated::command_record(&command, "api-private-dependencies", receipt)?;
     crate::crypto_isolated::bounded_output(
@@ -385,22 +414,24 @@ pub(crate) fn qualify(receipt: &mut String) -> Result<()> {
         8 * 1024 * 1024,
         1200,
     )?;
-    let mut command = cargo_diagnostic("rustdoc", manifest, "td-crypto", false);
+    let mut command = cargo_diagnostic("rustdoc", manifest, "td-crypto", false, architecture);
     crate::crypto_isolated::command_record(&command, "api-rustdoc", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-rustdoc", 8 * 1024 * 1024, 1200)?;
-    let count = inspect_file(Path::new(
-        "/output/api-target/x86_64-unknown-linux-musl/doc/td_crypto.json",
-    ))?;
-    fixtures(root)?;
-    cargo_fixtures(root, receipt)?;
+    let triple = architecture.triple();
+    let count = inspect_file(
+        Path::new(&format!("/output/api-target/{triple}/doc/td_crypto.json")),
+        architecture,
+    )?;
+    fixtures(root, architecture)?;
+    cargo_fixtures(root, receipt, architecture)?;
     receipt.push_str(&format!(
-        "api-schema 57\napi-target x86_64-unknown-linux-musl\napi-cpu-features fxsr,sse,sse2,x87\napi-reachable-items {count}\napi-fixtures {}\n",
-        FIXTURES.len()
+        "api-schema 57\napi-target {triple}\napi-cpu-features {}\napi-reachable-items {count}\napi-fixtures {}\n",
+        cpu_features(architecture).join(","), FIXTURES.len()
     ));
     Ok(())
 }
 
-fn cargo_fixtures(root: &Path, receipt: &mut String) -> Result<()> {
+fn cargo_fixtures(root: &Path, receipt: &mut String, architecture: Architecture) -> Result<()> {
     let manifest = root.join("Cargo.toml");
     let source = root.join("lib.rs");
     fs::write(&manifest, "[package]\nname=\"api_probe\"\nversion=\"0.0.0\"\nedition=\"2021\"\n[lib]\npath=\"lib.rs\"\n[dependencies]\napi_probe_backend={path=\"backend\"}\n[workspace]\n").map_err(|e| e.to_string())?;
@@ -413,16 +444,19 @@ fn cargo_fixtures(root: &Path, receipt: &mut String) -> Result<()> {
         "version=4\n[[package]]\nname=\"api_probe\"\nversion=\"0.0.0\"\ndependencies=[\"api_probe_backend\"]\n[[package]]\nname=\"api_probe_backend\"\nversion=\"0.0.0\"\n",
     )
     .map_err(|e| e.to_string())?;
-    fs::write(&source, "#[cfg(all(target_env=\"musl\",target_arch=\"x86_64\",target_feature=\"crt-static\",not(test)))] pub struct Qualified;").map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustdoc", &manifest, "api_probe", true);
+    fs::write(&source, format!("#[cfg(all(target_env=\"musl\",target_arch=\"{}\",target_feature=\"crt-static\",not(test)))] pub struct Qualified;", architecture.name())).map_err(|e| e.to_string())?;
+    let mut command = cargo_diagnostic("rustdoc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-target", receipt)?;
     crate::crypto_isolated::bounded_output(&mut command, "api-cargo-target", 8 * 1024 * 1024, 120)?;
     let document = parse(&crate::crypto_isolated::read_output(
-        Path::new("/output/api-target/x86_64-unknown-linux-musl/doc/api_probe.json"),
+        Path::new(&format!(
+            "/output/api-target/{}/doc/api_probe.json",
+            architecture.triple()
+        )),
         "Cargo API fixture",
         16 * 1024 * 1024,
     )?)?;
-    inspect(&document)?;
+    inspect_architecture(&document, architecture)?;
     if !object(field(&document, "index")?)?.iter().any(|(_, item)| {
         item.get("name").and_then(Json::as_str) == Some("Qualified")
             && item.get("visibility").and_then(Json::as_str) == Some("public")
@@ -430,7 +464,7 @@ fn cargo_fixtures(root: &Path, receipt: &mut String) -> Result<()> {
         return Err("Cargo rustdoc lost the static musl production cfg".into());
     }
     fs::write(&source, "#[cfg(not(doc))] pub struct Hidden;").map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-guard", receipt)?;
     let output = crate::crypto_isolated::bounded_exit_output(
         &mut command,
@@ -447,7 +481,7 @@ fn cargo_fixtures(root: &Path, receipt: &mut String) -> Result<()> {
         return Err("Cargo API guard did not produce the expected compiler error".into());
     }
     fs::write(&source, "pub trait Local {} impl dyn Local {pub fn leak(&self)->api_probe_backend::Key {api_probe_backend::Key}}").map_err(|e| e.to_string())?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     crate::crypto_isolated::command_record(&command, "api-cargo-private-baseline", receipt)?;
     crate::crypto_isolated::bounded_output(
         &mut command,
@@ -455,7 +489,7 @@ fn cargo_fixtures(root: &Path, receipt: &mut String) -> Result<()> {
         8 * 1024 * 1024,
         120,
     )?;
-    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true);
+    let mut command = cargo_diagnostic("rustc", &manifest, "api_probe", true, architecture);
     private_dependencies(&mut command, "api_probe", &["api_probe_backend"]);
     crate::crypto_isolated::command_record(&command, "api-cargo-private", receipt)?;
     let output = crate::crypto_isolated::bounded_exit_output(
@@ -621,11 +655,11 @@ const FIXTURES: &[(&str, &str, bool)] = &[
     ),
 ];
 
-fn fixtures(root: &Path) -> Result<()> {
+fn fixtures(root: &Path, architecture: Architecture) -> Result<()> {
     let leaf = root.join("leaf.rs");
     fs::write(&leaf, "pub struct Leaf;").map_err(|e| e.to_string())?;
     let leaf_library = root.join("libfake_leaf.rlib");
-    let mut command = compiler("rustc", "fake_leaf");
+    let mut command = compiler("rustc", "fake_leaf", architecture);
     command
         .args(["--crate-type", "lib"])
         .arg(&leaf)
@@ -635,7 +669,7 @@ fn fixtures(root: &Path) -> Result<()> {
     let backend = root.join("backend.rs");
     fs::write(&backend, "pub struct Key; pub use fake_leaf::Leaf; pub trait Foreign {} #[macro_export] macro_rules! expose {()=>{#[cfg(not(doc))] pub use fake_backend::Key;}}").map_err(|e| e.to_string())?;
     let library = root.join("libfake_backend.rlib");
-    let mut command = compiler("rustc", "fake_backend");
+    let mut command = compiler("rustc", "fake_backend", architecture);
     command
         .args(["--crate-type", "lib"])
         .arg("--extern")
@@ -649,7 +683,7 @@ fn fixtures(root: &Path) -> Result<()> {
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         let input = directory.join("lib.rs");
         fs::write(&input, source).map_err(|e| e.to_string())?;
-        let mut command = compiler("rustc", "api_fixture");
+        let mut command = compiler("rustc", "api_fixture", architecture);
         command
             .args(["--crate-type", "lib", "--extern"])
             .arg(format!("fake_backend={}", library.display()))
@@ -663,7 +697,7 @@ fn fixtures(root: &Path) -> Result<()> {
             256 * 1024,
             30,
         )?;
-        let mut command = compiler("rustc", "api_fixture");
+        let mut command = compiler("rustc", "api_fixture", architecture);
         command
             .args(CFG_GUARD)
             .args(["--crate-type", "lib", "--extern"])
@@ -706,7 +740,7 @@ fn fixtures(root: &Path) -> Result<()> {
             }
             continue;
         }
-        let mut command = compiler("rustc", "api_fixture");
+        let mut command = compiler("rustc", "api_fixture", architecture);
         command
             .args(["--crate-type", "lib", "--extern"])
             .arg(format!("fake_backend={}", library.display()))
@@ -747,14 +781,14 @@ fn fixtures(root: &Path) -> Result<()> {
         if matches!(*name, "dyn_inherent" | "dyn_trait_arg" | "dyn_transitive") {
             continue;
         }
-        let mut command = diagnostic("api_fixture", &input, &directory, &library);
+        let mut command = diagnostic("api_fixture", &input, &directory, &library, architecture);
         crate::crypto_isolated::bounded_output(
             &mut command,
             &format!("api-{name}-doc"),
             256 * 1024,
             30,
         )?;
-        let result = inspect_file(&directory.join("api_fixture.json"));
+        let result = inspect_file(&directory.join("api_fixture.json"), architecture);
         match (allowed, result) {
             (true, Ok(_)) => {}
             (false, Err(error))
@@ -784,6 +818,35 @@ mod tests {
             "external_crates":{{"1":{{"name":"{external}"}}}}}}"#
         ))
         .expect("fixture JSON")
+    }
+
+    #[test]
+    fn arm_diagnostics_require_arm_target_and_baseline_features() {
+        let mut document = graph(r#"{"use":{"id":2}}"#, "std");
+        let Json::Obj(fields) = &mut document else {
+            panic!("fixture object");
+        };
+        let target = fields
+            .iter_mut()
+            .find(|(name, _)| name == "target")
+            .unwrap();
+        target.1 = parse(
+            r#"{"triple":"aarch64-unknown-linux-musl","target_features":[
+                {"name":"outline-atomics","globally_enabled":true},
+                {"name":"neon","globally_enabled":true}]}"#,
+        )
+        .unwrap();
+        assert!(inspect_architecture(&document, Architecture::Aarch64).is_ok());
+        assert!(inspect_architecture(&document, Architecture::X86_64).is_err());
+        let base = document.to_canonical();
+        for altered in [
+            base.replace("aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"),
+            base.replace("\"neon\"", "\"aes\""),
+            base.replace("\"globally_enabled\":true", "\"globally_enabled\":false"),
+        ] {
+            let altered = parse(&altered).unwrap();
+            assert!(inspect_architecture(&altered, Architecture::Aarch64).is_err());
+        }
     }
 
     #[test]
