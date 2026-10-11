@@ -800,7 +800,11 @@ trusted public key, admitted by the same reader as `format --trusted-key`
 and refused unless it is the 64 hexadecimal digits td-boot decodes (a
 stricter rule than `format` applies, since a key the selector cannot
 read makes an unbootable disk), and the validated volume identity, using `engine/src/cpio.rs`, and leaves
-the verified base template's bytes unchanged. The shared
+the verified base template's bytes unchanged. The appended archive is
+built by `td-boot/src/selector_appendix.rs`, which the storage worker's
+selector update and the installed selector's staged-update commit
+compile too, so the commit rebuilds exactly the bytes the worker staged
+(ENCRYPTION.md "Selector update"). The shared
 EFI copier pins the input and rejects size changes; exclusive output
 creation cannot overwrite an existing destination. This preparation
 belongs before raw formatting and supplies no destructive authority.
@@ -2135,7 +2139,7 @@ which ones is written down in `TARGET_INCLUDED_ENGINE_SOURCES`:
 | `sha256.rs` | td-boot, td-update, td-install live ESP kernel check and its td-tpm rlib, td-authd, td-secret, td-firstboot, td-compositor corpus verifier, td-ui terminal corpus |
 | `crc32.rs` | td-install (via gpt) |
 | `gpt.rs` | td-install |
-| `cpio.rs` | td-install selector identity preparation |
+| `cpio.rs` | td-install selector identity preparation, td-boot's selector appendix |
 | `fat.rs` | td-install |
 | `ed25519.rs` | td-boot, td-net's `cfg(test)` ring differential |
 | `sha512.rs` | td-boot (pair with ed25519), td-net's ring differential |

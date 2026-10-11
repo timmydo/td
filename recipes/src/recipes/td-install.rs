@@ -35,6 +35,7 @@ const LOOP_SYS_RS: &str = include_str!("../../../td-install/src/loop_sys.rs");
 const LOOP_DEVICE_RS: &str = include_str!("../../../td-install/src/loop_device.rs");
 const DEVICE_BOUND_RS: &str = include_str!("../../../td-install/src/device_bound.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
+const SELECTOR_APPENDIX_RS: &str = include_str!("../../../td-boot/src/selector_appendix.rs");
 const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
 const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
 const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
@@ -390,6 +391,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/protocol.rs".into(),
             content: PROTOCOL_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/selector_appendix.rs".into(),
+            content: SELECTOR_APPENDIX_RS.into(),
             exec: false,
         },
         Step::WriteFile {

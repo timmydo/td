@@ -20,6 +20,7 @@ const ADMISSION_RS: &str = include_str!("../../../td-boot/src/admission.rs");
 const ADMIT_RS: &str = include_str!("../../../td-boot/src/admit.rs");
 const AUTHENTICODE_RS: &str = include_str!("../../../td-boot/src/authenticode.rs");
 const EVENTLOG_RS: &str = include_str!("../../../td-boot/src/eventlog.rs");
+const SELECTOR_APPENDIX_RS: &str = include_str!("../../../td-boot/src/selector_appendix.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
@@ -34,6 +35,7 @@ const CONSOLE_RS: &str = include_str!("../../../td-init/src/console.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
+const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
 /// td-tpm's files and td-fido's, whose P-256, AES and HMAC-SHA256 td-tpm's
 /// sessions use, each crate's whole `src` (test-only files included, as
 /// the staging test below holds). td-protector's PIN derivation also
@@ -219,6 +221,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-boot/src/selector_appendix.rs".into(),
+            content: SELECTOR_APPENDIX_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-boot/src/cap.rs".into(),
             content: CAP_RS.into(),
             exec: false,
@@ -291,6 +298,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-json/src/arena.rs".into(),
             content: JSON_ARENA_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/cpio.rs".into(),
+            content: CPIO_RS.into(),
             exec: false,
         },
         Step::WriteFile {

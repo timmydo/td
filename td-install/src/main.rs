@@ -35,6 +35,10 @@ mod fat;
 #[path = "../../engine/src/gpt.rs"]
 #[allow(dead_code)]
 mod gpt;
+// The selector appendix, shared with td-boot's staged-update commit, which
+// rebuilds it to authenticate a staged `INITRD.NEW`.
+#[path = "../../td-boot/src/selector_appendix.rs"]
+mod selector_appendix;
 // A live installation checks the kernel it copies to the ESP against the
 // manifest its plan names (DESIGN.md "Executing a consented installation").
 // Only the hasher and hex encoder are used here; `sha256_file` serves its other
@@ -383,9 +387,7 @@ fn digest_range(file: &mut File, offset: u64, len: u64) -> io::Result<[u8; 32]> 
 
 /// Admit the complete EFI input before creating the selector copy.
 fn selector_join_padding(len: u64, appendix_bytes: usize) -> io::Result<usize> {
-    let length =
-        usize::try_from(len).map_err(|_| invalid("selector template is too large".into()))?;
-    let padding = cpio::alignment_padding(length);
+    let padding = selector_appendix::padding(len).map_err(invalid)?;
     let total = len
         .checked_add(padding as u64)
         .and_then(|size| size.checked_add(appendix_bytes as u64))
@@ -485,7 +487,7 @@ fn selector_parts(
     uuid: &VolumeUuid,
 ) -> io::Result<SelectorParts> {
     let key = read_trusted_key(trusted_key)?;
-    let appendix = selector_appendix(&key, uuid, false)
+    let appendix = selector_appendix::appendix(&key, &uuid.0, false)
         .map_err(|error| invalid(format!("{}: {error}", trusted_key.display())))?;
     let (file, metadata) = td_fs::open_real_file(template, "selector template")?;
     let len = metadata.len();
@@ -508,7 +510,7 @@ fn selector_bytes(
     uuid: &VolumeUuid,
     measured: bool,
 ) -> io::Result<Vec<u8>> {
-    let appendix = selector_appendix(key, uuid, measured).map_err(invalid)?;
+    let appendix = selector_appendix::appendix(key, &uuid.0, measured).map_err(invalid)?;
     let padding = selector_join_padding(template.len() as u64, appendix.len())?;
     let zeros = [0u8; 3];
     let padding = zeros
@@ -522,60 +524,6 @@ fn selector_bytes(
     bytes.extend_from_slice(padding);
     bytes.extend_from_slice(&appendix);
     Ok(bytes)
-}
-
-/// The archive preparing a selector appends: the trust root, the volume
-/// identity it boots and, when `measured`, the deployment measurement
-/// policy. A key the booted selector could not decode makes an unbootable
-/// disk, found only after the destructive write, so its shape is refused
-/// here by td-boot's rule: 64 hex digits once surrounding whitespace is
-/// gone.
-fn selector_appendix(key: &[u8], uuid: &VolumeUuid, measured: bool) -> Result<Vec<u8>, String> {
-    let digits = key.trim_ascii();
-    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
-        return Err("trusted deployment key is not 64 hexadecimal digits".into());
-    }
-    let uuid_line = format!("{}\n", uuid.0);
-    let mut members: Vec<(&str, &[u8])> = vec![
-        (protocol::TRUSTED_KEY_PATH, key),
-        (protocol::VOLUME_UUID_PATH, uuid_line.as_bytes()),
-    ];
-    if measured {
-        members.push((
-            protocol::MEASUREMENT_POLICY_PATH,
-            protocol::MEASUREMENT_POLICY,
-        ));
-    }
-    let mut entries: Vec<cpio::Entry> = Vec::new();
-    for (path, bytes) in members {
-        // Every proper directory prefix, shallowest first and once: the
-        // kernel creates nothing under a parent the archive does not name.
-        let mut end = 0usize;
-        while let Some(slash) = path.get(end..).and_then(|tail| tail.find('/')) {
-            end = end
-                .checked_add(slash)
-                .ok_or_else(|| String::from("selector parent offset overflow"))?;
-            let parent = path
-                .get(..end)
-                .ok_or_else(|| String::from("invalid selector parent"))?;
-            if !entries.iter().any(|entry| entry.name == parent) {
-                entries.push(cpio::Entry {
-                    name: parent,
-                    mode: 0o755,
-                    kind: cpio::Kind::Directory,
-                });
-            }
-            end = end
-                .checked_add(1)
-                .ok_or_else(|| String::from("selector parent offset overflow"))?;
-        }
-        entries.push(cpio::Entry {
-            name: path,
-            mode: 0o644,
-            kind: cpio::Kind::File(bytes),
-        });
-    }
-    cpio::build(&entries)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -8555,109 +8503,116 @@ mod tests {
     /// because that is the half the scan below keys on.
     const ALLOW: &str = concat!("#[all", "ow(clippy::disallowed_methods)]");
 
-    /// The twelve files this binary compiles, with the item each allow in
+    /// The files this binary compiles, with the item each allow in
     /// them must sit on. Shared pure modules and test-only scratch have none;
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 23] {
-        [
-            ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
-            (
-                "real_file.rs",
-                include_str!("../../td-fs/src/real_file.rs"),
-                TD_FS_CHOKE.as_slice(),
-            ),
-            (
-                "gpt.rs",
-                include_str!("../../engine/src/gpt.rs"),
-                [].as_slice(),
-            ),
-            (
-                "fat.rs",
-                include_str!("../../engine/src/fat.rs"),
-                [].as_slice(),
-            ),
-            (
-                "cpio.rs",
-                include_str!("../../engine/src/cpio.rs"),
-                [].as_slice(),
-            ),
-            (
-                "crc32.rs",
-                include_str!("../../engine/src/crc32.rs"),
-                [].as_slice(),
-            ),
-            (
-                "sha256.rs",
-                include_str!("../../engine/src/sha256.rs"),
-                SHA256_CHOKE.as_slice(),
-            ),
-            (
-                "protocol.rs",
-                include_str!("../../td-boot/src/protocol.rs"),
-                [].as_slice(),
-            ),
-            ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
-            ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
-            (
-                "installation_plan.rs",
-                include_str!("installation_plan.rs"),
-                [].as_slice(),
-            ),
-            (
-                "installation_protocol.rs",
-                include_str!("installation_protocol.rs"),
-                [].as_slice(),
-            ),
-            (
-                "installation_service.rs",
-                include_str!("installation_service.rs"),
-                [].as_slice(),
-            ),
-            (
-                "installation_consent.rs",
-                include_str!("installation_consent.rs"),
-                [].as_slice(),
-            ),
-            ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
-            (
-                "hostname.rs",
-                include_str!("../../td-firstboot/src/hostname.rs"),
-                [].as_slice(),
-            ),
-            ("loop_sys.rs", include_str!("loop_sys.rs"), [].as_slice()),
-            (
-                "loop_device.rs",
-                include_str!("loop_device.rs"),
-                [].as_slice(),
-            ),
-            (
-                "device_bound.rs",
-                include_str!("device_bound.rs"),
-                [].as_slice(),
-            ),
-            (
-                "consent.rs",
-                include_str!("../../td-authd/src/consent.rs"),
-                [].as_slice(),
-            ),
-            (
-                "frames.rs",
-                include_str!("../../td-secret/src/frames.rs"),
-                [].as_slice(),
-            ),
-            (
-                "memory.rs",
-                include_str!("../../td-secret/src/memory.rs"),
-                [].as_slice(),
-            ),
-            (
-                "storage_operation.rs",
-                include_str!("storage_operation.rs"),
-                [].as_slice(),
-            ),
-        ]
+    const COMPILED_FILES: &[Compiled] = &[
+        ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
+        (
+            "real_file.rs",
+            include_str!("../../td-fs/src/real_file.rs"),
+            TD_FS_CHOKE.as_slice(),
+        ),
+        (
+            "gpt.rs",
+            include_str!("../../engine/src/gpt.rs"),
+            [].as_slice(),
+        ),
+        (
+            "fat.rs",
+            include_str!("../../engine/src/fat.rs"),
+            [].as_slice(),
+        ),
+        (
+            "cpio.rs",
+            include_str!("../../engine/src/cpio.rs"),
+            [].as_slice(),
+        ),
+        (
+            "selector_appendix.rs",
+            include_str!("../../td-boot/src/selector_appendix.rs"),
+            [].as_slice(),
+        ),
+        (
+            "crc32.rs",
+            include_str!("../../engine/src/crc32.rs"),
+            [].as_slice(),
+        ),
+        (
+            "sha256.rs",
+            include_str!("../../engine/src/sha256.rs"),
+            SHA256_CHOKE.as_slice(),
+        ),
+        (
+            "protocol.rs",
+            include_str!("../../td-boot/src/protocol.rs"),
+            [].as_slice(),
+        ),
+        ("scratch.rs", include_str!("scratch.rs"), [].as_slice()),
+        ("inventory.rs", include_str!("inventory.rs"), [].as_slice()),
+        (
+            "installation_plan.rs",
+            include_str!("installation_plan.rs"),
+            [].as_slice(),
+        ),
+        (
+            "installation_protocol.rs",
+            include_str!("installation_protocol.rs"),
+            [].as_slice(),
+        ),
+        (
+            "installation_service.rs",
+            include_str!("installation_service.rs"),
+            [].as_slice(),
+        ),
+        (
+            "installation_consent.rs",
+            include_str!("installation_consent.rs"),
+            [].as_slice(),
+        ),
+        ("timezones.rs", include_str!("timezones.rs"), [].as_slice()),
+        (
+            "hostname.rs",
+            include_str!("../../td-firstboot/src/hostname.rs"),
+            [].as_slice(),
+        ),
+        ("loop_sys.rs", include_str!("loop_sys.rs"), [].as_slice()),
+        (
+            "loop_device.rs",
+            include_str!("loop_device.rs"),
+            [].as_slice(),
+        ),
+        (
+            "device_bound.rs",
+            include_str!("device_bound.rs"),
+            [].as_slice(),
+        ),
+        (
+            "consent.rs",
+            include_str!("../../td-authd/src/consent.rs"),
+            [].as_slice(),
+        ),
+        (
+            "frames.rs",
+            include_str!("../../td-secret/src/frames.rs"),
+            [].as_slice(),
+        ),
+        (
+            "memory.rs",
+            include_str!("../../td-secret/src/memory.rs"),
+            [].as_slice(),
+        ),
+        (
+            "storage_operation.rs",
+            include_str!("storage_operation.rs"),
+            [].as_slice(),
+        ),
+    ];
+
+    fn compiled_files() -> impl Iterator<Item = Compiled> {
+        COMPILED_FILES.iter().copied()
     }
 
     /// THE LIST ABOVE IS HAND-KEPT, and an additional file compiled into this
@@ -8681,27 +8636,26 @@ mod tests {
         let text = uncommented(include_str!("main.rs"));
         let source = unspaced(&text);
         let source = source.as_str();
-        let labels: Vec<&str> = compiled_files()
-            .iter()
-            .map(|(label, _, _)| *label)
-            .collect();
+        let labels: Vec<&str> = compiled_files().map(|(label, _, _)| label).collect();
         // The TABLE's own body, because `include_str!` below has to bind a
         // declaration to the file the guards read and a `contains` over the
         // whole source binds it to any TEXT: review spelled the missing
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 23] {";
+            const HEAD: &str = "const COMPILED_FILES: &[Compiled] = &[";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
-            let tail = text.get(at..).unwrap_or_default();
-            let mut depth = 0usize;
+            let tail = text
+                .get(at.saturating_add(HEAD.len())..)
+                .unwrap_or_default();
+            let mut depth = 1usize;
             let mut end = tail.len();
             for (n, c) in tail.char_indices() {
                 match c {
-                    '{' => depth = depth.saturating_add(1),
-                    '}' => {
+                    '[' => depth = depth.saturating_add(1),
+                    ']' => {
                         depth = depth.saturating_sub(1);
                         if depth == 0 {
                             end = n;

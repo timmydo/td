@@ -324,7 +324,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/cpio.rs",
-        "td-recipe-eval's boot oracles and target-static td-install selector identity preparation; td-builder does not use it",
+        "td-recipe-eval's boot oracles, target-static td-install selector identity preparation and target-static td-boot's selector appendix; td-builder does not use it",
     ),
     (
         "engine/src/fat.rs",
@@ -2488,6 +2488,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
+    assert_contains!("engine/src/cpio.rs", "target-static td-boot");
     assert_contains!("engine/src/sha256.rs", "td-install (its live installation");
     assert_contains!("engine/src/ed25519.rs", "target-static td-boot");
     assert_contains!("engine/src/sha512.rs", "target-static td-boot");

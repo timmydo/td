@@ -22,6 +22,10 @@ mod admit;
 mod authenticode;
 #[path = "cap.rs"]
 mod cap;
+// engine's newc writer, for the selector appendix below.
+#[path = "../../engine/src/cpio.rs"]
+#[allow(dead_code, reason = "the selector update's commit calls it")]
+mod cpio;
 // Which terminal `/dev/console` is, td-init's, shared with its secret-line
 // applet: it lives outside this crate, so the `#[path]` is required, and the
 // recipe stages it at `{src}/td-init/src/console.rs`.
@@ -38,6 +42,11 @@ mod measurement;
 #[path = "mirror.rs"]
 mod mirror;
 mod protocol;
+// The archive preparing a selector appends, shared with td-install by its
+// path; 8e's staged-update commit rebuilds it to authenticate `INITRD.NEW`.
+#[path = "selector_appendix.rs"]
+#[allow(dead_code, reason = "the selector update's commit calls it")]
+mod selector_appendix;
 #[path = "selector_release.rs"]
 mod selector_release;
 #[path = "unlock.rs"]
