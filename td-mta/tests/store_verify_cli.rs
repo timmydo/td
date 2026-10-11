@@ -1386,9 +1386,12 @@ impl Drop for ReceivingProcess {
 }
 impl ReceivingProcess {
     fn start(fixture: &ConfigFixture) -> Self {
+        Self::profile(fixture, "smtp-only")
+    }
+    fn profile(fixture: &ConfigFixture, profile: &str) -> Self {
         use std::io::BufRead;
         let mut child = Command::new(mail_binary())
-            .args(["serve", "--smtp-only", "--config"])
+            .args(["serve", &format!("--{profile}"), "--config"])
             .arg(fixture.path("td-mta.conf"))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -1411,7 +1414,10 @@ impl ReceivingProcess {
             .recv_timeout(std::time::Duration::from_secs(15))
             .unwrap();
         assert!(line.contains("\"status\":\"ready\""), "{line}");
-        assert!(line.contains("\"profile\":\"smtp-only\""), "{line}");
+        assert!(
+            line.contains(&format!("\"profile\":\"{profile}\"")),
+            "{line}"
+        );
         process
     }
 }
@@ -1938,5 +1944,173 @@ fn device_cli_creates_once_revokes_durably_and_obeys_store_lock() {
         .try_lock()
         .unwrap();
     let devices = td_mta::store_fs::DeviceStore::open(&mut devices_root, ACCOUNT).unwrap();
+    assert_eq!(devices.authenticate(password.as_bytes()).unwrap(), None);
+}
+
+#[test]
+fn mailbox_profile_runs_live_device_commands_and_stops_cleanly() {
+    if private_case("mailbox_profile_runs_live_device_commands_and_stops_cleanly") {
+        return;
+    }
+    let fixture = ConfigFixture::new();
+    let runtime = Fixture::new();
+    let logs = Fixture::new();
+    for name in ["ingress", "devices"] {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(fixture.data.0.join(name))
+            .unwrap();
+    }
+    let smtp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let https = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let https_address = https.local_addr().unwrap();
+    let source = fs::read_to_string(fixture.path("td-mta.conf"))
+        .unwrap()
+        .replace("127.0.0.1:2525", &smtp.local_addr().unwrap().to_string())
+        .replace("127.0.0.1:8443", &https_address.to_string())
+        .replace(
+            "https://localhost:8443",
+            &format!("https://localhost:{}", https_address.port()),
+        )
+        .replace(
+            "[paths]",
+            &format!(
+                "[paths]\nruntime = \"{}\"\nlogs = \"{}\"",
+                runtime.0.display(),
+                logs.0.display()
+            ),
+        );
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
+    let account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let init = Command::new(mail_binary())
+        .args(["store", "init", "--root"])
+        .arg(&fixture.data.0)
+        .args(["--account", account])
+        .output()
+        .unwrap();
+    report_command(&init, 0, "store.init");
+    let initial = Command::new(mail_binary())
+        .args(["device", "create", "--root"])
+        .arg(&fixture.data.0)
+        .args(["--account", account, "--label", "initial"])
+        .output()
+        .unwrap();
+    report_command(&initial, 0, "device.create");
+    fixture.write(
+        "td-mta.conf",
+        source
+            .replace(
+                &https_address.to_string(),
+                &format!("[::1]:{}", https_address.port()),
+            )
+            .as_bytes(),
+        0o644,
+    );
+    let unsupported = Command::new(mail_binary())
+        .args(["serve", "--mailbox-access", "--config"])
+        .arg(fixture.path("td-mta.conf"))
+        .output()
+        .unwrap();
+    let refusal = report_command(&unsupported, 1, "serve");
+    assert_eq!(
+        refusal.get("error").and_then(td_json::Json::as_str),
+        Some("unsupported-listener")
+    );
+    fixture.write("td-mta.conf", source.as_bytes(), 0o644);
+    drop(smtp);
+    drop(https);
+    let mut process = ReceivingProcess::profile(&fixture, "mailbox-access");
+    let status = Command::new(mail_binary())
+        .args(["status", "--json", "--require-ready", "--runtime"])
+        .arg(&runtime.0)
+        .output()
+        .unwrap();
+    let json = report_command(&status, 0, "status");
+    assert_eq!(
+        json.get("profile").unwrap().as_str(),
+        Some("mailbox-access")
+    );
+    let live = |operation| {
+        let mut command = Command::new(mail_binary());
+        command
+            .args(["device", operation, "--runtime"])
+            .arg(&runtime.0);
+        command
+    };
+    let created = live("create")
+        .args(["--label", "live client α"])
+        .output()
+        .unwrap();
+    let receipt = report_command(&created, 0, "device.create");
+    let id = receipt.get("deviceId").unwrap().as_str().unwrap();
+    let password = receipt.get("password").unwrap().as_str().unwrap();
+    assert_eq!(password.len(), 97);
+    let listed = live("list").output().unwrap();
+    let ids = report_command(&listed, 0, "device.list");
+    assert_eq!(ids.get("deviceIds").unwrap().as_arr().unwrap().len(), 2);
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains(password));
+    let refused = Command::new(mail_binary())
+        .args(["device", "revoke", "--root"])
+        .arg(&fixture.data.0)
+        .args(["--account", account, "--id", id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        report_command(&refused, 1, "device.revoke")
+            .get("error")
+            .unwrap()
+            .as_str(),
+        Some("busy")
+    );
+    report_command(
+        &live("revoke").args(["--id", id]).output().unwrap(),
+        0,
+        "device.revoke",
+    );
+    report_command(
+        &Command::new(mail_binary())
+            .args(["stop", "--runtime"])
+            .arg(&runtime.0)
+            .output()
+            .unwrap(),
+        0,
+        "stop",
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = process.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut failed_process = ReceivingProcess::profile(&fixture, "mailbox-access");
+    let pending = fixture.data.0.join("devices/records.v1.pending");
+    fs::DirBuilder::new().mode(0o700).create(&pending).unwrap();
+    report_command(
+        &live("create")
+            .args(["--label", "publication failure"])
+            .output()
+            .unwrap(),
+        1,
+        "device.create",
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = failed_process.child.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fs::remove_dir(pending).unwrap();
+    let mut root = PrivateRoot::open(fixture.data.0.join("devices").to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let devices =
+        td_mta::store_fs::DeviceStore::open(&mut root, AccountId::parse(account).unwrap()).unwrap();
     assert_eq!(devices.authenticate(password.as_bytes()).unwrap(), None);
 }

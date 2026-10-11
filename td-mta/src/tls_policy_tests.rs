@@ -5,6 +5,8 @@ mod client_starttls_tests;
 mod client_tests;
 #[path = "tls_gateway_process_tests.rs"]
 mod gateway_process_tests;
+#[path = "https_tests.rs"]
+mod https_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
 #[path = "smtp_receiving_tests.rs"]

@@ -8,17 +8,22 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 use td_mta::{
+    ports::Clock,
     smtp_receiving::{Control, State},
-    store_fs::{LockedRoot, PrivateRoot},
+    store_fs::{DeviceStore, LockedRoot, PrivateRoot},
 };
 
 const NAME: &str = "smtp-control.sock";
 const TURN: Duration = Duration::from_millis(100);
 const EXCHANGE: Duration = Duration::from_secs(2);
+const DEVICE_WAIT: Duration = Duration::from_secs(30);
 
 pub(super) struct Endpoint {
     listener: UnixListener,
@@ -73,7 +78,12 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    pub(super) fn run(&self, control: &Control, finished: &AtomicBool) -> io::Result<()> {
+    pub(super) fn run(
+        &self,
+        control: &Control,
+        finished: &AtomicBool,
+        devices: Option<&Devices<'_, '_>>,
+    ) -> io::Result<()> {
         let mut retry_at = Instant::now();
         while !finished.load(Ordering::Acquire) {
             if super::signal_sys::requested()? {
@@ -86,7 +96,7 @@ impl Endpoint {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
                     // One private operator request; neither storage nor SMTP waits on it.
-                    let _ = exchange(&mut stream, control);
+                    let _ = exchange(&mut stream, control, devices);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(TURN);
@@ -139,7 +149,10 @@ fn io_failure(error: io::Error) -> ConfigFailure {
     )
 }
 fn remaining(start: Instant) -> io::Result<Duration> {
-    EXCHANGE
+    remaining_with_limit(start, EXCHANGE)
+}
+fn remaining_with_limit(start: Instant, limit: Duration) -> io::Result<Duration> {
+    limit
         .checked_sub(start.elapsed())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| io::ErrorKind::TimedOut.into())
@@ -147,12 +160,21 @@ fn remaining(start: Instant) -> io::Result<Duration> {
 fn line<'a>(
     stream: &mut UnixStream,
     start: Instant,
-    bytes: &'a mut [u8; 16],
+    bytes: &'a mut [u8],
     eof: bool,
+) -> io::Result<&'a [u8]> {
+    line_with_limit(stream, start, bytes, eof, EXCHANGE)
+}
+fn line_with_limit<'a>(
+    stream: &mut UnixStream,
+    start: Instant,
+    bytes: &'a mut [u8],
+    eof: bool,
+    limit: Duration,
 ) -> io::Result<&'a [u8]> {
     let mut used = 0;
     loop {
-        stream.set_read_timeout(Some(remaining(start)?))?;
+        stream.set_read_timeout(Some(remaining_with_limit(start, limit)?))?;
         let tail = bytes.get_mut(used..).ok_or(io::ErrorKind::InvalidData)?;
         if tail.is_empty() {
             return Err(io::ErrorKind::InvalidData.into());
@@ -185,10 +207,18 @@ fn send(stream: &mut UnixStream, start: Instant, mut bytes: &[u8]) -> io::Result
     }
     Ok(())
 }
-fn exchange(stream: &mut UnixStream, control: &Control) -> io::Result<()> {
+fn exchange(
+    stream: &mut UnixStream,
+    control: &Control,
+    devices: Option<&Devices<'_, '_>>,
+) -> io::Result<()> {
     let start = Instant::now();
-    let mut bytes = [0; 16];
-    let response: &[u8] = match line(stream, start, &mut bytes, true)? {
+    let mut bytes = [0; 256];
+    let request = line(stream, start, &mut bytes, true)?;
+    if request.starts_with(b"DEVICE ") {
+        return device_exchange(stream, request, devices, control);
+    }
+    let response: &[u8] = match request {
         b"STATUS\n" => match control.state() {
             State::Starting => b"STARTING\n",
             State::Ready => b"READY\n",
@@ -202,10 +232,46 @@ fn exchange(stream: &mut UnixStream, control: &Control) -> io::Result<()> {
         }
         _ => b"INVALID\n",
     };
+    if devices.is_some() {
+        send(stream, start, b"HTTPS ")?;
+    }
     send(stream, start, response)
 }
 
-pub(super) fn request(runtime: &str, stop: bool) -> Result<&'static str, ConfigFailure> {
+pub(super) fn request(
+    runtime: &str,
+    stop: bool,
+) -> Result<(&'static str, &'static str), ConfigFailure> {
+    let (_root, mut stream) = connect(runtime)?;
+    let start = Instant::now();
+    send(
+        &mut stream,
+        start,
+        if stop { b"STOP\n" } else { b"STATUS\n" },
+    )
+    .map_err(io_failure)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_failure)?;
+    let mut bytes = [0; 16];
+    let response = line(&mut stream, start, &mut bytes, false).map_err(io_failure)?;
+    let (response, profile) = match response.strip_prefix(b"HTTPS ") {
+        Some(response) => (response, "mailbox-access"),
+        None => (response, "smtp-only"),
+    };
+    let state = match (stop, response) {
+        (true, b"REQUESTED\n") => Ok("requested"),
+        (false, b"STARTING\n") => Ok("starting"),
+        (false, b"READY\n") => Ok("ready"),
+        (false, b"STOPPING\n") => Ok("stopping"),
+        (false, b"STOPPED\n") => Ok("stopped"),
+        (false, b"FAILED\n") => Ok("failed"),
+        _ => Err(config_failure("control", "invalid-response")),
+    }?;
+    Ok((state, profile))
+}
+
+fn connect(runtime: &str) -> Result<(PrivateRoot, UnixStream), ConfigFailure> {
     check_runtime_path(runtime)?;
     let root =
         PrivateRoot::open(runtime).map_err(|_| config_failure("control", "root-policy-or-io"))?;
@@ -218,30 +284,117 @@ pub(super) fn request(runtime: &str, stop: bool) -> Result<&'static str, ConfigF
     {
         return Err(config_failure("control", "socket-policy"));
     }
-    let mut stream = UnixStream::connect(&path).map_err(io_failure)?;
+    let stream = UnixStream::connect(&path).map_err(io_failure)?;
+    Ok((root, stream))
+}
+const DEVICE_REPLY_BYTES: usize = 12 * 1024;
+struct DeviceReply(Vec<u8>);
+impl DeviceReply {
+    fn failure(&mut self, command: &str, error: super::Failure) -> io::Result<()> {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+        self.0.clear();
+        super::failure(&mut self.0, command, error)
+    }
+}
+impl Drop for DeviceReply {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
+}
+pub(super) struct Devices<'a, 'r> {
+    pub store: &'a Mutex<DeviceStore<'r>>,
+    pub clock: &'a dyn Clock,
+}
+fn device_exchange(
+    stream: &mut UnixStream,
+    request: &[u8],
+    devices: Option<&Devices<'_, '_>>,
+    control: &Control,
+) -> io::Result<()> {
+    let operation = super::device::Operation::parse(request);
+    let command = operation
+        .as_ref()
+        .map_or("device", |operation| operation.name());
+    let mut reply = DeviceReply(Vec::with_capacity(DEVICE_REPLY_BYTES));
+    let result = (|| {
+        let operation = operation.as_ref().ok_or(super::Failure {
+            stage: "arguments",
+            code: "invalid-arguments",
+        })?;
+        let devices = devices.ok_or(super::Failure {
+            stage: "devices",
+            code: "inactive",
+        })?;
+        let mut store = devices.store.lock().map_err(|_| super::Failure {
+            stage: "devices",
+            code: "unavailable",
+        })?;
+        let now = devices
+            .clock
+            .sample()
+            .map_err(|error| super::adapter("clock", error))?
+            .utc_ms;
+        let now = u64::try_from(now).map_err(|_| super::Failure {
+            stage: "clock",
+            code: "invalid",
+        })?;
+        let result = super::device::apply(&mut store, operation, now, &mut reply.0);
+        if store.device_ids().is_err() {
+            control.fail();
+        }
+        result
+    })();
+    if let Err(error) = result {
+        reply.failure(command, error)?;
+    }
+    if reply.0.len() > DEVICE_REPLY_BYTES {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    send(stream, Instant::now(), &reply.0)
+}
+pub(super) fn device_request(
+    runtime: &str,
+    operation: &super::device::Operation,
+    output: &mut impl Write,
+) -> Result<bool, ConfigFailure> {
+    let request = operation
+        .wire()
+        .ok_or_else(|| config_failure("arguments", "invalid-arguments"))?;
+    let (_root, mut stream) = connect(runtime)?;
     let start = Instant::now();
-    send(
-        &mut stream,
-        start,
-        if stop { b"STOP\n" } else { b"STATUS\n" },
-    )
-    .map_err(io_failure)?;
+    send(&mut stream, start, request.as_bytes()).map_err(io_failure)?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(io_failure)?;
-    let mut bytes = [0; 16];
-    match (
-        stop,
-        line(&mut stream, start, &mut bytes, false).map_err(io_failure)?,
-    ) {
-        (true, b"REQUESTED\n") => Ok("requested"),
-        (false, b"STARTING\n") => Ok("starting"),
-        (false, b"READY\n") => Ok("ready"),
-        (false, b"STOPPING\n") => Ok("stopping"),
-        (false, b"STOPPED\n") => Ok("stopped"),
-        (false, b"FAILED\n") => Ok("failed"),
-        _ => Err(config_failure("control", "invalid-response")),
+    let mut reply = DeviceReply(vec![0; DEVICE_REPLY_BYTES + 1]);
+    let reply = line_with_limit(&mut stream, Instant::now(), &mut reply.0, true, DEVICE_WAIT)
+        .map_err(io_failure)?;
+    if reply.len() > DEVICE_REPLY_BYTES {
+        return Err(config_failure("control", "invalid-response"));
     }
+    let ok = format!(
+        "{{\"schema\":1,\"command\":\"{}\",\"status\":\"ok\",",
+        operation.name()
+    );
+    let failed = format!(
+        "{{\"schema\":1,\"command\":\"{}\",\"status\":\"error\",",
+        operation.name()
+    );
+    let success = if reply.starts_with(ok.as_bytes()) {
+        true
+    } else if reply.starts_with(failed.as_bytes()) {
+        false
+    } else {
+        return Err(config_failure("control", "invalid-response"));
+    };
+    if !reply.ends_with(b"}\n") || reply.iter().filter(|byte| **byte == b'\n').count() != 1 {
+        return Err(config_failure("control", "invalid-response"));
+    }
+    output.write_all(reply).map_err(io_failure)?;
+    output.flush().map_err(io_failure)?;
+    Ok(success)
 }
 
 #[cfg(test)]
@@ -268,7 +421,7 @@ mod tests {
             let (mut client, mut server) = UnixStream::pair().unwrap();
             client.write_all(request).unwrap();
             client.shutdown(std::net::Shutdown::Write).unwrap();
-            exchange(&mut server, &control).unwrap();
+            exchange(&mut server, &control, None).unwrap();
             let mut bytes = [0; 16];
             assert_eq!(
                 line(&mut client, Instant::now(), &mut bytes, false).unwrap(),
@@ -278,11 +431,32 @@ mod tests {
     }
 
     #[test]
+    fn device_error_replaces_provisional_success() {
+        let mut reply =
+            DeviceReply(b"{\"schema\":1,\"status\":\"ok\",\"secret\":\"partial".to_vec());
+        reply
+            .failure(
+                "device.list",
+                super::super::Failure {
+                    stage: "devices",
+                    code: "unavailable",
+                },
+            )
+            .unwrap();
+        let value = td_json::parse_slice(&reply.0).unwrap();
+        assert_eq!(
+            value.get("status").and_then(td_json::Json::as_str),
+            Some("error")
+        );
+        assert!(!reply.0.windows(7).any(|bytes| bytes == b"partial"));
+    }
+
+    #[test]
     fn private_protocol_refuses_oversized_input() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        client.write_all(b"abcdefghijklmnop").unwrap();
+        client.write_all(&[b'x'; 256]).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        assert!(exchange(&mut server, &Control::default()).is_err());
+        assert!(exchange(&mut server, &Control::default(), None).is_err());
     }
 
     #[test]
@@ -290,7 +464,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let control = Control::default();
         std::thread::scope(|scope| {
-            let worker = scope.spawn(|| exchange(&mut server, &control));
+            let worker = scope.spawn(|| exchange(&mut server, &control, None));
             client.write_all(b"STOP\n").unwrap();
             client
                 .set_read_timeout(Some(Duration::from_millis(100)))

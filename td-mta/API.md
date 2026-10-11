@@ -166,8 +166,10 @@ handshaking shared session, one exclusive transport and two distinct
 caller-reserved 18437-byte ciphertext buffers. TlsWireStorage is sealed to mutable
 array references and Box-owned arrays; data access cannot invoke arbitrary
 caller code or grow storage. Borrowed buffers remain exclusively borrowed for
-the connection lifetime. Owned buffers must be allocated at startup, before
-admission; the pump never constructs or replaces them. They let the complete
+the connection lifetime. Runtime-owned buffers are allocated fallibly under
+bounded session-slot admission, before native session construction and socket
+handoff. Each admitted TLS slot owns exactly two fixed-size wire buffers;
+the pump never constructs, grows or replaces them. They let the complete
 connection move between workers without self-references or unsafe code.
 Each operation progresses at
 most one outgoing and one incoming record, with at most one underlying read

@@ -4143,3 +4143,46 @@ uses bounded temporary std path/name allocations, retains no entry list and
 examines at most 65 entries. M23 measures integrated service memory and
 targeted stack/allocation diagnostics follow DESIGN section 5; these layout
 and streaming fixtures are not a claim about kernel page-cache residency.
+
+## HTTPS authentication runtime
+
+The mailbox-access profile adds one fixed HTTPS network thread and one fixed
+TLS worker to the receiver/control threads. A startup vector contains at most
+https_connections mutex-protected slots (compiled maximum 32); each occupied
+slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head, a 16 KiB
+plaintext input buffer, bounded response headers (under 512 bytes), deadlines
+and transport state. Head storage may be owned; retiring it clears credentials.
+Input is cleared after each framing turn and on retirement. These are ordinary
+buffer hygiene measures, not guaranteed erasure of provider/compiler copies.
+Native TLS, thread stacks and allocation overhead still require integrated
+M23 measurement; no whole-service memory qualification is added here.
+
+The TLS worker constructs sessions and visits each eligible handshake at most
+once per ten milliseconds, under the receiver's shared HandshakePool. Network
+and TLS scans wait at most five milliseconds between passes and never wait on
+socket readiness. Each nonblocking network turn reads at most 16 KiB, parses
+one head turn or advances one bounded response. Authentication is one bounded
+in-memory lookup/hash; the network thread only tries the registry mutex and
+never performs credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
+a retired slot can retain its old peer charge until the next scan. The
+listener has a fixed two-connection per-IP cap.
+Transient accept resource failures back off for five seconds. Session slots
+are the completion storage; no unbounded work queue or per-client thread exists.
+
+Control publishes credentials on its existing fixed worker while holding the
+registry mutex. The snapshot has a 64 KiB file cap and at most 256 records;
+control request/reply buffers have 256-byte/12-KiB caps. Successful publication
+precedes password output. Authentication attempts use a fixed 64-entry table,
+64 attempts globally and eight per IP per one-second monotonic window. Native
+work already executing is joined on shutdown, not forcibly canceled. The
+current HTTPS profile returns empty refusals and neither buffers nor commits
+request bodies; body/JMAP dispatch and streaming response ownership follow.
+
+The shared handshake pool bounds work, not availability against deliberate
+starvation: one peer sending partial TLS records on two connections can hold
+both default permits until their deadlines, including permits SMTP needs.
+The no-byte peek avoids charging silent TCP peers; it does not validate a
+ClientHello or provide cross-protocol fairness. The refusal-only increment
+also does not drain request bodies: closing with unread records can produce
+a TCP reset instead of a reliably observed HTTP refusal. Body dispatch must
+supply bounded connection draining before client interoperability is claimed.

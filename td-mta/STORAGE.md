@@ -2575,7 +2575,10 @@ the mail root lock and require the database's sole account. Run commands as
 the service user. `device list --root PATH --account ID` lists all IDs,
 including revocations, under the same locks without revealing secrets.
 They never accept
-an operator-chosen password. Online administration is not implemented yet.
+an operator-chosen password. The mailbox-access profile routes online administration through its private
+control socket; it owns the registry under the same lock for its lifetime.
+The control worker serializes publication with HTTP verification through a
+mutex. HTTP uses a nonblocking lock and never performs credential file I/O.
 
 `records.v1` is a bounded, mode-0600, single-link regular file. It contains
 magic `TDDEV001`, the 16-byte account ID, a big-endian u16 record count,

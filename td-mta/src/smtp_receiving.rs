@@ -101,6 +101,9 @@ impl Control {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
     pub fn state(&self) -> State {
         match self.state.load(Ordering::Acquire) {
             0 | 5 => State::Starting,
@@ -117,7 +120,7 @@ impl Control {
                 (old != 4).then_some(next)
             });
     }
-    fn fail(&self) {
+    pub fn fail(&self) {
         self.state.store(4, Ordering::Release);
         self.stop();
     }

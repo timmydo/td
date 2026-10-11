@@ -10,7 +10,7 @@ use std::{
     os::unix::fs::MetadataExt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use td_mta::{
@@ -21,11 +21,11 @@ use td_mta::{
     ports::{self, Clock},
     smtp_receiving::{BoundListener, Control, Receiving},
     store_fs::{AuxiliaryUsage, IngressSpool, LedgerInitError, StoreCoordinator},
-    store_fs::{IndexStore, PrivateRoot},
+    store_fs::{DeviceStore, IndexStore, PrivateRoot},
     tls_admission::HandshakePool,
 };
 
-pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
+pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure> {
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     let CheckedConfiguration {
         resolved,
@@ -82,6 +82,7 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
                 .listeners()
                 .map_err(|_| config_failure("configuration", "invariant"))?;
             let mut direct = Vec::new();
+            let mut https_rows = Vec::new();
             direct
                 .try_reserve_exact(rows.len())
                 .map_err(|_| config_failure("listeners", "capacity"))?;
@@ -92,8 +93,8 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
                     .ok_or_else(|| config_failure("configuration", "invariant"))?;
                 match row.kind {
                     Kind::DirectSmtp if row.bind.is_ipv4() => direct.push(row),
-                    // Required by the complete schema; explicitly inactive in this profile.
-                    Kind::Https => (),
+                    Kind::Https if mailbox_access && row.bind.is_ipv4() => https_rows.push(row),
+                    Kind::Https if !mailbox_access => (),
                     _ => return Err(config_failure("listeners", "unsupported-listener")),
                 }
             }
@@ -102,6 +103,21 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
             }
             let mut root = lock_root(root, "store-lock")?;
             let mut spool_root = lock_root(spool_root, "spool-lock")?;
+            let mut device_root = if mailbox_access {
+                Some(lock_root(
+                    same_owner_root(&format!("{data}/devices"), owner, "device-root")?,
+                    "device-lock",
+                )?)
+            } else {
+                None
+            };
+            let devices = match device_root.as_mut() {
+                Some(root) => Some(Mutex::new(
+                    DeviceStore::open(root, records.routes().account())
+                        .map_err(|_| config_failure("devices", "unavailable"))?,
+                )),
+                None => None,
+            };
             let store = IndexStore::open(
                 &mut root,
                 Arc::clone(&clock),
@@ -172,6 +188,39 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
                         .map_err(|error| adapter("listen", error))?,
                 );
             }
+            let mut https_listeners = Vec::new();
+            for row in https_rows {
+                let socket = TcpListener::bind(row.bind)
+                    .map_err(|_| config_failure("https-listen", "io"))?;
+                https_listeners.push(
+                    td_mta::https::BoundListener::new(socket, row, &policies)
+                        .map_err(|error| adapter("https-listen", error))?,
+                );
+            }
+            let https_ready = AtomicBool::new(false);
+            let https = if let Some(devices) = devices.as_ref() {
+                Some(td_mta::https::Https {
+                    listeners: &https_listeners,
+                    policies: &policies,
+                    handshakes: &handshakes,
+                    devices,
+                    origin: view
+                        .origin()
+                        .map_err(|_| config_failure("configuration", "invariant"))?,
+                    username: candidate
+                        .identities()
+                        .map_err(|_| config_failure("configuration", "invariant"))?
+                        .account()
+                        .map_err(|_| config_failure("configuration", "invariant"))?
+                        .username,
+                    resources,
+                    timeouts: plans.timeouts(),
+                    clock: Arc::clone(&clock),
+                    ready: &https_ready,
+                })
+            } else {
+                None
+            };
             let receiving = Receiving {
                 coordinator: &coordinator,
                 spool: &spool,
@@ -191,24 +240,73 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
             if super::signal_sys::requested().map_err(|_| config_failure("signals", "io"))? {
                 control.stop();
             }
+            let device_control = devices.as_ref().map(|store| super::control::Devices {
+                store,
+                clock: clock.as_ref(),
+            });
             let finished = AtomicBool::new(false);
             std::thread::scope(|scope| {
                 let worker = std::thread::Builder::new()
                     .name("smtp-control".into())
                     .spawn_scoped(scope, || {
-                        let result = std::panic::catch_unwind(|| endpoint.run(&control, &finished));
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            endpoint.run(&control, &finished, device_control.as_ref())
+                        }));
                         if !matches!(result, Ok(Ok(()))) {
                             control.stop();
                         }
                         result
                     })
                     .map_err(|_| config_failure("control", "worker-start"))?;
-                let finish = ControlFinish(&finished);
+                let finish = ControlFinish {
+                    finished: &finished,
+                    control: &control,
+                };
+                let http_worker = if let Some(https) = https.as_ref() {
+                    match std::thread::Builder::new()
+                        .name("https-network".into())
+                        .spawn_scoped(scope, || {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    https.run(&control)
+                                }));
+                            if !matches!(result, Ok(Ok(()))) {
+                                control.stop();
+                            }
+                            result
+                        }) {
+                        Ok(worker) => Some(worker),
+                        Err(_) => {
+                            control.stop();
+                            drop(finish);
+                            let _ = worker.join();
+                            return Err(config_failure("https", "worker-start"));
+                        }
+                    }
+                } else {
+                    None
+                };
                 let result = receiving
-                    .run_with_ready(&control, || announce(listeners.len()))
+                    .run_with_ready(&control, || {
+                        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while mailbox_access && !https_ready.load(Ordering::Acquire) {
+                            if control.stop_requested() || std::time::Instant::now() >= until {
+                                control.stop();
+                                return Err(ports::Error::WriterStopped);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        announce(listeners.len(), mailbox_access)
+                    })
                     .map_err(|error| ConfigFailure::from(adapter("receiving", error)));
                 drop(finish);
+                control.stop();
                 let joined = worker.join();
+                if let Some(worker) = http_worker {
+                    if !matches!(worker.join(), Ok(Ok(Ok(())))) {
+                        return Err(config_failure("https", "worker-stopped"));
+                    }
+                }
                 result?;
                 match joined {
                     Ok(Ok(Ok(()))) => Ok(()),
@@ -236,16 +334,62 @@ fn same_owner_root(
     }
     Ok(root)
 }
-fn announce(listeners: usize) -> Result<(), ports::Error> {
+fn announce(listeners: usize, mailbox_access: bool) -> Result<(), ports::Error> {
     let mut output = io::stdout().lock();
-    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"smtp-only\",\"smtp_listeners\":{listeners},\"https\":false,\"outbound\":false,\"reload\":false,\"signal_drain\":true}}")?;
+    let profile = if mailbox_access {
+        "mailbox-access"
+    } else {
+        "smtp-only"
+    };
+    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"{profile}\",\"smtp_listeners\":{listeners},\"https\":{mailbox_access},\"outbound\":false,\"reload\":false,\"signal_drain\":true}}")?;
     output.flush()?;
     Ok(())
 }
 
-struct ControlFinish<'a>(&'a AtomicBool);
+struct ControlFinish<'a> {
+    finished: &'a AtomicBool,
+    control: &'a Control,
+}
 impl Drop for ControlFinish<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.finished.store(true, Ordering::Release);
+        self.control.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn coordinator_unwind_stops_scoped_workers() {
+        let control = Control::default();
+        let finished = AtomicBool::new(false);
+        let observed = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !control.stop_requested() && std::time::Instant::now() < until {
+                        std::thread::yield_now();
+                    }
+                    observed.store(
+                        control.stop_requested() && finished.load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                });
+                let _finish = ControlFinish {
+                    finished: &finished,
+                    control: &control,
+                };
+                let _worker = worker;
+                panic!("injected coordinator failure");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(observed.load(Ordering::Acquire));
+        assert!(control.stop_requested());
+        assert!(finished.load(Ordering::Acquire));
     }
 }

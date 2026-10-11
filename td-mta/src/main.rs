@@ -29,7 +29,7 @@ mod device;
 mod serve;
 mod signal_sys;
 
-const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta serve --smtp-only --config PATH\n       td-mta status --json [--require-ready] --runtime PATH\n       td-mta stop --runtime PATH\n       td-mta device list --root PATH --account ID\n       td-mta device create --root PATH --account ID --label LABEL\n       td-mta device revoke --root PATH --account ID --id ID\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nDevice commands run offline as the service user; provision a private devices/ directory first.\nCreate displays its generated password once; store it before leaving the terminal.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nServe requires an initialized data root, its private ingress/ subdirectory,\nand private runtime/log roots.\nIt receives direct IPv4 SMTP only; HTTPS, outbound delivery and reload are inactive.\nStatus --require-ready exits 1 unless the receiver reports ready.\nPlace --require-ready immediately after --json, as shown above.\nStop requests orderly shutdown through its private control socket.\nSIGTERM and SIGINT request orderly shutdown; SIGKILL requires recovery.\nNo repair command is available.\n";
+const HELP: &str = "Usage: td-mta --version | --help\n       td-mta config check --config PATH\n       td-mta serve (--smtp-only | --mailbox-access) --config PATH\n       td-mta status --json [--require-ready] --runtime PATH\n       td-mta stop --runtime PATH\n       td-mta device list --root PATH --account ID\n       td-mta device create --root PATH --account ID --label LABEL\n       td-mta device revoke --root PATH --account ID --id ID\n       td-mta store init --root PATH --account ID [--timeout-seconds N]\n       td-mta store verify --root PATH (--account ID | --all) [--timeout-seconds N]\n       td-mta backup --root PATH --destination PATH [--timeout-seconds N]\n       td-mta restore --root PATH --destination PATH [--timeout-seconds N]\n\nVerify database integrity and metadata/body digests for selected or all accounts.\nRun offline with access to the private store; the writer lock must be free.\nDevice commands run as the service user; provision a private devices/ directory first.\nFor live device commands, replace --root PATH --account ID with --runtime PATH.\nCreate displays its generated password once; store it before leaving the terminal.\nInit creates a store holding one account and its Inbox; it does not serve.\nVerification JSON identifies its account or database scope. Default timeout: 600 seconds.\nBackup copies the stopped database to an existing private destination root.\nA completed copy does not certify semantic integrity or enable restore.\nRestore verifies the copy and renews its epoch; it does not start service.\nConfig check opens the file and every referenced input under the protected-file\nrules and decodes text and TLS material; run it as the service user.\nACME-managed material is unavailable to it.\nServe requires an initialized data root, its private ingress/ subdirectory,\nand private runtime/log roots.\nBoth profiles receive direct IPv4 SMTP; outbound delivery and reload are inactive.\n--mailbox-access enables bounded HTTPS authentication and live device commands.\nCreate an initial device offline before starting that profile. JMAP is not active yet.\nStatus --require-ready exits 1 unless the receiver reports ready.\nPlace --require-ready immediately after --json, as shown above.\nStop requests orderly shutdown through its private control socket.\nSIGTERM and SIGINT request orderly shutdown; SIGKILL requires recovery.\nNo repair command is available.\n";
 
 enum Selection {
     Account(AccountId),
@@ -737,12 +737,12 @@ fn run() -> io::Result<ExitCode> {
             .ok_or_else(|| config_failure("arguments", "invalid-arguments"))
             .and_then(|path| control::request(&path, stop));
         return match result {
-            Ok(state) => {
+            Ok((state, profile)) => {
                 let mut output = io::stdout().lock();
                 if stop {
-                    writeln!(output, "{{\"schema\":1,\"command\":\"stop\",\"status\":\"requested\",\"profile\":\"smtp-only\"}}")?;
+                    writeln!(output, "{{\"schema\":1,\"command\":\"stop\",\"status\":\"requested\",\"profile\":\"{profile}\"}}")?;
                 } else {
-                    writeln!(output, "{{\"schema\":1,\"command\":\"status\",\"status\":\"ok\",\"profile\":\"smtp-only\",\"state\":\"{state}\",\"ready\":{}}}", state == "ready")?;
+                    writeln!(output, "{{\"schema\":1,\"command\":\"status\",\"status\":\"ok\",\"profile\":\"{profile}\",\"state\":\"{state}\",\"ready\":{}}}", state == "ready")?;
                 }
                 Ok(if require_ready && state != "ready" {
                     ExitCode::FAILURE
@@ -758,14 +758,16 @@ fn run() -> io::Result<ExitCode> {
         };
     }
     if first.as_deref() == Some(OsStr::new("serve")) {
-        let path = if args.next().as_deref() == Some(OsStr::new("--smtp-only")) {
+        let profile = args.next();
+        let mailbox_access = profile.as_deref() == Some(OsStr::new("--mailbox-access"));
+        let path = if mailbox_access || profile.as_deref() == Some(OsStr::new("--smtp-only")) {
             config_arguments(args)
         } else {
             None
         };
         let result = path
             .ok_or_else(|| config_failure("arguments", "invalid-arguments"))
-            .and_then(|path| serve::run(&path));
+            .and_then(|path| serve::run(&path, mailbox_access));
         return match result {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(error) => {

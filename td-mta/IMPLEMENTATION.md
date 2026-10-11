@@ -2817,9 +2817,12 @@ and smuggling fixtures. This is not HTTPS activation or authentication.
 M13b adds the bounded durable device registry and offline device create/revoke
 commands, with provider-generated passwords, versioned salted verifiers,
 private atomic publication, restart/corruption tests and a real CLI fixture.
-Both commands hold the mail store lock; live control operations remain next.
-Next: bind framing and credentials to HTTPS request handling and local online
-administration, then authenticated discovery/Core dispatch.
+Offline commands hold the mail store lock. M13c activates the mailbox-access
+profile with bounded HTTPS/TLS workers, configured-origin Basic authentication,
+current revocation checks, fixed attempt limits, deadlines and live device
+control commands. Socket and process fixtures cover the activated transport.
+It returns only refusals (authenticated discovery is 503); JMAP is not yet
+advertised. Next: authenticated discovery/Core dispatch.
 Mail listing/retrieval/download integration and a real td-mail fixture
 follow in M14. DESIGN section 10 owns the initial framing restrictions
 and the enclosing driver's outstanding admission obligations.

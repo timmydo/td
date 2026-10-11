@@ -332,7 +332,7 @@ impl TlsPolicies {
         }
     }
 
-    /// Recheck a direct receiving listener's admitted chain against current UTC.
+    /// Recheck an inbound listener's admitted chain windows against current UTC.
     /// This also gates plaintext SMTP, which never constructs a TLS session.
     pub fn check_receiving_certificate(
         lease: &GenerationLease<Self>,
@@ -698,8 +698,7 @@ fn build<R: Read>(
             continue;
         }
         let primary = identity(row.certificate.ok_or(Error::Invalid)?)?;
-        let receiving_validity =
-            (row.kind == listener::Kind::DirectSmtp).then(|| primary.validity());
+        let receiving_validity = Some(primary.validity());
         let native = match row.kind {
             listener::Kind::DirectSmtp => Configuration::Server(Arc::new(
                 ServerConfig::new(

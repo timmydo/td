@@ -56,16 +56,16 @@ pub struct Head<'a> {
 
 /// Feed through the empty CRLF line only. There is no automatic reset or
 /// next-request parsing; retire this owner before reusing its backing.
-pub struct HeadReader<'a> {
-    storage: &'a mut [u8],
+pub struct HeadReader<B: AsRef<[u8]> + AsMut<[u8]>> {
+    storage: B,
     used: usize,
     line: usize,
     cr: bool,
     complete: bool,
     failure: Option<Error>,
 }
-impl<'a> HeadReader<'a> {
-    pub fn new(storage: &'a mut [u8]) -> Self {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> HeadReader<B> {
+    pub fn new(storage: B) -> Self {
         Self {
             storage,
             used: 0,
@@ -102,7 +102,11 @@ impl<'a> HeadReader<'a> {
         if self.used >= HEAD_BYTES || self.line >= LINE_BYTES {
             return Err(Error::Limit);
         }
-        *self.storage.get_mut(self.used).ok_or(Error::Limit)? = byte;
+        *self
+            .storage
+            .as_mut()
+            .get_mut(self.used)
+            .ok_or(Error::Limit)? = byte;
         self.used += 1;
         self.line += 1;
         if self.cr {
@@ -113,7 +117,7 @@ impl<'a> HeadReader<'a> {
             self.complete = self.line == 2;
             self.line = 0;
             if self.complete {
-                parse(self.storage.get(..self.used).ok_or(Error::Limit)?)?;
+                parse(self.storage.as_ref().get(..self.used).ok_or(Error::Limit)?)?;
             }
         } else if byte == b'\r' {
             self.cr = true;
@@ -129,7 +133,7 @@ impl<'a> HeadReader<'a> {
         if !self.complete {
             return Err(Error::Incomplete);
         }
-        parse(self.storage.get(..self.used).ok_or(Error::Limit)?)
+        parse(self.storage.as_ref().get(..self.used).ok_or(Error::Limit)?)
     }
     /// EOF before the complete head is a terminal failure.
     pub fn eof(&mut self) -> Result<(), Error> {
@@ -143,10 +147,10 @@ impl<'a> HeadReader<'a> {
         Ok(())
     }
 }
-impl Drop for HeadReader<'_> {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Drop for HeadReader<B> {
     fn drop(&mut self) {
-        self.storage.fill(0);
-        std::hint::black_box(&mut *self.storage);
+        self.storage.as_mut().fill(0);
+        std::hint::black_box(self.storage.as_mut());
     }
 }
 

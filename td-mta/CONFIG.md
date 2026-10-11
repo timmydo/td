@@ -1758,6 +1758,8 @@ configuration schema is unchanged, including its required HTTPS and relay
 settings. All referenced inputs are checked through the same single load as
 `config check`, but HTTPS and outbound delivery are inactive. Gateway,
 fixture, HTTP-01 and IPv6 SMTP listeners refuse before storage is opened.
+Mailbox-access also refuses IPv6 HTTPS listeners until the audited socket
+adapter is available.
 ACME-managed material remains unavailable. This profile has no reload,
 file logging, JMAP or outbound queue worker.
 
@@ -1805,9 +1807,11 @@ Serve leaves inherited signal behavior in place during configuration and
 cold storage recovery. Immediately before binding the control endpoint and
 creating workers, it blocks both signals; all workers inherit that mask. Its control worker consumes pending
 requests without an asynchronous handler, including during accept backoff.
-A local control exchange can delay observation by its two-second deadline;
-ordinary polling adds at most one 100-millisecond turn. Native I/O during
-serving cannot be forcibly cancelled by this path.
+A status/stop exchange can delay observation by its two-second deadline;
+a device command additionally waits for the registry mutex, durable file and
+directory publication, then a fresh two-second reply window. Publication has
+no cancellable deadline, so signal observation can wait for native storage
+I/O. Ordinary polling adds at most one 100-millisecond turn.
 A request arriving concurrently with readiness can race that announcement,
 just as a private stop request can. Repeated requests remain idempotent;
 they do not turn into forced termination. A successful drain exits zero.
@@ -1847,23 +1851,38 @@ unidentified socket remains for the next locked startup to recover safely.
 Namespace changes during service are unsupported, as for
 the existing private store roots. Clients verify socket type, owner and mode.
 
-One additional fixed worker serves one local request at a time. Requests and
-replies fit 16 bytes; the private wire protocol accepts only STATUS followed
-by LF or STOP followed by LF, then the client closes its write half. The
+One additional fixed worker serves one local request at a time. Request
+storage is 256 bytes; STATUS and STOP responses fit 16 bytes. Both commands
+end with LF, then the client closes its write half. The mailbox-access profile
+also accepts DEVICE CREATE followed by a space and bounded label, DEVICE
+REVOKE followed by a space and canonical ID, or DEVICE LIST, each ending in
+LF and write EOF. Device JSON responses have a 12 KiB cap and secret-bearing
+buffers are cleared on retirement. The
 server reads through that EOF before acting, so trailing bytes cannot change
 meaning with stream fragmentation. Malformed requests never stop the receiver.
-Each accepted exchange shares one two-second read/write deadline. A slow
-local client can make queued control clients time out, but cannot delay SMTP
-or storage workers. The fixed control worker polls every 100 milliseconds;
+STATUS/STOP and request intake retain a two-second exchange deadline. Device
+replies get a fresh two-second write window after publication, and device
+clients wait up to thirty seconds for the reply. A slow local client can make
+queued control clients time out, but cannot delay SMTP or storage workers.
+A device publication can block in file/directory sync; the socket deadline
+does not cancel a kernel operation already running. A publication failure
+retires the registry, marks the combined profile failed and initiates orderly
+shutdown. Restart recovers the durable registry before HTTPS can serve again.
+HTTPS authentication uses nonblocking registry locking and keeps its header
+deadlines during that publication. An uncertain/lost device receipt is
+resolved through device list and revocation, never by redisclosing passwords.
+The fixed control worker polls every 100 milliseconds;
 local connection aborts retry, and transient descriptor/memory pressure backs
 off accepts for five seconds without stopping mail service. This worker is
 in addition to smtp_receiving's two storage/TLS workers; it has no per-client
 threads and makes no new whole-service resource claim.
 Client socket connection uses the local kernel's connect behavior; after
-connection its complete request/reply exchange has the same deadline.
+connection the deadlines above apply.
 
 Status returns schema-1 command JSON with command status, status ok, profile
-smtp-only, state starting/ready/stopping/stopped/failed and a ready boolean.
+smtp-only or mailbox-access, state starting/ready/stopping/stopped/failed and a
+ready boolean. Mailbox-access prefixes private status/stop wire replies with
+HTTPS and a space; the client reports that profile explicitly.
 The endpoint starts after cold storage recovery, so status and stop are not
 available during that phase. An absent/refused endpoint reports not-running;
 other I/O failures remain io. There is a brief starting-to-ready transition
@@ -1882,7 +1901,7 @@ OBSERVABILITY.md's version-1 health envelope remains a
 separate future service status surface.
 
 Stop returns schema-1 command JSON with command stop, status requested and
-profile smtp-only. Acknowledgement means the stop flag was set, not that all
+the active profile. Acknowledgement means the stop flag was set, not that all
 work or disk I/O has finished. The receiver stops new admissions, gives
 existing sessions its five-second protocol allowance, and joins its workers.
 Already committed replies retain their final-reply allowance. A native store
@@ -1893,3 +1912,30 @@ control worker, including during unwinding. SIGTERM and SIGINT use this
 same stop flag. The process fixture queries status, recovers a stale socket after
 kill, requests stop with a connected SMTP client, observes 421, and verifies
 clean process exit, socket cleanup and durable accepted mail.
+
+### Mailbox-access profile
+
+`td-mta serve --mailbox-access --config PATH` activates the same SMTP receiver
+and configured HTTPS listeners with file-provisioned TLS identities. Provision
+`data/devices` mode 0700 under the same service owner and create an initial
+device offline before starting. The registry must exist and validate; startup
+does not silently initialize it. The profile has no public administration
+HTTP route. Discovery and mail access remain unavailable until the JMAP
+increments; authenticated `/.well-known/jmap` currently returns 503.
+
+Run `td-mta device create --runtime PATH --label LABEL`, `device list --runtime
+PATH`, or `device revoke --runtime PATH --id ID` for the running profile.
+These use its private control socket and current in-memory verifier store.
+Offline --root/--account forms still require the main store lock to be free.
+The create receipt contains the generated password exactly once. Listings
+contain only IDs, including revoked IDs. No password is a command-line input.
+Success receipts use schema 1, command device.create/device.list/device.revoke,
+status ok and the operation's data; failures carry fixed stage/error codes.
+
+The ready announcement and status report profile mailbox-access. Readiness
+waits for both SMTP initialization and HTTPS's bound certificate checks and
+network/TLS workers. This reports transport readiness, not available JMAP
+methods. Stop, SIGTERM and SIGINT use the same shared stop flag. HTTPS closes
+its current nonmutating exchanges, then joins its worker; SMTP preserves its
+normal drain and known committed replies. Outbound delivery, reload and ACME
+remain inactive in both profiles.

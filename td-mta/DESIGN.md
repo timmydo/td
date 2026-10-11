@@ -1405,8 +1405,9 @@ untrusted display strings. Bound authentication work globally and by peer.
 The first credential increment provides offline `device create` and `device
 revoke` commands. Both hold the main store lock, require its sole account,
 and separately lock an operator-provisioned private `devices/` directory.
-Online control-socket administration and HTTPS authentication are subsequent
-increments; these commands cannot race the running receiver. Device storage
+The mailbox-access profile provides online control-socket administration
+with --runtime in place of --root and --account. Offline commands cannot
+race either running profile. Device storage
 and publication are specified in STORAGE.md, "Device credentials".
 
 Accept HTTP Basic authentication only over verified server HTTPS from clients;
@@ -1772,7 +1773,8 @@ separate.
 ## 10. HTTP and JMAP
 
 The `http_request` module implements transport-independent HTTP/1.1
-request framing. It does not open HTTPS listeners or grant authentication.
+request framing. Its head storage may be borrowed or owned; the HTTPS
+runtime uses owned bounded buffers without self-referential state.
 A caller-owned head buffer admits at most 32 KiB, 8192 bytes per line
 including CRLF, and 100 fields. Parsing requires strict CRLF, one Host,
 origin-form targets and unambiguous framing. Duplicate security/framing
@@ -1803,8 +1805,10 @@ connection/request counts and scheduling. Routes match the raw target;
 only validated endpoint components may be decoded, never used as arbitrary
 filesystem paths. It must authorize and admit
 body storage before sending 100 Continue, check decoder completion before
-publication, and close on framing failure. These integrations, responses and JMAP remain subsequent increments;
-offline device persistence is implemented under section 7. Framing tests
+publication, and close on framing failure. The current HTTPS runtime performs these admission checks but serves only
+empty refusal responses; JMAP discovery/methods, uploads and downloads
+remain subsequent increments. Device persistence and local administration
+are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
 
@@ -1818,9 +1822,50 @@ but refuse standalone trailing whitespace before CRLF. Malformed request-line
 syntax is distinct from a well-formed unsupported HTTP version.
 No proxy, browser compatibility or JMAP conformance is claimed. These fixed
 parser caps are independent of the proposed slot partitions in RESOURCES
-and ADMISSION; no HTTPS runtime pool is allocated by this increment.
-Integrated slot layout and memory measurement remain driver work under
-section 5; the existing Limits::plan arithmetic is unchanged.
+and ADMISSION. The current HTTPS runtime uses the configured connection
+count and shared handshake cap; RESOURCES.md records its concrete buffers.
+Whole-service memory measurement remains section-5/M23 work; the existing
+Limits::plan arithmetic is unchanged.
+
+`serve --mailbox-access` runs the existing receiver plus the IPv4 `https`
+driver. IPv6 listeners remain refused pending the audited socket adapter.
+A fixed HTTPS network thread scans bounded slots, with a separate fixed TLS
+worker. Native session construction and pending handshakes stay on that
+worker; idle sockets retain connection slots without taking handshake permits.
+The worker peeks nonblocking for initial TLS bytes before reserving a shared
+permit, and retries a busy pool within the original handshake deadline.
+All socket operations
+are nonblocking. Request-head parsing uses at most 16 KiB per turn. The current
+profile permits one request per connection and sends Connection: close with
+all responses. It performs no mail/body mutation and can reject without
+consuming a request body. It never emits 100 Continue, accepts an upload or
+claims JMAP conformance yet. A valid authenticated discovery request gets 503;
+other authenticated targets get 404. Missing, invalid and revoked credentials
+receive the same 401 Basic challenge. No credential enters error output. A failed local credential publication
+marks the service failed and initiates orderly shutdown; restart must recover
+a healthy registry before serving again.
+
+TLS completes before HTTP parsing. The configured origin certificate's
+window is checked before readiness and every network scan; its failure stops
+the combined profile. Secondary HTTPS identities are checked by the provider
+at handshake time and do not govern the origin's readiness. Host must match the configured JMAP
+DNS origin and port (case-insensitive host, omitted port means 443). An Origin
+header must match that HTTPS origin; no CORS permission is emitted. A bounded
+strict Basic decoder compares the configured username exactly and verifies
+the generated device token. Each request observes current revocation state.
+A future mutation must still acquire its commit-time authorization guard.
+
+At most two active HTTPS connections per IP and the configured global count
+are admitted. Authentication uses fixed one-second monotonic windows: 64
+attempts globally and eight per IP, with a 64-entry peer table that never
+evicts an unexpired entry. Invalid credential syntax consumes an attempt too;
+wrong authority or cross-origin requests are refused before verification.
+Exhaustion receives 429 with Retry-After: 1. This permits boundary bursts,
+not a rolling-window rate guarantee. Header total/idle, TLS, response idle
+and absolute transfer/session caps use the configured timer plan. Shutdown
+stops HTTPS admission and closes these nonmutating exchanges immediately,
+while SMTP retains its orderly final-reply behavior. Fixed native/kernel work
+already running must return before joins complete.
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous
