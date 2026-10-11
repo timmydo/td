@@ -1591,16 +1591,19 @@ read from the verified deployment through the held volume and checked
 against its manifest.
 
 td's bounded FAT32 code, the std-only sibling crate `td-fat` that
-td-install and td-boot share, admits the held disk's ESP, the td
-layout's first GPT partition, only when its `EFI/BOOT` directory's first
-sector holds every entry the update touches, as td's layout writes
-them, and its free clusters hold the new files beside the old ones;
-otherwise nothing is written. Clusters allocated in the FATs but
+td-install and td-boot share (td-fat/DESIGN.md, since 8e's second
+commit), admits the held disk's ESP, the td layout's first GPT
+partition, only when its `EFI/BOOT` directory's first sector holds
+every entry the update touches, as td's layout writes them, and its
+free clusters hold the new files beside the old ones; otherwise nothing
+is written. Clusters allocated in the FATs but
 reachable from no directory entry, an earlier interrupted update's, are
 freed first. Each commit is one write of that directory sector, synced,
 after the new data is written and chained in both FATs and synced; the
-old chains are freed after it. The commit assumes the device writes one
-logical sector whole on power loss. NVMe's AWUPF covers at least one
+old chains are freed after it. Every entry a commit changes lies in the
+sector's first 512 bytes (td-fat/DESIGN.md), so the commit assumes the
+device writes one 512-byte unit whole on power loss, whatever sector
+size the volume claims. NVMe's AWUPF covers at least one
 block; SATA and eMMC devices state no such unit, so the assumption is
 unproven there, and evidence for a device class is a power-cut series
 on it (`qemu` cannot provide one) or its documented atomic write unit.

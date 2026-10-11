@@ -109,6 +109,10 @@ surface.
 
 `td-fido` (td-fido/DESIGN.md), the FIDO2 client td-secret and td-tpm
 depend on by path, forbids `unsafe` crate-wide and is not on the roster.
+Nor is `td-fat` (td-fat/DESIGN.md), the ESP's FAT32 code td-install
+and td-boot are to share from increment 8e, which forbids it too: its
+I/O is std's positioned reads and writes and `fsync` on a file its
+caller holds.
 Increment 8a moved td-secret's CTAP codecs, PIN protocols, P-256, AES and
 hidraw transport with its worker there; none of it was ever part of §15,
 whose surface stays in td-secret unchanged, and the transport is std file
@@ -130,8 +134,7 @@ keeps `unsafe` forbidden.
 Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
 tier is planned to add no surface ("Unsafe and syscall surfaces" there).
 td-tpm's signing commands are bytes over its safe file I/O, in the same
-sessions. td-secret keeps its own §15 surface, and the planned
-`td-fat` forbids `unsafe` as td-fido does. PIN entry is secret-line's existing surface (§3),
+sessions. td-secret keeps its own §15 surface. PIN entry is secret-line's existing surface (§3),
 the admission record rides td-kexec's existing calls (§1, where
 `--fds-key-admit` is current), the event log
 and power-supply reads are file reads, and securityfs and the optional
