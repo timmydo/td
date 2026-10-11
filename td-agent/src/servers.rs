@@ -181,12 +181,14 @@ impl Ending for Pipe {
 /// What the main thread asks of a server's thread.
 pub enum Ask {
     /// Call `tool` with `arguments` until `until`, `stop` ending the
-    /// wait; the outcome goes to `answer`.
+    /// wait, `begun` set once the thread takes it up; the outcome goes to
+    /// `answer`.
     Call {
         tool: String,
         arguments: Json,
         until: Instant,
         stop: Arc<AtomicBool>,
+        begun: Arc<AtomicBool>,
         answer: Sender<Result<Result<Json, RpcError>, Failure>>,
     },
     /// List its tools again.
@@ -263,10 +265,16 @@ pub fn serve<T: Ending>(
                 arguments,
                 until,
                 stop,
+                begun,
                 answer,
             }) => {
+                begun.store(true, Ordering::Relaxed);
                 let left = until.saturating_duration_since(Instant::now());
-                let outcome = if left.is_zero() {
+                // Stopped before it was taken up, a call is never sent:
+                // the turn may have answered it already.
+                let outcome = if stop.load(Ordering::Relaxed) {
+                    Err(Failure::Stopped)
+                } else if left.is_zero() {
                     Err(Failure::TimedOut)
                 } else {
                     let mut stopped = || stop.load(Ordering::Relaxed) || ending();
@@ -673,6 +681,7 @@ mod tests {
                 arguments: Json::Obj(Vec::new()),
                 until: Instant::now() + WAIT,
                 stop: Arc::new(AtomicBool::new(false)),
+                begun: Arc::new(AtomicBool::new(false)),
                 answer,
             })
             .unwrap();
@@ -680,6 +689,40 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A call stopped before its thread takes it up is never sent, so an
+    /// interrupt its turn answered does not reach the server later.
+    #[test]
+    fn a_call_stopped_before_it_is_taken_up_is_never_sent() {
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        fn marks(message: &Json) -> Vec<String> {
+            if message.get("method").and_then(Json::as_str) == Some("tools/call") {
+                CALLED.store(true, Ordering::Relaxed);
+            }
+            tools(message)
+        }
+        let run = run(marks, WAIT);
+        let (answer, answered) = mpsc::channel();
+        run.asks
+            .send(Ask::Call {
+                tool: "echo".into(),
+                arguments: Json::Obj(Vec::new()),
+                until: Instant::now() + WAIT,
+                stop: Arc::new(AtomicBool::new(true)),
+                begun: Arc::new(AtomicBool::new(false)),
+                answer,
+            })
+            .unwrap();
+        let outcome = answered.recv_timeout(WAIT).unwrap();
+        assert!(matches!(outcome, Err(Failure::Stopped)), "{outcome:?}");
+        assert!(!CALLED.load(Ordering::Relaxed));
+        // The server is not failed: a call after is answered.
+        let result = call(&run, "echo").unwrap().unwrap();
+        assert_eq!(crate::mcp::result_text(&result), ("hi".to_string(), false));
+        assert!(CALLED.load(Ordering::Relaxed));
+        run.end.store(true, Ordering::Relaxed);
+        run.thread.join().unwrap();
+    }
 
     #[test]
     fn a_server_starts_answers_calls_and_ends_untold() {

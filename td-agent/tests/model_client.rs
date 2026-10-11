@@ -9582,12 +9582,14 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A small MCP server in `sh`: it answers `initialize` and lists one
-/// tool, `echo`, taking each request's id from its line.
+/// A small MCP server in `sh`: it answers `initialize`, lists one tool,
+/// `echo`, and answers a call of it with `echoed`, taking each request's
+/// id from its line.
 const MCP_SERVER: &str = concat!(
     r#"while IFS= read -r line; do id=${line#*\"id\":}; id=${id%%[,\}]*}; "#,
     r#"case $line in *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' "$id";; "#,
     r#"*'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes.","inputSchema":{"type":"object"}}]}}\n' "$id";; "#,
+    r#"*'"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}]}}\n' "$id";; "#,
     r#"esac; done"#
 );
 
@@ -9779,5 +9781,225 @@ fn a_turn_with_no_server_takes_no_interrupt_as_a_servers() {
         "{}",
         h.said()
     );
+    h.close();
+}
+
+/// A reply that calls the echo server's tool, `{"limit": 3}` its
+/// arguments.
+fn calls_echo() -> Reply {
+    Reply::sse_with(
+        "stream-tool-system.sse",
+        "\"name\":\"system_status\"",
+        "\"name\":\"mcp__echo__echo\"",
+    )
+}
+
+/// A server's tools follow the conversation's own in the prefix, the
+/// environment saying what they are; in `ask` mode a call of one is put
+/// on a card naming the server, its command and the arguments, whose
+/// "always" offers the server and tool, and once allowed its server's
+/// result answers it (DESIGN.md §12, Its tools, Approval, Results).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_mcp_tool_is_offered_called_on_a_card_and_answered() {
+    let mut h = Harness::new_in(
+        "mcpcall",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            calls_echo(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(mcp_settings(&[("echo", MCP_SERVER)]));
+    h.say("Echo something.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Call an MCP server's tool", "{details:?}");
+    let card = details.join("\n");
+    assert!(card.contains("Call echo of MCP server echo"), "{card}");
+    assert!(card.contains("while IFS= read -r line"), "{card}");
+    assert!(card.contains("\"limit\": 3"), "{card}");
+    let always = format!("{:?}", h.always);
+    assert!(always.contains("mcp echo echo"), "{always}");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].1, "echoed");
+    assert!(!said[0].2);
+    let first = h.mock.requests()[0].text();
+    let own = first.find("\"name\":\"read_file\"").unwrap();
+    let theirs = first.find("\"name\":\"mcp__echo__echo\"").unwrap();
+    assert!(own < theirs, "{first}");
+    assert!(first.contains("- MCP tools: the tools named mcp__SERVER__TOOL"));
+    h.close();
+}
+
+/// In `auto` mode an MCP call runs with no card, its approval the mode's;
+/// a name that is no tool of the turn's is answered as an unknown tool
+/// (DESIGN.md §12, Approval).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_mcp_call_runs_in_auto_mode_and_an_unknown_one_is_refused() {
+    let mut h = Harness::new_in(
+        "mcpauto",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            calls_echo(),
+            Reply::sse_with(
+                "stream-tool-system.sse",
+                "\"name\":\"system_status\"",
+                "\"name\":\"mcp__echo__other\"",
+            ),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(mcp_settings(&[("echo", MCP_SERVER)]));
+    h.down(&Down::Policy {
+        version: 1,
+        mode: td_agent::config::Mode::Auto,
+        rules: Ok(String::new()),
+    });
+    h.say("Echo something.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert_eq!((said[0].1.as_str(), said[0].2), ("echoed", false));
+    assert!(
+        said[1].1.contains("no tool named \"mcp__echo__other\""),
+        "{said:?}"
+    );
+    assert!(said[1].2);
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::Approval { outcome, by, .. } if outcome == "allow" && by == "mode"
+    )));
+    h.close();
+}
+
+/// `MCP_SERVER`, but answering no call.
+fn mcp_silent() -> String {
+    MCP_SERVER.replace(r#"*'"tools/call"'*)"#, r#"*'"tools/never"'*)"#)
+}
+
+/// `auto` mode, with `rules` the person's.
+fn auto_with(rules: &str) -> Down {
+    Down::Policy {
+        version: 1,
+        mode: td_agent::config::Mode::Auto,
+        rules: Ok(rules.into()),
+    }
+}
+
+/// An interrupt cancels a call its server has not answered, which is
+/// answered so, its effect unknown; a call whose time runs out is
+/// answered likewise; neither is news of the server, which is not
+/// failed (DESIGN.md §12, Results).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_unanswered_mcp_call_is_cancelled_by_an_interrupt_or_its_time() {
+    let silent = mcp_silent();
+    let mut h = Harness::new_in(
+        "mcpstop",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            calls_echo(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            calls_echo(),
+        ],
+    );
+    let mut settings = mcp_settings(&[("echo", &silent)]);
+    settings.template_shared[0].mcp[0].timeout = 1;
+    h.setup(settings);
+    h.down(&auto_with(""));
+    // Its time, a second, runs out.
+    h.say("Echo something.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0]
+            .1
+            .contains("it timed out, and its effect is unknown"),
+        "{said:?}"
+    );
+    assert!(said[0].2);
+    // An interrupt, with a long time.
+    let mut settings = mcp_settings(&[("echo", &silent)]);
+    settings.template_shared[0].mcp[0].timeout = 600;
+    h.setup(settings);
+    h.say("Echo again.");
+    // Once approved, by the mode, the call is the server's.
+    h.until(|up| match up {
+        Up::Event(Event {
+            kind: Kind::Approval { .. },
+            ..
+        }) => Some(()),
+        _ => None,
+    });
+    h.down(&Down::Interrupt);
+    let (events, _, _) = h.turn();
+    let said = results(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0]
+            .1
+            .contains("it was cancelled, and its effect is unknown"),
+        "{said:?}"
+    );
+    let (conversation, _) = h.close();
+    assert!(!conversation.events().iter().any(|e| matches!(
+        &e.kind,
+        Kind::Mcp {
+            outcome: Served::Failed { .. },
+            ..
+        }
+    )));
+}
+
+/// A rule that denies a server's tools refuses a call of one, by the
+/// rule, even in `auto` mode (DESIGN.md §12, Approval).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_rule_denies_an_mcp_call() {
+    let mut h = Harness::new_in(
+        "mcpdeny",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            calls_echo(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(mcp_settings(&[("echo", MCP_SERVER)]));
+    h.down(&auto_with("[everywhere]\ndeny mcp echo\n"));
+    h.say("Echo something.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let said = results(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].1.contains("`deny mcp echo`"), "{said:?}");
+    assert!(said[0].2);
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        Kind::Approval { outcome, by, .. } if outcome == "deny" && by == "rule"
+    )));
     h.close();
 }

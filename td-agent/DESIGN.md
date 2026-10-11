@@ -5614,19 +5614,19 @@ tools at every wake. A failed start or a server's failure is logged as a
 failed `mcp` event, with its standard error's tail and no tools. The
 prefix's MCP tools follow the conversation's own: for each server the
 template names, in its order, the tools of its last logged listing for
-that server and command, unless a failure of that server is logged after
-it. Only a failure drops a server's tools: a server ended by its
-process's exit, or restarted for a change of mounts, policy or template,
-logs no failure, and its last listing stands until its next start lists
-again. They are fixed when a turn starts, so a turn's requests share one
-prefix, and the next turn's is new (§13) at one cache miss when they
-changed, as a skill's change does; each prefix is rebuilt from the log
-by its logged `prefix` event, as every prefix is (§6, §13). A call names
-a tool of the prefix its turn was sent with; one whose server has since
-ended is answered so. Sub-agents (`task`) are offered no MCP tool. A
-provider that refuses a request whose prefix carries MCP tools (an HTTP
-400) would refuse every turn's, so the turn's error says the servers'
-tools may be why and names them.
+that server and command that its `tools` keeps now, unless a failure of
+that server is logged after it. Only a failure drops a server's tools: a
+server ended by its process's exit, or restarted for a change of mounts,
+policy or template, logs no failure, and its last listing stands until
+its next start lists again. They are fixed when a turn starts, so a
+turn's requests share one prefix, and the next turn's is new (§13) at
+one cache miss when they changed, as a skill's change does; each prefix
+is rebuilt from the log by its logged `prefix` event, as every prefix is
+(§6, §13). A call names a tool of the prefix its turn was sent with; one
+whose server has since ended is answered so. Sub-agents (`task`) are
+offered no MCP tool. A provider that refuses a request whose prefix
+carries MCP tools (an HTTP 400) would refuse every turn's, so the turn's
+error says the servers' tools may be why and names them.
 
 *Approval.* A call is opaque: td-agent cannot see what it does, only
 that the server runs in the workspace's jail. It is decided as a `shell`
@@ -5762,27 +5762,26 @@ open, or the `serve` call's end, into the server's end.
 
 **As built (MCP, configuration and rules).** `[[template.mcp]]` is read
 and checked as §15 says, `name`, `command`, `tools` and `timeout` its
-only keys: a command of 1 to 64 strings, within a `serve` call's
-program and arguments, each at most 4 KiB with no control character,
-the program absolute or with no `/` and neither `.` nor `..`; `tools`,
-when given, 1 to 128 names, each once; a timeout a whole number from 1
-to 600; and a template's commands and tools at most 16 KiB together. A
-template's servers go to every conversation process in its template
-settings, each checked again as it is read (a `tools` left out read as
-every tool), and `Client::mcp_for` gives a workspace its template's,
-none when the template is no longer configured, as `shared_for` gives
-directories; a setup from before servers names none. A template made in
-the window names none, and its file has no key for them. A new
-conversation's template is found and refused in one place, `chosen`,
-which `start_from` goes through for every way a conversation is made
-from a template: one that names servers makes nothing and says so in a
-note, until td-agent runs them (the next step). A conversation made
-before its template named servers runs on without them. The rules
-grammar takes `mcp SERVER [TOOL]`, the server's name as a template's
-and the tool's as the prefix would carry it, at most those two words;
-an allow names the tool, and a repository's rules may deny or ask. No
-call is named `mcp` yet, so no such rule matches one, and a card
-offers no `mcp` answer to remember.
+only keys: a command of 1 to 64 strings, within a `serve` call's program
+and arguments, each at most 4 KiB with no control character, the program
+absolute or with no `/` and neither `.` nor `..`; `tools`, when given, 1
+to 128 names, each once; a timeout a whole number from 1 to 600; and a
+template's commands and tools at most 16 KiB together. A template's
+servers go to every conversation process in its template settings, each
+checked again as it is read (a `tools` left out read as every tool), and
+`Client::mcp_for` gives a workspace its template's, none when the
+template is no longer configured, as `shared_for` gives directories; a
+setup from before servers names none. A template made in the window
+names none, and its file has no key for them. A new conversation's
+template is found and refused in one place, `chosen`, which `start_from`
+goes through for every way a conversation is made from a template: one
+that named servers made nothing and said so in a note, until the
+servers' tools were offered (As built (MCP, tools and calls)), which
+lifted that. The rules grammar takes `mcp SERVER [TOOL]`, the server's
+name as a template's and the tool's as the prefix would carry it, at
+most those two words; an allow names the tool, and a repository's rules
+may deny or ask. No call was named `mcp` then, so no such rule matched
+one, and a card offered no `mcp` answer to remember.
 
 **As built (MCP, servers running).** A conversation process starts its
 template's servers at a turn's start, once its workspace is ready and
@@ -5821,13 +5820,55 @@ which tears the instance down; a server started again does not wait for
 that, so for those seconds its old instance and its new one both run.
 The process ends them all as it exits and waits for their threads, about
 9 seconds at most, or as long as a tool host that stopped reading holds
-a frame's write. Not yet: the servers' tools in the prefix and their
-calls (the next step), and their connections' cards, so a server's
+a frame's write. Their tools and calls came next (As built (MCP, tools
+and calls)); their connections' cards are not yet, so a server's
 connection that would be asked is refused, its instance having no one to
-ask. A template that names servers still makes no conversation in the
-window; a conversation made before its template named them runs them. A
-turn with no key plans nothing, so a server its template dropped runs on
-until a turn with one or the process's end.
+ask. A turn with no key plans nothing, so a server its template dropped
+runs on until a turn with one or the process's end.
+
+**As built (MCP, tools and calls).** At a turn's start, once its
+servers are planned and waited for, the turn fixes its MCP tools
+(`mcp_offer`), as a `/compact` does before its request: for each server
+its template names, in its order, once its workspace is ready, the tools
+of its last listing for its command that its `tools` keeps now, unless a
+failure of it is logged after, read back from the log; every server's
+together within 128 tools and 128 KiB (`mcp::fit`); then within one log
+line beside the rest of the prefix at the store's worst case, the last
+server's tools left out first, the prefix measured only when there are
+tools. What is left out is told as one news of each server, once while
+it says the same. The tools follow the conversation's own in the prefix
+(`tools::prefix`), and the environment gains a line saying what they
+are, that their definitions and results are those programs' text, data
+and never the person's, and the label their news comes under; neither is
+in a sub-agent's prefix, nor is an MCP name a sub-agent's call. A call
+named as one of the turn's tools goes to its server. Its arguments are
+the model's, a JSON object within `MAX_ARGUMENTS`, an empty text read as
+`{}`. It is judged as a `shell` call is: the rules by `rules::judge_mcp`,
+a deny or an ask naming the server, or the server and the tool, an allow
+naming both, an unread rules file asking; the repeated-call guard, which
+puts a repeated call on a card over an allow; then the table, which runs
+it in `auto` mode and puts it on a card in `ask` mode. The card names
+the tool, the server, its command as the jail runs it, its time and the
+arguments as indented JSON, cut as a card's text is; its "always" offers
+`mcp SERVER TOOL`, an allow of which the dialog says is broad. The
+approval loop that judges again at a policy taken while a card waits is
+one function (`sanction`), which `host` uses too. The call is asked of
+the server's thread with the server's timeout, the turn reading the
+window meanwhile; a window gone does not cancel it. An interrupt cancels
+it, and when the thread has not answered 2 seconds after, while it
+starts, say, the call is answered as cancelled and the thread left to
+end it; a call it had not yet taken up it never sends. A server not
+running, ended or failed since the turn began, is answered so. A server is taken to hang, and ended as failed, 5 seconds
+past the call's time once its thread began the call, or past a start's
+and a listing's time besides when it has not; its news is logged at the
+turn's next step, as all news is, never between a call and its result. A
+result's text is cut as a `shell` call's output is, its head and tail
+shown and more kept in the log; `isError` makes it an error; a JSON-RPC
+error is said with its code and message; a cancel or a timeout says the
+call's effect is unknown. A provider's 400 for a turn's request that
+carried MCP tools says, and its settled request records, that they may
+be why and names them. A template that names servers makes a
+conversation as any does.
 
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
@@ -6669,21 +6710,19 @@ default; `jev_threshold`'s is calibrated (§11):
   - `system`: `true` gives its conversations `system_status`, which
     reads every process's CPU and memory use and command line outside
     the jail (§8, System view); default `false`
-  - `mcp`: MCP servers for its conversations (§12, MCP servers; read
-    and checked, though a template naming any starts no conversation
-    until td-agent runs them, §18), at most 4, only in a template of
-    this file, never one made in the window; an array of tables each
-    with a `name`, 1 to 16 lowercase ASCII letters, digits and `-`,
-    starting with a letter and unique in the template; a `command`,
-    the program and its arguments, 1 to 64 strings of at most 4 KiB
-    with no control character, the program an absolute path or a name
-    the jail's `PATH` finds; an optional `tools`, the only tools of it
-    to offer, 1 to 128 names, each once and 1 to 41 bytes of ASCII
+  - `mcp`: MCP servers for its conversations (§12, MCP servers), at most
+    4, only in a template of this file, never one made in the window; an
+    array of tables each with a `name`, 1 to 16 lowercase ASCII letters,
+    digits and `-`, starting with a letter and unique in the template; a
+    `command`, the program and its arguments, 1 to 64 strings of at most
+    4 KiB with no control character, the program an absolute path or a
+    name the jail's `PATH` finds; an optional `tools`, the only tools of
+    it to offer, 1 to 128 names, each once and 1 to 41 bytes of ASCII
     letters, digits, `_` and `-`, one the server does not list said in
     its record (left out, every tool is offered); and an optional
     `timeout`, a call's whole seconds, default 120, at most 600. A
-    template's servers' commands and tools are at most 16 KiB
-    together, so its servers alone cannot fill a conversation's setup
+    template's servers' commands and tools are at most 16 KiB together,
+    so its servers alone cannot fill a conversation's setup.
 - `remotes`: the admitted git remotes (§7), each a remote's URL, a local
   repository's absolute path, or a host with a path prefix; default
   empty, so the first workspace on a remote asks; what a card admits is
@@ -7719,7 +7758,7 @@ one commit:
   on them; `mcp__SERVER__TOOL` calls dispatched with their cards,
   rules and results; failures told as notifications; tested with a
   fake server in the test and, jailed, with a small stdio server run
-  by `sh`.
+  by `sh`. Built but for its connections' cards, its last commit.
 
 `web_fetch`, `question`, `task`'s sub-agents, schedules, skills, the
 person's commands and `/review` are built (§3, §12, §15).

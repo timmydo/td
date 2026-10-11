@@ -322,6 +322,13 @@ enum Judged<'a> {
     Network {
         destination: &'a crate::config::Destination,
     },
+    /// A call of MCP server `server`'s tool `tool` (DESIGN.md §12,
+    /// Approval).
+    Mcp {
+        server: &'a str,
+        tool: &'a str,
+        repeated: bool,
+    },
     /// A push of `branch` to `remote`, and why it is the person's
     /// whatever the rules allow, if it is.
     Push {
@@ -653,6 +660,8 @@ pub fn serve_in(
         routes: Vec::new(),
         servers: crate::servers::Servers::default(),
         mcp_reports: VecDeque::new(),
+        mcp_offered: Vec::new(),
+        mcp_hung: Vec::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -988,6 +997,12 @@ struct Session {
     /// What they told, logged at the next point between a turn's steps
     /// or while idle, never inside a request.
     mcp_reports: VecDeque<crate::servers::Told>,
+    /// The MCP tools the turn under way offers, by server, fixed at its
+    /// start (DESIGN.md §12, The prefix).
+    mcp_offered: Vec<(crate::config::McpServer, Vec<crate::mcp::Offered>)>,
+    /// Servers a call found hung, whose news waits for the turn's next
+    /// step.
+    mcp_hung: Vec<(crate::config::McpServer, crate::servers::Failed)>,
 }
 
 /// How long an endpoint envelope is kept before it is fetched again, so
@@ -1069,7 +1084,7 @@ impl Session {
         if let Some(end) = self.exited.pop_front() {
             return Ok(Some(Work::Ended(end)));
         }
-        if !self.mcp_reports.is_empty() {
+        if !self.mcp_reports.is_empty() || !self.mcp_hung.is_empty() {
             return Ok(Some(Work::Mcp));
         }
         // No turn runs to ask the classifier in: the person is asked.
@@ -1371,6 +1386,7 @@ impl Session {
         if let Some(outcome) = self.mcp_turn()? {
             return Ok(outcome);
         }
+        self.mcp_offer()?;
         let mut replied = false;
         for _ in 0..MAX_STEPS {
             self.between()?;
@@ -2094,7 +2110,13 @@ impl Session {
                         }
                     }
                 }
-                Failure::Stop { .. } => {
+                Failure::Stop { status, .. } => {
+                    let outcome = match self.mcp_names() {
+                        Some(names) if status == Some(400) => format!(
+                            "{outcome}; the MCP servers' tools in the request may be why: {names}"
+                        ),
+                        _ => outcome,
+                    };
                     self.settle(request.seq, None, (0, Basis::Nothing), outcome.clone())?;
                     self.spent(id, 0);
                     return Ok(Outcome::stop(outcome));
@@ -2598,6 +2620,7 @@ impl Session {
                 compact::FOCUS_BYTES
             ));
         }
+        self.mcp_offer()?;
         let asking = match self.asking()? {
             Ok(asking) => asking,
             Err(why) => return Ok(format!("the conversation could not be compacted: {why}")),
@@ -2819,7 +2842,11 @@ impl Session {
                 .seq;
             // Durable before it runs: a restart never runs it again.
             self.sync()?;
-            let (answer, beside) =
+            let repeated = repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
+            let mcp = self.mcp_tool(kit, &call.name);
+            let (answer, beside) = if let Some((server, tool)) = mcp {
+                self.mcp_call(started, &server, &tool, &call.arguments, repeated)?
+            } else {
                 match tools::parse_offered(kit, system_view, &call.name, &call.arguments) {
                     // A sub-agent's process would outlive it (§12, `task`).
                     Ok(Args::Host {
@@ -2830,17 +2857,12 @@ impl Session {
                         Beside::default(),
                     ),
                     Ok(Args::Host { call: hosted, acts }) => {
-                        let repeated =
-                            repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
                         self.host(started, &call.name, hosted, acts, repeated)?
                     }
-                    Ok(args) => {
-                        let repeated =
-                            repeats(self.conversation.events(), reply, at) + 1 >= REPEATS;
-                        (self.run(started, args, repeated)?, Beside::default())
-                    }
+                    Ok(args) => (self.run(started, args, repeated)?, Beside::default()),
                     Err(why) => (Err(why), Beside::default()),
-                };
+                }
+            };
             let (content, error) = match answer {
                 Ok(content) => (content, false),
                 Err(why) => (format!("error: {why}"), true),
@@ -3862,16 +3884,21 @@ impl Session {
     /// workspace, the workspace prepared for `client`'s shared directories
     /// and named, with its tools.
     fn expected_prefix(&mut self, client: &Client) -> Result<String, String> {
-        // Listed as they are now, so one added is offered from the next
-        // request, as a changed prefix.
-        let skills = self
-            .skills
+        let skills = self.skills_index();
+        let mcp = serving::definitions(&self.mcp_offered);
+        self.placed(client, |created, place| {
+            crate::prompt::prefix_with(created, place, skills.as_deref(), &mcp)
+        })
+    }
+
+    /// The person's skills as the prompt lists them, listed as they are
+    /// now, so one added is offered from the next request, as a changed
+    /// prefix.
+    fn skills_index(&self) -> Option<String> {
+        self.skills
             .as_deref()
             .and_then(|dir| crate::skills::scan(dir).ok())
-            .and_then(|found| crate::skills::index(&found.skills));
-        self.placed(client, |created, place| {
-            crate::prompt::prefix_with(created, place, skills.as_deref())
-        })
+            .and_then(|found| crate::skills::index(&found.skills))
     }
 
     /// What `made` makes of the conversation's creation time and of its
@@ -3931,6 +3958,105 @@ impl Session {
         Ok(made(meta.created, Some(&place)))
     }
 
+    /// Whether a call judged as `judged`, the `ToolCall` record `started`,
+    /// runs (DESIGN.md §11): by `ruling`, made by the policy `ruled_at`;
+    /// on a card of `card`'s title and lines when it is the person's, its
+    /// "always" answers `proposed`; and again at a policy taken before it
+    /// starts. Each decision that holds is logged; why it does not run,
+    /// when it does not.
+    #[allow(clippy::too_many_arguments)]
+    fn sanction(
+        &mut self,
+        started: u64,
+        judged: &Judged<'_>,
+        ruling: Ruling,
+        mut ruled_at: u64,
+        repeated: bool,
+        card: &dyn Fn() -> (String, Vec<String>),
+        proposed: Option<crate::rules::Always>,
+    ) -> Result<Result<(), String>, String> {
+        // Until a decision holds: one a rule or the mode made, which a
+        // policy taken since leaves to the person, goes round again.
+        let mut ruling = ruling;
+        loop {
+            let mut human = false;
+            let mut allowed: Option<(&str, String)> = None;
+            match ruling {
+                Ruling::Card(asked) => {
+                    let (title, mut details) = card();
+                    if repeated {
+                        details.insert(0, REPEATED.into());
+                    }
+                    if let Some(why) = &asked {
+                        details.insert(0, format!("Asked because {why}."));
+                    }
+                    // No allow while a rule or an unread file asks, as one
+                    // would not run the call before them.
+                    let always = proposed.clone().map(|always| {
+                        crate::rules::Offer::Rules(crate::rules::Always {
+                            allow: always.allow && asked.is_none(),
+                            ..always
+                        })
+                    });
+                    let why = asked.as_deref().or(repeated.then_some("repeated"));
+                    let decided =
+                        self.decide(started, title, details, why, always, Some(judged))?;
+                    // The card was judged again at every policy it saw.
+                    ruled_at = self.human.0;
+                    match decided {
+                        Decided::Allowed => human = true,
+                        Decided::Released => {}
+                        Decided::Refused => return Ok(Err(CALL_REFUSED.into())),
+                        Decided::Undecided => return Ok(Err(CALL_UNDECIDED.into())),
+                        Decided::Ruled(why) => return Ok(Err(ruled(&why))),
+                    }
+                }
+                // Logged once the decision holds.
+                Ruling::Run(Some(why)) => allowed = Some(("rule", why)),
+                Ruling::Auto => allowed = Some(("mode", AUTO.into())),
+                Ruling::Run(None) | Ruling::Deny(_) => {}
+            }
+            // An interrupt that came with the decision, or before it: nothing
+            // starts; nor does a call a policy that came since refuses, nor,
+            // with no word from the person, one it leaves to them.
+            self.hear();
+            if self.interrupt {
+                return Ok(Err(CALL_SKIPPED.into()));
+            }
+            if self.human.0 != ruled_at {
+                ruled_at = self.human.0;
+                match self.ruling(judged) {
+                    Ruling::Deny(why) => {
+                        self.log(Kind::Approval {
+                            call: started,
+                            outcome: "deny".into(),
+                            by: "rule".into(),
+                            probabilities: None,
+                            reason: Some(why.clone()),
+                        })?;
+                        return Ok(Err(ruled(&why)));
+                    }
+                    again @ Ruling::Card(_) if !human => {
+                        ruling = again;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((by, why)) = allowed {
+                self.log(Kind::Approval {
+                    call: started,
+                    outcome: "allow".into(),
+                    by: by.into(),
+                    probabilities: None,
+                    reason: Some(why),
+                })?;
+            }
+            break;
+        }
+        Ok(Ok(()))
+    }
+
     /// Runs a workspace tool's call, the `ToolCall` record `started`, in
     /// the jail (DESIGN.md §8, §12), the human deciding first when it
     /// `acts` (§11): the tool's answer or why not, and what the log keeps
@@ -3965,7 +4091,7 @@ impl Session {
         };
         // The policy it was judged by: a background call's check below
         // can take a newer one.
-        let mut ruled_at = self.human.0;
+        let ruled_at = self.human.0;
         let ruling = self.ruling(&judged);
         if let Ruling::Deny(why) = &ruling {
             self.log(Kind::Approval {
@@ -4011,91 +4137,18 @@ impl Session {
                 ));
             }
         }
-        // Until a decision holds: one a rule or the mode made, which a
-        // policy taken since leaves to the person, goes round again.
-        let mut ruling = ruling;
-        loop {
-            let mut human = false;
-            let mut allowed: Option<(&str, String)> = None;
-            match ruling {
-                Ruling::Card(asked) => {
-                    let (title, mut details) = tools::card(&call);
-                    if repeated {
-                        details.insert(0, REPEATED.into());
-                    }
-                    if let Some(why) = &asked {
-                        details.insert(0, format!("Asked because {why}."));
-                    }
-                    // What the card's "always" answers would remember: no
-                    // allow while a rule or an unread file asks, as one
-                    // would not run the call before them.
-                    let always = self
-                        .conversation
-                        .meta()
-                        .workspace
-                        .as_ref()
-                        .and_then(|_| crate::rules::proposals(name, command))
-                        .map(|always| {
-                            crate::rules::Offer::Rules(crate::rules::Always {
-                                allow: always.allow && asked.is_none(),
-                                ..always
-                            })
-                        });
-                    let why = asked.as_deref().or(repeated.then_some("repeated"));
-                    let decided =
-                        self.decide(started, title, details, why, always, Some(&judged))?;
-                    // The card was judged again at every policy it saw.
-                    ruled_at = self.human.0;
-                    match decided {
-                        Decided::Allowed => human = true,
-                        Decided::Released => {}
-                        Decided::Refused => return failed(CALL_REFUSED.into()),
-                        Decided::Undecided => return failed(CALL_UNDECIDED.into()),
-                        Decided::Ruled(why) => return failed(ruled(&why)),
-                    }
-                }
-                // Logged once the decision holds.
-                Ruling::Run(Some(why)) => allowed = Some(("rule", why)),
-                Ruling::Auto => allowed = Some(("mode", AUTO.into())),
-                Ruling::Run(None) | Ruling::Deny(_) => {}
-            }
-            // An interrupt that came with the decision, or before it: nothing
-            // starts; nor does a call a policy that came since refuses, nor,
-            // with no word from the person, one it leaves to them.
-            self.hear();
-            if self.interrupt {
-                return failed(CALL_SKIPPED.into());
-            }
-            if self.human.0 != ruled_at {
-                ruled_at = self.human.0;
-                match self.ruling(&judged) {
-                    Ruling::Deny(why) => {
-                        self.log(Kind::Approval {
-                            call: started,
-                            outcome: "deny".into(),
-                            by: "rule".into(),
-                            probabilities: None,
-                            reason: Some(why.clone()),
-                        })?;
-                        return failed(ruled(&why));
-                    }
-                    again @ Ruling::Card(_) if !human => {
-                        ruling = again;
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some((by, why)) = allowed {
-                self.log(Kind::Approval {
-                    call: started,
-                    outcome: "allow".into(),
-                    by: by.into(),
-                    probabilities: None,
-                    reason: Some(why),
-                })?;
-            }
-            break;
+        let card = || tools::card(&call);
+        // What the card's "always" answers would remember.
+        let proposed = self
+            .conversation
+            .meta()
+            .workspace
+            .as_ref()
+            .and_then(|_| crate::rules::proposals(name, command));
+        if let Err(why) = self.sanction(
+            started, &judged, ruling, ruled_at, repeated, &card, proposed,
+        )? {
+            return failed(why);
         }
         let call = self.bench.with_digest(call);
         let mut client = match self.bench.take(&call, started) {
@@ -5146,7 +5199,9 @@ impl Session {
                         }
                         // A crossing's `auto` is the classifier's, and a
                         // card it waits on stays.
-                        Some(Ruling::Auto) if matches!(judged, Some(Judged::Host { .. })) => {
+                        Some(Ruling::Auto)
+                            if matches!(judged, Some(Judged::Host { .. } | Judged::Mcp { .. })) =>
+                        {
                             break Some(Err(Ok(("mode", AUTO.into()))))
                         }
                         Some(Ruling::Auto) => {}
@@ -5225,6 +5280,23 @@ impl Session {
                 acts,
                 repeated,
             } => (name, command, acts, repeated),
+            // As a `shell` call is: a call of a program in the jail
+            // (DESIGN.md §12, Approval).
+            Judged::Mcp {
+                server,
+                tool,
+                repeated,
+            } => {
+                let (rules, unread) = self.rules();
+                return match crate::rules::judge_mcp(&rules, &unread, server, tool) {
+                    crate::rules::Verdict::Deny(why) => Ruling::Deny(tools::visible(&why)),
+                    crate::rules::Verdict::Ask(why) => Ruling::Card(Some(tools::visible(&why))),
+                    _ if repeated => Ruling::Card(None),
+                    crate::rules::Verdict::Allow(why) => Ruling::Run(Some(tools::visible(&why))),
+                    _ if self.workspace_mode() == crate::config::Mode::Auto => Ruling::Auto,
+                    _ => Ruling::Card(None),
+                };
+            }
             // The rules for a push, then the reasons it is the person's,
             // then the table (DESIGN.md §11).
             Judged::Push {

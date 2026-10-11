@@ -826,8 +826,8 @@ fn subcommand(word: &str) -> bool {
 /// program with no subcommand to name; nothing for a command with no
 /// program a rule can name.
 pub fn proposals(tool: &str, command: Option<&str>) -> Option<Always> {
-    // `mcp` alone is no rule: its answers name a server and a tool,
-    // which the servers' step offers.
+    // `mcp` alone is no rule: a card for an MCP call offers its server
+    // and tool (DESIGN.md §12, Approval).
     if !TOOLS.contains(&tool) || tool == "mcp" {
         return None;
     }
@@ -879,6 +879,11 @@ pub fn proposals(tool: &str, command: Option<&str>) -> Option<Always> {
 /// The program of `body`, a rule's tool and words, when an allow for it
 /// is broad: an interpreter or build tool.
 pub fn broad(body: &str) -> Option<&str> {
+    // An MCP tool does whatever its server's program, workspace content,
+    // makes of a call (DESIGN.md §12, Approval).
+    if body.starts_with("mcp ") {
+        return Some(body);
+    }
     let word = body.strip_prefix("shell ")?.split(' ').next()?;
     BROAD.contains(&program(word)).then_some(word)
 }
@@ -1629,6 +1634,56 @@ pub fn judge(
 
 /// The most allow rules an allow's reason names.
 const NAMED: usize = 3;
+
+/// What `rules` say of a call of MCP server `server`'s tool `tool`
+/// (DESIGN.md §11, §12, Approval): a deny or an ask that names the
+/// server, or the server and the tool; an allow that names both; a rules
+/// file that could not be read asks; the table otherwise.
+pub fn judge_mcp(
+    rules: &[Sourced],
+    unread: &[(String, String)],
+    server: &str,
+    tool: &str,
+) -> Verdict {
+    let names = |rule: &Rule| {
+        rule.tool == "mcp"
+            && match rule.prefix.as_slice() {
+                [named] => named == server && rule.effect != Effect::Allow,
+                [named, called] => named == server && called == tool,
+                _ => false,
+            }
+    };
+    let said = |effect: Effect| {
+        rules
+            .iter()
+            .find(|one| one.rule.effect == effect && names(&one.rule))
+    };
+    if let Some(one) = said(Effect::Deny) {
+        return Verdict::Deny(format!(
+            "the rule `{}` of {} denies it",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some(one) = said(Effect::Ask) {
+        return Verdict::Ask(format!(
+            "the rule `{}` of {} asks",
+            one.rule.text(),
+            one.from
+        ));
+    }
+    if let Some((from, why)) = unread.first() {
+        return Verdict::Ask(format!("{from} could not be read: {why}"));
+    }
+    match said(Effect::Allow) {
+        Some(one) => Verdict::Allow(format!(
+            "the rule `{}` of {} allows it",
+            one.rule.text(),
+            one.from
+        )),
+        None => Verdict::Table,
+    }
+}
 
 /// Whether `rule` is for a push of `branch` to `remote`: a `git_push`
 /// rule naming neither, the remote, or both, its remote compared as an
@@ -2795,6 +2850,47 @@ mod tests {
         let rule = Rule::parse("deny mcp github").unwrap();
         assert!(!matches(&rule, "shell", None));
         assert!(!matches(&rule, "mcp__github__list", None));
+    }
+
+    /// An MCP call is judged by the rules naming its server, or its server
+    /// and tool: a deny before an ask before an allow, an unread rules
+    /// file asking before an allow, the table otherwise; and an allow of
+    /// one is broad (DESIGN.md §12, Approval).
+    #[test]
+    fn an_mcp_call_is_judged_by_its_server_and_tool() {
+        let rules = |text: &str| -> Vec<Sourced> {
+            text.lines()
+                .map(|line| Sourced {
+                    rule: Rule::parse(line).unwrap(),
+                    from: "the test".into(),
+                })
+                .collect()
+        };
+        let judged = |text: &str, tool: &str| judge_mcp(&rules(text), &[], "gh", tool);
+        assert_eq!(judged("", "list"), Verdict::Table);
+        assert!(matches!(
+            judged("allow mcp gh list", "list"),
+            Verdict::Allow(_)
+        ));
+        assert_eq!(judged("allow mcp gh list", "push"), Verdict::Table);
+        assert_eq!(judged("allow mcp other list", "list"), Verdict::Table);
+        assert!(matches!(
+            judged("allow mcp gh list\nask mcp gh", "list"),
+            Verdict::Ask(_)
+        ));
+        assert!(matches!(
+            judged("allow mcp gh list\nask mcp gh list\ndeny mcp gh", "list"),
+            Verdict::Deny(why) if why.contains("`deny mcp gh`")
+        ));
+        assert!(matches!(judged("deny mcp gh push", "list"), Verdict::Table));
+        assert!(matches!(judged("deny shell gh", "list"), Verdict::Table));
+        let unread = [("a rules file".to_string(), "it is gone".to_string())];
+        assert!(matches!(
+            judge_mcp(&rules("allow mcp gh list"), &unread, "gh", "list"),
+            Verdict::Ask(why) if why.contains("could not be read")
+        ));
+        assert_eq!(broad("mcp gh list"), Some("mcp gh list"));
+        assert_eq!(broad("network example.com:443"), None);
     }
 
     /// A network rule names one destination, written as an allowlist

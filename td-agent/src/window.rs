@@ -2920,21 +2920,13 @@ fn local_paths(remotes: &[crate::git::Admission]) -> Vec<PathBuf> {
 }
 
 /// The configured template `name` a new conversation starts from, or
-/// why none may: none is named so, or it names MCP servers, which no
-/// new conversation starts with until td-agent runs them (DESIGN.md §18,
-/// MCP's last step). One made before its template named them runs on
-/// without them.
+/// why none may: none is named so.
 fn chosen(templates: &[Template], name: &str) -> Result<Template, String> {
-    let template = templates
+    templates
         .iter()
         .find(|t| t.name == name)
-        .ok_or_else(|| format!("no template is named {name:?}"))?;
-    if !template.mcp.is_empty() {
-        return Err(format!(
-            "template {name:?} names MCP servers, which this td-agent does not run yet; nothing was made"
-        ));
-    }
-    Ok(template.clone())
+        .cloned()
+        .ok_or_else(|| format!("no template is named {name:?}"))
 }
 
 /// Where a workspace reaches: a conversation's own directory, or a
@@ -3370,11 +3362,10 @@ mod tests {
     }
 
     /// The template a new conversation starts from, as `start_from`
-    /// finds it: one naming MCP servers is refused until td-agent runs
-    /// them, and says so; one naming none is chosen, and a name no
-    /// template has is refused.
+    /// finds it, whether or not it names MCP servers; a name no template
+    /// has is refused.
     #[test]
-    fn a_template_with_mcp_servers_starts_nothing_yet() {
+    fn a_template_is_chosen_by_its_name() {
         let mut template = crate::config::Template {
             name: "tools".into(),
             repos: Vec::new(),
@@ -3396,8 +3387,10 @@ mod tests {
             .contains("no template is named"));
         template.mcp =
             vec![crate::config::mcp_server("gh", vec!["gh-mcp".into()], None, None).unwrap()];
-        let why = chosen(&[template], "tools").unwrap_err();
-        assert!(why.contains("\"tools\" names MCP servers"), "{why}");
+        assert_eq!(
+            chosen(std::slice::from_ref(&template), "tools"),
+            Ok(template.clone())
+        );
     }
 
     /// Conversations whose workspace names a template, by the exact name

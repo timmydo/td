@@ -674,10 +674,12 @@ pub(crate) fn definition(tool: Tool) -> Json {
 /// workspace's with them when it works in one, and their settings, then
 /// the messages every request begins with, `messages` last so a request
 /// appends to it.
-pub fn prefix(kit: Kit, system_view: bool, system: &str) -> String {
+pub fn prefix(kit: Kit, system_view: bool, system: &str, mcp: &[Json]) -> String {
+    // A conversation's MCP tools follow its own (DESIGN.md §12).
     let tools = Tool::offered(kit, system_view)
         .into_iter()
         .map(definition)
+        .chain(mcp.iter().cloned())
         .collect();
     Json::Obj(vec![
         ("tools".into(), Json::Arr(tools)),
@@ -1668,6 +1670,27 @@ fn quoted_word(word: &str) -> String {
     }
 }
 
+/// The card for a call of MCP server `server`'s tool `tool`, which runs
+/// as `command` in the workspace's jail, with `arguments`, for at most
+/// `timeout` seconds (DESIGN.md §12, Approval).
+pub fn mcp_card(
+    server: &str,
+    command: &[String],
+    tool: &str,
+    arguments: &Json,
+    timeout: u64,
+) -> (String, Vec<String>) {
+    let mut card = Lines::default();
+    card.line(format!(
+        "Call {tool} of MCP server {server}, for at most {timeout} s. The server runs in the workspace's jail as:"
+    ));
+    let words: Vec<String> = command.iter().map(|w| quoted_word(w)).collect();
+    card.text("", &words.join(" "), PART_LINES);
+    card.line("With these arguments, which the server makes of what it will:".into());
+    card.text("", &arguments.to_string_pretty(), PART_LINES * 2);
+    ("Call an MCP server's tool".to_string(), card.done())
+}
+
 /// The card that asks the human whether `call` may run (DESIGN.md §11):
 /// its title and the exact action, line by line, what it runs before the
 /// lists it runs over.
@@ -2066,6 +2089,53 @@ pub fn push_card(
 }
 
 #[cfg(test)]
+mod mcp_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    /// A conversation's MCP tools follow its own; a sub-agent's kit gets
+    /// whatever it is given, none in practice (DESIGN.md §12, Its tools).
+    #[test]
+    fn mcp_tools_follow_the_conversations_own() {
+        let mcp =
+            td_json::parse(r#"{"type":"function","function":{"name":"mcp__gh__list"}}"#).unwrap();
+        let text = prefix(Kit::Workspace, false, "system", &[mcp]);
+        let parsed = td_json::parse(&text).unwrap();
+        let tools = parsed.get("tools").and_then(Json::as_arr).unwrap();
+        let last = tools.last().unwrap();
+        assert_eq!(
+            last.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Json::as_str),
+            Some("mcp__gh__list")
+        );
+        assert_eq!(tools.len(), Tool::offered(Kit::Workspace, false).len() + 1);
+    }
+
+    /// The card names the tool, the server, its command and the
+    /// arguments as indented JSON.
+    #[test]
+    fn an_mcp_call_has_a_card_of_its_own() {
+        let arguments = td_json::parse(r#"{"repo":"td","state":"open"}"#).unwrap();
+        let (title, lines) = mcp_card(
+            "gh",
+            &["gh-mcp".to_string(), "--read only".to_string()],
+            "list",
+            &arguments,
+            120,
+        );
+        assert_eq!(title, "Call an MCP server's tool");
+        let card = lines.join("\n");
+        assert!(
+            card.contains("Call list of MCP server gh, for at most 120 s"),
+            "{card}"
+        );
+        assert!(card.contains("gh-mcp '--read only'"), "{card}");
+        assert!(card.contains("  \"repo\": \"td\""), "{card}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
@@ -2094,7 +2164,7 @@ mod tests {
     #[test]
     fn the_prefix_defines_the_tools_before_its_messages() {
         {
-            let text = prefix(Kit::Conversation, false, "system text");
+            let text = prefix(Kit::Conversation, false, "system text", &[]);
             assert!(text.ends_with("]}"), "{text}");
             let value = td_json::parse(&text).unwrap();
             let names: Vec<&str> = value
@@ -2132,7 +2202,7 @@ mod tests {
             };
             assert_eq!(members.last().unwrap().0, "messages");
             // The same text every time: the prefix is fixed.
-            assert_eq!(text, prefix(Kit::Conversation, false, "system text"));
+            assert_eq!(text, prefix(Kit::Conversation, false, "system text", &[]));
         }
     }
 
@@ -2169,9 +2239,9 @@ mod tests {
         }
         assert!(!acting("git_fetch"));
         assert!(known("git_fetch"));
-        let prefix = prefix(Kit::Repositories, false, "s");
+        let prefix = prefix(Kit::Repositories, false, "s", &[]);
         assert!(prefix.contains("\"git_fetch\""));
-        assert!(!super::prefix(Kit::Workspace, false, "s").contains("\"git_fetch\""));
+        assert!(!super::prefix(Kit::Workspace, false, "s", &[]).contains("\"git_fetch\""));
     }
 
     /// `task` is offered beside a workspace's tools, after the
@@ -2256,9 +2326,9 @@ mod tests {
         assert!(known("system_status"));
         assert!(!acting("system_status"));
         assert!(parse_in(Kit::Workspace, "system_status", "{}").is_err());
-        assert!(!prefix(Kit::Workspace, false, "s").contains("\"system_status\""));
+        assert!(!prefix(Kit::Workspace, false, "s", &[]).contains("\"system_status\""));
         for kit in [Kit::Workspace, Kit::Repositories] {
-            assert!(prefix(kit, true, "s").contains("\"system_status\""));
+            assert!(prefix(kit, true, "s", &[]).contains("\"system_status\""));
         }
         assert!(!Tool::offered(Kit::Review, true).contains(&Tool::SystemStatus));
         assert_eq!(
@@ -2339,7 +2409,7 @@ mod tests {
         }
         assert!(!acting("git_push"));
         assert!(known("git_push"));
-        assert!(prefix(Kit::Repositories, false, "s").contains("\"git_push\""));
+        assert!(prefix(Kit::Repositories, false, "s", &[]).contains("\"git_push\""));
     }
 
     /// A push's card says where the commit goes and what the scan found
