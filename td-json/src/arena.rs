@@ -87,6 +87,14 @@ impl<'a> Document<'a> {
     pub fn token_count(&self) -> usize {
         self.tokens.len()
     }
+    /// One indexed token's decoded UTF-8 bytes, if it is a string or key.
+    /// This does not rescan the string; callers can inspect bounded chunks.
+    pub fn string_bytes_at(&self, index: usize) -> Option<&'a [u8]> {
+        let token = *self.tokens.get(index)?;
+        matches!(token.kind, Kind::String | Kind::Key)
+            .then(|| raw_span(self.bytes, token))
+            .flatten()
+    }
     /// Includes object keys and values, allowing whole-document scalar policies.
     pub fn strings(&self) -> impl Iterator<Item = &str> {
         self.tokens
@@ -104,6 +112,13 @@ pub struct Value<'a> {
 impl<'a> Value<'a> {
     fn token(self) -> Option<Token> {
         self.tokens.get(self.index as usize).copied()
+    }
+    /// Decoded, validated UTF-8 bytes without a whole-string revalidation.
+    pub fn as_string_bytes(self) -> Option<&'a [u8]> {
+        let token = self.token()?;
+        (token.kind == Kind::String)
+            .then(|| raw_span(self.bytes, token))
+            .flatten()
     }
     pub fn as_str(self) -> Option<&'a str> {
         let token = self.token()?;
@@ -228,15 +243,15 @@ pub struct Object<'a> {
     next: u32,
     left: u32,
 }
-impl<'a> Iterator for Object<'a> {
-    type Item = (&'a str, Value<'a>);
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a> Object<'a> {
+    /// Advance one member without rescanning its decoded UTF-8 key.
+    pub fn next_bytes(&mut self) -> Option<(&'a [u8], Value<'a>)> {
         if self.left == 0 {
             return None;
         }
         let index = self.next;
         let token = self.value.tokens.get(index as usize).copied()?;
-        let key = span(self.value.bytes, token)?;
+        let key = raw_span(self.value.bytes, token)?;
         self.next = token.next;
         self.left -= 1;
         Some((
@@ -247,15 +262,25 @@ impl<'a> Iterator for Object<'a> {
             },
         ))
     }
+}
+impl<'a> Iterator for Object<'a> {
+    type Item = (&'a str, Value<'a>);
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, value) = self.next_bytes()?;
+        Some((checked_utf8(key)?, value))
+    }
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.left as usize, Some(self.left as usize))
     }
 }
 impl ExactSizeIterator for Object<'_> {}
 fn span(bytes: &[u8], token: Token) -> Option<&str> {
+    checked_utf8(raw_span(bytes, token)?)
+}
+fn checked_utf8(bytes: &[u8]) -> Option<&str> {
     #[cfg(test)]
-    tests::UTF8_BYTES.with(|count| count.set(count.get().saturating_add(u64::from(token.length))));
-    std::str::from_utf8(raw_span(bytes, token)?).ok()
+    tests::UTF8_BYTES.with(|count| count.set(count.get().saturating_add(bytes.len() as u64)));
+    std::str::from_utf8(bytes).ok()
 }
 fn raw_span(bytes: &[u8], token: Token) -> Option<&[u8]> {
     if !matches!(token.kind, Kind::String | Kind::Key | Kind::Number) {
@@ -1455,5 +1480,41 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn bounded_byte_views_preserve_decoding_and_type_boundaries() {
+        let mut bytes = br#"{"\u0061":"\ud834\udd1e","z":[1,null]}"#.to_vec();
+        let mut tokens = [Token::EMPTY; 10];
+        let document = parse(&mut bytes, &mut tokens, limits()).unwrap();
+        assert_eq!(document.string_bytes_at(0), None);
+        assert_eq!(document.string_bytes_at(1), Some(b"a".as_slice()));
+        assert_eq!(document.string_bytes_at(2), Some("𝄞".as_bytes()));
+        assert_eq!(document.string_bytes_at(document.token_count()), None);
+        let mut object = document.root().as_object().unwrap();
+        let (key, value) = object.next_bytes().unwrap();
+        assert_eq!(key, b"a");
+        assert_eq!(value.as_string_bytes(), Some("𝄞".as_bytes()));
+        let (key, value) = object.next_bytes().unwrap();
+        assert_eq!(key, b"z");
+        assert_eq!(value.as_string_bytes(), None);
+        assert!(object.next_bytes().is_none());
+    }
+    #[test]
+    fn ordinary_object_iteration_counts_key_revalidation() {
+        let mut bytes = br#"{"key":null}"#.to_vec();
+        let mut tokens = [Token::EMPTY; 3];
+        let document = parse(&mut bytes, &mut tokens, limits()).unwrap();
+        UTF8_BYTES.with(|count| count.set(0));
+        assert_eq!(
+            document.root().as_object().unwrap().next().unwrap().0,
+            "key"
+        );
+        assert_eq!(UTF8_BYTES.with(|count| count.get()), 3);
+        UTF8_BYTES.with(|count| count.set(0));
+        assert_eq!(
+            document.root().as_object().unwrap().next_bytes().unwrap().0,
+            b"key"
+        );
+        assert_eq!(UTF8_BYTES.with(|count| count.get()), 0);
     }
 }

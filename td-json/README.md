@@ -140,3 +140,11 @@ Neither API owns a clock, cancellation or a scheduler. A caller checks its
 original admission between steps and before using the completed document.
 Object lookup, scalar views and JSON writing remain synchronous helpers;
 this scheduling bound applies only to cursor parsing.
+
+For bounded protocol validation, `Document::string_bytes_at` visits one
+indexed token, `Value::as_string_bytes` returns one decoded string span,
+and `Object::next_bytes` advances one member without UTF-8 rescanning.
+Those byte slices contain validated decoded UTF-8 and borrow the immutable
+Document backing. A consumer decoding chunks must preserve scalar boundaries;
+no owned string or new authority is created. Ordinary string views and
+object iteration retain their existing synchronous string conversion.

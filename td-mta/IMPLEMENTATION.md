@@ -2838,10 +2838,15 @@ basic envelope at the advertised method count.
 
 The shared arena now has a fixed-state resumable Cursor for UTF-8 validation,
 tokenization and key sorting; its synchronous parse helper drives that same
-implementation. JMAP whole-envelope/I-JSON admission still uses synchronous
-helpers. Stepped admission with live deadlines, bounded downstream traversal
-and API.md's bridge from raw escaped body-property fragments to decoded
-values remain required before activation. Internal depth/token
+implementation. The inert JMAP Validation owner also makes whole-envelope,
+I-JSON, capability and creation-ID validation resumable. It exposes a Request
+only after every call is valid. Envelope error precedence remains: using
+shape, method-call count and tuples, creation map, then unknown capability.
+Invocation names and call IDs are borrowed
+decoded UTF-8 byte slices, avoiding unbounded string revalidation when calls
+are visited. Runtime live-deadline checks, bounded downstream traversal and
+API.md's bridge from raw escaped body-property fragments to decoded values
+remain required before activation. Internal depth/token
 refusal is planned as HTTP 400 with a redacted generic problem body; it is
 neither notJSON nor an advertised Core limit. Storage/configuration faults
 remain HTTP 500 server failures. The unreachable parser-byte Resource display

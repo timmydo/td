@@ -22,7 +22,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Configuration => "JMAP request limits cannot admit the basic envelope",
-            Self::Storage => "request arena backing invalid or exhausted",
+            Self::Storage => "request validation storage or state invalid",
             Self::NotJson => "notJSON",
             Self::NotRequest => "notRequest",
             Self::UnknownCapability => "unknownCapability",
@@ -65,11 +65,13 @@ pub struct Request<'a> {
     calls: arena::Array<'a>,
     created: Option<Object<'a>>,
 }
+/// Method names and call IDs are decoded, validated UTF-8 bytes. Byte views
+/// avoid rescanning unbounded strings when iterating admitted calls.
 #[derive(Clone, Copy)]
 pub struct Invocation<'a> {
-    pub name: &'a str,
+    pub name: &'a [u8],
     pub arguments: Value<'a>,
-    pub call_id: &'a str,
+    pub call_id: &'a [u8],
 }
 impl<'a> Invocation<'a> {
     pub fn argument(&self, name: &str) -> Option<Value<'a>> {
@@ -114,79 +116,14 @@ impl<'a> Request<'a> {
         resources: &ResourcePlan,
         capabilities: &[&str],
     ) -> Result<Self, Error> {
-        Self::validate_resources(resources)?;
-        let limits = resources.limits();
-        if tokens.len() < limits.json_tokens {
-            return Err(Error::Storage);
-        }
-        let value = arena::parse(
-            input,
-            tokens,
-            ParseLimits {
-                max_bytes: limits.json_bytes,
-                max_depth: limits.json_depth,
-                max_tokens: limits.json_tokens,
-            },
-        )
-        .map_err(|error| match error.kind {
-            arena::ErrorKind::Syntax => Error::NotJson,
-            arena::ErrorKind::Limit(ParseLimit::Bytes) => Error::MaxSizeRequest,
-            arena::ErrorKind::Limit(kind) => Error::Resource(kind),
-            arena::ErrorKind::Storage => Error::Storage,
-        })?;
-        if value
-            .strings()
-            .any(|text| text.chars().any(crate::unicode::is_noncharacter))
-        {
-            return Err(Error::NotJson);
-        }
-        let object = value.root();
-        if object.as_object().is_none() {
-            return Err(Error::NotRequest);
-        }
-        let using = object
-            .get("using")
-            .and_then(Value::as_array)
-            .ok_or(Error::NotRequest)?;
-        if using.into_iter().any(|value| value.as_str().is_none()) {
-            return Err(Error::NotRequest);
-        }
-        let calls = object
-            .get("methodCalls")
-            .and_then(Value::as_array)
-            .ok_or(Error::NotRequest)?;
-        if calls.len() > limits.json_methods {
-            return Err(Error::MaxCallsInRequest);
-        }
-        if calls.into_iter().any(|value| invocation(value).is_none()) {
-            return Err(Error::NotRequest);
-        }
-        let created = object
-            .get("createdIds")
-            .map(|value| value.as_object().ok_or(Error::NotRequest))
-            .transpose()?;
-        if let Some(mut created) = created {
-            if created.any(|(key, value)| !id(key) || !value.as_str().is_some_and(id)) {
-                return Err(Error::NotRequest);
-            }
-        }
-        if using.into_iter().any(|value| {
-            !value
-                .as_str()
-                .is_some_and(|name| capabilities.contains(&name))
-        }) {
-            return Err(Error::UnknownCapability);
-        }
-        Ok(Self {
-            using,
-            calls,
-            created,
-        })
+        let mut admission = Validation::new(input, tokens, resources, capabilities)?;
+        while !admission.step()? {}
+        admission.finish()
     }
     pub fn uses(&self, capability: &str) -> bool {
         self.using
             .into_iter()
-            .any(|value| value.as_str() == Some(capability))
+            .any(|value| value.as_string_bytes() == Some(capability.as_bytes()))
     }
     pub fn call_count(&self) -> usize {
         self.calls.len()
@@ -205,25 +142,387 @@ fn invocation(value: Value<'_>) -> Option<Invocation<'_>> {
     if values.len() != 3 {
         return None;
     }
-    let name = values.next()?.as_str()?;
+    let name = values.next()?.as_string_bytes()?;
     let arguments = values.next()?;
     arguments.as_object()?;
-    let call_id = values.next()?.as_str()?;
+    let call_id = values.next()?.as_string_bytes()?;
     Some(Invocation {
         name,
         arguments,
         call_id,
     })
 }
-fn id(value: &str) -> bool {
-    (1..=255).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+fn id_chunk(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Resumable whole-envelope admission. No invocation escapes before every
+/// string, tuple and creation ID has been checked. The caller supplies live
+/// admission/deadline checks between steps and before consuming finish.
+pub struct Validation<'a, 'c> {
+    parser: Option<arena::Cursor<'a>>,
+    document: Option<arena::Document<'a>>,
+    capabilities: &'c [&'c str],
+    maximum_calls: usize,
+    stage: Stage<'a>,
+    raw_using: Option<Value<'a>>,
+    raw_calls: Option<Value<'a>>,
+    raw_created: Option<Value<'a>>,
+    using: Option<arena::Array<'a>>,
+    calls: Option<arena::Array<'a>>,
+    created: Option<Object<'a>>,
+    unknown_capability: bool,
+    failed: Option<Error>,
+}
+#[derive(Clone, Copy)]
+enum Stage<'a> {
+    Parsing,
+    Strings {
+        token: usize,
+        offset: usize,
+    },
+    Fields(Object<'a>),
+    Using(arena::Array<'a>),
+    Capability {
+        rest: arena::Array<'a>,
+        name: &'a [u8],
+        index: usize,
+        offset: usize,
+    },
+    Calls(arena::Array<'a>),
+    Created(Object<'a>),
+    CreatedKey {
+        rest: Object<'a>,
+        value: Value<'a>,
+        key: &'a [u8],
+        offset: usize,
+    },
+    CreatedValue {
+        rest: Object<'a>,
+        bytes: &'a [u8],
+        offset: usize,
+    },
+    Done,
+}
+const _: () = assert!(std::mem::size_of::<Validation<'_, '_>>() <= 8192);
+impl<'a, 'c> Validation<'a, 'c> {
+    pub fn new(
+        input: &'a mut [u8],
+        tokens: &'a mut [Token],
+        resources: &ResourcePlan,
+        capabilities: &'c [&'c str],
+    ) -> Result<Self, Error> {
+        Request::validate_resources(resources)?;
+        let limits = resources.limits();
+        if tokens.len() < limits.json_tokens {
+            return Err(Error::Storage);
+        }
+        let parser = arena::Cursor::new(
+            input,
+            tokens,
+            ParseLimits {
+                max_bytes: limits.json_bytes,
+                max_depth: limits.json_depth,
+                max_tokens: limits.json_tokens,
+            },
+        )
+        .map_err(parser_error)?;
+        Ok(Self {
+            parser: Some(parser),
+            document: None,
+            capabilities,
+            maximum_calls: limits.json_methods,
+            stage: Stage::Parsing,
+            raw_using: None,
+            raw_calls: None,
+            raw_created: None,
+            using: None,
+            calls: None,
+            created: None,
+            unknown_capability: false,
+            failed: None,
+        })
+    }
+    /// One parser step, up to 256 scalar/capability transitions, or at most
+    /// sixteen structural transitions. Creation IDs use eight-byte chunks.
+    /// Failed/completed polls are inert; enforce live admission in the owner.
+    pub fn step(&mut self) -> Result<bool, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        // End scalar/comparison batches at their phase boundary so a cheap
+        // byte budget cannot become hundreds of structural operations.
+        let scalar_pass = matches!(self.stage, Stage::Strings { .. });
+        let capability_pass = matches!(self.stage, Stage::Capability { .. });
+        let turns = if matches!(self.stage, Stage::Parsing) {
+            1
+        } else if scalar_pass || capability_pass {
+            256
+        } else {
+            16
+        };
+        for _ in 0..turns {
+            if let Err(error) = self.transition() {
+                self.failed = Some(error);
+                return Err(error);
+            }
+            if matches!(self.stage, Stage::Done) {
+                return Ok(true);
+            }
+            if (scalar_pass && !matches!(self.stage, Stage::Strings { .. }))
+                || (capability_pass && !matches!(self.stage, Stage::Capability { .. }))
+            {
+                break;
+            }
+        }
+        Ok(false)
+    }
+    pub fn finish(self) -> Result<Request<'a>, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if !matches!(self.stage, Stage::Done) {
+            return Err(Error::Storage);
+        }
+        Ok(Request {
+            using: self.using.ok_or(Error::Storage)?,
+            calls: self.calls.ok_or(Error::Storage)?,
+            created: self.created,
+        })
+    }
+    fn transition(&mut self) -> Result<(), Error> {
+        match self.stage {
+            Stage::Parsing => {
+                if self
+                    .parser
+                    .as_mut()
+                    .ok_or(Error::Storage)?
+                    .step()
+                    .map_err(parser_error)?
+                {
+                    self.document = Some(
+                        self.parser
+                            .take()
+                            .ok_or(Error::Storage)?
+                            .finish()
+                            .map_err(parser_error)?,
+                    );
+                    self.stage = Stage::Strings {
+                        token: 0,
+                        offset: 0,
+                    };
+                }
+            }
+            Stage::Strings { token, offset } => {
+                let document = self.document.as_ref().ok_or(Error::Storage)?;
+                if token == document.token_count() {
+                    self.stage =
+                        Stage::Fields(document.root().as_object().ok_or(Error::NotRequest)?);
+                } else if let Some(bytes) = document
+                    .string_bytes_at(token)
+                    .filter(|bytes| offset < bytes.len())
+                {
+                    let first = *bytes.get(offset).ok_or(Error::Storage)?;
+                    let width = match first {
+                        0..=0x7f => 1,
+                        0xc2..=0xdf => 2,
+                        0xe0..=0xef => 3,
+                        0xf0..=0xf4 => 4,
+                        _ => return Err(Error::Storage),
+                    };
+                    let scalar = bytes
+                        .get(offset..offset + width)
+                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                        .and_then(|text| text.chars().next())
+                        .ok_or(Error::Storage)?;
+                    if crate::unicode::is_noncharacter(scalar) {
+                        return Err(Error::NotJson);
+                    }
+                    self.stage = Stage::Strings {
+                        token,
+                        offset: offset + width,
+                    };
+                } else {
+                    self.stage = Stage::Strings {
+                        token: token + 1,
+                        offset: 0,
+                    };
+                }
+            }
+            Stage::Fields(mut fields) => {
+                if let Some((key, value)) = fields.next_bytes() {
+                    match key {
+                        b"using" => self.raw_using = Some(value),
+                        b"methodCalls" => self.raw_calls = Some(value),
+                        b"createdIds" => self.raw_created = Some(value),
+                        _ => (),
+                    }
+                    self.stage = Stage::Fields(fields);
+                } else {
+                    let using = self
+                        .raw_using
+                        .and_then(Value::as_array)
+                        .ok_or(Error::NotRequest)?;
+                    self.using = Some(using);
+                    self.stage = Stage::Using(using);
+                }
+            }
+            Stage::Using(mut using) => {
+                self.stage = if let Some(value) = using.next() {
+                    Stage::Capability {
+                        rest: using,
+                        name: value.as_string_bytes().ok_or(Error::NotRequest)?,
+                        index: 0,
+                        offset: 0,
+                    }
+                } else {
+                    let calls = self
+                        .raw_calls
+                        .and_then(Value::as_array)
+                        .ok_or(Error::NotRequest)?;
+                    if calls.len() > self.maximum_calls {
+                        return Err(Error::MaxCallsInRequest);
+                    }
+                    self.calls = Some(calls);
+                    Stage::Calls(calls)
+                };
+            }
+            Stage::Capability {
+                rest,
+                name,
+                index,
+                offset,
+            } => {
+                if let Some(capability) = self.capabilities.get(index) {
+                    if name.len() != capability.len() {
+                        self.stage = Stage::Capability {
+                            rest,
+                            name,
+                            index: index + 1,
+                            offset: 0,
+                        };
+                    } else if offset == name.len() {
+                        self.stage = Stage::Using(rest);
+                    } else if name.get(offset) == capability.as_bytes().get(offset) {
+                        self.stage = Stage::Capability {
+                            rest,
+                            name,
+                            index,
+                            offset: offset + 1,
+                        };
+                    } else {
+                        self.stage = Stage::Capability {
+                            rest,
+                            name,
+                            index: index + 1,
+                            offset: 0,
+                        };
+                    }
+                } else {
+                    self.unknown_capability = true;
+                    self.stage = Stage::Using(rest);
+                }
+            }
+            Stage::Calls(mut calls) => {
+                if let Some(value) = calls.next() {
+                    invocation(value).ok_or(Error::NotRequest)?;
+                    self.stage = Stage::Calls(calls);
+                } else if let Some(value) = self.raw_created {
+                    let created = value.as_object().ok_or(Error::NotRequest)?;
+                    self.created = Some(created);
+                    self.stage = Stage::Created(created);
+                } else {
+                    self.complete()?;
+                }
+            }
+            Stage::Created(mut created) => {
+                if let Some((key, value)) = created.next_bytes() {
+                    if !(1..=255).contains(&key.len()) {
+                        return Err(Error::NotRequest);
+                    }
+                    self.stage = Stage::CreatedKey {
+                        rest: created,
+                        value,
+                        key,
+                        offset: 0,
+                    };
+                } else {
+                    self.complete()?;
+                }
+            }
+            Stage::CreatedKey {
+                rest,
+                value,
+                key,
+                offset,
+            } => {
+                let end = offset.saturating_add(8).min(key.len());
+                if !id_chunk(key.get(offset..end).ok_or(Error::Storage)?) {
+                    return Err(Error::NotRequest);
+                }
+                if end == key.len() {
+                    let bytes = value.as_string_bytes().ok_or(Error::NotRequest)?;
+                    if !(1..=255).contains(&bytes.len()) {
+                        return Err(Error::NotRequest);
+                    }
+                    self.stage = Stage::CreatedValue {
+                        rest,
+                        bytes,
+                        offset: 0,
+                    };
+                } else {
+                    self.stage = Stage::CreatedKey {
+                        rest,
+                        value,
+                        key,
+                        offset: end,
+                    };
+                }
+            }
+            Stage::CreatedValue {
+                rest,
+                bytes,
+                offset,
+            } => {
+                let end = offset.saturating_add(8).min(bytes.len());
+                if !id_chunk(bytes.get(offset..end).ok_or(Error::Storage)?) {
+                    return Err(Error::NotRequest);
+                }
+                self.stage = if end == bytes.len() {
+                    Stage::Created(rest)
+                } else {
+                    Stage::CreatedValue {
+                        rest,
+                        bytes,
+                        offset: end,
+                    }
+                };
+            }
+            Stage::Done => (),
+        }
+        Ok(())
+    }
+    fn complete(&mut self) -> Result<(), Error> {
+        if self.unknown_capability {
+            return Err(Error::UnknownCapability);
+        }
+        self.stage = Stage::Done;
+        Ok(())
+    }
+}
+fn parser_error(error: arena::Error) -> Error {
+    match error.kind {
+        arena::ErrorKind::Syntax => Error::NotJson,
+        arena::ErrorKind::Limit(ParseLimit::Bytes) => Error::MaxSizeRequest,
+        arena::ErrorKind::Limit(kind) => Error::Resource(kind),
+        arena::ErrorKind::Storage => Error::Storage,
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use crate::limits::Limits;
@@ -300,7 +599,7 @@ mod tests {
         let calls: Vec<_> = request.calls().collect();
         assert_eq!(request.call_count(), 2);
         assert_eq!(calls[0].call_id, calls[1].call_id);
-        assert_eq!(calls[1].name, "Future/method");
+        assert_eq!(calls[1].name, b"Future/method");
         assert_eq!(calls[0].argument("x").and_then(Value::as_number), Some("1"));
         assert!(calls[1].argument("x").is_none());
         assert_eq!(request.created_ids().unwrap().len(), 1);
@@ -358,7 +657,10 @@ mod tests {
                 );
             }
         }
-        assert!(id(&"a".repeat(255)));
+        let key = "k".repeat(255);
+        let value = "v".repeat(255);
+        let text = format!(r#"{{"using":[],"methodCalls":[],"createdIds":{{"{key}":"{value}"}}}}"#);
+        assert!(Fixture::new(&text).parse(Limits::default()).is_ok());
     }
     #[test]
     fn rejects_limits_that_cannot_admit_basic_calls_before_advertisement() {
@@ -417,5 +719,117 @@ mod tests {
             Fixture::new(body).parse(limits).err(),
             Some(Error::Resource(ParseLimit::Tokens))
         );
+    }
+    #[test]
+    fn admission_yields_through_unknown_strings_and_long_opaque_ids() {
+        let opaque = "é".repeat(30000);
+        let text = format!(
+            r#"{{"using":["{CORE}"],"methodCalls":[["Future/method",{{}},"{opaque}"]],"future":"{opaque}"}}"#
+        );
+        let mut fixture = Fixture::new(&text);
+        let plan = Limits::default().plan().unwrap();
+        let mut admission =
+            Validation::new(&mut fixture.bytes, &mut fixture.tokens, &plan, &[CORE]).unwrap();
+        let mut turns = 0;
+        while !admission.step().unwrap() {
+            turns += 1;
+            assert!(turns < text.len() * 2);
+        }
+        assert!(turns > 200);
+        let request = admission.finish().unwrap();
+        assert_eq!(request.calls().next().unwrap().call_id, opaque.as_bytes());
+        assert!(std::mem::size_of::<Validation<'_, '_>>() <= 8192);
+    }
+    #[test]
+    fn admission_checks_long_capabilities_incrementally_and_latches_errors() {
+        let capability = "x".repeat(10000);
+        let other = format!("{}y", "x".repeat(9999));
+        let capabilities = [other.as_str(), capability.as_str()];
+        let text = format!(r#"{{"using":["{capability}"],"methodCalls":[]}}"#);
+        let mut fixture = Fixture::new(&text);
+        let plan = Limits::default().plan().unwrap();
+        let mut admission = Validation::new(
+            &mut fixture.bytes,
+            &mut fixture.tokens,
+            &plan,
+            &capabilities,
+        )
+        .unwrap();
+        let mut comparison_turns = 0;
+        while !admission.step().unwrap() {
+            if matches!(admission.stage, Stage::Capability { .. }) {
+                comparison_turns += 1;
+            }
+        }
+        assert!(comparison_turns > 70);
+        assert!(admission.finish().unwrap().uses(&capability));
+        let mut fixture =
+            Fixture::new(r#"{"using":[],"methodCalls":[["x",{},"ok"],["x",false,"late"]]}"#);
+        let mut admission =
+            Validation::new(&mut fixture.bytes, &mut fixture.tokens, &plan, &[CORE]).unwrap();
+        let error = loop {
+            match admission.step() {
+                Err(error) => break error,
+                Ok(false) => (),
+                Ok(true) => panic!("invalid late call accepted"),
+            }
+        };
+        assert_eq!(error, Error::NotRequest);
+        assert_eq!(admission.step(), Err(error));
+        assert_eq!(admission.finish().err(), Some(error));
+    }
+    #[test]
+    fn unfinished_admission_cannot_expose_an_invocation() {
+        for turns in 0..20 {
+            let text = format!(
+                r#"{{"using":[],"methodCalls":[["Core/echo",{{}},"{}"]]}}"#,
+                "x".repeat(10000)
+            );
+            let mut fixture = Fixture::new(&text);
+            let plan = Limits::default().plan().unwrap();
+            let mut admission =
+                Validation::new(&mut fixture.bytes, &mut fixture.tokens, &plan, &[CORE]).unwrap();
+            for _ in 0..turns {
+                assert!(!admission.step().unwrap());
+            }
+            assert_eq!(admission.finish().err(), Some(Error::Storage));
+        }
+    }
+    #[test]
+    fn parsed_fields_do_not_publish_unchecked_later_calls() {
+        let mut calls = vec![r#"["Core/echo",{},"ok"]"#; 63];
+        calls.push(r#"["bad",false,"late"]"#);
+        let text = format!(r#"{{"using":[],"methodCalls":[{}]}}"#, calls.join(","));
+        let mut fixture = Fixture::new(&text);
+        let plan = Limits {
+            json_methods: 64,
+            ..Limits::default()
+        }
+        .plan()
+        .unwrap();
+        let mut validation =
+            Validation::new(&mut fixture.bytes, &mut fixture.tokens, &plan, &[CORE]).unwrap();
+        while !matches!(validation.stage, Stage::Calls(_)) {
+            assert!(!validation.step().unwrap());
+        }
+        assert!(validation.using.is_some());
+        assert!(validation.calls.is_some());
+        assert_eq!(validation.finish().err(), Some(Error::Storage));
+    }
+    #[test]
+    fn envelope_error_precedence_is_independent_of_field_order() {
+        let calls = vec![r#"["x",{},""]"#; 17].join(",");
+        for text in [
+            format!(r#"{{"methodCalls":[{calls}]}}"#),
+            format!(r#"{{"using":[3],"methodCalls":[{calls}]}}"#),
+        ] {
+            assert_eq!(error(&text), Error::NotRequest);
+        }
+        for text in [
+            format!(r#"{{"createdIds":null,"methodCalls":[{calls}],"using":[]}}"#),
+            format!(r#"{{"using":[],"methodCalls":[{calls}],"createdIds":null}}"#),
+        ] {
+            assert_eq!(error(&text), Error::MaxCallsInRequest);
+        }
     }
 }

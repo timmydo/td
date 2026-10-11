@@ -108,8 +108,13 @@ encoded-header adapters or combined service RSS.
   or comparing one key byte. UTF-8 validation, tokenization and linked key
   sorting all yield; finish exposes only a completed document. The convenience
   parse helper drives the same cursor synchronously. HTTPS remains inert:
-  activation must use stepped parsing with live admission between turns,
-  make whole-envelope/I-JSON validation resumable too, and avoid unbounded
+  the Validation owner now drives stepped parsing and whole-envelope/I-JSON
+  validation with at most 256 scalar/capability transitions or sixteen
+  structural transitions per turn. Scalar/comparison batches stop at their
+  phase boundary. Creation IDs use eight-byte chunks; each method tuple
+  has exactly three items. Its
+  fixed state, including the parser cursor, fits 8 KiB of the same scratch.
+  Activation must check live admission between turns and avoid unbounded
   scalar-view, object-lookup and serialization helpers on worker turns.
   Whole-buffer bounded allocation alone is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
