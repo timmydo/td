@@ -1,4 +1,6 @@
-use crate::ladder::{apply_patch, mesboot0_inputs, mesboot0_path, unpack_into, SH};
+use crate::ladder::{
+    apply_patch, deterministic_ar, mesboot0_inputs, mesboot0_path, unpack_into, SH,
+};
 use crate::types::{Recipe, Step};
 
 // GNU Binutils 2.20.1a — bootstrap rung 6 (#378, guix's binutils-mesboot0):
@@ -23,6 +25,7 @@ pub fn recipe() -> Recipe {
     let cc = "CC=tcc -static -D __GLIBC_MINOR__=6 -D MES_BOOTSTRAP=1";
     let mut steps = unpack_into("binutils-mesboot0-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-binutils-boot-2.20.1a"));
+    steps.push(deterministic_ar());
     // Retarget every `#! /bin/sh` shebang in the tree to the declared shell (the
     // sandbox has no /bin/sh). The recipe's own `configure`/`make` steps name SH
     // explicitly, but `make all` recurses into `binutils/`, whose `configure`

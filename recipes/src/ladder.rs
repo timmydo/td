@@ -1531,6 +1531,26 @@ pub fn apply_patch(patch_rung: &str, patch_input: &str) -> Step {
     )
 }
 
+/// Default binutils 2.20.1a's `ar` and `ranlib` to their `D` mode, as
+/// `--enable-deterministic-archives` does from 2.23: otherwise each archive
+/// member and symbol map records the build's wall clock, and no ladder archive
+/// reproduces the pinned root. `u` is dropped rather than fatal under `D`, as
+/// upstream does, since automake's `ar cru` would otherwise abort. `ar -M`
+/// scripts bypass the flag and stay nondeterministic; no rung uses them.
+pub fn deterministic_ar() -> Step {
+    Step::substitute_text(
+        "{src}/binutils/ar.c",
+        vec![
+            TextEdit::new("int deterministic = 0;", "int deterministic = 1;", 1),
+            TextEdit::new(
+                "\tfatal (_(\"`u' is not meaningful with the `D' option.\"));",
+                "\tnewer_only = 0;",
+                1,
+            ),
+        ],
+    )
+}
+
 /// `sed -i EXPR FILE…` via the td-built `sed-mesboot0` on `mesboot0_path()` (dir
 /// {src} unless absolute). `sed -i` writes a temp file and renames, so it never
 /// touches stdin or a non-syncable fd — the mes-libc bugs sed-mesboot0 patches

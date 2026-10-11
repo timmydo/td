@@ -1,5 +1,6 @@
 use crate::ladder::{
-    apply_patch, link_bins, mesboot0_inputs, mesboot0_path, unpack_into, unpack_keep_top, SH,
+    apply_patch, deterministic_ar, link_bins, mesboot0_inputs, mesboot0_path, unpack_into,
+    unpack_keep_top, SH,
 };
 use crate::types::{Recipe, Step};
 
@@ -25,6 +26,7 @@ pub fn recipe() -> Recipe {
     let cc = "CC={in:gcc-mesboot0}/bin/gcc -static";
     let mut steps = unpack_into("binutils-mesboot1-source", "{src}");
     steps.push(apply_patch("patch-mesboot", "patch-binutils-boot-2.20.1a"));
+    steps.push(deterministic_ar());
     steps.extend(unpack_keep_top("linux-headers", "{root}/kh"));
     // Retarget every `#! /bin/sh` shebang to the declared shell — the host-free
     // sandbox has no /bin/sh, and `binutils/configure`'s AM_PROG_LEX exec's the
