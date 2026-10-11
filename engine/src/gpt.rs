@@ -529,6 +529,122 @@ fn encode_header(
     Ok(h)
 }
 
+/// The two byte ranges a table occupies, as `(offset, len)` pairs.
+///
+/// The same positions `build` writes to, derived rather than remembered: the
+/// primary runs from LBA 0 through the end of its entry array (which is
+/// `first_usable_lba`), and the backup is the entry array plus the header on
+/// the LAST sector.
+pub fn table_ranges(sector_size: u64, disk_sectors: u64) -> Result<[(u64, u64); 2], String> {
+    let entries = entry_array_sectors(sector_size)?;
+    let primary_sectors = first_usable_lba(sector_size)?;
+    let backup_sectors = entries
+        .checked_add(1)
+        .ok_or_else(|| "the backup table length overflowed".to_string())?;
+    let backup_start = disk_sectors
+        .checked_sub(backup_sectors)
+        .ok_or_else(|| "the disk is too small to hold a backup table".to_string())?;
+    let bytes = |sectors: u64| {
+        sectors
+            .checked_mul(sector_size)
+            .ok_or_else(|| "a table range overflowed".to_string())
+    };
+    Ok([
+        (0, bytes(primary_sectors)?),
+        (bytes(backup_start)?, bytes(backup_sectors)?),
+    ])
+}
+
+/// Where td's partition `name` of type `kind` is on a disk of
+/// `disk_sectors`, read back off its table rather than recomputed: the byte
+/// offset and length of the one partition with that name and type, `None`
+/// when there is none. `primary` and `backup` are the bytes `table_ranges`
+/// names. With `first` the partition must also be the table's first entry.
+///
+/// td-install finds the volume and the ESP with this before writing to
+/// either, and the selector finds the ESP of a staged selector update with
+/// it, so the two cannot come to disagree about which partition that is.
+pub fn locate(
+    primary: &[u8],
+    backup: &[u8],
+    sector_size: u64,
+    disk_sectors: u64,
+    name: &str,
+    kind: Guid,
+    first: bool,
+) -> Result<Option<(u64, u64)>, String> {
+    let table = parse(primary, backup, sector_size)?;
+    // The table must be a table OF THIS DISK. `parse` is handed two byte
+    // slices and never learns where they came from, so it cannot tell; here the
+    // real count is known, and a header describing a different-sized disk is a
+    // table that was copied from one rather than written on this one.
+    if table.disk_sectors != disk_sectors {
+        return Err(format!(
+            "the table describes a {}-sector disk, not the {disk_sectors} sectors \
+             this destination has",
+            table.disk_sectors
+        ));
+    }
+    // A loop rather than the searching iterator adaptor, whose name this file
+    // may not spell: it is staged into a recipe as a `WriteFile` body, and the
+    // ladder's host-tool guard tokenises those bodies and reads that name as an
+    // invocation of the GNU tool it shares
+    // (`no_bootstrap_step_invokes_host_find_or_xargs`).
+    // A NAME is not an identity: GPT does not require partition names to be
+    // unique, so a table carrying two of them is one this program cannot choose
+    // between and must not guess at — the wrong choice formats a partition
+    // somebody else's data is in. The TYPE is checked with it for the same
+    // reason, since a name is 36 characters anyone can write and the type GUID
+    // is what says what the partition is FOR.
+    let mut found = None;
+    let mut matches = 0usize;
+    for (index, part) in table.partitions.iter().enumerate() {
+        if part.name == name && part.type_guid == kind {
+            matches += 1;
+            if found.is_none() {
+                found = Some((index, part));
+            }
+        }
+    }
+    if matches > 1 {
+        return Err(format!("this disk has {matches} partitions named {name}"));
+    }
+    let Some((index, part)) = found else {
+        return Ok(None);
+    };
+    if first && index != 0 {
+        return Err(format!("the {name} partition is not this disk's first"));
+    }
+    let offset = part
+        .start_lba
+        .checked_mul(sector_size)
+        .ok_or_else(|| format!("the {name} offset overflowed"))?;
+    // INCLUSIVE end, as GPT stores it.
+    let len = part
+        .end_lba
+        .checked_sub(part.start_lba)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|sectors| sectors.checked_mul(sector_size))
+        .ok_or_else(|| format!("the {name} length overflowed"))?;
+    // ...and the region must not overlap either copy of the TABLE that named
+    // it. `parse` bounds partitions by the header's OWN `first_usable` and
+    // `last_usable`, which are fields in the same table — so a table declaring
+    // a usable range over its own entry array is self-consistent, and this is
+    // the only place the REAL positions are known. A partition overlapping
+    // them is a write that destroys the table on its way to using it.
+    let [primary, backup] = table_ranges(sector_size, disk_sectors)?;
+    let primary_end = primary.0.saturating_add(primary.1);
+    let end = offset.saturating_add(len);
+    if offset < primary_end || end > backup.0 {
+        return Err(format!(
+            "{name} at {offset}..{end} overlaps a partition table \
+             ({}..{primary_end} and {}..)",
+            primary.0, backup.0
+        ));
+    }
+    Ok(Some((offset, len)))
+}
+
 /// Read a table back, checking everything a firmware would and the things it
 /// would not. `primary` starts at LBA 0; `backup` is the range `build` returned,
 /// ending on the last LBA. The two are compared against each other because a
@@ -900,6 +1016,63 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// `locate` reads back where `build` put each partition, refuses a
+    /// partition that is not first when `first` asks it to be, a name two
+    /// partitions carry and a table of another disk's size, and answers
+    /// `None` for a name and type no partition has.
+    #[test]
+    fn locate_finds_one_partition_by_name_type_and_position() {
+        let mut layout = layout();
+        let img = build(&layout).unwrap();
+        let [primary, backup] = table_ranges(512, layout.disk_sectors).unwrap();
+        assert_eq!(primary, (img.primary_offset, img.primary.len() as u64));
+        assert_eq!(backup, (img.backup_offset, img.backup.len() as u64));
+        let sectors = layout.disk_sectors;
+        let at = |name: &str, kind: Guid, first: bool| {
+            locate(&img.primary, &img.backup, 512, sectors, name, kind, first)
+        };
+        assert_eq!(
+            at("td-esp", TYPE_ESP, true),
+            Ok(Some((2048 * 512, (34_815 - 2048 + 1) * 512)))
+        );
+        assert_eq!(
+            at("td-root", TYPE_LINUX_FS, false),
+            Ok(Some((34_816 * 512, (131_038 - 34_816 + 1) * 512)))
+        );
+        assert_eq!(
+            at("td-root", TYPE_LINUX_FS, true),
+            Err("the td-root partition is not this disk's first".into())
+        );
+        assert_eq!(at("td-root", TYPE_ESP, false), Ok(None));
+        assert_eq!(at("td-home", TYPE_LINUX_FS, false), Ok(None));
+        assert!(locate(
+            &img.primary,
+            &img.backup,
+            512,
+            sectors + 1,
+            "td-esp",
+            TYPE_ESP,
+            true
+        )
+        .unwrap_err()
+        .contains("describes a 131072-sector disk"));
+        layout.partitions[1].name = "td-esp".into();
+        layout.partitions[1].type_guid = TYPE_ESP;
+        let img = build(&layout).unwrap();
+        assert_eq!(
+            locate(
+                &img.primary,
+                &img.backup,
+                512,
+                sectors,
+                "td-esp",
+                TYPE_ESP,
+                true
+            ),
+            Err("this disk has 2 partitions named td-esp".into())
+        );
     }
 
     #[test]

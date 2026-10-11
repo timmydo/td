@@ -3577,32 +3577,6 @@ fn commit_table(file: &mut File, table: &gpt::Image) -> io::Result<()> {
     file.sync_all()
 }
 
-/// The two byte ranges a table occupies, as `(offset, len)` pairs.
-///
-/// The same positions `gpt::build` writes to, derived rather than remembered:
-/// the primary runs from LBA 0 through the end of its entry array (which is
-/// `first_usable_lba`), and the backup is the entry array plus the header on
-/// the LAST sector.
-fn table_ranges(sector_size: u64, disk_sectors: u64) -> Result<[(u64, u64); 2], String> {
-    let entries = gpt::entry_array_sectors(sector_size)?;
-    let primary_sectors = gpt::first_usable_lba(sector_size)?;
-    let backup_sectors = entries
-        .checked_add(1)
-        .ok_or_else(|| "the backup table length overflowed".to_string())?;
-    let backup_start = disk_sectors
-        .checked_sub(backup_sectors)
-        .ok_or_else(|| "the disk is too small to hold a backup table".to_string())?;
-    let bytes = |sectors: u64| {
-        sectors
-            .checked_mul(sector_size)
-            .ok_or_else(|| "a table range overflowed".to_string())
-    };
-    Ok([
-        (0, bytes(primary_sectors)?),
-        (bytes(backup_start)?, bytes(backup_sectors)?),
-    ])
-}
-
 fn read_at(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
     let len = usize::try_from(len)
         .map_err(|_| invalid("a table range exceeds this address space".to_string()))?;
@@ -3647,7 +3621,8 @@ fn esp_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Resul
 }
 
 /// The one partition named `name` of type `kind`, its byte offset and
-/// length; with `first`, it must also be the table's first entry.
+/// length; with `first`, it must also be the table's first entry
+/// (`gpt::locate`, which the selector's staged-update commit shares).
 fn partition_region(
     file: &mut File,
     sector_size: u64,
@@ -3656,85 +3631,24 @@ fn partition_region(
     kind: gpt::Guid,
     first: bool,
 ) -> io::Result<(u64, u64)> {
-    let [primary, backup] = table_ranges(sector_size, disk_sectors).map_err(invalid)?;
+    let [primary, backup] = gpt::table_ranges(sector_size, disk_sectors).map_err(invalid)?;
     let primary = read_at(file, primary.0, primary.1)?;
     let backup = read_at(file, backup.0, backup.1)?;
-    let table = gpt::parse(&primary, &backup, sector_size).map_err(invalid)?;
-    // The table must be a table OF THIS DISK. `gpt::parse` is handed two byte
-    // slices and never learns where they came from, so it cannot tell; here the
-    // real count is known, and a header describing a different-sized disk is a
-    // table that was copied from one rather than written on this one.
-    if table.disk_sectors != disk_sectors {
-        return Err(invalid(format!(
-            "the table describes a {}-sector disk, not the {disk_sectors} sectors \
-             this destination has",
-            table.disk_sectors
-        )));
-    }
-    // A loop rather than the searching iterator adaptor, whose name this file
-    // may not spell: it is staged into a recipe as a `WriteFile` body, and the
-    // ladder's host-tool guard tokenises those bodies and reads that name as an
-    // invocation of the GNU tool it shares
-    // (`no_bootstrap_step_invokes_host_find_or_xargs`).
-    // A NAME is not an identity: GPT does not require partition names to be
-    // unique, so a table carrying two of them is one this program cannot choose
-    // between and must not guess at — the wrong choice formats a partition
-    // somebody else's data is in. The TYPE is checked with it for the same
-    // reason, since a name is 36 characters anyone can write and the type GUID
-    // is what says what the partition is FOR.
-    let mut found = None;
-    let mut matches = 0usize;
-    for (index, part) in table.partitions.iter().enumerate() {
-        if part.name == name && part.type_guid == kind {
-            matches += 1;
-            if found.is_none() {
-                found = Some((index, part));
-            }
-        }
-    }
-    if matches > 1 {
-        return Err(invalid(format!(
-            "this disk has {matches} partitions named {name}"
-        )));
-    }
-    let (index, part) = found.ok_or_else(|| {
+    gpt::locate(
+        &primary,
+        &backup,
+        sector_size,
+        disk_sectors,
+        name,
+        kind,
+        first,
+    )
+    .map_err(invalid)?
+    .ok_or_else(|| {
         invalid(format!(
             "no {name} partition on this disk — run `layout` first"
         ))
-    })?;
-    if first && index != 0 {
-        return Err(invalid(format!(
-            "the {name} partition is not this disk's first"
-        )));
-    }
-    let offset = part
-        .start_lba
-        .checked_mul(sector_size)
-        .ok_or_else(|| invalid(format!("the {name} offset overflowed")))?;
-    // INCLUSIVE end, as GPT stores it.
-    let len = part
-        .end_lba
-        .checked_sub(part.start_lba)
-        .and_then(|span| span.checked_add(1))
-        .and_then(|sectors| sectors.checked_mul(sector_size))
-        .ok_or_else(|| invalid(format!("the {name} length overflowed")))?;
-    // ...and the region must not overlap either copy of the TABLE that named
-    // it. `gpt::parse` bounds partitions by the header's OWN `first_usable` and
-    // `last_usable`, which are fields in the same table — so a table declaring
-    // a usable range over its own entry array is self-consistent, and this is
-    // the only place the REAL positions are known. A volume overlapping them is
-    // an install that destroys the table on its way to using it.
-    let [primary, backup] = table_ranges(sector_size, disk_sectors).map_err(invalid)?;
-    let primary_end = primary.0.saturating_add(primary.1);
-    let end = offset.saturating_add(len);
-    if offset < primary_end || end > backup.0 {
-        return Err(invalid(format!(
-            "{name} at {offset}..{end} overlaps a partition table \
-             ({}..{primary_end} and {}..)",
-            primary.0, backup.0
-        )));
-    }
-    Ok((offset, len))
+    })
 }
 
 /// The unit both the sparse copy and the edge zeroing work in. Named once
@@ -6977,7 +6891,7 @@ mod tests {
         let snapshot = || {
             let mut file = File::open(&disk.path).unwrap();
             let mut bytes = Vec::new();
-            for (offset, len) in table_ranges(512, DISK / 512)
+            for (offset, len) in gpt::table_ranges(512, DISK / 512)
                 .unwrap()
                 .into_iter()
                 .chain([(MIB, 16 * MIB)])
@@ -7192,7 +7106,7 @@ mod tests {
     fn the_table_ranges_are_where_the_table_was_written() {
         for (sector, disk) in [(512u64, DISK), (4096, DISK)] {
             let sectors = disk / sector;
-            let [primary, backup] = table_ranges(sector, sectors).unwrap();
+            let [primary, backup] = gpt::table_ranges(sector, sectors).unwrap();
             let layout = gpt::Layout {
                 sector_size: sector,
                 disk_sectors: sectors,
@@ -7344,7 +7258,7 @@ mod tests {
             let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
             write_at(&mut file, forged.primary_offset, &forged.primary).unwrap();
             // ...at THIS disk's backup position, not the one the header names.
-            let [_, backup] = table_ranges(512, DISK / 512).unwrap();
+            let [_, backup] = gpt::table_ranges(512, DISK / 512).unwrap();
             write_at(&mut file, backup.0, &forged.backup).unwrap();
         }
         let mut file = File::open(&scratch.path).unwrap();
@@ -7507,7 +7421,7 @@ mod tests {
     /// The ENGINE refuses to place a partition over the table, which is the
     /// first of the two answers to a volume that would overwrite one.
     ///
-    /// The second is `volume_region`'s own `overlaps a partition table` bound,
+    /// The second is `gpt::locate`'s own `overlaps a partition table` bound,
     /// and NO TEST HERE REACHES IT — deliberately recorded rather than left to
     /// be discovered. `gpt::parse` bounds partitions by the header's own
     /// `first_usable`, a field in the same table, so a hand-forged table
