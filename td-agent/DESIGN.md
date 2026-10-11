@@ -1427,38 +1427,47 @@ conversation uses it from now on.
 
 **As built (the Messages window).** The status row keeps to items of a
 fixed width: the state, `C-r asks again` while a turn may be asked
-again, else `Escape stops` while a turn runs, `no key: F10`, a count of the notes not yet read (`2 new
-messages: C-S-m`), `workspace: C-S-w` for a repository workspace (§7,
-As built (increment 11, the workspace card)), the mode and the network
-policy (§10), first so a narrow row never cuts them off, the model and
-effort, the context, the cost, today and the credit, `no limits` and
-`0 background`. A note, which
-the row used to show cut to fit (a refusal said by name, a step done, a
-background conversation's notice under its title), goes to a log of the
-last 500, each with the time it came and kept whole up to 16 KiB, a
-longer one cut and saying so. `C-S-m` or File → `Messages…` opens the
-Messages window, modal over the body as the picker is: a title row and
-td-ui's message list (td-ui/DESIGN.md, "Shared message list"), a note
-to a message headed by its time in UTC, oldest first and following the
-newest, its keys the transcript's (`C-c` copies the selection, `C-S-c`
-the focused note); `Escape` or `C-S-m` closes it. Opening it reads
-every note, and a note that comes while it is open joins it, read; a
-paste while it is open is dropped and said. A held `Escape` or
-`C-S-m` closes nothing; only a press does. It does not open over
-another modal, and the key dialog replaces it. It always opens, so what
-it holds is never out of reach: where its list has no room it says so
-under its title and lays the list out once a resize gives it room, and
-a window too small for the split still draws it. A note the list
+again, else `Escape stops` while a turn runs, `no key: F10`, a count of
+the notes not yet read (`2 new messages: C-S-m`), `workspace: C-S-w` for
+a repository workspace (§7, As built (increment 11, the workspace
+card)), the mode and the network policy (§10), the model and effort, the
+context, the cost, today and the credit, `no limits` and `0 background`.
+A row too narrow for them all keeps whole items and never cuts one
+(`status_fitted`): it lets go of the background count, `no limits`, the
+credit and today, from the last; leaves the provider off the model's
+name (`claude-opus-5.5` for `anthropic/claude-opus-5.5`); lets go of the
+cost and the context, then the hints to keys (the workspace card, the
+unread count, `Escape stops` or `C-r asks again`); leaves off the
+effort, then the mode's `classifier without Jev`; lets go of `no key:
+F10`, then the model, whole, then the network, then the mode, which say
+what runs unasked and so outlast it; and cuts the state with an ellipsis
+only when it alone does not fit. The control socket reports the whole
+line. A note, which the row used to show cut to fit (a refusal said by
+name, a step done, a background conversation's notice under its title),
+goes to a log of the last 500, each with the time it came and kept whole
+up to 16 KiB, a longer one cut and saying so. `C-S-m` or File →
+`Messages…` opens the Messages window, modal over the body as the picker
+is: a title row and td-ui's message list (td-ui/DESIGN.md, "Shared
+message list"), a note to a message headed by its time in UTC, oldest
+first and following the newest, its keys the transcript's (`C-c` copies
+the selection, `C-S-c` the focused note); `Escape` or `C-S-m` closes it.
+Opening it reads every note, and a note that comes while it is open
+joins it, read; a paste while it is open is dropped and said. A held
+`Escape` or `C-S-m` closes nothing; only a press does. It does not open
+over another modal, and the key dialog replaces it. It always opens, so
+what it holds is never out of reach: where its list has no room it says
+so under its title and lays the list out once a resize gives it room,
+and a window too small for the split still draws it. A note the list
 refuses past its bounds takes the oldest shown with it, as the
 transcript's do, and the list keeps no more notes than the log. The
 workspace a conversation works in, which the row named, is the list's
 third column, `Workspace`: `none`, `scratch`, `template NAME`, or a
-directory by its folder's name (the deletion question names it whole,
-so two folders of one name tell apart there).
-The list's default share is a third of the body, so that its three
-columns fit a window 1024 pixels wide. The driven action is
-`messages`, and the state gains `notes` (`open` or `closed`), `unread`
-and `note`, the newest note whole on one line.
+directory by its folder's name (the deletion question names it whole, so
+two folders of one name tell apart there). The list's default share is a
+third of the body, so that its three columns fit a window 1024 pixels
+wide. The driven action is `messages`, and the state gains `notes`
+(`open` or `closed`), `unread` and `note`, the newest note whole on one
+line.
 
 **As built (row menus).** A right press on a conversation's row (td-ui's
 `Context`, td-ui/DESIGN.md, "Widget window") opens its row menu at the

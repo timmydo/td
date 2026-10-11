@@ -367,6 +367,23 @@ struct Tasks {
     running: BTreeSet<u64>,
 }
 
+/// One item of the status row: its text, the rank at which a narrow row
+/// lets it go (the highest first, 0 never), and which it is, for the
+/// shortenings that rename it.
+struct StatusPart {
+    text: String,
+    rank: u8,
+    kind: StatusKind,
+}
+
+/// The status row's items a narrow row shortens rather than lets go.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusKind {
+    Model,
+    Mode,
+    Other,
+}
+
 /// How many of a conversation's sub-agents the list shows, the most
 /// recent; a row then says how many more its log keeps.
 const MAX_SUB_AGENT_ROWS: usize = 20;
@@ -1205,8 +1222,96 @@ impl App {
         }
     }
 
-    /// The status row's line.
+    /// The status row's line, whole.
     pub fn status_line(&self) -> String {
+        let items: Vec<String> = self.status_items().into_iter().map(|p| p.text).collect();
+        items.join(" | ")
+    }
+
+    /// The status row's line in at most `cells` cells (DESIGN.md §4, As
+    /// built (the Messages window)): whole items, never one cut. A narrow
+    /// row lets go of the background count, `no limits`, the credit and
+    /// today; leaves the provider off the model's name; lets go of the
+    /// cost and the context, then the hints to keys (the workspace card,
+    /// unread messages, `Escape stops` or `C-r asks again`); leaves off the
+    /// effort, then the mode's `classifier without Jev`; lets go of
+    /// `no key: F10`, then the model, whole, then the network, then the
+    /// mode; and cuts the state with an ellipsis only when it alone does
+    /// not fit.
+    fn status_fitted(&self, cells: usize) -> String {
+        if cells == 0 {
+            return String::new();
+        }
+        let mut parts = self.status_items();
+        let width = |parts: &[StatusPart]| {
+            parts.iter().map(|p| p.text.chars().count()).sum::<usize>()
+                + parts.len().saturating_sub(1) * 3
+        };
+        let model = self.model();
+        let name = model
+            .split_once('/')
+            .map_or(model, |(_, name)| name)
+            .to_string();
+        let name = if name.is_empty() {
+            model.to_string()
+        } else {
+            name
+        };
+        let effort = self.status_effort(model);
+        let mode = format!("mode {}", self.shown_mode().word());
+        // Each shortening takes its turn once every item it outranks
+        // has gone: the rank below which it runs, and what it does.
+        let mut shortenings: Vec<(u8, StatusKind, String)> = vec![
+            (12, StatusKind::Model, format!("{name} {effort}")),
+            (7, StatusKind::Model, name.clone()),
+            (7, StatusKind::Mode, mode),
+        ];
+        shortenings.reverse();
+        while width(&parts) > cells {
+            let lowest = parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.rank > 0)
+                .max_by_key(|(at, p)| (p.rank, *at))
+                .map(|(at, p)| (at, p.rank));
+            let top = lowest.map_or(0, |(_, rank)| rank);
+            if shortenings.last().is_some_and(|(below, _, _)| top < *below) {
+                if let Some((_, kind, to)) = shortenings.pop() {
+                    if let Some(part) = parts.iter_mut().find(|p| p.kind == kind) {
+                        part.text = to;
+                    }
+                }
+                continue;
+            }
+            match lowest {
+                Some((at, _)) => {
+                    parts.remove(at);
+                }
+                None => break,
+            }
+        }
+        let line: Vec<String> = parts.into_iter().map(|p| p.text).collect();
+        let line = line.join(" | ");
+        if line.chars().count() <= cells {
+            return line;
+        }
+        let mut cut: String = line.chars().take(cells - 1).collect();
+        cut.push('\u{2026}');
+        cut
+    }
+
+    /// The effort the status row names beside model `model`.
+    fn status_effort(&self, model: &str) -> &str {
+        if self.reasoning(model) {
+            self.effort()
+        } else {
+            "no reasoning"
+        }
+    }
+
+    /// The status row's items in order, each with the rank at which a
+    /// narrow row lets it go, the highest first; 0 is never let go.
+    fn status_items(&self) -> Vec<StatusPart> {
         let row = self
             .active
             .as_ref()
@@ -1216,28 +1321,24 @@ impl App {
         // here and read whole in the Messages window.
         let unread = match self.log.unread() {
             0 => String::new(),
-            1 => " | 1 new message: C-S-m".to_string(),
-            n => format!(" | {n} new messages: C-S-m"),
+            1 => "1 new message: C-S-m".to_string(),
+            n => format!("{n} new messages: C-S-m"),
         };
         let retry = if self.meter.retry {
-            " | C-r asks again"
+            "C-r asks again"
         } else if self.running() {
-            " | Escape stops"
+            "Escape stops"
         } else {
             ""
         };
-        let keyless = if self.keyed { "" } else { " | no key: F10" };
+        let keyless = if self.keyed { "" } else { "no key: F10" };
         let card = if self.repositories().is_some() {
-            " | workspace: C-S-w"
+            "workspace: C-S-w"
         } else {
             ""
         };
         let model = self.model();
-        let effort = if self.reasoning(model) {
-            self.effort()
-        } else {
-            "no reasoning"
-        };
+        let effort = self.status_effort(model);
         let length = self
             .contexts
             .iter()
@@ -1254,29 +1355,63 @@ impl App {
             Some(limit) => format!("{}/{}", cost::show(spent), cost::show(limit)),
             None => cost::show(spent),
         };
-        let today = self
-            .today
-            .map(|t| format!(" | today {}", of(t, self.limits.day)))
-            .unwrap_or_default();
-        let credit = self
-            .credit
-            .as_deref()
-            .map(|c| format!(" | {c}"))
-            .unwrap_or_default();
-        format!(
-            // The mode and the network policy first, so a narrow row
-            // never cuts them off.
-            "{state}{retry}{keyless}{unread}{card} | mode {}{} | network {} | {model} {effort} | {context} | cost {}{today}{credit} | no limits | {} background",
-            self.shown_mode().word(),
-            if self.without_jev {
-                ", classifier without Jev"
-            } else {
-                ""
-            },
-            self.shown_network().name(),
-            of(self.meter.spent, self.limits.conversation),
-            self.processes.values().map(Vec::len).sum::<usize>()
-        )
+        let part = |text: String, rank: u8| StatusPart {
+            text,
+            rank,
+            kind: StatusKind::Other,
+        };
+        let mut parts: Vec<StatusPart> = [
+            (state, 0),
+            (retry, 7),
+            (keyless, 4),
+            (unread.as_str(), 8),
+            (card, 9),
+        ]
+        .into_iter()
+        .filter(|(text, _)| !text.is_empty())
+        .map(|(text, rank)| part(text.to_string(), rank))
+        .collect();
+        // The mode and the network policy before the model, and kept
+        // after it, as they say what runs unasked.
+        parts.push(StatusPart {
+            text: format!(
+                "mode {}{}",
+                self.shown_mode().word(),
+                if self.without_jev {
+                    ", classifier without Jev"
+                } else {
+                    ""
+                }
+            ),
+            rank: 1,
+            kind: StatusKind::Mode,
+        });
+        parts.push(part(format!("network {}", self.shown_network().name()), 2));
+        parts.push(StatusPart {
+            text: format!("{model} {effort}"),
+            rank: 3,
+            kind: StatusKind::Model,
+        });
+        parts.push(part(context, 10));
+        parts.push(part(
+            format!("cost {}", of(self.meter.spent, self.limits.conversation)),
+            11,
+        ));
+        if let Some(t) = self.today {
+            parts.push(part(format!("today {}", of(t, self.limits.day)), 12));
+        }
+        if let Some(credit) = self.credit.as_deref() {
+            parts.push(part(credit.to_string(), 13));
+        }
+        parts.push(part("no limits".to_string(), 14));
+        parts.push(part(
+            format!(
+                "{} background",
+                self.processes.values().map(Vec::len).sum::<usize>()
+            ),
+            15,
+        ));
+        parts
     }
 
     /// Whether the classifier may allow without Jev.
@@ -6165,7 +6300,8 @@ impl App {
                 color: BORDER,
             },
         });
-        let line = self.status_line();
+        let cells = (rect.width as usize / (CELL_WIDTH * s)).saturating_sub(2);
+        let line = self.status_fitted(cells);
         raster::text_run(
             self.surface.scale,
             line.chars(),
@@ -6454,8 +6590,10 @@ pub mod tests {
             "{}",
             app.status_line()
         );
+        // The drawn row, narrower than the line, keeps the model whole,
+        // its provider left off before anything is cut.
         assert!(
-            text(&app).contains("| m/default medium |"),
+            text(&app).contains("| network off | default medium"),
             "{}",
             text(&app)
         );
@@ -8967,6 +9105,97 @@ pub mod tests {
             .log
             .last()
             .is_some_and(|n| n.contains("no longer shows that sub-agent")));
+    }
+
+    /// A narrow status row lets whole items go and never cuts one, in the
+    /// order DESIGN.md §4 gives: at every width the row is the first of
+    /// the steps below that fits, and only the state, alone, is cut.
+    #[test]
+    fn a_narrow_status_row_lets_whole_items_go() {
+        let mut app = app();
+        app.set_today(cost::ONE / 4);
+        app.set_credit(Some("credit $7.5000".into()));
+        app.set_keyed(false);
+        app.set_without_jev(true);
+        app.meter.retry = true;
+        app.note("a note");
+        let open = app.active().cloned().unwrap();
+        let mut rows = app.rows().to_vec();
+        for row in &mut rows {
+            if row.id == open {
+                row.workspace = Some(Workspace::Repositories(crate::workspace::Repositories {
+                    template: "td".into(),
+                    name: "td-1".into(),
+                    entries: Vec::new(),
+                }));
+            }
+        }
+        app.set_rows(rows);
+        let whole = app.status_line();
+        let mut items: Vec<String> = whole.split(" | ").map(String::from).collect();
+        let state = items[0].clone();
+        assert_eq!(
+            items[1..],
+            [
+                "C-r asks again",
+                "no key: F10",
+                "1 new message: C-S-m",
+                "workspace: C-S-w",
+                "mode auto, classifier without Jev",
+                "network off",
+                "m/default medium",
+                "ctx 0/200k",
+                "cost $0.0000",
+                "today $0.2500",
+                "credit $7.5000",
+                "no limits",
+                "0 background",
+            ]
+        );
+        let mut steps = vec![items.join(" | ")];
+        let mut step = |items: &mut Vec<String>, from: &str, to: Option<&str>| {
+            let at = items.iter().position(|i| i == from).unwrap();
+            match to {
+                Some(to) => items[at] = to.to_string(),
+                None => {
+                    items.remove(at);
+                }
+            }
+            steps.push(items.join(" | "));
+        };
+        for (from, to) in [
+            ("0 background", None),
+            ("no limits", None),
+            ("credit $7.5000", None),
+            ("today $0.2500", None),
+            ("m/default medium", Some("default medium")),
+            ("cost $0.0000", None),
+            ("ctx 0/200k", None),
+            ("workspace: C-S-w", None),
+            ("1 new message: C-S-m", None),
+            ("C-r asks again", None),
+            ("default medium", Some("default")),
+            ("mode auto, classifier without Jev", Some("mode auto")),
+            ("no key: F10", None),
+            ("default", None),
+            ("network off", None),
+            ("mode auto", None),
+        ] {
+            step(&mut items, from, to);
+        }
+        assert_eq!(steps.last(), Some(&state));
+        for cells in 0..=whole.chars().count() + 4 {
+            let fitted = app.status_fitted(cells);
+            let expected = steps
+                .iter()
+                .find(|line| line.chars().count() <= cells)
+                .cloned()
+                .unwrap_or_else(|| match cells {
+                    0 => String::new(),
+                    _ => state.chars().take(cells - 1).chain(['\u{2026}']).collect(),
+                });
+            assert_eq!(fitted, expected, "at {cells} cells");
+        }
     }
 
     /// The conversations the list shows, in its order.
