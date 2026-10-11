@@ -89,8 +89,11 @@ td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"
 modules, and the files td-firstboot and td-portal share with it, name
 them as before. td-tpm depends on it the same way for its salted
 sessions (td-tpm/DESIGN.md). Per `td-install/ENCRYPTION.md` item 8,
-td-protector (its HMAC-SHA256) and td-boot (8b's FIDO2 boot client) are
-the only other crates that may depend on it directly; any other
+td-protector (its HMAC-SHA256) and td-boot are the only other crates
+that may depend on it directly. Since increment 8b td-boot does, for its
+selector's FIDO2 client: `fido_disk` over root-admitted devices, each
+session's worker td-boot's own `fido-worker` verb (`Program::ROOT`),
+whose desktop verb it never builds or dispatches; any other
 dependent is an amendment here and to `FIDO_DEPENDENTS` in
 `builder/src/affected.rs`, whose lock preflight refuses the rest. Crates
 that reach it only through td-secret or td-tpm, as td-pass does, are
@@ -111,7 +114,7 @@ The td-secret recipe builds td-fido's rlib twice, with the shipped
 profile and for the test harness, links td-secret and td-tpm against
 them, and runs td-fido's and td-tpm's own tests. The td-boot, td-install
 and td-firstboot recipes stage its files and build its rlib before
-td-tpm's (td-boot's and td-install's staging also serves td-protector's
+td-tpm's, td-boot's recipe also passing it to the binary by `--extern` (td-boot's and td-install's staging also serves td-protector's
 `hmac.rs`); the td-setup, td-portal and td-pass recipes stage its tree
 for cargo.
 

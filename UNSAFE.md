@@ -115,17 +115,19 @@ PIN-authorized sessions and its lockout hierarchy commands
 (td-tpm/DESIGN.md) add none either: their commands are bytes over
 td-tpm's safe file I/O on `/dev/tpmrm0`, their ephemeral key and the
 lockout authorization std reads of `/dev/random`, and their
-cryptography td-fido's safe P-256, AES and HMAC-SHA256.
+cryptography td-fido's safe P-256, AES and HMAC-SHA256. Since increment
+8b td-boot depends on td-fido too and serves its sessions' HID worker as
+its `fido-worker` verb, linked in and run by nothing yet: the worker
+reads and writes `/dev/hidrawN` with std file I/O, reads the report
+descriptor from sysfs and bounds its life with a sleeping thread, so no
+hidraw ioctl (`HIDIOCGRDESC` or another) joins any roster, and td-boot
+keeps `unsafe` forbidden.
 
 Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
 tier is planned to add no surface ("Unsafe and syscall surfaces" there).
 td-tpm's signing commands are bytes over its safe file I/O, in the same
-sessions. td-boot's FIDO2 `fido-worker` reads
-and writes `/dev/hidrawN` with std file I/O and reads the report
-descriptor from sysfs, so no hidraw ioctl (`HIDIOCGRDESC` or another)
-joins any roster, and the `td-fido` crate it shares with td-secret and
-td-tpm forbids `unsafe`, td-secret keeping its own §15 surface; so does
-the planned `td-fat`. PIN entry is secret-line's existing surface (§3),
+sessions. td-secret keeps its own §15 surface, and the planned
+`td-fat` forbids `unsafe` as td-fido does. PIN entry is secret-line's existing surface (§3),
 the admission record rides td-kexec's existing calls (§1), the event log
 and power-supply reads are file reads, and securityfs and the optional
 Secure Boot enrollment's efivarfs are mounted through td-init's existing

@@ -10,7 +10,8 @@ use crate::types::{Recipe, Step};
 // sessions use td-fido's P-256 and AES (td-fido/DESIGN.md), and its
 // volume discovery, the live selector's PCR 12 release cap and the installed
 // selector's release and the deployment initramfs's unlock over
-// td-protector, which reaches td-json; each is
+// td-protector, which reaches td-json, and its FIDO2 client over td-fido
+// (`fido.rs`, whose `fido-worker` verb nothing runs yet); each is
 // compiled first as an rlib with the binary's profile and passed by
 // `--extern`, as td-install passes them. td-tpm and td-fido include the
 // same engine SHA-256 by `#[path]`.
@@ -19,6 +20,7 @@ const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
 const MIRROR_RS: &str = include_str!("../../../td-boot/src/mirror.rs");
+const FIDO_RS: &str = include_str!("../../../td-boot/src/fido.rs");
 const SELECTOR_RELEASE_RS: &str = include_str!("../../../td-boot/src/selector_release.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
@@ -206,6 +208,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-boot/src/fido.rs".into(),
+            content: FIDO_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-boot/src/selector_release.rs".into(),
             content: SELECTOR_RELEASE_RS.into(),
             exec: false,
@@ -385,6 +392,7 @@ pub fn recipe() -> Recipe {
         let main = format!("{source}/td-boot/src/main.rs");
         let tpm = format!("td_tpm={root}/libtd_tpm.rlib");
         let protector = format!("td_protector={root}/libtd_protector.rlib");
+        let fido = format!("td_fido={root}/libtd_fido.rlib");
         // td-protector's own dependency, td-json, is found here.
         let dependencies = format!("dependency={root}");
         target_rustc_at_roots(
@@ -407,6 +415,8 @@ pub fn recipe() -> Recipe {
                 &tpm,
                 "--extern",
                 &protector,
+                "--extern",
+                &fido,
                 "-L",
                 &dependencies,
                 &linker,

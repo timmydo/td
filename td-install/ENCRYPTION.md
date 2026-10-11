@@ -1439,7 +1439,18 @@ character device, USB HID bus metadata and the FIDO report descriptor
 read from sysfs) with its two-minute absolute deadline and independent
 watchdog. devtmpfs creates the nodes and the kernel already builds USB,
 xHCI, EHCI, HID, hidraw and USB HID in, so the selector loads no module
-and needs no new binary under D6. UHID is never on the boot path. The
+and needs no new binary under D6. UHID is never on the boot path.
+Since increment 8b td-boot links td-fido and dispatches `fido-worker
+<index> <inode> <rdev>` to td-fido's root worker; its `fido.rs` runs
+`fido_disk` over root-admitted devices under one deadline fixed when
+the operation begins, with `/dev/random` for its salts, hashes and the
+PIN protocol's ephemeral scalar, and nothing starts it before 8c. For
+8c: one `fido::Client` per Enter at the prompt, so each attempt has its
+own two minutes; the root worker takes `/run/td-fido/operation.lock`
+and reads `/proc/self/exe`, so the selector's initramfs needs `/run`
+(root:root 0755) and `/proc` mounted first; and 8c's qemu evidence must
+cover a real release over the worker transport, which 8b's scripted
+tests do not. The
 CTAP code td-secret, td-boot, td-tpm and td-protector then share (report
 framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
 AES, HMAC-SHA256 and hidraw admission) moves into one std-only sibling

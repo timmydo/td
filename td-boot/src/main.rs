@@ -14,6 +14,9 @@ mod cap;
 // recipe stages it at `{src}/td-init/src/console.rs`.
 #[path = "../../td-init/src/console.rs"]
 mod console;
+// The selector's FIDO2 client and its `fido-worker` verb.
+#[path = "fido.rs"]
+mod fido;
 #[path = "measurement.rs"]
 mod measurement;
 #[path = "mirror.rs"]
@@ -98,6 +101,13 @@ const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
 
 enum Mode {
+    /// One FIDO2 session's HID worker: td-fido's root worker for the node
+    /// the session admitted, started by `fido::Client` (run by nothing yet).
+    FidoWorker {
+        index: String,
+        inode: String,
+        rdev: String,
+    },
     OnVolume {
         operation: Box<Mode>,
     },
@@ -295,7 +305,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot fido-worker <index> <inode> <rdev>",
     )
 }
 
@@ -312,6 +322,19 @@ fn parse_deployment_id(value: OsString) -> io::Result<String> {
 
 fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
     match args.next().as_deref() {
+        Some(mode) if mode == OsStr::new(fido::VERB) => {
+            let mut text = || {
+                args.next()
+                    .ok_or_else(usage_error)?
+                    .into_string()
+                    .map_err(|_| invalid("non-UTF-8 FIDO worker argument"))
+            };
+            let (index, inode, rdev) = (text()?, text()?, text()?);
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::FidoWorker { index, inode, rdev })
+        }
         Some(mode) if mode == OsStr::new("on-volume") => {
             let verb = args.next().ok_or_else(usage_error)?;
             if !matches!(
@@ -4132,6 +4155,9 @@ fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
 /// drives this function rather than `run_install` for exactly that reason.
 fn dispatch(mode: Mode) -> io::Result<()> {
     match mode {
+        Mode::FidoWorker { index, inode, rdev } => {
+            fido::worker(&index, &inode, &rdev).map_err(io::Error::other)
+        }
         Mode::OnVolume { operation } => on_volume(*operation),
         Mode::MountVolume {
             device,
