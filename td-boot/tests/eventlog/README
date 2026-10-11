@@ -15,11 +15,14 @@ tpm-tis, a fresh TPM state per boot, the way the encrypted oracles attach
 it; the ESP was a vvfat directory holding EFI/BOOT/BOOTX64.EFI and
 EFI/BOOT/INITRD. Its arguments were
 
-    KERNEL         bzImage of linux-x86-64 7.1.4 built from this recipe
-                   with CONFIG_SECURITY=y and CONFIG_INTEGRITY off added
-                   (td's shipped kernel cannot mount securityfs yet; see
-                   "Prediction"), SHA-256 548673b3...caf21f
-    SELECTOR_CPIO  a system-x86-64 build's boot/selector-initramfs.cpio
+    KERNEL         a system-x86-64 build's deployment/bzImage: td's
+                   shipped linux-x86-64 7.1.4, with the module-free LSM
+                   framework that registers securityfs ("Prediction"),
+                   SHA-256 f51896d4...1f26e441
+    SELECTOR_CPIO  the same build's boot/selector-initramfs.cpio
+
+so each log was read from /sys/kernel/security/tpm0/binary_bios_measurements
+by the kernel td ships.
 
 Chain b is chain a with 512 zero bytes after the kernel, which Authenticode
 hashes, and 512 after the initramfs, which the kernel's unpacker skips. The

@@ -552,6 +552,16 @@ pub fn recipe() -> Recipe {
     //    IA32_EMULATION alone leaves old glibc without futex/time syscalls.
     //
     //    EFI needs ACPI; EFI_STUB selects the already enabled RELOCATABLE.
+    //
+    //    SECURITYFS and SECURITY (both pinned ON) exist only so securityfs
+    //    registers: the selector's prediction reads the firmware's TPM event
+    //    log from it (td-install/ENCRYPTION.md "Prediction"). TCG_TPM only
+    //    implies SECURITYFS, and Linux 7.1 registers securityfs from the LSM
+    //    framework's initcall alone, so SECURITYFS without SECURITY builds a
+    //    filesystem nothing registers. No security module is built or active:
+    //    every LSM and the hook sets are pinned OFF, INTEGRITY (default y
+    //    once SECURITY is on) with them, and CONFIG_LSM is empty, so only the
+    //    always-first capability module runs, as it does without SECURITY.
     //    Runtime-map support follows KEXEC_CORE. Other EFI menu symbols retain
     //    upstream defaults except the pinned-off efivarfs/handover/mixed modes.
     //
@@ -691,6 +701,23 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_HIDRAW[ =]/d; \
                   /^#? *CONFIG_USB_HID[ =]/d; \
                   /^#? *CONFIG_TCG_TPM[ =]/d; \
+                  /^#? *CONFIG_SECURITYFS[ =]/d; \
+                  /^#? *CONFIG_SECURITY[ =]/d; \
+                  /^#? *CONFIG_LSM[ =]/d; \
+                  /^#? *CONFIG_SECURITY_NETWORK[ =]/d; \
+                  /^#? *CONFIG_SECURITY_PATH[ =]/d; \
+                  /^#? *CONFIG_SECURITY_SELINUX[ =]/d; \
+                  /^#? *CONFIG_SECURITY_SMACK[ =]/d; \
+                  /^#? *CONFIG_SECURITY_TOMOYO[ =]/d; \
+                  /^#? *CONFIG_SECURITY_APPARMOR[ =]/d; \
+                  /^#? *CONFIG_SECURITY_LOADPIN[ =]/d; \
+                  /^#? *CONFIG_SECURITY_YAMA[ =]/d; \
+                  /^#? *CONFIG_SECURITY_SAFESETID[ =]/d; \
+                  /^#? *CONFIG_SECURITY_LOCKDOWN_LSM[ =]/d; \
+                  /^#? *CONFIG_SECURITY_LANDLOCK[ =]/d; \
+                  /^#? *CONFIG_SECURITY_IPE[ =]/d; \
+                  /^#? *CONFIG_BPF_LSM[ =]/d; \
+                  /^#? *CONFIG_INTEGRITY[ =]/d; \
                   /^#? *CONFIG_TCG_TIS[ =]/d; \
                   /^#? *CONFIG_TCG_CRB[ =]/d; \
                   /^#? *CONFIG_TCG_TPM2_HMAC[ =]/d; \
@@ -868,6 +895,23 @@ pub fn recipe() -> Recipe {
                    'CONFIG_HIDRAW=y' \
                    'CONFIG_USB_HID=y' \
                    'CONFIG_TCG_TPM=y' \
+                   'CONFIG_SECURITYFS=y' \
+                   'CONFIG_SECURITY=y' \
+                   'CONFIG_LSM=\"\"' \
+                   '# CONFIG_SECURITY_NETWORK is not set' \
+                   '# CONFIG_SECURITY_PATH is not set' \
+                   '# CONFIG_SECURITY_SELINUX is not set' \
+                   '# CONFIG_SECURITY_SMACK is not set' \
+                   '# CONFIG_SECURITY_TOMOYO is not set' \
+                   '# CONFIG_SECURITY_APPARMOR is not set' \
+                   '# CONFIG_SECURITY_LOADPIN is not set' \
+                   '# CONFIG_SECURITY_YAMA is not set' \
+                   '# CONFIG_SECURITY_SAFESETID is not set' \
+                   '# CONFIG_SECURITY_LOCKDOWN_LSM is not set' \
+                   '# CONFIG_SECURITY_LANDLOCK is not set' \
+                   '# CONFIG_SECURITY_IPE is not set' \
+                   '# CONFIG_BPF_LSM is not set' \
+                   '# CONFIG_INTEGRITY is not set' \
                    'CONFIG_TCG_TIS=y' \
                    'CONFIG_TCG_CRB=y' \
                    '# CONFIG_TCG_TPM2_HMAC is not set' \
@@ -1050,6 +1094,23 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_USB_HID=y' .config || { echo 'USB_HID off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_USB_XHCI_PCI=y' .config || { echo 'USB_XHCI_PCI off - FIDO USB transport requires built-in xHCI and hidraw' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_TPM=y' .config || { echo 'TCG_TPM off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SECURITYFS=y$' .config || { echo 'SECURITYFS off - the selector reads the TPM event log through securityfs' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SECURITY=y$' .config || { echo 'SECURITY off - Linux 7.1 registers securityfs only from the LSM framework' >&2; exit 1; }; \
+                 grep -Fxq 'CONFIG_LSM=\"\"' .config || { echo 'CONFIG_LSM not empty - no security module may be ordered' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_SECURITY_NETWORK=' .config; then echo 'SECURITY_NETWORK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_PATH=' .config; then echo 'SECURITY_PATH on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_SELINUX=' .config; then echo 'SECURITY_SELINUX on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_SMACK=' .config; then echo 'SECURITY_SMACK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_TOMOYO=' .config; then echo 'SECURITY_TOMOYO on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_APPARMOR=' .config; then echo 'SECURITY_APPARMOR on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_LOADPIN=' .config; then echo 'SECURITY_LOADPIN on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_YAMA=' .config; then echo 'SECURITY_YAMA on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_SAFESETID=' .config; then echo 'SECURITY_SAFESETID on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_LOCKDOWN_LSM=' .config; then echo 'SECURITY_LOCKDOWN_LSM on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_LANDLOCK=' .config; then echo 'SECURITY_LANDLOCK on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_IPE=' .config; then echo 'SECURITY_IPE on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_BPF_LSM=' .config; then echo 'BPF_LSM on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_INTEGRITY=' .config; then echo 'INTEGRITY on - the LSM framework is built for securityfs alone, with no security module' >&2; exit 1; fi; \
                  grep -q '^CONFIG_TCG_TIS=y' .config || { echo 'TCG_TIS off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_TCG_CRB=y' .config || { echo 'TCG_CRB off - TPM enrollment requires ACPI discovery and TPM2 device support' >&2; exit 1; }; \
                  grep -q '^CONFIG_PERF_EVENTS=y' .config || { echo 'PERF_EVENTS off — td-profiler cannot open its per-CPU software sampling events' >&2; exit 1; }; \
@@ -1559,6 +1620,57 @@ mod tests {
             assert!(
                 text.contains(&format!("grep -q '^CONFIG_{symbol}=y' .config")),
                 "{symbol} missing resolved guard"
+            );
+        }
+    }
+
+    #[test]
+    fn securityfs_takes_the_lsm_framework_and_no_security_module() {
+        let text = recipe()
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => Some(argv.join("\n")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for symbol in ["SECURITYFS", "SECURITY"] {
+            assert!(
+                text.contains(&format!("'CONFIG_{symbol}=y'")),
+                "{symbol} pin"
+            );
+            assert!(
+                text.contains(&format!("grep -q '^CONFIG_{symbol}=y$' .config")),
+                "{symbol} guard"
+            );
+        }
+        assert!(text.contains("'CONFIG_LSM=\"\"'"));
+        assert!(text.contains("grep -Fxq 'CONFIG_LSM=\"\"' .config"));
+        for symbol in [
+            "SECURITY_NETWORK",
+            "SECURITY_PATH",
+            "SECURITY_SELINUX",
+            "SECURITY_SMACK",
+            "SECURITY_TOMOYO",
+            "SECURITY_APPARMOR",
+            "SECURITY_LOADPIN",
+            "SECURITY_YAMA",
+            "SECURITY_SAFESETID",
+            "SECURITY_LOCKDOWN_LSM",
+            "SECURITY_LANDLOCK",
+            "SECURITY_IPE",
+            "BPF_LSM",
+            "INTEGRITY",
+        ] {
+            assert!(
+                text.contains(&format!("'# CONFIG_{symbol} is not set'")),
+                "{symbol} pin"
+            );
+            assert!(
+                text.contains(&format!("if grep -q '^CONFIG_{symbol}=' .config")),
+                "{symbol} guard"
             );
         }
     }

@@ -1719,13 +1719,15 @@ The update takes one of two forms:
   those events gives the predicted PCR 4 and PCR 9; PCR 7 keeps its
   value. td-boot's `eventlog.rs` and `authenticode.rs` hold this, tested
   over logs OVMF recorded under swtpm (`td-boot/tests/eventlog`); no
-  hardware machine's log is recorded yet. td's kernel does not register
-  securityfs today, and pinning `SECURITYFS` (which `TCG_TPM` only
-  implies) is not enough: Linux 7.1 registers it from the LSM
-  framework's initcall alone, so it also needs `SECURITY`, which turns
-  on `INTEGRITY` by default. Whether the shipped kernel takes the LSM
-  framework for this is an owner decision still open; until it is made
-  no selector reads the log, and the pre-seal cannot run.
+  hardware machine's log is recorded yet. The kernel pins `SECURITYFS`,
+  which `TCG_TPM` only implies, and `SECURITY`: Linux 7.1 registers
+  securityfs from the LSM framework's initcall alone. The LSM framework
+  is built only to provide securityfs for the event log, with no
+  security module active: every LSM, `BPF_LSM`, the network and path
+  hook sets and `INTEGRITY` (default on once `SECURITY` is) are pinned
+  off, `CONFIG_LSM` is empty, and only the capability module, which runs
+  without `SECURITY` too, is ordered. The kernel recipe's configuration
+  check holds each of these, so no later change drifts them.
 
 | Interrupted | ESP and header after | Next boot |
 | --- | --- | --- |
@@ -2254,7 +2256,8 @@ TPM-primary shape.
   configuration extension's digest, and keeps PCR 7, whose authority
   event names the same db certificate.
 - **Kernel.** `EFIVAR_FS` is built in and mounted by nothing but
-  enrollment; lockdown stays off (no lockdown LSM) and `KEXEC_SIG` stays
+  enrollment; lockdown stays off (no lockdown LSM: the LSM framework is
+  built for securityfs alone, "Prediction") and `KEXEC_SIG` stays
   off, since td-boot authenticates deployments itself.
 
 **Threat and limits.** With Secure Boot and a firmware setup password,
@@ -2429,7 +2432,8 @@ commit.
      before their code; the `td-fat` crate (bounded FAT32 reader,
      reclaim, staging and the one-sector commits); td-boot's event-log
      reader, its refusal rules and PCR 4 and PCR 9 prediction, then the
-     kernel configuration securityfs needs ("Prediction"); td-init's
+     kernel's `SECURITYFS` pin with the module-free LSM framework
+     securityfs needs ("Prediction"); td-init's
      `losetup` applet linked into the selector initramfs, with its D6
      binding and the image check that requires it;
      `storage-operation`'s `selector-update` in both
@@ -2856,7 +2860,11 @@ Increment 8's evidence, by sub-increment:
   two matching events, of a "Returning from EFI Application" action or
   a second boot application, of a log without SHA-256, and of a
   truncated or oversized log, with `EV_NO_ACTION` events skipped and the
-  final-events table included. Commit tests: a staged `INITRD.NEW`
+  final-events table included. The OVMF logs are in td-boot's tests
+  from 8e's third commit, read through securityfs on the shipped kernel;
+  the hardware machines' logs are owed by the hardware evidence that
+  follows 8h and precedes item 9, beside 8h's, and are never constructed.
+  Commit tests: a staged `INITRD.NEW`
   holding another template with this selector's exact appended archive,
   another kernel, and a pair from `previous` each delete the staged
   update after the cap with no object imported; a prediction failure
@@ -2997,7 +3005,8 @@ Increment 8's evidence, by sub-increment:
   `FIDO_2_1` with hmac-secret and a client PIN, and one CTAP 2.0-only
   key, which must be refused: an upgrade, PIN boots, a predicted
   update, a wrong PIN's count, each key's boot and the first frame,
-  recorded in that commit's message before item 9 lands. The
+  recorded in that commit's message before item 9 lands, with each
+  machine's TPM event log added to td-boot's prediction tests (8e). The
   single-sector ESP commit stays a disclosed assumption on SATA and eMMC
   devices unless that evidence includes a power-cut series on one.
 - **8i.** OVMF's Secure Boot build with SMM (`TD_QEMU_EFI_CODE` naming

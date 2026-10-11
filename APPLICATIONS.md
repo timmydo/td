@@ -323,7 +323,11 @@ their namespace symbol, and writes `Seccomp:`/`Seccomp_filters:` into
 — so those nodes exist *if and only if* the feature is compiled in. What
 is unproven is the sysctl and LSM policy around the calls rather than
 the features themselves, and `/proc/sys/user/max_user_namespaces` covers
-the one sysctl that turns a compiled-in `USER_NS` into an `EPERM`.
+the one sysctl that turns a compiled-in `USER_NS` into an `EPERM`. td's
+kernel builds the LSM framework (`SECURITY`) only so securityfs
+registers for the TPM event log (td-install/ENCRYPTION.md "Prediction");
+it builds and orders no security module, so no LSM policy stands around
+these calls.
 
 **`SECCOMP_FILTER` must not be pinned, and the block above said to pin
 it.** That line contradicted this section's own prose eight paragraphs
