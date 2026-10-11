@@ -330,6 +330,16 @@ pub trait Handler {
     /// the raster refused, a clipboard transfer that failed or was
     /// cancelled.
     fn notice(&mut self, _message: &str) {}
+    /// Where the pointer is over the surface while it is entered with no
+    /// button held and the key list closed, and `None` once any of that
+    /// ends (it leaves, the device or seat goes, the left button is held,
+    /// the list opens; a context press does not end it, the handler hearing
+    /// `Context`): for what a hover shows, a tooltip, never a drag, which
+    /// `Pointer` carries. Worked out as `Hover` is, after each event and
+    /// before it, so a release or the list closing tells the pointer's
+    /// place again without its moving. Delivered on a change only; a
+    /// handler with no use for it leaves it as it is.
+    fn motion(&mut self, _at: Option<(i64, i64)>) {}
     /// Takes a request to withdraw the text the handler copied, asked
     /// after every input and after every poll before that turn steps a
     /// send, so a lock or a timer can take a secret back. An edge, not a
@@ -396,6 +406,8 @@ pub struct Window<'h, H: Handler> {
     held: bool,
     /// The position the handler was last told Control is held over.
     hover: Option<(i64, i64)>,
+    /// The position the handler was last told the pointer moves over.
+    moved: Option<(i64, i64)>,
     wheel: Wheel,
     dirty: bool,
     /// The title the toplevel was last given, re-read from the handler
@@ -424,6 +436,7 @@ impl<'h, H: Handler> Window<'h, H> {
             pointer: (0, 0),
             held: false,
             hover: None,
+            moved: None,
             wheel: Wheel::default(),
             dirty: true,
             title: String::new(),
@@ -546,6 +559,18 @@ impl<'h, H: Handler> Window<'h, H> {
         Ok(())
     }
 
+    /// Tells the handler where the pointer is with no button held, or
+    /// that it no longer is: a change only.
+    fn moved(&mut self) {
+        let at = (self.client.entered().is_some() && !self.held && !self.keys.is_open())
+            .then_some(self.pointer);
+        if at == self.moved || self.client.closed() {
+            return;
+        }
+        self.moved = at;
+        self.handler.motion(at);
+    }
+
     /// Tells the handler where the pointer is while Control is held over
     /// the surface, as the keyboard's synchronized state reports it while
     /// the window has focus, or that it no longer is: a change only.
@@ -603,6 +628,7 @@ impl<'h, H: Handler> Window<'h, H> {
         self.cancel_pointer()?;
         self.keys.open(self.handler.keys(), self.surface);
         self.dirty = true;
+        self.moved();
         Ok(())
     }
 
@@ -971,7 +997,9 @@ impl<H: Handler> App for Window<'_, H> {
             }
             Handled::Done | Handled::FrameDone | Handled::GlobalRemoved { .. } => {}
         }
-        // Whatever moved the pointer, Control, focus or the devices.
+        // Whatever moved the pointer, Control, focus or the devices: the
+        // motion first, then the hover.
+        self.moved();
         self.hover()
     }
 

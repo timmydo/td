@@ -82,6 +82,7 @@ impl Record {
 struct Recorder {
     inputs: Vec<Record>,
     hovers: Vec<Option<(i64, i64)>>,
+    motions: Vec<Option<(i64, i64)>>,
     polls: Vec<u64>,
     notices: Vec<String>,
     quit_on: Option<Record>,
@@ -114,6 +115,7 @@ impl Recorder {
         Self {
             inputs: Vec::new(),
             hovers: Vec::new(),
+            motions: Vec::new(),
             polls: Vec::new(),
             notices: Vec::new(),
             quit_on: None,
@@ -183,6 +185,9 @@ impl td_ui::raster::Composition for Corner {
 impl Handler for Recorder {
     fn title(&self) -> &str {
         &self.title
+    }
+    fn motion(&mut self, at: Option<(i64, i64)>) {
+        self.motions.push(at);
     }
     fn app_id(&self) -> &str {
         "td-recorder"
@@ -909,6 +914,86 @@ fn the_key_list_follows_the_surface_and_a_poll_may_open_it() {
     w.handler_mut().show_keys = true;
     w.end_turn(20_000, false).unwrap();
     assert!(w.help().is_open());
+}
+
+/// Motion with no button held reaches the handler's `motion`, on a
+/// change only, and never as input; a press, a context press and leaving
+/// end it, and a drag carries none.
+#[test]
+fn motion_without_a_button_is_told_apart_from_input() {
+    let mut handler = Recorder::new();
+    let (mut w, _peer, _keyboard, pointer) = fixture(&mut handler);
+    configure(&mut w, 800, 480);
+    let inputs = w.handler().inputs.len();
+    w.event(message(pointer, 0, &[2, SURFACE, fixed(20), fixed(35)]))
+        .unwrap();
+    w.event(message(pointer, 2, &[0, fixed(30), fixed(40)]))
+        .unwrap();
+    w.event(message(pointer, 2, &[0, fixed(30) + 100, fixed(40)]))
+        .unwrap();
+    assert_eq!(
+        w.handler().motions,
+        [Some((20, 35)), Some((30, 40))],
+        "a move within a pixel is no change"
+    );
+    assert_eq!(w.handler().inputs.len(), inputs, "motion is no input");
+    // A press ends it; the drag that follows is input, not motion; the
+    // release tells where the pointer is without its moving.
+    w.event(message(pointer, 3, &[3, 0, 0x110, 1])).unwrap();
+    w.event(message(pointer, 2, &[0, fixed(50), fixed(40)]))
+        .unwrap();
+    assert_eq!(w.handler().motions.last(), Some(&None));
+    assert_eq!(w.handler().motions.len(), 3);
+    w.event(message(pointer, 3, &[4, 0, 0x110, 0])).unwrap();
+    assert_eq!(w.handler().motions.last(), Some(&Some((50, 40))));
+    // Leaving ends it, and entering again at the same place begins it.
+    w.event(message(pointer, 1, &[6, SURFACE])).unwrap();
+    assert_eq!(w.handler().motions.last(), Some(&None));
+    w.event(message(pointer, 0, &[7, SURFACE, fixed(50), fixed(40)]))
+        .unwrap();
+    assert_eq!(w.handler().motions.last(), Some(&Some((50, 40))));
+    // The pointer capability going ends it.
+    let seat = w.client().seat().unwrap();
+    w.event(message(seat, 0, &[2])).unwrap();
+    assert_eq!(w.handler().motions.last(), Some(&None));
+    assert_eq!(
+        w.handler().inputs.len(),
+        inputs + 3,
+        "the press, its drag and its release"
+    );
+}
+
+/// The key list opening ends the motion, and its closing tells where the
+/// pointer is again, without its moving.
+#[test]
+fn the_key_list_ends_motion_until_it_closes() {
+    const F1: u32 = 59;
+    const ESCAPE: u32 = 1;
+    let mut handler = Recorder::new();
+    handler.keys = vec![Section::new("Recorder", &[("x", "record an x")])];
+    let (mut w, peer, keyboard, pointer) = fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    configure(&mut w, 800, 480);
+    w.event(message(keyboard, 4, &[30, 0, 0, 0, 0])).unwrap();
+    w.event(message(pointer, 0, &[2, SURFACE, fixed(20), fixed(35)]))
+        .unwrap();
+    assert_eq!(w.handler().motions, [Some((20, 35))]);
+    press(&mut w, keyboard, 31, F1);
+    release(&mut w, keyboard, 32, F1);
+    assert!(w.help().is_open());
+    assert_eq!(w.handler().motions, [Some((20, 35)), None]);
+    w.event(message(pointer, 2, &[0, fixed(30), fixed(35)]))
+        .unwrap();
+    assert_eq!(w.handler().motions.len(), 2, "none while it is open");
+    press(&mut w, keyboard, 33, ESCAPE);
+    release(&mut w, keyboard, 34, ESCAPE);
+    assert!(!w.help().is_open());
+    assert_eq!(w.handler().motions.last(), Some(&Some((30, 35))));
+    // A poll that opens it ends the motion too.
+    w.handler_mut().show_keys = true;
+    w.end_turn(20_000, false).unwrap();
+    assert!(w.help().is_open());
+    assert_eq!(w.handler().motions.last(), Some(&None));
 }
 
 #[test]

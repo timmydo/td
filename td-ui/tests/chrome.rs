@@ -13,8 +13,8 @@
 //! and paint one band whole to a buffer to confirm the pixels.
 
 use td_ui::chrome::{
-    step, Bar, Block, Field, Item, List, Panel, Row, Slider, Status, Strip, TextEntry,
-    BUTTON_MARGIN, DISABLED, KNOB_WIDTH, SELECTED_ROW, STATUS_COLUMNS,
+    step, Bar, Block, Field, Item, List, Panel, Row, Slider, Status, Strip, TextEntry, Tooltip,
+    BUTTON_MARGIN, DISABLED, KNOB_WIDTH, SELECTED_ROW, STATUS_COLUMNS, TOOLTIP_CHARS,
 };
 use td_ui::font;
 use td_ui::raster::{
@@ -2592,4 +2592,102 @@ fn slider_new_refuses_a_rect_the_surface_or_the_knob_cannot_hold() {
         ok
     )
     .is_none());
+}
+
+/// A tooltip sits a pixel under its anchor, or over it when there is no
+/// room under, its left edge at the anchor's moved in to stay inside; it
+/// is its text's cells and one each side wide, cut to `TOOLTIP_CHARS`, a
+/// cell and six pixels tall, and paints a bezel round an `INK` face with
+/// its text in `PAPER` a cell in and three pixels down, inside itself.
+#[test]
+fn a_tooltip_sits_by_its_anchor_inside_the_bounds() {
+    for scale in 1..=4u8 {
+        let s = i64::from(scale);
+        let su = scale as usize;
+        let surface = surface(800 * su, 200 * su, scale);
+        let bounds = surface.bounds();
+        let cw = 8 * s;
+        let anchor = Rect {
+            x: 10 * s,
+            y: 20 * s,
+            width: (16 * s) as u32,
+            height: (16 * s) as u32,
+        };
+        let tip = Tooltip::place(surface, "Copy", anchor, bounds).unwrap();
+        let rect = tip.rect();
+        assert_eq!((rect.x, rect.y), (anchor.x, anchor.y + 17 * s));
+        assert_eq!(
+            (i64::from(rect.width), i64::from(rect.height)),
+            (6 * cw, 22 * s)
+        );
+        // At the foot, above it; at the right edge, moved in.
+        let low = Rect {
+            y: i64::from(bounds.height) - 10 * s,
+            ..anchor
+        };
+        let over = Tooltip::place(surface, "Copy", low, bounds).unwrap().rect();
+        assert_eq!(over.y + i64::from(over.height) + s, low.y);
+        let edge = Rect {
+            x: i64::from(bounds.width) - 4 * s,
+            ..anchor
+        };
+        let moved = Tooltip::place(surface, "Copy", edge, bounds)
+            .unwrap()
+            .rect();
+        assert_eq!(moved.x + i64::from(moved.width), i64::from(bounds.width));
+        // A long text is cut; nothing, or no room, is none.
+        let long = "x".repeat(TOOLTIP_CHARS + 10);
+        let cut = Tooltip::place(surface, &long, anchor, bounds)
+            .unwrap()
+            .rect();
+        assert_eq!(i64::from(cut.width), (TOOLTIP_CHARS as i64 + 2) * cw);
+        assert_eq!(Tooltip::place(surface, "", anchor, bounds), None);
+        let squat = Rect {
+            height: (20 * s) as u32,
+            ..bounds
+        };
+        assert_eq!(Tooltip::place(surface, "Copy", anchor, squat), None);
+        // An anchor out of the bounds, above, below or far off, has none;
+        // one at the integer range's edge too, without overflowing.
+        let inner = Rect {
+            x: 0,
+            y: 50 * s,
+            width: bounds.width,
+            height: (100 * s) as u32,
+        };
+        for y in [
+            0,
+            180 * s,
+            100_000,
+            i64::MAX - 5,
+            i64::MAX - 30 * s,
+            i64::MIN + 5,
+        ] {
+            let off = Rect { y, ..anchor };
+            assert_eq!(Tooltip::place(surface, "Copy", off, inner), None, "{y}");
+        }
+        // Painted under partial damage, it draws only there.
+        let part = Rect {
+            height: (4 * s) as u32,
+            ..rect
+        };
+        let mut clipped = Vec::new();
+        tip.emit("Copy", part, &mut |draw| clipped.push(draw));
+        for draw in &clipped {
+            assert!(part.intersection(draw.clip) == Some(draw.clip), "{draw:?}");
+        }
+        // Painted inside itself, the text a cell in, in paper on ink.
+        let draws = run(surface, |damage, sink| tip.emit("Copy", damage, sink));
+        for draw in &draws {
+            assert!(rect.intersection(draw.clip) == Some(draw.clip), "{draw:?}");
+        }
+        let colours: Vec<u32> = fills(&draws).iter().map(|(_, c)| *c).collect();
+        assert!(colours.contains(&BORDER) && colours.contains(&INK));
+        let text = glyphs(&draws);
+        assert_eq!(
+            text.first().map(|g| (g.0, g.1, g.2, g.3)),
+            Some((rect.x + cw, rect.y + 3 * s, 'C', PAPER))
+        );
+        assert_eq!(text.len(), 4);
+    }
 }

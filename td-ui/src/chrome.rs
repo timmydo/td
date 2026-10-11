@@ -106,6 +106,96 @@ fn bezel(rect: Rect, scale: Scale, face: u32, damage: Rect, sink: &mut dyn FnMut
     inner
 }
 
+/// The most scalars a tooltip shows; a longer text is cut to it.
+pub const TOOLTIP_CHARS: usize = 80;
+
+/// A tooltip: one line of text in a bezelled box beside what it names,
+/// `PAPER` on `INK` so it reads apart from the chrome under it. The
+/// caller places it, owns when it shows (a hover's delay is the caller's
+/// clock) and paints it last, over everything else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tooltip {
+    surface: Surface,
+    rect: Rect,
+}
+
+impl Tooltip {
+    /// A tooltip of `text` for `anchor`, inside `bounds` and the surface:
+    /// a scaled pixel below the anchor when it fits inside there, else as
+    /// far above, else none, so an anchor scrolled out of the bounds has
+    /// none; its left edge at the anchor's, moved left to stay inside. Its
+    /// scalars, at most `TOOLTIP_CHARS`, and a cell each side set its
+    /// width; a cell and three pixels each way, its height. `None` for an
+    /// empty text or one `bounds` cannot hold.
+    pub fn place(surface: Surface, text: &str, anchor: Rect, bounds: Rect) -> Option<Self> {
+        surface.check().ok()?;
+        let bounds = bounds.intersection(surface.bounds())?;
+        let s = surface.scale.value();
+        let chars = text.chars().take(TOOLTIP_CHARS).count();
+        if chars == 0 {
+            return None;
+        }
+        let width = u32::try_from((chars + 2) * CELL_WIDTH * s).ok()?;
+        let height = u32::try_from((CELL_HEIGHT + 6) * s).ok()?;
+        if width > bounds.width || height > bounds.height {
+            return None;
+        }
+        let gap = s as i64;
+        let below = anchor
+            .y
+            .checked_add(i64::from(anchor.height))?
+            .checked_add(gap)?;
+        let above = anchor.y.checked_sub(gap)?.checked_sub(i64::from(height))?;
+        let bottom = bounds.y + i64::from(bounds.height);
+        let inside = |y: i64| {
+            y >= bounds.y
+                && y.checked_add(i64::from(height))
+                    .is_some_and(|end| end <= bottom)
+        };
+        let y = if inside(below) {
+            below
+        } else if inside(above) {
+            above
+        } else {
+            return None;
+        };
+        let right = bounds.x + i64::from(bounds.width);
+        let x = anchor.x.min(right - i64::from(width)).max(bounds.x);
+        Some(Self {
+            surface,
+            rect: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+        })
+    }
+
+    /// Where it is placed.
+    pub fn rect(self) -> Rect {
+        self.rect
+    }
+
+    /// Paints the tooltip of `text`, the text it was placed for (a longer
+    /// one is clipped to the box), as placed: a `BORDER` bezel round an
+    /// `INK` face, the text, cut to `TOOLTIP_CHARS`, a cell in and three
+    /// pixels down in `PAPER`, all clipped to damage.
+    pub fn emit(self, text: &str, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        let s = self.surface.scale.value() as i64;
+        let inner = bezel(self.rect, self.surface.scale, INK, damage, sink);
+        text_run(
+            self.surface.scale,
+            text.chars().take(TOOLTIP_CHARS),
+            (self.rect.x + CELL_WIDTH as i64 * s, self.rect.y + 3 * s),
+            inner,
+            GlyphStyle::medium(PAPER, INK),
+            damage,
+            sink,
+        );
+    }
+}
+
 /// A bordered action with shared text, focus and disabled styling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Button {

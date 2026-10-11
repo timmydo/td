@@ -1868,16 +1868,19 @@ clock made them and not after the window closed, a bare modifier
 nothing, focus following the keyboard and a handler quitting on a chord;
 the left button's press at the pointer in surface pixels rounded down,
 motion while held a drag signed past the edge, a second press while held
-nothing, the release where the pointer is, motion without the button and
-a stray release nothing, the right button's press a `Context` at the
-pointer and its release nothing, its press while the left is held or
-the key list is open nothing, leaving or losing the
-pointer while held a cancel with no release after it, a handler quitting
-on that cancel hearing nothing of the resize that made it nor of
-anything after, and Shift under a focused synchronized keyboard
-extending the press; wheel frames in cells; the poll and wait each turn,
-the keyboard capability's loss as focus loss once; and the whole loop
-over a socket.
+nothing, the release where the pointer is, motion without the button no
+input but `Handler::motion` on a change, ended by a press and told again
+at its release, ended by leaving and the pointer capability going and
+begun again by entering, ended by the key list opening, by a key or a
+poll, and told again at its closing, and a stray release nothing, the
+right button's press a `Context` at the pointer and its release nothing,
+its press while the left is held or the key list is open nothing,
+leaving or losing the pointer while held a cancel with no release after
+it, a handler quitting on that cancel hearing nothing of the resize that
+made it nor of anything after, and Shift under a focused synchronized
+keyboard extending the press; wheel frames in cells; the poll and wait
+each turn, the keyboard capability's loss as focus loss once; and the
+whole loop over a socket.
 
 `tests/window.rs` also presents the corner composition, whose glyph
 the window executes through a typeface's fitted face when it is given
@@ -1923,29 +1926,39 @@ the loop ends.
 The vocabulary is `Input`: `Key` with the chord as the keymap spells it
 (`a`, `C-x`, `S-Right`), so a handler translates it itself or hands it
 to td-editor's controller unchanged, and `repeat` for a delivery the
-repeat clock made; `Pointer` with the driven seam's `PointerPhase` (`Press`,
-`Move`, `Release`), the position in the surface's physical pixels, signed so
-travel past an edge is representable, `extend`, Shift held at the
-press, and `follow`, Control held at the press, as the keyboard's
-synchronized modifier state reports them while the window has focus;
-`Context` with the pointer's position at a right-button press while
-the left is not held and the key list is closed, so the handler opens
-the context menu of what lies there (through "Shared menu controller",
-whose `open_context` places it); holding the right button is no drag,
-so such a menu is chosen from by a click, not by a release over it;
-`CancelPointer` when the pointer leaves or the device goes while the
-button is held, so the handler ends a drag without a release; `Hover` with the pointer's position while Control is
-held, by that same state, and the pointer has entered the surface (a
-held button's grab keeps it entered through travel past an edge), and
-`None` once either ends, delivered on a change only, button held or
-not, so a handler marks the link a Control-press there would follow;
-`Wheel` in cell rows and columns as `pointer::Wheel` accumulates a
-frame; `Resize` with the `Surface` the handler lays out for; `Focus`
-and `Close`. Motion is delivered as `Pointer` only while the button is
-held and as `Hover` only while Control is, so a handler without drags
-sees no motion stream until Control is held; a second press while held,
-a release without a press, the right button's release, its press while
-the left is held, and every other button are nothing.
+repeat clock made; `Pointer` with the driven seam's `PointerPhase`
+(`Press`, `Move`, `Release`), the position in the surface's physical
+pixels, signed so travel past an edge is representable, `extend`, Shift
+held at the press, and `follow`, Control held at the press, as the
+keyboard's synchronized modifier state reports them while the window has
+focus; `Context` with the pointer's position at a right-button press
+while the left is not held and the key list is closed, so the handler
+opens the context menu of what lies there (through "Shared menu
+controller", whose `open_context` places it); holding the right button
+is no drag, so such a menu is chosen from by a click, not by a release
+over it; `CancelPointer` when the pointer leaves or the device goes
+while the button is held, so the handler ends a drag without a release;
+`Hover` with the pointer's position while Control is held, by that same
+state, and the pointer has entered the surface (a held button's grab
+keeps it entered through travel past an edge), and `None` once either
+ends, delivered on a change only, button held or not, so a handler marks
+the link a Control-press there would follow; `Wheel` in cell rows and
+columns as `pointer::Wheel` accumulates a frame; `Resize` with the
+`Surface` the handler lays out for; `Focus` and `Close`. Motion is
+delivered as `Pointer` only while the button is held and as `Hover` only
+while Control is, so a handler without drags sees no motion stream as
+input until Control is held; the pointer's place while it is entered
+with no button held and the key list closed goes instead to
+`Handler::motion`, never an `Input`: worked out after every event, as
+`Hover` is and before it, and when a poll opens the list, it is told on
+a change only, and `None` once any of that ends (the pointer leaves, its
+device or seat goes, the left button is held, the list opens; a context
+press does not end it, the handler hearing `Context`), so a release or
+the list closing tells the place again without a move; it is for what a
+hover shows (a `chrome::Tooltip`), and a handler that does not take it
+never sees it; a second press while held, a release without a press, the
+right button's release, its press while the left is held, and every
+other button are nothing.
 
 The loop, turn by turn: on `Bound` the window sets the title and app id,
 commits, and hands the handler the default `Resize`; on `Configure` it
@@ -2383,6 +2396,29 @@ nothing, a last button wrapped to a second row and hit there, a band on
 its own left and width wrapping to three rows, a button too wide for a
 row left out, a band at the surface's foot and past the integer range,
 and an empty strip.
+
+## Shared tooltip
+
+`chrome::Tooltip` is a line of text naming what lies under the pointer,
+painted last over everything else: a `BORDER` bezel one scaled pixel
+wide round an `INK` face, the text in `PAPER` a cell in and three pixels
+down, so it reads apart from the chrome under it. `place` puts it for an
+anchor inside given bounds and the surface: a scaled pixel below the
+anchor when it fits inside the bounds there, else as far above when it
+fits there, else nowhere, so an anchor scrolled out of the bounds has
+none; its left edge at the anchor's, moved left to stay inside. It is
+its text's scalars, at most `TOOLTIP_CHARS` (80) and the rest left off,
+and a cell each side wide, and a cell and six pixels tall; an empty
+text, or one the bounds cannot hold, has none. The consumer owns when it
+shows: a hover's delay runs on its clock, from `Handler::motion` (see
+"Widget window"), and a press, a key or the pointer's leaving its anchor
+ends it. Rendering clips to damage and allocates nothing. Its arithmetic
+is checked, so an anchor at the integer range's edge has none rather
+than overflowing. `emit` is given the text it was placed for; a longer
+one is clipped to the box. Its test pins the placement under, over and
+moved in, the cut, the none (no text, no room, anchors above, below and
+far off the bounds, at the range's edges), partial damage, the bezel and
+face, and the text's first glyph and ink at scales 1-4.
 
 ## Shared slider
 
