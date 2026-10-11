@@ -25,6 +25,7 @@ needs them:
 - For shared Unicode normalization, read `td-nfc/DESIGN.md`.
 - For shared Markdown parsing, read `td-markdown/DESIGN.md`.
 - For shared JPEG decoding, read `td-jpeg/DESIGN.md`.
+- For shared PNG decoding, read `td-png/DESIGN.md`.
 - For disk encryption or session unlock, read `td-install/ENCRYPTION.md`.
 - For compositor/UI, service supervision, or installation, read the matching
   `td-compositor/DESIGN.md`, `td-svc/DESIGN.md`, or `td-install/DESIGN.md`;

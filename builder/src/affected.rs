@@ -312,11 +312,11 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/crc32.rs",
-        "td-builder's xz decoder, the shared gzip decoder, target-static td-install (through gpt.rs), and target-static td-util's gzip applets",
+        "td-builder's xz decoder, the shared gzip decoder, target-static td-install (through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
     ),
     (
         "engine/src/gzip.rs",
-        "td-builder source extraction, the bounded OSTree importer, and target-static td-util's gunzip and zcat",
+        "td-builder source extraction, the bounded OSTree importer, target-static td-util's gunzip and zcat, and td-png's image data (raw DEFLATE)",
     ),
     (
         "engine/src/gpt.rs",
@@ -2483,6 +2483,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/sha256.rs", "td-crypto's test-only ES256 oracle");
     assert_contains!("engine/src/crc32.rs", "target-static td-install");
     assert_contains!("engine/src/crc32.rs", "target-static td-util");
+    assert_contains!("engine/src/crc32.rs", "td-png's chunk CRCs");
+    assert_contains!("engine/src/gzip.rs", "td-png's image data");
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
