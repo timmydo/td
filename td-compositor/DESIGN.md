@@ -5688,7 +5688,9 @@ with a second recovery token, X explicit unrecoverability, and W the ready
 credential write queued through `td-secret set`; I selects a queued system
 installation, K opens the key-management screen ("Login-key
 operations" below), and L locks the session ("Session lock and
-login-key entry" below, item 5). Only one operation is selected per successfully
+login-key entry" below, item 5); ENCRYPTION.md increment 8e adds S, the
+storage screen ("Storage operations" below), fixed but not yet
+implemented. Only one operation is selected per successfully
 opened and closed attention lifetime. Held keys, repeats and a second
 device pressing an already-held logical key cannot select an operation; a key held only by
 a security key's own keyboard does not count as held (below). Ordinary
@@ -6347,6 +6349,116 @@ drive the keymap, Shift, the keypad, Space, Backspace, Enter, Escape,
 repeats, a second keyboard's held key, the bounds and Enter while too
 short through `read_device`, and a security key's own keyboard typing
 nothing but cancelling.
+
+### Storage operations
+
+Fixed by `td-install/ENCRYPTION.md` increment 8e's documentation
+commit before their code; none is implemented yet. td-authd/DESIGN.md
+amendment 10 gives the wire, and ENCRYPTION.md the operations. Until
+that document's item 9, root refuses every storage operation and every
+disk proof in a production build, so these screens end at `NOT
+AVAILABLE IN THIS BUILD` there.
+
+**The storage screen.** The attention menu gains `S: DISK ENCRYPTION`
+below `H`'s row, so every row above keeps its place and only `ESC TO
+RETURN` moves down (on 1280x800 `S` at 636 and `ESC TO RETURN` at
+672; the twelve-row menu, 410 pixels at double scale, still starts at
+176 on 800x600, and `rows_top`'s fit rule moves it up only where it
+must). `S` is not modhex, but the exclusion of a security key's own
+keyboard applies to it as to every selection. A fresh physical `S`,
+under the menu's rules and before the lifetime's operation, opens the
+storage screen, which names its paint as the key-management screen
+does and chooses nothing until that paint is on glass. Its rows are
+`DISK ENCRYPTION`, then one row per operation, in operation-byte
+order: in 8e `U: UPDATE THE BOOT SELECTOR`; each later increment adds
+its own row with its operation. On that screen the menu's letters
+select nothing and Escape still cancels. A choice is the lifetime's one
+operation, read under the menu's rules, so a security key's own
+keyboard neither opens the screen nor chooses on it; on the lock
+surface `S` selects nothing, as no menu letter does.
+
+`U` sends `20 01`. Root's `a0 00` shows `NOT AVAILABLE IN THIS BUILD`;
+`a0 01` keeps the nonce, and the client then polls as for a login
+operation: `91 0b` until the worker's baseline, then root's tag 16
+description, which must keep the nonce and owner 1000 and carry the
+selected operation; any other description, a second one or one before
+the nonce is a violation that ends the paired generation. Root's `04`
+presents it, its approval key's rows replacing the generic Escape row;
+the key is typed under "Elevation consent"'s rules, and the receipt,
+the exact description, is sent only after its second digit. Root's
+`05` then asks for the commit, which the client sends at once, since
+the key was the consent; a `05` before the receipt is a violation.
+Enter confirms nothing and a wrong digit ends the request, as on an
+elevation's prompt. Success (`06`) shows `BOOT SELECTOR UPDATED` and
+the form's row: `THE NEXT BOOT ASKS FOR THE DISK PIN` (staged), `THE
+NEXT BOOT NEEDS THE RECOVERY KEY` (direct, device-bound) or nothing more
+(direct, FIDO2 primary). An end shows its kind's text:
+
+| Kind | Shows |
+| --- | --- |
+| `20` VOLUME | `NO ENCRYPTED TD VOLUME` |
+| `21` STATE | `THE DISK CANNOT DO THIS NOW` |
+| `22` NOT CURRENT | `RESTART INTO THE CURRENT SYSTEM` / `BEFORE UPDATING THE SELECTOR` |
+| `23` DEPLOYMENT | `THE SYSTEM'S BOOT FILES DO NOT` / `MATCH ITS MANIFEST` |
+| `24` ESP | `THE EFI PARTITION IS NOT TD'S` / `OR HAS TOO LITTLE SPACE` |
+| `28` CHANGED | `THE DISK CHANGED; NOTHING WRITTEN` |
+| `08`, `0f`, `10` | `TIMED OUT`, `THE OPERATION FAILED` |
+| `0e` uncertain | `RESULT UNCERTAIN` |
+| `80` cancelled | nothing |
+
+A selector update's ends are exactly these, `0e` and `28` only after
+the acknowledged commit, and `20` to `22` only before any description;
+any other is a violation. The attempt's lifetime is the operation's
+ceiling, 240 seconds, and its prompt's time line shows it.
+
+**Disk proofs.** On the key-management screen, while the last `1a`
+answer's protected byte reads `01`, a choice of `1`, `2` or `A`, or a
+removal's Enter, does not select yet: the screen shows `AUTHORIZE
+WITH:`, then `R: THE DISK RECOVERY KEY`, `S: A DISK SECURITY KEY` and,
+for an addition or removal, `K: AN ENROLLED LOGIN KEY`, named by its
+own paint and read under the same rules. `R` and `S` send `1b 0b 01`
+or `1b 0b 02` and the operation's selection, and `K` the ordinary
+`1b`. The operation is the lifetime's one selection only once this
+choice is made; Escape before it cancels nothing at root, since nothing
+was sent. While the byte reads `00` the screen is as before, and a
+first enrollment's `1b` meets root's `84` on a protected machine whose
+marker appeared since. The client checks a disk proof's descriptions
+as a login operation's ("Login-key operations"), through consent's
+start and successor rules for tags 13 to 15: the proof's steps first,
+the chosen proof in every step, and no identify or authorize. A
+removal's commit follows its last proof step. Root's `86` shows `THIS
+MACHINE HAS NO DISK PROOF`, and the storage worker's ends the rows
+TOKEN-LOGIN.md's "Enrollment, addition and removal" adds to its
+"Failure texts". The ceilings are amendment 10's.
+
+**The recovery-key profile.** Root's `0c` for a recovery-key step opens
+the PIN field in its recovery-key profile; everything "The PIN field"
+says holds but the following. Its row is `TYPE THE DISK RECOVERY KEY`.
+It types only digits: a number-row digit, at either Shift level, and a
+keypad digit while NumLock types one; every other key, Space and a
+hyphen included, is ignored rather than typed, so the field holds the
+48 passphrase digits td-protector's codec admits without separators
+(td-protector/DESIGN.md, "Recovery key"). Backspace erases one digit;
+Enter submits only at exactly 48 digits and does nothing before; a
+49th digit is refused. Its masks are drawn in eight groups of six, one
+mask advance apart, 220 prompt pixels in all, so the row fits from 320
+pixels wide; the band and its refusal are the PIN field's. After `9c
+00` the field gives way to `CHECKING THE RECOVERY KEY` rather than the
+touch request. The 64-byte buffer, its zeroing, the `1c` write and the
+take's race are the PIN field's; the 48 digits are `1c`'s secret bytes.
+The client never parses or checks the key: the storage worker does,
+and a codec refusal ends the operation as `25`, a keyslot that refuses
+it as `26`. A disk authorize step opens the field in its ordinary PIN
+profile and then shows `TOUCH YOUR KEY`, as a login authorize step
+does.
+
+Host tests are to drive a selector update's whole status sequence to
+each form's success and every end in the table, a key typed before
+presentation and a wrong digit, the storage screen's choices and their
+refusal outside attention, before the screen is on glass and from a
+security key's own keyboard, the protected byte's choices and their
+absence, each disk proof's sequence for all three operations, the
+recovery-key profile's keys, bounds, masks and zeroing, and `86`.
 
 ### The lock surface
 

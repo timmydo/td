@@ -1794,10 +1794,12 @@ takes a fresh proof at that moment, the recovery key or a disk security
 key, under the rule TOKEN-LOGIN.md "Enrollment, addition and removal"
 states. Its keyslot test runs only through `td-install
 storage-operation`, the running system's one keyslot-test surface
-(DESIGN.md "Full-system volume consumers"), and its consent step, `1b`
-selection, PIN-field profile and compositor screen land with 8e's
-storage-operation wire; until then a protected machine refuses every
-login-key operation only a disk proof can authorize. Upgrade's first
+(DESIGN.md "Storage operation worker"). 8e's documentation commit
+fixes its consent steps, `1b` selection, PIN-field profile and
+compositor screen (td-authd/DESIGN.md amendment 10), and 8e's last
+commit implements them over the storage-operation wire; until then a
+protected machine refuses every login-key operation only a disk proof
+can authorize. Upgrade's first
 phase requires an enrolled login state, and the
 last login key cannot be removed on a protected machine, so a recovery
 boot never finds an unlocked session.
@@ -2390,23 +2392,26 @@ commit.
      last-key refusal, and, until 8e's disk proof, the refusal of every
      login-key operation only that proof can authorize (td-authd and
      td-secret's login operation).
-   - **8e, predicted selector update.** A documentation commit fixing
-     td-authd's storage-operation wire (amendment 10) and the
-     compositor's storage screen before their code; the `td-fat` crate
-     (bounded FAT32 reader, reclaim, staging and the one-sector
-     commits); td-boot's event-log reader, its refusal rules and PCR 4
-     and PCR 9 prediction, with the kernel's `SECURITYFS` pin;
-     td-init's `losetup` applet linked into the selector initramfs, with
-     its D6 binding and the image check that requires it;
-     `storage-operation`'s `selector-update` in both forms, with
-     td-authd's supervision, which refuses it in production; the
-     selector's pre-seal, its authentication against `current`'s
-     `bzImage` and `root.erofs`, its retry token, deletion and immediate
-     reboot after `update`, and the commit; and TOKEN-LOGIN.md's disk
-     proof for login-key operations, whose consent step, `1b` selection,
-     PIN-field profile and compositor screen the same documentation
-     commit fixes, and whose keyslot test runs through
-     `storage-operation`, lifting 8d's interim refusal.
+   - **8e, predicted selector update.** Its commits, in order: a
+     documentation commit fixing td-authd's storage-operation wire
+     (amendment 10), the storage worker's frames (DESIGN.md "Storage
+     operation worker"), the compositor's storage screen, and the disk
+     proof's consent steps, `1b` selection and PIN-field profile, all
+     before their code; the `td-fat` crate (bounded FAT32 reader,
+     reclaim, staging and the one-sector commits); td-boot's event-log
+     reader, its refusal rules and PCR 4 and PCR 9 prediction, with the
+     kernel's `SECURITYFS` pin; td-init's `losetup` applet linked into
+     the selector initramfs, with its D6 binding and the image check
+     that requires it; `storage-operation`'s `selector-update` in both
+     forms, with td-authd's supervision and the compositor's storage
+     screen, which production refuses; the selector's pre-seal, its
+     authentication against `current`'s `bzImage` and `root.erofs`, its
+     retry token, deletion and immediate reboot after `update`, and the
+     commit; and last, once the storage-operation wire exists,
+     TOKEN-LOGIN.md's disk proof for login-key operations, whose keyslot
+     test runs through `storage-operation`, with the compositor's
+     authorization choice and recovery-key profile, lifting 8d's
+     interim refusal.
    - **8f, re-encrypting upgrade.** td-protector's upgrade planner over
      the states U0 to U5 and the runner's `reencrypt` (initialization in
      both resilience modes and `--resume-only`) and `token import`

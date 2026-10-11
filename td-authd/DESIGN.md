@@ -1817,7 +1817,9 @@ APPLICATIONS.md §L.1, "The v1 operations", says what
 and its "Elevation increments" which commit lands each part;
 `td-compositor/DESIGN.md`, "Elevation consent", says which presses
 confirm. The private channel routes requests `10` to `1f` to the secret
-session and refuses `20` and above.
+session and refuses `20` and above; ENCRYPTION.md increment 8e's storage
+commit routes `20` there too ("Login keys and session lock", amendment
+10).
 
 **Consent tags.** Tags 11 (`deploy-rollback`) and 12 (`set-hostname`)
 follow the login tags. Each carries, right after its tag byte, the
@@ -2632,26 +2634,181 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    the protected marker was made or found; and the admission byte goes
    with the generation's first `1a` answer whatever that answer's
    state.
-10. **Storage operations (planned).** One fixed root `td-install
-    storage-operation --uid 1000` child per operation, sharing the
-    single operation slot and the login worker's launch, framing,
-    presentation, commit rounds, cancellation and teardown, carries
+10. **Storage operations.** Fixed by ENCRYPTION.md increment 8e's
+    documentation commit, before their code; none is implemented yet.
+    One fixed root `/bin/td-install storage-operation --uid 1000` child
+    per operation, the storage worker (`td-install/DESIGN.md`, "Storage
+    operation worker"), launched and supervised as the login worker is
+    ("Login-key operation supervision" below: empty environment, `/`
+    cwd, null stdout and stderr, a private stdin socketpair, the
+    authority's process group, the nonblocking framed endpoint), with
+    the same presentation and commit rounds, cancellation, deadlines and
+    teardown, and holding the same single operation slot, carries
     ENCRYPTION.md increment 8's selector update, upgrade and its
     cancellation, protector management (token addition and removal,
-    recovery-key removal, the PIN-change and TPM-clear requests),
-    optional Secure Boot enrollment, and the keyslot test of
-    TOKEN-LOGIN.md's login-key disk proof, whose consent step, `1b`
-    selection, PIN-field profile and screen 8e's documentation commit
-    fixes with the rest. Physical selection alone starts
-    one, from a storage screen of the attention menu; each presented
-    step's description names the operation, its tokens' fingerprints
-    and, for a PIN or recovery-key step, which secret it asks for;
-    secrets reach it through `1c`. Until ENCRYPTION.md's item 9 a
-    production build refuses every storage operation, as it refused
-    login writes before TOKEN-LOGIN.md's A5. Its request bytes, consent
-    tags and screen are fixed by increment 8e's first commit, a
-    documentation commit amending this section and
-    `td-compositor/DESIGN.md` before their code.
+    recovery-key removal, the PIN-change, TPM-clear and re-enrollment
+    requests), optional Secure Boot enrollment, and the keyslot test of
+    TOKEN-LOGIN.md's login-key disk proof. Physical selection alone
+    starts one, from the attention menu's storage screen
+    (`td-compositor/DESIGN.md`, "Storage operations") or, for a disk
+    proof, from the key-management screen. Each presented step's
+    description names the operation, its tokens' fingerprints and, for a
+    PIN or recovery-key step, which secret it asks for; secrets reach
+    the worker through `1c` and its `16` frame.
+
+    **Selection.** Request `20` and one operation byte selects a storage
+    operation: `01` selector update. The other operations' bytes are
+    assigned here, and their operands and steps are fixed by their own
+    increment's documentation commit, before their code, under this
+    framing: `02` upgrade, `03` upgrade cancellation, `04` FIDO2 token
+    addition, `05` FIDO2 token removal, `06` recovery-key removal, `07`
+    PIN-change request, `08` TPM-clear request, `09` TPM re-enrollment
+    request and `0a` Secure Boot enrollment; until then each decodes
+    and is refused as this build's. `20` needs completed preparation and
+    an empty slot, as `1b` does, or ends the generation; it answers `a0
+    01` and the operation's 32-byte nonce, started, or `a0 00`, refused
+    in this build. The private channel routes `20` to the paired session
+    beside `10` to `1f`, and still refuses `21` and above. Polls `11`,
+    cancellation `15`, presentation `13`, commit `14` and the secret
+    request `1c` are a login operation's, with the same answers (`91 0b`
+    while root waits for the worker's baseline, `91 03` to `91 06`, `91
+    0c`, `91 0d` and `91 0e`; `9c`; `95`).
+
+    **Disk proofs.** Request `1b 0b P` followed by a first enrollment
+    (`08 01`, `08 02`), an addition (`09`) or a removal (`0a`, the count
+    and slots), each as `1b` spells it, selects that login operation
+    authorized by a disk proof instead of an enrolled key: `P` is `01`
+    for the volume's recovery key and `02` for a disk security key, any
+    other refused. An unlock has no such form. It is a login operation
+    in every other respect: the `9b` answers, the slot, the polls and
+    the ends. Root reads the protected marker at the start, as for `84`
+    and `85`, a read failure counting as present, and without it ends
+    the operation with `86`, a disk proof on a machine that is not
+    protected, before any worker starts. Otherwise root starts the login
+    worker, which sends its baseline (`18`), then the storage worker,
+    which sends its own; root builds the first description (consent
+    tags 13 to 15, the proof's first step, with the disclosure's key
+    where the operation discloses) from both and sends it to the
+    storage worker alone. The storage worker presents the proof's
+    steps, takes the recovery key or the disk key's PIN, verifies the
+    proof and tests the keyslot it opens, then sends `14` and exits; it
+    writes nothing and has no commit round. Only after observing that
+    success and that exit does root send the login worker its first
+    frame, the description of the proof's last step, which the worker
+    admits without presenting it (`td-secret/DESIGN.md`, "Login-key
+    worker"); the operation then continues in the login worker, whose
+    next step is a new key's connect or, for a removal, the commit round
+    over that proof step. The login worker's first-frame wait is
+    therefore bounded by its operation deadline rather than a frame
+    time. A failure, cancellation or deadline at any point kills and
+    reaps both children before the end is reported. Root admits each
+    step the storage worker presents against both baselines: a disk
+    key's fingerprint must name a fido2 token of the volume's baseline,
+    and its retries be one nonzero byte, as an authorize step's are; the
+    recovery-key step needs a `recovery-key` marker in that baseline. A
+    `1c` for the recovery-key step must hold exactly 48 ASCII digits,
+    which root forwards unparsed; anything else is a protocol violation
+    that ends the generation, since the compositor's field admits
+    nothing else. The ceilings (amendment 6) count the proof as one key
+    ceremony: a removal by disk proof 120 seconds, an addition 240, a
+    first enrollment 240 for one key and 360 for two, each plus the
+    reading allowance where it discloses, so `LOGIN_LONGEST` becomes
+    480. Until activation `login::WRITES` refuses every disk-proof
+    selection with `9b 00`, as it refuses every login write; 8e's
+    disk-proof commit lifts 8d's interim refusal in test builds, where a
+    first enrollment on a protected machine without a proof still ends
+    with `84`.
+
+    **Consent tags.** Tags 13, 14 and 15 are a first enrollment, an
+    addition and a removal authorized by a disk proof: each is tag 8's,
+    9's or 10's value with one proof byte after the account, `1` the
+    recovery key or `2` a disk security key, any other refused. Three
+    steps join the table above: recovery key (9, no fields), disk
+    identify (10, no fields) and disk authorize (11, fingerprint and
+    retries), the fingerprint being the first four bytes of SHA-256 over
+    the credential ID a fido2 token of the header names. The proof steps
+    replace identify and authorize: recovery key alone, or disk identify
+    then disk authorize, as `P` chose, followed for an enrollment by
+    each new key's connect, create, prove, repeat and probe, for an
+    addition by the new key's, and for a removal by nothing, its last
+    proof step being `Last`. An enrollment's first step is its proof's
+    first, which then carries the disclosure and its key, and no
+    connect does; a removal leaving one key discloses on its proof's
+    first step. Tags 8 to 10 never carry a proof step, and 13 to 15
+    never identify or authorize. Recovery key and disk authorize ask for
+    a secret (`asks_pin`), the first the recovery key, the second the
+    disk key's PIN. The rows name the operation as tags 8 to 10 do, then
+    `AUTHORIZED BY THE DISK RECOVERY KEY` or `AUTHORIZED BY A DISK
+    SECURITY KEY`; the recovery-key step shows `TYPE THE DISK RECOVERY
+    KEY`, disk identify `CONNECT ONE DISK SECURITY KEY ONLY`, and disk
+    authorize `DISK SECURITY KEY` with its fingerprint, then a PIN
+    step's two rows. The widest such value, a removal of eight keys at
+    its disk authorize step, is 99 bytes.
+
+    Tag 16 is the selector update: right after its tag byte the two-byte
+    approval key, as tags 5, 11 and 12 carry it, then one form byte, `1`
+    direct on a device-bound volume, `2` direct on a FIDO2-primary
+    volume or `3` staged on a TPM-primary volume, any other refused,
+    then the 64 lowercase hexadecimal bytes of the running deployment's
+    manifest ID, which is `current`'s: 112 bytes in all. It has one step
+    and no step byte: its description is presented once, its key typed
+    confirms that presentation, and it is `Last`. Its rows are `UPDATE
+    THE BOOT SELECTOR ON DISK`, `FROM THE RUNNING SYSTEM` and the ID's
+    rows as tag 5 shows them, then the form's two: `THE NEXT BOOT ASKS
+    FOR THE DISK PIN` and `AND COMPLETES THE UPDATE` (3), `THE NEXT BOOT
+    NEEDS THE RECOVERY KEY` and `AND A CONFIRMED RESEAL` (1), or `EVERY
+    BOOT ASKS FOR A SECURITY KEY` and `AS IT DOES NOW` (2); then the
+    key's rows. Tags 17 to 25 are reserved for operation bytes `02` to
+    `0a` in that order, and decode as unknown until their increments fix
+    them.
+
+    **The selector update.** At `20 01` root starts the storage worker,
+    which sends its baseline: the volume's state, its tokens and the
+    running deployment's standing. Root derives the form from that state
+    (device-bound 1, FIDO2 primary 2, TPM primary 3) and, before any
+    description, ends the operation with the storage worker's own kinds
+    from its baseline: `20` for no encrypted td volume or a header td's
+    reader refuses, `21` for an upgrading volume, whose upgrade writes
+    the direct form itself, and `22` for a running deployment that is
+    not an acknowledged `current` with no pending attempt. An
+    unencrypted volume takes no selector update: none of ENCRYPTION.md's
+    forms names one. Otherwise it draws the approval
+    key and sends tag 16's description; the worker repeats it as its one
+    step, which root presents (`91 04`) and acknowledges once the
+    compositor's receipt arrives, sent only after the key is typed; then
+    the commit round, in which the worker stages or writes the pair
+    (ENCRYPTION.md, "Selector update"). Its ceiling is 240 seconds,
+    fixed at the selection: 120 for the worker's reads and the key, which
+    the worker presents only once its reads are done, and 120 for the
+    writes, which the worker begins only with 120 seconds of its
+    deadline left (its commit margin). After root's `13` an outcome
+    other than `14` and a successful exit is uncertain (`91 0e`), as a
+    login write's is, but for the worker's `28` CHANGED with its
+    successful exit: the worker sends it only from its checks after
+    `13` and before its first write, so it is definite and root reports
+    it as `91 0d 28 00`. Success shows the form's result
+    (`td-compositor/DESIGN.md`, "Storage operations").
+
+    **Kinds.** An end carries the worker's `15` kind, from the storage
+    worker's table in `td-install/DESIGN.md` for its own, or root's:
+    `80` cancelled, `86` above, and `08` and `10` as for a login
+    operation. The compositor accepts exactly the kinds each selection
+    can produce where it stands, as for a login operation, and anything
+    else ends the generation.
+
+    **The login state.** The `9a` answer gains one byte after the
+    admission byte: `01` when root read the protected marker for this
+    answer, or could not read it, and `00` when it is absent. The
+    compositor offers the disk-proof choices only while the last answer
+    reads `01`; root decides from its own read at the operation's start,
+    so the byte is a display choice and authorizes nothing. Both peers
+    ship it atomically, still `TDLA003`, with 8e's disk-proof commit.
+
+    Until ENCRYPTION.md's item 9 a production build answers every `20`
+    with `a0 00` before starting anything (`storage::OPERATIONS`, false
+    there as `login::WRITES` is), so nothing in production starts the
+    storage worker; test builds set it, so host fixtures drive every
+    implemented operation.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.
@@ -2672,6 +2829,12 @@ argument. The paired requests are:
 | `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds, or `0d`, an unenrolled protected machine; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, the revocation byte, `00` to `03`, and the admission byte, `00` or `01` (amendments 1, 7 and 9) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
+
+Amendment 10 extends these rows: `1b 0b P` and an enrollment, addition
+or removal selects a login operation authorized by a disk proof, with
+the `9b` answers; `20` and an operation byte selects a storage
+operation, answered `a0`; and a recovery-key step's `1c` carries the 48
+digits.
 
 `1a` needs completed preparation, or it ends the generation, but neither
 needs nor takes the operation slot. The compositor admits only an answer

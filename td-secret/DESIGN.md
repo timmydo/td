@@ -2414,6 +2414,28 @@ step it derives later carries no key.
    when a removal leaves no key. Root must also observe a successful
    exit.
 
+**Disk proofs.** Fixed by ENCRYPTION.md increment 8e's documentation
+commit, implemented by its last: a first enrollment, an addition or a
+removal authorized by a disk proof (td-authd/DESIGN.md amendment 10,
+consent tags 13 to 15). The proof runs in td-install's storage worker,
+never here: this worker never tests a keyslot, reads the volume or
+holds a disk secret. Its baseline is sent as above, and its wait for
+root's first frame is bounded by the operation deadline, not a frame
+time, since root runs the proof meanwhile. For these tags root's first
+frame is the description of the proof's last step (recovery key, or
+disk authorize), sent only once the storage worker proved it; the
+worker admits it through consent's start rule for a proven proof and
+against its own baseline, presents nothing for it, and reads the
+record again as step 3 does (RECORD CHANGED otherwise). It then
+continues from that step: an enrollment's or addition's new key at a
+connect step it presents, the authorizing device being none, so any
+one connected key may be the new one; a removal's commit round over
+that proof step, admitted `Last`. Any other first frame for these tags,
+a proof step later, or an identify or authorize step, is INTERNAL. The
+protected marker's rules above hold unchanged, except that a first
+enrollment under tag 13 is the one first enrollment a protected
+machine admits.
+
 A write's outcome, never retried:
 
 - **Committed** sends `14`.

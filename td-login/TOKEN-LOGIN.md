@@ -1042,18 +1042,45 @@ token alone is something anyone who can write the disk can add:
 
 The keyslot test runs only through `td-install storage-operation`, the
 running system's one keyslot-test surface (`td-install/DESIGN.md`,
-"Full-system volume consumers"), never in td-secret's login worker. The
-disk proof's consent step, its `1b` selection, the PIN-field profile
-that carries the recovery key and its compositor screen land with
-ENCRYPTION.md increment 8e's storage-operation wire (td-authd/DESIGN.md
-amendment 10, fixed by 8e's documentation commit). Until then a
-protected machine refuses every login-key operation that only a disk
-proof can authorize: a first enrollment, which has no enrolled key to
-assert, is refused from the worker's baseline with `84`, and the worker
-refuses a description of it as INTERNAL. An addition and a removal that
-leaves a key are authorized by an enrolled key's assertion, as
-anywhere; their disk-proof forms have no selection yet, so they cannot
-be asked for.
+"Full-system volume consumers"), never in td-secret's login worker.
+ENCRYPTION.md increment 8e's documentation commit fixes the rest, and
+its last commit implements it after the storage-operation wire exists
+(td-authd/DESIGN.md amendment 10):
+
+- **Selection.** On the key-management screen, while the last `1a`
+  answer's protected byte reads `01`, choosing `1`, `2`, `A` or a
+  removal's set is followed by an authorization choice:
+  `R: THE DISK RECOVERY KEY`, `S: A DISK SECURITY KEY` and, for an
+  addition or removal, `K: AN ENROLLED LOGIN KEY`, the ordinary path
+  (td-compositor/DESIGN.md, "Login-key operations"). A disk proof is
+  sent as `1b 0b`, the proof byte and the operation's own selection.
+- **Consent steps.** The proof replaces identify and authorize: one
+  recovery-key step, or a disk identify step and a disk authorize step
+  naming the disk credential's fingerprint and its PIN retries, in the
+  disk-proof consent tags 13 to 15, which carry which proof was chosen
+  in every step. The proof's first step carries the operation's
+  disclosure and its approval key, where it has one.
+- **PIN field.** The recovery-key step opens the PIN field in its
+  recovery-key profile, which admits the 48 digits alone; a disk
+  authorize step opens it in this document's PIN profile, then asks
+  for a touch.
+- **Failure texts.** The storage worker's kinds that a proof can end
+  with, and td-authd's `86`, add these rows to "Failure texts":
+  `86` `THIS MACHINE HAS NO DISK PROOF`, and the storage worker's
+  `20` `NO ENCRYPTED TD VOLUME`, `21` `THE DISK CANNOT DO THIS NOW`,
+  `25` `RECOVERY KEY MISTYPED`, `26` `WRONG KEY FOR THIS DISK` and `28`
+  `THE DISK CHANGED; NOTHING WRITTEN`, the last when the header changed
+  between the worker's baseline and its keyslot test, which writes
+  nothing; a disk key's PIN, presence and device kinds show the rows
+  above.
+
+Until that commit a protected machine refuses every login-key operation
+that only a disk proof can authorize: a first enrollment, which has no
+enrolled key to assert, is refused from the worker's baseline with
+`84`, and the worker refuses a description of it as INTERNAL; after
+it, a first enrollment without a proof still is. An addition and a
+removal that leaves a key are authorized by an enrolled key's
+assertion, as anywhere, or by a disk proof once it lands.
 
 The recovery key is not hardware-backed, and is acceptable here because
 its holder already has equal power offline: from the live medium it

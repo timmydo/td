@@ -1368,7 +1368,8 @@ carries another UUID or none, refuses. The running system never opens
 or unlocks the volume: it runs no cryptsetup, reaches no TPM and reads
 no key, so a LUKS2 partition with no active mapping, or with an active
 mapping under another name, refuses. The planned exception is
-ENCRYPTION.md increment 8's `td-install storage-operation`: the
+ENCRYPTION.md increment 8's `td-install storage-operation` ("Storage
+operation worker" below): the
 upgrade's first phase reads one TPM capability, it and the requests
 import key-less tokens, protector management adds and kills keyslots
 under a FIDO2 passphrase or the recovery key, a login-key disk proof
@@ -1567,6 +1568,116 @@ for using PCR 11 in a shipped release policy. Root and the running kernel
 remain trusted. This adds no key release, enrollment or authorization for a
 changed deployment. Update authorization for approved current/previous
 states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
+
+### Storage operation worker
+
+Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
+commit before its code; nothing implements it yet, and td-authd refuses
+every storage operation in a production build until that document's
+item 9. `td-install storage-operation --uid 1000` is the root worker
+td-authd's amendment 10 supervises (td-authd/DESIGN.md, "Login keys
+and session lock"), the one running-system process that runs a
+key-bearing cryptsetup command or writes the ESP ("Full-system volume
+consumers"). It reaches the command line only through `main`, accepts
+no other operand, and keeps the login worker's startup, unnamed
+socketpair, descriptor inventory and bounded framing
+(td-secret/DESIGN.md, "Login-key worker"): it requires no active swap
+and a zero core-dump soft limit before its baseline, since it may hold
+a recovery key, a PIN or a derived passphrase, and reads every frame
+into clearing storage.
+
+Its frames are the login worker's: it sends `18` its baseline, `10` and
+`12` invitations, `14` success and `15` a failure; root sends the
+description, `11` and `13` acknowledgements and `16` a secret after a
+secret step's acknowledgement, `16` and 4 to 63 bytes as a PIN frame
+is. The baseline, sent before any presentation, token or ESP I/O, is
+`18`, then:
+
+- the volume byte, from discovery's held partition and td-protector's
+  reader over its LUKS2 header: `00` no encrypted td volume, `01`
+  device-bound, `02` upgrading (a `td-upgrade` token), `03` protected
+  with the TPM-primary shape, `04` protected with the FIDO2-primary
+  shape, `05` a header the reader refuses;
+- `01` when a `recovery-key` marker names a keyslot, else `00`;
+- the fido2 token count, 0 to 4, then each token's role (`01` primary,
+  `02` recovery) and fingerprint, the first four bytes of SHA-256 over
+  its credential ID, in token-number order;
+- `00` and the running deployment's 32-byte manifest ID when it is
+  `current`, acknowledged and with no pending attempt, or `01` alone.
+
+Root's first frame is a TDCONS01 description: tag 16 for a selector
+update, or tags 13 to 15 at their proof's first step for a disk proof.
+The worker requires it to be what its baseline admits, as root does,
+or fails as INTERNAL before any I/O, and repeats it exactly as its
+first `10`, a selector update's after the reads below, so the key's
+consent time holds no I/O.
+
+- **Selector update** (tag 16). The form must be the one the volume
+  byte gives and the ID the baseline's. Before its first `10` it
+  reads `current`'s manifest and signature from the held volume and
+  verifies them under the trusted key as td-boot does to boot it, then
+  hashes the deployment's `bzImage` against that manifest (`23`
+  otherwise). The manifest names no selector template; the template is
+  authenticated through `root.erofs`, as the selector's commit
+  authenticates it: the baseline requires the running deployment to be
+  that `current`, whose root is the `root.erofs` the deployment
+  initramfs hashed against this manifest and bound read-only, so the
+  worker reads the template from that running root's
+  `/lib/td-boot/selector-initramfs.cpio`. It prepares the selector in
+  memory by `prepare-selector`'s rules with the trusted key as the
+  volume holds it, the volume UUID of `td.volume=` and, for a protected
+  volume, `etc/td/boot-measurement`, and admits the ESP with `td-fat`
+  (`24` otherwise), reclaiming nothing yet. After the presentation's
+  `11` it sends `12` only with 120 seconds of its deadline left (`08`
+  otherwise); after root's `13`, before any write, it re-reads the
+  header, the running deployment's standing and the ESP's `EFI/BOOT`
+  sector, failing as `28` if the header changed since the baseline,
+  the deployment is no longer an acknowledged `current` with no pending
+  attempt, or the sector changed since its admission. Then it stages
+  the pair or writes it directly (ENCRYPTION.md, "Selector update") and
+  sends `14`. It never opens the volume or reads its key.
+- **Disk proof** (tags 13 to 15). With the recovery key: after the
+  recovery-key step's `11` it takes one `16`, parses it with
+  td-protector's recovery-key codec (`25` on a refusal, before any
+  cryptsetup), re-reads the header, failing as `28` if it changed since
+  the baseline (or `20` if the reader now refuses it), and runs
+  `cryptsetup open --test-passphrase` on the keyslot the marker names,
+  the key on standard input (`26` when it refuses). With a disk key: it identifies the one connected key among
+  the header's fido2 tokens, as the selector's worker does, presents the
+  disk authorize step with that token's fingerprint and the key's PIN
+  retries, takes the PIN, runs the authorize-phase assertion whose
+  client data is the disk domain's over that exact step (ENCRYPTION.md,
+  "FIDO2 protectors"), verifies its signature under the token's public
+  key, derives the passphrase, re-reads the header as the recovery key
+  does (`28` or `20`) and tests it on the keyslot the token names (`26`
+  when it refuses), the passphrase as a key file on
+  standard input. Success sends `14` with no commit round, and the
+  worker exits; the secret, output and passphrase are zeroed first.
+
+Its failure kinds are td-secret's login worker's where they mean the
+same (`01` to `08` for a disk key's PIN, presence, devices and time,
+`04` a key that is no header token's, `0e` an uncertain write, `0f`,
+`10`), and its own:
+
+| Byte | Kind |
+| --- | --- |
+| `20` | VOLUME: no encrypted td volume, or a header td's reader refuses |
+| `21` | STATE: a volume state the operation does not take, such as an unencrypted or upgrading volume for a selector update, or a proof the header has no protector for |
+| `22` | NOT CURRENT: the running deployment is not an acknowledged `current` with no pending attempt |
+| `23` | DEPLOYMENT: the kernel or the template does not match `current`'s manifest |
+| `24` | ESP: the ESP is not td's layout or lacks the space ("Selector update") |
+| `25` | KEY MISTYPED: the recovery-key codec refused the entry |
+| `26` | WRONG KEY: the keyslot refused the recovery key or the derived passphrase |
+| `27` | reserved |
+| `28` | CHANGED: the header, the deployment's standing or the ESP changed since it was read; sent before any write, so definite |
+
+After root's `13` any outcome but `14` with a successful exit is
+uncertain to root, as a login write's is, with one exception: `28`,
+which the worker sends only from its checks before its first write, is
+definite, and root forwards it as `91 0d`. Host tests are to drive each
+form over a header and an ESP the test builds, every kind at its point,
+the commit margin, the change check and the secret's zeroing; the disk
+proof's against the scripted cryptsetup and the virtual authenticator.
 
 ## 6. Signing and keys
 
