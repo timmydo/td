@@ -151,6 +151,8 @@ impl Theme {
                 scalar,
                 ink: self.map(ink),
             },
+            // A picture's colours are its own.
+            Primitive::Image { id, rect } => Primitive::Image { id, rect },
         }
     }
 

@@ -460,7 +460,8 @@ pub fn text(composition: &dyn Composition) -> Result<(usize, usize, String), ras
             Primitive::Glyph { x, y, scalar, .. } => (x, y, scalar),
             // A mark is a hint's pixel, not text the window shows.
             Primitive::Mark { .. } => return,
-            Primitive::Fill { rect, .. } => {
+            // A picture covers its cells as paint does.
+            Primitive::Fill { rect, .. } | Primitive::Image { rect, .. } => {
                 // Opaque paint: whatever it wholly covers is no longer shown.
                 let Some(covered) = draw.clip.intersection(rect) else {
                     return;

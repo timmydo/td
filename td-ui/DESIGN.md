@@ -343,10 +343,13 @@ of its own files may name each module.
   ink, background, weight and `font_style`, an `atlas::Style`; `medium`
   and `regular` over an ink and a background, `bold` and `italic` the
   same style bold or italic), `Primitive`
-  (`Fill`, `Glyph`, and `Mark`, a scalar of the hint face in one ink),
+  (`Fill`, `Glyph`, `Mark`, a scalar of the hint face in one ink, and
+  `Image`, a fitted picture its composition names by id),
   `Draw`, `fill` (a `Fill` of a whole rectangle clipped to the damage,
   the one most widgets and clients stream), `Surface`, the `Composition`
-  trait, `Scrollbar`, `text_run`,
+  trait (its `picture` hands `paint` an `Image` draw's fitted picture;
+  a composition that emits none keeps the default, none),
+  `Scrollbar`, `text_run`,
   `hint_run`, `Raster`, `Error`, the axis and frame-byte ceilings, the
   palette constants with the status inks `SUCCESS`, `WARNING` and
   `ACCENT` and the message list's `BUBBLE`, and `rgb` and `ppm`, a
@@ -594,13 +597,18 @@ of its own files may name each module.
   no row highlighted when nothing is selected. Activation, a double
   press and filtering stay with the consumer.
 - `messages`: `Message` (built from `new` with `text`, `rich`,
-  `section`, `excerpt`, `status`, `verdict`, `action`, `source`,
-  `collapsed`, `side` and `time`), `Side`, `Tone`, `Point`, `Shown`, `Tip`
-  and `Target`, `Key` with `from_chord`, `Event`, `Outcome` (with `Link`),
-  `Error` (with `Styled`), the budgets and
+  `picture`, `section`, `excerpt`, `status`, `verdict`, `action`,
+  `source`, `collapsed`, `side` and `time`), `Side`, `Tone`, `Point`,
+  `Shown` (with `Image`), `Tip` and `Target`, `Key` with `from_chord`,
+  `Event`, `Outcome` (with `Link`), `Error` (with `Styled` and
+  `Picture`), the budgets (`MAX_PICTURE_ROWS` and `MAX_PICTURE_BYTES`
+  among them) and
   `COPY_LABEL`, `COPY_ICON`, `COPY_TIP`, `ICON_CELLS`, `MAX_ACTION_CHARS`,
   `MAX_TIME_CHARS` and `MORE`, and `Controller`, the message list under
   "Shared message list" below.
+- `picture`: `Picture` (`new`, `width`, `height`, `bytes`, `fit_size`
+  and `fit`), `Fitted` (`pixel`), `Error`, `MAX_PICTURE_AXIS` and
+  `MAX_PICTURE_PIXELS`, under "Pictures" below.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output, and `OUTLINE_FACE`, one
@@ -1682,6 +1690,34 @@ storage; and the draw stream at two scales: the prefix in quiet ink,
 bold and italic font styles, a link's ink and underline, a strike's
 line, and the code ground under a code span and across a code block's
 row.
+
+For pictures `tests/picture.rs` holds a picture's bounds and its
+pixels' length, the fit size keeping the aspect, bound by either axis,
+never enlarged and at least a pixel, the area average over
+premultiplied samples in the raster's order (a transparent pixel adding
+no colour, a fractional shrink weighting each pixel by its overlap along
+either axis, a flat picture shrunk keeping its colour), and the raster's
+blend of a fitted picture over its buffer inside the clip and no
+further than the picture; and `tests/messages.rs` holds a picture laid
+as cell-high rows fitted to the columns, shrunk to them when wider and
+to `MAX_PICTURE_ROWS` when taller, at its own size at scale two; each
+row's draw one placement at the text area's left clipped to its row,
+the list handing the picture fitted to it and nothing for an unknown
+id; painted pixels on the picture and none past it, and fitted again,
+smaller, after a narrowing resize; a bubble as wide as its picture; a
+copy taking the picture's text, a select-all and a drag into the
+lower half including it and into the upper half not, a one-row
+picture's halves told apart by the pointer's height, a drag released
+below the view whose last row is a picture's taking its text whole and
+one released above a view starting in a picture's lower half taking it
+whole too, `append` and `set_rich` refused as `Picture`; a selected
+picture framed in the selection's ground and an unselected one not; a
+list's tag in its ids' top bits and an id of another tag answered with
+nothing; a picture scrolled partly out painting its slice from the
+view's top, a half-alpha picture blended over its ground and nothing
+above the list; and the picture budget refusing past
+`MAX_PICTURE_BYTES` with text still admitted, freed by `remove_first`
+and counted out by a `replace`.
 
 `tests/messages.rs` holds the message list through a clipboard that
 records each copy or refuses as told: bodies wrapped at a word, or
@@ -3342,6 +3378,54 @@ and a second click follow nothing; a selection a jitter made is left
 empty. The owner decides whether to follow it, and resolves the target
 before it sets the section's text again, since a new rendering may
 number links anew.
+
+### Pictures
+
+A section may show a picture (`Message::picture`): a
+`picture::Picture`, eight-bit RGBA with straight alpha that its owner
+decoded (td-agent's from td-png and td-jpeg), with the text a copy of it
+takes, its alternative text or a reference to it. The toolkit decodes
+nothing. A picture is at most `MAX_PICTURE_AXIS` (8192) on an axis and
+`MAX_PICTURE_PIXELS` (16 Mi) in all, its pixels shared, so a message and
+its owner hold one copy; the list counts every picture's bytes, a clone
+too, against `MAX_PICTURE_BYTES` (256 MiB), a budget apart from its
+text's, and frees them as messages go.
+
+A picture is drawn at its own pixel size, so a screenshot shows one to
+one at any scale, unless that is wider than the section's columns or
+taller than `MAX_PICTURE_ROWS` (20) rows: then it is shrunk to fit with
+its aspect kept, never enlarged (`Picture::fit_size`). It lays out as
+cell-high rows (`Shown::Image`, its row and its count), so scrolling,
+anchors and the row budget treat it as text, each row drawing its slice:
+one `Primitive::Image` placed at the text area's left, its top as many
+rows up as the slice is down, clipped to the row. A bubble is as wide as
+its picture needs. The list fits a picture on first draw, an area
+average over premultiplied samples, each source pixel weighted by its
+exact overlap with the output pixel, into the raster's byte order
+(`Picture::fit`), and keeps the fit until the size it is drawn at
+changes, so a resize fits it again and a repaint does not; the raster
+blends the fit over what is drawn (`Raster::image`). A fit is never
+larger than its picture nor than the columns by `MAX_PICTURE_ROWS` rows,
+so the fits a list keeps are bounded by its pictures' budget; a fit's
+pixels are reserved fallibly, and a picture whose fit cannot be had is
+not drawn. A fit walks every source pixel, so it costs the picture's size
+whatever it is shrunk to, paid on the first paint at a size. A theme
+leaves a picture's colours its own. An id names its list too: the owner
+of two lists tags each (`set_picture_tag`), and `picture` answers only
+its own tag's ids, so a composition asks each list in turn.
+
+A copy of a message takes a picture section's text as it takes any
+section's. A pointer over a picture stands in its section's text at the
+start in the picture's upper half and at the end in its lower, by the
+pointer's height over the placed picture, so a selection dragged into a
+picture takes its text whole or not at all; above the view a picture
+row stands at its text's start and below the shown rows at its end, as
+a text row does, and `select_all` reaches a picture at either end. A
+picture whose text the selection holds whole is framed in the
+selection's ground, two scaled pixels deep, so a drag shows what a copy
+takes; a picture with empty text is framed only when the selection runs
+past it on both sides, as a copy takes it. A picture section holds
+no text to change: `append` and `set_rich` refuse it (`Error::Picture`).
 
 ## Task-manager widgets
 

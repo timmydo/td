@@ -12,6 +12,7 @@ use crate::atlas::{Entry, Slot, Style, PAGE_WIDTH};
 use crate::face::Face;
 use crate::font::Font;
 use crate::hint;
+use crate::picture::Fitted;
 use crate::theme::{Theme, SAND};
 use crate::typeface::Typeface;
 use crate::{CELL_HEIGHT, CELL_WIDTH};
@@ -207,6 +208,13 @@ pub enum Primitive {
         scalar: char,
         ink: u32,
     },
+    /// The fitted picture its composition names `id` (`Composition::
+    /// picture`), its top left at `rect`'s and as large as it, blended
+    /// over whatever the caller painted.
+    Image {
+        id: u64,
+        rect: Rect,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +288,11 @@ impl Surface {
 pub trait Composition {
     fn surface(&self) -> Surface;
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw));
+    /// Hands `with` the fitted picture an `Image` draw it emitted names;
+    /// a composition that emits none has none.
+    fn picture(&self, id: u64, with: &mut dyn FnMut(&Fitted)) {
+        let _ = (id, with);
+    }
 }
 
 /// A scrollbar's track and thumb for a viewport of `visible` units over
@@ -597,8 +610,60 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
         if self.surface != scene.surface() {
             return Err(Error::InvalidArgument);
         }
-        scene.emit(damage, &mut |draw| self.draw(draw));
+        scene.emit(damage, &mut |draw| match draw.primitive {
+            Primitive::Image { id, rect } => {
+                scene.picture(id, &mut |fitted| self.image(draw.clip, rect, fitted));
+            }
+            _ => self.draw(draw),
+        });
         Ok(())
+    }
+
+    /// Blends `fitted` with its top left at `rect`'s, inside `clip`: each
+    /// premultiplied pixel over the buffer's, which is opaque.
+    pub fn image(&mut self, clip: Rect, rect: Rect, fitted: &Fitted) {
+        let rect = Rect {
+            width: rect
+                .width
+                .min(u32::try_from(fitted.width).unwrap_or(u32::MAX)),
+            height: rect
+                .height
+                .min(u32::try_from(fitted.height).unwrap_or(u32::MAX)),
+            ..rect
+        };
+        let Some(area) = clip
+            .intersection(self.surface.bounds())
+            .and_then(|clip| clip.intersection(rect))
+        else {
+            return;
+        };
+        // The area lies inside the surface and the picture, so its
+        // coordinates and offsets are non-negative; a row at a time, the
+        // picture's and the buffer's slices taken once.
+        let (left, width) = ((area.x - rect.x) as usize, area.width as usize);
+        for y in area.y..area.y + i64::from(area.height) {
+            let from = ((y - rect.y) as usize * fitted.width + left) * 4;
+            let to = y as usize * self.stride + area.x as usize * 4;
+            let (Some(top), Some(under)) = (
+                fitted.bgra.get(from..from + width * 4),
+                self.pixels.get_mut(to..to + width * 4),
+            ) else {
+                continue;
+            };
+            for (out, top) in under
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(top.as_chunks::<4>().0)
+            {
+                let keep = 255 - u16::from(top[3]);
+                for (out, &top) in out.iter_mut().zip(top).take(3) {
+                    let under = u16::from(*out) * keep;
+                    *out = top.saturating_add(((under + 127) / 255) as u8);
+                }
+                out[3] = 255;
+            }
+        }
     }
 
     pub fn draw(&mut self, draw: Draw) {
@@ -690,6 +755,9 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                     italic: matches!(style.font_style, Style::Italic | Style::BoldItalic),
                 },
             ),
+            // A picture is drawn by `paint`, which has its composition;
+            // a bare draw of one has nothing to draw.
+            Primitive::Image { .. } => return,
             Primitive::Mark { x, y, scalar, ink } => (
                 Rect {
                     x,

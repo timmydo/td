@@ -19,8 +19,10 @@ use td_ui::chrome::{ROW, SELECTED_ROW};
 use td_ui::messages::{
     Controller, Error, Event, Key, Message, Outcome, Point, Shown, Side, Target, Tip, Tone,
     COPY_ICON, COPY_LABEL, COPY_TIP, EXCERPT_ROWS, GAP, ICON_CELLS, MAX_LABEL_BYTES, MAX_LINES,
-    MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS, MORE,
+    MAX_PICTURE_BYTES, MAX_PICTURE_ROWS, MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES,
+    MIN_COLUMNS, MORE,
 };
+use td_ui::picture::{Fitted, Picture};
 use td_ui::raster::{
     Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, ACCENT, BORDER, BUBBLE,
     CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
@@ -99,6 +101,12 @@ fn rows(list: &Controller) -> Vec<String> {
                 collapsed,
             } => format!("T{message}.{section}{}", if collapsed { '-' } else { '+' }),
             Shown::Text { text, .. } => text.to_string(),
+            Shown::Image {
+                message,
+                section,
+                row,
+                rows,
+            } => format!("I{message}.{section}:{row}/{rows}"),
             Shown::More { message, section } => format!("M{message}.{section}"),
             Shown::Gap { message } => format!("G{message}"),
         })
@@ -996,6 +1004,9 @@ impl Composition for Scene<'_> {
     }
     fn emit(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         self.list.emit(damage, sink)
+    }
+    fn picture(&self, id: u64, with: &mut dyn FnMut(&Fitted)) {
+        self.list.picture(id, with)
     }
 }
 
@@ -2919,4 +2930,447 @@ fn only_a_still_single_click_follows_a_link_and_its_tip_names_it() {
         assert!(list.hover(Some(at(row, 1, scale))));
         assert!(list.tip().is_none());
     }
+}
+
+// ---------------------------------------------------------------- pictures
+
+fn picture(width: usize, height: usize, rgba: [u8; 4]) -> Picture {
+    Picture::new(width, height, rgba.repeat(width * height)).unwrap()
+}
+
+fn pictured(header: &str, picture: Picture, alt: &str) -> Message {
+    Message::new(header).unwrap().picture(picture, alt).unwrap()
+}
+
+#[test]
+fn a_picture_is_cell_high_rows_fitted_to_the_columns() {
+    let mut first = list(1, 40, 300);
+    // 64x40 fits 40 columns of 8: three rows of 16.
+    first
+        .push(pictured("a", picture(64, 40, [255, 0, 0, 255]), "alt"))
+        .unwrap();
+    assert_eq!(
+        rows(&first),
+        ["H0", "I0.0:0/3", "I0.0:1/3", "I0.0:2/3", "G0"]
+    );
+    // Wider than the columns: shrunk to 320 wide, so 16 tall, one row.
+    let mut wide = list(1, 40, 300);
+    wide.push(pictured("a", picture(640, 32, [0; 4]), ""))
+        .unwrap();
+    assert_eq!(rows(&wide), ["H0", "I0.0:0/1", "G0"]);
+    // Taller than the rows allow: shrunk to MAX_PICTURE_ROWS, more than
+    // the view shows.
+    let mut tall = list(1, 40, 300);
+    tall.push(pictured("a", picture(10, 1000, [0; 4]), ""))
+        .unwrap();
+    let laid = tall.shown().find_map(|(_, shown)| match shown {
+        Shown::Image { rows, .. } => Some(rows),
+        _ => None,
+    });
+    assert_eq!(laid, Some(MAX_PICTURE_ROWS));
+    // At scale 2 a row is 32 pixels, the picture drawn at its own size.
+    let mut double = list(2, 40, 300);
+    double
+        .push(pictured("a", picture(64, 40, [0; 4]), ""))
+        .unwrap();
+    assert_eq!(rows(&double), ["H0", "I0.0:0/2", "I0.0:1/2", "G0"]);
+}
+
+/// The picture draws a list emits, as (id, rect, clip).
+fn image_draws(list: &Controller, surface: Surface) -> Vec<(u64, Rect, Rect)> {
+    let mut out = Vec::new();
+    list.emit(surface.bounds(), &mut |draw| {
+        if let Primitive::Image { id, rect } = draw.primitive {
+            out.push((id, rect, draw.clip));
+        }
+    });
+    out
+}
+
+#[test]
+fn each_picture_row_draws_its_slice_of_one_placement() {
+    for scale in 1..=3u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 40, 300);
+        list.push(pictured("a", picture(64, 40, [255, 0, 0, 255]), ""))
+            .unwrap();
+        let draws = image_draws(&list, surface(scale));
+        let rows: Vec<Rect> = list
+            .shown()
+            .filter(|(_, shown)| matches!(shown, Shown::Image { .. }))
+            .map(|(rect, _)| rect)
+            .collect();
+        assert_eq!(draws.len(), rows.len());
+        let (id, placed, _) = draws[0];
+        for (row, (other, rect, clip)) in rows.iter().zip(&draws) {
+            // One placement, at the text area's left, each draw clipped
+            // to its row.
+            assert_eq!((*other, *rect), (id, placed));
+            assert_eq!(clip.y, row.y);
+            assert_eq!(clip.height, row.height);
+        }
+        assert_eq!(placed.x, rows[0].x + CELL_WIDTH as i64 * s);
+        assert_eq!(placed.y, rows[0].y);
+        assert_eq!((placed.width, placed.height), (64, 40));
+        // The list hands the picture fitted to that size.
+        let mut seen = None;
+        list.picture(id, &mut |fitted| seen = Some((fitted.width, fitted.height)));
+        assert_eq!(seen, Some((64, 40)));
+        list.picture(id + 1, &mut |_| panic!("no such picture"));
+    }
+}
+
+#[test]
+fn a_painted_picture_lands_on_its_rows_and_refits_on_resize() {
+    let font = td_ui::font::pinned().unwrap();
+    for scale in 1..=2u8 {
+        let surface = surface(scale);
+        let mut list = list(scale, 40, 300);
+        list.push(pictured("a", picture(400, 40, [255, 0, 0, 255]), ""))
+            .unwrap();
+        let paint = |list: &Controller| {
+            let mut buffer = vec![0x7a; surface.width * surface.height * 4];
+            let scene = Scene { surface, list };
+            Raster::new(&mut buffer, &font, surface, surface.width * 4)
+                .unwrap()
+                .paint(&scene, surface.bounds())
+                .unwrap();
+            buffer
+        };
+        let (_, placed, _) = image_draws(&list, surface)[0];
+        let buffer = paint(&list);
+        let right = placed.x + i64::from(placed.width);
+        let bottom = placed.y + i64::from(placed.height);
+        assert_eq!(pixel(&buffer, surface, placed.x, placed.y), 0xff0000);
+        assert_eq!(pixel(&buffer, surface, right - 1, bottom - 1), 0xff0000);
+        assert_ne!(pixel(&buffer, surface, right, placed.y), 0xff0000);
+        assert_ne!(pixel(&buffer, surface, placed.x, bottom), 0xff0000);
+        // Narrower, the picture is fitted again, smaller.
+        let s = u32::from(scale);
+        list.resize(surface, rect(scale, 20, 300)).unwrap();
+        let (id, narrow, _) = image_draws(&list, surface)[0];
+        assert_eq!(narrow.width, 20 * CELL_WIDTH as u32 * s);
+        assert!(narrow.width < placed.width);
+        let mut seen = None;
+        list.picture(id, &mut |fitted| seen = Some(fitted.width));
+        assert_eq!(seen, Some(narrow.width as usize));
+        let buffer = paint(&list);
+        let right = narrow.x + i64::from(narrow.width);
+        assert_eq!(pixel(&buffer, surface, right - 1, narrow.y), 0xff0000);
+        assert_ne!(pixel(&buffer, surface, right, narrow.y), 0xff0000);
+    }
+}
+
+#[test]
+fn a_bubble_is_as_wide_as_its_picture() {
+    let mut list = list(1, 40, 300);
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .side(Side::Right)
+            .picture(picture(40, 16, [0; 4]), "")
+            .unwrap(),
+    )
+    .unwrap();
+    let row = list
+        .shown()
+        .find(|(_, shown)| matches!(shown, Shown::Image { .. }))
+        .unwrap()
+        .0;
+    // Five cells of picture and a cell each side, unless the header asks
+    // for more.
+    assert!(row.width < rect(1, 40, 300).width / 2, "{row:?}");
+    assert!(row.width >= (5 + 2) * CELL_WIDTH as u32);
+}
+
+#[test]
+fn a_picture_copies_as_its_text_and_holds_no_text_to_change() {
+    let mut board = Board::default();
+    let mut list = list(1, 40, 300);
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .text("look:")
+            .unwrap()
+            .picture(picture(8, 8, [0; 4]), "[image: shot.png]")
+            .unwrap(),
+    )
+    .unwrap();
+    let copied = list.message_text(0).unwrap();
+    assert!(
+        copied.contains("look:") && copied.contains("[image: shot.png]"),
+        "{copied}"
+    );
+    list.event(Event::Focus(true), &mut board);
+    list.select_all();
+    let selected = list.selected_text().unwrap().unwrap();
+    assert!(selected.contains("[image: shot.png]"), "{selected}");
+    assert_eq!(list.append(0, 1, "more"), Err(Error::Picture));
+    let rich = Rich::new("x").unwrap();
+    assert_eq!(list.set_rich(0, 1, rich), Err(Error::Picture));
+}
+
+#[test]
+fn pictures_have_a_budget_of_their_own() {
+    let mut list = list(1, 40, 300);
+    // 8192 x 2048 is 64 MiB; clones share their pixels but each counts.
+    let big = picture(8192, 2048, [1, 2, 3, 255]);
+    let count = MAX_PICTURE_BYTES / big.bytes();
+    for _ in 0..count {
+        list.push(pictured("a", big.clone(), "")).unwrap();
+    }
+    assert_eq!(list.push(pictured("a", big.clone(), "")), Err(Error::Limit));
+    // Text still has its own room.
+    list.push(text("t", "words")).unwrap();
+    list.remove_first(1);
+    list.push(pictured("a", big.clone(), "")).unwrap();
+    // A replace counts what it takes away.
+    list.replace(0, text("t", "words")).unwrap();
+    list.replace(0, pictured("a", big, "")).unwrap();
+}
+
+#[test]
+fn a_drag_into_a_pictures_lower_half_takes_its_text() {
+    let mut board = Board::default();
+    let mut list = list(1, 40, 300);
+    // Four rows of picture after a text row.
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .text("look:")
+            .unwrap()
+            .picture(picture(8, 64, [0; 4]), "[image]")
+            .unwrap(),
+    )
+    .unwrap();
+    let images: Vec<Rect> = list
+        .shown()
+        .filter(|(_, shown)| matches!(shown, Shown::Image { .. }))
+        .map(|(rect, _)| rect)
+        .collect();
+    assert_eq!(images.len(), 4);
+    let start = at(text_row(&list, 0), 0, 1);
+    let mut drag = |end: Rect| {
+        press(&mut list, &mut board, start, false, 0);
+        release(&mut list, &mut board, at(end, 3, 1), 5);
+        list.selected_text().unwrap().map(|text| text.to_string())
+    };
+    // The upper half stands at the text's start: only the text row.
+    assert_eq!(drag(images[1]).as_deref(), Some("look:"));
+    // The lower half stands at its end: the text whole.
+    assert_eq!(drag(images[2]).as_deref(), Some("look:\n\n[image]"));
+}
+
+/// Presses at `from` and releases at `to`, then copies.
+fn drag_points(list: &mut Controller, from: (i64, i64), to: (i64, i64)) -> String {
+    let mut board = Board::default();
+    press(list, &mut board, from, false, 0);
+    list.event(Event::Move { x: to.0, y: to.1 }, &mut board);
+    release(list, &mut board, to, 10);
+    key(list, &mut board, Key::Copy);
+    board.copies.last().cloned().unwrap_or_default()
+}
+
+fn image_rows(list: &Controller) -> Vec<Rect> {
+    list.shown()
+        .filter(|(_, shown)| matches!(shown, Shown::Image { .. }))
+        .map(|(rect, _)| rect)
+        .collect()
+}
+
+#[test]
+fn a_one_row_picture_has_two_halves() {
+    let mut list = list(1, 40, 300);
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .text("look:")
+            .unwrap()
+            .picture(picture(300, 16, [0; 4]), "[image]")
+            .unwrap(),
+    )
+    .unwrap();
+    let images = image_rows(&list);
+    assert_eq!(images.len(), 1);
+    let start = at(text_row(&list, 0), 0, 1);
+    let row = images[0];
+    assert_eq!(
+        drag_points(&mut list, start, (row.x + 40, row.y + 3)),
+        "look:"
+    );
+    assert_eq!(
+        drag_points(&mut list, start, (row.x + 40, row.y + 12)),
+        "look:\n\n[image]"
+    );
+}
+
+#[test]
+fn a_drag_past_the_view_takes_a_pictures_text_whole() {
+    let mut board = Board::default();
+    let alt = "[image: a-rather-long-file-name.png]";
+    // Below: the last shown row is a picture's; the text whole.
+    let mut list = list(1, 40, 300);
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .text("look:")
+            .unwrap()
+            .picture(picture(8, 1000, [0; 4]), alt)
+            .unwrap(),
+    )
+    .unwrap();
+    key(&mut list, &mut board, Key::Home);
+    let last = list.shown().last().unwrap();
+    assert!(matches!(last.1, Shown::Image { .. }), "{:?}", last.1);
+    let start = at(text_row(&list, 0), 0, 1);
+    let below = list.rect().y + i64::from(list.rect().height) + 40;
+    let copied = drag_points(&mut list, start, (start.0, below));
+    assert_eq!(copied, format!("look:\n\n{alt}"));
+    // Above: the first shown row is in a picture's lower half; the
+    // pointer is above the picture, so its text whole.
+    let mut list = self::list(1, 40, 160);
+    list.push(pictured("a", picture(8, 1000, [0; 4]), "[img]"))
+        .unwrap();
+    list.push(text("b", "after")).unwrap();
+    key(&mut list, &mut board, Key::Home);
+    list.event(Event::Wheel { rows: 15 }, &mut board);
+    let top = list.shown().next().unwrap().1;
+    assert!(
+        matches!(top, Shown::Image { row, rows: 20, .. } if row >= 10),
+        "{top:?} {:?}",
+        rows(&list)
+    );
+    let end = at(text_row(&list, 0), 5, 1);
+    let above = list.rect().y - 40;
+    let copied = drag_points(&mut list, end, (end.0, above));
+    assert_eq!(copied, "[img]\n\nafter");
+}
+
+#[test]
+fn a_selected_picture_is_framed_in_the_selections_ground() {
+    let mut board = Board::default();
+    let mut list = list(1, 40, 300);
+    list.push(pictured("a", picture(64, 40, [0, 0, 0, 255]), "[image]"))
+        .unwrap();
+    list.event(Event::Focus(true), &mut board);
+    let surface = surface(1);
+    let (_, placed, _) = image_draws(&list, surface)[0];
+    let frames = |list: &Controller| {
+        let mut out = Vec::new();
+        list.emit(surface.bounds(), &mut |draw| {
+            if let Primitive::Fill { rect, color } = draw.primitive {
+                if color == SELECTED && placed.intersection(rect) == Some(rect) {
+                    out.push(rect);
+                }
+            }
+        });
+        out
+    };
+    assert!(frames(&list).is_empty());
+    list.select_all();
+    let framed = frames(&list);
+    // Four edges, two pixels deep, along the picture's own: the sides
+    // with each of its three rows, the top and foot with theirs.
+    assert_eq!(framed.len(), 2 + 2 * 3, "{framed:?}");
+    assert!(framed.iter().any(|r| r.y == placed.y && r.height == 2));
+    assert!(framed
+        .iter()
+        .any(|r| r.x + i64::from(r.width) == placed.x + i64::from(placed.width) && r.width == 2));
+}
+
+#[test]
+fn a_lists_tag_names_its_pictures() {
+    let mut list = list(1, 40, 300);
+    list.push(pictured("a", picture(8, 8, [0; 4]), "")).unwrap();
+    let surface = surface(1);
+    let (untagged, _, _) = image_draws(&list, surface)[0];
+    list.set_picture_tag(3);
+    let (id, _, _) = image_draws(&list, surface)[0];
+    assert_eq!(id >> 48, 3);
+    assert_eq!(id & ((1 << 48) - 1), untagged);
+    let mut seen = 0;
+    list.picture(id, &mut |_| seen += 1);
+    list.picture(untagged, &mut |_| seen += 10);
+    assert_eq!(seen, 1);
+}
+
+#[test]
+fn a_picture_scrolled_partly_out_paints_its_slice_and_blends() {
+    let font = td_ui::font::pinned().unwrap();
+    let mut board = Board::default();
+    let surface = surface(1);
+    let mut list = list(1, 40, 300);
+    // Half-alpha white: each channel 128 plus the ground's 127/255.
+    list.push(pictured("a", picture(64, 320, [255, 255, 255, 128]), ""))
+        .unwrap();
+    key(&mut list, &mut board, Key::Home);
+    list.event(Event::Wheel { rows: 5 }, &mut board);
+    let mut buffer = vec![0x7a; surface.width * surface.height * 4];
+    let scene = Scene {
+        surface,
+        list: &list,
+    };
+    Raster::new(&mut buffer, &font, surface, surface.width * 4)
+        .unwrap()
+        .paint(&scene, surface.bounds())
+        .unwrap();
+    let (_, placed, _) = image_draws(&list, surface)[0];
+    let first = image_rows(&list)[0];
+    assert!(placed.y < first.y, "placed above the view: {placed:?}");
+    let ground = pixel(
+        &buffer,
+        surface,
+        placed.x + i64::from(placed.width) + 2,
+        first.y,
+    );
+    let blend = |c: u32| 128 + (c * 127 + 127) / 255;
+    let expected = (blend(ground >> 16 & 0xff) << 16)
+        | (blend(ground >> 8 & 0xff) << 8)
+        | blend(ground & 0xff);
+    assert_eq!(pixel(&buffer, surface, placed.x, first.y), expected);
+    // Nothing above the list.
+    let above = list.rect().y - 1;
+    assert_eq!(pixel(&buffer, surface, placed.x, above), 0x7a7a7a);
+}
+
+#[test]
+fn a_picture_without_text_is_framed_only_when_the_selection_passes_it() {
+    let mut board = Board::default();
+    let mut list = list(1, 40, 300);
+    list.push(
+        Message::new("you")
+            .unwrap()
+            .text("look:")
+            .unwrap()
+            .picture(picture(64, 40, [0, 0, 0, 255]), "")
+            .unwrap()
+            .text("after")
+            .unwrap(),
+    )
+    .unwrap();
+    list.event(Event::Focus(true), &mut board);
+    let surface = surface(1);
+    let framed = |list: &Controller| {
+        let mut any = false;
+        let (_, placed, _) = image_draws(list, surface)[0];
+        list.emit(surface.bounds(), &mut |draw| {
+            if let Primitive::Fill { rect, color } = draw.primitive {
+                any |= color == SELECTED && placed.intersection(rect) == Some(rect);
+            }
+        });
+        any
+    };
+    // Into it from above: the copy takes nothing of it, and it is not
+    // framed.
+    let start = at(text_row(&list, 0), 0, 1);
+    let first = image_rows(&list)[0];
+    assert_eq!(
+        drag_points(&mut list, start, (first.x + 40, first.y + 3)),
+        "look:"
+    );
+    assert!(!framed(&list));
+    // Across it: framed.
+    let end = at(text_row(&list, 1), 3, 1);
+    drag_points(&mut list, start, end);
+    assert!(framed(&list));
 }

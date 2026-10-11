@@ -91,6 +91,7 @@ pub mod menus;
 pub mod messages;
 pub mod notices;
 pub mod open;
+pub mod picture;
 pub mod pinned_face;
 pub mod pointer;
 #[path = "../../td-compositor/src/proc_status.rs"]

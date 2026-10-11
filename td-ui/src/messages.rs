@@ -7,7 +7,9 @@
 //! hands the clipboard. Nothing here reads a clock, a file or the
 //! environment: the caller passes the clock with each press.
 
+use crate::picture::{Fitted, Picture};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::chrome::{Button, BUTTON_MARGIN, ROW, SELECTED_ROW};
 use crate::raster::{
@@ -33,6 +35,11 @@ pub const MAX_LABEL_BYTES: usize = 128;
 pub const MAX_LINES: usize = 1 << 20;
 /// The text rows an excerpt section shows.
 pub const EXCERPT_ROWS: usize = 8;
+/// The most rows a picture section's picture takes; a taller one is
+/// shrunk to them.
+pub const MAX_PICTURE_ROWS: usize = 20;
+/// The most picture bytes the list holds, apart from its text.
+pub const MAX_PICTURE_BYTES: usize = 256 << 20;
 /// The text columns a layout needs, besides a cell each side.
 pub const MIN_COLUMNS: usize = 16;
 /// The space below each message, in font pixels.
@@ -92,6 +99,8 @@ pub enum Error {
     InvalidRect,
     /// Text was appended to a styled section, which is replaced whole.
     Styled,
+    /// Text was appended to, or styled text set on, a picture section.
+    Picture,
 }
 
 impl std::fmt::Display for Error {
@@ -105,6 +114,7 @@ impl std::fmt::Display for Error {
             Self::InvalidSurface => "invalid message list surface",
             Self::InvalidRect => "message list rectangle lies outside the surface",
             Self::Styled => "a styled message section is replaced, not appended to",
+            Self::Picture => "a picture message section holds no text to change",
         })
     }
 }
@@ -145,6 +155,37 @@ struct Section {
     excerpt: bool,
     /// Its styled text, which it shows in place of `text`.
     rich: Option<Box<Rich>>,
+    /// Its picture, which it shows in place of `text`; `text` is what a
+    /// copy of it takes.
+    picture: Option<Arc<Framed>>,
+}
+
+/// A picture section's picture and its fit to the size it was last drawn
+/// at, made on first draw and again when that size changes.
+#[derive(Debug)]
+struct Framed {
+    picture: Picture,
+    fitted: Mutex<Option<Arc<Fitted>>>,
+}
+
+/// The size `picture` is drawn at in `columns` cells at `scale`: its own,
+/// or shrunk to the columns and to `MAX_PICTURE_ROWS` rows.
+fn picture_size(picture: &Picture, columns: usize, scale: usize) -> (usize, usize) {
+    picture.fit_size(
+        columns.max(1) * CELL_WIDTH * scale,
+        MAX_PICTURE_ROWS * CELL_HEIGHT * scale,
+    )
+}
+
+/// The rows a picture `height` pixels tall takes at `scale`.
+fn picture_rows(height: usize, scale: usize) -> usize {
+    height.div_ceil(CELL_HEIGHT * scale.max(1)).max(1)
+}
+
+/// Where message `message`'s section `section`'s picture is named in the
+/// draw stream of a list tagged `tag` (`Controller::set_picture_tag`).
+fn picture_id(tag: u16, message: usize, section: usize) -> u64 {
+    (u64::from(tag) << 48) | ((message as u64 & 0xffff_ffff) << 16) | (section as u64 & 0xffff)
 }
 
 impl Section {
@@ -315,6 +356,25 @@ impl Message {
             collapsed: false,
             excerpt: false,
             rich: None,
+            picture: None,
+        })
+    }
+
+    /// Adds an untitled picture section: its rows show `picture`, as wide
+    /// as the text and at most `MAX_PICTURE_ROWS` rows tall, and a copy
+    /// takes `text` (its alternative text, or a reference to it).
+    pub fn picture(self, picture: Picture, text: &str) -> Result<Self, Error> {
+        let text = copied(text, MAX_TEXT_BYTES)?;
+        self.with(Section {
+            title: None,
+            text,
+            collapsed: false,
+            excerpt: false,
+            rich: None,
+            picture: Some(Arc::new(Framed {
+                picture,
+                fitted: Mutex::new(None),
+            })),
         })
     }
 
@@ -327,6 +387,7 @@ impl Message {
             collapsed: false,
             excerpt: false,
             rich: Some(Box::new(rich)),
+            picture: None,
         })
     }
 
@@ -341,6 +402,7 @@ impl Message {
             collapsed,
             excerpt: false,
             rich: None,
+            picture: None,
         })
     }
 
@@ -355,6 +417,7 @@ impl Message {
             collapsed: false,
             excerpt: true,
             rich: None,
+            picture: None,
         })
     }
 
@@ -401,6 +464,15 @@ impl Message {
 
     pub fn is_collapsed(&self) -> bool {
         self.collapsed
+    }
+
+    /// The picture bytes its sections hold.
+    fn picture_bytes(&self) -> usize {
+        self.sections
+            .iter()
+            .filter_map(|section| section.picture.as_ref())
+            .map(|framed| framed.picture.bytes())
+            .sum()
     }
 
     /// The bytes the message counts against `MAX_TOTAL_BYTES`.
@@ -451,6 +523,8 @@ enum Kind {
     Header,
     Title,
     Text,
+    /// A cell-high slice of a picture: `start` is which, `end` how many.
+    Image,
     More,
     Gap,
 }
@@ -472,7 +546,7 @@ impl Line {
         (match self.kind {
             Kind::Header => ROW,
             Kind::Gap => GAP,
-            Kind::Title | Kind::Text | Kind::More => CELL_HEIGHT,
+            Kind::Title | Kind::Text | Kind::Image | Kind::More => CELL_HEIGHT,
         }) as u64
     }
     /// The order rows read in, by which an anchor survives a relayout.
@@ -481,7 +555,7 @@ impl Line {
         match self.kind {
             Kind::Header => (self.message, 0, 0),
             Kind::Title => (self.message, section + 1, 0),
-            Kind::Text => (self.message, section + 2, self.start),
+            Kind::Text | Kind::Image => (self.message, section + 2, self.start),
             Kind::More => (self.message, section + 3, 0),
             Kind::Gap => (self.message, u32::MAX, 0),
         }
@@ -499,6 +573,14 @@ impl Line {
                 message,
                 section,
                 byte: 0,
+            },
+            // A picture's row stands at its text's start or end
+            // (`Controller::byte_at`), so a selection takes its text whole
+            // or not at all.
+            Kind::Image => Point {
+                message,
+                section,
+                byte,
             },
             Kind::Text => Point {
                 message,
@@ -535,6 +617,13 @@ pub enum Shown<'a> {
         message: usize,
         section: usize,
         text: &'a str,
+    },
+    /// Row `row` of `rows` of a picture section's picture.
+    Image {
+        message: usize,
+        section: usize,
+        row: usize,
+        rows: usize,
     },
     More {
         message: usize,
@@ -651,6 +740,11 @@ pub struct Controller {
     laid: bool,
     messages: Vec<Message>,
     bytes: usize,
+    /// The picture bytes its messages hold, at most `MAX_PICTURE_BYTES`.
+    pictures: usize,
+    /// The top bits of its picture ids, so one composition can tell two
+    /// lists' pictures apart.
+    picture_tag: u16,
     lines: Vec<Line>,
     /// Each message's first row.
     first_line: Vec<usize>,
@@ -706,6 +800,8 @@ impl Controller {
             laid: false,
             messages: Vec::new(),
             bytes: 0,
+            pictures: 0,
+            picture_tag: 0,
             lines: Vec::new(),
             first_line: Vec::new(),
             scratch: Vec::new(),
@@ -781,6 +877,7 @@ impl Controller {
             .map_err(|_| Error::Limit)?;
         let mut lines = std::mem::take(&mut self.lines);
         let mut result = Ok(());
+        let scale = self.surface.scale.value();
         for index in 0..self.messages.len() {
             let Some(message) = self.messages.get(index) else {
                 break;
@@ -789,11 +886,11 @@ impl Controller {
             self.first_line.push(start);
             let budget = MAX_LINES.saturating_sub(start);
             let columns = self.wrap_columns(message);
-            if let Err(error) = layout(index, message, columns, budget, &mut lines) {
+            if let Err(error) = layout(index, message, columns, scale, budget, &mut lines) {
                 result = Err(error);
                 break;
             }
-            let laid = laid_columns(message, lines.get(start..).unwrap_or(&[]), columns);
+            let laid = laid_columns(message, lines.get(start..).unwrap_or(&[]), columns, scale);
             if let Some(message) = self.messages.get_mut(index) {
                 message.columns = laid;
             }
@@ -862,6 +959,7 @@ impl Controller {
             return Err(Error::Limit);
         }
         let bytes = self.admit(message.bytes(), 0)?;
+        let pictures = self.admit_pictures(message.picture_bytes(), 0)?;
         self.messages.try_reserve(1).map_err(|_| Error::Limit)?;
         self.first_line.try_reserve(1).map_err(|_| Error::Limit)?;
         if self.laid {
@@ -869,16 +967,18 @@ impl Controller {
             scratch.clear();
             let budget = MAX_LINES.saturating_sub(self.lines.len());
             let columns = self.wrap_columns(&message);
-            let laid = layout(index, &message, columns, budget, &mut scratch).and_then(|()| {
-                self.lines
-                    .try_reserve(scratch.len())
-                    .map_err(|_| Error::Limit)
-            });
+            let scale = self.surface.scale.value();
+            let laid =
+                layout(index, &message, columns, scale, budget, &mut scratch).and_then(|()| {
+                    self.lines
+                        .try_reserve(scratch.len())
+                        .map_err(|_| Error::Limit)
+                });
             if let Err(error) = laid {
                 self.scratch = scratch;
                 return Err(error);
             }
-            message.columns = laid_columns(&message, &scratch, columns);
+            message.columns = laid_columns(&message, &scratch, columns, scale);
             let anchor = self.anchor();
             self.first_line.push(self.lines.len());
             self.total_y += scratch.iter().map(|line| line.height()).sum::<u64>();
@@ -888,6 +988,7 @@ impl Controller {
         }
         self.messages.push(message);
         self.bytes = bytes;
+        self.pictures = pictures;
         Ok(index)
     }
 
@@ -903,6 +1004,9 @@ impl Controller {
             .ok_or(Error::NoSection)?;
         if current.rich.is_some() {
             return Err(Error::Styled);
+        }
+        if current.picture.is_some() {
+            return Err(Error::Picture);
         }
         let current = current.text.len();
         if current.saturating_add(text.len()) > MAX_TEXT_BYTES {
@@ -935,8 +1039,10 @@ impl Controller {
 
     /// Replaces a message whole; a selection reaching into it is cleared.
     pub fn replace(&mut self, index: usize, message: Message) -> Result<(), Error> {
-        let old = self.messages.get(index).ok_or(Error::NoMessage)?.bytes();
+        let current = self.messages.get(index).ok_or(Error::NoMessage)?;
+        let (old, old_pictures) = (current.bytes(), current.picture_bytes());
         let bytes = self.admit(message.bytes(), old)?;
+        let pictures = self.admit_pictures(message.picture_bytes(), old_pictures)?;
         let previous = std::mem::replace(
             self.messages.get_mut(index).ok_or(Error::NoMessage)?,
             message,
@@ -948,6 +1054,7 @@ impl Controller {
             return Err(error);
         }
         self.bytes = bytes;
+        self.pictures = pictures;
         if self
             .ordered()
             .is_some_and(|(lo, hi)| lo.message <= index && index <= hi.message)
@@ -968,6 +1075,9 @@ impl Controller {
             .sections
             .get(section)
             .ok_or(Error::NoSection)?;
+        if current.picture.is_some() {
+            return Err(Error::Picture);
+        }
         let same = common_prefix(current.shown(), rich.shown());
         let old = current.bytes();
         let incoming = rich.shown().len() + rich.extra_bytes();
@@ -1280,8 +1390,15 @@ impl Controller {
             return;
         }
         let freed: usize = self.messages.iter().take(count).map(Message::bytes).sum();
+        let pictures: usize = self
+            .messages
+            .iter()
+            .take(count)
+            .map(Message::picture_bytes)
+            .sum();
         self.messages.drain(..count);
         self.bytes = self.bytes.saturating_sub(freed);
+        self.pictures = self.pictures.saturating_sub(pictures);
         self.selection = self
             .selection
             .and_then(|(anchor, head)| Some((shifted(anchor, count)?, shifted(head, count)?)));
@@ -1305,6 +1422,20 @@ impl Controller {
             .checked_add(add)
             .ok_or(Error::Limit)?;
         if bytes > MAX_TOTAL_BYTES {
+            return Err(Error::Limit);
+        }
+        Ok(bytes)
+    }
+
+    /// The picture total after `add` bytes come and `remove` go, within
+    /// `MAX_PICTURE_BYTES`.
+    fn admit_pictures(&self, add: usize, remove: usize) -> Result<usize, Error> {
+        let bytes = self
+            .pictures
+            .saturating_sub(remove)
+            .checked_add(add)
+            .ok_or(Error::Limit)?;
+        if bytes > MAX_PICTURE_BYTES {
             return Err(Error::Limit);
         }
         Ok(bytes)
@@ -1579,11 +1710,12 @@ impl Controller {
         scratch.clear();
         let budget = MAX_LINES.saturating_sub(self.lines.len().saturating_sub(end - start));
         let columns = self.wrap_columns(message);
-        if let Err(error) = layout(index, message, columns, budget, &mut scratch) {
+        let scale = self.surface.scale.value();
+        if let Err(error) = layout(index, message, columns, scale, budget, &mut scratch) {
             self.scratch = scratch;
             return Err(error);
         }
-        let laid = laid_columns(message, &scratch, columns);
+        let laid = laid_columns(message, &scratch, columns, scale);
         if let Some(message) = self.messages.get_mut(index) {
             message.columns = laid;
         }
@@ -1612,7 +1744,7 @@ impl Controller {
                     last = Some(at);
                     break;
                 }
-                Kind::More | Kind::Title => return Ok(()),
+                Kind::More | Kind::Title | Kind::Image => return Ok(()),
                 Kind::Gap => {}
             }
         }
@@ -1652,7 +1784,7 @@ impl Controller {
             return Err(error);
         }
         // Rows before the re-wrapped one keep their widths.
-        let laid = laid_columns(message, &scratch, columns);
+        let laid = laid_columns(message, &scratch, columns, self.surface.scale.value());
         if let Some(message) = self.messages.get_mut(index) {
             message.columns = message.columns.max(laid);
         }
@@ -1845,6 +1977,12 @@ impl Controller {
                     section,
                     text: self.text(line),
                 },
+                Kind::Image => Shown::Image {
+                    message,
+                    section,
+                    row: line.start as usize,
+                    rows: line.end as usize,
+                },
                 Kind::More => Shown::More { message, section },
                 Kind::Gap => Shown::Gap { message },
             };
@@ -1860,6 +1998,9 @@ impl Controller {
     }
 
     fn text(&self, line: Line) -> &str {
+        if line.kind != Kind::Text {
+            return "";
+        }
         self.section(line)
             .and_then(|section| section.shown().get(line.start as usize..line.end as usize))
             .unwrap_or("")
@@ -1926,6 +2067,9 @@ impl Controller {
     /// The column a pointer at `x` falls before, rounded to the nearer
     /// cell edge, as a byte of the row.
     fn byte_at(&self, line: Line, x: i64, round: bool) -> usize {
+        if line.kind == Kind::Image {
+            return 0;
+        }
         let cell = self.cell();
         let left = self.frame(line.message as usize, self.view()).x
             + cell
@@ -1945,6 +2089,46 @@ impl Controller {
                 .map_or(text.len(), |(at, _)| at)
     }
 
+    /// The point under (x, y) on `line`, shown at `rect`: a text row's
+    /// byte under `x`, and a picture's text's start in the picture's
+    /// upper half and its end in its lower.
+    fn point_on(&self, line: Line, rect: Rect, x: i64, y: i64) -> Point {
+        if line.kind != Kind::Image {
+            return line.point(self.byte_at(line, x, true));
+        }
+        let lower = self.picture_rect(line, rect).is_some_and(|placed| {
+            y.saturating_sub(placed.y).saturating_mul(2) >= i64::from(placed.height)
+        });
+        line.point(if lower {
+            self.picture_text_len(line)
+        } else {
+            0
+        })
+    }
+
+    /// The first and last point a row shows: a picture's its text's
+    /// start and end, since its rows count slices, not bytes.
+    fn line_start(&self, line: Line) -> Point {
+        line.point(if line.kind == Kind::Image {
+            0
+        } else {
+            line.start as usize
+        })
+    }
+
+    fn line_end(&self, line: Line) -> Point {
+        line.point(if line.kind == Kind::Image {
+            self.picture_text_len(line)
+        } else {
+            line.end as usize
+        })
+    }
+
+    /// The length of the text a picture row's section copies as.
+    fn picture_text_len(&self, line: Line) -> usize {
+        self.section(line).map_or(0, |section| section.text.len())
+    }
+
     /// The point under (x, y), above the view the first shown row's start
     /// and below the shown rows the last one's end.
     fn point_at(&self, x: i64, y: i64) -> Option<Point> {
@@ -1952,12 +2136,16 @@ impl Controller {
         let mut last = None;
         for (_, line, rect) in self.rows() {
             if y < rect.y || (y >= rect.y && y < rect.y + i64::from(rect.height)) {
-                let x = if y < view.y { i64::MIN } else { x };
-                return Some(line.point(self.byte_at(line, x, true)));
+                let (x, y) = if y < view.y {
+                    (i64::MIN, i64::MIN)
+                } else {
+                    (x, y)
+                };
+                return Some(self.point_on(line, rect, x, y));
             }
             last = Some(line);
         }
-        last.map(|line| line.point(line.end as usize))
+        last.map(|line| self.line_end(line))
     }
 
     /// The selection's ends in reading order.
@@ -1995,9 +2183,17 @@ impl Controller {
         let mut any = false;
         let mut group: Option<Line> = None;
         for &line in self.lines.get(from..to).unwrap_or(&[]) {
-            if line.kind != Kind::Text {
-                continue;
-            }
+            let line = match line.kind {
+                Kind::Text => line,
+                // A picture's rows stand for its section's text whole.
+                Kind::Image => Line {
+                    kind: Kind::Text,
+                    start: 0,
+                    end: u32::try_from(self.picture_text_len(line)).unwrap_or(u32::MAX),
+                    ..line
+                },
+                _ => continue,
+            };
             match &mut group {
                 Some(shown) if (shown.message, shown.section) == (line.message, line.section) => {
                     shown.end = line.end;
@@ -2057,15 +2253,13 @@ impl Controller {
 
     /// Selects every shown text row.
     pub fn select_all(&mut self) -> bool {
-        let first = self.lines.iter().find(|line| line.kind == Kind::Text);
-        let last = self.lines.iter().rev().find(|line| line.kind == Kind::Text);
-        let (Some(first), Some(last)) = (first, last) else {
+        let shown = |line: &&Line| matches!(line.kind, Kind::Text | Kind::Image);
+        let first = self.lines.iter().find(shown);
+        let last = self.lines.iter().rev().find(shown);
+        let (Some(&first), Some(&last)) = (first, last) else {
             return false;
         };
-        let selection = Some((
-            first.point(first.start as usize),
-            last.point(last.end as usize),
-        ));
+        let selection = Some((self.line_start(first), self.line_end(last)));
         let changed = selection != self.selection;
         self.selection = selection;
         changed
@@ -2395,7 +2589,7 @@ impl Controller {
         let row = self.rows().find(|(_, _, rect)| rect.contains(x, y));
         let Some((_, line, rect)) = row else {
             // Below the last row: a selection ends at the text's end.
-            let end = self.lines.last().map(|line| line.point(line.end as usize));
+            let end = self.lines.last().map(|&line| self.line_end(line));
             return Self::changed(self.begin(end, extend, None));
         };
         let message = line.message as usize;
@@ -2444,7 +2638,7 @@ impl Controller {
                 let word = (paired.is_some() && !extend && line.kind == Kind::Text)
                     .then(|| self.word_at(line, x))
                     .flatten();
-                let point = line.point(self.byte_at(line, x, true));
+                let point = self.point_on(line, rect, x, y);
                 self.pressed = (paired.is_none() && !extend).then_some((x, y));
                 let changed = self.begin(Some(point), extend, word);
                 Self::changed(changed || focus_changed)
@@ -2604,6 +2798,7 @@ impl Controller {
                     sink,
                 ),
                 Kind::Text => self.paint_text(line, rect, paper, selection, clip, sink),
+                Kind::Image => self.paint_picture(line, rect, selection, clip, sink),
                 Kind::Gap => {}
             }
         }
@@ -2614,6 +2809,141 @@ impl Controller {
             damage,
             sink,
         );
+    }
+
+    /// A picture's slice on its row: the picture placed at the text
+    /// area's left, its top as many rows above as the slice is down it,
+    /// clipped to the row. A picture whose text the selection holds whole
+    /// is framed in the selection's ground, as a copy takes it: an empty
+    /// text only strictly inside, as `selected_piece` takes it.
+    fn paint_picture(
+        &self,
+        line: Line,
+        rect: Rect,
+        selection: Option<(Point, Point)>,
+        clip: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let Some(placed) = self.picture_rect(line, rect) else {
+            return;
+        };
+        sink(Draw {
+            clip,
+            primitive: Primitive::Image {
+                id: picture_id(
+                    self.picture_tag,
+                    line.message as usize,
+                    usize::from(line.section),
+                ),
+                rect: placed,
+            },
+        });
+        let (start, end) = (self.line_start(line), self.line_end(line));
+        let held = selection.is_some_and(|(lo, hi)| {
+            if start == end {
+                lo < start && end < hi
+            } else {
+                lo <= start && end <= hi
+            }
+        });
+        if !held {
+            return;
+        }
+        let ground = if self.focused {
+            SELECTED
+        } else {
+            INACTIVE_SELECTION
+        };
+        let edge = 2 * self.surface.scale.value() as u32;
+        let right = placed.x + i64::from(placed.width.saturating_sub(edge));
+        let bottom = placed.y + i64::from(placed.height.saturating_sub(edge));
+        for side in [
+            Rect {
+                height: edge.min(placed.height),
+                ..placed
+            },
+            Rect {
+                y: bottom,
+                height: edge.min(placed.height),
+                ..placed
+            },
+            Rect {
+                width: edge.min(placed.width),
+                ..placed
+            },
+            Rect {
+                x: right,
+                width: edge.min(placed.width),
+                ..placed
+            },
+        ] {
+            fill(side, ground, clip, sink);
+        }
+    }
+
+    /// Where the picture a picture row slices is drawn whole, its row at
+    /// `rect`.
+    fn picture_rect(&self, line: Line, rect: Rect) -> Option<Rect> {
+        let framed = self.section(line)?.picture.as_ref()?;
+        let message = self.messages.get(line.message as usize)?;
+        let scale = self.surface.scale.value();
+        let (width, height) = picture_size(&framed.picture, self.wrap_columns(message), scale);
+        let above = i64::from(line.start) * (CELL_HEIGHT * scale) as i64;
+        Some(Rect {
+            x: rect.x + self.cell(),
+            y: rect.y - above,
+            width: u32::try_from(width).ok()?,
+            height: u32::try_from(height).ok()?,
+        })
+    }
+
+    /// Tags the picture ids it draws with `tag`; `picture` answers only
+    /// ids of its own tag, so a composition showing two lists asks both.
+    pub fn set_picture_tag(&mut self, tag: u16) {
+        self.picture_tag = tag;
+    }
+
+    /// Hands `with` the picture `id` names (`Primitive::Image`), fitted
+    /// to the size the list draws it at: fitted on first use and kept
+    /// until that size changes.
+    pub fn picture(&self, id: u64, with: &mut dyn FnMut(&Fitted)) {
+        if id >> 48 != u64::from(self.picture_tag) {
+            return;
+        }
+        let message = ((id >> 16) & 0xffff_ffff) as usize;
+        let section = (id & 0xffff) as usize;
+        let Some(message) = self.messages.get(message) else {
+            return;
+        };
+        let Some(framed) = message
+            .sections
+            .get(section)
+            .and_then(|section| section.picture.as_ref())
+        else {
+            return;
+        };
+        let (width, height) = picture_size(
+            &framed.picture,
+            self.wrap_columns(message),
+            self.surface.scale.value(),
+        );
+        let fitted = {
+            let Ok(mut slot) = framed.fitted.lock() else {
+                return;
+            };
+            match slot.as_ref() {
+                Some(fitted) if (fitted.width, fitted.height) == (width, height) => fitted.clone(),
+                _ => {
+                    let Some(fitted) = framed.picture.fit(width, height) else {
+                        return;
+                    };
+                    let fitted = Arc::new(fitted);
+                    *slot = Some(fitted.clone());
+                    fitted
+                }
+            }
+        };
+        with(&fitted);
     }
 
     /// Message `index`'s time, beside its bubble's header or in its full
@@ -3205,9 +3535,9 @@ fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Err
 }
 
 /// The columns `rows` of `message` take, at most `most`: a text row's
-/// prefix and scalars, a title row's mark, space and title, the more
-/// row's text.
-fn laid_columns(message: &Message, rows: &[Line], most: usize) -> usize {
+/// prefix and scalars, a title row's mark, space and title, a picture's
+/// width in cells at `scale`, the more row's text.
+fn laid_columns(message: &Message, rows: &[Line], most: usize, scale: usize) -> usize {
     let section = |line: &Line| message.sections.get(usize::from(line.section));
     rows.iter()
         .map(|line| match line.kind {
@@ -3221,6 +3551,12 @@ fn laid_columns(message: &Message, rows: &[Line], most: usize) -> usize {
             Kind::Title => section(line)
                 .and_then(|section| section.title.as_ref())
                 .map_or(0, |title| title.chars().count() + 2),
+            Kind::Image => section(line)
+                .and_then(|section| section.picture.as_ref())
+                .map_or(0, |framed| {
+                    let (width, _) = picture_size(&framed.picture, most, scale);
+                    width.div_ceil(CELL_WIDTH * scale.max(1))
+                }),
             Kind::More => MORE.chars().count(),
             Kind::Header | Kind::Gap => 0,
         })
@@ -3236,6 +3572,7 @@ fn layout(
     index: usize,
     message: &Message,
     columns: usize,
+    scale: usize,
     budget: usize,
     out: &mut Vec<Line>,
 ) -> Result<(), Error> {
@@ -3248,6 +3585,14 @@ fn layout(
                 if section.collapsed {
                     continue;
                 }
+            }
+            if let Some(framed) = &section.picture {
+                let (_, height) = picture_size(&framed.picture, columns, scale);
+                let rows = picture_rows(height, scale);
+                for slice in 0..rows {
+                    push(out, budget, row(index, number, Kind::Image, slice, rows)?)?;
+                }
+                continue;
             }
             let wrap = Wrap {
                 message: index,

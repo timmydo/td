@@ -53,6 +53,7 @@ const PURE: &[&str] = &[
     "list_model.rs",
     "menus.rs",
     "messages.rs",
+    "picture.rs",
     "pointer.rs",
     "raster.rs",
     "repeat.rs",
