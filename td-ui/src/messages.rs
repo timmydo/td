@@ -41,6 +41,13 @@ pub const GAP: usize = 8;
 pub const MULTI_CLICK_MS: u64 = 500;
 /// The copy button's caption.
 pub const COPY_LABEL: &str = "Copy";
+/// The copy button's icon where the face has icons: two squares, one over
+/// the other (Nerd Fonts' `fa-copy`).
+pub const COPY_ICON: char = '\u{f0c5}';
+/// What the copy button's tooltip says.
+pub const COPY_TIP: &str = "Copy message (C-S-c)";
+/// The cells an icon button takes: its icon and half a cell each side.
+pub const ICON_CELLS: usize = 2;
 /// The most characters an action button's caption has.
 pub const MAX_ACTION_CHARS: usize = 12;
 /// What an excerpt cut short shows below its last row.
@@ -140,6 +147,8 @@ pub struct Message {
     /// The caption of the button before the copy button, when the
     /// message has an action of its owner's.
     action: Option<String>,
+    /// That button's icon and tooltip, where the list shows icons.
+    action_icon: Option<(char, String)>,
 }
 
 fn copied(text: &str, bound: usize) -> Result<String, Error> {
@@ -182,6 +191,7 @@ impl Message {
             source: None,
             collapsed: false,
             action: None,
+            action_icon: None,
         })
     }
 
@@ -299,6 +309,7 @@ impl Message {
             + self.label.len()
             + marks
             + self.action.as_ref().map_or(0, String::len)
+            + self.action_icon.as_ref().map_or(0, |(_, tip)| tip.len())
             + self.source.as_ref().map_or(0, |source| source.len())
     }
 
@@ -547,6 +558,22 @@ pub struct Controller {
     click: Option<(u64, i64, i64)>,
     /// Whether the held press selected a word, so its release is no click.
     word: bool,
+    /// Whether the face draws icons, so the header's buttons are icons.
+    icons: bool,
+    /// Where the pointer hovers with no button held, for the button under
+    /// it: lit, and its tooltip `tip`.
+    hover_at: Option<(i64, i64)>,
+}
+
+/// The header button the pointer hovers over (`Controller::tip`): its
+/// message, whether it is the copy button or the owner's action, where it
+/// is, and what its tooltip says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Tip<'a> {
+    pub message: usize,
+    pub copy: bool,
+    pub rect: Rect,
+    pub text: &'a str,
 }
 
 impl Controller {
@@ -574,6 +601,8 @@ impl Controller {
             scrolling: None,
             click: None,
             word: false,
+            icons: false,
+            hover_at: None,
         };
         list.resize(surface, rect)?;
         Ok(list)
@@ -847,11 +876,97 @@ impl Controller {
         let message = self.messages.get(index).ok_or(Error::NoMessage)?;
         let old = message.action.as_ref().map_or(0, String::len);
         let bytes = self.admit(caption.as_ref().map_or(0, String::len), old)?;
+        // Taking the action off takes its icon with it.
+        let bytes = match (&caption, &message.action_icon) {
+            (None, Some((_, tip))) => bytes.saturating_sub(tip.len()),
+            _ => bytes,
+        };
         if let Some(message) = self.messages.get_mut(index) {
+            if caption.is_none() {
+                message.action_icon = None;
+            }
             message.action = caption;
         }
         self.bytes = bytes;
         Ok(())
+    }
+
+    /// Sets the icon and tooltip of message `index`'s action button, which
+    /// shows as that icon where the list shows icons (`set_icons`), and as
+    /// its caption otherwise; `None` takes them off.
+    pub fn set_action_icon(
+        &mut self,
+        index: usize,
+        icon: Option<(char, &str)>,
+    ) -> Result<(), Error> {
+        let icon = match icon {
+            Some((scalar, _)) if scalar.is_control() => return Err(Error::Control),
+            Some((scalar, tip)) => Some((scalar, label(tip)?)),
+            None => None,
+        };
+        let message = self.messages.get(index).ok_or(Error::NoMessage)?;
+        let old = message.action_icon.as_ref().map_or(0, |(_, tip)| tip.len());
+        let bytes = self.admit(icon.as_ref().map_or(0, |(_, tip)| tip.len()), old)?;
+        if let Some(message) = self.messages.get_mut(index) {
+            message.action_icon = icon;
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    /// Whether the face draws icons: the header's buttons are then icons,
+    /// `COPY_ICON` and each action's own, `ICON_CELLS` wide and flat. A
+    /// change answers true.
+    pub fn set_icons(&mut self, icons: bool) -> bool {
+        let changed = self.icons != icons;
+        self.icons = icons;
+        changed
+    }
+
+    /// Where the pointer hovers with no button held, or `None`: answers
+    /// whether the header button under it changed, which is then lit and
+    /// named by `tip`.
+    pub fn hover(&mut self, at: Option<(i64, i64)>) -> bool {
+        let before = self.tip().map(|tip| (tip.message, tip.copy));
+        self.hover_at = at;
+        before != self.tip().map(|tip| (tip.message, tip.copy))
+    }
+
+    /// The header button the pointer hovers over, with its tooltip's text:
+    /// `COPY_TIP`, or an action's tip, or its caption when it has none.
+    pub fn tip(&self) -> Option<Tip<'_>> {
+        let (x, y) = self.hovered()?;
+        let (_, line, header) = self
+            .rows()
+            .find(|(_, line, rect)| line.kind == Kind::Header && rect.contains(x, y))?;
+        let index = line.message as usize;
+        let message = self.messages.get(index)?;
+        let copy = self.button(header);
+        if copy.contains(x, y) {
+            return Some(Tip {
+                message: index,
+                copy: true,
+                rect: copy,
+                text: COPY_TIP,
+            });
+        }
+        let action = self.action_rect(header, index)?;
+        let text = match &message.action_icon {
+            Some((_, tip)) => tip.as_str(),
+            None => message.action.as_deref()?,
+        };
+        action.contains(x, y).then_some(Tip {
+            message: index,
+            copy: false,
+            rect: action,
+            text,
+        })
+    }
+
+    /// Where the pointer hovers, inside the view only: a header cut off at
+    /// the view's foot has no button below it.
+    fn hovered(&self) -> Option<(i64, i64)> {
+        self.hover_at.filter(|&(x, y)| self.view().contains(x, y))
     }
 
     /// Sets the text a message's copy action copies (a tool block's whole
@@ -1382,10 +1497,16 @@ impl Controller {
             .unwrap_or("")
     }
 
-    /// The copy button on a shown header's right, inset like a strip's.
+    /// The copy button on a shown header's right, inset like a strip's:
+    /// `ICON_CELLS` wide where the list shows icons.
     fn button(&self, header: Rect) -> Rect {
         let s = self.surface.scale.value();
-        let width = ((COPY_LABEL.chars().count() + 2) * CELL_WIDTH * s) as u32;
+        let cells = if self.icons {
+            ICON_CELLS
+        } else {
+            COPY_LABEL.chars().count() + 2
+        };
+        let width = (cells * CELL_WIDTH * s) as u32;
         Rect {
             x: header.x + i64::from(header.width) - self.cell() - i64::from(width),
             y: header.y + (BUTTON_MARGIN * s) as i64,
@@ -1406,10 +1527,16 @@ impl Controller {
     /// room for it past the fold mark's three cells: a header too narrow
     /// neither draws it nor takes a press for it.
     fn action_rect(&self, header: Rect, message: usize) -> Option<Rect> {
-        let caption = self.messages.get(message)?.action.as_ref()?;
+        let message = self.messages.get(message)?;
+        let caption = message.action.as_ref()?;
         let copy = self.button(header);
         let s = self.surface.scale.value();
-        let width = ((caption.chars().count() + 2) * CELL_WIDTH * s) as u32;
+        let cells = if self.icons && message.action_icon.is_some() {
+            ICON_CELLS
+        } else {
+            caption.chars().count() + 2
+        };
+        let width = (cells * CELL_WIDTH * s) as u32;
         let x = copy.x - self.cell() - i64::from(width);
         (x >= header.x + 3 * self.cell()).then_some(Rect { x, width, ..copy })
     }
@@ -2120,14 +2247,38 @@ impl Controller {
                 sink,
             );
         }
-        if let Some(button) = Button::new(self.surface, button) {
+        // An icon button is flat: its icon half a cell in, on the
+        // header's ground, or lit `BORDER`, which stands off both grounds
+        // a header has, while the pointer hovers over it.
+        let icon = |scalar: char, at: Rect, sink: &mut dyn FnMut(Draw)| {
+            let lit = self.hovered().is_some_and(|(x, y)| at.contains(x, y));
+            let face = if lit { BORDER } else { ground };
+            if lit {
+                fill(at, face, clip, sink);
+            }
+            text_run(
+                self.surface.scale,
+                std::iter::once(scalar),
+                (at.x + cell / 2, y),
+                at,
+                GlyphStyle::medium(INK, face),
+                clip,
+                sink,
+            );
+        };
+        if self.icons {
+            icon(COPY_ICON, button, sink);
+        } else if let Some(button) = Button::new(self.surface, button) {
             button.emit(COPY_LABEL, false, true, clip, sink);
         }
-        if let (Some(caption), Some(action)) = (
-            message.action.as_deref(),
-            action.and_then(|action| Button::new(self.surface, action)),
-        ) {
-            action.emit(caption, false, true, clip, sink);
+        match (message.action.as_deref(), &message.action_icon, action) {
+            (Some(_), Some((scalar, _)), Some(at)) if self.icons => icon(*scalar, at, sink),
+            (Some(caption), _, Some(at)) => {
+                if let Some(action) = Button::new(self.surface, at) {
+                    action.emit(caption, false, true, clip, sink);
+                }
+            }
+            _ => {}
         }
     }
 }

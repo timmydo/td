@@ -578,10 +578,10 @@ of its own files may name each module.
   press and filtering stay with the consumer.
 - `messages`: `Message` (built from `new` with `text`, `section`,
   `excerpt`, `status`, `verdict`, `action`, `source` and `collapsed`),
-  `Tone`, `Point`, `Shown`, `Key` with `from_chord`, `Event`, `Outcome`,
-  `Error`, the budgets and `COPY_LABEL`, `MAX_ACTION_CHARS` and `MORE`,
-  and `Controller`, the message
-  list under "Shared message list" below.
+  `Tone`, `Point`, `Shown`, `Tip`, `Key` with `from_chord`, `Event`,
+  `Outcome`, `Error`, the budgets and `COPY_LABEL`, `COPY_ICON`,
+  `COPY_TIP`, `ICON_CELLS`, `MAX_ACTION_CHARS` and `MORE`, and
+  `Controller`, the message list under "Shared message list" below.
 - `notices`: `FONT_PROVENANCE`, `FONT_COPYING` and `FONT_LICENSE`, the
   texts beside the face in `td-compositor/assets`, embedded at compile
   time for a program's `--font-license` output, and `OUTLINE_FACE`, one
@@ -3138,6 +3138,29 @@ td-agent does. An owner moves the focus itself with `focus_on`, which
 reveals the message's header as `NextMessage` does; td-agent's keys to
 the person's own messages use it. A press on a title row folds the
 section.
+
+Where the face draws icons, the owner says so with `set_icons`, and the
+header's buttons are then icons: the copy button `COPY_ICON` (two
+squares, Nerd Fonts' `fa-copy`), and an action given one with
+`set_action_icon` its own, each `ICON_CELLS` wide, flat on the header's
+ground with its icon half a cell in, at the places and a cell apart as
+the captions were and pressed as they are; an action with no icon keeps
+its caption, and taking an action off (`set_action` with `None`) takes
+its icon too. The bitmap face has no icons, so an owner without the
+pinned face leaves them off. The owner tells the list where the pointer
+hovers with no button held (`hover`, from the window's
+`Handler::motion`), which answers whether the button under it changed;
+only a point inside the view counts, so a header cut off at the view's
+foot has no button below it. An icon button under it is lit `BORDER`,
+which stands off both a header's `CHROME` and a focused one's
+`SELECTED_ROW`; a captioned button is not lit. `tip` names the button
+under it, icon or caption: its message, whether it is copy, its
+rectangle and its tooltip's text, `COPY_TIP` (naming the list's own
+`CopyMessage` chord), the action's tip, or its caption without one. The
+list draws no tooltip and keeps no clock: the owner places a
+`chrome::Tooltip` on `tip`'s rectangle after its own delay. An action
+icon is a non-control scalar and its tip a label, counted in the list's
+bytes.
 
 Copies go through the window's `Clipboard` (see "Widget window") while
 the event is delivered, the button's at its press and the keys' at

@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use td_ui::chrome::{ROW, SELECTED_ROW};
 use td_ui::messages::{
-    Controller, Error, Event, Key, Message, Outcome, Point, Shown, Tone, COPY_LABEL, EXCERPT_ROWS,
-    GAP, MAX_LABEL_BYTES, MAX_LINES, MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS,
-    MORE,
+    Controller, Error, Event, Key, Message, Outcome, Point, Shown, Tip, Tone, COPY_ICON,
+    COPY_LABEL, COPY_TIP, EXCERPT_ROWS, GAP, ICON_CELLS, MAX_LABEL_BYTES, MAX_LINES, MAX_SECTIONS,
+    MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS, MORE,
 };
 use td_ui::raster::{
     Composition, Draw, Primitive, Raster, Rect, Scale, Surface, BORDER, CHROME, INACTIVE_SELECTION,
@@ -1808,4 +1808,195 @@ fn the_scrollbar_thumb_drags_and_the_track_jumps() {
         still.event(Event::Move { x: still_x, y: 0 }, &mut board),
         Outcome::Ignored
     );
+}
+
+/// Where the face draws icons, the copy button and an action with an icon
+/// are flat icon buttons `ICON_CELLS` wide, a cell apart, pressed as
+/// before; an action with no icon keeps its caption. The pointer over one
+/// lights it and names it for its tooltip, `COPY_TIP` or the action's tip,
+/// or its caption without one; over anything else, nothing.
+#[test]
+fn icon_buttons_are_lit_and_named_under_the_pointer() {
+    for scale in 1..=4 {
+        let mut board = Board::default();
+        let mut list = list(scale, 40, 200);
+        list.push(text("assistant", "a reply").action("Debug").unwrap())
+            .unwrap();
+        list.push(text("user", "a question").action("Retry").unwrap())
+            .unwrap();
+        list.set_action_icon(0, Some(('\u{f188}', "Debug the exchange")))
+            .unwrap();
+        assert!(list.set_icons(true));
+        assert!(!list.set_icons(true), "no change");
+        let cell = (CELL_WIDTH * usize::from(scale)) as i64;
+        let copy = list.copy_button(0).unwrap();
+        let action = list.action_button(0).unwrap();
+        assert_eq!(i64::from(copy.width), ICON_CELLS as i64 * cell);
+        assert_eq!((action.width, action.y), (copy.width, copy.y));
+        assert_eq!(action.x + i64::from(action.width) + cell, copy.x);
+        let retry = list.action_button(1).unwrap();
+        assert_eq!(i64::from(retry.width), ("Retry".len() as i64 + 2) * cell);
+        // Lit and named under the pointer.
+        assert!(list.tip().is_none());
+        assert!(list.hover(Some((copy.x + 2, copy.y + 2))));
+        assert_eq!(
+            list.tip(),
+            Some(Tip {
+                message: 0,
+                copy: true,
+                rect: copy,
+                text: COPY_TIP,
+            })
+        );
+        assert!(!list.hover(Some((copy.x + 3, copy.y + 2))), "the same one");
+        assert!(list.hover(Some((action.x + 2, action.y + 2))));
+        assert_eq!(
+            list.tip().map(|tip| (tip.message, tip.copy, tip.text)),
+            Some((0, false, "Debug the exchange"))
+        );
+        assert!(list.hover(Some((retry.x + 2, retry.y + 2))));
+        assert_eq!(list.tip().map(|tip| tip.text), Some("Retry"));
+        let body = text_row(&list, 0);
+        assert!(list.hover(Some((body.x + 2, body.y + 2))));
+        assert!(list.tip().is_none());
+        // Drawn: the icons, the lit one on its own ground.
+        list.hover(Some((copy.x + 2, copy.y + 2)));
+        let mut draws = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| draws.push(draw));
+        let icons: Vec<(i64, char)> = draws
+            .iter()
+            .filter_map(|draw| match draw.primitive {
+                Primitive::Glyph { x, scalar, .. }
+                    if scalar == COPY_ICON || scalar == '\u{f188}' =>
+                {
+                    Some((x, scalar))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(icons.contains(&(copy.x + cell / 2, COPY_ICON)), "{scale}");
+        assert!(
+            icons.contains(&(action.x + cell / 2, '\u{f188}')),
+            "{scale}"
+        );
+        let lit = |rect: Rect| {
+            draws.iter().any(|draw| {
+                draw.primitive
+                    == Primitive::Fill {
+                        rect,
+                        color: BORDER,
+                    }
+            })
+        };
+        assert!(lit(copy) && !lit(action), "{scale}");
+        let text: String = draws
+            .iter()
+            .filter_map(|draw| match draw.primitive {
+                Primitive::Glyph { scalar, .. } => Some(scalar),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !text.contains(COPY_LABEL) && !text.contains("Debug"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Retry"),
+            "an action with no icon keeps its caption"
+        );
+        // Pressed as before.
+        assert_eq!(
+            press(
+                &mut list,
+                &mut board,
+                (action.x + 2, action.y + 2),
+                false,
+                0
+            ),
+            Outcome::Action(0)
+        );
+        assert_eq!(
+            press(&mut list, &mut board, (copy.x + 2, copy.y + 2), false, 1000),
+            Outcome::Copied
+        );
+        // Icons off, the captions again; an icon is no control.
+        assert!(list.set_icons(false));
+        assert_eq!(
+            list.copy_button(0).map(|copy| i64::from(copy.width)),
+            Some((COPY_LABEL.len() as i64 + 2) * cell)
+        );
+        assert!(matches!(
+            list.set_action_icon(0, Some(('\n', "tip"))),
+            Err(Error::Control)
+        ));
+        assert!(matches!(
+            list.set_action_icon(9, Some(('x', "tip"))),
+            Err(Error::NoMessage)
+        ));
+        // Its tip counted in the list's bytes, a refusal leaving the
+        // icon as it was, and taking the action off takes its icon too.
+        list.set_icons(true);
+        let with = list.storage_bytes();
+        list.set_action_icon(0, None).unwrap();
+        assert_eq!(list.storage_bytes(), with - "Debug the exchange".len());
+        list.set_action_icon(0, Some(('\u{f188}', "tip"))).unwrap();
+        assert_eq!(list.storage_bytes(), with - "Debug the exchange".len() + 3);
+        assert!(list.set_action_icon(0, Some(('\n', "longer tip"))).is_err());
+        assert_eq!(list.storage_bytes(), with - "Debug the exchange".len() + 3);
+        let action = list.action_button(0).unwrap();
+        assert_eq!(action.width, copy.width, "the icon kept");
+        list.set_action(0, None).unwrap();
+        assert_eq!(
+            list.storage_bytes(),
+            with - "Debug the exchange".len() - "Debug".len()
+        );
+        list.set_action(0, Some("Debug")).unwrap();
+        assert_eq!(
+            list.action_button(0).map(|action| i64::from(action.width)),
+            Some(("Debug".len() as i64 + 2) * cell),
+            "no icon left behind"
+        );
+        // Leaving, it answers the change.
+        list.hover(Some((copy.x + 2, copy.y + 2)));
+        assert!(list.hover(None));
+        assert!(list.tip().is_none());
+    }
+    // A header cut off at the view's foot has no button below the view:
+    // the pointer there lights and names nothing.
+    for scale in 1..=4 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 40, 49);
+        for _ in 0..6 {
+            list.push(text("assistant", "a reply").action("Debug").unwrap())
+                .unwrap();
+        }
+        list.set_icons(true);
+        key(&mut list, &mut Board::default(), Key::Home);
+        let header = list
+            .shown()
+            .filter(|(_, shown)| matches!(shown, Shown::Header { .. }))
+            .map(|(rect, _)| rect)
+            .last()
+            .unwrap();
+        let foot = list.rect().y + i64::from(list.rect().height);
+        assert!(header.y + i64::from(header.height) > foot, "{scale}");
+        let copy = Rect {
+            y: header.y + 4 * s,
+            ..header
+        };
+        // On the button's own rows, below the foot, at every scale.
+        let below = (
+            copy.x + i64::from(copy.width) - 3 * CELL_WIDTH as i64 * s,
+            copy.y.max(foot) + 1,
+        );
+        assert!(below.1 < header.y + i64::from(header.height) - 4 * s);
+        assert!(!list.hover(Some(below)), "{scale}");
+        assert!(list.tip().is_none(), "{scale}");
+        let mut draws = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| draws.push(draw));
+        assert!(!draws.iter().any(|draw| matches!(
+            draw.primitive,
+            Primitive::Fill { color: BORDER, rect } if rect.width == (ICON_CELLS * CELL_WIDTH) as u32 * scale as u32
+        )), "{scale}");
+    }
 }

@@ -1136,6 +1136,19 @@ copyable:
   user's message, a tool block or a notice has none, and the chord on
   one says it came of no request. Through the control seam it is the
   chord;
+- with the pinned face, which draws icons, the buttons are icons (td-ui's
+  icon buttons): Copy two squares, Debug a bug. Without it they keep their
+  captions. The pointer resting on one with no button held lights an icon,
+  and a `chrome::Tooltip` names either kind and its chord ("Copy message
+  (C-S-c)", "Show the request and reply (C-S-d)") from the tick
+  `TIP_DELAY_MS` (half a second) after the first tick it rested there,
+  inside the transcript's region. The button under the pointer is worked
+  out again each tick, as streaming, the wheel or a resize moves buttons
+  under a still pointer; another one there waits its own delay, and the
+  tooltip shown is only ever its own button's. A modal or the open menu
+  lights and names nothing. A key, a press or the wheel puts the tooltip
+  away until the pointer moves, the window telling its place again at a
+  release included;
 - copying never includes the chrome: headers, buttons and verdict marks are
   not part of any selection.
 

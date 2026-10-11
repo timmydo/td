@@ -769,6 +769,12 @@ const TRANSCRIPT_KEYS: &[(&str, &str)] = &[
 pub const DEBUG: &str = "Debug";
 /// The chord that does, on the focused message.
 pub const DEBUG_CHORD: &str = "C-S-d";
+/// That button's icon where the face has icons: a bug (Nerd Fonts'
+/// `fa-bug`), and its tooltip.
+const DEBUG_ICON: char = '\u{f188}';
+const DEBUG_TIP: &str = "Show the request and reply (C-S-d)";
+/// How long the pointer rests on a button before its tooltip shows.
+const TIP_DELAY_MS: u64 = 500;
 const COMPOSER_KEYS: &[(&str, &str)] = &[
     (
         "Return/C-Return",
@@ -986,6 +992,15 @@ pub struct App {
     /// never the composer's.
     dialog_paste: Option<Asker>,
     clock: u64,
+    /// The transcript's button the pointer rests on, by message and
+    /// whether it is copy, since when, and whether its tooltip shows.
+    tip_target: Option<(usize, bool)>,
+    tip_since: Option<u64>,
+    tip_shown: bool,
+    /// Where the pointer was last told to be, and where it was when its
+    /// tooltip was put away: none shows again until it moves from there.
+    pointer_at: Option<(i64, i64)>,
+    tip_held_at: Option<(i64, i64)>,
     dirty: bool,
     /// Counts the changes that need a paint, so a driven input can say
     /// whether it changed anything whether or not a paint has happened.
@@ -1111,6 +1126,11 @@ impl App {
             press: None,
             dialog_paste: None,
             clock: 0,
+            tip_target: None,
+            tip_since: None,
+            tip_shown: false,
+            pointer_at: None,
+            tip_held_at: None,
             dirty: true,
             generation: 0,
         };
@@ -3695,10 +3715,81 @@ impl App {
 
     // --- input ------------------------------------------------------
 
-    /// A clock tick: the composer's caret blinks by it.
+    /// A clock tick: the composer's caret blinks by it, and a tooltip's
+    /// delay runs by it, from the first tick its button is under the
+    /// pointer.
     pub fn tick(&mut self, now: u64) {
         self.clock = now;
         if self.composer.event(PaneEvent::Tick(now)) == PaneOutcome::Changed {
+            self.touch();
+        }
+        self.retarget();
+        if self.tip_target.is_some() && !self.tip_shown {
+            let since = *self.tip_since.get_or_insert(now);
+            if now.saturating_sub(since) >= TIP_DELAY_MS {
+                self.tip_shown = true;
+                self.touch();
+            }
+        }
+    }
+
+    /// The button the pointer rests on, as the transcript has it now,
+    /// since streaming, a scroll or a resize moves buttons under a still
+    /// pointer: a change starts the delay again. Under a modal or the open
+    /// menu, nothing is lit or named.
+    fn retarget(&mut self) {
+        if (self.modal() || self.menu.is_open()) && self.transcript.hover(None) {
+            self.touch();
+        }
+        let target = self
+            .transcript
+            .tip()
+            .map(|tip| (tip.message, tip.copy))
+            .filter(|_| self.tip_held_at.is_none());
+        if target != self.tip_target {
+            self.tip_target = target;
+            self.tip_since = None;
+            if std::mem::take(&mut self.tip_shown) {
+                self.touch();
+            }
+        }
+    }
+
+    /// Whether the face draws icons: the transcript's buttons are then
+    /// icons with tooltips (DESIGN.md §4, the transcript's buttons).
+    pub fn set_icons(&mut self, icons: bool) {
+        if self.transcript.set_icons(icons) {
+            self.touch();
+        }
+    }
+
+    /// Where the pointer moves with no button held, or `None`: the
+    /// transcript's button under it is lit, and its tooltip shows once
+    /// the pointer has rested on it `TIP_DELAY_MS`. Under a modal or an
+    /// open menu, nothing is.
+    pub fn motion(&mut self, at: Option<(i64, i64)>) {
+        let at = at.filter(|_| !self.modal() && !self.menu.is_open());
+        self.pointer_at = at;
+        // The window tells the place again at a release; only a move from
+        // where the tooltip was put away lets one show again.
+        if at.is_some() && at != self.tip_held_at {
+            self.tip_held_at = None;
+        }
+        if self.transcript.hover(at) {
+            self.touch();
+        }
+        self.retarget();
+    }
+
+    /// The tooltip shown, put away by a press, a key or the wheel, and not
+    /// shown again until the pointer moves.
+    fn put_tip_away(&mut self) {
+        if let Some(at) = self.pointer_at {
+            self.tip_held_at = Some(at);
+        }
+        self.tip_target = None;
+        self.tip_since = None;
+        if std::mem::take(&mut self.tip_shown) {
             self.touch();
         }
     }
@@ -4137,6 +4228,10 @@ impl App {
     }
 
     fn handle(&mut self, input: Input<'_>, clipboard: &mut dyn Clipboard) {
+        // Focus follows the pointer in, so its gain is no reason to.
+        if !matches!(input, Input::Hover(_) | Input::Resize(_) | Input::Focus(_)) {
+            self.put_tip_away();
+        }
         if let Input::Paste(text) = input {
             return self.pasted(text);
         }
@@ -4687,7 +4782,15 @@ impl App {
 
     /// Message `index`, which came of a request, gets its Debug button.
     fn exchange(&mut self, request: u64, index: usize) {
+        // The icon first, so a refusal leaves no button at all.
+        if let Err(e) = self
+            .transcript
+            .set_action_icon(index, Some((DEBUG_ICON, DEBUG_TIP)))
+        {
+            return self.note(format!("the transcript refused a Debug button: {e}"));
+        }
         if let Err(e) = self.transcript.set_action(index, Some(DEBUG)) {
+            let _ = self.transcript.set_action_icon(index, None);
             return self.note(format!("the transcript refused a Debug button: {e}"));
         }
         self.exchanges.push((request, index));
@@ -5875,6 +5978,7 @@ impl App {
     /// A key, by its chord: the window's own first, then the focused
     /// widget's.
     pub fn key(&mut self, chord: &str, repeat: bool, clipboard: &mut dyn Clipboard) {
+        self.put_tip_away();
         // An open dialog, picker or menu has every key.
         if self.dialog.is_some() {
             return self.dialog_input(Input::Key { chord, repeat }, clipboard);
@@ -6378,10 +6482,33 @@ impl Composition for App {
         menu::bar(self.surface).emit(damage, sink);
         self.menu.emit(damage, sink);
         self.emit_modals(damage, sink);
+        self.emit_tip(regions.transcript, damage, sink);
     }
 }
 
 impl App {
+    /// The tooltip of the transcript's button the pointer rests on, over
+    /// everything, inside the transcript's region.
+    fn emit_tip(&self, region: Rect, damage: Rect, sink: &mut dyn FnMut(Draw)) {
+        if !self.tip_shown || self.modal() || self.menu.is_open() {
+            return;
+        }
+        // Only the button its delay ran for: another under the pointer
+        // waits for the next tick to start its own.
+        let Some(tip) = self
+            .transcript
+            .tip()
+            .filter(|tip| Some((tip.message, tip.copy)) == self.tip_target)
+        else {
+            return;
+        };
+        if let Some(tooltip) =
+            td_ui::chrome::Tooltip::place(self.surface, tip.text, tip.rect, region)
+        {
+            tooltip.emit(tip.text, damage, sink);
+        }
+    }
+
     /// The modals over everything else, the one with the keys last.
     fn emit_modals(&self, damage: Rect, sink: &mut dyn FnMut(Draw)) {
         if let Some(picker) = &self.picker {
@@ -7194,6 +7321,154 @@ pub mod tests {
             bytes: 0,
             reserved,
         }
+    }
+
+    /// One turn and its reply from `base` on, the reply with a Debug
+    /// button.
+    fn exchange_at(app: &mut App, base: u64) {
+        turn(app, base + 1, "hello");
+        app.update(at(base + 3, request(base + 2, 900)), 0);
+        app.update(
+            at(
+                base + 4,
+                Kind::Assistant {
+                    request: base + 3,
+                    content: Some("hi there".into()),
+                    reasoning: None,
+                    details: None,
+                    finish: "stop".into(),
+                    incomplete: false,
+                    calls: Vec::new(),
+                },
+            ),
+            0,
+        );
+    }
+
+    /// Where the face has icons, a reply's Debug button is a bug and its
+    /// copy button two squares. The pointer resting on one shows its
+    /// tooltip from the tick half a second after the first it rested
+    /// there; moving onto another starts again; a press, its release
+    /// telling the same place, or a key puts it away until the pointer
+    /// moves; a modal shows none and lights nothing; another button moved
+    /// under a still pointer waits its own delay; without icons, the
+    /// captions keep their tooltips.
+    #[test]
+    fn a_pointer_resting_on_an_icon_shows_its_tooltip() {
+        let mut app = app();
+        app.set_icons(true);
+        exchange_at(&mut app, 0);
+        let (_, reply) = *app.exchanges.last().unwrap();
+        let debug = app.transcript.action_button(reply).unwrap();
+        let copy = app.transcript.copy_button(reply).unwrap();
+        assert_eq!(debug.width, copy.width, "both icons");
+        let on_debug = (debug.x + 2, debug.y + 2);
+        let on_copy = (copy.x + 2, copy.y + 2);
+        let copy_tip = td_ui::messages::COPY_TIP;
+        let tip = |app: &App| text(app).contains(DEBUG_TIP);
+        // Entering onto it, with focus following the pointer in.
+        app.motion(Some(on_debug));
+        app.input(Input::Focus(true), &mut NoClipboard);
+        app.tick(1_000);
+        app.tick(1_400);
+        assert!(!tip(&app), "not before the delay");
+        app.tick(1_500);
+        assert!(tip(&app), "{}", text(&app));
+        // Onto the copy button: its own, after its own delay.
+        app.motion(Some(on_copy));
+        assert!(!tip(&app) && !text(&app).contains(copy_tip));
+        app.tick(1_600);
+        app.tick(2_000);
+        assert!(!text(&app).contains(copy_tip));
+        app.tick(2_100);
+        assert!(text(&app).contains(copy_tip));
+        // A press and its release, as the window tells them: none after,
+        // until the pointer moves.
+        let click = |app: &mut App, (x, y): (i64, i64)| {
+            for phase in [PointerPhase::Press, PointerPhase::Release] {
+                app.input(
+                    Input::Pointer {
+                        phase,
+                        x,
+                        y,
+                        extend: false,
+                        follow: false,
+                    },
+                    &mut NoClipboard,
+                );
+                app.motion((phase == PointerPhase::Release).then_some((x, y)));
+            }
+        };
+        click(&mut app, on_copy);
+        assert!(!text(&app).contains(copy_tip));
+        app.tick(3_000);
+        app.tick(9_000);
+        assert!(!text(&app).contains(copy_tip), "held at the click");
+        app.motion(Some((on_copy.0 + 1, on_copy.1)));
+        app.tick(9_100);
+        app.tick(9_600);
+        assert!(text(&app).contains(copy_tip), "moved");
+        // A key puts it away; the modal it opens shows none and lights
+        // nothing, the pointer moving or not.
+        key(&mut app, "C-S-m");
+        assert!(app.modal());
+        assert!(!text(&app).contains(copy_tip));
+        app.motion(Some(on_debug));
+        app.tick(10_000);
+        app.tick(11_000);
+        assert!(!tip(&app) && app.transcript.tip().is_none());
+        key(&mut app, "C-S-m");
+        assert!(!app.modal());
+        app.motion(Some(on_debug));
+        app.tick(12_000);
+        app.tick(12_500);
+        assert!(tip(&app));
+        app.motion(None);
+        assert!(!tip(&app));
+        // Without icons, the captions, and their tooltips still.
+        app.set_icons(false);
+        let debug = app.transcript.action_button(reply).unwrap();
+        assert!(debug.width > copy.width);
+        app.motion(Some((debug.x + 2, debug.y + 2)));
+        app.tick(13_000);
+        app.tick(13_500);
+        assert!(tip(&app));
+    }
+
+    /// Streaming moves buttons under a still pointer: the tooltip shown is
+    /// only ever its own button's, and another's under the pointer waits
+    /// its own delay.
+    #[test]
+    fn a_button_moved_under_a_still_pointer_waits_its_own_delay() {
+        let mut app = app();
+        app.set_icons(true);
+        for k in 0..12 {
+            exchange_at(&mut app, 10 * k);
+        }
+        let (_, last) = *app.exchanges.last().unwrap();
+        let debug = app.transcript.action_button(last).unwrap();
+        let on_debug = (debug.x + 2, debug.y + 2);
+        app.motion(Some(on_debug));
+        app.tick(1_000);
+        app.tick(1_500);
+        assert!(text(&app).contains(DEBUG_TIP));
+        assert_eq!(app.tip_target, Some((last, false)));
+        // Another exchange: the view follows the end, and the newest
+        // reply's Debug is now under the pointer.
+        exchange_at(&mut app, 200);
+        let (_, newest) = *app.exchanges.last().unwrap();
+        assert_eq!(
+            app.transcript.tip().map(|tip| (tip.message, tip.copy)),
+            Some((newest, false))
+        );
+        assert!(!text(&app).contains(DEBUG_TIP), "not the old one's");
+        app.tick(1_550);
+        assert!(!text(&app).contains(DEBUG_TIP));
+        app.tick(2_000);
+        assert!(!text(&app).contains(DEBUG_TIP), "its own delay");
+        app.tick(2_050);
+        assert!(text(&app).contains(DEBUG_TIP));
+        assert_eq!(app.tip_target, Some((newest, false)));
     }
 
     /// A reply gets a Debug button, a user's message none; its press, or

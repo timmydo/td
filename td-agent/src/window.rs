@@ -2418,6 +2418,10 @@ impl Handler for Session {
         "td-agent"
     }
 
+    fn motion(&mut self, at: Option<(i64, i64)>) {
+        self.app.motion(at);
+    }
+
     fn title(&self) -> &str {
         "td-agent"
     }
@@ -2839,6 +2843,9 @@ pub fn run(
         "td-agent",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
+    // The pinned face draws the transcript's icons; the bitmap one has
+    // none, so its buttons keep their captions.
+    session.app.set_icons(typeface.is_some());
     td_ui::window::run(&mut session, stream, std::env::temp_dir(), typeface)
 }
 
