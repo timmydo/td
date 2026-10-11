@@ -3519,8 +3519,12 @@ musl driver to run the command-line suite against its exact retained `td-mta`
 binary, in a separate namespace without installed td helpers or shared
 libraries. The build supervisor's init remains PID 1 in that namespace.
 `td-crypto/PORTABLE.md` owns the build invocation and fixture boundary.
-This adds executable deployment evidence for the current SMTP-only profile;
-release packaging, its debug companion and supervisor/operator runbook remain
+The portable build also retains and verifies a stripped receiver and its
+matching debug companion in one artifact. DEPLOYMENT.md documents the manual
+installation layout, dedicated identity and file provisioning, startup/control,
+certificate replacement, and stopped-store backup/restore. The process suite
+runs the stripped executable. This qualifies the receiving-only artifact;
+production supervisor integration, aarch64 and full v1 acceptance remain
 separate work. It does not mark M24 or the full M25 release complete.
 
 ## Later increments

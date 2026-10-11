@@ -35,6 +35,8 @@ pub(crate) fn rust_flags() -> String {
         "-C",
         "force-frame-pointers=yes",
         "-C",
+        "link-arg=--build-id=sha1",
+        "-C",
         "debuginfo=1",
         "--remap-path-prefix=/source=/td-build",
         "--remap-path-prefix=/vendor=/td-cargo/vendor",
@@ -307,6 +309,54 @@ fn qualify_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn split_mail_debug(receipt: &mut String) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = Path::new("/output/artifacts/td-mta");
+    let debug = Path::new("/output/artifacts/td-mta.debug");
+    crate::elf::read_build_id(runtime)?;
+    let mut commands = vec![vec![
+        "--only-keep-debug".to_owned(),
+        path_text(runtime)?,
+        path_text(debug)?,
+    ]];
+    // Read the original line program before pruning any companion sections.
+    let mut prune: Vec<String> = td_engine::target_profile::ALWAYS_PRUNED_DEBUG_SECTIONS
+        .iter()
+        .map(|section| format!("--remove-section={section}"))
+        .collect();
+    if !crate::elf::debug_line_requires_debug_str(runtime)? {
+        prune.push("--remove-section=.debug_str".into());
+    }
+    prune.push(path_text(debug)?);
+    commands.push(prune);
+    commands.push(vec!["--strip-all".into(), path_text(runtime)?]);
+    for (index, args) in commands.iter().enumerate() {
+        let mut command = Command::new("/binutils/bin/objcopy");
+        command.args(args).env_clear().stdin(Stdio::null());
+        crate::host_bin::arm_check_child(&mut command);
+        let name = format!("mail-debug-{index}");
+        command_record(&command, &name, receipt)?;
+        bounded_output(&mut command, &name, 4096, 30)?;
+    }
+    fs::set_permissions(debug, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("set portable debug mode: {e}"))?;
+    crate::elf::assert_debug_pair(runtime, debug)
+}
+
+fn qualify_artifacts(directory: &Path) -> Result<()> {
+    for binary in BINARIES {
+        let path = directory.join(binary);
+        if *binary == "td-mta" {
+            crate::elf::assert_x86_64_executable_bounded(&path, 256 * 1024 * 1024)?;
+            crate::elf::assert_static_pie(&path)?;
+            crate::elf::assert_debug_pair(&path, &directory.join("td-mta.debug"))?;
+        } else {
+            qualify_binary(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn require_namespace(paths: &[&str]) -> Result<()> {
     if std::env::var_os("TD_HOST_SANDBOX").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return Err("portable inner commands require the owned host sandbox".into());
@@ -527,6 +577,7 @@ pub(crate) fn build_inner() -> Result<()> {
         Path::new("/output/artifacts/td-mta-native-allocation-probe"),
     )?;
     copy_binary(&rss, Path::new("/output/artifacts/td-mta-rss-probe"))?;
+    split_mail_debug(&mut receipt)?;
     crate::crypto_api::qualify(&mut receipt)?;
     refuse_decoy(Path::new("/output"))?;
     write_new(Path::new("/output/artifacts/COMMANDS"), receipt.as_bytes())?;
@@ -1211,7 +1262,7 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
     let expected = BINARIES
         .iter()
         .copied()
-        .chain(["COMMANDS"])
+        .chain(["td-mta.debug", "COMMANDS"])
         .map(std::ffi::OsString::from)
         .collect();
     if names != expected {
@@ -1222,6 +1273,11 @@ fn collect_artifacts(output: &Path, destination: &Path) -> Result<String> {
     for name in BINARIES {
         copy_binary(&source.join(name), &destination.join(name))?;
     }
+    let debug = destination.join("td-mta.debug");
+    copy_binary(&source.join("td-mta.debug"), &debug)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(debug, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("set collected debug mode: {e}"))?;
     Ok(receipt)
 }
 
@@ -2043,9 +2099,7 @@ pub(crate) fn build(root: &Path, archives: &Path) -> Result<std::path::PathBuf> 
     )?;
     let artifacts = scratch.0.join("artifacts");
     receipt.push_str(&collect_artifacts(&output, &artifacts)?);
-    for binary in BINARIES {
-        qualify_binary(&artifacts.join(binary))?;
-    }
+    qualify_artifacts(&artifacts)?;
     let runtime = vec![
         bind(&artifacts, "/artifacts", true)?,
         bind(&helper, "/td-builder", true)?,
@@ -2991,13 +3045,17 @@ mod tests {
 
     #[test]
     fn host_collection_refuses_missing_outputs_links_extras_and_oversized_receipts() {
+        use std::os::unix::fs::PermissionsExt;
         let scratch = Scratch::create(&std::env::temp_dir(), "td-crypto-test").unwrap();
         let output = scratch.0.join("output");
         let source = output.join("artifacts");
         fs::create_dir_all(&source).unwrap();
-        for name in BINARIES.iter().copied().chain(["COMMANDS"]) {
+        for name in BINARIES.iter().copied().chain(["td-mta.debug", "COMMANDS"]) {
             fs::write(source.join(name), name).unwrap();
         }
+        fs::remove_file(source.join("td-mta.debug")).unwrap();
+        assert!(collect_artifacts(&output, &scratch.0.join("missing-debug")).is_err());
+        fs::write(source.join("td-mta.debug"), b"td-mta.debug").unwrap();
         fs::remove_file(source.join("td-mta-cli-smoke")).unwrap();
         assert!(collect_artifacts(&output, &scratch.0.join("missing-cli")).is_err());
         fs::write(source.join("td-mta-cli-smoke"), b"td-mta-cli-smoke").unwrap();
@@ -3020,6 +3078,18 @@ mod tests {
         let good = scratch.0.join("good");
         assert_eq!(collect_artifacts(&output, &good).unwrap(), "COMMANDS");
         assert_eq!(fs::read(good.join("td-mta")).unwrap(), b"td-mta");
+        assert_eq!(
+            fs::read(good.join("td-mta.debug")).unwrap(),
+            b"td-mta.debug"
+        );
+        assert_eq!(
+            fs::metadata(good.join("td-mta.debug"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
         assert_eq!(
             fs::read(good.join("td-mta-transport-smoke")).unwrap(),
             b"td-mta-transport-smoke"

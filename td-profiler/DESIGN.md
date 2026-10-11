@@ -132,6 +132,17 @@ garbage collection, deployment selection, and rollback cannot separate code
 from its symbols. Debug files are not separate downloads and require no
 td-operated server.
 
+The standalone host-built musl td-mta artifact uses this same SHA-1 identity,
+non-line DWARF pruning and pair validator, retaining `td-mta` and `td-mta.debug`
+together. Its operator layout places those files at `bin/td-mta` and
+`lib/debug/bin/td-mta.debug`. That separate portable build is documented in
+`td-crypto/PORTABLE.md`; its pinned upstream prebuilt std/libc and provider
+assembly remain profiling boundaries. It does not establish this target
+artifact graph's source-bootstrap or whole-closure frame-pointer coverage.
+This mirrors the companion naming rule, not index discovery: td-profiler
+currently accepts runtime paths only under canonical `/td/store` children,
+so it does not discover this standalone `/opt` installation.
+
 A package that copies a source-built runtime out of the output that built it,
 as the `mail` and `news` application packages copy `td-mail` and
 `td-news` into `files/bin`,

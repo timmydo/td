@@ -5,10 +5,10 @@
 This document specifies the complete v1 operator schema to implement in
 M04b2c3. Typed statement dispatch closes structural references, and the
 owned whole-reader loader requires actual EOF. CONFIG.md specifies its
-portable structural-loader stack qualification. A runnable service remains
-unimplemented. CONFIG.md owns physical syntax,
-resource fields, local routing and stream completion. API.md owns visible
-identity encoding. This document owns the remaining fields, cross-references
+portable structural-loader stack qualification and the foreground SMTP-only
+receiving profile; the complete v1 service remains unimplemented. CONFIG.md
+owns physical syntax, resource fields, local routing and stream completion.
+API.md owns visible identity encoding. This document owns the remaining fields, cross-references
 and candidate construction. M04b3a implements bounded signature/password
 content decoding. CONFIG.md specifies protected file loading and the
 `config check` command; redacted effective output remains M04b3 and M19

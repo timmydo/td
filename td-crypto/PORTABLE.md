@@ -228,8 +228,20 @@ requires structurally valid `.debug_line` data. Source/vendor/output paths map
 to `/td-build`, `/td-cargo/vendor` and
 `/td-build-root`. Upstream prebuilt std/libc and hand-written provider assembly
 remain profiling boundaries. This host portable artifact is not the target
-image's whole-closure profiling qualification. Debug information remains in
-the executables; distribution debug-companion integration is not claimed.
+image's whole-closure profiling qualification.
+
+The linker requests a deterministic SHA-1 GNU build ID. After allocator-symbol
+inspection, the declared binutils `objcopy` creates `td-mta.debug` from the
+receiver, prunes non-line DWARF using the shared target profiling policy, then
+strips the runtime. The existing ELF pair validator requires matching build IDs,
+ordinary companion symbols, useful uncompressed line tables and a stripped
+runtime. The host repeats that validation on its private collected copy before
+running the process suite against the exact stripped receiver. Both files ship
+in the same content-addressed artifact. Probe executables retain embedded debug
+data and never become installed service dependencies. This pair does not
+establish frame-pointer coverage for the upstream prebuilt std/libc or provider
+assembly. [DEPLOYMENT.md](../td-mta/DEPLOYMENT.md) documents the installation
+layout and receiver operations.
 
 Cargo's selected normal/build graphs must match admission. Its artifact records
 must select exactly one expected binary/test profile. All nine results must be
@@ -262,8 +274,8 @@ private status/stop and fixed error output against the exact retained
 executable. They use generated fixture configuration and locally generated TLS
 material, with private loopback and no deployment endpoint. The tests do not
 qualify a production supervisor, certificate renewal, STARTTLS delivery at
-the process boundary, full v1 operation or a distribution debug companion.
-Debug information still remains embedded as described above.
+the process boundary or full v1 operation. The runtime/debug companion pair
+is qualified separately as described above.
 
 The component-probe namespace has no compiler, root-data file, loader or
 library mounts. Ordinary component commands have a 30-second deadline;
@@ -277,9 +289,9 @@ a Result wrapper cannot contain provider aborts.
 
 After the compile namespace exits and its descendants are reaped, the host
 requires an exact regular-file output inventory: nine binaries and the inner
-command record. It rejects output directory/file symlinks and additional files,
-then copies these checked inputs into a fresh private directory outside the
-compiler's writable mount. Only this directory receives host-written metadata
+command record plus the receiver debug companion. It rejects output
+directory/file symlinks and additional files, then copies these checked inputs
+into a fresh private directory outside the compiler's writable mount. Only this directory receives host-written metadata
 and notices, and only it is bound into the runtime fixture and published.
 The internal commands require the host-sandbox marker and expected input paths
 before writing. This guards accidental direct invocation, not callers forging
@@ -296,6 +308,8 @@ Success prints `.td-build-cache/crypto-artifact-<NAR-sha256>`, containing:
 - `td-mta`: the installed receiving-only executable. Its supported store,
   configuration, `serve --smtp-only`, status and stop commands and remaining
   service limits are documented in td-mta/CONFIG.md and STORAGE.md.
+- `td-mta.debug`: the matching receiver symbols and line tables, mode 0644.
+  Retain it with the executable; it is not a separate download.
 - `td-mta-cli-smoke`: the existing store/configuration/receiver process suite,
   selecting this exact `td-mta` under the separate fixture described above.
   It is a test controller, never a service dependency.
