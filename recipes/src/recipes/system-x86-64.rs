@@ -13922,6 +13922,33 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
         ));
     }
 
+    /// The selector's FIDO2 worker (td-boot's `fido-worker` verb, td-fido's
+    /// root admission) takes its operation lock under `/run`, which must be
+    /// root's and mode 0755, and starts itself as `/proc/self/exe`, so
+    /// `/proc` stays mounted while td-boot runs: /init mounts it and
+    /// `exec`s td-boot without unmounting it, and nothing mounts over
+    /// `/run`.
+    #[test]
+    fn the_selector_holds_what_the_fido_worker_needs() {
+        let selector = build_initramfs_spec("selector-init", Phase::Selector);
+        assert!(selector.contains("dir /run 0755 0 0"));
+        assert!(selector.contains("dir /proc 0755 0 0"));
+        let init = build_selector_init();
+        let proc = init
+            .find("/bin/mount -t proc proc /proc")
+            .expect("proc mount");
+        let boot = init.find("exec /bin/td-boot").expect("td-boot");
+        assert!(proc < boot);
+        assert!(!init.contains("umount"), "{init}");
+        assert!(!init.contains(" /run"), "{init}");
+        let lock = include_str!("../../../td-fido/src/fido_device.rs");
+        assert!(lock.contains(
+            "        (Admission::Root, None) => (\n            \"/run\",\n            Owner {\n                uid: 0,\n                gid: Some(0),\n            },\n            0o755,"
+        ));
+        let worker = include_str!("../../../td-boot/src/fido.rs");
+        assert!(worker.contains("const PATH: &'static str = \"/proc/self/exe\";"));
+    }
+
     #[test]
     fn initramfs_packs_the_verified_boot_chain() {
         let selector = build_initramfs_spec("selector-init", Phase::Selector);

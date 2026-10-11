@@ -1325,7 +1325,12 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
      retries, and prompts `td security key PIN (N attempts left): `;
      after the PIN it prints `td: touch your security key`.
      TOKEN-LOGIN.md's PIN statuses and a key not enrolled here are
-     console lines that return to this prompt. Any other entry goes to
+     console lines that return to this prompt. A fido2 token whose public
+     key is not a valid P-256 point is named on the console and left
+     out of the identification, so no key can answer for it; with none
+     left the console says the volume holds no usable security key and
+     the prompt returns. Each Enter starts one worker under its own
+     two-minute deadline. Any other entry goes to
      the recovery-key codec, whose refusals prompt again; an admitted
      key is held for its test after the cap, and ends TPM attempts for
      this boot.
@@ -1392,10 +1397,12 @@ the plan only after the cap, the TPM wait) and replaces steps 2 and 3:
    today.
 
 The deployment initramfs's post-cap check ("Boot and authority
-boundaries") tries each tpm-pin token by PolicyPCR alone, which the
-closed cap refuses with `TPM_RC_VALUE` before any authorization: it
-never sends Unseal or a PIN, and a PolicyPCR that passes halts as a
-release does. A fido2 token and the recovery key release nothing
+boundaries") tries each tpm-pin token by PolicyPCR alone, keyslot-less
+ones included, which the closed cap refuses with `TPM_RC_VALUE` before
+any authorization: it never sends Unseal or a PIN. A PolicyPCR that
+passes halts as a release does, and so does every other outcome but
+that refusal and a TPM without a SHA-256 bank, which go on to the next
+token: a check that cannot tell the cap held fails closed. A fido2 token and the recovery key release nothing
 without a person, so the check attempts neither.
 
 **Threat and limits.** A finder of the powered-off machine, or of its
@@ -1508,7 +1515,14 @@ own two minutes; the root worker takes `/run/td-fido/operation.lock`
 and reads `/proc/self/exe`, so the selector's initramfs needs `/run`
 (root:root 0755) and `/proc` mounted first; and 8c's qemu evidence must
 cover a real release over the worker transport, which 8b's scripted
-tests do not. The
+tests do not. 8c's selector builds the client per Enter
+(`selector_release::SecurityKeys`), and system-x86-64's tests pin the
+selector initramfs's `/run` and `/proc` against td-fido's lock and the
+worker's path. The release over the real worker transport is 8h's
+evidence: the host's virtual FIDO2 authenticator over QEMU `usb-redir`
+releases a protected header through the shipped selector's worker in
+`qemu-boot-protected`, since no earlier oracle writes a protected
+header or attaches a CTAP 2.1 key to the guest. The
 CTAP code td-secret, td-boot, td-tpm and td-protector then share (report
 framing, CBOR, the CTAP codecs, the PIN protocols, hmac-secret, P-256,
 AES, HMAC-SHA256 and hidraw admission) moves into one std-only sibling
@@ -2382,7 +2396,9 @@ commit.
      anchors a seal to its own take; no second TPM clear.
    - **8h, the combined oracle.** The host's virtual FIDO2 authenticator
      over QEMU `usb-redir` ("Acceptance evidence"); then
-     `qemu-boot-protected` with every leg below. The hardware evidence
+     `qemu-boot-protected` with every leg below, which are also 8c's
+     evidence of a release over the selector's real FIDO2 worker
+     transport. The hardware evidence
      follows it and precedes item 9.
    - **8i, firmware authentication (optional).** The sealed selector
      image's recipe (the second kernel build with the selector initramfs

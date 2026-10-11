@@ -4014,20 +4014,23 @@ fn boot_encrypted(
         selector_release::wait_for_tpm(&mut selector_release::tpm_present, &mut std::thread::sleep);
     if !present {
         console(&format!(
-            "no TPM device ({}): nothing can release and PCR 12 stays open; a TPM the \
-             kernel exposes later on this boot finds it open",
+            "no TPM device ({}): no TPM protector can release and PCR 12 stays open; a TPM \
+             the kernel exposes later on this boot finds it open",
             unlock::TPM_DEVICE
         ));
     }
     let mut tpm = present.then_some(DeviceTpm);
     let mut cryptsetup = Cryptsetup::new(Path::new("/bin").join(protocol::CRYPTSETUP));
     let mut line = selector_release::Applet(Path::new("/bin").join(protocol::SECRET_LINE_APPLET));
+    // A protected header's security keys, one FIDO2 client per Enter.
+    let mut keys = selector_release::SecurityKeys::root();
     let (keyslot, key) = match selector_release::unlock(
         &header,
         &partition.path(),
         tpm.as_mut(),
         &mut cryptsetup,
         &mut line,
+        &mut keys,
         Path::new(selector_release::KEY_DIRECTORY),
         &mut console,
     ) {
@@ -8823,8 +8826,10 @@ mod tests {
         let applet = position(
             "let mut line = selector_release::Applet(Path::new(\"/bin\").join(protocol::SECRET_LINE_APPLET));",
         );
+        let keys = position("let mut keys = selector_release::SecurityKeys::root();");
         let released = position("let (keyslot, key) = match selector_release::unlock(");
         assert!(position("&mut line,") > released);
+        assert!(applet < keys && keys < released && position("&mut keys,") > released);
         assert_eq!(protocol::SECRET_LINE_APPLET, "secret-line");
         let halted = position("selector_release::Unlock::Halt(reason) => halt(&reason),");
         let failed = position("selector_release::Unlock::Failed(error) => return Err(error),");

@@ -3,8 +3,11 @@
 //! the TPM wait, td-protector's release order, the recovery flow when it
 //! ends in recovery, the mapping opened with the released secret or the
 //! recovery key, and the volume key the handoff carries to td-kexec
-//! ("Boot and authority boundaries"). Nothing here mounts or selects: the
-//! caller does both only after `unlock` returns `Boot`.
+//! ("Boot and authority boundaries"). A protected header takes
+//! td-protector's protected release instead ("Protected release"), its
+//! entries through the same secret-line and its security keys through the
+//! FIDO2 client. Nothing here mounts or selects: the caller does both only
+//! after `unlock` returns `Boot`.
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Read};
@@ -13,14 +16,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use td_fido::fido_disk::{DiskError, Operation, Person, Phase, Released, Token as FidoKey};
+use td_fido::fido_p256::PublicKey;
+use td_fido::fido_pin::{LoginRefusal, Pin};
+use td_fido::fido_transaction::{Devices, Error as FidoFailure, Status};
 use td_protector::cryptsetup::{
     dump_volume_key_args, exit_code, open_args, open_slot_args, test_args, EXIT_BAD_PASSPHRASE,
 };
-use td_protector::luks2::Header;
+use td_protector::luks2::{Header, Kind};
+use td_protector::protected_release::{self as protected, Fido, FidoError, FidoToken, Prompt};
 use td_protector::recovery::RecoveryKey;
 use td_protector::release::{self, Outcome, Resealed, Runner, Tpm};
 use td_protector::transition::RECOVERY_SLOT;
+use td_protector::Secret;
 
+use crate::fido;
 use crate::protocol::VOLUME_KEY_BYTES;
 use crate::td_fs::open_real_file;
 use crate::unlock::{VolumeKey, TPM_DEVICE};
@@ -223,18 +233,35 @@ impl SecretLine for Applet {
 
 /// The release order over `header`, then what its outcome calls for: a
 /// released secret opens the mapping, recovery runs the recovery flow on
-/// `line`, and an uncertain cap halts. `partition` names the pinned
+/// `line`, and an uncertain cap halts. A protected header takes the
+/// protected release (`unlock_protected`); a device-bound or upgrading
+/// one, which selectors before 8f boot as device-bound without a reseal,
+/// and a refused one the device-bound order. `partition` names the pinned
 /// partition to cryptsetup, `/proc/PID/fd/N`; `tpm` is `None` when no TPM
 /// device appeared within the wait.
-pub(crate) fn unlock<T: Tpm, C: Runner>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
     header: &Result<Header, String>,
     partition: &Path,
     mut tpm: Option<&mut T>,
     cryptsetup: &mut C,
     line: &mut dyn SecretLine,
+    keys: &mut F,
     key_directory: &Path,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
+    if let Some(protected) = header.as_ref().ok().filter(|h| h.kind() == Kind::Protected) {
+        return unlock_protected(
+            protected,
+            partition,
+            tpm,
+            cryptsetup,
+            line,
+            keys,
+            key_directory,
+            console,
+        );
+    }
     match release::release(header, partition, tpm.as_deref_mut(), cryptsetup, console) {
         Outcome::Released { keyslot, secret } => open(
             partition,
@@ -276,6 +303,276 @@ pub(crate) fn unlock<T: Tpm, C: Runner>(
             "{reason}; every released secret is zeroed and boot is refused"
         )),
     }
+}
+
+/// The protected release over a protected header (ENCRYPTION.md
+/// "Protected release"): td-protector's order before and through the cap
+/// and the released keyslot's test, every entry one run of secret-line;
+/// then the mapping opens on that keyslot alone with the released key, the
+/// volume key is taken with it, and td-protector's `finish` runs the plan,
+/// the lockout's take or proof, the counter and the reset, needing the
+/// volume key. A failed open fails the boot before any plan.
+#[allow(clippy::too_many_arguments)]
+fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
+    header: &Header,
+    partition: &Path,
+    mut tpm: Option<&mut T>,
+    cryptsetup: &mut C,
+    line: &mut dyn SecretLine,
+    keys: &mut F,
+    key_directory: &Path,
+    console: &mut dyn FnMut(&str),
+) -> Unlock {
+    let mut prompt = Lines(line);
+    let released = match protected::release(
+        header,
+        partition,
+        tpm.as_deref_mut(),
+        cryptsetup,
+        keys,
+        &mut prompt,
+        console,
+    ) {
+        protected::Outcome::Released(released) => released,
+        protected::Outcome::Halt(reason) => return Unlock::Halt(refused(&reason)),
+        protected::Outcome::Failed(error) => return Unlock::Failed(error),
+    };
+    let keyslot = released.keyslot;
+    let opened = open(
+        partition,
+        keyslot,
+        &open_slot_args(partition, MAPPING_NAME, keyslot),
+        released.key.expose(),
+        cryptsetup,
+        key_directory,
+    );
+    let Unlock::Boot { key, .. } = opened else {
+        return opened;
+    };
+    console(&format!(
+        "keyslot {keyslot} opened with {}",
+        match released.method {
+            protected::Method::TpmPin => "the TPM PIN",
+            protected::Method::Fido2Primary => "a primary security key",
+            protected::Method::Fido2Recovery => "a recovery security key",
+            protected::Method::RecoveryKey => "the recovery key",
+        }
+    ));
+    protected::finish(
+        released,
+        header,
+        partition,
+        key.expose(),
+        tpm,
+        cryptsetup,
+        console,
+    );
+    Unlock::Boot { keyslot, key }
+}
+
+/// A protected halt's reason, ending once in the zeroing and the refusal,
+/// whether td-protector's reason already says boot is refused or not.
+fn refused(reason: &str) -> String {
+    let reason = reason
+        .strip_suffix("; every released secret is zeroed and boot is refused")
+        .or_else(|| reason.strip_suffix("; boot is refused"))
+        .unwrap_or(reason);
+    format!("{reason}; every released secret is zeroed and boot is refused")
+}
+
+/// secret-line as td-protector's prompt: each entry is copied into
+/// td-protector's zeroing entry and this one dropped, which zeroes it.
+struct Lines<'a>(&'a mut dyn SecretLine);
+
+impl Prompt for Lines<'_> {
+    fn read(&mut self, prompt: &str) -> Result<protected::Entered, String> {
+        match self.0.read(prompt) {
+            Ok(Entered::Line(entry)) => Ok(protected::Entered::Line(protected::Entry::new(
+                entry.as_bytes(),
+            ))),
+            Ok(Entered::Eof) => Ok(protected::Entered::Eof),
+            Ok(Entered::Refused) => Ok(protected::Entered::Refused),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// One security-key release: td-boot's FIDO2 client, or a test's.
+pub(crate) trait Releaser {
+    fn release(
+        &mut self,
+        tokens: &[FidoKey<'_>],
+        operation: Operation<'_>,
+        person: &mut KeyPerson<'_>,
+    ) -> Result<Released, DiskError>;
+}
+
+impl<D: Devices> Releaser for fido::Client<D> {
+    fn release(
+        &mut self,
+        tokens: &[FidoKey<'_>],
+        operation: Operation<'_>,
+        person: &mut KeyPerson<'_>,
+    ) -> Result<Released, DiskError> {
+        fido::Client::release(self, tokens, operation, Phase::Unlock, person)
+    }
+}
+
+/// The selector's security keys for the protected release. Each Enter at
+/// the prompt for another way builds a fresh client from `client`, so each
+/// attempt has its own two-minute deadline from when it begins.
+pub(crate) struct SecurityKeys<M>(pub(crate) M);
+
+impl SecurityKeys<fn() -> fido::Client<fido::Root>> {
+    /// td-boot's root FIDO2 client: root-admitted hidraw nodes, each
+    /// session's worker this program's `fido-worker` verb.
+    pub(crate) fn root() -> Self {
+        Self(fido::Client::root)
+    }
+}
+
+/// A key PIN td-fido's profile refuses, which never reaches the key.
+const KEY_PIN_PROFILE: &str =
+    "td: a security key PIN is 4 to 63 printable ASCII bytes; the key was not asked";
+
+/// The key's PIN through secret-line, under td-fido's PIN profile, and
+/// the touch line. An entry that ends the operation is kept as its halt
+/// reason or console line.
+pub(crate) struct KeyPerson<'a> {
+    prompt: &'a mut dyn Prompt,
+    console: &'a mut dyn FnMut(&str),
+    halt: Option<String>,
+    refused: Option<String>,
+}
+
+impl Person for KeyPerson<'_> {
+    fn pin(&mut self, _: Phase, retries: u8) -> Result<Pin, String> {
+        let text = format!("td security key PIN ({retries} attempts left): ");
+        match self.prompt.read(&text) {
+            // td-fido's profile: its own wording names the portable vault.
+            Ok(protected::Entered::Line(entry)) => {
+                Pin::new(entry.as_bytes().into()).map_err(|_| {
+                    let line = KEY_PIN_PROFILE.to_owned();
+                    self.refused = Some(line.clone());
+                    line
+                })
+            }
+            Ok(protected::Entered::Refused) => {
+                let line = "td: the security key PIN was longer than 256 bytes or held a \
+                            newline; the key was not asked"
+                    .to_owned();
+                self.refused = Some(line.clone());
+                Err(line)
+            }
+            Ok(protected::Entered::Eof) => {
+                let reason = "end of input at the security key PIN prompt; boot is refused";
+                self.halt = Some(reason.into());
+                Err(reason.into())
+            }
+            Err(error) => {
+                let reason = format!("the security key PIN prompt failed: {error}");
+                self.halt = Some(reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    fn touch(&mut self, _: Phase) {
+        (self.console)("td: touch your security key");
+    }
+}
+
+impl<R: Releaser, M: FnMut() -> R> Fido for SecurityKeys<M> {
+    fn release(
+        &mut self,
+        tokens: &[FidoToken<'_>],
+        volume: &[u8; 16],
+        description: &[u8],
+        prompt: &mut dyn Prompt,
+        console: &mut dyn FnMut(&str),
+    ) -> Result<(usize, Secret), FidoError> {
+        let mut keys = Vec::new();
+        let mut index = Vec::new();
+        for (at, token) in tokens.iter().enumerate() {
+            match PublicKey::from_coordinates(token.x, token.y) {
+                Ok(key) => {
+                    keys.push(FidoKey {
+                        credential: token.credential,
+                        key,
+                        salt: *token.salt,
+                    });
+                    index.push(at);
+                }
+                Err(error) => console(&format!(
+                    "td token {} names no usable public key ({error}); it is not tried",
+                    token.number
+                )),
+            }
+        }
+        if keys.is_empty() {
+            return Err(FidoError::Retry(
+                "td: this volume holds no usable security key".into(),
+            ));
+        }
+        let mut client = (self.0)();
+        let mut person = KeyPerson {
+            prompt,
+            console,
+            halt: None,
+            refused: None,
+        };
+        let operation = Operation {
+            volume: *volume,
+            description,
+        };
+        match client.release(&keys, operation, &mut person) {
+            Ok(released) => match index.get(released.token) {
+                Some(at) => Ok((*at, Secret::copy_of(released.passphrase.bytes()))),
+                None => Err(FidoError::Retry(
+                    "td: the security key answered for no token of this volume".into(),
+                )),
+            },
+            Err(error) => Err(match (person.halt.take(), person.refused.take()) {
+                (Some(reason), _) => FidoError::Halt(reason),
+                (None, Some(line)) => FidoError::Retry(line),
+                (None, None) => FidoError::Retry(describe(&error)),
+            }),
+        }
+    }
+}
+
+/// A console line for a security key's refusal: TOKEN-LOGIN.md's PIN
+/// statuses, the key's admission and the one-key rule. It names no
+/// credential, PIN or output.
+fn describe(error: &DiskError) -> String {
+    let text = match error {
+        DiskError::OneKey => "connect exactly one security key, then press Enter",
+        DiskError::NotEnrolled => "this security key is not enrolled for this volume",
+        DiskError::Ended => "no security key PIN was entered",
+        DiskError::Refused(LoginRefusal::NoFido21) => {
+            "this security key does not support FIDO 2.1 and cannot unlock td volumes"
+        }
+        DiskError::Refused(LoginRefusal::PinNotSet) => "this security key has no PIN set",
+        DiskError::Refused(_) => "this security key cannot unlock td volumes",
+        DiskError::Failed(FidoFailure::Status(Status::PinInvalid)) => "wrong security key PIN",
+        DiskError::Failed(FidoFailure::Status(Status::PinBlocked)) => {
+            "the security key's PIN is blocked; use another key or the recovery key"
+        }
+        DiskError::Failed(FidoFailure::Status(Status::PinAuthBlocked)) => {
+            "the security key needs to be unplugged and reconnected before another PIN"
+        }
+        DiskError::Failed(FidoFailure::Status(
+            Status::TouchTimeout | Status::ActionTimeout | Status::Cancelled,
+        )) => "the security key was not touched in time",
+        DiskError::Failed(FidoFailure::Interrupted(_)) => {
+            "the security key did not finish within two minutes"
+        }
+        DiskError::Failed(_)
+        | DiskError::CredentialLength
+        | DiskError::Mismatch
+        | DiskError::Unselectable => "the security key did not release this volume",
+    };
+    format!("td: {text}")
 }
 
 /// The reseal td-protector runs: the header it plans over, the recovery
@@ -599,6 +896,8 @@ pub(crate) mod tests {
         capped: Option<Box<dyn Fn() -> bool>>,
         /// Every keyslot test exits with this status instead.
         test_exit: Option<i32>,
+        /// Another keyslot and the key that opens it.
+        extra: Option<(String, Vec<u8>)>,
     }
 
     /// The runner's error for a cryptsetup `open` that exited `code`.
@@ -626,6 +925,7 @@ pub(crate) mod tests {
                 directory_mode: None,
                 capped: None,
                 test_exit: None,
+                extra: None,
             }
         }
         fn verbs(&self) -> Vec<&str> {
@@ -658,7 +958,11 @@ pub(crate) mod tests {
                 .iter()
                 .position(|w| w == "--key-slot")
                 .map(|at| words[at + 1].clone());
-            let opens_0 = slot.as_deref() == Some("0") && input == KEY;
+            let opens_0 = (slot.as_deref() == Some("0") && input == KEY)
+                || self
+                    .extra
+                    .as_ref()
+                    .is_some_and(|(other, key)| slot.as_ref() == Some(other) && input == key);
             match words.first().map(String::as_str) {
                 Some("open") if words.iter().any(|w| w == "--test-passphrase") => {
                     match self.test_exit {
@@ -1021,6 +1325,19 @@ pub(crate) mod tests {
         }
     }
 
+    /// A FIDO2 client a device-bound boot never reaches.
+    struct NoKeys;
+    impl Releaser for NoKeys {
+        fn release(
+            &mut self,
+            _: &[FidoKey<'_>],
+            _: Operation<'_>,
+            _: &mut KeyPerson<'_>,
+        ) -> Result<Released, DiskError> {
+            panic!("a security key was asked for")
+        }
+    }
+
     /// One boot's unlock with the console's answers; every entry is zeroed
     /// when it returns.
     fn run_unlock<T: Tpm>(
@@ -1030,6 +1347,24 @@ pub(crate) mod tests {
         console: &mut Console,
         scratch: &Scratch,
     ) -> (Unlock, Vec<String>) {
+        run_unlock_with(
+            header,
+            tpm,
+            script,
+            console,
+            scratch,
+            &mut SecurityKeys(|| NoKeys),
+        )
+    }
+
+    fn run_unlock_with<T: Tpm, F: Fido>(
+        header: &Result<Header, String>,
+        tpm: Option<&mut T>,
+        script: &mut Script,
+        console: &mut Console,
+        scratch: &Scratch,
+        keys: &mut F,
+    ) -> (Unlock, Vec<String>) {
         let mut lines = Vec::new();
         let outcome = unlock(
             header,
@@ -1037,8 +1372,9 @@ pub(crate) mod tests {
             tpm,
             script,
             console,
+            keys,
             &scratch.keys(),
-            &mut |line| lines.push(line.to_owned()),
+            &mut |line: &str| lines.push(line.to_owned()),
         );
         assert_eq!(LIVE_ENTRIES.with(Cell::get), 0, "an entry outlived it");
         (outcome, lines)
@@ -1723,5 +2059,572 @@ pub(crate) mod tests {
         };
         assert!(error.to_string().contains("absent"), "{error}");
         assert_eq!(LIVE_ENTRIES.with(Cell::get), 0);
+    }
+
+    /// P-256's generator, a point td-fido admits as a token's key.
+    const GX: [u8; 32] = [
+        0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40,
+        0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98,
+        0xc2, 0x96,
+    ];
+    const GY: [u8; 32] = [
+        0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e,
+        0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf,
+        0x51, 0xf5,
+    ];
+    const CREDENTIAL: &[u8] = &[7; 16];
+    const KEY_PIN: &str = "4321";
+
+    fn protected_header(
+        tokens: Vec<(u8, td_protector::protected::Token)>,
+    ) -> Result<Header, String> {
+        let mut header = header(Vec::new())?;
+        header.protected = tokens;
+        Ok(header)
+    }
+
+    /// The FIDO2-primary shape: the marker on keyslot 0 and a fido2-primary
+    /// token on keyslot 1.
+    fn fido_header() -> Result<Header, String> {
+        use td_protector::protected::{Fido2, FidoRole, Token as Protected};
+        protected_header(vec![
+            (0, Protected::RecoveryKey { keyslot: Some(0) }),
+            (
+                1,
+                Protected::Fido2(Fido2 {
+                    keyslot: Some(1),
+                    role: FidoRole::Primary,
+                    credential: CREDENTIAL.to_vec(),
+                    salt: [3; 32],
+                    x: GX,
+                    y: GY,
+                }),
+            ),
+        ])
+    }
+
+    /// The keyslot passphrase the scripted key releases for the volume.
+    fn fido_passphrase(header: &Result<Header, String>) -> Vec<u8> {
+        let volume = td_protector::lockout::volume_uuid(&header.as_ref().unwrap().uuid).unwrap();
+        td_fido::fido_disk::passphrase(&[0x11; 32], &volume, CREDENTIAL)
+            .unwrap()
+            .bytes()
+            .to_vec()
+    }
+
+    /// One scripted key per client: its answer to the next release, which
+    /// asks the person's PIN first.
+    struct OneKey {
+        answers: Rc<RefCell<VecDeque<Result<usize, DiskError>>>>,
+    }
+    impl Releaser for OneKey {
+        fn release(
+            &mut self,
+            tokens: &[FidoKey<'_>],
+            operation: Operation<'_>,
+            person: &mut KeyPerson<'_>,
+        ) -> Result<Released, DiskError> {
+            let answer = self.answers.borrow_mut().pop_front().unwrap();
+            let index = answer?;
+            assert_eq!(tokens[index].credential, CREDENTIAL);
+            let pin = person.pin(Phase::Unlock, 8).map_err(|_| DiskError::Ended)?;
+            drop(pin);
+            person.touch(Phase::Unlock);
+            Ok(Released {
+                token: index,
+                passphrase: td_fido::fido_disk::passphrase(
+                    &[0x11; 32],
+                    &operation.volume,
+                    tokens[index].credential,
+                )
+                .unwrap(),
+            })
+        }
+    }
+
+    fn scripted_keys(
+        answers: Vec<Result<usize, DiskError>>,
+    ) -> (SecurityKeys<impl FnMut() -> OneKey>, Rc<Cell<usize>>) {
+        let answers = Rc::new(RefCell::new(VecDeque::from(answers)));
+        let made = Rc::new(Cell::new(0));
+        let count = made.clone();
+        let keys = SecurityKeys(move || {
+            count.set(count.get() + 1);
+            OneKey {
+                answers: answers.clone(),
+            }
+        });
+        (keys, made)
+    }
+
+    fn no_tpm() -> Option<&'static mut Shared> {
+        None
+    }
+
+    const KEY_PIN_PROMPT: &str = "td security key PIN (8 attempts left): ";
+
+    /// A protected header releases through a security key: each Enter at
+    /// the prompt for another way builds one FIDO2 client, the key's PIN
+    /// is one secret-line run, and the mapping opens on the released
+    /// keyslot alone with its passphrase, which reaches no argv and no
+    /// console line.
+    #[test]
+    fn a_protected_header_releases_through_one_client_per_enter() {
+        let scratch = Scratch::new();
+        let header = fido_header();
+        let mut script = Script::new(Dump::Key);
+        script.extra = Some(("1".into(), fido_passphrase(&header)));
+        let mut console = Console::new(&[Typed::Line(""), Typed::Line(""), Typed::Line(KEY_PIN)]);
+        let (mut keys, made) = scripted_keys(vec![Err(DiskError::OneKey), Ok(0)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        let Unlock::Boot { keyslot, .. } = outcome else {
+            panic!("no boot: {lines:?}");
+        };
+        assert_eq!(keyslot, 1);
+        assert_eq!(made.get(), 2);
+        assert_eq!(
+            console.prompts,
+            [
+                protected::ANOTHER_WAY_PROMPT,
+                protected::ANOTHER_WAY_PROMPT,
+                KEY_PIN_PROMPT
+            ]
+        );
+        assert!(lines.contains(&"td: connect exactly one security key, then press Enter".into()));
+        assert!(lines.contains(&"td: touch your security key".into()));
+        assert!(lines.iter().any(|l| l.starts_with("PCR 12 is not capped")));
+        assert_eq!(script.verbs(), ["open", "open", "luksDump"]);
+        assert_eq!(script.tests(), ["1"]);
+        let open = &script.commands[1].0;
+        assert!(
+            open.windows(2).any(|w| w == ["--key-slot", "1"]),
+            "{open:?}"
+        );
+        let passphrase = fido_passphrase(&header);
+        assert_not_in_argv(&script, &passphrase);
+        assert!(!lines.iter().any(|l| l.contains(KEY_PIN)), "{lines:?}");
+    }
+
+    /// A PIN td-fido's profile refuses never reaches the key and asks
+    /// again at the next Enter; end of input at the key's PIN or at the
+    /// prompt for another way halts with nothing opened.
+    #[test]
+    fn a_refused_key_pin_asks_again_and_end_of_input_halts() {
+        let scratch = Scratch::new();
+        let header = fido_header();
+        let mut script = Script::new(Dump::Key);
+        script.extra = Some(("1".into(), fido_passphrase(&header)));
+        let mut console = Console::new(&[
+            Typed::Line(""),
+            Typed::Line("12"),
+            Typed::Line(""),
+            Typed::Line(KEY_PIN),
+        ]);
+        let (mut keys, made) = scripted_keys(vec![Ok(0), Ok(0)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        assert!(
+            matches!(outcome, Unlock::Boot { keyslot: 1, .. }),
+            "{lines:?}"
+        );
+        assert_eq!(made.get(), 2);
+        assert!(lines.iter().any(|l| l.contains("the key was not asked")));
+
+        for typed in [
+            &[Typed::Line(""), Typed::Eof][..],
+            &[Typed::Fail],
+            &[Typed::Eof],
+        ] {
+            let mut script = Script::new(Dump::Key);
+            let mut console = Console::new(typed);
+            let (mut keys, _) = scripted_keys(vec![Ok(0)]);
+            let (outcome, _) = run_unlock_with(
+                &header,
+                no_tpm(),
+                &mut script,
+                &mut console,
+                &scratch,
+                &mut keys,
+            );
+            assert!(matches!(outcome, Unlock::Halt(_)));
+            assert!(script.commands.is_empty());
+        }
+    }
+
+    /// The recovery key on a TPM-primary header without a TPM device opens
+    /// keyslot 0, the marker's, with no PIN asked.
+    #[test]
+    fn a_protected_header_without_a_tpm_opens_with_the_recovery_key() {
+        use td_protector::pin::PinPcrs;
+        use td_protector::protected::{Token as Protected, TpmPin};
+        let scratch = Scratch::new();
+        let header = protected_header(vec![
+            (0, Protected::RecoveryKey { keyslot: Some(0) }),
+            (
+                1,
+                Protected::TpmPin(TpmPin {
+                    keyslot: Some(1),
+                    pcrs: PinPcrs::Selector,
+                    primary: [0x0b; 34],
+                    salt: [1; 32],
+                    sealed: SealedObject {
+                        public: vec![1; 8],
+                        private: vec![2; 8],
+                    },
+                }),
+            ),
+        ]);
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| NoKeys),
+        );
+        assert!(
+            matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+            "{lines:?}"
+        );
+        assert_eq!(console.prompts, [protected::ANOTHER_WAY_PROMPT]);
+        assert!(lines.contains(&protected::NO_TPM.to_owned()));
+        assert_eq!(script.tests(), ["0"]);
+        assert_key_on_keyslot_0_alone(&script, &lines);
+        assert!(!lines.iter().any(|l| l.contains("123459")), "{lines:?}");
+    }
+
+    /// Selectors before 8f boot a header carrying a `td-upgrade` token as a
+    /// device-bound one, with no reseal offered: a reseal would hold a
+    /// second device-bound token beside it.
+    #[test]
+    fn an_upgrading_header_boots_as_device_bound_without_a_reseal() {
+        use td_protector::protected::{Shape, Token as Protected};
+        let scratch = Scratch::new();
+        for upgrading in [false, true] {
+            let mut header = header(vec![first_boot_token()]);
+            if upgrading {
+                header.as_mut().unwrap().protected = vec![(
+                    5,
+                    Protected::Upgrade {
+                        shape: Shape::Tpm,
+                        from: [0; 32],
+                    },
+                )];
+            }
+            let (mut tpm, _) = shared([0; 32]);
+            let mut script = Script::new(Dump::Key);
+            let typed = if upgrading {
+                vec![Typed::Line(TYPED)]
+            } else {
+                vec![Typed::Line(TYPED), Typed::Line("no")]
+            };
+            let mut console = Console::new(&typed);
+            let (outcome, lines) =
+                run_unlock(&header, Some(&mut tpm), &mut script, &mut console, &scratch);
+            assert!(
+                matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+                "{lines:?}"
+            );
+            let expected: &[&str] = if upgrading {
+                &[KEY_PROMPT]
+            } else {
+                &[KEY_PROMPT, RESEAL_PROMPT]
+            };
+            assert_eq!(console.prompts, expected, "{lines:?}");
+        }
+    }
+
+    /// The protected tier's prompts are secret-line operands too.
+    #[test]
+    fn the_protected_prompts_are_secret_lines() {
+        for prompt in [
+            protected::PIN_PROMPT,
+            protected::ANOTHER_WAY_PROMPT,
+            protected::NEW_PIN_PROMPT,
+            protected::NEW_PIN_AGAIN_PROMPT,
+            protected::RESEAL_PROMPT,
+            "td security key PIN (255 attempts left): ",
+        ] {
+            assert!((1..=128).contains(&prompt.len()), "{prompt}");
+            assert!(
+                prompt.bytes().all(|b| (b' '..=b'~').contains(&b)),
+                "{prompt}"
+            );
+        }
+        // td-boot prints none of them: each reaches the console only as
+        // secret-line's operand, through td-protector or the key's PIN.
+        let source = include_str!("selector_release.rs");
+        let (production, _) = source.split_once("\n#[cfg(test)]\n").unwrap();
+        assert_eq!(production.matches("self.prompt.read(&text)").count(), 1);
+        assert_eq!(production.matches("self.0.read(prompt)").count(), 1);
+        // One client per Enter: built inside each release, never kept.
+        let fido = production
+            .split_once("impl<R: Releaser, M: FnMut() -> R> Fido for SecurityKeys<M> {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .unwrap();
+        assert_eq!(fido.matches("let mut client = (self.0)();").count(), 1);
+        assert!(production.contains("Self(fido::Client::root)"));
+    }
+
+    /// The FIDO2-primary shape with an extra fido2-recovery token on
+    /// keyslot 2; `bad` gives token 1 a public key that is no P-256 point.
+    fn fido_header_with(bad: bool) -> Result<Header, String> {
+        use td_protector::protected::{Fido2, FidoRole, Token as Protected};
+        let mut header = fido_header()?;
+        if bad {
+            if let Some((_, Protected::Fido2(fido))) = header.protected.get_mut(1) {
+                fido.credential = vec![9; 16];
+                fido.x = [0; 32];
+                fido.y = [0; 32];
+            }
+        }
+        header.protected.push((
+            2,
+            Protected::Fido2(Fido2 {
+                keyslot: Some(2),
+                role: FidoRole::Recovery,
+                credential: CREDENTIAL.to_vec(),
+                salt: [3; 32],
+                x: GX,
+                y: GY,
+            }),
+        ));
+        Ok(header)
+    }
+
+    /// A key that answers for a token index it was not given.
+    struct Stray;
+    impl Releaser for Stray {
+        fn release(
+            &mut self,
+            tokens: &[FidoKey<'_>],
+            operation: Operation<'_>,
+            _: &mut KeyPerson<'_>,
+        ) -> Result<Released, DiskError> {
+            Ok(Released {
+                token: tokens.len(),
+                passphrase: td_fido::fido_disk::passphrase(&[0x11; 32], &operation.volume, &[1])
+                    .unwrap(),
+            })
+        }
+    }
+
+    /// A fido2 token whose public key is not a P-256 point is named and
+    /// left out; the key's answer, an index among the tokens kept, names
+    /// the token after it, whose keyslot alone opens.
+    #[test]
+    fn a_token_off_the_curve_is_left_out_and_the_index_maps_past_it() {
+        let scratch = Scratch::new();
+        let header = fido_header_with(true);
+        let mut script = Script::new(Dump::Key);
+        script.extra = Some(("2".into(), fido_passphrase(&header)));
+        let mut console = Console::new(&[Typed::Line(""), Typed::Line(KEY_PIN)]);
+        let (mut keys, made) = scripted_keys(vec![Ok(0)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        assert!(
+            matches!(outcome, Unlock::Boot { keyslot: 2, .. }),
+            "{lines:?}"
+        );
+        assert_eq!(made.get(), 1);
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("td token 1 names no usable public key")));
+        assert!(lines.contains(&"keyslot 2 opened with a recovery security key".into()));
+        assert_eq!(script.tests(), ["2"]);
+    }
+
+    /// With no usable token, or a key answering for none, the console says
+    /// so and the prompt returns; the recovery key then opens keyslot 0.
+    #[test]
+    fn no_usable_token_or_a_stray_answer_returns_to_the_prompt() {
+        use td_protector::protected::Token as Protected;
+        let scratch = Scratch::new();
+        // Every fido2 token off the curve: no client is built.
+        let mut header = fido_header_with(true);
+        if let Ok(header) = header.as_mut() {
+            for (_, token) in header.protected.iter_mut() {
+                if let Protected::Fido2(fido) = token {
+                    fido.x = [0; 32];
+                }
+            }
+        }
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(""), Typed::Line(TYPED)]);
+        let (mut keys, made) = scripted_keys(Vec::new());
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        assert!(
+            matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+            "{lines:?}"
+        );
+        assert_eq!(made.get(), 0);
+        assert!(lines.contains(&"td: this volume holds no usable security key".into()));
+        assert_eq!(
+            console.prompts,
+            [protected::ANOTHER_WAY_PROMPT, protected::ANOTHER_WAY_PROMPT]
+        );
+
+        let header = fido_header();
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(""), Typed::Line(TYPED)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut SecurityKeys(|| Stray),
+        );
+        assert!(
+            matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"td: the security key answered for no token of this volume".into()));
+        assert_eq!(script.tests(), ["0"]);
+    }
+
+    /// A key's refusals are console lines that return to the prompt and
+    /// name no secret.
+    #[test]
+    fn a_keys_refusals_are_named_and_return_to_the_prompt() {
+        let cases = [
+            (
+                DiskError::Failed(FidoFailure::Status(Status::PinInvalid)),
+                "td: wrong security key PIN",
+            ),
+            (
+                DiskError::Failed(FidoFailure::Status(Status::PinBlocked)),
+                "td: the security key's PIN is blocked; use another key or the recovery key",
+            ),
+            (
+                DiskError::Failed(FidoFailure::Status(Status::PinAuthBlocked)),
+                "td: the security key needs to be unplugged and reconnected before another PIN",
+            ),
+            (
+                DiskError::NotEnrolled,
+                "td: this security key is not enrolled for this volume",
+            ),
+            (
+                DiskError::Refused(LoginRefusal::NoFido21),
+                "td: this security key does not support FIDO 2.1 and cannot unlock td volumes",
+            ),
+        ];
+        let scratch = Scratch::new();
+        let header = fido_header();
+        for (error, expected) in cases {
+            assert_eq!(describe(&error), expected);
+            let mut script = Script::new(Dump::Key);
+            let mut console = Console::new(&[Typed::Line(""), Typed::Line(TYPED)]);
+            let (mut keys, _) = scripted_keys(vec![Err(error)]);
+            let (outcome, lines) = run_unlock_with(
+                &header,
+                no_tpm(),
+                &mut script,
+                &mut console,
+                &scratch,
+                &mut keys,
+            );
+            assert!(
+                matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+                "{lines:?}"
+            );
+            assert!(lines.contains(&expected.to_owned()), "{lines:?}");
+            assert_eq!(console.prompts.len(), 2);
+        }
+    }
+
+    /// A failed applet at the key's PIN halts with nothing opened, and a
+    /// protected halt says once that boot is refused; a PIN outside
+    /// td-fido's profile is named in the disk's own words.
+    #[test]
+    fn a_failed_applet_at_the_key_pin_halts_once() {
+        let scratch = Scratch::new();
+        let header = fido_header();
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(""), Typed::Fail]);
+        let (mut keys, made) = scripted_keys(vec![Ok(0)]);
+        let (outcome, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        let Unlock::Halt(reason) = outcome else {
+            panic!("no halt: {lines:?}");
+        };
+        assert!(
+            reason.starts_with("the security key PIN prompt failed"),
+            "{reason}"
+        );
+        assert_eq!(reason.matches("boot is refused").count(), 1, "{reason}");
+        assert_eq!(made.get(), 1);
+        assert!(script.commands.is_empty());
+        assert_eq!(
+            console.prompts,
+            [protected::ANOTHER_WAY_PROMPT, KEY_PIN_PROMPT]
+        );
+
+        for typed in [&[Typed::Eof][..], &[Typed::Fail]] {
+            let mut script = Script::new(Dump::Key);
+            let mut console = Console::new(typed);
+            let (outcome, _) = run_unlock_with(
+                &header,
+                no_tpm(),
+                &mut script,
+                &mut console,
+                &scratch,
+                &mut SecurityKeys(|| NoKeys),
+            );
+            let Unlock::Halt(reason) = outcome else {
+                panic!("no halt");
+            };
+            assert_eq!(reason.matches("boot is refused").count(), 1, "{reason}");
+            assert_eq!(reason.matches("zeroed").count(), 1, "{reason}");
+        }
+
+        let mut script = Script::new(Dump::Key);
+        let mut console = Console::new(&[Typed::Line(""), Typed::Line("12"), Typed::Line(TYPED)]);
+        let (mut keys, _) = scripted_keys(vec![Ok(0)]);
+        let (_, lines) = run_unlock_with(
+            &header,
+            no_tpm(),
+            &mut script,
+            &mut console,
+            &scratch,
+            &mut keys,
+        );
+        assert!(lines.contains(&KEY_PIN_PROFILE.to_owned()), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("portable")), "{lines:?}");
     }
 }

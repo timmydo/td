@@ -214,7 +214,11 @@ volume consumers"). So the image build refuses either initramfs without
 ships in the root with the package. The live selector, the same stock
 initramfs, carries it and never runs it. The installed selector's
 recovery flow reads the recovery key through td-init's `secret-line`
-(td-boot's `SECRET_LINE_APPLET`), a td-init applet like the rest, and the
+(td-boot's `SECRET_LINE_APPLET`), as its protected release reads every
+PIN, answer and key there, a td-init applet like the rest; its FIDO2
+worker, td-boot's own `fido-worker` verb started as `/proc/self/exe`,
+needs `/proc` mounted and takes its operation lock under the root-owned
+mode-0755 `/run` the selector initramfs carries, and the
 image build refuses a selector initramfs whose `/bin/secret-line` does
 not link td-init, and a deployment initramfs or root that carries it.
 
@@ -1324,7 +1328,15 @@ pinned partition, before any mount
 (ENCRYPTION.md "Selector release"); a mapping already active then
 refuses boot. The released secret, or the recovery key on keyslot 0
 when the release ends in the recovery flow, opens the mapping
-`td-selector`, cryptsetup naming the partition by its held descriptor,
+`td-selector`; on a protected header (ENCRYPTION.md "Protected
+release"), td-protector's protected release instead, its entries
+through the same `secret-line` and its security keys through td-boot's
+FIDO2 client, one client per Enter, opens it on the released keyslot
+alone, takes the volume key, then runs td-protector's plan and lockout
+steps; a device-bound, upgrading or refused header keeps the
+device-bound order, so a `td-upgrade` header boots as device-bound
+without a reseal before 8f. cryptsetup names the partition by its held
+descriptor,
 `/proc/<pid>/fd/N`; the mapping is then admitted by this walk, under
 that name only, held with the partition, and the boot's mounts name it
 as `/proc/<pid>/fd/M`. It does not survive `kexec`.

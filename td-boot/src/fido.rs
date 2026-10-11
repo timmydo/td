@@ -3,7 +3,8 @@
 //! session's HID worker this program's `fido-worker` verb, started from
 //! `/proc/self/exe` as td-secret starts its `hid-worker`. One operation
 //! runs under one two-minute absolute deadline fixed when it begins, on
-//! exactly one connected key. Linked in and run by nothing until 8c.
+//! exactly one connected key. The installed selector's protected release
+//! builds one client per Enter (`selector_release::SecurityKeys`).
 
 use std::fs::File;
 use std::io::Read;
@@ -34,7 +35,6 @@ pub(crate) fn worker(index: &str, inode: &str, rdev: &str) -> Result<(), String>
 }
 
 /// The root USB transport: root-owned mode-0600 `/dev/hidrawN` nodes.
-#[allow(dead_code, reason = "the selector's FIDO2 release calls it from 8c")]
 pub(crate) struct Root;
 impl Devices for Root {
     type Node = Device;
@@ -51,20 +51,17 @@ impl Devices for Root {
 }
 
 /// One selector operation's token access and its absolute deadline.
-#[allow(dead_code, reason = "the selector's FIDO2 release calls it from 8c")]
 pub(crate) struct Client<D: Devices> {
     devices: D,
     deadline: Instant,
 }
 
-#[allow(dead_code, reason = "the selector's FIDO2 release calls it from 8c")]
 impl Client<Root> {
     pub(crate) fn root() -> Self {
         Self::new(Root, Instant::now())
     }
 }
 
-#[allow(dead_code, reason = "the selector's FIDO2 release calls it from 8c")]
 impl<D: Devices> Client<D> {
     fn new(devices: D, start: Instant) -> Self {
         Self {
@@ -93,6 +90,7 @@ impl<D: Devices> Client<D> {
     }
 
     /// A new fido2 token's credential, excluding the header's.
+    #[allow(dead_code, reason = "protector management calls it")]
     pub(crate) fn create(
         &mut self,
         excluded: &[&[u8]],
@@ -114,7 +112,6 @@ impl<D: Devices> Client<D> {
 /// protocol's ephemeral P-256 scalar. `/dev/random`, as td-tpm's
 /// ephemeral scalar reads it: in early boot it blocks until the kernel's
 /// generator is initialized, where the non-blocking device would not.
-#[allow(dead_code, reason = "the selector's FIDO2 release calls it from 8c")]
 fn entropy(out: &mut [u8]) -> Result<(), String> {
     File::open("/dev/random")
         .and_then(|mut random| random.read_exact(out))

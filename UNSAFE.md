@@ -117,7 +117,9 @@ td-tpm's safe file I/O on `/dev/tpmrm0`, their ephemeral key and the
 lockout authorization std reads of `/dev/random`, and their
 cryptography td-fido's safe P-256, AES and HMAC-SHA256. Since increment
 8b td-boot depends on td-fido too and serves its sessions' HID worker as
-its `fido-worker` verb, linked in and run by nothing yet: the worker
+its `fido-worker` verb, which since 8c the installed selector's
+protected release runs, one root worker per security-key attempt
+(`td-install/ENCRYPTION.md` "Protected release"): the worker
 reads and writes `/dev/hidrawN` with std file I/O, reads the report
 descriptor from sysfs and bounds its life with a sleeping thread, so no
 hidraw ioctl (`HIDIOCGRDESC` or another) joins any roster, and td-boot
@@ -436,9 +438,11 @@ hung-up terminal reports `POLLERR` beside it), so a hang-up is end of
 input; `POLLERR` or `POLLNVAL` without it drops the line.
 
 The selector initramfs links it, and nothing else does: the installed
-selector's recovery flow runs it once per entry as td-boot's child and
-reads its line from the pipe (`td-install/ENCRYPTION.md` "Selector
-release"); the live selector, the same stock initramfs, never runs it,
+selector's recovery flow, and since 8c its protected release (the TPM
+PIN, another way's entry, the reseal's answer and new PIN, and a
+security key's PIN), run it once per entry as td-boot's child and read
+its line from the pipe (`td-install/ENCRYPTION.md` "Selector release"
+and "Protected release"); the live selector, the same stock initramfs, never runs it,
 and the image's shape check refuses it in the deployment initramfs or
 the root. Its one operand is the prompt, 1 to 128 printable ASCII bytes,
 and it takes no device operand. It refuses a stdout that is not a pipe

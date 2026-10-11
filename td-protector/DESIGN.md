@@ -641,8 +641,11 @@ commit, the lockout token's encryption, the codecs of the tokens 8a
 names and the reader's protected bounds below, and, from 8c's first
 commit, the plans on protected headers and the runner's `token import
 --token-replace`, and from its second the protected release with the
-lockout's take, proof, counter and reset: library code nothing in
-production calls until td-boot dispatches to it. The lockout's clear,
+lockout's take, proof, counter and reset, which td-boot's installed
+selector runs on a protected header from its third, and the deployment
+initramfs's PolicyPCR-only check of tpm-pin tokens. Before item 9 only
+a header root wrote through the worker, or one forged on the disk,
+reaches them. The lockout's clear,
 the secure-boot, config and update-retry tokens and the upgrade's plans
 and `reencrypt` shapes are not.
 

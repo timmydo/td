@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 
 use td_protector::cryptsetup::{self, Cryptsetup, KeyFile};
 use td_protector::luks2::{self, Header};
+use td_protector::protected::TpmPin;
 use td_protector::release::{self, Tpm};
 use td_protector::token::Token;
+use td_protector::{protected_plan, protected_release};
 use td_protector::{Secret, UnsealError};
 
 use crate::{invalid, protocol, volume};
@@ -150,6 +152,9 @@ pub(crate) trait Unlocker {
     fn header(&mut self) -> Result<Header, String>;
     /// One td token's unseal on a fresh TPM client.
     fn unseal(&mut self, token: &Token) -> Result<Secret, UnsealError>;
+    /// One tpm-pin token's PolicyPCR alone on a fresh TPM client: no Load,
+    /// Unseal or PIN (td-protector's `policy_pcr_alone`).
+    fn policy_pcr(&mut self, token: &TpmPin) -> Result<(), UnsealError>;
     /// One cryptsetup command (`Cryptsetup::run`).
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()>;
     /// The active mapping of the partition that discovery admits.
@@ -171,9 +176,13 @@ pub(crate) enum Unlocked {
 /// attempted. The tokens are the selector's release candidates, so none
 /// naming keyslot 0. Each one's unseal must be refused by policy or at
 /// load, or find no SHA-256 bank to meet a policy with; a release, or any
-/// other outcome, is the halt reason. A header td's reader refuses gives
-/// the check no tokens, so nothing is attempted. Console lines are best
-/// effort: a failed write must not turn a halt into an exit.
+/// other outcome, is the halt reason. Each tpm-pin token is then tried by
+/// PolicyPCR alone ("Protected release"), which the closed cap refuses
+/// before any authorization: a PolicyPCR the TPM accepts, or any outcome
+/// but that refusal and a missing SHA-256 bank, is the halt reason. A
+/// header td's reader refuses gives the check no tokens, so nothing is
+/// attempted. Console lines are best effort: a failed write must not turn
+/// a halt into an exit.
 pub(crate) fn check_cap<U: Unlocker>(unlocker: &mut U, out: &mut dyn Write) -> Option<String> {
     if !unlocker.tpm_present() {
         let _ =
@@ -216,6 +225,31 @@ pub(crate) fn check_cap<U: Unlocker>(unlocker: &mut U, out: &mut dyn Write) -> O
                 return Some(format!(
                     "post-cap unseal of td token {number} ({role}) did not show release closed: \
                      {error}; deployment boot refused"
+                ));
+            }
+        }
+    }
+    for (number, token) in protected_plan::tpm_pins(&header) {
+        match unlocker.policy_pcr(token) {
+            Ok(()) => {
+                return Some(format!(
+                    "td token {number} (tpm-pin) passed PolicyPCR after the PCR 12 release \
+                     cap; deployment boot refused"
+                ));
+            }
+            Err(error @ (UnsealError::PolicyRefused(_) | UnsealError::NoSha256Bank)) => {
+                let _ = out.write_all(
+                    format!(
+                        "td-boot: post-cap PolicyPCR of td token {number} (tpm-pin) refused: \
+                         {error}\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            Err(error) => {
+                return Some(format!(
+                    "post-cap PolicyPCR of td token {number} (tpm-pin) did not show release \
+                     closed: {error}; deployment boot refused"
                 ));
             }
         }
@@ -310,6 +344,11 @@ impl Unlocker for System<'_> {
     fn unseal(&mut self, token: &Token) -> Result<Secret, UnsealError> {
         let client = release::DeviceTpm.open().map_err(UnsealError::Other)?;
         release::unseal_token(client, token)
+    }
+
+    fn policy_pcr(&mut self, token: &TpmPin) -> Result<(), UnsealError> {
+        let client = release::DeviceTpm.open().map_err(UnsealError::Other)?;
+        protected_release::policy_pcr_alone(client, token)
     }
 
     fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
@@ -504,6 +543,9 @@ mod tests {
         tpm: bool,
         header: Result<Header, String>,
         answers: Vec<Answer>,
+        /// What PolicyPCR answers for each tpm-pin token, by its salt's
+        /// first byte.
+        policy: Vec<Answer>,
         run_fails: bool,
         admit: Option<&'static str>,
         events: Vec<String>,
@@ -522,6 +564,7 @@ mod tests {
                 tpm: true,
                 header: Ok(header(tokens)),
                 answers: answers.to_vec(),
+                policy: Vec::new(),
                 run_fails: false,
                 admit: Some(protocol::VOLUME_MAPPING_NAME),
                 events: Vec::new(),
@@ -548,6 +591,16 @@ mod tests {
                 Answer::Bankless => Err(UnsealError::NoSha256Bank),
                 Answer::Other => Err(UnsealError::Other("no reply".into())),
                 Answer::Release => Ok(Secret::generate().unwrap()),
+            }
+        }
+        fn policy_pcr(&mut self, token: &TpmPin) -> Result<(), UnsealError> {
+            self.events.push(format!("policy {}", token.salt[0]));
+            match self.policy[usize::from(token.salt[0])] {
+                Answer::Policy => Err(UnsealError::PolicyRefused("0x1c4".into())),
+                Answer::Load => Err(UnsealError::LoadRefused("0x1df".into())),
+                Answer::Bankless => Err(UnsealError::NoSha256Bank),
+                Answer::Other => Err(UnsealError::Other("no reply".into())),
+                Answer::Release => Ok(()),
             }
         }
         fn run(&mut self, args: &[OsString], input: &[u8]) -> io::Result<()> {
@@ -616,6 +669,89 @@ mod tests {
         assert_eq!(argv[..4], ["open", "--type", "luks2", "--volume-key-file"]);
         assert!(argv[4].starts_with(&prefix), "{argv:?}");
         assert_eq!(argv[5..], ["/proc/7/fd/3", protocol::VOLUME_MAPPING_NAME]);
+    }
+
+    /// A protected header: each tpm-pin token by PolicyPCR alone, after the
+    /// device-bound candidates; a refusal or no SHA-256 bank goes on, and
+    /// anything else, a PolicyPCR the TPM accepts first, halts before
+    /// cryptsetup. A device-bound header sends none.
+    #[test]
+    fn tpm_pin_tokens_are_checked_by_policy_pcr_alone() {
+        use td_protector::pin::PinPcrs;
+        use td_protector::protected::{self, FidoRole};
+        let pin = |salt: u8, keyslot: Option<u8>| {
+            protected::Token::TpmPin(TpmPin {
+                keyslot,
+                pcrs: PinPcrs::Selector,
+                primary: [0x0b; 34],
+                salt: [salt; 32],
+                sealed: SealedObject {
+                    public: vec![1; 8],
+                    private: vec![2; 8],
+                },
+            })
+        };
+        let protected_header = |policy: &[Answer]| {
+            let mut unlocker = Scripted::new(&[]);
+            let mut header = header(Vec::new());
+            header.protected = vec![
+                (0, protected::Token::RecoveryKey { keyslot: Some(0) }),
+                (1, pin(0, Some(1))),
+                // A keyslot-less token is tried too.
+                (2, pin(1, None)),
+                (
+                    3,
+                    protected::Token::Fido2(protected::Fido2 {
+                        keyslot: Some(2),
+                        role: FidoRole::Recovery,
+                        credential: vec![7; 16],
+                        salt: [3; 32],
+                        x: [4; 32],
+                        y: [5; 32],
+                    }),
+                ),
+            ];
+            unlocker.header = Ok(header);
+            unlocker.policy = policy.to_vec();
+            unlocker
+        };
+        for refusals in [
+            [Answer::Policy, Answer::Policy],
+            [Answer::Bankless, Answer::Policy],
+        ] {
+            let mut unlocker = protected_header(&refusals);
+            let (result, out) = unlock_with(&mut unlocker);
+            assert!(matches!(result.unwrap(), Unlocked::Mapping(_)));
+            assert_eq!(
+                unlocker.events,
+                ["tpm", "header", "policy 0", "policy 1", "run open", "admit"]
+            );
+            assert_eq!(out.matches("post-cap PolicyPCR of td token").count(), 2);
+        }
+        for (policy, tried) in [
+            ([Answer::Release, Answer::Policy], 1),
+            ([Answer::Policy, Answer::Release], 2),
+            ([Answer::Other, Answer::Policy], 1),
+            ([Answer::Load, Answer::Policy], 1),
+        ] {
+            let mut unlocker = protected_header(&policy);
+            let (result, _) = unlock_with(&mut unlocker);
+            let Unlocked::Halt(reason) = result.unwrap() else {
+                panic!("did not halt");
+            };
+            assert!(reason.contains("deployment boot refused"), "{reason}");
+            let sent = unlocker
+                .events
+                .iter()
+                .filter(|event| event.starts_with("policy"))
+                .count();
+            assert_eq!(sent, tried);
+            assert!(!unlocker.events.iter().any(|event| event.starts_with("run")));
+        }
+        // A device-bound header sends no PolicyPCR.
+        let mut unlocker = Scripted::new(&[Answer::Policy]);
+        let _ = unlock_with(&mut unlocker);
+        assert!(!unlocker.events.iter().any(|e| e.starts_with("policy")));
     }
 
     #[test]

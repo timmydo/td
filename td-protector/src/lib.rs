@@ -5,7 +5,8 @@
 //! the transition planner and the selector's release orchestration
 //! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
 //! protected tier's PIN primitives, token codecs, lockout token
-//! encryption, plans and release, which nothing in production calls yet.
+//! encryption, plans and release, which the installed selector runs on a
+//! protected header.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
