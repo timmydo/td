@@ -124,6 +124,18 @@ pub fn token_import_args(device: &Path, id: Option<u8>) -> Vec<OsString> {
     args
 }
 
+/// `token import` of the JSON on standard input as token `id`, replacing
+/// the token there in the one header commit cryptsetup makes of an import
+/// (`--token-replace`), so no cut leaves the number empty.
+pub fn token_replace_args(device: &Path, id: u8) -> Vec<OsString> {
+    let mut args = os(&["token", "import", "--token-id"]);
+    args.push(id.to_string().into());
+    args.push("--token-replace".into());
+    args.push("--json-file=-".into());
+    args.push(device.into());
+    args
+}
+
 /// `token remove` of token `id`.
 pub fn token_remove_args(device: &Path, id: u8) -> Vec<OsString> {
     let mut args = os(&["token", "remove", "--token-id"]);
@@ -558,6 +570,18 @@ mod tests {
         assert_eq!(
             words(&token_import_args(device, None)),
             ["token", "import", "--json-file=-", "/dev/loop7"]
+        );
+        assert_eq!(
+            words(&token_replace_args(device, 5)),
+            [
+                "token",
+                "import",
+                "--token-id",
+                "5",
+                "--token-replace",
+                "--json-file=-",
+                "/dev/loop7"
+            ]
         );
         assert_eq!(
             words(&token_remove_args(device, 3)),

@@ -638,10 +638,12 @@ each landing in the sub-increment ENCRYPTION.md names.
 The PIN codec, the authValue and the tpm-pin policy with its chain
 check are current ("PIN and tpm-pin policy"), as are, from 8a's last
 commit, the lockout token's encryption, the codecs of the tokens 8a
-names and the reader's protected bounds below, library code nothing in
-production calls. The lockout's TPM sequences, the secure-boot, config
-and update-retry tokens, the plans, the runner's new shapes and the
-release are not.
+names and the reader's protected bounds below, and, from 8c's first
+commit, the plans on protected headers and the runner's `token import
+--token-replace`: library code nothing in production calls. The
+lockout's TPM sequences, the secure-boot, config and update-retry
+tokens, the upgrade's plans and `reencrypt` shapes and the release are
+not.
 
 **Lockout.** `lockout::seal(volume_key, uuid, l, name)` and `open`
 implement ENCRYPTION.md's lockout token: HKDF-SHA256 over the volume key
@@ -807,15 +809,67 @@ keyslot and token. While a `td-upgrade` token remains, only the upgrade
 planner runs, over ENCRYPTION.md's states U0 to U5, read from the header
 alone: the data segment's digest against `from`, cryptsetup's
 online-reencryption requirement, and which tokens exist. A pending
-fido2 token without a `td-upgrade` token is an orphan. The planner
-computes each step's resulting JSON size and refuses a step whose header
-would not fit the 12 KiB area, before writing.
+fido2 token without a `td-upgrade` token is an orphan. The upgrade
+planner computes each step's resulting JSON size and refuses a step
+whose header would not fit the 12 KiB area, before writing.
+
+Since 8c, `protected_plan` is that planner for protected headers, pure
+as `transition` is. `check` admits a header only when it is protected
+(`luks2::Kind`; device-bound headers are `transition`'s and upgrading
+ones 8f's), of one shape, the FIDO2-primary shape being a header with a
+fido2-primary token and the TPM-primary shape any other, with no
+fido2-primary token beside a tpm-pin or lockout token (`MixedShape`), a
+TPM-primary header holding a marker that names a keyslot
+(`NoRecoveryMarker`), and no keyslot named by two tokens of any type
+but two tpm-pin tokens (`SharedKeyslot`). `plan` takes the protector
+whose keyslot's test passed this boot (`Opened`: a tpm-pin or fido2
+token, or the recovery key on the marker's keyslot), which the release
+ran and the plan does not repeat, and the confirmed reseal's new
+tpm-pin token, if any. Four choices go beyond ENCRYPTION.md's text, each
+failing closed:
+
+- Only a release by the shape's primary protector (tpm-pin in the TPM
+  shape, fido2-primary in the FIDO2 shape) or a confirmed reseal plans.
+  "Every tpm-pin token but the one that released or was resealed" is
+  read after a tpm-pin release: a fido2-recovery or recovery-key release
+  without a reseal plans nothing, orphans included, as the device-bound
+  recovery without a reseal does, so a boot through a security key, a
+  locked-out TPM's included, never retires the tpm-pin protector.
+- An orphan keyslot is killed only beside a marker naming the recovery
+  keyslot, never the opener's, the marker's or one a protected or
+  foreign token names; without a marker, in the FIDO2 shape, no keyslot
+  is an orphan, since keyslot 0 could still hold the recovery key. An
+  orphan token is a tpm-pin, fido2 or marker token naming no keyslot;
+  a lockout or `td-request` token names none by its format.
+- A reseal whose token would exceed the two-token bound first retires
+  every tpm-pin keyslot and token, keyslot then token, under the
+  opener, as the device-bound planner retires early at its bound; it
+  then adds at the lowest free keyslot from 1, imports at the lowest
+  free number, which cryptsetup chooses, tests, and retires the old
+  protectors under the new keyslot's key.
+- The lockout token's writes are the planner's too: `lockout_import`
+  imports it as the number the header's lockout token holds, with
+  `--token-replace`, or else as the lowest number no token holds,
+  naming it explicitly so that the take's later writes can name it;
+  `lockout_proven` replaces it there with `proven` set, and
+  `lockout_remove` removes it. Only a header `check` admits in the TPM
+  shape takes one; a FIDO2-shape header is refused with `NoLockout`.
+
+Every kill carries the key of a keyslot that remains, and `Plan::confirm`
+compares cryptsetup's own metadata with the header the plan was
+computed from, as `transition`'s does; the release confirms once, before
+its first write (`protected_plan::confirm`). A step whose header would
+not fit is refused by cryptsetup's own commit, which leaves the header
+unchanged: the plans stay within the reader's per-class bounds, which
+the header measurement below covers with 1 KiB to spare.
 
 **Runner.** The runner gains `reencrypt` in three spelled shapes, the
 upgrade's initialization with `--resilience checksum` or `--resilience
 journal` (ENCRYPTION.md's argument list) and `--resume-only`, each with
 `--active-name td-selector` and the key on standard input, and `token
-import` with and without `--token-replace` for a token id. Its
+import` with and without `--token-replace` for a token id, the second
+current since 8c (`token_replace_args`), cryptsetup's one header commit
+replacing the token in place. Its
 `luksKillSlot` floor stays 32 bytes, which a FIDO2 passphrase and the
 recovery key's 48 digits meet.
 
@@ -857,6 +911,8 @@ marker, lockout, `td-upgrade` and `td-request` tokens. The lockout's
 HKDF expands two blocks. A plan has at most 39
 steps: two tests, a kill per keyslot from 1 to 31, a removal per td
 token, an add and an import. The runner's inputs are at most one page.
+A protected plan has at most 48 steps: a kill per keyslot but the
+opener's, a removal per td token, an add, an import and a test.
 A PIN is at most 63 bytes, and a chain check sends one PCR_Read, one
 CreatePrimary, one Load and two flushes. A release tries at most four
 tokens, seals at most one protector, caps once, and runs at most one
@@ -1047,7 +1103,25 @@ protected one, two device-bound tokens beside `td-upgrade`, a
 malformed protected token, a lockout naming a keyslot, a role td does
 not know yet and a token naming an absent keyslot. Planner tests refuse
 protected and upgrading headers and leave pending fido2 tokens beside a
-device-bound header with their numbers taken. td-fido's `hkdf_expand`
+device-bound header with their numbers taken. Protected-plan tests, over
+a model of cryptsetup's commits whose every state the reader's bounds
+must admit, pin a tpm-pin release retiring a superseded protector, an
+orphan keyslot and an orphan token; two tpm-pin tokens on one keyslot
+keeping it for the one that released; a fido2-recovery or recovery-key
+release planning nothing; the reseal after each, and beside two tpm-pin
+tokens retiring both first; no reseal after a tpm-pin release or in
+the FIDO2 shape; a fido2-primary release removing only orphans, and no
+keyslot as an orphan without a marker; forged headers refused before
+any step (a tpm-pin token on a fido2 or the recovery keyslot, a fido2 or
+foreign token on a tpm-pin keyslot, a fido2-primary token beside a
+tpm-pin or lockout token, the TPM shape without a marker or with one
+naming none, an upgrading and a device-bound header), each also
+refusing the lockout import; an opened token of another kind or naming
+no keyslot; metadata that disagrees; no free keyslot or token number and
+an object over the token's bounds; the lockout token's import, proof
+mark and removal at the numbers the planner names; and every plan, a
+tpm-pin release and the reseal beside one and two old protectors, cut
+after each of its steps, converging over the next boots on one header. td-fido's `hkdf_expand`
 is pinned to RFC 5869's three SHA-256 cases at their whole lengths,
 with the info split at every offset, one block agreeing with `hkdf`, and
 an output over 8160 bytes refused untouched.

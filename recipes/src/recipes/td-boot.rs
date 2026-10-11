@@ -134,6 +134,8 @@ const PROTECTOR_LOCKOUT_RS: &str = include_str!("../../../td-protector/src/locko
 const PROTECTOR_LUKS2_RS: &str = include_str!("../../../td-protector/src/luks2.rs");
 const PROTECTOR_PIN_RS: &str = include_str!("../../../td-protector/src/pin.rs");
 const PROTECTOR_PROTECTED_RS: &str = include_str!("../../../td-protector/src/protected.rs");
+const PROTECTOR_PROTECTED_PLAN_RS: &str =
+    include_str!("../../../td-protector/src/protected_plan.rs");
 const PROTECTOR_RECOVERY_RS: &str = include_str!("../../../td-protector/src/recovery.rs");
 const PROTECTOR_RELEASE_RS: &str = include_str!("../../../td-protector/src/release.rs");
 const PROTECTOR_TOKEN_RS: &str = include_str!("../../../td-protector/src/token.rs");
@@ -300,6 +302,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-protector/src/protected.rs".into(),
             content: PROTECTOR_PROTECTED_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-protector/src/protected_plan.rs".into(),
+            content: PROTECTOR_PROTECTED_PLAN_RS.into(),
             exec: false,
         },
         Step::WriteFile {

@@ -4,8 +4,8 @@
 //! LUKS2 tokens with their bounded header reader, the cryptsetup runner,
 //! the transition planner and the selector's release orchestration
 //! (DESIGN.md, td-install/ENCRYPTION.md "Device-bound default"); and the
-//! protected tier's PIN primitives, token codecs and lockout token
-//! encryption, which nothing in production calls yet.
+//! protected tier's PIN primitives, token codecs, lockout token
+//! encryption and plans, which nothing in production calls yet.
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -28,6 +28,7 @@ pub mod lockout;
 pub mod luks2;
 pub mod pin;
 pub mod protected;
+pub mod protected_plan;
 pub mod recovery;
 pub mod release;
 pub mod token;
