@@ -46,7 +46,7 @@ fn show(source: &str) -> Vec<String> {
                     SpanKind::Code => format!("`{text}`"),
                     SpanKind::SoftBreak => " ".to_string(),
                     SpanKind::HardBreak => "|".to_string(),
-                    SpanKind::Image { source: image } => {
+                    SpanKind::Image { source: image, .. } => {
                         let link = doc.links.get(image).unwrap();
                         format!("![{text}]({})", crate::text(source, &link.destination))
                     }
@@ -99,8 +99,15 @@ fn check(source: &str, doc: &Document) {
     for span in &doc.spans {
         assert!(ok(&span.range), "{span:?} in {source:?}");
         assert!(span.link.is_none_or(|l| l < doc.links.len()));
-        if let SpanKind::Image { source } = span.kind {
+        if let SpanKind::Image {
+            source,
+            open,
+            close,
+        } = span.kind
+        {
             assert!(source < doc.links.len());
+            assert!(ok(&(open..close)), "{span:?} in {source:?}");
+            assert!(open <= span.range.start && span.range.end <= close);
         }
     }
     for link in &doc.links {
@@ -413,5 +420,28 @@ fn any_input_parses_to_ranges_inside_it() {
         seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
         let doc = parse(&source).unwrap();
         check(&source, &doc);
+    }
+}
+
+#[test]
+fn an_images_markup_runs_from_its_bang_past_its_parenthesis() {
+    for (source, markup) in [
+        ("x ![a](b) y", "![a](b)"),
+        ("x ![a](b \"t\" ) y", "![a](b \"t\" )"),
+        ("x ![a](b (t)) y", "![a](b (t))"),
+        ("x ![a](<b c>) (y)", "![a](<b c>)"),
+        ("> x ![a\n> b](c) y", "![a\n> b](c)"),
+        ("[![a](b)](c)", "![a](b)"),
+    ] {
+        let doc = parse(source).unwrap();
+        let (open, close) = doc
+            .spans
+            .iter()
+            .find_map(|span| match span.kind {
+                SpanKind::Image { open, close, .. } => Some((open, close)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no image in {source:?}"));
+        assert_eq!(&source[open..close], markup, "{source:?}");
     }
 }

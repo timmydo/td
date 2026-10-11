@@ -11,6 +11,7 @@ dependencies = [
  "td-fs",
  "td-html",
  "td-json",
+ "td-markdown",
  "td-test-compositor",
  "td-toml",
  "td-ui",
@@ -34,6 +35,10 @@ version = "0.1.0"
 
 [[package]]
 name = "td-json"
+version = "0.1.0"
+
+[[package]]
+name = "td-markdown"
 version = "0.1.0"
 
 [[package]]

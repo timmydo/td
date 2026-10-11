@@ -46,6 +46,7 @@ enum Item {
     Image {
         alt: Range<usize>,
         source: usize,
+        markup: Range<usize>,
     },
     /// A line ending, at its newline.
     Soft(usize),
@@ -437,6 +438,7 @@ impl Inline<'_> {
             self.push(Item::Image {
                 alt: after..at,
                 source,
+                markup: start..end,
             });
             return end;
         }
@@ -839,12 +841,21 @@ impl Inline<'_> {
                 }
                 Item::LinkStart(l) => link = Some(*l),
                 Item::LinkEnd => link = None,
-                Item::Image { alt, source } => {
+                Item::Image {
+                    alt,
+                    source,
+                    markup,
+                } => {
                     // Its alt text up to a line's end.
                     let inner = self.text.get(alt.clone()).unwrap_or("");
                     let end = inner.find('\n').map_or(alt.end, |at| alt.start + at);
+                    let markup = self.map_range(markup);
                     spans.push(Span {
-                        kind: SpanKind::Image { source: *source },
+                        kind: SpanKind::Image {
+                            source: *source,
+                            open: markup.start,
+                            close: markup.end,
+                        },
                         range: self.map_range(&(alt.start..end)),
                         style,
                         link,

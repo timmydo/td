@@ -787,7 +787,7 @@ mod tests {
             "{content}"
         );
         assert!(
-            content.contains("renders no Markdown, so write them in plain text"),
+            content.contains("The window renders your replies' Markdown"),
             "{content}"
         );
         assert!(

@@ -121,9 +121,13 @@ pub enum SpanKind {
     /// A hard line break, or a line ending in a code block or table.
     HardBreak,
     /// An image: `range` its alt text up to its first line's end, `source`
-    /// its destination in `Document::links`.
+    /// its destination in `Document::links`, its markup the source from
+    /// `open`, where its `![` starts, to `close`, past its closing
+    /// parenthesis.
     Image {
         source: usize,
+        open: usize,
+        close: usize,
     },
 }
 

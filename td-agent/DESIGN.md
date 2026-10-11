@@ -102,10 +102,10 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares six
+td's source-built stage2 toolchain. Its manifest declares eight
 dependencies, all td crates by path: `td-civil`, `td-fetch-client`,
-`td-fs`, `td-json`, `td-toml` and `td-ui`, and its lock lists exactly
-those and td-agent. It
+`td-fs`, `td-html`, `td-json`, `td-markdown`, `td-toml` and `td-ui`, and
+its lock lists exactly those and td-agent. It
 carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
 fetch service (APPLICATIONS.md §W.8) by td-fetch-client, as td-news and
@@ -158,10 +158,14 @@ There are four parties, and the design is the separation between them:
    personalities. Together they own the window, the conversation store,
    the model client, the API key, the fetch grant, the repository store
    and every decision of §11. They never execute anything a model wrote
-   and never read or write workspace file content. They run git outside a
-   jail only on repositories no jail can write, with the fixed invocation
-   of §9, and everything else of git in maintenance instances. How the
-   work divides between them is below.
+   and never read or write workspace file content. A reply's link the
+   person clicks is handed to their browser (§4, "Markdown") as data:
+   one `http` or `https` URL that td-ui's `open::url` checks is one word
+   and no option, run without a shell; its target, host first, shows
+   when the pointer rests on it, and the status names it once opened.
+   They run git outside a jail only on repositories no jail can write,
+   with the fixed invocation of §9, and everything else of git in
+   maintenance instances. How the work divides between them is below.
 2. **The tool host** is the same binary under the `tool-host` personality,
    started inside a jail instance. It performs every tool effect, file
    reads and edits as well as shell commands, local commits and the
@@ -1161,6 +1165,53 @@ copyable:
 - copying never includes the chrome: headers, buttons and verdict marks are
   not part of any selection.
 
+**Markdown.** A reply's text, the conversation's or a sub-agent's, is
+drawn as Markdown: `markdown.rs` parses it with td-markdown and maps the
+document onto td-ui's styled text (td-ui DESIGN.md "Styled sections"),
+so a copy of a reply, or of any part of it, is the Markdown as written.
+Headings are bold; emphasis, strong emphasis and strikethrough are
+italic, bold and struck; a code span and a fenced or indented code block
+stand on the code ground; a list item's rows sit behind its marker, a
+bullet `•` or its number, and a quotation's behind a bar `│` in quiet
+ink, both cut to td-ui's `MAX_PREFIX_CHARS`; a thematic break is a quiet
+rule; a table shows as written, row for row. A link's text is in the
+accent ink, underlined: the pointer resting on it shows its target in a
+tooltip, so where a link leads shows before it is followed, and a click
+asks the window to open it (`Request::OpenLink`), which hands it to
+td-ui's `open::url`: an `http` or `https` URL only, in the person's
+browser (`BROWSER`, else `xdg-open`), never through a shell, the window
+saying in its status which link it opened or why it could not. A
+destination `open::url` would refuse (another scheme, a relative path)
+is no link, drawn as plain text, so nothing looks followable that is
+not. The tooltip shows the target as it is when it fits and names no
+user before its host; else the host it opens first, then as much of the
+target as the region holds, so `https://good@evil/` names `evil`. The
+target is taken at the click, before a new drawing of a streaming reply
+may number its links anew. An image is never fetched: it shows as its
+alt text in brackets, `image` with none, in quiet ink and linked to its
+destination unless it is a link's own, its brackets standing for its
+markup so a copy reaching into it takes the image's Markdown whole. Text
+the styled text cannot hold (past td-ui's bounds) is shown as written.
+The reasoning, the person's messages, other conversations' messages,
+tool blocks and notices stay plain text; a reply with calls and no text
+stands on its reasoning's summary (above), which is drawn as the reply
+is, since summaries carry Markdown headings of their own. A heading in a
+quotation is bold in the quotation's quiet ink.
+
+A streaming reply's text is kept as it comes and drawn again whole,
+since a delimiter that closes later restyles what came before it: at
+each delta up to `RESTYLE_EAGER_BYTES` (64 KiB), and past that by the
+clock at most once each `RESTYLE_MS` (50 ms), since each drawing parses
+and lays out the reply whole. A reply that grows past what styled text
+holds is drawn again as written and appended to from then on, never cut
+short for it; a process that dies first draws the text that waited for
+the clock. The reply settles as drawn when its logged text is the text
+drawn, and is replaced by the logged reply when not.
+The window loads the pinned face's four styles
+(`pinned_face::load_styled_or_note`), so bold and italic text draws in
+the face's own bold and italic, and a missing style is the whole face
+refused for the bitmap one, whose bold and italic are drawn.
+
 Everything else the list draws (wrapping, collapsing, scrolling and paging)
 is the list's own, under the same raster and typeface contracts as the
 toolkit's other widgets.
@@ -1287,30 +1338,29 @@ conversations, each against its limit where one is set, the key's
 credit, the mode, `no limits` (the resource limits of §8) and `0
 background` (the background processes of §12).
 
-**As built (increment 7).** A streamed reply is drawn as it arrives:
-its first delta adds an `assistant` message with the status
-`streaming`, its reasoning a collapsed section before its text, and
-each later delta is appended to its section through the list's
-`append`, so the window does no more per delta than the bytes it
-brought; reasoning that comes after text draws the message again with
-its section first. When the reply is logged the message is settled: kept
-as drawn, its reasoning left open or closed as the human left it, when
-its sections are the logged reply's, and replaced by the logged reply
-otherwise. A transcript at its limit mid-stream makes room as for a new
-message, dropping its oldest; a reply it still cannot draw is marked
-`cut short`, its later deltas dropped, and the logged reply replaces
-it; one the transcript cannot hold even so stays as drawn with the
-verdict `cut short`. A reply logged incomplete (§5) carries the
-verdict `incomplete`; one whose process fails mid-stream keeps what was
-drawn, marked `interrupted`, until a restart draws the transcript again
-from the log. While the open conversation's turn runs, `Escape` asks
-it to interrupt and the status row says so; otherwise `Escape` is the
-focused widget's. `interrupt` is the driven action. The turn's
-`td-agent` message then says that the stream was closed but that not
-every provider stops generating, or billing, when a stream closes, and
-that `C-r` asks again. A turn whose reply is logged and whose title is
-being asked for (§13) does not hear an interrupt: the title request is
-short and counted.
+**As built (increment 7).** A streamed reply is drawn as it arrives: its
+first delta adds an `assistant` message with the status `streaming`, its
+reasoning a collapsed section before its text, and each later delta is
+appended to its section, the reasoning's through the list's `append`,
+the text's drawn again whole as Markdown (§4, "Markdown"); reasoning
+that comes after text draws the message again with its section first.
+When the reply is logged the message is settled: kept as drawn, its
+reasoning left open or closed as the human left it, when its sections
+are the logged reply's, and replaced by the logged reply otherwise. A
+transcript at its limit mid-stream makes room as for a new message,
+dropping its oldest; a reply it still cannot draw is marked `cut short`,
+its later deltas dropped, and the logged reply replaces it; one the
+transcript cannot hold even so stays as drawn with the verdict `cut
+short`. A reply logged incomplete (§5) carries the verdict `incomplete`;
+one whose process fails mid-stream keeps what was drawn, marked
+`interrupted`, until a restart draws the transcript again from the log.
+While the open conversation's turn runs, `Escape` asks it to interrupt
+and the status row says so; otherwise `Escape` is the focused widget's.
+`interrupt` is the driven action. The turn's `td-agent` message then
+says that the stream was closed but that not every provider stops
+generating, or billing, when a stream closes, and that `C-r` asks again.
+A turn whose reply is logged and whose title is being asked for (§13)
+does not hear an interrupt: the title request is short and counted.
 
 **As built (increment 8).** The open conversation's todo list is drawn
 above the composer, over the chrome, collapsed to one line: how many
@@ -6450,10 +6500,13 @@ reserved like any request; the first line of the task stands until then.
 `prompt/conversation.txt` and `prompt/title.txt`, with the workspace
 paragraphs below. With no tools, no environment block and no project
 instructions yet, the prefix is the static text alone, which says that
-the conversation has no tools and that the window shows plain text,
-naming the Markdown marks its replies are not to use (headings,
-emphasis, backticks and fences, tables) and the plain forms a list,
-steps and code take; files it writes keep their own format. A
+the conversation has no tools and that the window renders its replies'
+Markdown (§4, "Markdown"), naming what it renders (headings, emphasis,
+strikethrough, code spans and fenced blocks, lists, quotes and links the
+person can click), that tables show as written in a fixed-width font,
+that an image shows as its alt text with a link and is never fetched,
+and that copying a reply copies its Markdown; files it writes keep
+their own format. A
 title request is the title prompt and one user message quoting the
 first message and the start of the reply, each cut to 4 KiB, with
 `max_tokens` 256. It is sent once, after a conversation's first reply.
@@ -7932,5 +7985,6 @@ person's commands, `/review` and the MCP client are built (§3, §12,
 - **Human review.** Whether td-agent should offer the human a review
   checkout of the publish repository, so that writing git commands never
   run in a jail-written worktree.
-- **Transcript rendering.** Plain text first; which Markdown subset, if any,
-  is worth rendering in the message list. Rendering never fetches.
+- **Transcript rendering.** Replies render Markdown (§4); whether a
+  table is worth laying out as columns, and how an image a reply or a
+  tool returns is shown inline, with nothing fetched by the rendering.

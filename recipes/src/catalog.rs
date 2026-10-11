@@ -527,6 +527,7 @@ mod tests {
                 "td-json",
                 "td-kv",
                 "td-mail",
+                "td-markdown",
                 "td-news",
                 "td-open",
                 "td-pass",

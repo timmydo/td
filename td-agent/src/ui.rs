@@ -262,6 +262,15 @@ struct Streaming {
     reasoning: bool,
 }
 
+/// A reply's text as its message's body: its Markdown styled, or as
+/// written when styled text cannot hold it (DESIGN.md §4, "Markdown").
+fn reply_body(message: Message, text: &str) -> Result<Message, MessagesError> {
+    match crate::markdown::rich(text) {
+        Some(rich) => message.rich(rich),
+        None => message.text(text),
+    }
+}
+
 /// What the open picker chooses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Picking {
@@ -476,6 +485,8 @@ pub enum Request {
     },
     /// List the person's commands.
     Commands,
+    /// Open a reply's link in the browser (DESIGN.md §4, "Markdown").
+    OpenLink(String),
     /// List the person's skills.
     Skills,
     /// The human's answer to `conversation`'s cold-resume card for turn
@@ -774,6 +785,11 @@ const DEBUG_ICON: char = '\u{f188}';
 const DEBUG_TIP: &str = "Show the request and reply (C-S-d)";
 /// How long the pointer rests on a button before its tooltip shows.
 const TIP_DELAY_MS: u64 = 500;
+/// A streaming reply up to this long is drawn again at each delta; a
+/// longer one at most once each `RESTYLE_MS`, since each drawing parses
+/// and lays out the reply whole.
+const RESTYLE_EAGER_BYTES: usize = 64 * 1024;
+const RESTYLE_MS: u64 = 50;
 const COMPOSER_KEYS: &[(&str, &str)] = &[
     (
         "Return/C-Return",
@@ -877,6 +893,14 @@ pub struct App {
     /// A request whose reply the transcript could not draw as it came:
     /// its deltas are dropped, and its reply shown once logged.
     undrawn: Option<u64>,
+    /// The streaming reply's text so far, drawn as Markdown.
+    stream_text: String,
+    /// When the streaming reply was last drawn, and whether text came
+    /// since that it does not show yet.
+    restyled: (u64, bool),
+    /// Whether the streaming reply is shown as written, past what styled
+    /// text holds: its text is then appended as it comes.
+    stream_plain: bool,
     /// The model a conversation with none of its own uses.
     default_model: String,
     /// Each model's context length, as the models list gives it.
@@ -1072,6 +1096,9 @@ impl App {
             meter: Meter::default(),
             streaming: None,
             undrawn: None,
+            stream_text: String::new(),
+            restyled: (0, false),
+            stream_plain: false,
             default_model: String::new(),
             contexts: Vec::new(),
             effort: String::new(),
@@ -2200,6 +2227,9 @@ impl App {
         self.routing_asked = None;
         self.system_shown = false;
         self.streaming = None;
+        self.stream_text = String::new();
+        self.restyled = (0, false);
+        self.stream_plain = false;
         self.undrawn = None;
         if !self.todo.is_empty() {
             self.todo.clear();
@@ -2703,7 +2733,7 @@ impl App {
                     message = message.and_then(|m| m.section("reasoning", reasoning, true));
                 }
                 let message = message
-                    .and_then(|m| m.text(text))
+                    .and_then(|m| reply_body(m, text))
                     .and_then(|m| match (calls.is_empty(), folded) {
                         (true, _) => Ok(m),
                         (false, true) => m.section(&title, &called, true),
@@ -3171,22 +3201,33 @@ impl App {
             Some(streaming) => self.extend_stream(streaming, reasoning, content),
         };
         if let Err(e) = drawn {
-            self.undrawn = Some(request);
-            if let Some(streaming) = self.streaming.filter(|s| s.request == request) {
-                let _ = self
-                    .transcript
-                    .set_status(streaming.index, Some(("cut short", Tone::Bad)));
-            }
-            self.note(format!(
-                "the transcript cannot draw the reply as it comes ({e}); it shows it once whole"
-            ));
+            self.cut_stream(request, &e);
         }
         self.touch();
+    }
+
+    /// The transcript cannot draw request `request`'s reply as it comes:
+    /// its deltas are dropped from here, and its reply shown once logged.
+    fn cut_stream(&mut self, request: u64, e: &str) {
+        self.undrawn = Some(request);
+        self.restyled.1 = false;
+        if let Some(streaming) = self.streaming.filter(|s| s.request == request) {
+            let _ = self
+                .transcript
+                .set_status(streaming.index, Some(("cut short", Tone::Bad)));
+        }
+        self.note(format!(
+            "the transcript cannot draw the reply as it comes ({e}); it shows it once whole"
+        ));
     }
 
     /// The process died mid-stream: what was drawn stays, marked. The log
     /// never holds it; a restart shows the request interrupted.
     fn stream_died(&mut self) {
+        // What came and waits for the clock is drawn first.
+        if self.restyled.1 {
+            let _ = self.restyle();
+        }
         if let Some(streaming) = self.streaming.take() {
             let _ = self
                 .transcript
@@ -3215,8 +3256,6 @@ impl App {
         }
     }
 
-    /// A streaming message: its reasoning section, when there is
-    /// reasoning, then its text.
     /// Whose reply request `request` brings: a sub-agent's is its own,
     /// not the conversation's (DESIGN.md §12, `task`).
     fn author(&self, request: u64) -> &'static str {
@@ -3226,10 +3265,13 @@ impl App {
         }
     }
 
+    /// A streaming message: its reasoning section, when there is
+    /// reasoning, then its text, as Markdown when `styled`.
     fn streaming_message(
         who: &str,
         reasoning: Option<&str>,
         text: &str,
+        styled: bool,
     ) -> Result<Message, String> {
         let mut message = Message::new(who)
             .map(|m| m.side(Side::Left))
@@ -3238,26 +3280,40 @@ impl App {
             message = message.and_then(|m| m.section("reasoning", reasoning, true));
         }
         message
-            .and_then(|m| m.text(text))
+            .and_then(|m| {
+                if styled {
+                    reply_body(m, text)
+                } else {
+                    m.text(text)
+                }
+            })
             .map_err(|e| e.to_string())
     }
 
     fn start_stream(&mut self, request: u64, reasoning: &str, content: &str) -> Result<(), String> {
         let has = !reasoning.is_empty();
-        let message =
-            Self::streaming_message(self.author(request), has.then_some(reasoning), content)?;
+        let message = Self::streaming_message(
+            self.author(request),
+            has.then_some(reasoning),
+            content,
+            true,
+        )?;
         let index = self.push_message(message)?;
         self.streaming = Some(Streaming {
             request,
             index,
             reasoning: has,
         });
+        self.stream_text.clear();
+        self.stream_text.push_str(content);
+        self.restyled = (self.clock, false);
+        self.stream_plain = false;
         Ok(())
     }
 
     fn extend_stream(
         &mut self,
-        mut streaming: Streaming,
+        streaming: Streaming,
         reasoning: &str,
         content: &str,
     ) -> Result<(), String> {
@@ -3266,28 +3322,73 @@ impl App {
                 self.edit_stream(|list, index| list.append(index, 0, reasoning))?;
             } else {
                 // Reasoning after text: drawn again with its section first.
-                let text = self
-                    .transcript
-                    .message(streaming.index)
-                    .and_then(|m| m.section_text(0))
-                    .unwrap_or_default()
-                    .to_string();
+                let text = self.stream_text.clone();
                 let message = Self::streaming_message(
                     self.author(streaming.request),
                     Some(reasoning),
                     &text,
+                    !self.stream_plain,
                 )?;
                 self.edit_stream(|list, index| list.replace(index, message.clone()))?;
                 if let Some(drawn) = self.streaming.as_mut() {
                     drawn.reasoning = true;
                 }
-                streaming.reasoning = true;
             }
         }
         if !content.is_empty() {
-            let section = usize::from(streaming.reasoning);
-            self.edit_stream(|list, index| list.append(index, section, content))?;
+            if self.stream_text.len().saturating_add(content.len()) > td_ui::rich::MAX_BYTES {
+                return Err("the reply is longer than the transcript shows".into());
+            }
+            self.stream_text.push_str(content);
+            if self.stream_plain {
+                let section = usize::from(self.streaming.is_some_and(|s| s.reasoning));
+                self.edit_stream(|list, index| list.append(index, section, content))?;
+            } else if self.stream_text.len() <= RESTYLE_EAGER_BYTES {
+                self.restyle()?;
+            } else {
+                self.restyled.1 = true;
+            }
         }
+        Ok(())
+    }
+
+    /// Draws the streaming reply's text so far as Markdown, whole: a later
+    /// delimiter may restyle what came before it. Past what styled text
+    /// holds, the reply is drawn again as written and appended to from
+    /// then on. A reply already cut short is not drawn.
+    fn restyle(&mut self) -> Result<(), String> {
+        self.restyled = (self.clock, false);
+        let Some(streaming) = self
+            .streaming
+            .filter(|s| self.undrawn != Some(s.request) && !self.stream_plain)
+        else {
+            return Ok(());
+        };
+        let section = usize::from(streaming.reasoning);
+        if let Some(rich) = crate::markdown::rich(&self.stream_text) {
+            // Cloned per try: a try that makes room tries again.
+            self.edit_stream(|list, index| list.set_rich(index, section, rich.clone()))?;
+            return Ok(());
+        }
+        let drawn = self.transcript.message(streaming.index);
+        let collapsed = drawn.is_some_and(|m| m.is_collapsed());
+        let reasoning = streaming.reasoning.then(|| {
+            drawn
+                .and_then(|m| m.section_text(0))
+                .unwrap_or_default()
+                .to_string()
+        });
+        // Drawn again whole, folded as the person left it; its reasoning
+        // is folded again.
+        let message = Self::streaming_message(
+            self.author(streaming.request),
+            reasoning.as_deref(),
+            &self.stream_text,
+            false,
+        )?
+        .collapsed(collapsed);
+        self.edit_stream(|list, index| list.replace(index, message.clone()))?;
+        self.stream_plain = true;
         Ok(())
     }
 
@@ -3728,12 +3829,19 @@ impl App {
 
     // --- input ------------------------------------------------------
 
-    /// A clock tick: the composer's caret blinks by it, and a tooltip's
-    /// delay runs by it, from the first tick its button is under the
-    /// pointer.
+    /// A clock tick: the composer's caret blinks by it, a long streaming
+    /// reply is drawn again by it, and a tooltip's delay runs by it, from
+    /// the first tick its button is under the pointer.
     pub fn tick(&mut self, now: u64) {
         self.clock = now;
         if self.composer.event(PaneEvent::Tick(now)) == PaneOutcome::Changed {
+            self.touch();
+        }
+        if self.restyled.1 && now.saturating_sub(self.restyled.0) >= RESTYLE_MS {
+            let request = self.streaming.map(|s| s.request);
+            if let (Err(e), Some(request)) = (self.restyle(), request) {
+                self.cut_stream(request, &e);
+            }
             self.touch();
         }
         self.retarget();
@@ -3766,6 +3874,16 @@ impl App {
                 self.touch();
             }
         }
+    }
+
+    /// Asks the window to open a reply's link, its target taken now,
+    /// before a new drawing of a streaming reply may number its links
+    /// anew; the click's repaint clears a selection it jittered.
+    fn follow(&mut self, message: usize, section: usize, link: usize) {
+        if let Some(target) = self.transcript.link(message, section, link) {
+            self.requests.push(Request::OpenLink(target.to_string()));
+        }
+        self.touch();
     }
 
     /// The zone the transcript's times are shown in; UTC until the window
@@ -6294,6 +6412,11 @@ impl App {
                     messages::Outcome::Ignored | messages::Outcome::Consumed => {}
                     messages::Outcome::Refused(why) => self.note(format!("copy: {why}")),
                     messages::Outcome::Action(index) => self.debug(index),
+                    messages::Outcome::Link {
+                        message,
+                        section,
+                        link,
+                    } => self.follow(message, section, link),
                     _ => self.touch(),
                 }
             }
@@ -6525,10 +6648,21 @@ impl App {
         else {
             return;
         };
-        if let Some(tooltip) =
-            td_ui::chrome::Tooltip::place(self.surface, tip.text, tip.rect, region)
-        {
-            tooltip.emit(tip.text, damage, sink);
+        // A link's target with its host first, cut to what the region
+        // holds, so where it leads shows however long it is.
+        let link;
+        let text = if matches!(tip.target, Target::Link { .. }) {
+            let cell = CELL_WIDTH * self.surface.scale.value();
+            let room = (region.width as usize / cell.max(1))
+                .saturating_sub(2)
+                .min(td_ui::chrome::TOOLTIP_CHARS);
+            link = crate::markdown::tip(tip.text, room);
+            link.as_str()
+        } else {
+            tip.text
+        };
+        if let Some(tooltip) = td_ui::chrome::Tooltip::place(self.surface, text, tip.rect, region) {
+            tooltip.emit(text, damage, sink);
         }
     }
 
@@ -8042,6 +8176,159 @@ pub mod tests {
         assert_eq!(app.transcript().len(), 8);
     }
 
+    /// A reply is drawn as Markdown as it streams, whole each time, so a
+    /// delimiter that closes later restyles what came before; its copy is
+    /// the Markdown; a click on a link asks the window to open it.
+    #[test]
+    fn a_reply_is_drawn_as_markdown_and_its_links_open() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        app.update(delta(3, "thinking", "**bo"), 0);
+        assert!(text(&app).contains("**bo"), "{}", text(&app));
+        app.update(delta(3, "", "ld** see [docs](https://e.x/d)"), 0);
+        let shown = text(&app);
+        assert!(shown.contains("bold see docs"), "{shown}");
+        assert!(!shown.contains("**"), "{shown}");
+        let source = "**bold** see [docs](https://e.x/d)";
+        let drawn = app.transcript().message(1).unwrap();
+        assert_eq!(drawn.section_text(1), Some(source));
+        // The link under the pointer is named by its tip; a click there
+        // asks for it to be opened.
+        let row = app
+            .transcript()
+            .shown()
+            .find_map(|(rect, shown)| match shown {
+                td_ui::messages::Shown::Text { text, .. } if text.contains("docs") => Some(rect),
+                _ => None,
+            })
+            .unwrap();
+        let y = row.y + 2;
+        let x = (row.x..row.x + i64::from(row.width))
+            .find(|&x| {
+                app.motion(Some((x, y)));
+                app.transcript()
+                    .tip()
+                    .is_some_and(|tip| matches!(tip.target, Target::Link { .. }))
+            })
+            .unwrap();
+        assert_eq!(app.transcript().tip().unwrap().text, "https://e.x/d");
+        app.take_requests();
+        for phase in [PointerPhase::Press, PointerPhase::Release] {
+            app.input(
+                Input::Pointer {
+                    phase,
+                    x,
+                    y,
+                    extend: false,
+                    follow: false,
+                },
+                &mut NoClipboard,
+            );
+        }
+        assert_eq!(
+            app.take_requests(),
+            [Request::OpenLink("https://e.x/d".into())]
+        );
+        // Logged as drawn, it settles as it is.
+        app.update(at(4, reply(3, "thinking", source, false)), 0);
+        let shown = text(&app);
+        assert!(
+            shown.contains("bold see docs") && !shown.contains("**"),
+            "{shown}"
+        );
+        assert_eq!(app.transcript().len(), 2);
+        // A reply first seen in the log is drawn as Markdown too.
+        turn(&mut app, 5, "again");
+        app.update(at(7, request(6, 900)), 0);
+        app.update(at(8, reply(7, "", "- *one*\n- two", false)), 0);
+        let shown = text(&app);
+        assert!(shown.contains("one") && shown.contains("two"), "{shown}");
+        assert!(
+            !shown.contains("*one*") && !shown.contains("- two"),
+            "{shown}"
+        );
+    }
+
+    /// A long streaming reply is drawn again by the clock, at most once a
+    /// `RESTYLE_MS`, not at each delta.
+    #[test]
+    fn a_long_streaming_reply_is_drawn_by_the_clock() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        let long = "word ".repeat(RESTYLE_EAGER_BYTES / 5 + 1);
+        app.tick(1_000);
+        app.update(delta(3, "", &long), 0);
+        let drawn = |app: &App| {
+            app.transcript()
+                .message(1)
+                .and_then(|m| m.section_text(0))
+                .map(str::len)
+        };
+        assert_eq!(drawn(&app), Some(long.len()), "the first delta draws");
+        app.update(delta(3, "", " **more**"), 0);
+        assert_eq!(drawn(&app), Some(long.len()), "waits for the clock");
+        app.tick(1_000 + RESTYLE_MS - 1);
+        assert_eq!(drawn(&app), Some(long.len()));
+        app.tick(1_000 + RESTYLE_MS);
+        assert_eq!(drawn(&app), Some(long.len() + " **more**".len()));
+        let shown = text(&app);
+        assert!(
+            shown.contains("more") && !shown.contains("**"),
+            "restyled: {shown}"
+        );
+    }
+
+    /// A streaming reply past what styled text holds is drawn again as
+    /// written and appended to from then on, not cut short; a process
+    /// that dies first draws the text that waited for the clock.
+    #[test]
+    fn a_streaming_reply_past_styled_text_goes_on_plain() {
+        let mut app = app();
+        turn(&mut app, 1, "hello");
+        app.update(at(3, request(2, 900)), 0);
+        app.update(delta(3, "thinking", "**a** "), 0);
+        // Lines enough to pass the styled text's records.
+        let lines = "a\n".repeat(td_ui::rich::MAX_RECORDS / 2);
+        app.transcript.set_collapsed(1, true).unwrap();
+        app.update(delta(3, "", &lines), 0);
+        app.tick(RESTYLE_MS);
+        let whole = format!("**a** {lines}");
+        let drawn = |app: &App| {
+            app.transcript()
+                .message(1)
+                .and_then(|m| m.section_text(1))
+                .map(str::to_string)
+        };
+        assert_eq!(drawn(&app).as_deref(), Some(whole.as_str()));
+        assert_eq!(
+            app.transcript().message(1).unwrap().section_text(0),
+            Some("thinking")
+        );
+        app.update(delta(3, "", "end"), 0);
+        assert_eq!(drawn(&app), Some(format!("{whole}end")));
+        assert!(
+            app.transcript().message(1).unwrap().is_collapsed(),
+            "folded as left"
+        );
+        let shown = text(&app);
+        assert!(!shown.contains("cut short"), "{shown}");
+        // The append itself shows it plain: a styled section refuses one.
+        // Text waiting for the clock when the process dies is drawn.
+        turn(&mut app, 5, "again");
+        app.update(at(7, request(6, 900)), 0);
+        let long = "word ".repeat(RESTYLE_EAGER_BYTES / 5 + 1);
+        app.update(delta(7, "", &long), 0);
+        app.update(delta(7, "", "tail"), 0);
+        app.update(Update::Failed { reason: "x".into() }, 0);
+        let last = app.transcript().len() - 1;
+        assert_eq!(
+            app.transcript().message(last).unwrap().section_text(0),
+            Some(format!("{long}tail").as_str())
+        );
+    }
+
     /// A transcript at its limit mid-stream makes room as a pushed message
     /// does, and a reply it still cannot hold is marked, not left streaming.
     #[test]
@@ -8062,6 +8349,8 @@ pub mod tests {
         for _ in 0..8 {
             app.update(delta(request, "", &piece), 0);
         }
+        // A reply this long is drawn by the clock.
+        app.tick(RESTYLE_MS);
         assert!(app.transcript().len() as u64 <= full, "evicted");
         let last = app.transcript().len() - 1;
         let whole = piece.repeat(8);

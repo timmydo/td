@@ -405,6 +405,10 @@ impl Session {
                     Err(why) => self.app.template_refused(why),
                 },
                 Request::Send(text) => self.send_message(text),
+                Request::OpenLink(url) => match td_ui::open::url(&url, None) {
+                    Ok(_) => self.app.note(format!("opened {url} in the browser")),
+                    Err(why) => self.app.note(format!("could not open the link: {why}")),
+                },
                 Request::Command { name, args, typed } => {
                     let expanded = match &self.commands {
                         Some(dir) => crate::commands::expand(dir, &name, &args, crate::protocol::MAX_TEXT),
@@ -2842,7 +2846,8 @@ pub fn run(
         session.app.set_active(id.clone());
         session.open(id, None);
     }
-    let typeface = td_ui::pinned_face::load_or_note(
+    // Four styles: a reply's bold and italic Markdown draws in its own.
+    let typeface = td_ui::pinned_face::load_styled_or_note(
         "td-agent",
         std::env::var_os(td_ui::pinned_face::SETTING).as_deref(),
     );
