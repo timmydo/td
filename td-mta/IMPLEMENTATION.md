@@ -3524,7 +3524,7 @@ matching debug companion in one artifact. DEPLOYMENT.md documents the manual
 installation layout, dedicated identity and file provisioning, startup/control,
 certificate replacement, and stopped-store backup/restore. The process suite
 runs the stripped executable. This qualifies the receiving-only artifact;
-production supervisor integration, aarch64 and full v1 acceptance remain
+end-to-end supervisor qualification, aarch64 and full v1 acceptance remain
 separate work. It does not mark M24 or the full M25 release complete.
 
 ## Later increments
@@ -3601,6 +3601,8 @@ orderly stop; process tests cover its authority/refusal and kill/restart
 cleanup. Signal integration and full health aggregation remain separate.
 The status command now offers --require-ready for supervisor probes, with
 exit zero only for the ready lifecycle and unchanged JSON. Next operational
-work is supervisor deployment examples; HTTPS/JMAP, gateway, reload,
+work is end-to-end supervisor qualification and graceful signal integration;
+DEPLOYMENT.md supplies systemd and high-port td-svc examples with their
+current readiness and abrupt-stop limits. HTTPS/JMAP, gateway, reload,
 ACME, outgoing delivery
 and file logging remain unimplemented activation paths.

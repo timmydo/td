@@ -179,6 +179,135 @@ admitted chain's validity window ends. Expiration or an invalid UTC observation
 stops receiving with a TLS error; restarting with the same invalid material
 does not recover service.
 
+## Supervisor examples
+
+These are administrator-installed examples, not automatic installation or
+qualification of a host's service manager. The td-svc stanza has passed its
+table validator; neither example has an end-to-end supervisor fixture here.
+Provision the identity, complete
+configuration, initialized store and ingress/log roots above first. Do not
+initialize or restore a store from an automatic restart command. Keep one
+supervisor responsible for this receiver. The executable has no dependency
+on either supervisor.
+
+### systemd on another Linux distribution
+
+Install the following as `/etc/systemd/system/td-mta.service`, adapting the
+paths to the installation. The host must support the directives shown. The
+`td-mta` account and group must already exist; use a fixed dedicated UID,
+not `DynamicUser`. RuntimeDirectory recreates the volatile private root.
+Persistent directories remain operator-provisioned.
+
+```ini
+[Unit]
+Description=td-mta receiving-only SMTP server
+After=network.target
+
+[Service]
+Type=exec
+User=td-mta
+Group=td-mta
+UMask=0077
+RuntimeDirectory=td-mta
+RuntimeDirectoryMode=0700
+ExecStart=/opt/td-mta/bin/td-mta serve --smtp-only --config /etc/td-mta/config
+Restart=on-failure
+RestartSec=5s
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+KillMode=control-group
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The capability grant lets the nonroot process bind port 25; for a private
+unprivileged-port pilot, remove AmbientCapabilities and set an empty
+CapabilityBoundingSet. This example uses the execution identity and runtime
+directory behavior defined by [systemd.exec](https://github.com/systemd/systemd/blob/main/man/systemd.exec.xml).
+It sets no application memory limit. The host's effective slice and unit
+limits still apply.
+
+`Type=exec` means the binary executed, not that storage recovery or listener
+startup completed. Check readiness with the command above as the service
+UID; do not make a dependent service treat systemd's active state as SMTP
+readiness. There is no systemd notification or socket-activation support.
+No ExecStartPost probe is used: a single immediate probe races startup.
+No ExecStop command is used: the current stop command acknowledges a request
+without waiting for process exit, while systemd proceeds to terminate
+remaining processes when ExecStop returns. These lifecycle rules follow
+[systemd.service](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml).
+
+Use the host's `systemd-analyze verify` on the installed unit before enabling
+it, then `systemctl daemon-reload` and `systemctl enable --now td-mta.service`.
+Inspect `journalctl -u td-mta.service` and the readiness probe. Failed startup
+can enter the host's restart rate limit; repair configuration/material first,
+then use `systemctl reset-failed td-mta.service` and start again.
+
+For maintenance, `systemctl stop td-mta.service` suppresses automatic restart
+and waits for termination. This currently sends SIGTERM and may escalate to
+SIGKILL after the configured timeout: it is abrupt recovery-safe termination,
+not SMTP draining. Confirm the unit stopped before replacing files or using
+offline store commands. A manual `td-mta stop` exits cleanly and is not
+restarted by this unit's on-failure policy, but its acknowledgement alone is
+still not a maintenance barrier. The journal owns captured lifecycle output;
+`[paths] logs` remains a required, unused private root.
+
+### td-svc on a separately provisioned host
+
+This is a high-port pilot example, not td system-image integration. The
+current image does not package or provision td-mta. It requires installed
+td-svc and td-login, an administrator-provisioned service identity with the
+exact `!td-service` shadow class, and all mail roots provisioned before the
+unit becomes eligible. Recreate `/run/td-mta` at each boot before starting
+it. If provisioning is a td-svc oneshot, add that real unit as a `requires=`
+dependency in the complete table. Do not reference an undeclared placeholder.
+
+Choose a dedicated infrastructure UID distinct from UID 1000 and the
+application UID range; td-login's service path retains the supervisor's
+service cgroup for such an identity. Its verified credential switch clears
+held capabilities, so this example cannot grant port-25 binding. Configure
+a direct SMTP listener on an unprivileged port such as 2525. An Internet
+port-25 deployment needs a separately reviewed binding arrangement.
+[td-login's threat model](../td-login/THREAT-MODEL.md) owns the identity and
+credential-switch rules; do not use a passwordless human account instead.
+
+Merge this stanza into the host's single `/etc/td-svc.conf`:
+
+```ini
+[td-mta]
+type=daemon
+exec=/bin/td-login exec-service-as td-mta -- /opt/td-mta/bin/td-mta serve --smtp-only --config /etc/td-mta/config
+ready=/bin/td-login exec-service-as td-mta -- /opt/td-mta/bin/td-mta status --json --require-ready --runtime /run/td-mta
+ready-timeout=300
+restart=on-failure
+stop-timeout=30
+log=/var/log/svc/td-mta.log
+console=no
+```
+
+Validate the entire table with `td-svc check -f /etc/td-svc.conf` before
+loading it. The readiness command runs as the service UID and probes the
+actual receiver. Choose the startup timeout to cover measured cold recovery;
+its expiry is a failed readiness decision, not evidence of a stopped process.
+The example leaves resource limits unset. td-svc's own defaults and platform
+accounting contract still apply.
+
+`td-svc stop td-mta` requests signal-based stopping; poll `td-svc status td-mta`
+until it reports stopped before maintenance. The stop command itself does
+not wait. SIGTERM currently ends the receiver abruptly, with the accepted-mail
+recovery described above. `td-svc start td-mta` starts it again; `td-svc
+restart td-mta` likewise uses signal-based teardown. Automatic on-failure
+restart can enter td-svc's capped hold; after repairing the cause, an explicit
+start/restart clears that hold. The private mail stop command ends serve
+cleanly, so on-failure does not restart it. Neither supervisor example claims
+graceful signal draining. [td-svc/DESIGN.md](../td-svc/DESIGN.md) owns readiness,
+restart, stop completion and capture behavior.
+
 ## Offline backup and restore
 
 Stop and wait for exit first. Provision each destination as a fresh private
