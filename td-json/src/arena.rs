@@ -95,6 +95,34 @@ impl<'a> Document<'a> {
             .then(|| raw_span(self.bytes, token))
             .flatten()
     }
+    /// Constant-time, document-relative lookup. Indices are positions, not
+    /// capabilities: callers must keep them with the document that issued them.
+    pub fn value_at(&self, index: usize) -> Option<Value<'a>> {
+        let token = self.tokens.get(index)?;
+        (token.kind != Kind::Key).then_some(Value {
+            bytes: self.bytes,
+            tokens: self.tokens,
+            index: u32::try_from(index).ok()?,
+        })
+    }
+    /// One traversal continuation. Array traversal MUST also retain its element
+    /// count: the final element may point beyond its container. Object key
+    /// links are sorted and terminated. Neither form can leave this document.
+    pub fn next_index(&self, index: usize) -> Option<usize> {
+        let next = self.tokens.get(index)?.next;
+        self.tokens.get(next as usize).map(|_| next as usize)
+    }
+    /// One object member at its key token, without rescanning the key bytes.
+    pub fn member_at(&self, index: usize) -> Option<(&'a [u8], Value<'a>)> {
+        let token = *self.tokens.get(index)?;
+        if token.kind != Kind::Key {
+            return None;
+        }
+        Some((
+            raw_span(self.bytes, token)?,
+            self.value_at(index.checked_add(1)?)?,
+        ))
+    }
     /// Includes object keys and values, allowing whole-document scalar policies.
     pub fn strings(&self) -> impl Iterator<Item = &str> {
         self.tokens
@@ -110,6 +138,16 @@ pub struct Value<'a> {
     index: u32,
 }
 impl<'a> Value<'a> {
+    /// Position in this document's token backing; never a cross-document ID.
+    pub fn token_index(self) -> usize {
+        self.index as usize
+    }
+    /// First child token of an array or first key token of an object.
+    pub fn first_child_index(self) -> Option<usize> {
+        let token = self.token()?;
+        (matches!(token.kind, Kind::Array | Kind::Object) && token.length != 0)
+            .then_some(token.start as usize)
+    }
     fn token(self) -> Option<Token> {
         self.tokens.get(self.index as usize).copied()
     }
@@ -444,12 +482,20 @@ impl<B, T> std::error::Error for Refusal<B, T> {
 /// Valid JSON with exclusively owned storage. Views borrow this owner; the
 /// boxes can be recovered for another request only after those borrows end.
 pub struct OwnedDocument {
+    limits: ParseLimits,
     bytes: Box<[u8]>,
     tokens: Box<[Token]>,
     input_len: usize,
     used: usize,
 }
 impl OwnedDocument {
+    /// Exact ceilings that admitted this document; retained for protocol handoff.
+    pub const fn parse_limits(&self) -> ParseLimits {
+        self.limits
+    }
+    pub fn token_capacity(&self) -> usize {
+        self.tokens.len()
+    }
     pub fn view(&self) -> Result<Document<'_>, Error> {
         let error = Error {
             kind: ErrorKind::Storage,
@@ -1103,6 +1149,7 @@ impl OwnedCursor {
             });
         }
         Ok(OwnedDocument {
+            limits: self.limits,
             bytes: self.bytes,
             tokens: self.tokens,
             input_len: self.input_len,
@@ -1174,6 +1221,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn document_indices_visit_sorted_members_and_wire_order_arrays() {
+        let mut bytes = br#"{"z":[1,2],"a":{"b":null}}"#.to_vec();
+        let mut tokens = [Token::EMPTY; 16];
+        let document = parse(&mut bytes, &mut tokens, limits()).unwrap();
+        assert!(document.value_at(usize::MAX).is_none());
+        assert!(document.member_at(usize::MAX).is_none());
+        assert!(document.next_index(usize::MAX).is_none());
+        let first = document.root().first_child_index().unwrap();
+        let (key, object) = document.member_at(first).unwrap();
+        assert_eq!(key, b"a");
+        assert!(document.value_at(first).is_none());
+        assert!(document.member_at(object.token_index()).is_none());
+        let (_, null) = document
+            .member_at(object.first_child_index().unwrap())
+            .unwrap();
+        assert!(document.value_at(null.token_index()).unwrap().is_null());
+        assert!(null.first_child_index().is_none());
+        let last = document.next_index(first).unwrap();
+        assert!(document.next_index(last).is_none());
+        let (key, array) = document.member_at(last).unwrap();
+        assert_eq!(key, b"z");
+        let one = array.first_child_index().unwrap();
+        let two = document.next_index(one).unwrap();
+        assert_eq!(document.value_at(one).unwrap().as_number(), Some("1"));
+        assert_eq!(document.value_at(two).unwrap().as_number(), Some("2"));
+        // Array iteration ends at its count, not at a null link: here the
+        // continuation is the next physical key outside this array.
+        assert_eq!(document.next_index(two), Some(first));
+        assert_eq!(array.as_array().unwrap().count(), 2);
     }
 
     #[test]

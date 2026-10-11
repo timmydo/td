@@ -165,46 +165,7 @@ pub struct Validation<'a, 'c> {
     parser: Option<arena::Cursor<'a>>,
     document: Option<arena::Document<'a>>,
     capabilities: &'c [&'c str],
-    maximum_calls: usize,
-    stage: Stage<'a>,
-    raw_using: Option<Value<'a>>,
-    raw_calls: Option<Value<'a>>,
-    raw_created: Option<Value<'a>>,
-    using: Option<arena::Array<'a>>,
-    calls: Option<arena::Array<'a>>,
-    created: Option<Object<'a>>,
-    unknown_capability: bool,
-    failed: Option<Error>,
-}
-#[derive(Clone, Copy)]
-enum Stage<'a> {
-    Parsing,
-    Strings {
-        token: usize,
-        offset: usize,
-    },
-    Fields(Object<'a>),
-    Using(arena::Array<'a>),
-    Capability {
-        rest: arena::Array<'a>,
-        name: &'a [u8],
-        index: usize,
-        offset: usize,
-    },
-    Calls(arena::Array<'a>),
-    Created(Object<'a>),
-    CreatedKey {
-        rest: Object<'a>,
-        value: Value<'a>,
-        key: &'a [u8],
-        offset: usize,
-    },
-    CreatedValue {
-        rest: Object<'a>,
-        bytes: &'a [u8],
-        offset: usize,
-    },
-    Done,
+    envelope: Envelope,
 }
 const _: () = assert!(std::mem::size_of::<Validation<'_, '_>>() <= 8192);
 impl<'a, 'c> Validation<'a, 'c> {
@@ -233,8 +194,269 @@ impl<'a, 'c> Validation<'a, 'c> {
             parser: Some(parser),
             document: None,
             capabilities,
-            maximum_calls: limits.json_methods,
-            stage: Stage::Parsing,
+            envelope: Envelope::new(limits.json_methods),
+        })
+    }
+    /// One parser step, up to 256 scalar/comparison transitions, or sixteen
+    /// structural transitions. The caller checks live admission between turns.
+    pub fn step(&mut self) -> Result<bool, Error> {
+        if let Some(error) = self.envelope.failed {
+            return Err(error);
+        }
+        if let Some(parser) = self.parser.as_mut() {
+            match parser.step().map_err(parser_error) {
+                Ok(true) => {
+                    match self
+                        .parser
+                        .take()
+                        .ok_or(Error::Storage)?
+                        .finish()
+                        .map_err(parser_error)
+                    {
+                        Ok(document) => self.document = Some(document),
+                        Err(error) => {
+                            self.envelope.failed = Some(error);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(false) => (),
+                Err(error) => {
+                    self.envelope.failed = Some(error);
+                    return Err(error);
+                }
+            }
+            return Ok(false);
+        }
+        self.envelope.step(
+            self.document.as_ref().ok_or(Error::Storage)?,
+            self.capabilities,
+        )
+    }
+    pub fn finish(self) -> Result<Request<'a>, Error> {
+        self.envelope.request(
+            self.document
+                .as_ref()
+                .ok_or(self.envelope.failed.unwrap_or(Error::Storage))?,
+        )
+    }
+}
+
+/// Whole-envelope validation of an already parsed, owned arena. Construction
+/// binds its recorded parser ceilings and token capacity to the ResourcePlan.
+/// The caller still enforces live work/deadline admission between every step.
+pub struct OwnedValidation<'c> {
+    document: arena::OwnedDocument,
+    capabilities: &'c [&'c str],
+    envelope: Envelope,
+}
+impl<'c> OwnedValidation<'c> {
+    pub fn new(
+        document: arena::OwnedDocument,
+        resources: &ResourcePlan,
+        capabilities: &'c [&'c str],
+    ) -> Result<Self, ValidationRefusal> {
+        let limits = resources.limits();
+        let result = Request::validate_resources(resources).and_then(|()| {
+            if document.parse_limits()
+                != (ParseLimits {
+                    max_bytes: limits.json_bytes,
+                    max_depth: limits.json_depth,
+                    max_tokens: limits.json_tokens,
+                })
+            {
+                Err(Error::Configuration)
+            } else if document.token_capacity() < limits.json_tokens {
+                Err(Error::Storage)
+            } else {
+                Ok(())
+            }
+        });
+        match result {
+            Ok(()) => Ok(Self {
+                document,
+                capabilities,
+                envelope: Envelope::new(limits.json_methods),
+            }),
+            Err(error) => Err(ValidationRefusal { error, document }),
+        }
+    }
+    pub fn step(&mut self) -> Result<bool, Error> {
+        self.envelope.step(
+            &self.document.view().map_err(parser_error)?,
+            self.capabilities,
+        )
+    }
+    pub fn finish(self) -> Result<OwnedRequest, ValidationRefusal> {
+        let result = self
+            .document
+            .view()
+            .map_err(parser_error)
+            .and_then(|view| self.envelope.request(&view).map(|_| ()));
+        match result {
+            Ok(()) => Ok(OwnedRequest {
+                document: self.document,
+                envelope: self.envelope,
+            }),
+            Err(error) => Err(ValidationRefusal {
+                error,
+                document: self.document,
+            }),
+        }
+    }
+    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+        self.document.into_buffers()
+    }
+}
+/// Failed validation retains the arenas for recycling and exposes no Request.
+pub struct ValidationRefusal {
+    error: Error,
+    document: arena::OwnedDocument,
+}
+impl ValidationRefusal {
+    pub fn error(&self) -> Error {
+        self.error
+    }
+    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+        self.document.into_buffers()
+    }
+}
+impl fmt::Debug for ValidationRefusal {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_tuple("ValidationRefusal")
+            .field(&self.error)
+            .finish()
+    }
+}
+impl fmt::Display for ValidationRefusal {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(out)
+    }
+}
+impl std::error::Error for ValidationRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+/// The complete validated envelope owns the immutable arenas it lends.
+///
+/// ```compile_fail,E0505
+/// use td_mta::jmap_request::OwnedRequest;
+/// fn recycle_while_borrowed(owner: OwnedRequest) {
+///     let request = owner.view().unwrap();
+///     let _buffers = owner.into_buffers();
+///     let _ = request.calls().next();
+/// }
+/// ```
+pub struct OwnedRequest {
+    document: arena::OwnedDocument,
+    envelope: Envelope,
+}
+impl OwnedRequest {
+    pub fn view(&self) -> Result<Request<'_>, Error> {
+        self.envelope
+            .request(&self.document.view().map_err(parser_error)?)
+    }
+    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+        self.document.into_buffers()
+    }
+}
+const _: () = assert!(std::mem::size_of::<OwnedValidation<'_>>() <= 8192);
+#[derive(Clone, Copy)]
+enum Stage {
+    Strings {
+        token: usize,
+        offset: usize,
+    },
+    Fields(Walk),
+    Using(Walk),
+    Capability {
+        rest: Walk,
+        name: usize,
+        index: usize,
+        offset: usize,
+    },
+    Calls(Walk),
+    Created(Walk),
+    CreatedKey {
+        rest: Walk,
+        value: usize,
+        key: usize,
+        offset: usize,
+    },
+    CreatedValue {
+        rest: Walk,
+        value_index: usize,
+        offset: usize,
+    },
+    Done,
+}
+struct Member<'a> {
+    index: usize,
+    key: &'a [u8],
+    value: Value<'a>,
+}
+#[derive(Clone, Copy)]
+struct Walk {
+    next: Option<usize>,
+    left: usize,
+}
+impl Walk {
+    fn array(value: Value<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            next: value.first_child_index(),
+            left: value.as_array().ok_or(Error::NotRequest)?.len(),
+        })
+    }
+    fn object(value: Value<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            next: value.first_child_index(),
+            left: value.as_object().ok_or(Error::NotRequest)?.len(),
+        })
+    }
+    fn advance(&mut self, document: &arena::Document<'_>) -> Result<Option<usize>, Error> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        let index = self.next.ok_or(Error::Storage)?;
+        self.next = document.next_index(index);
+        self.left -= 1;
+        Ok(Some(index))
+    }
+    fn value<'a>(&mut self, document: &arena::Document<'a>) -> Result<Option<Value<'a>>, Error> {
+        self.advance(document)?
+            .map(|index| document.value_at(index).ok_or(Error::Storage))
+            .transpose()
+    }
+    fn member<'a>(&mut self, document: &arena::Document<'a>) -> Result<Option<Member<'a>>, Error> {
+        self.advance(document)?
+            .map(|index| {
+                let (key, value) = document.member_at(index).ok_or(Error::Storage)?;
+                Ok(Member { index, key, value })
+            })
+            .transpose()
+    }
+}
+struct Envelope {
+    maximum_calls: usize,
+    stage: Stage,
+    raw_using: Option<usize>,
+    raw_calls: Option<usize>,
+    raw_created: Option<usize>,
+    using: Option<usize>,
+    calls: Option<usize>,
+    created: Option<usize>,
+    unknown_capability: bool,
+    failed: Option<Error>,
+}
+impl Envelope {
+    fn new(maximum_calls: usize) -> Self {
+        Self {
+            maximum_calls,
+            stage: Stage::Strings {
+                token: 0,
+                offset: 0,
+            },
             raw_using: None,
             raw_calls: None,
             raw_created: None,
@@ -243,28 +465,27 @@ impl<'a, 'c> Validation<'a, 'c> {
             created: None,
             unknown_capability: false,
             failed: None,
-        })
+        }
     }
-    /// One parser step, up to 256 scalar/capability transitions, or at most
-    /// sixteen structural transitions. Creation IDs use eight-byte chunks.
-    /// Failed/completed polls are inert; enforce live admission in the owner.
-    pub fn step(&mut self) -> Result<bool, Error> {
+    fn step(
+        &mut self,
+        document: &arena::Document<'_>,
+        capabilities: &[&str],
+    ) -> Result<bool, Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        // End scalar/comparison batches at their phase boundary so a cheap
-        // byte budget cannot become hundreds of structural operations.
+        // Stop scalar batches at phase boundaries: byte credits must not
+        // become hundreds of structural transitions in the same worker turn.
         let scalar_pass = matches!(self.stage, Stage::Strings { .. });
         let capability_pass = matches!(self.stage, Stage::Capability { .. });
-        let turns = if matches!(self.stage, Stage::Parsing) {
-            1
-        } else if scalar_pass || capability_pass {
+        let turns = if scalar_pass || capability_pass {
             256
         } else {
             16
         };
         for _ in 0..turns {
-            if let Err(error) = self.transition() {
+            if let Err(error) = self.transition(document, capabilities) {
                 self.failed = Some(error);
                 return Err(error);
             }
@@ -279,7 +500,7 @@ impl<'a, 'c> Validation<'a, 'c> {
         }
         Ok(false)
     }
-    pub fn finish(self) -> Result<Request<'a>, Error> {
+    fn request<'a>(&self, document: &arena::Document<'a>) -> Result<Request<'a>, Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -287,39 +508,34 @@ impl<'a, 'c> Validation<'a, 'c> {
             return Err(Error::Storage);
         }
         Ok(Request {
-            using: self.using.ok_or(Error::Storage)?,
-            calls: self.calls.ok_or(Error::Storage)?,
-            created: self.created,
+            using: document
+                .value_at(self.using.ok_or(Error::Storage)?)
+                .and_then(Value::as_array)
+                .ok_or(Error::Storage)?,
+            calls: document
+                .value_at(self.calls.ok_or(Error::Storage)?)
+                .and_then(Value::as_array)
+                .ok_or(Error::Storage)?,
+            created: self
+                .created
+                .map(|index| {
+                    document
+                        .value_at(index)
+                        .and_then(Value::as_object)
+                        .ok_or(Error::Storage)
+                })
+                .transpose()?,
         })
     }
-    fn transition(&mut self) -> Result<(), Error> {
+    fn transition(
+        &mut self,
+        document: &arena::Document<'_>,
+        capabilities: &[&str],
+    ) -> Result<(), Error> {
         match self.stage {
-            Stage::Parsing => {
-                if self
-                    .parser
-                    .as_mut()
-                    .ok_or(Error::Storage)?
-                    .step()
-                    .map_err(parser_error)?
-                {
-                    self.document = Some(
-                        self.parser
-                            .take()
-                            .ok_or(Error::Storage)?
-                            .finish()
-                            .map_err(parser_error)?,
-                    );
-                    self.stage = Stage::Strings {
-                        token: 0,
-                        offset: 0,
-                    };
-                }
-            }
             Stage::Strings { token, offset } => {
-                let document = self.document.as_ref().ok_or(Error::Storage)?;
                 if token == document.token_count() {
-                    self.stage =
-                        Stage::Fields(document.root().as_object().ok_or(Error::NotRequest)?);
+                    self.stage = Stage::Fields(Walk::object(document.root())?);
                 } else if let Some(bytes) = document
                     .string_bytes_at(token)
                     .filter(|bytes| offset < bytes.len())
@@ -352,40 +568,45 @@ impl<'a, 'c> Validation<'a, 'c> {
                 }
             }
             Stage::Fields(mut fields) => {
-                if let Some((key, value)) = fields.next_bytes() {
+                if let Some(Member { key, value, .. }) = fields.member(document)? {
                     match key {
-                        b"using" => self.raw_using = Some(value),
-                        b"methodCalls" => self.raw_calls = Some(value),
-                        b"createdIds" => self.raw_created = Some(value),
+                        b"using" => self.raw_using = Some(value.token_index()),
+                        b"methodCalls" => self.raw_calls = Some(value.token_index()),
+                        b"createdIds" => self.raw_created = Some(value.token_index()),
                         _ => (),
                     }
                     self.stage = Stage::Fields(fields);
                 } else {
-                    let using = self
-                        .raw_using
-                        .and_then(Value::as_array)
-                        .ok_or(Error::NotRequest)?;
-                    self.using = Some(using);
+                    let using = Walk::array(
+                        self.raw_using
+                            .and_then(|index| document.value_at(index))
+                            .ok_or(Error::NotRequest)?,
+                    )?;
+                    self.using = self.raw_using;
                     self.stage = Stage::Using(using);
                 }
             }
             Stage::Using(mut using) => {
-                self.stage = if let Some(value) = using.next() {
+                self.stage = if let Some(value) = using.value(document)? {
                     Stage::Capability {
                         rest: using,
-                        name: value.as_string_bytes().ok_or(Error::NotRequest)?,
+                        name: {
+                            value.as_string_bytes().ok_or(Error::NotRequest)?;
+                            value.token_index()
+                        },
                         index: 0,
                         offset: 0,
                     }
                 } else {
-                    let calls = self
-                        .raw_calls
-                        .and_then(Value::as_array)
-                        .ok_or(Error::NotRequest)?;
-                    if calls.len() > self.maximum_calls {
+                    let calls = Walk::array(
+                        self.raw_calls
+                            .and_then(|index| document.value_at(index))
+                            .ok_or(Error::NotRequest)?,
+                    )?;
+                    if calls.left > self.maximum_calls {
                         return Err(Error::MaxCallsInRequest);
                     }
-                    self.calls = Some(calls);
+                    self.calls = self.raw_calls;
                     Stage::Calls(calls)
                 };
             }
@@ -395,17 +616,21 @@ impl<'a, 'c> Validation<'a, 'c> {
                 index,
                 offset,
             } => {
-                if let Some(capability) = self.capabilities.get(index) {
-                    if name.len() != capability.len() {
+                let name_bytes = document
+                    .value_at(name)
+                    .and_then(Value::as_string_bytes)
+                    .ok_or(Error::Storage)?;
+                if let Some(capability) = capabilities.get(index) {
+                    if name_bytes.len() != capability.len() {
                         self.stage = Stage::Capability {
                             rest,
                             name,
                             index: index + 1,
                             offset: 0,
                         };
-                    } else if offset == name.len() {
+                    } else if offset == name_bytes.len() {
                         self.stage = Stage::Using(rest);
-                    } else if name.get(offset) == capability.as_bytes().get(offset) {
+                    } else if name_bytes.get(offset) == capability.as_bytes().get(offset) {
                         self.stage = Stage::Capability {
                             rest,
                             name,
@@ -426,26 +651,31 @@ impl<'a, 'c> Validation<'a, 'c> {
                 }
             }
             Stage::Calls(mut calls) => {
-                if let Some(value) = calls.next() {
+                if let Some(value) = calls.value(document)? {
                     invocation(value).ok_or(Error::NotRequest)?;
                     self.stage = Stage::Calls(calls);
                 } else if let Some(value) = self.raw_created {
-                    let created = value.as_object().ok_or(Error::NotRequest)?;
-                    self.created = Some(created);
+                    let created = Walk::object(document.value_at(value).ok_or(Error::Storage)?)?;
+                    self.created = Some(value);
                     self.stage = Stage::Created(created);
                 } else {
                     self.complete()?;
                 }
             }
             Stage::Created(mut created) => {
-                if let Some((key, value)) = created.next_bytes() {
+                if let Some(Member {
+                    index: key_index,
+                    key,
+                    value,
+                }) = created.member(document)?
+                {
                     if !(1..=255).contains(&key.len()) {
                         return Err(Error::NotRequest);
                     }
                     self.stage = Stage::CreatedKey {
                         rest: created,
-                        value,
-                        key,
+                        value: value.token_index(),
+                        key: key_index,
                         offset: 0,
                     };
                 } else {
@@ -458,18 +688,22 @@ impl<'a, 'c> Validation<'a, 'c> {
                 key,
                 offset,
             } => {
-                let end = offset.saturating_add(8).min(key.len());
-                if !id_chunk(key.get(offset..end).ok_or(Error::Storage)?) {
+                let key_bytes = document.string_bytes_at(key).ok_or(Error::Storage)?;
+                let end = offset.saturating_add(8).min(key_bytes.len());
+                if !id_chunk(key_bytes.get(offset..end).ok_or(Error::Storage)?) {
                     return Err(Error::NotRequest);
                 }
-                if end == key.len() {
-                    let bytes = value.as_string_bytes().ok_or(Error::NotRequest)?;
+                if end == key_bytes.len() {
+                    let bytes = document
+                        .value_at(value)
+                        .and_then(Value::as_string_bytes)
+                        .ok_or(Error::NotRequest)?;
                     if !(1..=255).contains(&bytes.len()) {
                         return Err(Error::NotRequest);
                     }
                     self.stage = Stage::CreatedValue {
                         rest,
-                        bytes,
+                        value_index: value,
                         offset: 0,
                     };
                 } else {
@@ -483,19 +717,23 @@ impl<'a, 'c> Validation<'a, 'c> {
             }
             Stage::CreatedValue {
                 rest,
-                bytes,
+                value_index,
                 offset,
             } => {
-                let end = offset.saturating_add(8).min(bytes.len());
-                if !id_chunk(bytes.get(offset..end).ok_or(Error::Storage)?) {
+                let value_bytes = document
+                    .value_at(value_index)
+                    .and_then(Value::as_string_bytes)
+                    .ok_or(Error::Storage)?;
+                let end = offset.saturating_add(8).min(value_bytes.len());
+                if !id_chunk(value_bytes.get(offset..end).ok_or(Error::Storage)?) {
                     return Err(Error::NotRequest);
                 }
-                self.stage = if end == bytes.len() {
+                self.stage = if end == value_bytes.len() {
                     Stage::Created(rest)
                 } else {
                     Stage::CreatedValue {
                         rest,
-                        bytes,
+                        value_index,
                         offset: end,
                     }
                 };
@@ -549,6 +787,248 @@ mod tests {
     fn error(input: &str) -> Error {
         Fixture::new(input).parse(Limits::default()).err().unwrap()
     }
+    fn owned_fixture(input: &str) -> (OwnedValidation<'static>, (*const u8, *const Token)) {
+        let limits = Limits::default();
+        let mut bytes = vec![0xff; limits.json_bytes].into_boxed_slice();
+        bytes[..input.len()].copy_from_slice(input.as_bytes());
+        let tokens = vec![Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let pointers = (bytes.as_ptr(), tokens.as_ptr());
+        let mut parser = arena::OwnedCursor::with_input_length(
+            bytes,
+            tokens,
+            input.len(),
+            ParseLimits {
+                max_bytes: limits.json_bytes,
+                max_depth: limits.json_depth,
+                max_tokens: limits.json_tokens,
+            },
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        (
+            OwnedValidation::new(parser.finish().unwrap(), &limits.plan().unwrap(), &[CORE])
+                .unwrap(),
+            pointers,
+        )
+    }
+    fn owned(input: &str) -> OwnedValidation<'static> {
+        owned_fixture(input).0
+    }
+    #[test]
+    fn scalar_and_capability_batches_end_at_their_phase_boundary() {
+        let input = format!(r#"{{"using":["{CORE}"],"methodCalls":[]}}"#);
+        let mut validation = owned(&input);
+        assert!(!validation.step().unwrap());
+        assert!(matches!(validation.envelope.stage, Stage::Fields(_)));
+        assert!(!validation.step().unwrap());
+        assert!(matches!(
+            validation.envelope.stage,
+            Stage::Capability { .. }
+        ));
+        assert!(!validation.step().unwrap());
+        assert!(matches!(validation.envelope.stage, Stage::Using(_)));
+        assert!(validation.step().unwrap());
+    }
+
+    #[test]
+    fn owned_handoff_binds_advertised_limits_and_returns_refused_storage() {
+        let plan = Limits::default().plan().unwrap();
+        let limits = plan.limits();
+        let expected = ParseLimits {
+            max_bytes: limits.json_bytes,
+            max_depth: limits.json_depth,
+            max_tokens: limits.json_tokens,
+        };
+        for (parser_limits, capacity, error) in [
+            (
+                ParseLimits {
+                    max_bytes: expected.max_bytes + 1,
+                    ..expected
+                },
+                limits.json_tokens,
+                Error::Configuration,
+            ),
+            (
+                ParseLimits {
+                    max_depth: expected.max_depth + 1,
+                    ..expected
+                },
+                limits.json_tokens,
+                Error::Configuration,
+            ),
+            (
+                ParseLimits {
+                    max_tokens: expected.max_tokens + 1,
+                    ..expected
+                },
+                limits.json_tokens,
+                Error::Configuration,
+            ),
+            (expected, 8, Error::Storage),
+        ] {
+            let bytes = b"{}".to_vec().into_boxed_slice();
+            let tokens = vec![Token::EMPTY; capacity].into_boxed_slice();
+            let pointers = (bytes.as_ptr(), tokens.as_ptr());
+            let mut parser =
+                arena::OwnedCursor::with_input_length(bytes, tokens, 2, parser_limits).unwrap();
+            while !parser.step().unwrap() {}
+            let refusal = OwnedValidation::new(parser.finish().unwrap(), &plan, &[CORE])
+                .err()
+                .unwrap();
+            assert_eq!(refusal.error(), error);
+            let (bytes, tokens) = refusal.into_buffers();
+            assert_eq!((bytes.as_ptr(), tokens.as_ptr()), pointers);
+        }
+        let document = owned("{}").document;
+        let impossible = Limits {
+            json_depth: 1,
+            ..Limits::default()
+        }
+        .plan()
+        .unwrap();
+        assert_eq!(
+            OwnedValidation::new(document, &impossible, &[CORE])
+                .err()
+                .unwrap()
+                .error(),
+            Error::Configuration
+        );
+    }
+
+    #[test]
+    fn owned_validation_moves_without_exposing_unchecked_calls() {
+        fn send<T: Send>() {}
+        send::<OwnedValidation<'static>>();
+        send::<OwnedRequest>();
+        let input = format!("{{\"using\":[\"{CORE}\"],\"methodCalls\":[[\"Core/echo\",{{}},\"{}\"]],\"createdIds\":{{\"k\":\"v\"}}}}", "x".repeat(4096));
+        let mut queue = Some(owned(&input));
+        let mut steps = 0;
+        let request = loop {
+            let mut validation = queue.take().unwrap();
+            steps += 1;
+            if validation.step().unwrap() {
+                break validation.finish().unwrap();
+            }
+            queue = Some(validation);
+        };
+        assert!(steps > 16);
+        let view = request.view().unwrap();
+        assert!(view.uses(CORE));
+        assert_eq!(view.call_count(), 1);
+        assert_eq!(view.calls().next().unwrap().call_id.len(), 4096);
+        assert_eq!(view.created_ids().unwrap().next().unwrap().0, "k");
+        let (bytes, tokens) = request.into_buffers();
+        assert_eq!(bytes.len(), Limits::default().json_bytes);
+        assert_eq!(tokens.len(), Limits::default().json_tokens);
+    }
+    #[test]
+    fn owned_failure_and_premature_finish_preserve_arenas() {
+        let input = format!(
+            r#"{{"using":[],"methodCalls":[{}[false,{{}},"bad"]]}}"#,
+            r#"["Core/echo",{},"ok"],"#.repeat(15)
+        );
+        let (mut validation, pointers) = owned_fixture(&input);
+        while !matches!(validation.envelope.stage, Stage::Calls(_)) {
+            assert!(!validation.step().unwrap());
+        }
+        let refusal = validation.finish().err().unwrap();
+        assert_eq!(refusal.error(), Error::Storage);
+        let (bytes, tokens) = refusal.into_buffers();
+        assert_eq!((bytes.as_ptr(), tokens.as_ptr()), pointers);
+        assert_eq!(bytes.len(), Limits::default().json_bytes);
+        assert_eq!(tokens.len(), Limits::default().json_tokens);
+        let (mut validation, pointers) = owned_fixture(&input);
+        let error = loop {
+            match validation.step() {
+                Ok(false) => (),
+                Ok(true) => panic!("bad call admitted"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error, Error::NotRequest);
+        assert_eq!(validation.step(), Err(error));
+        let refusal = validation.finish().err().unwrap();
+        assert_eq!(refusal.error(), error);
+        assert!(!format!("{refusal:?}").contains("Core/echo"));
+        let (bytes, tokens) = refusal.into_buffers();
+        assert_eq!((bytes.as_ptr(), tokens.as_ptr()), pointers);
+        assert_eq!(bytes.len(), Limits::default().json_bytes);
+        assert_eq!(tokens.len(), Limits::default().json_tokens);
+    }
+    #[test]
+    fn owned_and_borrowed_envelopes_have_the_same_error_precedence() {
+        for input in [
+            r#"[]"#,
+            r#"{}"#,
+            r#"{"using":[],"methodCalls":false}"#,
+            r#"{"using":["unknown"],"methodCalls":[],"createdIds":null}"#,
+            r#"{"using":["unknown"],"methodCalls":[]}"#,
+            r#"{"using":[],"methodCalls":[],"createdIds":{"!":"v"}}"#,
+            r#"{"using":[],"methodCalls":[],"ignored":"\uffff"}"#,
+            r#"{"using":[false],"methodCalls":[]}"#,
+            r#"{"using":["unknown"],"methodCalls":[[false,{},"id"]]}"#,
+            r#"{"using":[],"methodCalls":[],"createdIds":{"":"v"}}"#,
+            r#"{"using":[],"methodCalls":[],"createdIds":{"k":false}}"#,
+        ] {
+            let expected = error(input);
+            let mut validation = owned(input);
+            loop {
+                match validation.step() {
+                    Ok(false) => (),
+                    Ok(true) => panic!("invalid request admitted: {input}"),
+                    Err(actual) => {
+                        assert_eq!(actual, expected, "{input}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_call_limit_and_success_match_borrowed_validation() {
+        let calls = vec![r#"["Core/echo",{},"id"]"#; 17].join(",");
+        let input = format!(r#"{{"using":[],"methodCalls":[{calls}]}}"#);
+        assert_eq!(error(&input), Error::MaxCallsInRequest);
+        let mut validation = owned(&input);
+        loop {
+            match validation.step() {
+                Ok(false) => (),
+                Ok(true) => panic!("call limit escaped"),
+                Err(error) => {
+                    assert_eq!(error, Error::MaxCallsInRequest);
+                    break;
+                }
+            }
+        }
+        let input = format!(
+            r#"{{"using":["{CORE}"],"methodCalls":[["Core/echo",{{"x":"é"}},"\u0069d"]],"createdIds":{{"seed":"value"}}}}"#
+        );
+        let mut fixture = Fixture::new(&input);
+        let borrowed = fixture.parse(Limits::default()).unwrap();
+        let mut validation = owned(&input);
+        while !validation.step().unwrap() {}
+        let owned = validation.finish().unwrap();
+        let view = owned.view().unwrap();
+        assert_eq!(borrowed.call_count(), view.call_count());
+        assert_eq!(borrowed.uses(CORE), view.uses(CORE));
+        let left = borrowed.calls().next().unwrap();
+        let right = view.calls().next().unwrap();
+        assert_eq!(left.name, right.name);
+        assert_eq!(left.call_id, right.call_id);
+        assert_eq!(
+            left.argument("x").unwrap().as_string_bytes(),
+            right.argument("x").unwrap().as_string_bytes()
+        );
+        assert_eq!(
+            borrowed.created_ids().unwrap().next().unwrap().0,
+            view.created_ids().unwrap().next().unwrap().0
+        );
+        let (bytes, tokens) = owned.into_buffers();
+        assert_eq!(bytes.len(), Limits::default().json_bytes);
+        assert_eq!(tokens.len(), Limits::default().json_tokens);
+    }
+
     #[test]
     fn rejects_short_backing_before_touching_input() {
         let original = br#"{"using":[],"methodCalls":[]}"#;
@@ -757,7 +1237,7 @@ mod tests {
         .unwrap();
         let mut comparison_turns = 0;
         while !admission.step().unwrap() {
-            if matches!(admission.stage, Stage::Capability { .. }) {
+            if matches!(admission.envelope.stage, Stage::Capability { .. }) {
                 comparison_turns += 1;
             }
         }
@@ -809,11 +1289,11 @@ mod tests {
         .unwrap();
         let mut validation =
             Validation::new(&mut fixture.bytes, &mut fixture.tokens, &plan, &[CORE]).unwrap();
-        while !matches!(validation.stage, Stage::Calls(_)) {
+        while !matches!(validation.envelope.stage, Stage::Calls(_)) {
             assert!(!validation.step().unwrap());
         }
-        assert!(validation.using.is_some());
-        assert!(validation.calls.is_some());
+        assert!(validation.envelope.using.is_some());
+        assert!(validation.envelope.calls.is_some());
         assert_eq!(validation.finish().err(), Some(Error::Storage));
     }
     #[test]

@@ -2842,8 +2842,15 @@ implementation. Its OwnedCursor form owns preallocated boxed arenas and
 moves between worker turns without reparsing or copying storage. Completion
 lends document views from an owned backing; consuming that owner, abandoning
 a parser, or recovering a refusal returns the same arenas for reuse.
-JMAP Validation still uses borrowed arenas and needs runtime ownership
-integration. The inert JMAP Validation owner also makes whole-envelope,
+OwnedValidation retains that parsed document and runs the same
+position-based envelope machine as borrowed Validation. Its OwnedRequest
+lends admitted calls only after every phase completes and returns the arenas
+for reuse when consumed. Indexed state is private to that document and is
+never transferred to another backing. The owned handoff verifies the
+document's recorded parser ceilings and token capacity against ResourcePlan
+and derives its method limit from that plan.
+Runtime still enforces live work/deadline admission across all phases.
+The inert JMAP Validation owner also makes whole-envelope,
 I-JSON, capability and creation-ID validation resumable. It exposes a Request
 only after every call is valid. Envelope error precedence remains: using
 shape, method-call count and tuples, creation map, then unknown capability.

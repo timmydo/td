@@ -165,3 +165,19 @@ pools use `with_input_length`. Both storage forms share the same
 boxed slices, preventing custom backing substitution between parser turns.
 Only two borrowed slices or two owned boxes may form a parser; mixed pairs
 cannot be constructed.
+
+Document-relative token indices support owned consumers whose state must
+survive across worker turns. `value_at`, `member_at` and `next_index` inspect
+one token/member or traversal link without scanning. Array walkers must also
+retain the element count: the last element can continue past its container
+within the document. Object key links are sorted and terminated. `Value::token_index` and
+`first_child_index` provide positions from borrowed views. A member index
+names its key; `value_at` excludes key tokens. Out-of-range positions refuse.
+Positions are not capabilities or persistent IDs: a consumer must retain
+indices with the same immutable document and discard them when recycling its
+arenas. Reusing a position with another document selects that document's
+position and carries no source-identity guarantee.
+
+OwnedDocument retains its exact parser ceilings and exposes token capacity
+for a protocol handoff to verify the configured resource plan. These are
+observations of successful parsing, not new admission or deadline grants.

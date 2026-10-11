@@ -121,8 +121,16 @@ encoded-header adapters or combined service RSS.
   cancellation or refusal. Its completed owner lends immutable document
   views. It adds no arena copy, allocation or parser state allowance;
   the occupied prefix bounds parsing even when capacity is larger.
-  JMAP validation still borrows its arenas; runtime ownership integration
-  remains required before activation.
+  JMAP's OwnedValidation owns the completed parser document and uses the
+  same envelope machine as borrowed Validation. Its resumable state contains
+  only positions into that document, counts and phase tags, never borrowed
+  values. Each turn lends views for only that turn; completed OwnedRequest
+  lends the full envelope without parsing or validation again. Refusal and
+  cancellation return the same arenas. Both validation forms fit 8 KiB.
+  OwnedValidation checks the document's recorded parser ceilings against
+  its ResourcePlan, checks token capacity and derives the method limit from
+  that same plan. Runtime retains the original work/deadline admission
+  throughout all phases.
   Whole-buffer bounded allocation alone is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
