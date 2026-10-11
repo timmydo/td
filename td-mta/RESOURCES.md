@@ -101,10 +101,17 @@ encoded-header adapters or combined service RSS.
   the request arena. Unescaping cannot expand the UTF-8 byte length; the
   shared JSON arena parser validates escapes and updates token extents
   before immutable borrowing. Output re-escapes strings into the bounded
-  sink. No separate decoded-string arena is owned. The current arena parser
-  runs synchronously and is inert in HTTPS. Resumable tokenization and key
-  sorting under the bounded-step rule below remain activation obligations;
-  whole-buffer bounded allocation is not scheduler qualification.
+  sink. No separate decoded-string arena is owned. The shared arena Cursor
+  keeps at most 4 KiB fixed state within the 40 KiB
+  argument/scheduler/framing partition of HTTPS scratch and advances
+  at most 256 transitions per step, each inspecting at most 12 input bytes
+  or comparing one key byte. UTF-8 validation, tokenization and linked key
+  sorting all yield; finish exposes only a completed document. The convenience
+  parse helper drives the same cursor synchronously. HTTPS remains inert:
+  activation must use stepped parsing with live admission between turns,
+  make whole-envelope/I-JSON validation resumable too, and avoid unbounded
+  scalar-view, object-lookup and serialization helpers on worker turns.
+  Whole-buffer bounded allocation alone is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
   without pinning storage views between emissions.

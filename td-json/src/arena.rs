@@ -1,7 +1,7 @@
 //! Allocation-free JSON parsing into caller-owned bytes and 16-byte tokens.
 //! Strings (including keys) decode in place. Object iteration is sorted by
 //! decoded key; array order is preserved. A failure invalidates both backings.
-use crate::{valid_json_number, MAX_DEPTH};
+use crate::MAX_DEPTH;
 use std::fmt;
 
 /// Caller ceilings checked before byte inspection, container entry or token use.
@@ -266,58 +266,180 @@ fn raw_span(bytes: &[u8], token: Token) -> Option<&[u8]> {
     bytes.get(start..end)
 }
 
+/// Parse to completion. Scheduling-sensitive callers use Cursor::step instead.
 pub fn parse<'a>(
     bytes: &'a mut [u8],
     tokens: &'a mut [Token],
     limits: ParseLimits,
 ) -> Result<Document<'a>, Error> {
-    if bytes.len() > limits.max_bytes {
-        return Err(Error {
-            kind: ErrorKind::Limit(ParseLimit::Bytes),
-            offset: limits.max_bytes,
-        });
-    }
-    if bytes.len() >= NONE as usize || tokens.len() >= NONE as usize {
-        return Err(Error {
-            kind: ErrorKind::Storage,
-            offset: 0,
-        });
-    }
-    std::str::from_utf8(bytes).map_err(|error| Error {
-        kind: ErrorKind::Syntax,
-        offset: error.valid_up_to(),
-    })?;
-    let used = {
-        let mut parser = Parser {
-            bytes,
-            tokens,
-            limits,
-            position: 0,
-            used: 0,
-        };
-        parser.value(0)?;
-        parser.whitespace();
-        if parser.position != parser.bytes.len() {
-            return Err(parser.error(ErrorKind::Syntax));
-        }
-        parser.used
-    };
-    Ok(Document {
-        bytes,
-        tokens: tokens.get(..used).ok_or(Error {
-            kind: ErrorKind::Storage,
-            offset: 0,
-        })?,
-    })
+    let mut cursor = Cursor::new(bytes, tokens, limits)?;
+    while !cursor.step()? {}
+    cursor.finish()
 }
-struct Parser<'a> {
+
+#[derive(Clone, Copy)]
+enum Place {
+    First,
+    Value,
+    Key,
+    Colon,
+    After,
+}
+#[derive(Clone, Copy)]
+struct Frame {
+    index: u32,
+    first: u32,
+    last: u32,
+    count: u32,
+    kind: Kind,
+    place: Place,
+}
+impl Frame {
+    const EMPTY: Self = Self {
+        index: NONE,
+        first: NONE,
+        last: NONE,
+        count: 0,
+        kind: Kind::Null,
+        place: Place::First,
+    };
+}
+#[derive(Clone, Copy)]
+enum NumberState {
+    Start,
+    Sign,
+    Zero,
+    Integer,
+    Dot,
+    Fraction,
+    Exponent,
+    ExponentSign,
+    ExponentDigits,
+}
+#[derive(Clone, Copy)]
+enum Mode {
+    Utf8,
+    Grammar,
+    String {
+        index: u32,
+        start: usize,
+        output: usize,
+    },
+    Number {
+        index: u32,
+        start: usize,
+        state: NumberState,
+    },
+    Literal {
+        index: u32,
+        matched: usize,
+    },
+    Sort(Sort),
+    Done,
+}
+#[derive(Clone, Copy)]
+enum SortPhase {
+    Split,
+    Merge,
+}
+#[derive(Clone, Copy)]
+struct Sort {
+    object: u32,
+    width: u32,
+    rest: u32,
+    head: u32,
+    tail: u32,
+    left: u32,
+    right: u32,
+    left_count: u32,
+    right_count: u32,
+    split: u32,
+    compared: usize,
+    phase: SortPhase,
+}
+
+/// Fixed-state in-place parser. Each step performs at most 256 transitions;
+/// a transition inspects at most 12 input bytes (one Unicode escape pair),
+/// or compares one key byte. No whole-string or whole-object work is hidden
+/// at completion. Callers retain responsibility for cancellation and deadlines.
+/// Dropping or failing the cursor invalidates the partially modified backing.
+pub struct Cursor<'a> {
     bytes: &'a mut [u8],
     tokens: &'a mut [Token],
     limits: ParseLimits,
     position: usize,
     used: usize,
+    stack: [Frame; MAX_DEPTH],
+    depth: usize,
+    root_started: bool,
+    mode: Mode,
+    failed: Option<Error>,
 }
-impl Parser<'_> {
+const _: () = assert!(std::mem::size_of::<Cursor<'_>>() <= 4096);
+impl<'a> Cursor<'a> {
+    pub fn new(
+        bytes: &'a mut [u8],
+        tokens: &'a mut [Token],
+        limits: ParseLimits,
+    ) -> Result<Self, Error> {
+        if bytes.len() > limits.max_bytes {
+            return Err(Error {
+                kind: ErrorKind::Limit(ParseLimit::Bytes),
+                offset: limits.max_bytes,
+            });
+        }
+        if bytes.len() >= NONE as usize || tokens.len() >= NONE as usize {
+            return Err(Error {
+                kind: ErrorKind::Storage,
+                offset: 0,
+            });
+        }
+        Ok(Self {
+            bytes,
+            tokens,
+            limits,
+            position: 0,
+            used: 0,
+            stack: [Frame::EMPTY; MAX_DEPTH],
+            depth: 0,
+            root_started: false,
+            mode: Mode::Utf8,
+            failed: None,
+        })
+    }
+    /// True means the document can be consumed with finish. Errors are sticky.
+    pub fn step(&mut self) -> Result<bool, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        for _ in 0..256 {
+            if matches!(self.mode, Mode::Done) {
+                return Ok(true);
+            }
+            if let Err(error) = self.transition() {
+                self.failed = Some(error);
+                return Err(error);
+            }
+        }
+        Ok(matches!(self.mode, Mode::Done))
+    }
+    /// No document is available before successful completion. Calling this
+    /// prematurely consumes the cursor and returns Storage (caller misuse).
+    pub fn finish(self) -> Result<Document<'a>, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if !matches!(self.mode, Mode::Done) {
+            return Err(self.error(ErrorKind::Storage));
+        }
+        Ok(Document {
+            bytes: self.bytes,
+            tokens: self.tokens.get(..self.used).ok_or(Error {
+                kind: ErrorKind::Storage,
+                offset: self.position,
+            })?,
+        })
+    }
     fn error(&self, kind: ErrorKind) -> Error {
         Error {
             kind,
@@ -327,16 +449,22 @@ impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.position).copied()
     }
-    fn whitespace(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-            self.position += 1;
-        }
-    }
     fn require(&mut self, byte: u8) -> Result<(), Error> {
         if self.peek() != Some(byte) {
             return Err(self.error(ErrorKind::Syntax));
         }
         self.position += 1;
+        Ok(())
+    }
+    fn token(&self, index: u32) -> Result<Token, Error> {
+        self.tokens
+            .get(index as usize)
+            .copied()
+            .ok_or(self.error(ErrorKind::Storage))
+    }
+    fn set(&mut self, index: u32, token: Token) -> Result<(), Error> {
+        let error = self.error(ErrorKind::Storage);
+        *self.tokens.get_mut(index as usize).ok_or(error)? = token;
         Ok(())
     }
     fn allocate(&mut self, kind: Kind) -> Result<u32, Error> {
@@ -346,29 +474,201 @@ impl Parser<'_> {
         if self.used >= self.tokens.len() {
             return Err(self.error(ErrorKind::Storage));
         }
-        let index = self.used;
+        let index = self.used as u32;
         self.used += 1;
-        let token = Token {
-            kind,
-            next: self.used as u32,
-            ..Token::EMPTY
-        };
-        self.set(index as u32, token)?;
-        Ok(index as u32)
+        self.set(
+            index,
+            Token {
+                kind,
+                next: self.used as u32,
+                ..Token::EMPTY
+            },
+        )?;
+        Ok(index)
     }
-    fn set(&mut self, index: u32, token: Token) -> Result<(), Error> {
-        let error = self.error(ErrorKind::Storage);
-        *self.tokens.get_mut(index as usize).ok_or(error)? = token;
-        Ok(())
-    }
-    fn token(&self, index: u32) -> Result<Token, Error> {
-        self.tokens
-            .get(index as usize)
+    fn frame(&self) -> Result<Frame, Error> {
+        self.depth
+            .checked_sub(1)
+            .and_then(|i| self.stack.get(i))
             .copied()
             .ok_or(self.error(ErrorKind::Storage))
     }
-    fn value(&mut self, depth: usize) -> Result<u32, Error> {
-        self.whitespace();
+    fn set_frame(&mut self, frame: Frame) -> Result<(), Error> {
+        let error = self.error(ErrorKind::Storage);
+        let index = self.depth.checked_sub(1).ok_or(error)?;
+        *self.stack.get_mut(index).ok_or(error)? = frame;
+        Ok(())
+    }
+    fn transition(&mut self) -> Result<(), Error> {
+        match self.mode {
+            Mode::Utf8 => {
+                let Some(byte) = self.peek() else {
+                    self.position = 0;
+                    self.mode = Mode::Grammar;
+                    return Ok(());
+                };
+                let width = match byte {
+                    0..=0x7f => 1,
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => return Err(self.error(ErrorKind::Syntax)),
+                };
+                let bytes = self
+                    .bytes
+                    .get(self.position..self.position + width)
+                    .ok_or(self.error(ErrorKind::Syntax))?;
+                std::str::from_utf8(bytes).map_err(|_| self.error(ErrorKind::Syntax))?;
+                self.position += width;
+                Ok(())
+            }
+            Mode::Grammar => self.grammar(),
+            Mode::String {
+                index,
+                start,
+                output,
+            } => self.string_byte(index, start, output),
+            Mode::Number {
+                index,
+                start,
+                state,
+            } => self.number_byte(index, start, state),
+            Mode::Literal { index, matched } => {
+                let literal: &[u8] = match self.token(index)?.kind {
+                    Kind::Null => b"null",
+                    Kind::True => b"true",
+                    Kind::False => b"false",
+                    _ => return Err(self.error(ErrorKind::Storage)),
+                };
+                if let Some(&byte) = literal.get(matched) {
+                    self.require(byte)?;
+                    self.mode = Mode::Literal {
+                        index,
+                        matched: matched + 1,
+                    };
+                } else {
+                    self.mode = Mode::Grammar;
+                }
+                Ok(())
+            }
+            Mode::Sort(sort) => self.sort_step(sort),
+            Mode::Done => Ok(()),
+        }
+    }
+    fn grammar(&mut self) -> Result<(), Error> {
+        if matches!(self.peek(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+            self.position += 1;
+            return Ok(());
+        }
+        if self.depth == 0 {
+            if self.root_started {
+                if self.peek().is_some() {
+                    return Err(self.error(ErrorKind::Syntax));
+                }
+                self.mode = Mode::Done;
+                return Ok(());
+            }
+            self.root_started = true;
+            return self.value();
+        }
+        let mut frame = self.frame()?;
+        let close = if frame.kind == Kind::Array {
+            b']'
+        } else {
+            b'}'
+        };
+        if matches!(frame.place, Place::First | Place::After) && self.peek() == Some(close) {
+            self.position += 1;
+            self.depth -= 1;
+            self.set(
+                frame.index,
+                Token {
+                    start: frame.first,
+                    length: frame.count,
+                    next: self.used as u32,
+                    kind: frame.kind,
+                },
+            )?;
+            if frame.kind == Kind::Object && frame.count > 1 {
+                self.mode = Mode::Sort(Sort {
+                    object: frame.index,
+                    width: 1,
+                    rest: frame.first,
+                    head: NONE,
+                    tail: NONE,
+                    left: NONE,
+                    right: NONE,
+                    left_count: 0,
+                    right_count: 0,
+                    split: 0,
+                    compared: 0,
+                    phase: SortPhase::Split,
+                });
+            }
+            return Ok(());
+        }
+        match frame.place {
+            Place::First => {
+                frame.place = if frame.kind == Kind::Object {
+                    Place::Key
+                } else {
+                    Place::Value
+                };
+                self.set_frame(frame)
+            }
+            Place::After => {
+                self.require(b',')?;
+                frame.place = if frame.kind == Kind::Object {
+                    Place::Key
+                } else {
+                    Place::Value
+                };
+                self.set_frame(frame)
+            }
+            Place::Colon => {
+                self.require(b':')?;
+                frame.place = Place::Value;
+                self.set_frame(frame)
+            }
+            Place::Key => {
+                if self.peek() != Some(b'"') {
+                    return Err(self.error(ErrorKind::Syntax));
+                }
+                let key = self.allocate(Kind::Key)?;
+                if frame.last != NONE {
+                    let mut token = self.token(frame.last)?;
+                    token.next = key;
+                    self.set(frame.last, token)?;
+                }
+                if frame.first == NONE {
+                    frame.first = key;
+                }
+                frame.last = key;
+                frame.place = Place::Colon;
+                self.set_frame(frame)?;
+                self.position += 1;
+                self.mode = Mode::String {
+                    index: key,
+                    start: self.position,
+                    output: self.position,
+                };
+                Ok(())
+            }
+            Place::Value => {
+                if frame.kind == Kind::Array && frame.first == NONE {
+                    frame.first = self.used as u32;
+                }
+                frame.count = frame
+                    .count
+                    .checked_add(1)
+                    .ok_or(self.error(ErrorKind::Storage))?;
+                frame.place = Place::After;
+                self.set_frame(frame)?;
+                self.value()
+            }
+        }
+    }
+    fn value(&mut self) -> Result<(), Error> {
         let kind = match self.peek() {
             Some(b'n') => Kind::Null,
             Some(b't') => Kind::True,
@@ -380,173 +680,147 @@ impl Parser<'_> {
             _ => return Err(self.error(ErrorKind::Syntax)),
         };
         if matches!(kind, Kind::Array | Kind::Object)
-            && depth >= self.limits.max_depth.min(MAX_DEPTH)
+            && self.depth >= self.limits.max_depth.min(MAX_DEPTH)
         {
             return Err(self.error(ErrorKind::Limit(ParseLimit::Depth)));
         }
         let index = self.allocate(kind)?;
-        if matches!(kind, Kind::Array | Kind::Object) {
-            self.container(index, kind, depth + 1)?;
-        } else {
-            let (start, length) = match kind {
-                Kind::String => self.string()?,
-                Kind::Number => {
-                    let start = self.position;
-                    while self.peek().is_some_and(|byte| {
-                        byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E')
-                    }) {
-                        self.position += 1;
-                    }
-                    let lexeme = self
-                        .bytes
-                        .get(start..self.position)
-                        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                        .ok_or(self.error(ErrorKind::Storage))?;
-                    if !valid_json_number(lexeme) {
-                        return Err(self.error(ErrorKind::Syntax));
-                    }
-                    (start as u32, (self.position - start) as u32)
-                }
-                _ => {
-                    let literal: &[u8] = match kind {
-                        Kind::Null => b"null",
-                        Kind::True => b"true",
-                        Kind::False => b"false",
-                        _ => return Err(self.error(ErrorKind::Storage)),
-                    };
-                    for &byte in literal {
-                        self.require(byte)?;
-                    }
-                    (0, 0)
-                }
-            };
-            self.set(
-                index,
-                Token {
-                    start,
-                    length,
-                    next: self.used as u32,
+        match kind {
+            Kind::Array | Kind::Object => {
+                let error = self.error(ErrorKind::Storage);
+                *self.stack.get_mut(self.depth).ok_or(error)? = Frame {
+                    index,
                     kind,
-                },
-            )?;
-        }
-        Ok(index)
-    }
-    fn container(&mut self, index: u32, kind: Kind, depth: usize) -> Result<(), Error> {
-        self.position += 1;
-        self.whitespace();
-        let close = if kind == Kind::Array { b']' } else { b'}' };
-        let mut first = NONE;
-        let mut last = NONE;
-        let mut count = 0u32;
-        if self.peek() != Some(close) {
-            loop {
-                self.whitespace();
-                if kind == Kind::Object {
-                    if self.peek() != Some(b'"') {
-                        return Err(self.error(ErrorKind::Syntax));
-                    }
-                    let key = self.allocate(Kind::Key)?;
-                    let (start, length) = self.string()?;
-                    self.set(
-                        key,
-                        Token {
-                            start,
-                            length,
-                            next: NONE,
-                            kind: Kind::Key,
-                        },
-                    )?;
-                    if last != NONE {
-                        let mut previous = self.token(last)?;
-                        previous.next = key;
-                        self.set(last, previous)?;
-                    }
-                    if first == NONE {
-                        first = key;
-                    }
-                    last = key;
-                    self.whitespace();
-                    self.require(b':')?;
-                    self.value(depth)?;
-                } else {
-                    let child = self.value(depth)?;
-                    if first == NONE {
-                        first = child;
-                    }
-                }
-                count = count.checked_add(1).ok_or(self.error(ErrorKind::Storage))?;
-                self.whitespace();
-                if self.peek() == Some(close) {
-                    break;
-                }
-                self.require(b',')?;
+                    ..Frame::EMPTY
+                };
+                self.depth += 1;
+                self.position += 1;
             }
+            Kind::String => {
+                self.position += 1;
+                self.mode = Mode::String {
+                    index,
+                    start: self.position,
+                    output: self.position,
+                };
+            }
+            Kind::Number => {
+                self.mode = Mode::Number {
+                    index,
+                    start: self.position,
+                    state: NumberState::Start,
+                }
+            }
+            _ => self.mode = Mode::Literal { index, matched: 0 },
         }
-        self.require(close)?;
-        if kind == Kind::Object {
-            first = self.sort(first, count)?;
+        Ok(())
+    }
+    fn number_byte(&mut self, index: u32, start: usize, state: NumberState) -> Result<(), Error> {
+        use NumberState::*;
+        let next = match (state, self.peek()) {
+            (Start, Some(b'-')) => Some(Sign),
+            (Start | Sign, Some(b'0')) => Some(Zero),
+            (Start | Sign, Some(b'1'..=b'9')) => Some(Integer),
+            (Integer, Some(b'0'..=b'9')) => Some(Integer),
+            (Zero | Integer, Some(b'.')) => Some(Dot),
+            (Dot | Fraction, Some(b'0'..=b'9')) => Some(Fraction),
+            (Zero | Integer | Fraction, Some(b'e' | b'E')) => Some(Exponent),
+            (Exponent, Some(b'+' | b'-')) => Some(ExponentSign),
+            (Exponent | ExponentSign | ExponentDigits, Some(b'0'..=b'9')) => Some(ExponentDigits),
+            _ => None,
+        };
+        if let Some(state) = next {
+            self.position += 1;
+            self.mode = Mode::Number {
+                index,
+                start,
+                state,
+            };
+            return Ok(());
+        }
+        if !matches!(state, Zero | Integer | Fraction | ExponentDigits) {
+            return Err(self.error(ErrorKind::Syntax));
         }
         self.set(
             index,
             Token {
-                start: first,
-                length: count,
+                start: start as u32,
+                length: (self.position - start) as u32,
                 next: self.used as u32,
-                kind,
+                kind: Kind::Number,
             },
-        )
+        )?;
+        self.mode = Mode::Grammar;
+        Ok(())
     }
-    fn string(&mut self) -> Result<(u32, u32), Error> {
-        self.require(b'"')?;
-        let start = self.position;
-        let mut output = start;
-        loop {
-            let byte = self.peek().ok_or(self.error(ErrorKind::Syntax))?;
+    fn string_byte(&mut self, index: u32, start: usize, mut output: usize) -> Result<(), Error> {
+        let byte = self.peek().ok_or(self.error(ErrorKind::Syntax))?;
+        self.position += 1;
+        if byte == b'"' {
+            let kind = self.token(index)?.kind;
+            self.set(
+                index,
+                Token {
+                    start: start as u32,
+                    length: (output - start) as u32,
+                    next: if kind == Kind::Key {
+                        NONE
+                    } else {
+                        self.used as u32
+                    },
+                    kind,
+                },
+            )?;
+            self.mode = Mode::Grammar;
+            return Ok(());
+        }
+        if byte < 32 {
+            return Err(self.error(ErrorKind::Syntax));
+        }
+        if byte == b'\\' {
+            let escape = self.peek().ok_or(self.error(ErrorKind::Syntax))?;
             self.position += 1;
-            if byte == b'"' {
-                return Ok((start as u32, (output - start) as u32));
-            }
-            if byte < 32 {
-                return Err(self.error(ErrorKind::Syntax));
-            }
-            if byte == b'\\' {
-                let escape = self.peek().ok_or(self.error(ErrorKind::Syntax))?;
-                self.position += 1;
-                let scalar = match escape {
-                    b'"' => '"',
-                    b'\\' => '\\',
-                    b'/' => '/',
-                    b'b' => '\u{8}',
-                    b'f' => '\u{c}',
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    b'u' => {
-                        let mut code = self.hex4()?;
-                        if (0xd800..=0xdbff).contains(&code) {
-                            self.require(b'\\')?;
-                            self.require(b'u')?;
-                            let low = self.hex4()?;
-                            if !(0xdc00..=0xdfff).contains(&low) {
-                                return Err(self.error(ErrorKind::Syntax));
-                            }
-                            code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+            let scalar = match escape {
+                b'"' => '"',
+                b'\\' => '\\',
+                b'/' => '/',
+                b'b' => '\u{8}',
+                b'f' => '\u{c}',
+                b'n' => '\n',
+                b'r' => '\r',
+                b't' => '\t',
+                b'u' => {
+                    let mut code = self.hex4()?;
+                    if (0xd800..=0xdbff).contains(&code) {
+                        self.require(b'\\')?;
+                        self.require(b'u')?;
+                        let low = self.hex4()?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(self.error(ErrorKind::Syntax));
                         }
-                        char::from_u32(code).ok_or(self.error(ErrorKind::Syntax))?
+                        code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
                     }
-                    _ => return Err(self.error(ErrorKind::Syntax)),
-                };
-                let mut encoded = [0; 4];
-                for &byte in scalar.encode_utf8(&mut encoded).as_bytes() {
-                    self.put(output, byte)?;
-                    output += 1;
+                    char::from_u32(code).ok_or(self.error(ErrorKind::Syntax))?
                 }
-            } else {
+                _ => return Err(self.error(ErrorKind::Syntax)),
+            };
+            let mut encoded = [0; 4];
+            for &byte in scalar.encode_utf8(&mut encoded).as_bytes() {
                 self.put(output, byte)?;
                 output += 1;
             }
+        } else {
+            if output != self.position - 1 {
+                self.put(output, byte)?;
+            }
+            output += 1;
         }
+        self.mode = Mode::String {
+            index,
+            start,
+            output,
+        };
+        Ok(())
     }
     fn put(&mut self, output: usize, byte: u8) -> Result<(), Error> {
         if output >= self.position {
@@ -559,78 +833,111 @@ impl Parser<'_> {
     fn hex4(&mut self) -> Result<u32, Error> {
         let mut code = 0u32;
         for _ in 0..4 {
-            let byte = self.peek().ok_or(self.error(ErrorKind::Syntax))?;
-            let digit = char::from(byte)
-                .to_digit(16)
+            let digit = self
+                .peek()
+                .and_then(|byte| char::from(byte).to_digit(16))
                 .ok_or(self.error(ErrorKind::Syntax))?;
             self.position += 1;
             code = (code << 4) | digit;
         }
         Ok(code)
     }
-    // In-place linked merge sort uses key-token links, not another key arena.
-    fn sort(&mut self, head: u32, count: u32) -> Result<u32, Error> {
-        if count < 2 {
-            return Ok(head);
-        }
-        let left_count = count / 2;
-        let mut cut = head;
-        for _ in 1..left_count {
-            cut = self.token(cut)?.next;
-        }
-        let mut token = self.token(cut)?;
-        let right = token.next;
-        token.next = NONE;
-        self.set(cut, token)?;
-        let mut left = self.sort(head, left_count)?;
-        let mut right = self.sort(right, count - left_count)?;
-        let mut result = NONE;
-        let mut tail = NONE;
-        while left != NONE || right != NONE {
-            let choose_left = if right == NONE {
-                true
-            } else if left == NONE {
-                false
-            } else {
-                let left_key = raw_span(self.bytes, self.token(left)?)
-                    .ok_or(self.error(ErrorKind::Storage))?;
-                let right_key = raw_span(self.bytes, self.token(right)?)
-                    .ok_or(self.error(ErrorKind::Storage))?;
-                match left_key.cmp(right_key) {
-                    std::cmp::Ordering::Equal => {
-                        return Err(Error {
-                            kind: ErrorKind::Syntax,
-                            offset: (self.token(right)?.start as usize)
-                                .checked_sub(1)
-                                .ok_or(self.error(ErrorKind::Storage))?,
-                        })
+    fn sort_step(&mut self, mut sort: Sort) -> Result<(), Error> {
+        match sort.phase {
+            SortPhase::Split => {
+                if sort.left == NONE {
+                    if sort.rest == NONE {
+                        let mut token = self.token(sort.object)?;
+                        token.start = sort.head;
+                        self.set(sort.object, token)?;
+                        sort.width = sort.width.saturating_mul(2);
+                        if sort.width >= token.length {
+                            self.mode = Mode::Grammar;
+                            return Ok(());
+                        }
+                        sort.rest = sort.head;
+                        sort.head = NONE;
+                        sort.tail = NONE;
                     }
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Greater => false,
+                    sort.left = sort.rest;
+                    sort.right = sort.rest;
+                    sort.split = 0;
                 }
-            };
-            let item = if choose_left {
-                let item = left;
-                left = self.token(left)?.next;
-                item
-            } else {
-                let item = right;
-                right = self.token(right)?.next;
-                item
-            };
-            if tail == NONE {
-                result = item;
-            } else {
-                let mut token = self.token(tail)?;
-                token.next = item;
-                self.set(tail, token)?;
+                if sort.split < sort.width && sort.right != NONE {
+                    sort.right = self.token(sort.right)?.next;
+                    sort.split += 1;
+                } else {
+                    sort.left_count = sort.split;
+                    sort.right_count = sort.width;
+                    sort.phase = SortPhase::Merge;
+                }
             }
-            tail = item;
+            SortPhase::Merge => {
+                if sort.left_count == 0 && (sort.right_count == 0 || sort.right == NONE) {
+                    sort.rest = sort.right;
+                    sort.left = NONE;
+                    sort.phase = SortPhase::Split;
+                } else {
+                    let choose_left = if sort.left_count == 0 {
+                        false
+                    } else if sort.right_count == 0 || sort.right == NONE {
+                        true
+                    } else {
+                        let left = raw_span(self.bytes, self.token(sort.left)?)
+                            .ok_or(self.error(ErrorKind::Storage))?;
+                        let right = raw_span(self.bytes, self.token(sort.right)?)
+                            .ok_or(self.error(ErrorKind::Storage))?;
+                        match (left.get(sort.compared), right.get(sort.compared)) {
+                            (Some(a), Some(b)) if a == b => {
+                                sort.compared += 1;
+                                self.mode = Mode::Sort(sort);
+                                return Ok(());
+                            }
+                            (None, None) => {
+                                return Err(Error {
+                                    kind: ErrorKind::Syntax,
+                                    offset: self
+                                        .token(sort.left)?
+                                        .start
+                                        .max(self.token(sort.right)?.start)
+                                        .saturating_sub(1)
+                                        as usize,
+                                })
+                            }
+                            (None, Some(_)) => true,
+                            (Some(_), None) => false,
+                            (Some(a), Some(b)) => a < b,
+                        }
+                    };
+                    sort.compared = 0;
+                    let item = if choose_left {
+                        let item = sort.left;
+                        sort.left = self.token(item)?.next;
+                        sort.left_count -= 1;
+                        item
+                    } else {
+                        let item = sort.right;
+                        sort.right = self.token(item)?.next;
+                        sort.right_count -= 1;
+                        item
+                    };
+                    if sort.tail == NONE {
+                        sort.head = item;
+                    } else {
+                        let mut token = self.token(sort.tail)?;
+                        token.next = item;
+                        self.set(sort.tail, token)?;
+                    }
+                    sort.tail = item;
+                    // Detach output; both input run cursors already retain their successors.
+                    let mut token = self.token(item)?;
+                    token.next = NONE;
+                    self.set(item, token)?;
+                }
+            }
         }
-        let mut token = self.token(tail)?;
-        token.next = NONE;
-        self.set(tail, token)?;
-        Ok(result)
+        self.mode = Mode::Sort(sort);
+        Ok(())
     }
 }
 
@@ -996,5 +1303,157 @@ mod tests {
             .kind,
             ErrorKind::Limit(ParseLimit::Depth)
         );
+    }
+    #[test]
+    fn cursor_yields_inside_large_strings_numbers_and_shared_key_prefixes() {
+        for input in [
+            format!("\"{}\"", "\\ud834\\udd1e".repeat(10000)),
+            "1".repeat(100000),
+            format!(
+                "{{\"{}b\":0,\"{}a\":1}}",
+                "x".repeat(20000),
+                "x".repeat(20000)
+            ),
+        ] {
+            let expected = crate::parse(&input).unwrap().to_canonical();
+            let mut bytes = input.into_bytes();
+            let mut tokens = [Token::EMPTY; 8];
+            let mut cursor = Cursor::new(&mut bytes, &mut tokens, limits()).unwrap();
+            let mut turns = 0;
+            let mut sorting_turns = 0;
+            let mut string_turns = 0;
+            let mut number_turns = 0;
+            loop {
+                let before = cursor.position;
+                let validating_utf8 = matches!(cursor.mode, Mode::Utf8);
+                let done = cursor.step().unwrap();
+                if !validating_utf8 {
+                    assert!(cursor.position.saturating_sub(before) <= 256 * 12);
+                }
+                if done {
+                    break;
+                }
+                turns += 1;
+                if matches!(cursor.mode, Mode::String { .. }) {
+                    string_turns += 1;
+                }
+                if matches!(cursor.mode, Mode::Number { .. }) {
+                    number_turns += 1;
+                }
+                if matches!(cursor.mode, Mode::Sort(_)) {
+                    sorting_turns += 1;
+                }
+                assert!(turns < 10000);
+            }
+            assert!(turns > 100);
+            let document = cursor.finish().unwrap();
+            if document.root().as_object().is_some() {
+                assert!(sorting_turns > 50);
+            } else if document.root().as_str().is_some() {
+                assert!(string_turns > 20);
+            } else {
+                assert!(number_turns > 100);
+            }
+            let mut output = String::new();
+            document.root().write_json(&mut output).unwrap();
+            assert_eq!(output, expected);
+        }
+        assert!(std::mem::size_of::<Cursor<'_>>() <= 4096);
+    }
+    #[test]
+    fn cursor_hides_partial_documents_and_repeats_terminal_errors() {
+        let mut bytes = vec![b' '; 4096];
+        let mut tokens = [Token::EMPTY; 8];
+        let mut cursor = Cursor::new(&mut bytes, &mut tokens, limits()).unwrap();
+        assert!(!cursor.step().unwrap());
+        assert_eq!(cursor.finish().err().unwrap().kind, ErrorKind::Storage);
+        for input in [
+            br#"{"a":0,"a":1}"#.as_slice(),
+            br#""\ud800""#,
+            &[0xf0, 0x90, 0x80],
+        ] {
+            let mut bytes = input.to_vec();
+            let mut cursor = Cursor::new(&mut bytes, &mut tokens, limits()).unwrap();
+            let error = loop {
+                match cursor.step() {
+                    Err(error) => break error,
+                    Ok(false) => (),
+                    Ok(true) => panic!("malformed document accepted"),
+                }
+            };
+            assert_eq!(cursor.step(), Err(error));
+            assert_eq!(cursor.finish().err(), Some(error));
+        }
+    }
+    #[test]
+    fn sorting_all_permutations_preserves_nested_values_and_duplicate_offsets() {
+        fn permutations(prefix: &mut Vec<usize>, rest: &mut Vec<usize>) {
+            if rest.is_empty() {
+                let text = prefix
+                    .iter()
+                    .map(|i| format!("\"k{i}\":[{{\"value\":{i}}},[]]"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                compare(&format!("{{{text}}}"));
+                compare(&format!("{{{text},\"k2\":false}}"));
+            } else {
+                for index in 0..rest.len() {
+                    let value = rest.remove(index);
+                    prefix.push(value);
+                    permutations(prefix, rest);
+                    prefix.pop();
+                    rest.insert(index, value);
+                }
+            }
+        }
+        permutations(&mut Vec::new(), &mut (0..6).collect());
+    }
+    #[test]
+    fn closed_duplicate_object_precedes_later_depth_token_and_storage_errors() {
+        for (depth, token_limit, backing) in [(2, 32, 32), (128, 6, 32), (128, 32, 6)] {
+            let mut bytes = br#"[{"a":1,"a":2},[[0]]]"#.to_vec();
+            let mut tokens = vec![Token::EMPTY; backing];
+            let error = parse(
+                &mut bytes,
+                &mut tokens,
+                ParseLimits {
+                    max_depth: depth,
+                    max_tokens: token_limit,
+                    ..limits()
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                Error {
+                    kind: ErrorKind::Syntax,
+                    offset: 8
+                }
+            );
+        }
+    }
+    #[test]
+    fn utf8_error_offsets_match_whole_input_validation() {
+        for invalid in [
+            &[0xc2, b'x'][..],
+            &[0xe0, 0x80, 0x80],
+            &[0xf4, 0x90, 0x80, 0x80],
+            &[0xf0, 0x90, 0x80],
+        ] {
+            for prefix in ["", "abc", "é☃"] {
+                let mut bytes = prefix.as_bytes().to_vec();
+                bytes.extend_from_slice(invalid);
+                let expected = std::str::from_utf8(&bytes).err().unwrap().valid_up_to();
+                let mut tokens = [Token::EMPTY; 8];
+                assert_eq!(
+                    parse(&mut bytes, &mut tokens, limits()).err().unwrap(),
+                    Error {
+                        kind: ErrorKind::Syntax,
+                        offset: expected
+                    }
+                );
+            }
+        }
     }
 }

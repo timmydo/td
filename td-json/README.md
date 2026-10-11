@@ -124,6 +124,19 @@ rejects duplicates without a separate key arena. `ParseLimits` bounds bytes,
 container depth (capped by `MAX_DEPTH`) and tokens. Inputs
 and token storage must each have fewer than `u32::MAX` entries. Errors are
 redacted, allocation-free classifications with raw byte offsets; insufficient
-caller token storage is distinct from the configured token ceiling. This is
+caller token storage is distinct from the configured token ceiling. Storage
+also reports caller misuse when finish consumes an incomplete cursor. This is
 ordinary JSON; protocol-specific I-JSON character restrictions stay with the
 caller. There is no heap tree or owned conversion in this API.
+
+`arena::Cursor` advances the same parser in fixed steps of at most 256
+transitions, including UTF-8 validation, string decoding, number grammar,
+container entry/exit and linked key sorting. Each transition inspects at most
+12 input bytes or compares one key byte. Fixed cursor state fits 4 KiB;
+caller byte/token arenas are separate. No whole-string validation or sort is
+deferred to finish. A partial or failed cursor cannot yield a Document;
+errors latch. `arena::parse` drives this cursor synchronously to completion.
+Neither API owns a clock, cancellation or a scheduler. A caller checks its
+original admission between steps and before using the completed document.
+Object lookup, scalar views and JSON writing remain synchronous helpers;
+this scheduling bound applies only to cursor parsing.

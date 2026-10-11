@@ -2836,9 +2836,12 @@ limits remain distinct from internal depth and token exhaustion. Core
 activation must validate that configured bytes, depth and tokens admit the
 basic envelope at the advertised method count.
 
-The parser is synchronous. Resumable tokenization/sorting under RESOURCES.md's
-bounded-step rule, and API.md's bridge from raw escaped body-property fragments
-to decoded values, remain required before activation. Internal depth/token
+The shared arena now has a fixed-state resumable Cursor for UTF-8 validation,
+tokenization and key sorting; its synchronous parse helper drives that same
+implementation. JMAP whole-envelope/I-JSON admission still uses synchronous
+helpers. Stepped admission with live deadlines, bounded downstream traversal
+and API.md's bridge from raw escaped body-property fragments to decoded
+values remain required before activation. Internal depth/token
 refusal is planned as HTTP 400 with a redacted generic problem body; it is
 neither notJSON nor an advertised Core limit. Storage/configuration faults
 remain HTTP 500 server failures. The unreachable parser-byte Resource display
