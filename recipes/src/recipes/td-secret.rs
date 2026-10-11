@@ -147,6 +147,7 @@ const MODULES: &[(&str, &str)] = &[
         "operation",
         include_str!("../../../td-secret/src/operation.rs"),
     ),
+    ("frames", include_str!("../../../td-secret/src/frames.rs")),
     (
         "enrollment_operation",
         include_str!("../../../td-secret/src/enrollment_operation.rs"),
@@ -282,6 +283,11 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-secret/src/scm.rs",
             include_str!("../../../td-secret/src/scm.rs"),
+        ),
+        // store.rs's own child.
+        (
+            "{src}/td-secret/src/memory.rs",
+            include_str!("../../../td-secret/src/memory.rs"),
         ),
         (
             "{src}/td-secret/src/portable_events.rs",

@@ -2905,8 +2905,8 @@ mod tests {
         let worker = production(include_str!("login_operation.rs"));
         assert!(!worker.contains(".receive()"));
         assert_eq!(worker.matches(".receive_cleared()").count(), 1);
-        let exchange = production(include_str!("operation.rs"))
-            .split("    fn exchange(")
+        let exchange = production(include_str!("frames.rs"))
+            .split("    pub(crate) fn exchange(")
             .nth(1)
             .unwrap()
             .split("\n    }\n")

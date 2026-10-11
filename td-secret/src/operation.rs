@@ -1,147 +1,22 @@
 //! One private root-owned unlock operation, with separate presentation and commit.
 
 use super::fido_pin::Pin;
+use super::frames;
+pub(super) use super::frames::{remaining, Cleared, Wire};
 use super::{consent, crypto, fido_device, fido_enroll, fido_metadata, store, tpm};
 use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-const LIMIT: usize = 289;
-const FRAME_TIME: Duration = Duration::from_secs(5);
 /// Root's PIN frame: this tag, then the PIN's 4 to 63 bytes.
 pub(super) const PIN: u8 = 0x16;
 const PIN_FRAME: usize = 64;
-pub(super) const OPERATION_TIME: Duration = fido_device::MAX_LIFETIME;
+pub(super) const OPERATION_TIME: std::time::Duration = fido_device::MAX_LIFETIME;
 
-pub(super) struct Wire {
-    stream: UnixStream,
-    deadline: Instant,
-    /// The open token session's deadline, which bounds every wait while it
-    /// is open without narrowing the operation's.
-    session: Option<Instant>,
-    /// A frame or the operation ran out of time; nothing else sets it.
-    expired: bool,
-}
-
+/// td-secret's frames over the shared endpoint (frames.rs): a credential,
+/// a PIN, and the rounds that bind a consent description.
 impl Wire {
-    pub(super) fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
-    /// Whether a failure so far was a frame or operation deadline.
-    pub(super) fn expired(&self) -> bool {
-        self.expired
-    }
-
-    /// Narrows the operation deadline once the operation is known; never extends it.
-    pub(super) fn limit(&mut self, deadline: Instant) {
-        self.deadline = self.deadline.min(deadline);
-    }
-
-    /// Bounds every wait by a token session's deadline while it is open;
-    /// none once it has ended.
-    pub(super) fn session(&mut self, deadline: Option<Instant>) {
-        self.session = deadline;
-    }
-
-    /// What the next wait may last until: the operation deadline, or an
-    /// open session's if that is earlier.
-    pub(super) fn bound(&self) -> Instant {
-        self.session
-            .map_or(self.deadline, |session| session.min(self.deadline))
-    }
-
-    pub(super) fn new(stream: UnixStream, deadline: Instant) -> Result<Self, String> {
-        stream
-            .set_nonblocking(false)
-            .map_err(|_| "set blocking operation endpoint")?;
-        Ok(Self {
-            stream,
-            deadline,
-            session: None,
-            expired: false,
-        })
-    }
-
-    fn frame_remaining(&mut self, deadline: Instant) -> Result<Duration, String> {
-        let result = remaining(self.bound()).and_then(|_| {
-            remaining(deadline).map_err(|_| "private operation frame timed out".into())
-        });
-        self.expired |= result.is_err();
-        result
-    }
-
-    fn frame_deadline(&self) -> Result<Instant, String> {
-        Instant::now()
-            .checked_add(FRAME_TIME)
-            .map(|deadline| deadline.min(self.bound()))
-            .ok_or_else(|| "operation deadline overflow".into())
-    }
-
-    fn read(&mut self, mut bytes: &mut [u8], deadline: Instant) -> Result<(), String> {
-        while !bytes.is_empty() {
-            let timeout = self.frame_remaining(deadline)?;
-            self.stream
-                .set_read_timeout(Some(timeout))
-                .map_err(|_| "set operation read timeout")?;
-            let count = match self.stream.read(bytes) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    self.frame_remaining(deadline)?;
-                    self.expired = true;
-                    return Err("private operation frame timed out".into());
-                }
-                result => result.map_err(|_| "read private operation frame")?,
-            };
-            if count == 0 {
-                return Err("operation authority disconnected".into());
-            }
-            bytes = bytes
-                .get_mut(count..)
-                .ok_or("invalid operation read count")?;
-        }
-        self.frame_remaining(deadline).map(|_| ())
-    }
-
-    pub(super) fn receive(&mut self) -> Result<Vec<u8>, String> {
-        let mut frame = self.receive_cleared()?;
-        Ok(std::mem::take(&mut frame.0).into_vec())
-    }
-
-    /// One frame in clearing storage: a misordered PIN, or a partial
-    /// frame, is zeroed when it is dropped.
-    pub(super) fn receive_cleared(&mut self) -> Result<Cleared, String> {
-        self.receive_cleared_by(None)
-    }
-
-    /// `receive_cleared`, whose header waits until `header` when given,
-    /// the rest then having one frame time.
-    fn receive_cleared_by(&mut self, header: Option<Instant>) -> Result<Cleared, String> {
-        let mut deadline = self.frame_deadline()?;
-        let mut length = [0; 2];
-        if let Some(header) = header {
-            self.read(&mut length, header)?;
-            deadline = self.frame_deadline()?;
-        } else {
-            self.read(&mut length, deadline)?;
-        }
-        let length = usize::from(u16::from_be_bytes(length));
-        if length == 0 || length > LIMIT {
-            return Err("invalid operation frame length".into());
-        }
-        let mut frame = Cleared(vec![0; length].into_boxed_slice());
-        self.read(&mut frame.0, deadline)?;
-        Ok(frame)
-    }
-
     pub(super) fn receive_credential(&mut self) -> Result<Credential, String> {
         let deadline = self.frame_deadline()?;
         let mut header = [0; 2];
@@ -178,51 +53,13 @@ impl Wire {
             .map_err(|_| "operation PIN is outside its profile".into())
     }
 
-    pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.is_empty() || bytes.len() > LIMIT {
-            return Err("invalid operation frame length".into());
-        }
-        let deadline = self.frame_deadline()?;
-        let mut frame = Vec::with_capacity(bytes.len() + 2);
-        frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        frame.extend_from_slice(bytes);
-        let mut pending = frame.as_slice();
-        while !pending.is_empty() {
-            let timeout = self.frame_remaining(deadline)?;
-            self.stream
-                .set_write_timeout(Some(timeout))
-                .map_err(|_| "set operation write timeout")?;
-            let count = match self.stream.write(pending) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    self.frame_remaining(deadline)?;
-                    self.expired = true;
-                    return Err("private operation frame timed out".into());
-                }
-                result => result.map_err(|_| "write private operation frame")?,
-            };
-            if count == 0 {
-                return Err("operation authority stopped reading".into());
-            }
-            pending = pending
-                .get(count..)
-                .ok_or("invalid operation write count")?;
-        }
-        self.frame_remaining(deadline).map(|_| ())
-    }
-
     pub(super) fn acknowledge(
         &mut self,
         tag: u8,
         answer: u8,
         request: &consent::Request,
     ) -> Result<(), String> {
-        self.exchange(tag, answer, request, None)
+        self.exchange(tag, answer, round()?, &request.encode(), None)
     }
 
     /// A login disclosure step's presentation round: root acknowledges it
@@ -235,45 +72,18 @@ impl Wire {
         answer: u8,
         request: &consent::Request,
     ) -> Result<(), String> {
-        self.exchange(tag, answer, request, Some(self.bound()))
-    }
-
-    fn exchange(
-        &mut self,
-        tag: u8,
-        answer: u8,
-        request: &consent::Request,
-        wait: Option<Instant>,
-    ) -> Result<(), String> {
-        let mut round = [0; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut round))
-            .map_err(|_| "read operation round randomness")?;
-        let mut message = vec![tag];
-        message.extend_from_slice(&round);
-        message.extend_from_slice(&request.encode());
-        self.send(&message)?;
-        let reply = self.receive_cleared_by(wait)?;
-        let reply = reply.bytes();
-        if reply.first() != Some(&answer) || reply.get(1..) != message.get(1..) {
-            return Err("operation acknowledgement does not match its request and round".into());
-        }
-        Ok(())
+        let wait = Some(self.bound());
+        self.exchange(tag, answer, round()?, &request.encode(), wait)
     }
 }
 
-/// Zeroed on drop, including after a partial read.
-pub(super) struct Cleared(Box<[u8]>);
-impl Cleared {
-    pub(super) fn bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-impl Drop for Cleared {
-    fn drop(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
-    }
+/// One round's 32 random bytes, from the kernel.
+fn round() -> Result<[u8; 32], String> {
+    let mut round = [0; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut round))
+        .map_err(|_| "read operation round randomness")?;
+    Ok(round)
 }
 
 pub(super) struct Credential(Vec<u8>);
@@ -288,72 +98,35 @@ impl Drop for Credential {
     }
 }
 
-pub(super) fn remaining(deadline: Instant) -> Result<Duration, String> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| "private token operation expired".into())
-}
-
 pub(super) fn startup() -> Result<UnixStream, String> {
     store::require_root()?;
     let mut status = String::new();
     File::open("/proc/self/status")
         .and_then(|file| file.take(8193).read_to_string(&mut status))
         .map_err(|_| "read operation process identity")?;
-    if status.len() > 8192
-        || !status.lines().any(|line| {
-            line.strip_prefix("Threads:")
-                .is_some_and(|value| value.trim() == "1")
-        })
-    {
-        return Err("token operation requires single-threaded startup".into());
-    }
     let input = std::fs::metadata("/proc/self/fd/0").map_err(|_| "missing operation endpoint")?;
-    if input.uid() != 0 {
-        return Err("operation endpoint must be root owned".into());
-    }
-    for fd in [1, 2] {
-        let output = std::fs::metadata(format!("/proc/self/fd/{fd}"))
-            .map_err(|_| "missing operation log descriptor")?;
-        if (input.dev(), input.ino()) == (output.dev(), output.ino()) {
-            return Err("operation log aliases its private endpoint".into());
-        }
-    }
+    let log = |fd: u8| {
+        std::fs::metadata(format!("/proc/self/fd/{fd}"))
+            .map_err(|_| "missing operation log descriptor")
+    };
+    let descriptors = [input, log(1)?, log(2)?];
     // The read_dir handle observes itself as fd 3; only 0/1/2 are inherited.
-    let mut descriptors = Vec::new();
+    let mut open = Vec::new();
     for entry in std::fs::read_dir("/proc/self/fd")
         .map_err(|_| "inspect operation descriptors")?
         .take(5)
     {
-        descriptors.push(
+        open.push(
             entry
                 .map_err(|_| "inspect operation descriptor")?
                 .file_name(),
         );
     }
-    descriptors.sort();
-    if descriptors != ["0", "1", "2", "3"].map(std::ffi::OsString::from) {
-        return Err("token operation inherited extra descriptors".into());
-    }
-    let stream = UnixStream::from(
-        std::io::stdin()
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|_| "retain private operation endpoint")?,
-    );
-    if !stream
-        .local_addr()
-        .map_err(|_| "inspect operation endpoint")?
-        .is_unnamed()
-        || !stream
-            .peer_addr()
-            .map_err(|_| "inspect operation peer")?
-            .is_unnamed()
-    {
-        return Err("token operation requires an unnamed socketpair".into());
-    }
-    Ok(stream)
+    frames::endpoint(frames::Process {
+        status,
+        descriptors,
+        open,
+    })
 }
 
 fn description(bytes: &[u8], owner: u32) -> Result<consent::Request, String> {
@@ -379,9 +152,9 @@ fn perform<T>(
     commit: impl FnOnce(T) -> Result<(), String>,
 ) -> Result<(), String> {
     wire.acknowledge(0x10, 0x11, request)?;
-    let result = acquire(challenge(request), wire.deadline)?;
+    let result = acquire(challenge(request), wire.deadline())?;
     wire.acknowledge(0x12, 0x13, request)?;
-    remaining(wire.deadline)?;
+    remaining(wire.deadline())?;
     commit(result)?;
     wire.send(&[0x14])
 }
@@ -446,10 +219,13 @@ pub fn run(uid: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::FRAME_TIME;
+    use std::io::Write;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use std::time::Duration;
 
     fn request() -> consent::Request {
         consent::Request::new(
@@ -468,6 +244,12 @@ mod tests {
             Wire::new(one, deadline).unwrap(),
             Wire::new(two, deadline).unwrap(),
         )
+    }
+    /// A worker's end and the raw peer root writes to.
+    fn raw_pair() -> (Wire, UnixStream) {
+        let (child, parent) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        (Wire::new(child, deadline).unwrap(), parent)
     }
     fn answer(wire: &mut Wire, tag: u8) {
         let mut prompt = wire.receive().unwrap();
@@ -689,30 +471,6 @@ mod tests {
         sender.join().unwrap();
     }
 
-    #[test]
-    fn frame_timeout_diagnostic_distinguishes_operation_expiration() {
-        let (mut child, _parent) = pair();
-        assert_eq!(
-            child.frame_remaining(Instant::now()).unwrap_err(),
-            "private operation frame timed out"
-        );
-        child.deadline = Instant::now();
-        assert_eq!(
-            child.frame_remaining(Instant::now()).unwrap_err(),
-            "private token operation expired"
-        );
-    }
-
-    #[test]
-    fn socket_timeout_preserves_the_overall_expiration_diagnostic() {
-        let (mut child, _parent) = pair();
-        child.deadline = Instant::now() + Duration::from_millis(30);
-        assert_eq!(
-            child.receive().unwrap_err(),
-            "private token operation expired"
-        );
-    }
-
     /// A login disclosure's acknowledgement waits as a PIN does: past a
     /// frame time, within the operation deadline. Any other waits one frame
     /// time.
@@ -826,8 +584,8 @@ mod tests {
             // Truncated: the clearing owner drops a partial PIN.
             (&[0, 5, PIN, b'1', b'2'], false),
         ] {
-            let (mut child, mut parent) = pair();
-            parent.stream.write_all(frame).unwrap();
+            let (mut child, mut parent) = raw_pair();
+            parent.write_all(frame).unwrap();
             drop(parent);
             match child.receive_pin() {
                 Ok(_) => assert!(accepted, "{frame:?}"),
@@ -839,30 +597,12 @@ mod tests {
             }
         }
         // A header beyond the bound refuses before waiting for its payload.
-        let (mut child, mut parent) = pair();
-        parent.stream.write_all(&[0, 65]).unwrap();
+        let (mut child, mut parent) = raw_pair();
+        parent.write_all(&[0, 65]).unwrap();
         assert_eq!(
             child.receive_pin().err().unwrap(),
             "invalid operation PIN frame length"
         );
         assert!(!child.expired());
-    }
-
-    #[test]
-    fn frame_bounds_and_expiration_refuse_before_processing() {
-        let (mut child, mut parent) = pair();
-        parent.stream.write_all(&290u16.to_be_bytes()).unwrap();
-        assert!(child.receive().is_err());
-        let (mut child, mut parent) = pair();
-        parent.stream.write_all(&0u16.to_be_bytes()).unwrap();
-        assert!(child.receive().is_err());
-        let (mut child, _parent) = pair();
-        child.deadline = Instant::now();
-        assert!(child.receive().is_err());
-        assert!(child.send(&[1]).is_err());
-        let (mut child, _parent) = pair();
-        assert!(child.send(&vec![1; LIMIT + 1]).is_err());
-        let (mut child, _parent) = pair();
-        assert!(child.send(&[]).is_err());
     }
 }

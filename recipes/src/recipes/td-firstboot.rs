@@ -218,6 +218,11 @@ pub fn recipe() -> Recipe {
             "{src}/td-fido/src/root.rs",
             include_str!("../../../td-fido/src/root.rs"),
         ),
+        // td-secret's store.rs compiles its memory rules by path.
+        (
+            "{src}/td-secret/src/memory.rs",
+            include_str!("../../../td-secret/src/memory.rs"),
+        ),
         (
             "{src}/td-fido/src/lib.rs",
             include_str!("../../../td-fido/src/lib.rs"),

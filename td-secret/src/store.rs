@@ -1020,28 +1020,13 @@ fn read_field<'a>(bytes: &mut &'a [u8], max: usize) -> Result<&'a [u8], String> 
 mod root;
 pub use root::require_root;
 
-fn check_swap_state(swaps: io::Result<String>) -> Result<(), String> {
-    let swaps = match swaps {
-        Ok(swaps) => swaps,
-        // Linux registers /proc/swaps only when CONFIG_SWAP is enabled.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
-    if swaps.lines().next().is_none() || swaps.lines().skip(1).any(|line| !line.trim().is_empty()) {
-        return Err("TPM credential release requires swap to be disabled".into());
-    }
-    Ok(())
-}
-
-fn with_memory_state<T>(
-    swaps: io::Result<String>,
-    limits: io::Result<String>,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
-    check_swap_state(swaps)?;
-    check_core_limit(&limits.map_err(|e| e.to_string())?)?;
-    operation()
-}
+/// The memory a secret-holding process requires, compiled by path so
+/// td-install's storage worker shares it with this file's consumers.
+#[path = "memory.rs"]
+mod memory;
+use memory::with_memory_state;
+#[cfg(test)]
+use memory::{check_core_limit, check_swap_state};
 
 pub fn require_protected_memory() -> Result<(), String> {
     with_memory_state(
@@ -1063,16 +1048,6 @@ fn runtime_directory(uid: u32, create: bool) -> Result<File, String> {
     }
     check_runtime_mount(&mounts)?;
     runtime_directory_at(Path::new("/run"), 0, uid, create)
-}
-
-fn check_core_limit(limits: &str) -> Result<(), String> {
-    let core = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max core file size"));
-    if core.and_then(|line| line.split_whitespace().next()) != Some("0") {
-        return Err("TPM credential access requires a zero core-dump soft limit".into());
-    }
-    Ok(())
 }
 
 fn runtime_directory_at(base: &Path, owner: u32, uid: u32, create: bool) -> Result<File, String> {

@@ -45,6 +45,8 @@ mod login_tier;
 mod message;
 #[path = "../../td-busd/src/name.rs"]
 mod name;
+// The private worker endpoint, shared with td-install's storage worker.
+mod frames;
 mod operation;
 mod pin_sys;
 mod pin_terminal;
@@ -304,11 +306,13 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x0c03909956647c23
+            0x61fb39e8ad0725b4
         );
+        // The endpoint td-install's storage worker shares.
+        assert_eq!(fingerprint(include_str!("frames.rs")), 0x79f4d987a8fb0901);
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
-            0x20559f3211cb6eea
+            0xa3bf2d51dd83eec8
         );
         assert_eq!(
             fingerprint(include_str!("write_operation.rs")),
@@ -495,6 +499,8 @@ mod confinement {
                 include_str!("../../td-authd/src/secret_sys.rs"),
             ),
             ("operation.rs", include_str!("operation.rs")),
+            ("frames.rs", include_str!("frames.rs")),
+            ("memory.rs", include_str!("memory.rs")),
             (
                 "enrollment_operation.rs",
                 include_str!("enrollment_operation.rs"),
@@ -688,6 +694,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "fido_device.rs",
                 "fido_metadata.rs",
                 "fido_uhid.rs",
+                "frames.rs",
                 "lib.rs",
                 "login_operation.rs",
                 "login_record.rs",
@@ -697,6 +704,7 @@ pub fn take_received(fd: RawFd) -> Result<File, String> {
                 "login_tier.rs",
                 "login_vm.rs",
                 "main.rs",
+                "memory.rs",
                 "operation.rs",
                 "pin_sys.rs",
                 "pin_terminal.rs",
