@@ -43,7 +43,23 @@ fn scan(root: &Path, path: &Path) {
             continue;
         }
         let source = std::fs::read_to_string(&path).unwrap();
-        if relative == "td-mta/tests/support/allocation_shim.rs" {
+        if relative == "td-mta/src/signal_sys.rs" {
+            assert_eq!(words(&source, "unsafe"), 2);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
+            assert_eq!(source.matches("std::arch::asm!").count(), 2);
+            fingerprint(
+                &source,
+                "f7e46e8ad468ae532adc78bb332ddb5d71bc6b1daee69f2392ac39054c0562bc",
+            );
+        } else if relative == "td-mta/tests/support/termination_sender.rs" {
+            assert_eq!(words(&source, "unsafe"), 2);
+            assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
+            assert_eq!(source.matches("std::arch::asm!").count(), 2);
+            fingerprint(
+                &source,
+                "3ca35f2e97d5ad7d7238ba8f18dd09d27a93d2cd0be72d50130e18ecd8d851c7",
+            );
+        } else if relative == "td-mta/tests/support/allocation_shim.rs" {
             assert_eq!(words(&source, "unsafe"), 9);
             assert_eq!(source.matches("#[allow(unsafe_code)]").count(), 1);
             assert_eq!(source.matches("#[global_allocator]").count(), 1);
@@ -71,6 +87,37 @@ fn scan(root: &Path, path: &Path) {
             assert_eq!(words(&source, "unsafe"), 0, "{relative}");
             assert!(!source.contains("allow(unsafe_code"), "{relative}");
             assert!(!source.contains("global_allocator"), "{relative}");
+        }
+        match relative {
+            "td-mta/src/main.rs" => {
+                assert_eq!(source.matches("mod signal_sys;").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 1);
+            }
+            "td-mta/src/serve.rs" => {
+                assert_eq!(source.matches("super::signal_sys::block()").count(), 1);
+                assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 2);
+                assert!(
+                    source.find("signal_sys::block()").unwrap()
+                        < source.find("Endpoint::bind(").unwrap()
+                );
+            }
+            "td-mta/src/control.rs" => {
+                assert_eq!(source.matches("super::signal_sys::requested()").count(), 1);
+                assert_eq!(words(&source, "signal_sys"), 1);
+            }
+            _ => assert_eq!(words(&source, "signal_sys"), 0, "{relative}"),
+        }
+        if relative == "td-mta/tests/store_verify_cli.rs" {
+            assert_eq!(
+                source
+                    .matches("#[path = \"support/termination_sender.rs\"]\nmod termination_sender;")
+                    .count(),
+                1
+            );
+            assert_eq!(source.matches("#![deny(unsafe_code)]").count(), 1);
+        } else {
+            assert_eq!(words(&source, "termination_sender"), 0, "{relative}");
         }
         if relative == "td-mta/tests/support/allocation_registry.rs" {
             fingerprint(
@@ -129,7 +176,7 @@ fn allocation_surface_is_separate_and_exact() {
     assert_eq!(library.matches("#![forbid(unsafe_code)]").count(), 1);
     assert_eq!(
         include_str!("../src/main.rs")
-            .matches("#![forbid(unsafe_code)]")
+            .matches("#![deny(unsafe_code)]")
             .count(),
         1
     );

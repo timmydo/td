@@ -175,7 +175,14 @@ Ordinary status still exits
 zero for any successful query, including a stopping receiver. Neither form
 guarantees that the next delivery will be admitted.
 
-SIGTERM, SIGINT and SIGKILL currently terminate without protocol draining.
+After cold startup, SIGTERM and SIGINT request orderly shutdown through the same path as
+`td-mta stop`. New admission stops; existing SMTP sessions have the existing
+five-second protocol allowance, and committed replies retain their final-reply
+allowance. The process joins its workers before exiting. Native storage I/O
+can delay exit. Repeated signals do not force it. Cold configuration and
+storage recovery retain inherited signal behavior. A completed signal
+stop exits zero, including when a launcher ignored that signal; it is not
+re-raised. SIGKILL remains abrupt.
 Restart recovers mail that received final SMTP 250 and discards incomplete
 DATA spools. A committed message whose reply was lost may be retried and
 stored again. Manual certificate/configuration updates require stopping,
@@ -283,9 +290,10 @@ can enter the host's restart rate limit; repair configuration/material first,
 then use `systemctl reset-failed td-mta.service` and start again.
 
 For maintenance, `systemctl stop td-mta.service` suppresses automatic restart
-and waits for termination. This currently sends SIGTERM and may escalate to
-SIGKILL after the configured timeout: it is abrupt recovery-safe termination,
-not SMTP draining. Confirm the unit stopped before replacing files or using
+and waits for termination. SIGTERM requests orderly receiver shutdown;
+systemd may escalate to SIGKILL after the configured timeout. That escalation
+uses abrupt recovery rather than finishing the orderly stop.
+Confirm the unit stopped before replacing files or using
 offline store commands. A manual `td-mta stop` exits cleanly and is not
 restarted by this unit's on-failure policy, but its acknowledgement alone is
 still not a maintenance barrier. The journal owns captured lifecycle output;
@@ -333,13 +341,15 @@ accounting contract still apply.
 
 `td-svc stop td-mta` requests signal-based stopping; poll `td-svc status td-mta`
 until it reports stopped before maintenance. The stop command itself does
-not wait. SIGTERM currently ends the receiver abruptly, with the accepted-mail
-recovery described above. `td-svc start td-mta` starts it again; `td-svc
+not wait. SIGTERM requests orderly receiver shutdown; a supervisor timeout
+may force termination, with the accepted-mail recovery described above.
+`td-svc start td-mta` starts it again; `td-svc
 restart td-mta` likewise uses signal-based teardown. Automatic on-failure
 restart can enter td-svc's capped hold; after repairing the cause, an explicit
-start/restart clears that hold. The private mail stop command ends serve
-cleanly, so on-failure does not restart it. Neither supervisor example claims
-graceful signal draining. [td-svc/DESIGN.md](../td-svc/DESIGN.md) owns readiness,
+start/restart clears that hold. The private mail stop command and a completed SIGTERM/SIGINT stop end
+serve cleanly, so on-failure does not restart either, even when the signal
+came from outside the supervisor. Neither supervisor example claims
+end-to-end host qualification here. [td-svc/DESIGN.md](../td-svc/DESIGN.md) owns readiness,
 restart, stop completion and capture behavior.
 
 ## Offline backup and restore

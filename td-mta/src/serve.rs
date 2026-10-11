@@ -185,8 +185,12 @@ pub(super) fn run(path: &str) -> Result<(), ConfigFailure> {
                 listeners: &listeners,
                 clock: Arc::clone(&clock),
             };
+            super::signal_sys::block().map_err(|_| config_failure("signals", "io"))?;
             let endpoint = Endpoint::bind(runtime, runtime_path)?;
             let control = Control::default();
+            if super::signal_sys::requested().map_err(|_| config_failure("signals", "io"))? {
+                control.stop();
+            }
             let finished = AtomicBool::new(false);
             std::thread::scope(|scope| {
                 let worker = std::thread::Builder::new()
@@ -234,7 +238,7 @@ fn same_owner_root(
 }
 fn announce(listeners: usize) -> Result<(), ports::Error> {
     let mut output = io::stdout().lock();
-    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"smtp-only\",\"smtp_listeners\":{listeners},\"https\":false,\"outbound\":false,\"reload\":false,\"signal_drain\":false}}")?;
+    writeln!(output, "{{\"schema\":1,\"command\":\"serve\",\"status\":\"ready\",\"profile\":\"smtp-only\",\"smtp_listeners\":{listeners},\"https\":false,\"outbound\":false,\"reload\":false,\"signal_drain\":true}}")?;
     output.flush()?;
     Ok(())
 }

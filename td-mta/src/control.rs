@@ -76,6 +76,9 @@ impl Endpoint {
     pub(super) fn run(&self, control: &Control, finished: &AtomicBool) -> io::Result<()> {
         let mut retry_at = Instant::now();
         while !finished.load(Ordering::Acquire) {
+            if super::signal_sys::requested()? {
+                control.stop();
+            }
             if Instant::now() < retry_at {
                 std::thread::sleep(TURN);
                 continue;

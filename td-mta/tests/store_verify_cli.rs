@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::{
@@ -26,6 +26,9 @@ use td_mta::{
     ports::{Clock, Crypto, Deadline, Digest, ReadView},
     store_fs::{BlobSource, CommitRequest, IndexStore, PrivateRoot},
 };
+
+#[path = "support/termination_sender.rs"]
+mod termination_sender;
 
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const OTHER: AccountId = AccountId::from_bytes([2; 16]);
@@ -1443,6 +1446,8 @@ fn serve_receives_and_recovers_after_process_death() {
     let source = fs::read_to_string(fixture.path("td-mta.conf"))
         .unwrap()
         .replace("127.0.0.1:2525", &address.to_string())
+        .replace("session_limit = 1", "session_limit = 2")
+        .replace("per_peer_limit = 1", "per_peer_limit = 2")
         .replace(
             "[paths]",
             &format!(
@@ -1645,6 +1650,48 @@ fn serve_receives_and_recovers_after_process_death() {
     drop(process);
     let report = report_command(&status(false), 1, "status");
     assert_eq!(report.get("error").unwrap().as_str(), Some("not-running"));
+    for signal in [
+        termination_sender::Signal::Terminate,
+        termination_sender::Signal::Interrupt,
+    ] {
+        let mut process = ReceivingProcess::start(&fixture);
+        let mut idle = connect();
+        let mut partial = connect();
+        smtp_command(&mut partial, b"MAIL FROM:<>\r\n", "250");
+        smtp_command(&mut partial, b"RCPT TO:<main@example.test>\r\n", "250");
+        smtp_command(&mut partial, b"DATA\r\n", "354");
+        partial
+            .get_mut()
+            .write_all(b"Subject: signal-aborted\r\n\r\nnot-accepted\r\n")
+            .unwrap();
+        assert!(fs::read_dir(fixture.data.0.join("ingress"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("slot-")));
+        termination_sender::send(&process.child, signal).unwrap();
+        smtp_command(&mut idle, b"", "421");
+        termination_sender::send(&process.child, signal).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                assert!(status.success(), "signal stop: {status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!socket.exists());
+        assert_eq!(
+            fs::read_dir(fixture.data.0.join("ingress"))
+                .unwrap()
+                .count(),
+            1
+        );
+        drop((idle, partial, process));
+    }
     // Exercise exit policy deterministically across the private wire states.
     for (wire, state) in [
         ("STARTING\n", Some("starting")),

@@ -15,10 +15,10 @@ can stay `libc`-free. `ostree.rs` calls one safe syscall wrapper and carries
 no unsafe allowance. Every other
 engine crate (the shared `engine` lib and
 `recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. There are TWENTY-THREE
-numbered target-side exceptions, TWENTY of them live, each a standalone
+numbered target-side exceptions, TWENTY-ONE of them live, each a standalone
 crate OUTSIDE the `builder`/`recipes`/`engine` workspace with a scoped
 `#[allow]` around its recorded raw Linux boundary (the crate itself
-`#![deny(unsafe_code)]`s); the seventeenth, eighteenth and twenty-second are retired and
+`#![deny(unsafe_code)]`s); the seventeenth and eighteenth are retired and
 their crates forbid `unsafe` outright.
 The first nine confine that boundary to their syscall-instruction layer except
 for `td-compositor`, whose received descriptors enter exact File ownership through a second
@@ -52,15 +52,16 @@ value-pinned requests, and `poll(2)` — recorded twice because the
 one-package locks the gate required of a root crate when the two were
 imported left no shared crate to put it in; both now draw in a td-ui
 window and forbid `unsafe` crate-wide, so §17 and §18 are retired and the
-roster counts twenty live surfaces in twenty-three numbered entries. The
+roster counts twenty-one live surfaces in twenty-three numbered entries. The
 twentieth, `td-taskmgr`, has one function-scoped instruction for
 process-directed signals through retained procfs directory descriptors.
 The twenty-first, `td-install`, has one function-scoped instruction for two
 value-pinned loop-device requests, which reach a freshly formatted volume
 through the disk claim the installer already holds.
-The twenty-second, `td-mta`, keeps no owned production unsafe surface: its
-library and binary forbid the keyword. Safe std owns database-path and lock operations;
-§22 records the admitted private SQLite upstream FFI. The crypto admission
+The twenty-second, `td-mta`, retains a safe library and adds one binary-only
+Linux termination-signal instruction boundary, for x86-64 and aarch64.
+Safe std owns database-path and lock operations; §22 also records the
+admitted private SQLite upstream FFI. The crypto admission
 is specified in [td-crypto/DESIGN.md](td-crypto/DESIGN.md). Test allocators
 remain separate. The twenty-third, `td-open`, compiles §12's module to send one
 file's descriptor to the portal and adopts none.
@@ -73,7 +74,8 @@ separate `td-review` package forbids unsafe code package-wide and contains
 no VM binaries or services.
 
 The test-only allocation probes in `td-mta` have the separately recorded T1
-and T2 surfaces below. They are absent from shipped binaries and libraries
+and T2 surfaces below; T3 sends termination signals to retained test
+children. They are absent from shipped binaries and libraries
 and do not add a target syscall exception to the numbered roster.
 
 Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
@@ -187,7 +189,7 @@ one.
 | 19 | `td-ui` | `recvmsg(2)`, `sendmsg(2)`, `fcntl(2)` pinned to `F_DUPFD_CLOEXEC` for the shared Wayland client transport and to `F_GETFL` and `F_SETFL` for the clipboard destination owner, `poll(2)` over exactly the connection's stream and its waker, `ioctl(2)` with five value-pinned PTY requests for the terminal's device, `setsid(2)` for a PTY child; plus one scoped descriptor adoption and one scoped pre-exec hook — see [§19](#19-td-ui--the-shared-wayland-client-transport) |
 | 20 | `td-taskmgr` | `pidfd_send_signal(2)`, retained procfs process directories, named signals or a fixed signal-zero self probe |
 | 21 | `td-install` | `ioctl(2)` with two value-pinned loop requests, `LOOP_CTL_GET_FREE` and `LOOP_CONFIGURE` — see [§21](#21-td-install--publishing-through-a-loop-over-the-claim) |
-| 22 | `td-mta` | no owned production unsafe: safe std paths/locks and admitted private SQLite FFI; see [§22](#22-td-mta--safe-owned-code-private-sqlite-backend) |
+| 22 | `td-mta` | binary-only `rt_sigprocmask(2)` with SIG_BLOCK and `rt_sigtimedwait(2)` with zero timeout, both pinned to SIGINT/SIGTERM; see [§22](#22-td-mta--termination-signals-and-private-sqlite-backend) |
 | 23 | `td-open` | the shared `recvmsg(2)`, `sendmsg(2)`, `close(2)` module of §12, called only to send one descriptor; no adoption or disposal call — see [§23](#23-td-open--one-descriptor-to-the-portal) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
@@ -3393,11 +3395,41 @@ detached it; the read-back reports that case rather than hiding it. Any
 further syscall, request, configured field or flag, caller, or allowance
 amends this section and `td-install/DESIGN.md`.
 
-## 22. `td-mta` — safe owned code, private SQLite backend
+## 22. `td-mta` — termination signals and private SQLite backend
 
-The production library and binary forbid `unsafe_code` throughout. Filesystem
-operations use safe std APIs under STORAGE.md's stable-path deployment contract.
-Only the separate test executables retain the T1/T2 exceptions below.
+The library forbids `unsafe_code`. The binary denies it with exactly one
+function-scoped allowance in `signal_sys.rs`. Its private four-argument
+entry has one instruction per supported architecture: x86-64 `syscall`
+and aarch64 `svc 0`, selected at compile time. Other platforms refuse to
+compile. No FFI, pointer dereference, descriptor adoption or handler exists.
+The only two safe callers supply fixed operations:
+
+- `block`: `rt_sigprocmask` (x86-64 14, aarch64 135), SIG_BLOCK (0), a
+  pointer to the eight-byte mask containing SIGINT (2) and SIGTERM (15),
+  null old-mask output, and kernel sigset size 8.
+- `requested`: `rt_sigtimedwait` (128, 137), that same mask, null siginfo
+  output, a live sixteen-byte `[i64; 2]` zero timeout, and sigset size 8.
+  It consumes at most one request, maps EAGAIN/EINTR to no request, and
+  refuses other unexpected returns. Neither call retains its input pointers.
+
+Serve calls block after cold configuration/storage setup, immediately
+before control binding and any worker creation; workers inherit the mask. The one-command binary exits after serve, so the
+mask remains blocked through teardown and is not restored. Main checks
+pending requests after control binding; the control
+worker polls on each turn, even during listener resource-pressure backoff,
+and sets the existing orderly stop flag. Its local two-second exchange can
+delay signal observation. Cold startup retains inherited signal behavior. Blocking native storage
+I/O during serving retains its existing interruption limits. The blocked
+signals request stop even with inherited SIG_IGN; no disposition is
+rewritten. Only process-directed SIGINT/SIGTERM are this control interface.
+A thread-directed request can remain pending on a different thread; it is
+not a supported stop mechanism. SIGKILL remains abrupt. Source confinement pins the complete raw
+module, allowance/instruction counts, import and caller inventory. Real
+child-process tests exercise both signals and cleanup; T3 records their
+separate signal sender. Both architectures require execution qualification.
+
+Filesystem operations use safe std APIs under STORAGE.md's stable-path
+contract. The separate test executables retain T1/T2/T3 below.
 
 The user-approved private rusqlite 0.40.2/libsqlite3-sys 0.38.2 closure
 contains upstream unsafe FFI and bundled SQLite 3.53.2 C, including its Unix
@@ -3406,8 +3438,8 @@ builder/src/crypto_policy.rs. The owned consumers are store_fs/index.rs and its 
 index/relational.rs and index/relational/read.rs adapters. The schema-only
 index/relational/schema.rs supplies closed statements. They use rusqlite's
 safe API with bounded body-chunk inserts and indexed reads. Native connections, callbacks, SQL and backend
-types do not cross the mail port boundary. There is no td-owned FFI, scoped
-allow or additional syscall surface. Source-built bundled linking, disabled
+types do not cross the mail port boundary. This SQLite admission adds no
+td-owned FFI, scoped allowance or syscall. Source-built bundled linking, disabled
 extension loading, fixed native heap/allocation limits and closed queries
 are specified in td-mta/STORAGE.md. This named backend admission does not
 permit new owned unsafe code or qualify native heap/stack/RSS by itself.
@@ -3468,7 +3500,8 @@ The human-approved test instrumentation exception is confined to
 `tests/rust_alloc_probe.rs` integration executable. Cargo marks this target
 `harness = false`: one main runs each observation sequentially without libtest
 workers. The root is `cfg(test)` and denies unsafe code. The production
-library and binary both forbid the keyword. No runtime feature enables a probe.
+library forbids the keyword; the binary has only the section-22 boundary.
+No runtime feature enables a probe.
 
 One impl-scoped allowance covers `unsafe impl GlobalAlloc` and exactly four
 methods (`alloc`, `alloc_zeroed`, `dealloc`, `realloc`). Each has exactly one
@@ -3515,8 +3548,8 @@ The approved allocation instrumentation exception also admits a separate
 `tests/native_alloc_probe.rs` executable. Its native modules compile only
 with `cfg(td_native_alloc_probe)`, applied by the isolated builder to this
 final test target for Linux x86-64 musl. Ordinary host tests run an explicit
-unqualified stub. The production library and binary
-retain `forbid(unsafe_code)` and the test root denies it. No Cargo feature
+unqualified stub. The production library forbids unsafe code; the binary
+has only the section-22 boundary, and the test root denies it. No Cargo feature
 or common compiler flag enables wrapping.
 
 `tests/support/native_allocator_bridge.rs` declares the six real libc entry
@@ -3573,3 +3606,16 @@ only to this final test link, checks all retained executables for stray wrapper
 symbols, refuses resolved alternate AWS-LC allocator hooks, and runs positive
 controls in a fresh process. No direct aws-lc-sys dependency, new C source,
 production allocator or production unsafe permission is introduced.
+
+## T3. td-mta — test-only termination sender
+
+`tests/support/termination_sender.rs` is included only by the
+`store_verify_cli` process test, whose root denies unsafe code. Its one
+function-scoped allowance contains two architecture-selected instructions,
+x86-64 `kill(62)` or aarch64 `kill(129)`. The safe function borrows the
+fixture's retained Child, derives its positive PID, and accepts only an enum
+selecting SIGINT or SIGTERM. There is no process-group or arbitrary-PID API,
+FFI, pointer, descriptor adoption or signal handler. Tests call it only on
+a child that answered SMTP, before reaping it; the guard kills/reaps that
+same child on failure. The exact source and sole inclusion are pinned by
+confinement tests. It is absent from every production binary and library.

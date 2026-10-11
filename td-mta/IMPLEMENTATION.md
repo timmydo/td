@@ -3593,16 +3593,17 @@ real td-mail integration evidence and tested migration/restore procedure.
 `serve --smtp-only --config PATH` now composes protected configuration,
 provisioned roots, initialized account/Inbox, cold quota reconciliation,
 disposable ingress recovery, direct IPv4 bindings and the fixed receiving
-workers. CONFIG.md owns command scope, readiness and default signal behavior;
+workers. CONFIG.md owns command scope, readiness and termination-signal behavior;
 STORAGE.md owns the selected data/ingress layout. The child-process fixture
 proves accepted-mail recovery across termination during another DATA transfer.
 The private runtime socket now reports receiving lifecycle and requests
 orderly stop; process tests cover its authority/refusal and kill/restart
-cleanup. Signal integration and full health aggregation remain separate.
+cleanup. SIGTERM/SIGINT now request the same orderly stop through the audited
+synchronous Linux signal boundary. Full health aggregation remains separate.
 The status command now offers --require-ready for supervisor probes, with
 exit zero only for the ready lifecycle and unchanged JSON. Next operational
-work is end-to-end supervisor qualification and graceful signal integration;
+work is end-to-end supervisor qualification;
 DEPLOYMENT.md supplies systemd and high-port td-svc examples with their
-current readiness and abrupt-stop limits. HTTPS/JMAP, gateway, reload,
+current readiness, orderly-stop and forced-termination limits. HTTPS/JMAP, gateway, reload,
 ACME, outgoing delivery
 and file logging remain unimplemented activation paths.

@@ -1081,7 +1081,25 @@ Replacing only the direct digest/signing operations does not replace TLS's
 cryptography. Retaining Rustls means td-crypto still has an external TLS
 implementation even after AWS-LC is removed.
 
-The production library and binary both retain `forbid(unsafe_code)`.
+The production library retains `forbid(unsafe_code)`. The binary denies it
+with one function-scoped exception in `signal_sys.rs`, recorded in
+UNSAFE.md section 22. On x86-64 and aarch64 Linux, serve blocks SIGINT and
+SIGTERM before starting workers, then consumes them synchronously with
+zero-timeout `rt_sigtimedwait` in its control loop. The two fixed raw
+operations are `rt_sigprocmask(SIG_BLOCK)` and `rt_sigtimedwait`, over an
+eight-byte mask containing only those two signals. No handler, descriptor,
+FFI, allocation, pointer retention or signal-disposition change is involved.
+The mask remains in force until this one-command process exits. Other CLI
+commands never install it. Source confinement pins the full raw module and
+its callers. Process-directed supervisor/terminal signals use the same
+orderly stop path as the private control command; thread-directed signals
+are not a control interface. Cold configuration and storage setup retain inherited signal behavior;
+blocking begins immediately before control binding and worker creation.
+Once blocked, both signals request stop even with inherited SIG_IGN; no
+disposition is rewritten or signal re-raised. Blocking native I/O during
+serving retains its existing limits. CONFIG.md owns shutdown timing and observations.
+The process test has the separate UNSAFE.md T3 boundary to signal only its
+retained children on both architectures.
 The separate test executable
 `tests/rust_alloc_probe.rs` has the user-approved allocation instrumentation
 exception specified in UNSAFE.md T1. Its single scoped GlobalAlloc

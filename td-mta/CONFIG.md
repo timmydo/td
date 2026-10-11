@@ -1792,23 +1792,36 @@ may restart after an operator replaces expired material.
 
 One flushed JSON line reports `command: "serve"`, `status: "ready"`,
 `profile: "smtp-only"`, the number of SMTP listeners and false flags for
-`https`, `outbound`, `reload` and `signal_drain`. It is receiving readiness,
+`https`, `outbound` and `reload`, with `signal_drain: true`. It is receiving readiness,
 not v1 whole-service health. Startup/runtime errors use the same redacted
 stage, fixed error code and optional target/detail shape as `config.check`,
 with command `serve` and exit one (invalid arguments: exit two). Failure to
 write readiness stops the workers before accepting clients. Output must be
 consumed by the supervisor; this is not a per-message logging channel.
 
-The process stays in the foreground. SIGTERM/SIGINT currently retain default
-termination behavior, without draining; SIGKILL likewise relies on SQLite
-recovery. A message followed by final SMTP 250 survives restart. Incomplete
-DATA may leave a disposable slot, which the next locked startup validates and
-removes. A disconnected sender must retry without final acceptance; a commit
-whose reply was lost can consequently be delivered again, as in normal SMTP.
-Graceful signal integration remains a separate increment needing the audited
-signal boundary. The local process fixture kills the server during a second
-DATA transfer after a first accepted message, restarts it, and independently
-verifies the surviving body and removal of the incomplete input.
+The process stays in the foreground. Process-directed SIGTERM and SIGINT
+request the same orderly shutdown as the private stop command below.
+Serve leaves inherited signal behavior in place during configuration and
+cold storage recovery. Immediately before binding the control endpoint and
+creating workers, it blocks both signals; all workers inherit that mask. Its control worker consumes pending
+requests without an asynchronous handler, including during accept backoff.
+A local control exchange can delay observation by its two-second deadline;
+ordinary polling adds at most one 100-millisecond turn. Native I/O during
+serving cannot be forcibly cancelled by this path.
+A request arriving concurrently with readiness can race that announcement,
+just as a private stop request can. Repeated requests remain idempotent;
+they do not turn into forced termination. A successful drain exits zero.
+Both signals become stop requests even if the launcher ignored them; no
+signal is re-raised on exit. Supervisors using on-failure do not restart
+a clean signal stop. Wait for process exit.
+
+SIGKILL remains abrupt and relies on SQLite recovery. A message followed by
+final SMTP 250 survives restart. Incomplete DATA may leave a disposable
+slot after abrupt termination, which the next locked startup removes. A
+sender without final acceptance must retry; a commit whose reply was lost
+can consequently be delivered again, as in normal SMTP. Process tests cover
+accepted-mail recovery after SIGKILL and orderly SIGTERM/SIGINT stops with
+idle and incomplete DATA sessions, successful exit and socket/spool cleanup.
 
 ### Local receiver control
 
@@ -1876,7 +1889,7 @@ Already committed replies retain their final-reply allowance. A native store
 operation already executing can delay the join; this is not a hard wall-clock
 process-exit promise. A control worker failure also requests shutdown and
 makes serve exit with a redacted failure. Main teardown signals and joins the
-control worker, including during unwinding. Default signal behavior is
-unchanged. The process fixture queries status, recovers a stale socket after
+control worker, including during unwinding. SIGTERM and SIGINT use this
+same stop flag. The process fixture queries status, recovers a stale socket after
 kill, requests stop with a connected SMTP client, observes 421, and verifies
 clean process exit, socket cleanup and durable accepted mail.
