@@ -101,6 +101,7 @@ pub mod repeat;
 pub mod replay;
 #[path = "../../td-compositor/src/reportable.rs"]
 pub mod reportable;
+pub mod rich;
 pub mod sfnt;
 pub mod split;
 mod sys;

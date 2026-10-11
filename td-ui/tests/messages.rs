@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use td_ui::atlas::Style as FontStyle;
 use td_ui::chrome::{ROW, SELECTED_ROW};
 use td_ui::messages::{
     Controller, Error, Event, Key, Message, Outcome, Point, Shown, Side, Target, Tip, Tone,
@@ -21,8 +22,11 @@ use td_ui::messages::{
     MAX_SECTIONS, MAX_TEXT_BYTES, MAX_TOTAL_BYTES, MIN_COLUMNS, MORE,
 };
 use td_ui::raster::{
-    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, BORDER, BUBBLE, CHROME,
-    INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
+    Composition, Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, ACCENT, BORDER, BUBBLE,
+    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, PAPER, SELECTED,
+};
+use td_ui::rich::{
+    Error as RichError, Look, Rich, MAX_BYTES as RICH_MAX_BYTES, MAX_RECORDS as RICH_MAX_RECORDS,
 };
 use td_ui::window::{Clipboard, Refusal};
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
@@ -2393,4 +2397,526 @@ fn a_time_sits_beside_a_bubble_or_in_a_full_header() {
     assert_eq!(list.storage_bytes(), before + 1 + 5 + 10);
     list.set_time(0, None).unwrap();
     assert_eq!(list.storage_bytes(), before + 1);
+}
+
+/// Styled text over "- one two three four\n> a quote": a bulleted block
+/// and a quoted one, each wrapped behind its prefix.
+fn styled() -> Rich {
+    let source = "- one two three four\n> a quote";
+    let mut rich = Rich::new(source).unwrap();
+    rich.block("\u{2022} ", "  ", false).unwrap();
+    rich.text(2..20, Look::PLAIN, None).unwrap();
+    rich.block("\u{2502} ", "\u{2502} ", false).unwrap();
+    rich.text(23..30, Look::QUIET, None).unwrap();
+    rich
+}
+
+#[test]
+fn styled_blocks_wrap_behind_their_prefixes() {
+    for scale in 1..=4 {
+        let mut list = list(scale, 18, 300);
+        list.push(Message::new("a").unwrap().rich(styled()).unwrap())
+            .unwrap();
+        // Eighteen columns, two the prefix's: sixteen for the text.
+        assert_eq!(
+            rows(&list),
+            ["H0", "one two three ", "four", "a quote", "G0"],
+            "scale {scale}"
+        );
+        // A row's columns start past its prefix: a press on the first
+        // text column of the second row is at "four".
+        let mut board = Board::default();
+        let row = text_row(&list, 1);
+        press(&mut list, &mut board, at(row, 2, scale), false, 0);
+        list.event(
+            Event::Move {
+                x: at(row, 6, scale).0,
+                y: at(row, 6, scale).1,
+            },
+            &mut board,
+        );
+        release(&mut list, &mut board, at(row, 6, scale), 10);
+        assert_eq!(list.selected_text().unwrap().as_deref(), Some("four"));
+        // The prefix itself is no text: a press on it is the row's start.
+        press(&mut list, &mut board, at(row, 0, scale), false, 1000);
+        let point = list.selection().unwrap().0;
+        assert_eq!(point.byte, "one two three ".len());
+    }
+}
+
+#[test]
+fn a_styled_copy_takes_the_source_it_shows() {
+    let source = "**bold** and [link](http://x) `code`";
+    let mut rich = Rich::new(source).unwrap();
+    let link = rich.link("http://x").unwrap();
+    rich.text(2..6, Look::BOLD, None).unwrap();
+    rich.text(8..13, Look::PLAIN, None).unwrap();
+    rich.text(14..18, Look::PLAIN, Some(link)).unwrap();
+    rich.put(" ", 18..30, Look::PLAIN, None).unwrap();
+    rich.text(31..35, Look::CODE, None).unwrap();
+    assert_eq!(rich.shown(), "bold and link code");
+    let mut list = list(1, 40, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    assert_eq!(rows(&list), ["H0", "bold and link code", "G0"]);
+    let mut board = Board::default();
+    // The whole shown text copies the whole source, its markup at both
+    // ends included.
+    assert!(list.select_all());
+    key(&mut list, &mut board, Key::Copy);
+    assert_eq!(board.copies.last().unwrap(), source);
+    // A message copies its source.
+    assert_eq!(&*list.message_text(0).unwrap(), source);
+    assert_eq!(list.message(0).unwrap().section_text(0), Some(source));
+    // Part of it copies the source its ends stand for: from inside the
+    // bold word to the end of the link's text, the markup between kept
+    // and none past the end.
+    let row = text_row(&list, 0);
+    press(&mut list, &mut board, at(row, 1, 1), false, 0);
+    let end = at(row, 13, 1);
+    list.event(Event::Move { x: end.0, y: end.1 }, &mut board);
+    release(&mut list, &mut board, end, 10);
+    key(&mut list, &mut board, Key::Copy);
+    assert_eq!(board.copies.last().unwrap(), "old** and [link");
+}
+
+#[test]
+fn a_click_on_a_link_reports_it_and_a_drag_does_not() {
+    let source = "see [the docs](https://example.com/a) now";
+    let mut rich = Rich::new(source).unwrap();
+    let link = rich.link("https://example.com/a").unwrap();
+    rich.text(0..4, Look::PLAIN, None).unwrap();
+    rich.text(5..13, Look::PLAIN, Some(link)).unwrap();
+    rich.text(37..41, Look::PLAIN, None).unwrap();
+    let mut list = list(2, 40, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    let mut board = Board::default();
+    let row = text_row(&list, 0);
+    press(&mut list, &mut board, at(row, 6, 2), false, 0);
+    assert_eq!(
+        release(&mut list, &mut board, at(row, 6, 2), 10),
+        Outcome::Link {
+            message: 0,
+            section: 0,
+            link,
+        }
+    );
+    assert_eq!(list.link(0, 0, link), Some("https://example.com/a"));
+    assert_eq!(list.link(0, 0, link + 1), None);
+    // Off the link, and a drag across it, follow nothing.
+    press(&mut list, &mut board, at(row, 1, 2), false, 2000);
+    assert_ne!(
+        release(&mut list, &mut board, at(row, 1, 2), 2010),
+        Outcome::Link {
+            message: 0,
+            section: 0,
+            link,
+        }
+    );
+    press(&mut list, &mut board, at(row, 2, 2), false, 4000);
+    let end = at(row, 8, 2);
+    list.event(Event::Move { x: end.0, y: end.1 }, &mut board);
+    assert!(!matches!(
+        release(&mut list, &mut board, end, 4010),
+        Outcome::Link { .. }
+    ));
+    assert_eq!(list.selected_text().unwrap().as_deref(), Some("e [the "));
+}
+
+#[test]
+fn a_styled_section_is_replaced_whole_and_never_appended_to() {
+    let mut list = list(1, 18, 300);
+    list.push(Message::new("a").unwrap().rich(styled()).unwrap())
+        .unwrap();
+    assert_eq!(list.append(0, 0, "more"), Err(Error::Styled));
+    let mut longer = Rich::new("- one two three four five").unwrap();
+    longer.block("\u{2022} ", "  ", false).unwrap();
+    longer.text(2..25, Look::PLAIN, None).unwrap();
+    list.set_rich(0, 0, longer).unwrap();
+    assert_eq!(rows(&list), ["H0", "one two three ", "four five", "G0"]);
+    assert_eq!(list.set_rich(0, 1, styled()), Err(Error::NoSection));
+    assert_eq!(list.set_rich(1, 0, styled()), Err(Error::NoMessage));
+    // A plain section takes styled text too.
+    list.push(text("b", "plain")).unwrap();
+    list.set_rich(1, 0, styled()).unwrap();
+    assert_eq!(
+        list.message(1).unwrap().section_text(0),
+        Some(styled().source())
+    );
+}
+
+#[test]
+fn styled_text_refuses_what_a_row_cannot_show() {
+    let mut rich = Rich::new("a\nb").unwrap();
+    assert_eq!(rich.text(0..3, Look::PLAIN, None), Err(RichError::Invalid));
+    assert_eq!(rich.text(0..9, Look::PLAIN, None), Err(RichError::Invalid));
+    assert_eq!(
+        rich.put("x\ny", 0..0, Look::PLAIN, None),
+        Err(RichError::Invalid)
+    );
+    assert_eq!(
+        rich.text(0..1, Look::PLAIN, Some(0)),
+        Err(RichError::Invalid)
+    );
+    assert_eq!(rich.block("> ", " ", false), Err(RichError::Prefix));
+    assert_eq!(rich.block("\t", "\t", false), Err(RichError::Invalid));
+    assert_eq!(
+        rich.put("x", 9..9, Look::PLAIN, None),
+        Err(RichError::Invalid)
+    );
+    // Text before any block is in one with no prefix.
+    rich.text(0..1, Look::PLAIN, None).unwrap();
+    rich.line(1..2).unwrap();
+    rich.text(2..3, Look::PLAIN, None).unwrap();
+    let mut list = list(1, 20, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    assert_eq!(rows(&list), ["H0", "a", "b", "G0"]);
+    assert!(Rich::new(&"a".repeat(RICH_MAX_BYTES + 1)).is_err());
+}
+
+#[test]
+fn styled_rows_draw_their_looks_prefixes_and_grounds() {
+    let source = "**b** *i* [l](u) ~~s~~ `c`";
+    let mut rich = Rich::new(source).unwrap();
+    let link = rich.link("u").unwrap();
+    rich.block("\u{2022} ", "  ", false).unwrap();
+    rich.text(2..3, Look::BOLD, None).unwrap();
+    rich.put(" ", 5..5, Look::PLAIN, None).unwrap();
+    rich.text(7..8, Look::ITALIC, None).unwrap();
+    rich.put(" ", 9..9, Look::PLAIN, None).unwrap();
+    rich.text(11..12, Look::PLAIN, Some(link)).unwrap();
+    rich.put(" ", 16..16, Look::PLAIN, None).unwrap();
+    rich.text(19..20, Look::STRIKE, None).unwrap();
+    rich.put(" ", 22..22, Look::PLAIN, None).unwrap();
+    rich.text(24..25, Look::CODE, None).unwrap();
+    rich.block("", "", true).unwrap();
+    rich.put("fn", 26..26, Look::PLAIN, None).unwrap();
+    assert_eq!(rich.shown(), "b i l s c\nfn");
+    for scale in 1..=2 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 20, 300);
+        list.push(Message::new("a").unwrap().rich(rich.clone()).unwrap())
+            .unwrap();
+        let row = text_row(&list, 0);
+        let mut draws = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| draws.push(draw));
+        let code = text_row(&list, 1);
+        let glyph = |scalar: char| {
+            draws
+                .iter()
+                .find_map(|draw| match draw.primitive {
+                    Primitive::Glyph {
+                        x,
+                        y,
+                        scalar: c,
+                        style,
+                    } if c == scalar && (y == row.y || y == code.y) => Some((x, style)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let cell = CELL_WIDTH as i64 * s;
+        let left = row.x + cell;
+        // The prefix in quiet ink, then the text past it.
+        let (x, style) = glyph('\u{2022}');
+        assert_eq!((x, style.ink), (left, LINE_NUMBER));
+        let (x, style) = glyph('b');
+        assert_eq!(x, left + 2 * cell);
+        assert_eq!(style.font_style, FontStyle::Bold);
+        assert_eq!(glyph('i').1.font_style, FontStyle::Italic);
+        assert_eq!(glyph('l').1.ink, ACCENT);
+        assert_eq!(glyph('s').1.ink, INK);
+        // Code stands on the other ground, here chrome on paper.
+        assert_eq!(glyph('c').1.background, CHROME);
+        assert_eq!(glyph('f').1.background, CHROME);
+        let fill = |color: u32, x: i64, y: i64| {
+            draws.iter().any(|draw| {
+                matches!(draw.primitive, Primitive::Fill { rect, color: c }
+                    if c == color && rect.contains(x, y))
+            })
+        };
+        let foot = row.y + (CELL_HEIGHT as i64 - 2) * s;
+        let middle = row.y + (CELL_HEIGHT as i64 / 2) * s;
+        // The link underlined and the struck letter struck, in their inks.
+        assert!(fill(ACCENT, left + 6 * cell, foot));
+        assert!(!fill(ACCENT, left + 6 * cell, middle));
+        assert!(fill(INK, left + 8 * cell, middle));
+        assert!(fill(CHROME, left + 10 * cell, row.y));
+        // The code block's row on the code ground to its right edge.
+        assert!(fill(
+            CHROME,
+            code.x + i64::from(code.width) - cell - 1,
+            code.y
+        ));
+    }
+}
+
+/// Copies shown bytes `from..to` of the first row by a drag at scale one.
+fn drag_copy(list: &mut Controller, from: usize, to: usize, at_ms: u64) -> String {
+    let mut board = Board::default();
+    let row = text_row(list, 0);
+    press(list, &mut board, at(row, from, 1), false, at_ms);
+    let end = at(row, to, 1);
+    list.event(Event::Move { x: end.0, y: end.1 }, &mut board);
+    release(list, &mut board, end, at_ms + 10);
+    key(list, &mut board, Key::Copy);
+    board.copies.last().cloned().unwrap_or_default()
+}
+
+#[test]
+fn a_copy_takes_what_a_stand_in_stands_for_and_no_markup_past_its_ends() {
+    // An entity shown as its character at a block's end, then a block.
+    let source = "a &amp;\n\nb";
+    let mut rich = Rich::new(source).unwrap();
+    rich.block("", "", false).unwrap();
+    rich.text(0..2, Look::PLAIN, None).unwrap();
+    rich.put("&", 2..7, Look::PLAIN, None).unwrap();
+    rich.gap().unwrap();
+    rich.block("", "", false).unwrap();
+    rich.text(9..10, Look::PLAIN, None).unwrap();
+    let mut list = list(1, 30, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    assert_eq!(rows(&list), ["H0", "a &", "", "b", "G0"]);
+    assert_eq!(drag_copy(&mut list, 0, 3, 0), "a &amp;");
+    assert_eq!(drag_copy(&mut list, 2, 3, 2000), "&amp;");
+    assert_eq!(drag_copy(&mut list, 1, 2, 4000), " ");
+    // A part from the shown text's start takes none of the markup before
+    // it; only the whole shown text takes the source whole.
+    let source = "**a** b";
+    let mut rich = Rich::new(source).unwrap();
+    rich.text(2..3, Look::BOLD, None).unwrap();
+    rich.text(5..7, Look::PLAIN, None).unwrap();
+    let mut list = self::list(1, 30, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    assert_eq!(drag_copy(&mut list, 0, 1, 0), "a");
+    assert_eq!(drag_copy(&mut list, 1, 3, 2000), " b");
+    assert_eq!(drag_copy(&mut list, 0, 3, 4000), source);
+}
+
+#[test]
+fn a_refused_piece_leaves_the_text_as_it_was() {
+    let mut rich = Rich::new("ab").unwrap();
+    let before = rich.clone();
+    assert_eq!(
+        rich.put("x", 9..9, Look::PLAIN, None),
+        Err(RichError::Invalid)
+    );
+    assert_eq!(
+        rich.put("x", std::ops::Range { start: 1, end: 0 }, Look::PLAIN, None),
+        Err(RichError::Invalid)
+    );
+    assert_eq!(
+        rich.text(0..1, Look::PLAIN, Some(0)),
+        Err(RichError::Invalid)
+    );
+    assert_eq!(rich.line(0..9), Err(RichError::Invalid));
+    assert_eq!(rich.block("> ", ">", false), Err(RichError::Prefix));
+    assert_eq!(rich, before);
+    rich.block("> ", "> ", false).unwrap();
+    rich.text(0..2, Look::PLAIN, None).unwrap();
+    let mut list = list(1, 30, 300);
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    assert_eq!(rows(&list), ["H0", "ab", "G0"]);
+    // Links count as records, an empty target too.
+    let mut rich = Rich::new("").unwrap();
+    let mut made = 0;
+    while rich.link("").is_ok() {
+        made += 1;
+    }
+    assert_eq!(made, RICH_MAX_RECORDS);
+    assert_eq!(rich.link(""), Err(RichError::Limit));
+    assert_eq!(rich.gap(), Err(RichError::Limit));
+}
+
+#[test]
+fn a_styled_sections_records_count_against_the_lists_budget() {
+    // As many one-byte pieces in alternating looks as the records allow:
+    // their records cost far more than their shown bytes.
+    let source = "ab".repeat(RICH_MAX_RECORDS / 4);
+    let mut rich = Rich::new(&source).unwrap();
+    for at in 0..source.len() / 2 {
+        let look = if at % 2 == 0 { Look::BOLD } else { Look::PLAIN };
+        if rich.text(2 * at..2 * at + 1, look, None).is_err() {
+            break;
+        }
+    }
+    let mut list = list(1, 30, 300);
+    let before = list.storage_bytes();
+    list.push(Message::new("a").unwrap().rich(rich).unwrap())
+        .unwrap();
+    // A run and a segment a piece, each far more than its one shown byte.
+    assert!(list.storage_bytes() - before > 20 * (source.len() / 2));
+}
+
+#[test]
+fn a_deep_prefix_leaves_its_text_half_the_row() {
+    let prefix = " ".repeat(40);
+    let source = "one two three four five six seven";
+    let mut rich = Rich::new(source).unwrap();
+    rich.block(&prefix, &prefix, false).unwrap();
+    rich.text(0..source.len(), Look::PLAIN, None).unwrap();
+    for scale in 1..=2 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 20, 300);
+        list.push(Message::new("a").unwrap().rich(rich.clone()).unwrap())
+            .unwrap();
+        // Twenty columns: ten the prefix's, ten the text's.
+        assert_eq!(
+            rows(&list),
+            ["H0", "one two ", "three four ", "five six ", "seven", "G0"]
+        );
+        let row = text_row(&list, 0);
+        let mut draws = Vec::new();
+        list.emit(surface(scale).bounds(), &mut |draw| draws.push(draw));
+        let o = draws
+            .iter()
+            .find_map(|draw| match draw.primitive {
+                Primitive::Glyph { x, y, scalar, .. } if scalar == 'o' && y == row.y => Some(x),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(o, row.x + 11 * CELL_WIDTH as i64 * s);
+        // A press on the text's first column is at its start.
+        let mut board = Board::default();
+        press(&mut list, &mut board, at(row, 10, scale), false, 0);
+        assert_eq!(list.selection().unwrap().0.byte, 0);
+    }
+}
+
+#[test]
+fn styled_text_set_again_keeps_a_selection_only_over_unchanged_text() {
+    let literal = |source: &str| {
+        let mut rich = Rich::new(source).unwrap();
+        rich.text(0..source.len(), Look::PLAIN, None).unwrap();
+        rich
+    };
+    let bold = |source: &str, range: std::ops::Range<usize>, rest: usize| {
+        let mut rich = Rich::new(source).unwrap();
+        rich.text(range, Look::BOLD, None).unwrap();
+        rich.text(rest..source.len(), Look::PLAIN, None).unwrap();
+        rich
+    };
+    let mut list = list(1, 30, 300);
+    list.push(Message::new("a").unwrap().rich(literal("ab **cd")).unwrap())
+        .unwrap();
+    let mut board = Board::default();
+    let row = text_row(&list, 0);
+    press(&mut list, &mut board, at(row, 0, 1), false, 0);
+    let end = at(row, 2, 1);
+    list.event(Event::Move { x: end.0, y: end.1 }, &mut board);
+    release(&mut list, &mut board, end, 10);
+    assert_eq!(list.selected_text().unwrap().as_deref(), Some("ab"));
+    // The text before the change stays, and so does the selection.
+    list.set_rich(0, 0, literal("ab **cd e")).unwrap();
+    assert_eq!(list.selected_text().unwrap().as_deref(), Some("ab"));
+    // A selection over text the change restyles is cleared.
+    press(&mut list, &mut board, at(row, 5, 1), false, 2000);
+    let end = at(row, 7, 1);
+    list.event(Event::Move { x: end.0, y: end.1 }, &mut board);
+    release(&mut list, &mut board, end, 2010);
+    assert_eq!(list.selected_text().unwrap().as_deref(), Some("cd"));
+    list.set_rich(0, 0, bold("ab **cd** e", 5..7, 9)).unwrap();
+    assert_eq!(list.selection(), None);
+    // A change inside a character's encoding keeps none of it.
+    let mut list = self::list(1, 30, 300);
+    list.push(Message::new("a").unwrap().rich(literal("*é")).unwrap())
+        .unwrap();
+    assert!(list.select_all());
+    list.set_rich(0, 0, bold("*é*", 1..3, 4)).unwrap();
+    assert_eq!(list.selection(), None);
+}
+
+#[test]
+fn a_styled_excerpt_keeps_its_cut() {
+    let source = "r\n".repeat(EXCERPT_ROWS + 2);
+    let mut rich = Rich::new(&source).unwrap();
+    for row in 0..EXCERPT_ROWS + 2 {
+        rich.block("- ", "  ", false).unwrap();
+        rich.text(2 * row..2 * row + 1, Look::PLAIN, None).unwrap();
+    }
+    let mut list = list(1, 30, 300);
+    list.push(Message::new("a").unwrap().excerpt("out", "x").unwrap())
+        .unwrap();
+    list.set_rich(0, 0, rich).unwrap();
+    let mut expected = vec!["H0".to_string(), "T0.0+".to_string()];
+    expected.extend(std::iter::repeat_n("r".to_string(), EXCERPT_ROWS));
+    expected.extend(["M0.0".to_string(), "G0".to_string()]);
+    assert_eq!(rows(&list), expected);
+}
+
+#[test]
+fn only_a_still_single_click_follows_a_link_and_its_tip_names_it() {
+    let source = "go [a-b](https://example.com/x) now";
+    let mut rich = Rich::new(source).unwrap();
+    let link = rich.link("https://example.com/x").unwrap();
+    rich.text(0..3, Look::PLAIN, None).unwrap();
+    rich.text(4..7, Look::PLAIN, Some(link)).unwrap();
+    rich.text(31..35, Look::PLAIN, None).unwrap();
+    assert_eq!(rich.shown(), "go a-b now");
+    let followed = Outcome::Link {
+        message: 0,
+        section: 0,
+        link,
+    };
+    for scale in 1..=2u8 {
+        let s = i64::from(scale);
+        let mut list = list(scale, 30, 300);
+        list.push(Message::new("a").unwrap().rich(rich.clone()).unwrap())
+            .unwrap();
+        let mut board = Board::default();
+        let row = text_row(&list, 0);
+        let dash = at(row, 4, scale);
+        // A press and release a few pixels apart, across a cell's middle,
+        // is a click, and leaves no selection.
+        press(&mut list, &mut board, dash, false, 0);
+        let jitter = (dash.0 + 3 * s, dash.1);
+        list.event(
+            Event::Move {
+                x: jitter.0,
+                y: jitter.1,
+            },
+            &mut board,
+        );
+        assert_eq!(release(&mut list, &mut board, jitter, 10), followed);
+        assert!(list.selection().is_none_or(|(anchor, head)| anchor == head));
+        // Its second click, quick and near, follows nothing more.
+        press(&mut list, &mut board, dash, false, 100);
+        assert_ne!(release(&mut list, &mut board, dash, 110), followed);
+        // Nor does a drag away and back.
+        press(&mut list, &mut board, dash, false, 2000);
+        let away = at(row, 9, scale);
+        list.event(
+            Event::Move {
+                x: away.0,
+                y: away.1,
+            },
+            &mut board,
+        );
+        list.event(
+            Event::Move {
+                x: dash.0,
+                y: dash.1,
+            },
+            &mut board,
+        );
+        assert_ne!(release(&mut list, &mut board, dash, 2010), followed);
+        // Hovered, the link's tip is its target, under its cells.
+        assert!(list.hover(Some(dash)));
+        let tip = list.tip().unwrap();
+        assert_eq!(tip.text, "https://example.com/x");
+        assert_eq!(tip.target, Target::Link { section: 0, link });
+        let cell = CELL_WIDTH as i64 * s;
+        assert_eq!(
+            (tip.rect.x, tip.rect.width),
+            (row.x + 4 * cell, 3 * cell as u32)
+        );
+        assert!(!list.hover(Some(at(row, 5, scale))), "the same link");
+        assert!(list.hover(Some(at(row, 1, scale))));
+        assert!(list.tip().is_none());
+    }
 }

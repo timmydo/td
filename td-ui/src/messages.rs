@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use crate::chrome::{Button, BUTTON_MARGIN, ROW, SELECTED_ROW};
 use crate::raster::{
-    text_run, Draw, GlyphStyle, Primitive, Rect, Scrollbar, Surface, BORDER, BUBBLE, CHROME,
-    INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
+    text_run, Draw, GlyphStyle, Primitive, Rect, Scrollbar, Surface, ACCENT, BORDER, BUBBLE,
+    CHROME, INACTIVE_SELECTION, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED,
 };
+use crate::rich::{Look, Rich};
 use crate::window::{Clipboard, Refusal};
 use crate::{CELL_HEIGHT, CELL_WIDTH};
 
@@ -89,6 +90,8 @@ pub enum Error {
     InvalidSurface,
     /// The rectangle lies outside the surface.
     InvalidRect,
+    /// Text was appended to a styled section, which is replaced whole.
+    Styled,
 }
 
 impl std::fmt::Display for Error {
@@ -101,6 +104,7 @@ impl std::fmt::Display for Error {
             Self::NoSection => "no such message section",
             Self::InvalidSurface => "invalid message list surface",
             Self::InvalidRect => "message list rectangle lies outside the surface",
+            Self::Styled => "a styled message section is replaced, not appended to",
         })
     }
 }
@@ -135,9 +139,42 @@ impl Tone {
 #[derive(Clone, Debug)]
 struct Section {
     title: Option<String>,
+    /// Its text, or nothing when it is styled.
     text: String,
     collapsed: bool,
     excerpt: bool,
+    /// Its styled text, which it shows in place of `text`.
+    rich: Option<Box<Rich>>,
+}
+
+impl Section {
+    /// The text its rows are laid out over.
+    fn shown(&self) -> &str {
+        self.rich.as_ref().map_or(&self.text, |rich| rich.shown())
+    }
+
+    /// The text a copy of shown bytes `from..to` takes: a styled section's
+    /// source they stand for.
+    fn copied(&self, from: usize, to: usize) -> &str {
+        match &self.rich {
+            Some(rich) => rich.source_slice(from, to),
+            None => self.text.get(from..to).unwrap_or(""),
+        }
+    }
+
+    /// Its text as supplied: a styled section's source.
+    fn supplied(&self) -> &str {
+        self.rich.as_ref().map_or(&self.text, |rich| rich.source())
+    }
+
+    fn bytes(&self) -> usize {
+        self.text.len()
+            + self.title.as_ref().map_or(0, String::len)
+            + self
+                .rich
+                .as_ref()
+                .map_or(0, |rich| rich.shown().len() + rich.extra_bytes())
+    }
 }
 
 /// Where a message sits: across the list, or as a bubble on one side as
@@ -152,13 +189,15 @@ pub enum Side {
     Right,
 }
 
-/// What a tooltip names (`Tip`): a header's copy button, its action, or
-/// a message's time.
+/// What a tooltip names (`Tip`): a header's copy button, its action, a
+/// message's time, or a link in a styled section, whose tip is its
+/// target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Copy,
     Action,
     Time,
+    Link { section: usize, link: usize },
 }
 
 /// One message: a header label (its role or source), an optional status
@@ -275,6 +314,19 @@ impl Message {
             text,
             collapsed: false,
             excerpt: false,
+            rich: None,
+        })
+    }
+
+    /// Adds an untitled section of styled text: its rows show `rich`'s
+    /// shown text, and a copy takes its source.
+    pub fn rich(self, rich: Rich) -> Result<Self, Error> {
+        self.with(Section {
+            title: None,
+            text: String::new(),
+            collapsed: false,
+            excerpt: false,
+            rich: Some(Box::new(rich)),
         })
     }
 
@@ -288,6 +340,7 @@ impl Message {
             text,
             collapsed,
             excerpt: false,
+            rich: None,
         })
     }
 
@@ -301,6 +354,7 @@ impl Message {
             text,
             collapsed: false,
             excerpt: true,
+            rich: None,
         })
     }
 
@@ -340,11 +394,9 @@ impl Message {
         self.sections.len()
     }
 
-    /// Section `index`'s text as supplied.
+    /// Section `index`'s text as supplied: a styled section's source.
     pub fn section_text(&self, index: usize) -> Option<&str> {
-        self.sections
-            .get(index)
-            .map(|section| section.text.as_str())
+        self.sections.get(index).map(Section::supplied)
     }
 
     pub fn is_collapsed(&self) -> bool {
@@ -358,10 +410,7 @@ impl Message {
             .filter_map(|mark| mark.as_ref())
             .map(|(text, _)| text.len())
             .sum::<usize>();
-        self.sections
-            .iter()
-            .map(|section| section.text.len() + section.title.as_ref().map_or(0, String::len))
-            .sum::<usize>()
+        self.sections.iter().map(Section::bytes).sum::<usize>()
             + self.label.len()
             + marks
             + self.action.as_ref().map_or(0, String::len)
@@ -381,7 +430,7 @@ impl Message {
             if index > 0 {
                 f("\n\n");
             }
-            f(&section.text);
+            f(section.supplied());
         }
     }
 }
@@ -406,12 +455,14 @@ enum Kind {
     Gap,
 }
 
-/// One laid-out row: a byte range of a section's text for `Text`.
+/// One laid-out row: a byte range of a section's text for `Text`, and
+/// the cells its styled block's prefix takes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Line {
     message: u32,
     section: u16,
     kind: Kind,
+    indent: u8,
     start: u32,
     end: u32,
 }
@@ -583,6 +634,13 @@ pub enum Outcome {
     NothingToCopy,
     /// The action button of the message at this index was pressed.
     Action(usize),
+    /// A link in a styled section was clicked: its message, its section
+    /// and its link, whose target `Controller::link` names.
+    Link {
+        message: usize,
+        section: usize,
+        link: usize,
+    },
 }
 
 /// The message list over one rectangle of a surface.
@@ -618,6 +676,9 @@ pub struct Controller {
     click: Option<(u64, i64, i64)>,
     /// Whether the held press selected a word, so its release is no click.
     word: bool,
+    /// Where the held press on text was, while the pointer stays near it
+    /// and it paired with no click before: its release may follow a link.
+    pressed: Option<(i64, i64)>,
     /// Whether the face draws icons, so the header's buttons are icons.
     icons: bool,
     /// Where the pointer hovers with no button held, for the button under
@@ -660,6 +721,7 @@ impl Controller {
             scrolling: None,
             click: None,
             word: false,
+            pressed: None,
             icons: false,
             hover_at: None,
         };
@@ -838,9 +900,11 @@ impl Controller {
             .ok_or(Error::NoMessage)?
             .sections
             .get(section)
-            .ok_or(Error::NoSection)?
-            .text
-            .len();
+            .ok_or(Error::NoSection)?;
+        if current.rich.is_some() {
+            return Err(Error::Styled);
+        }
+        let current = current.text.len();
         if current.saturating_add(text.len()) > MAX_TEXT_BYTES {
             return Err(Error::Limit);
         }
@@ -891,6 +955,64 @@ impl Controller {
             self.selection = None;
         }
         Ok(())
+    }
+
+    /// Replaces a section's text with styled text, as a styled reply
+    /// streams in and its owner renders it whole again. The selection
+    /// stays where its text in the section is unchanged, else is cleared.
+    pub fn set_rich(&mut self, index: usize, section: usize, rich: Rich) -> Result<(), Error> {
+        let current = self
+            .messages
+            .get(index)
+            .ok_or(Error::NoMessage)?
+            .sections
+            .get(section)
+            .ok_or(Error::NoSection)?;
+        let same = common_prefix(current.shown(), rich.shown());
+        let old = current.bytes();
+        let incoming = rich.shown().len() + rich.extra_bytes();
+        let kept = current.title.as_ref().map_or(0, String::len);
+        let bytes = self.admit(incoming + kept, old)?;
+        let target = self
+            .messages
+            .get_mut(index)
+            .and_then(|message| message.sections.get_mut(section))
+            .ok_or(Error::NoSection)?;
+        let text = std::mem::take(&mut target.text);
+        let previous = target.rich.replace(Box::new(rich));
+        if let Err(error) = self.relayout(index) {
+            if let Some(target) = self
+                .messages
+                .get_mut(index)
+                .and_then(|message| message.sections.get_mut(section))
+            {
+                target.text = text;
+                target.rich = previous;
+            }
+            return Err(error);
+        }
+        self.bytes = bytes;
+        let changed =
+            |point: Point| point.message == index && point.section == section && point.byte > same;
+        if self
+            .selection
+            .is_some_and(|(anchor, head)| changed(anchor) || changed(head))
+        {
+            self.selection = None;
+        }
+        Ok(())
+    }
+
+    /// The target of link `link` of a styled section, as `Outcome::Link`
+    /// names it.
+    pub fn link(&self, message: usize, section: usize, link: usize) -> Option<&str> {
+        self.messages
+            .get(message)?
+            .sections
+            .get(section)?
+            .rich
+            .as_ref()?
+            .target(link)
     }
 
     /// Sets or clears a message's status; the header alone changes.
@@ -1014,8 +1136,8 @@ impl Controller {
     }
 
     /// Where the pointer hovers with no button held, or `None`: answers
-    /// whether what is under it with a tooltip, a header button or a
-    /// time, changed; a button there is lit, and `tip` names either.
+    /// whether what is under it with a tooltip, a header button, a time
+    /// or a link, changed; a button there is lit, and `tip` names each.
     pub fn hover(&mut self, at: Option<(i64, i64)>) -> bool {
         let before = self.tip().map(|tip| (tip.message, tip.target));
         self.hover_at = at;
@@ -1024,9 +1146,13 @@ impl Controller {
 
     /// What the pointer hovers over that has a tooltip, with its text: a
     /// header button, `COPY_TIP`, an action's tip or its caption when it
-    /// has none; or a message's time, its tip.
+    /// has none; a message's time, its tip; or a styled section's link,
+    /// its target, so where a link leads shows before it is followed.
     pub fn tip(&self) -> Option<Tip<'_>> {
         let (x, y) = self.hovered()?;
+        if let Some(tip) = self.link_tip(x, y) {
+            return Some(tip);
+        }
         let (_, line, row) = self
             .rows()
             .find(|(_, line, rect)| line.kind == Kind::Header && rect.contains(x, y))?;
@@ -1735,8 +1861,14 @@ impl Controller {
 
     fn text(&self, line: Line) -> &str {
         self.section(line)
-            .and_then(|section| section.text.get(line.start as usize..line.end as usize))
+            .and_then(|section| section.shown().get(line.start as usize..line.end as usize))
             .unwrap_or("")
+    }
+
+    /// The cells a row's text stands right of its text area's start: a
+    /// styled block's prefix, as the layout fitted it.
+    fn indent(&self, line: Line) -> usize {
+        usize::from(line.indent)
     }
 
     /// The copy button on a shown header's right, inset like a strip's:
@@ -1795,7 +1927,9 @@ impl Controller {
     /// cell edge, as a byte of the row.
     fn byte_at(&self, line: Line, x: i64, round: bool) -> usize {
         let cell = self.cell();
-        let left = self.frame(line.message as usize, self.view()).x + cell;
+        let left = self.frame(line.message as usize, self.view()).x
+            + cell
+            + self.indent(line) as i64 * cell;
         let offset = x.saturating_sub(left);
         let offset = if round {
             offset.saturating_add(cell / 2)
@@ -1904,7 +2038,7 @@ impl Controller {
         if std::mem::replace(any, true) {
             f("\n\n");
         }
-        f(section.text.get(from.byte..to.byte).unwrap_or(""));
+        f(section.copied(from.byte, to.byte));
     }
 
     /// The selected text, without chrome; `None` when nothing is.
@@ -2042,6 +2176,12 @@ impl Controller {
                 if !self.dragging {
                     return Outcome::Ignored;
                 }
+                let near = NEAR * self.surface.scale.value() as i64;
+                if self.pressed.is_some_and(|(px, py)| {
+                    px.abs_diff(x) > near as u64 || py.abs_diff(y) > near as u64
+                }) {
+                    self.pressed = None;
+                }
                 // Dragging past the view scrolls a row a motion.
                 let view = self.view();
                 let scrolled = if y < view.y {
@@ -2061,10 +2201,93 @@ impl Controller {
                     return Outcome::Ignored;
                 }
                 let outcome = self.extend_to(x, y);
-                self.click = (!std::mem::take(&mut self.word)).then_some((at_ms, x, y));
-                outcome
+                let word = std::mem::take(&mut self.word);
+                self.click = (!word).then_some((at_ms, x, y));
+                // A click, not a drag nor a second click, on a link
+                // follows it, leaving no selection a jitter made.
+                let near = NEAR * self.surface.scale.value() as i64;
+                let clicked = !word
+                    && std::mem::take(&mut self.pressed).is_some_and(|(px, py)| {
+                        px.abs_diff(x) <= near as u64 && py.abs_diff(y) <= near as u64
+                    });
+                match self.link_at(x, y).filter(|_| clicked) {
+                    Some(link) => {
+                        if let Some((anchor, _)) = self.selection {
+                            self.selection = Some((anchor, anchor));
+                        }
+                        link
+                    }
+                    None => outcome,
+                }
             }
         }
+    }
+
+    /// The link under (x, y), on a styled section's text.
+    fn link_at(&self, x: i64, y: i64) -> Option<Outcome> {
+        let (line, _, _, link) = self.link_under(x, y)?;
+        Some(Outcome::Link {
+            message: line.message as usize,
+            section: usize::from(line.section),
+            link,
+        })
+    }
+
+    /// The styled row under (x, y) and its rectangle, with the shown byte
+    /// and link there.
+    fn link_under(&self, x: i64, y: i64) -> Option<(Line, Rect, usize, usize)> {
+        let (_, line, rect) = self
+            .rows()
+            .find(|(_, line, rect)| line.kind == Kind::Text && rect.contains(x, y))?;
+        let frame = self.frame(line.message as usize, rect);
+        let left = frame.x + self.cell() + self.indent(line) as i64 * self.cell();
+        if !frame.contains(x, y) || x < left {
+            return None;
+        }
+        let rich = self.section(line)?.rich.as_deref()?;
+        let byte = self.byte_at(line, x, false);
+        if byte >= line.end as usize {
+            return None;
+        }
+        let (_, link) = rich.look(byte);
+        Some((line, frame, byte, link?))
+    }
+
+    /// The tooltip of the link under (x, y): its target, under the link's
+    /// cells on that row.
+    fn link_tip(&self, x: i64, y: i64) -> Option<Tip<'_>> {
+        let (line, frame, byte, link) = self.link_under(x, y)?;
+        let rich = self.section(line)?.rich.as_deref()?;
+        let text = rich.target(link)?;
+        let start = line.start as usize;
+        // The link's cells on the row around the one under the pointer.
+        let mut span: Option<(usize, usize)> = None;
+        for (column, (offset, _)) in self.text(line).char_indices().enumerate() {
+            let at = start + offset;
+            if rich.look(at).1 == Some(link) {
+                span = Some(span.map_or((column, column + 1), |(first, _)| (first, column + 1)));
+            } else if at > byte {
+                break;
+            } else {
+                span = None;
+            }
+        }
+        let (first, last) = span?;
+        let cell = self.cell();
+        let left = frame.x + cell + (self.indent(line) + first) as i64 * cell;
+        Some(Tip {
+            message: line.message as usize,
+            target: Target::Link {
+                section: usize::from(line.section),
+                link,
+            },
+            rect: Rect {
+                x: left,
+                width: ((last - first) as i64 * cell) as u32,
+                ..frame
+            },
+            text,
+        })
     }
 
     fn extend_to(&mut self, x: i64, y: i64) -> Outcome {
@@ -2161,6 +2384,7 @@ impl Controller {
         self.dragging = false;
         self.scrolling = None;
         self.word = false;
+        self.pressed = None;
         let click = self.click.take();
         if !self.rect.contains(x, y) {
             return Outcome::Ignored;
@@ -2221,6 +2445,7 @@ impl Controller {
                     .then(|| self.word_at(line, x))
                     .flatten();
                 let point = line.point(self.byte_at(line, x, true));
+                self.pressed = (paired.is_none() && !extend).then_some((x, y));
                 let changed = self.begin(Some(point), extend, word);
                 Self::changed(changed || focus_changed)
             }
@@ -2256,7 +2481,7 @@ impl Controller {
         if at >= line.end as usize {
             return None;
         }
-        let text = section.text.get(..self.shown_end(line)?)?;
+        let text = section.shown().get(..self.shown_end(line)?)?;
         let after = text.get(at..)?;
         if !after.chars().next().is_some_and(char::is_alphanumeric) {
             return None;
@@ -2455,6 +2680,12 @@ impl Controller {
         clip: Rect,
         sink: &mut dyn FnMut(Draw),
     ) {
+        if self
+            .section(line)
+            .is_some_and(|section| section.rich.is_some())
+        {
+            return self.paint_rich(line, rect, paper, selection, clip, sink);
+        }
         let text = self.text(line);
         let start = line.start as usize;
         let normal = GlyphStyle::medium(INK, paper);
@@ -2496,6 +2727,134 @@ impl Controller {
             sink,
         );
         self.run(text.chars().skip(to), rect, to, normal, clip, sink);
+    }
+
+    /// A styled section's row: its block's prefix in quiet ink, a code
+    /// block's ground, and each character in its run's look on its
+    /// ground (code's, or the selection's), a link underlined and struck
+    /// text struck through in its ink.
+    fn paint_rich(
+        &self,
+        line: Line,
+        rect: Rect,
+        paper: u32,
+        selection: Option<(Point, Point)>,
+        clip: Rect,
+        sink: &mut dyn FnMut(Draw),
+    ) {
+        let Some(rich) = self
+            .section(line)
+            .and_then(|section| section.rich.as_deref())
+        else {
+            return;
+        };
+        let (start, end) = (line.start as usize, line.end as usize);
+        let text = rich.shown().get(start..end).unwrap_or("");
+        let block = rich.block_at(start);
+        let indent = usize::from(line.indent);
+        let cell = self.cell();
+        let s = self.surface.scale.value() as i64;
+        let shown = Rect {
+            x: rect.x + cell,
+            width: (i64::from(rect.width) - 2 * cell).max(0) as u32,
+            ..rect
+        };
+        // Code stands on the other of the two grounds a row may have.
+        let code_ground = if paper == PAPER { CHROME } else { PAPER };
+        let code_block = block.is_some_and(|block| block.code);
+        if let Some(block) = block {
+            let prefix = rich.prefix(block, start == block.start as usize);
+            let style = GlyphStyle::medium(LINE_NUMBER, paper);
+            self.run(prefix.chars().take(indent), rect, 0, style, clip, sink);
+        }
+        let base = if code_block { code_ground } else { paper };
+        if code_block {
+            let x = shown.x + indent as i64 * cell;
+            let width = (shown.x + i64::from(shown.width) - x).max(0) as u32;
+            if let Some(area) = (Rect { x, width, ..rect }).intersection(shown) {
+                fill(area, code_ground, clip, sink);
+            }
+        }
+        let selected = selection.and_then(|(lo, hi)| self.selected(line, lo, hi));
+        let (selected_ground, selected_ink) = if self.focused {
+            (SELECTED, PAPER)
+        } else {
+            (INACTIVE_SELECTION, INK)
+        };
+        let (mut look, mut link) = rich.look(start);
+        let mut changes = rich.changes(start, end).peekable();
+        for (column, (offset, scalar)) in text.char_indices().enumerate() {
+            let byte = start + offset;
+            while let Some(&(at, next, next_link)) = changes.peek() {
+                if at > byte {
+                    break;
+                }
+                (look, link) = (next, next_link);
+                changes.next();
+            }
+            let x = shown.x + (indent + column) as i64 * cell;
+            let at = Rect {
+                x,
+                width: cell as u32,
+                ..rect
+            };
+            let chosen = selected.is_some_and(|(a, b)| a <= byte && byte < b);
+            let ground = if chosen {
+                selected_ground
+            } else if look.has(Look::CODE) {
+                code_ground
+            } else {
+                base
+            };
+            if ground != base {
+                if let Some(area) = at.intersection(shown) {
+                    fill(area, ground, clip, sink);
+                }
+            }
+            let ink = if chosen {
+                selected_ink
+            } else if link.is_some() {
+                ACCENT
+            } else if look.has(Look::QUIET) {
+                LINE_NUMBER
+            } else {
+                INK
+            };
+            let mut style = GlyphStyle::medium(ink, ground);
+            if look.has(Look::BOLD) {
+                style = style.bold();
+            }
+            if look.has(Look::ITALIC) {
+                style = style.italic();
+            }
+            let scalar = if scalar == '\t' { ' ' } else { scalar };
+            text_run(
+                self.surface.scale,
+                std::iter::once(scalar),
+                (x, rect.y),
+                shown,
+                style,
+                clip,
+                sink,
+            );
+            // A link's underline near the cell's foot, a strike's line
+            // through its middle.
+            let height = CELL_HEIGHT as i64;
+            for (on, y) in [
+                (link.is_some(), height - 2),
+                (look.has(Look::STRIKE), height / 2),
+            ] {
+                let line = Rect {
+                    x,
+                    y: rect.y + y * s,
+                    width: cell as u32,
+                    height: s as u32,
+                };
+                if let Some(area) = line.intersection(shown).filter(|_| on) {
+                    fill(area, ink, clip, sink);
+                }
+            }
+        }
     }
 
     fn paint_header(&self, line: Line, rect: Rect, clip: Rect, sink: &mut dyn FnMut(Draw)) {
@@ -2727,6 +3086,7 @@ fn row(
         message: u32::try_from(message).map_err(|_| Error::Limit)?,
         section: u16::try_from(section).map_err(|_| Error::Limit)?,
         kind,
+        indent: 0,
         start: u32::try_from(start).map_err(|_| Error::Limit)?,
         end: u32::try_from(end).map_err(|_| Error::Limit)?,
     })
@@ -2751,7 +3111,7 @@ fn wrap_section(
     shown: usize,
     out: &mut Vec<Line>,
 ) -> Result<(), Error> {
-    let text = wrap.target.text.get(from..).ok_or(Error::Limit)?;
+    let text = wrap.target.shown().get(from..).ok_or(Error::Limit)?;
     let mut rows = shown;
     let mut more = false;
     self::wrap(text, wrap.columns, &mut |start, end| {
@@ -2780,15 +3140,84 @@ fn wrap_section(
     Ok(())
 }
 
+/// The bytes `a` and `b` begin with alike, at a character boundary.
+fn common_prefix(a: &str, b: &str) -> usize {
+    let mut same = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(same) {
+        same -= 1;
+    }
+    same
+}
+
+/// The cells a block's prefix of `width` takes in `columns`: at most
+/// half, so its text keeps the other half however deep its nesting.
+fn fitted_indent(width: u16, columns: usize) -> u8 {
+    u8::try_from(usize::from(width).min(columns / 2)).unwrap_or(u8::MAX)
+}
+
+/// Appends a styled section's text rows to `out`: each block's text
+/// wrapped to the columns its prefix leaves, a row at least, an excerpt
+/// cut at `EXCERPT_ROWS` with a `More` row.
+fn wrap_rich(wrap: Wrap<'_>, rich: &Rich, out: &mut Vec<Line>) -> Result<(), Error> {
+    let shown = rich.shown();
+    let blocks = rich.blocks();
+    if blocks.is_empty() {
+        let line = row(wrap.message, wrap.section, Kind::Text, 0, 0)?;
+        return push(out, wrap.budget, line);
+    }
+    let mut rows = 0;
+    let mut more = false;
+    for (number, block) in blocks.iter().enumerate() {
+        let start = block.start as usize;
+        // A block ends at the line ending before the next.
+        let end = blocks
+            .get(number + 1)
+            .map_or(shown.len(), |next| (next.start as usize).saturating_sub(1));
+        let text = shown.get(start..end.max(start)).ok_or(Error::Limit)?;
+        let indent = fitted_indent(block.width, wrap.columns);
+        let room = wrap.columns.saturating_sub(usize::from(indent)).max(1);
+        self::wrap(text, room, &mut |from, to| {
+            if wrap.target.excerpt && rows == EXCERPT_ROWS {
+                more = true;
+                return Ok(false);
+            }
+            rows += 1;
+            let mut line = row(
+                wrap.message,
+                wrap.section,
+                Kind::Text,
+                start + from,
+                start + to,
+            )?;
+            line.indent = indent;
+            push(out, wrap.budget, line)?;
+            Ok(true)
+        })?;
+        if more {
+            return push(
+                out,
+                wrap.budget,
+                row(wrap.message, wrap.section, Kind::More, 0, 0)?,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The columns `rows` of `message` take, at most `most`: a text row's
-/// scalars, a title row's mark, space and title, the more row's text.
+/// prefix and scalars, a title row's mark, space and title, the more
+/// row's text.
 fn laid_columns(message: &Message, rows: &[Line], most: usize) -> usize {
     let section = |line: &Line| message.sections.get(usize::from(line.section));
     rows.iter()
         .map(|line| match line.kind {
-            Kind::Text => section(line)
-                .and_then(|section| section.text.get(line.start as usize..line.end as usize))
-                .map_or(0, |text| text.chars().count()),
+            Kind::Text => section(line).map_or(0, |section| {
+                let text = section
+                    .shown()
+                    .get(line.start as usize..line.end as usize)
+                    .unwrap_or("");
+                usize::from(line.indent) + text.chars().count()
+            }),
             Kind::Title => section(line)
                 .and_then(|section| section.title.as_ref())
                 .map_or(0, |title| title.chars().count() + 2),
@@ -2827,7 +3256,10 @@ fn layout(
                 columns,
                 budget,
             };
-            wrap_section(wrap, 0, 0, out)?;
+            match &section.rich {
+                Some(rich) => wrap_rich(wrap, rich, out)?,
+                None => wrap_section(wrap, 0, 0, out)?,
+            }
         }
     }
     push(out, budget, row(index, 0, Kind::Gap, 0, 0)?)

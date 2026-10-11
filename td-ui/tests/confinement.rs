@@ -56,6 +56,7 @@ const PURE: &[&str] = &[
     "pointer.rs",
     "raster.rs",
     "repeat.rs",
+    "rich.rs",
     "sfnt.rs",
     "split.rs",
     "text.rs",

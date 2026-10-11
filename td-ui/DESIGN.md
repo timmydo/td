@@ -459,6 +459,12 @@ of its own files may name each module.
   `help`, `lines`); `CHORD`, `BUTTON`, `ITEM`, `MAX_KEYS_COLUMN`,
   `MIN_WRAP`, `MAX_COLUMNS`, `MARGIN`, `TITLE` and `TITLE_HINT`. Pure.
   Under "Key list" below.
+- `rich`: `Rich`, a styled section's text built piece by piece from
+  its source (`new`; `block`, `gap`, `text`, `put`, `line` and `link`;
+  `source`, `shown` and `target`), `Look` (`BOLD`, `ITALIC`, `STRIKE`,
+  `CODE`, `QUIET`), `Error` and the bounds `MAX_BYTES`,
+  `MAX_PREFIX_CHARS`, `MAX_LINK_BYTES` and `MAX_RECORDS`; under "Styled
+  sections".
 - `pinned_face`: `load` from `host_places`, `load_in` given places and
   `load_from` a directory, the regular style through `face_file::read`;
   `SETTING`, re-exported; and `load_or_note` and `load_in_or_note` given
@@ -587,10 +593,11 @@ of its own files may name each module.
   range a consumer hands `emit`, which paints through `List::emit` with
   no row highlighted when nothing is selected. Activation, a double
   press and filtering stay with the consumer.
-- `messages`: `Message` (built from `new` with `text`, `section`,
-  `excerpt`, `status`, `verdict`, `action`, `source`, `collapsed`, `side`
-  and `time`), `Side`, `Tone`, `Point`, `Shown`, `Tip` and `Target`, `Key`
-  with `from_chord`, `Event`, `Outcome`, `Error`, the budgets and
+- `messages`: `Message` (built from `new` with `text`, `rich`,
+  `section`, `excerpt`, `status`, `verdict`, `action`, `source`,
+  `collapsed`, `side` and `time`), `Side`, `Tone`, `Point`, `Shown`, `Tip`
+  and `Target`, `Key` with `from_chord`, `Event`, `Outcome` (with `Link`),
+  `Error` (with `Styled`), the budgets and
   `COPY_LABEL`, `COPY_ICON`, `COPY_TIP`, `ICON_CELLS`, `MAX_ACTION_CHARS`,
   `MAX_TIME_CHARS` and `MORE`, and `Controller`, the message list under
   "Shared message list" below.
@@ -1647,6 +1654,34 @@ four sides with the face a scaled pixel in, every bezel fill inside its
 rectangle and off the face and every other draw inside the face, and a
 repaint of a face alone streaming no `BORDER`. td-editor keeps its
 scene-level render, ui and menu oracles.
+
+For styled sections `tests/messages.rs` holds: blocks wrapped behind
+their prefixes at scales one through four, a press on a prefix the
+row's start and a drag over a later row copying its word; a prefix
+wider than half the row cut to half at two scales, its text drawn and
+pressed past the cut; a select-all copying the whole source, markup at
+both ends included, a message and its section text their source, a
+partial selection the source between its ends' places, one from the
+shown start none of the markup before it, and a stand-in at a block's
+end copying what it stands for, alone or reached into; a still click
+on a link answering `Link` with a target and leaving no selection
+after a jitter across a cell's middle, an unknown link none, and a
+press off it, a second click, a drag across it or away and back no
+link; a link's tip its target under its cells, the same link hovered
+again unchanged and plain text none; an append refused as `Styled`,
+`set_rich` relaying a section out wider, keeping a selection over
+unchanged text and clearing one past a change or inside a changed
+character, refused for an unknown message or section, a plain section
+taking styled text and an excerpt keeping its cut and more row; pieces
+refused for a line ending, a reversed range or one outside the source
+or off a boundary, an unknown link, prefixes of unequal width or with a
+control character, each leaving the text equal to before, text before
+any block in a block of its own, a source past the bound, links up to
+`MAX_RECORDS` and no record past it, and records counted in the list's
+storage; and the draw stream at two scales: the prefix in quiet ink,
+bold and italic font styles, a link's ink and underline, a strike's
+line, and the code ground under a code span and across a code block's
+row.
 
 `tests/messages.rs` holds the message list through a clipboard that
 records each copy or refuses as told: bodies wrapped at a word, or
@@ -3179,7 +3214,10 @@ which stands off both a header's `CHROME` and a focused one's
 `SELECTED_ROW`; a captioned button is not lit. `tip` names the button
 under it, icon or caption: its message, its `Target`, its
 rectangle and its tooltip's text, `COPY_TIP` (naming the list's own
-`CopyMessage` chord), the action's tip, or its caption without one. The
+`CopyMessage` chord), the action's tip, or its caption without one;
+over a styled section's link it names the link (`Target::Link`), its
+cells on that row and its target, so where a link leads shows before it
+is followed. The
 list draws no tooltip and keeps no clock: the owner places a
 `chrome::Tooltip` on `tip`'s rectangle after its own delay. An action
 icon is a non-control scalar and its tip a label, counted in the list's
@@ -3236,6 +3274,74 @@ rows a fold lays out, which it reserves fallibly as its setter does;
 nothing reads a clock, a file or the environment. `shown`,
 `copy_button` and `action_button` give a consumer the shown rows and a
 header's buttons for its driven read-back and its tests.
+
+### Styled sections
+
+A section may show styled text (`Message::rich`, or `set_rich` on one
+shown): a `rich::Rich` its owner builds from a source, td-agent's from
+a reply's Markdown (`td-agent/DESIGN.md` §4). The list parses nothing.
+The owner says what each piece is: `text`, a range of the source shown
+as written, or `put`, text the source does not hold as such (a soft
+break's space, an entity's character, an image's stand-in), standing
+for a range of the source whole. Each piece has a `Look`: bold and
+italic through the glyph's font style, struck through, code on a ground
+of its own, or quiet ink, and it may be in a link, whose target `link`
+records. Blocks give rows their shape: each starts on a row of its own
+behind a prefix, a first row's and its later rows' of as many
+characters (a bullet and spaces, a quote's bar on both), the block
+wrapped to the columns the prefix leaves; a code block stands on the
+code ground; `gap` is a block with no prefix, an empty row unless text
+follows it; `line` ends a row inside a block, standing for a hard
+break's source. A piece holds no line ending, a prefix no control
+character. Each piece is checked, and its room reserved, before
+anything changes, so a refused piece leaves the text as it was; the
+owner may keep building or give up. A `Rich` holds at most
+`rich::MAX_BYTES` of shown text, of source and of prefixes,
+`MAX_LINK_BYTES` of targets and `MAX_RECORDS` records (stretches,
+looks, blocks and links together), and the list counts all of it,
+records by the room they take, against its budgets.
+
+The rows lay out over the shown text, so selection, words and the
+`Shown` read-back work as on plain text, a row's columns starting past
+its prefix; the read-back holds a row's text, not its prefix. A prefix
+takes at most half a row's columns, cut to them when it is wider, so a
+deep nesting in a narrow bubble keeps its text half the row; the indent
+is the row's own, so painting and every hit test use what wrapping did.
+An excerpt section given styled text keeps its cut at `EXCERPT_ROWS`
+and its more row.
+
+A copy takes the source. A selection's start maps to the source byte
+it shows, or the start of what a `put` stands for; its end, by the
+shown byte before it, past the byte shown or to the end of what a `put`
+stands for. So a copy holds the markup between its ends and none past
+them, and a selection reaching into a stand-in copies what it stands
+for whole. The line ending before a block stands for nothing, where the
+source shown before it ends. A selection of the whole shown text copies
+the whole source, its leading and trailing markup included, and a
+message's copy its sections' sources: a copy is the Markdown as
+written, never the rendering. A styled section is replaced whole, never
+appended to (`Error::Styled`): its owner renders a reply again as it
+streams, since a later delimiter may restyle earlier text. The
+selection survives the replacement only where the section's shown text
+before its points is unchanged; a point past the first change clears
+it.
+
+It is painted a character a cell at a time: the prefix in
+`LINE_NUMBER` ink, the code ground (`CHROME` on paper, `PAPER` on a
+bubble) across a code block's rows from past its prefix and under code
+spans, the selection's ground over both, a link in `ACCENT` ink with an
+underline a scale pixel high two pixels above the cell's foot, struck
+text with a line through its middle, quiet text in `LINE_NUMBER`, a tab
+as a space and another control scalar as the raster's replacement, as
+on plain rows. A click on a link answers `Outcome::Link` with its
+message, section and link, whose target `Controller::link` gives: a
+press on text, not extending and not paired with the click before, and
+its release on the link with the pointer never more than `NEAR` scaled
+pixels from the press, so a drag away and back, a word's double click
+and a second click follow nothing; a selection a jitter made is left
+empty. The owner decides whether to follow it, and resolves the target
+before it sets the section's text again, since a new rendering may
+number links anew.
 
 ## Task-manager widgets
 
