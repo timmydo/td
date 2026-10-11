@@ -10003,3 +10003,155 @@ fn a_rule_denies_an_mcp_call() {
     )));
     h.close();
 }
+
+/// An MCP server's connection off the allowlist waits on a card of its
+/// own, the person's in `auto` mode too, titled with the server and its
+/// command, cut; refused, it is refused to the server, which starts on,
+/// and the answer is logged naming the server (DESIGN.md §12, Its
+/// connections).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_mcp_servers_connection_waits_on_a_card_of_its_own() {
+    let script = format!("git ls-remote http://other.test/r.git >/dev/null 2>&1; {MCP_SERVER}");
+    let mut h = Harness::new_in(
+        "mcplink",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+    );
+    h.setup(mcp_settings(&[("echo", &script)]));
+    h.down(&auto_with(""));
+    h.say("Hello.");
+    let (card, title, details) = h.until_ask();
+    assert!(card >= 1 << 62, "{card}");
+    assert!(
+        title.starts_with("Let MCP server echo (sh -c 'git ls-remote"),
+        "{title}"
+    );
+    assert!(
+        title.ends_with("\u{2026}) connect to other.test:80?"),
+        "{title}"
+    );
+    assert!(
+        details[0].starts_with("MCP server echo, which this conversation's template runs"),
+        "{details:?}"
+    );
+    assert!(
+        details[1].contains("other.test:80 is not on this workspace's allowlist"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    let listed = events
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.kind,
+                Kind::Mcp {
+                    outcome: Served::Listed { .. },
+                    ..
+                }
+            )
+        })
+        .map(|e| e.seq);
+    assert!(listed.is_some(), "{events:?}");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Approval { outcome, by, reason: Some(reason), .. }
+                if outcome == "deny"
+                    && by == "human"
+                    && reason.starts_with("MCP server echo connecting to other.test:80: ")
+        )),
+        "{events:?}"
+    );
+}
+
+/// What a person allows an MCP server is its instance's alone: a
+/// command's connection to the same destination after asks on a card
+/// of its own; the server's approval is logged by the person, before
+/// any `mcp` event of it, so naming none (DESIGN.md §12, Its
+/// connections).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_servers_allowed_connection_is_not_a_commands() {
+    let script = format!("git ls-remote http://other.test/r.git >/dev/null 2>&1; {MCP_SERVER}");
+    let mut h = Harness::new_in(
+        "mcpapart",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            Reply::sse("stream-tool-network.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(mcp_settings(&[("echo", &script)]));
+    h.say("List the remotes.");
+    let (card, title, details) = h.until_ask();
+    assert!(title.starts_with("Let MCP server echo ("), "{title}");
+    assert!(
+        details[2].starts_with("Allow lets the server reach it until it ends"),
+        "{details:?}"
+    );
+    h.down(&Down::Decision {
+        call: card,
+        allow: true,
+        always: None,
+    });
+    // The model's command, on its own card, then its connection to the
+    // destination the server was allowed.
+    let (call, title, _) = h.until_ask();
+    assert_eq!(title, "Run a command");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (other, title, _) = h.until_ask();
+    assert_eq!(title, "Let a command connect to other.test:80?");
+    assert_ne!(other, card);
+    h.down(&Down::Decision {
+        call: other,
+        allow: false,
+        always: None,
+    });
+    let (third, title, _) = h.until_ask();
+    assert_eq!(title, "Let a command connect to third.test:80?");
+    h.down(&Down::Decision {
+        call: third,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let (conversation, _) = h.close();
+    let events = conversation.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Approval { call: 0, outcome, by, reason: Some(reason), .. }
+                if outcome == "allow"
+                    && by == "human"
+                    && reason.starts_with("MCP server echo connecting to other.test:80: ")
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            Kind::Approval { call: c, outcome, by, .. }
+                if *c == call && outcome == "deny" && by == "human"
+        )),
+        "{events:?}"
+    );
+}

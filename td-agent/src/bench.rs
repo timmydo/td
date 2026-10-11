@@ -157,12 +157,11 @@ impl Bench {
                 asker: self.asker.clone(),
                 call: started,
             }),
-            // An MCP server's connections belong to no call, and one that
-            // would be asked is refused until a server has cards of its own
-            // (DESIGN.md §12, Its connections).
+            // An MCP server's connections belong to no call: `started` is
+            // its start's owner (DESIGN.md §12, Its connections).
             Call::Serve { .. } if !off => Some(crate::egress::Linked {
                 judge: std::sync::Arc::clone(&self.judge),
-                asker: None,
+                asker: self.asker.clone(),
                 call: started,
             }),
             _ => None,

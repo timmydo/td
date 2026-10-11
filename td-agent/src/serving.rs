@@ -112,7 +112,9 @@ impl Session {
             args: args.to_vec(),
             workdir: None,
         };
-        let mut client = self.bench.take(&call, 0)?;
+        // Its instance's connections are its start's (DESIGN.md §12).
+        let owner = crate::servers::owner(self.servers.upcoming());
+        let mut client = self.bench.take(&call, owner)?;
         let id = client.call(call)?;
         let inbox = self.sender.clone();
         let name = server.name.clone();
@@ -131,8 +133,23 @@ impl Session {
     /// little more at most, logging what comes: an outcome when an
     /// interrupt ended the wait.
     fn mcp_wait(&mut self, mut awaited: Vec<(String, u64)>) -> Result<Option<Outcome>, String> {
-        let until = Instant::now() + crate::mcp::START_TIME + WAIT_SLACK;
+        let began = Instant::now();
+        // A start waits no longer than its own clock, which a card for its
+        // connection stops: the stops since the wait began.
+        let before: std::collections::BTreeMap<String, Duration> = awaited
+            .iter()
+            .filter_map(|(name, _)| Some((name.clone(), self.servers.get(name)?.clock.stopped())))
+            .collect();
         loop {
+            let held = awaited
+                .iter()
+                .filter_map(|(name, _)| {
+                    let stopped = self.servers.get(name)?.clock.stopped();
+                    Some(stopped.saturating_sub(before.get(name).copied().unwrap_or_default()))
+                })
+                .max()
+                .unwrap_or_default();
+            let until = began + crate::mcp::START_TIME + WAIT_SLACK + held;
             self.log_mcp(&mut awaited)?;
             if awaited.is_empty() || self.gone {
                 return Ok(None);
@@ -467,6 +484,12 @@ impl Session {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let begun = Arc::new(AtomicBool::new(false));
+        let clock_stopped = |servers: &crate::servers::Servers| {
+            servers
+                .get(&server.name)
+                .map_or(Duration::ZERO, |running| running.clock.stopped())
+        };
+        let stopped_before = clock_stopped(&self.servers);
         let (answer, answered) = mpsc::channel();
         let asked = Instant::now();
         let until = asked + Duration::from_secs(server.timeout);
@@ -512,7 +535,10 @@ impl Session {
             if stopped.is_some_and(|at| now >= at + STOP_GRACE) {
                 break Err(Failure::Stopped);
             }
-            if now >= hung || (begun.load(Ordering::Relaxed) && now >= hung_begun) {
+            // Its start's time does not run while a card for its
+            // connection waits, since the call was asked.
+            let held = clock_stopped(&self.servers).saturating_sub(stopped_before);
+            if now >= hung + held || (begun.load(Ordering::Relaxed) && now >= hung_begun) {
                 let why = "it did not answer in its time";
                 self.servers.fail(&server.name);
                 // Its news waits for the turn's next step: none comes

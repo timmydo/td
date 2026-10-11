@@ -4497,7 +4497,8 @@ tenth of a second while a command runs, and at once otherwise. The
 conversation judges it again by the policy as it is then, a rule's
 answer opening or refusing it without a card, and asks only of one
 that still waits. Connections waiting on one destination share one
-card, whatever instance made them, its id past any call's, at most 8
+card, whatever command's instance made them (an MCP server's have cards
+of their own, §12, Its connections), its id past any call's, at most 8
 cards at once, past which a connection is refused: `Let a command
 connect to HOST:PORT?`, the calls whose commands ask (`shell #N`), why
 it is asked, and what each answer does, the card put again as more
@@ -5650,15 +5651,20 @@ connect while it starts, between turns, or during any call. Its instance
 is linked to its `mcp` start, not to a call. A connection the policy and
 the rules let through runs as a command's would (§10); one that would be
 asked of the person waits on a card of its own, `Let MCP server NAME
-(COMMAND) connect to HOST:PORT?`, the person's in both modes, since the
-classifier has no command of the model's to judge. A server's connection
-never joins a command's card, nor a command's a server's, and two
-servers' never share one. The answer holds for that server's instance
-until it ends and is logged as an approval naming the `mcp` event; its
-"always" answers are `network` rules as a command's card's are. While a
-server's connection waits on a card, its start's clock is stopped. A
-server's loopback is its own namespace's (§19, Background servers), so
-it cannot reach a server the model started, nor the model's commands it.
+(COMMAND) connect to HOST:PORT?`, its command cut to 60 characters, the
+person's in both modes, since the classifier has no command of the
+model's to judge. A server's connection never joins a command's card,
+nor a command's a server's, and two servers' never share one. The answer
+holds for that server's instance until it ends and is logged as an
+approval naming the server, at its last `mcp` event, or 0 before its
+first; its "always" answers are `network` rules as a command's card's
+are. While a server's connection waits on a card, its start's clock is
+stopped, as a listing's is; a call's own time runs meanwhile, as a
+command's does (§11). Its cards count toward the 8 a conversation shows
+at once, so a server asking of many destinations leaves the model's
+commands' connections refused until the person answers. A server's
+loopback is its own namespace's (§19, Background servers), so it cannot
+reach a server the model started, nor the model's commands it.
 
 *Results.* A result's `content` items become the call's text in order,
 joined by blank lines: `text` as it is, a `resource` with `text` as that
@@ -5821,10 +5827,9 @@ that, so for those seconds its old instance and its new one both run.
 The process ends them all as it exits and waits for their threads, about
 9 seconds at most, or as long as a tool host that stopped reading holds
 a frame's write. Their tools and calls came next (As built (MCP, tools
-and calls)); their connections' cards are not yet, so a server's
-connection that would be asked is refused, its instance having no one to
-ask. A turn with no key plans nothing, so a server its template dropped
-runs on until a turn with one or the process's end.
+and calls)), and their connections' cards last (As built (MCP,
+connections)). A turn with no key plans nothing, so a server its
+template dropped runs on until a turn with one or the process's end.
 
 **As built (MCP, tools and calls).** At a turn's start, once its
 servers are planned and waited for, the turn fixes its MCP tools
@@ -5869,6 +5874,26 @@ call's effect is unknown. A provider's 400 for a turn's request that
 carried MCP tools says, and its settled request records, that they may
 be why and names them. A template that names servers makes a
 conversation as any does.
+
+**As built (MCP, connections).** A server's instance is launched
+linked to its start, not a call: its `Linked.call` is the start's owner,
+`servers::LINKS` (2^61, past any sequence number and below the window's
+card ids, 2^62) plus its generation, with the conversation's asker. A
+connection whose owner is a start waits on a `LinkCard` of that start's
+alone, matched by destination and owner, never classified, titled with
+the server's name and its command quoted as a card shows it, cut to 60
+characters and then made visible; its details name the server and why
+it is asked, and say what an answer reaches, the instance's rest only
+where the allowlist alone asks, as §10 keeps it; its "always" answers
+are `network` rules as a command's card's are. Each waiting connection
+carries its server's name, which its approval names. A connection of a
+start since ended is refused. The answer is logged as an approval
+naming the server, at its last `mcp` event, 0 before its first. Each
+start has a clock (`servers::Clock`), stopped whenever a card of its own
+is up and going otherwise, set again at every change to the cards; its
+start's deadline and each listing's again, the turn's wait for its
+listing, and a call's bound for a server not yet begun each add the
+time it stopped since they began.
 
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
@@ -7728,11 +7753,10 @@ in parallel with it.
     non-Rust package (AGENTS.md). td-agent is a standalone program: no
     boot test starts it, its window or its model.
 
-After these: resource limits (§8), a loopback shared by
-a conversation's instances (§19), the MCP client, moving a
-conversation between workspaces, and a native Anthropic Messages
-dialect. The MCP client (§12, MCP servers) comes in four steps, each
-one commit:
+After these: resource limits (§8), a loopback shared by a
+conversation's instances (§19), moving a conversation between
+workspaces, and a native Anthropic Messages dialect. The MCP client
+(§12, MCP servers) came in four steps, each one commit, and is built:
 
 - **The tool host's `serve`.** The call that starts a program with
   piped standard input, the binary `input` and `close` frames written
@@ -7758,10 +7782,11 @@ one commit:
   on them; `mcp__SERVER__TOOL` calls dispatched with their cards,
   rules and results; failures told as notifications; tested with a
   fake server in the test and, jailed, with a small stdio server run
-  by `sh`. Built but for its connections' cards, its last commit.
+  by `sh`.
 
 `web_fetch`, `question`, `task`'s sub-agents, schedules, skills, the
-person's commands and `/review` are built (§3, §12, §15).
+person's commands, `/review` and the MCP client are built (§3, §12,
+§15).
 
 ## 19. Open questions
 

@@ -485,9 +485,13 @@ enum Work {
 const LINK_CARDS: u64 = 1 << 62;
 
 /// A card for the connections that wait on one destination, whichever
-/// of this conversation's instances made them.
+/// of this conversation's commands made them, or one MCP server's start.
 struct LinkCard {
     destination: crate::config::Destination,
+    /// The start whose connections it is, its owner and its server's
+    /// name and command; none for commands' (DESIGN.md §12, Its
+    /// connections).
+    server: Option<(u64, String, Vec<String>)>,
     why: String,
     /// Whether the card offers an "always allow".
     allow: bool,
@@ -505,10 +509,15 @@ struct Waiting {
     links: std::sync::Weak<crate::egress::Links>,
     link: u64,
     call: u64,
+    /// The MCP server whose start made it, for one a start made.
+    server: Option<String>,
 }
 
 /// The most cards for connections a conversation shows at once.
 const MAX_LINK_CARDS: usize = 8;
+
+/// The most characters of an MCP server's command a card's title names.
+const MCP_TITLE_COMMAND: usize = 60;
 
 /// One step of a streamed request, as its thread read it.
 #[derive(Debug)]
@@ -4417,7 +4426,37 @@ impl Session {
                 if !links.upgrade().is_some_and(|strong| strong.waits(link)) {
                     return;
                 }
-                let waiting = Waiting { links, link, call };
+                // A server's own, or a server's that ended, its instance
+                // with it.
+                let server = if call >= crate::servers::LINKS {
+                    match self.servers.owning(call) {
+                        Some(running) => Some((
+                            call,
+                            running.config.name.clone(),
+                            running.config.command.clone(),
+                        )),
+                        None => {
+                            let waiting = Waiting {
+                                links,
+                                link,
+                                call,
+                                server: None,
+                            };
+                            let why = "its MCP server ended".to_string();
+                            Self::give(&[waiting], &destination, Err(why), false);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let waiting = Waiting {
+                    links,
+                    link,
+                    call,
+                    server: server.as_ref().map(|(_, name, _)| name.clone()),
+                };
+                let owner = server.as_ref().map(|(owner, _, _)| *owner);
                 // What asked may have changed since the instance judged it.
                 let (why, allow) = match self.bench.judge(&destination) {
                     crate::egress::Judgment::Ask { why, allow } => (why, allow),
@@ -4433,11 +4472,12 @@ impl Session {
                         return self.settle_by_rule(&destination, &[waiting], Err(why.clone()), why)
                     }
                 };
-                if let Some((&id, card)) = self
-                    .link_cards
-                    .iter_mut()
-                    .find(|(_, card)| card.destination == destination)
-                {
+                // A server's never joins a command's card, nor another
+                // server's.
+                if let Some((&id, card)) = self.link_cards.iter_mut().find(|(_, card)| {
+                    card.destination == destination
+                        && card.server.as_ref().map(|(owner, _, _)| *owner) == owner
+                }) {
                     let joins = !card.waiting.iter().any(|one| one.call == waiting.call);
                     card.waiting.push(waiting);
                     if joins && card.shown {
@@ -4467,12 +4507,15 @@ impl Session {
                 self.next_link_card += 1;
                 // `auto`'s column is the classifier's for a destination
                 // the allowlist alone asks about; a rule's ask, or a
-                // rules file not read, is the person's (§11).
-                let classified = allow && self.workspace_mode() == crate::config::Mode::Auto;
+                // rules file not read, is the person's (§11), as a
+                // server's always is, with no command of the model's.
+                let classified =
+                    allow && server.is_none() && self.workspace_mode() == crate::config::Mode::Auto;
                 self.link_cards.insert(
                     id,
                     LinkCard {
                         destination,
+                        server,
                         why,
                         allow,
                         waiting: vec![waiting],
@@ -4485,6 +4528,7 @@ impl Session {
                 } else {
                     self.show_link_card(id);
                 }
+                self.mcp_hold();
             }
             crate::egress::Asked::Gone { links, link, .. } => {
                 let mut empty = Vec::new();
@@ -4521,6 +4565,7 @@ impl Session {
                         );
                     }
                 }
+                self.mcp_hold();
             }
         }
     }
@@ -4535,6 +4580,39 @@ impl Session {
         card.shown = true;
         let card = &*card;
         let named = card.destination.text();
+        // No answer to keep while the human's rules are unread, which
+        // would leave nothing to write it to.
+        let always = if self.human.1.is_ok() {
+            crate::rules::Always::checked(card.allow, vec![format!("network {named}")])
+                .ok()
+                .map(crate::rules::Offer::Rules)
+        } else {
+            None
+        };
+        if let Some((_, server, command)) = &card.server {
+            // An answer is kept for the instance only where the allowlist
+            // alone asks (§10).
+            let reach = if card.allow {
+                "Allow lets the server reach it until it ends, and Deny refuses it as long."
+            } else {
+                "Allow and Deny answer the connections waiting now; the next one asks again."
+            };
+            let up = Up::Ask {
+                call: id,
+                title: format!(
+                    "Let MCP server {server} ({}) connect to {named}?",
+                    tools::command_line(command, MCP_TITLE_COMMAND)
+                ),
+                details: vec![
+                    format!("MCP server {server}, which this conversation's template runs, asks to connect to {named} through the workspace's proxy."),
+                    format!("Asked because {}.", card.why),
+                    reach.into(),
+                ],
+                always,
+            };
+            self.send(&up);
+            return;
+        }
         let mut calls: Vec<u64> = card.waiting.iter().map(|one| one.call).collect();
         calls.sort_unstable();
         calls.dedup();
@@ -4556,15 +4634,6 @@ impl Session {
             format!("The command of {} asks", callers.join(""))
         } else {
             format!("The commands of {} ask", callers.join(", "))
-        };
-        // No answer to keep while the human's rules are unread, which
-        // would leave nothing to write it to.
-        let always = if self.human.1.is_ok() {
-            crate::rules::Always::checked(card.allow, vec![format!("network {named}")])
-                .ok()
-                .map(crate::rules::Offer::Rules)
-        } else {
-            None
         };
         let up = Up::Ask {
             call: id,
@@ -4653,6 +4722,7 @@ impl Session {
         let Some(card) = self.link_cards.remove(&id) else {
             return;
         };
+        self.mcp_hold();
         if allow {
             if let crate::egress::Judgment::Refuse(why) = self.bench.judge(&card.destination) {
                 return self.settle_by_rule(
@@ -4710,6 +4780,18 @@ impl Session {
                 self.settle_by_rule(&card.destination, &card.waiting, answer, reason);
             }
         }
+        self.mcp_hold();
+    }
+
+    /// Each MCP server's start's clock stopped while a connection of its
+    /// own waits on a card, and going otherwise (DESIGN.md §12).
+    fn mcp_hold(&self) {
+        let waits: std::collections::BTreeSet<u64> = self
+            .link_cards
+            .values()
+            .filter_map(|card| card.server.as_ref().map(|(owner, _, _)| *owner))
+            .collect();
+        self.servers.hold(|owner| waits.contains(&owner));
     }
 
     /// An approval for each call whose command made one of `waiting`,
@@ -4738,6 +4820,31 @@ impl Session {
         let mut calls: Vec<u64> = waiting.iter().map(|one| one.call).collect();
         calls.sort_unstable();
         calls.dedup();
+        // A server's connection names its server and its last `mcp`
+        // event, none before its first (DESIGN.md §12, Its connections).
+        if let Some(name) = waiting.iter().find_map(|one| one.server.clone()) {
+            let call = self
+                .conversation
+                .events()
+                .iter()
+                .rev()
+                .find_map(|e| match &e.kind {
+                    Kind::Mcp { server, .. } if *server == name => Some(e.seq),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            self.link_approvals.push_back(Kind::Approval {
+                call,
+                outcome: outcome.into(),
+                by: by.into(),
+                probabilities,
+                reason: Some(format!(
+                    "MCP server {name} connecting to {}: {reason}",
+                    destination.text()
+                )),
+            });
+            return;
+        }
         // The classifier gives one verdict, which the breaker counts
         // once: logged at the first call, naming the others.
         if by == "classifier" {

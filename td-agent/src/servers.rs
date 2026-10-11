@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -232,6 +232,7 @@ pub struct Told {
 pub fn serve<T: Ending>(
     transport: T,
     start_time: Duration,
+    clock: &Clock,
     asks: &Receiver<Ask>,
     end: &AtomicBool,
     tell: &dyn Fn(Report),
@@ -243,7 +244,7 @@ pub fn serve<T: Ending>(
         tail: server.transport().tail(),
     };
     let until = Instant::now() + start_time;
-    match server.start(&mut || until, &mut || ending()) {
+    match server.start(&mut || until + clock.stopped(), &mut || ending()) {
         Ok(started) => tell(Report::Started(Ok(started))),
         Err(failure) => {
             if !ending() {
@@ -289,7 +290,9 @@ pub fn serve<T: Ending>(
             }
             Ok(Ask::List) => {
                 let until = Instant::now() + start_time;
-                match server.list(&mut || until, &mut || ending()) {
+                let before = clock.stopped();
+                let mut deadline = || until + clock.stopped().saturating_sub(before);
+                match server.list(&mut deadline, &mut || ending()) {
                     Ok(listed) => {
                         changed = false;
                         tell(Report::Listed(Ok(listed)));
@@ -350,6 +353,50 @@ pub struct Running {
     pub protocol: Option<String>,
     /// It said its tools changed since they were last listed.
     pub changed: bool,
+    /// Its start's clock, stopped while a connection waits on a card.
+    pub clock: Arc<Clock>,
+}
+
+/// The first owner of a server's connections, past any call's sequence
+/// number and below the window's card ids: a server's instance is linked
+/// to its start, not to a call (DESIGN.md §12, Its connections).
+pub const LINKS: u64 = 1 << 61;
+
+/// The owner of the connections of a server's start `generation`.
+pub fn owner(generation: u64) -> u64 {
+    LINKS.saturating_add(generation)
+}
+
+/// A start's clock, stopped while a connection of its server waits on
+/// the person (DESIGN.md §12, Its connections): how long it has stopped.
+#[derive(Debug, Default)]
+pub struct Clock(Mutex<(Option<Instant>, Duration)>);
+
+impl Clock {
+    /// Stops it, unless it is stopped.
+    pub fn stop(&self) {
+        if let Ok(mut clock) = self.0.lock() {
+            clock.0.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Starts it again, unless it runs.
+    pub fn go(&self) {
+        if let Ok(mut clock) = self.0.lock() {
+            if let Some(since) = clock.0.take() {
+                clock.1 = clock.1.saturating_add(since.elapsed());
+            }
+        }
+    }
+
+    /// How long it has been stopped, until now.
+    pub fn stopped(&self) -> Duration {
+        self.0.lock().map_or(Duration::ZERO, |clock| {
+            clock
+                .1
+                .saturating_add(clock.0.map_or(Duration::ZERO, |since| since.elapsed()))
+        })
+    }
 }
 
 /// The conversation's servers, as its main thread knows them.
@@ -412,9 +459,16 @@ impl Servers {
         start
     }
 
+    /// The generation the next start is, whose owner its instance is
+    /// launched linked to.
+    pub fn upcoming(&self) -> u64 {
+        self.next.saturating_add(1)
+    }
+
     /// Runs `config` over `transport` on a thread of its own, launched
     /// with `launch`, telling what comes of it through `tell` with its
-    /// generation: that generation, or why no thread could be made.
+    /// generation: that generation, `upcoming`'s, or why no thread could
+    /// be made.
     pub fn add<T: Ending + Send + 'static>(
         &mut self,
         config: McpServer,
@@ -427,12 +481,15 @@ impl Servers {
         let (asks, asked) = std::sync::mpsc::channel();
         let end = Arc::new(AtomicBool::new(false));
         let ended = Arc::clone(&end);
+        let clock = Arc::new(Clock::default());
+        let held = Arc::clone(&clock);
         let thread = std::thread::Builder::new()
             .name(format!("mcp {}", config.name))
             .spawn(move || {
                 serve(
                     transport,
                     crate::mcp::START_TIME,
+                    &held,
                     &asked,
                     &ended,
                     &|report| tell(generation, report),
@@ -450,9 +507,29 @@ impl Servers {
                 thread,
                 protocol: None,
                 changed: false,
+                clock,
             },
         );
         Ok(generation)
+    }
+
+    /// The running server whose connections `owner` owns.
+    pub fn owning(&self, owner: u64) -> Option<&Running> {
+        self.running
+            .values()
+            .find(|running| self::owner(running.generation) == owner)
+    }
+
+    /// Each running server's clock stopped while `waits` says a
+    /// connection of its own waits on the person, and going otherwise.
+    pub fn hold(&self, waits: impl Fn(u64) -> bool) {
+        for running in self.running.values() {
+            if waits(owner(running.generation)) {
+                running.clock.stop();
+            } else {
+                running.clock.go();
+            }
+        }
     }
 
     /// `name`'s server, when the report of `generation` is its.
@@ -660,9 +737,16 @@ mod tests {
         let end = Arc::new(AtomicBool::new(false));
         let ending = Arc::clone(&end);
         let thread = std::thread::spawn(move || {
-            serve(fake, start_time, &asked, &ending, &|report| {
-                let _ = tell.send(report);
-            })
+            serve(
+                fake,
+                start_time,
+                &Clock::default(),
+                &asked,
+                &ending,
+                &|report| {
+                    let _ = tell.send(report);
+                },
+            )
         });
         Run {
             asks,
@@ -756,6 +840,120 @@ mod tests {
         assert_eq!(failed.tail, "it said goodbye");
         run.thread.join().unwrap();
         assert!(run.ended.load(Ordering::Relaxed));
+    }
+
+    /// A start's time does not run while its clock is stopped, and runs
+    /// on from where it was when it goes again.
+    #[test]
+    fn a_starts_time_waits_while_its_clock_is_stopped() {
+        let (fake, _) = Fake::new(silent);
+        let (_asks, asked) = mpsc::channel();
+        let (tell, told) = mpsc::channel();
+        let clock = Arc::new(Clock::default());
+        clock.stop();
+        let held = Arc::clone(&clock);
+        let thread = std::thread::spawn(move || {
+            let end = AtomicBool::new(false);
+            serve(
+                fake,
+                Duration::from_millis(100),
+                &held,
+                &asked,
+                &end,
+                &|report| {
+                    let _ = tell.send(report);
+                },
+            )
+        });
+        // Stopped, its 100 ms do not run out.
+        assert!(told.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(clock.stopped() >= Duration::from_millis(300));
+        clock.go();
+        let went = Instant::now();
+        let Report::Started(Err(failed)) = told.recv_timeout(WAIT).unwrap() else {
+            panic!("no failure");
+        };
+        assert!(failed.why.contains("in time"), "{}", failed.why);
+        assert!(went.elapsed() < Duration::from_secs(2));
+        thread.join().unwrap();
+    }
+
+    /// A listing again, like a start, waits while the clock is stopped,
+    /// counting only what it stopped since the listing was asked.
+    #[test]
+    fn a_listing_again_waits_while_its_clock_is_stopped() {
+        static LISTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // The first listing answered, every later one never.
+        fn once(message: &Json) -> Vec<String> {
+            if message.get("method").and_then(Json::as_str) == Some("tools/list")
+                && LISTS.fetch_add(1, Ordering::Relaxed) > 0
+            {
+                return Vec::new();
+            }
+            tools(message)
+        }
+        let (fake, _) = Fake::new(once);
+        let (asks, asked) = mpsc::channel();
+        let (tell, told) = mpsc::channel();
+        let clock = Arc::new(Clock::default());
+        let held = Arc::clone(&clock);
+        let thread = std::thread::spawn(move || {
+            let end = AtomicBool::new(false);
+            serve(
+                fake,
+                Duration::from_millis(100),
+                &held,
+                &asked,
+                &end,
+                &|report| {
+                    let _ = tell.send(report);
+                },
+            )
+        });
+        assert!(matches!(
+            told.recv_timeout(WAIT),
+            Ok(Report::Started(Ok(_)))
+        ));
+        clock.stop();
+        asks.send(Ask::List).unwrap();
+        assert!(told.recv_timeout(Duration::from_millis(300)).is_err());
+        clock.go();
+        let Report::Listed(Err(failed)) = told.recv_timeout(WAIT).unwrap() else {
+            panic!("no failure");
+        };
+        assert!(failed.why.contains("in time"), "{}", failed.why);
+        drop(asks);
+        thread.join().unwrap();
+    }
+
+    /// `hold` stops the clock of each running server a card waits for,
+    /// and only that one's, and starts it again when none does.
+    #[test]
+    fn hold_stops_only_the_clocks_of_servers_a_card_waits_for() {
+        let mut servers = Servers::default();
+        let config =
+            |name: &str| crate::config::mcp_server(name, vec!["x".into()], None, None).unwrap();
+        let launch: Launch = Default::default();
+        let first = servers
+            .add(config("a"), launch.clone(), Fake::new(tools).0, |_, _| {})
+            .unwrap();
+        servers
+            .add(config("b"), launch, Fake::new(tools).0, |_, _| {})
+            .unwrap();
+        assert_eq!(
+            servers.owning(owner(first)).map(|r| r.config.name.as_str()),
+            Some("a")
+        );
+        servers.hold(|waits| waits == owner(first));
+        std::thread::sleep(Duration::from_millis(50));
+        let a = servers.get("a").unwrap().clock.stopped();
+        assert!(a >= Duration::from_millis(50), "{a:?}");
+        assert_eq!(servers.get("b").unwrap().clock.stopped(), Duration::ZERO);
+        servers.hold(|_| false);
+        let held = servers.get("a").unwrap().clock.stopped();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(servers.get("a").unwrap().clock.stopped(), held);
+        servers.end_all();
     }
 
     #[test]

@@ -1655,6 +1655,22 @@ pub fn visible(line: &str) -> String {
     out
 }
 
+/// `words`, an argv, as a card's title names it: each word quoted as a
+/// card shows it, cut to at most `max` characters, an ellipsis saying it
+/// was, and then made visible, so no cut falls within what that writes.
+pub fn command_line(words: &[String], max: usize) -> String {
+    let words: Vec<String> = words.iter().map(|w| quoted_word(w)).collect();
+    let line = words.join(" ");
+    if line.chars().count() <= max {
+        return visible(&line);
+    }
+    let mut cut: String = line.chars().take(max.saturating_sub(1)).collect();
+    if max > 0 {
+        cut.push('\u{2026}');
+    }
+    visible(&cut)
+}
+
 /// `word` as one word of an argv shown on a card: single-quoted as `sh`
 /// would read it when it is empty or holds what would end or bend a
 /// word, so two argvs never look alike.
@@ -2110,6 +2126,23 @@ mod mcp_tests {
             Some("mcp__gh__list")
         );
         assert_eq!(tools.len(), Tool::offered(Kit::Workspace, false).len() + 1);
+    }
+
+    /// A command in a card's title is quoted as a card shows it, and cut
+    /// with an ellipsis past its bound.
+    #[test]
+    fn a_titles_command_is_quoted_and_cut() {
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_line(&words(&["gh-mcp", "--read only"]), 60),
+            "gh-mcp '--read only'"
+        );
+        let long = command_line(&words(&["sh", "-c", &"x".repeat(100)]), 20);
+        assert_eq!(long.chars().count(), 20);
+        assert!(
+            long.starts_with("sh -c xxx") && long.ends_with('\u{2026}'),
+            "{long}"
+        );
     }
 
     /// The card names the tool, the server, its command and the
