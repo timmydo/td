@@ -383,14 +383,97 @@ struct Sort {
     phase: SortPhase,
 }
 
+mod sealed {
+    pub trait Pair<T> {}
+    impl Pair<&mut [super::Token]> for &mut [u8] {}
+    impl Pair<Box<[super::Token]>> for Box<[u8]> {}
+    pub trait Storage {}
+    impl<T> Storage for &mut [T] {}
+    impl<T> Storage for Box<[T]> {}
+}
+/// Stable caller-provided backing. Sealed to slices and boxed slices so a
+/// storage implementation cannot substitute a different arena between turns.
+pub trait Storage<T>: sealed::Storage + std::ops::Deref<Target = [T]> + std::ops::DerefMut {}
+impl<T> Storage<T> for &mut [T] {}
+impl<T> Storage<T> for Box<[T]> {}
+
+/// Supported complete parser backing pairs. Mixed owned/borrowed pairs have
+/// no completion API and cannot be constructed.
+pub trait StoragePair<T>: sealed::Pair<T> {}
+impl StoragePair<&mut [Token]> for &mut [u8] {}
+impl StoragePair<Box<[Token]>> for Box<[u8]> {}
+
+/// Borrowed parser; existing callers retain ownership of both buffers.
+pub type Cursor<'a> = Parser<&'a mut [u8], &'a mut [Token]>;
+/// Moveable parser owning preallocated boxes, suitable for a queued worker job.
+pub type OwnedCursor = Parser<Box<[u8]>, Box<[Token]>>;
+/// Owned backings returned after a constructor or completion refusal.
+pub type OwnedRefusal = Refusal<Box<[u8]>, Box<[Token]>>;
+
+/// A refusal returns the same backings without publishing a partial document.
+/// Debug output is redacted; buffers may contain credentials or mail.
+pub struct Refusal<B, T> {
+    error: Error,
+    bytes: B,
+    tokens: T,
+}
+impl<B, T> Refusal<B, T> {
+    pub const fn error(&self) -> Error {
+        self.error
+    }
+    pub fn into_buffers(self) -> (B, T) {
+        (self.bytes, self.tokens)
+    }
+}
+impl<B, T> fmt::Debug for Refusal<B, T> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_tuple("Refusal").field(&self.error).finish()
+    }
+}
+impl<B, T> fmt::Display for Refusal<B, T> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(out)
+    }
+}
+impl<B, T> std::error::Error for Refusal<B, T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Valid JSON with exclusively owned storage. Views borrow this owner; the
+/// boxes can be recovered for another request only after those borrows end.
+pub struct OwnedDocument {
+    bytes: Box<[u8]>,
+    tokens: Box<[Token]>,
+    input_len: usize,
+    used: usize,
+}
+impl OwnedDocument {
+    pub fn view(&self) -> Result<Document<'_>, Error> {
+        let error = Error {
+            kind: ErrorKind::Storage,
+            offset: 0,
+        };
+        Ok(Document {
+            bytes: self.bytes.get(..self.input_len).ok_or(error)?,
+            tokens: self.tokens.get(..self.used).ok_or(error)?,
+        })
+    }
+    pub fn into_buffers(self) -> (Box<[u8]>, Box<[Token]>) {
+        (self.bytes, self.tokens)
+    }
+}
+
 /// Fixed-state in-place parser. Each step performs at most 256 transitions;
 /// a transition inspects at most 12 input bytes (one Unicode escape pair),
 /// or compares one key byte. No whole-string or whole-object work is hidden
 /// at completion. Callers retain responsibility for cancellation and deadlines.
 /// Dropping or failing the cursor invalidates the partially modified backing.
-pub struct Cursor<'a> {
-    bytes: &'a mut [u8],
-    tokens: &'a mut [Token],
+pub struct Parser<B: Storage<u8>, T: Storage<Token>> {
+    bytes: B,
+    tokens: T,
+    input_len: usize,
     limits: ParseLimits,
     position: usize,
     used: usize,
@@ -401,27 +484,46 @@ pub struct Cursor<'a> {
     failed: Option<Error>,
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_>>() <= 4096);
-impl<'a> Cursor<'a> {
-    pub fn new(
-        bytes: &'a mut [u8],
-        tokens: &'a mut [Token],
+const _: () = assert!(std::mem::size_of::<OwnedCursor>() <= 4096);
+impl<B: Storage<u8>, T: Storage<Token>> Parser<B, T> {
+    /// Parse only the occupied prefix of a preallocated byte arena. Constructor
+    /// refusal returns the same boxes/slices; no allocation or wiping occurs.
+    pub fn with_input_length(
+        bytes: B,
+        tokens: T,
+        input_len: usize,
         limits: ParseLimits,
-    ) -> Result<Self, Error> {
-        if bytes.len() > limits.max_bytes {
-            return Err(Error {
-                kind: ErrorKind::Limit(ParseLimit::Bytes),
-                offset: limits.max_bytes,
-            });
-        }
-        if bytes.len() >= NONE as usize || tokens.len() >= NONE as usize {
-            return Err(Error {
+    ) -> Result<Self, Refusal<B, T>>
+    where
+        B: StoragePair<T>,
+    {
+        let error = if input_len > bytes.len()
+            || bytes.len() >= NONE as usize
+            || tokens.len() >= NONE as usize
+        {
+            Some(Error {
                 kind: ErrorKind::Storage,
                 offset: 0,
+            })
+        } else if input_len > limits.max_bytes {
+            Some(Error {
+                kind: ErrorKind::Limit(ParseLimit::Bytes),
+                offset: limits.max_bytes,
+            })
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(Refusal {
+                error,
+                bytes,
+                tokens,
             });
         }
         Ok(Self {
             bytes,
             tokens,
+            input_len,
             limits,
             position: 0,
             used: 0,
@@ -431,6 +533,20 @@ impl<'a> Cursor<'a> {
             mode: Mode::Utf8,
             failed: None,
         })
+    }
+    /// Abandon parsing and recover both complete arenas, even after failure.
+    /// Their contents may be partially decoded and have no validity guarantee.
+    pub fn into_buffers(self) -> (B, T) {
+        (self.bytes, self.tokens)
+    }
+    fn completion(&self) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if !matches!(self.mode, Mode::Done) {
+            return Err(self.error(ErrorKind::Storage));
+        }
+        Ok(())
     }
     /// True means the document can be consumed with finish. Errors are sticky.
     pub fn step(&mut self) -> Result<bool, Error> {
@@ -448,23 +564,6 @@ impl<'a> Cursor<'a> {
         }
         Ok(matches!(self.mode, Mode::Done))
     }
-    /// No document is available before successful completion. Calling this
-    /// prematurely consumes the cursor and returns Storage (caller misuse).
-    pub fn finish(self) -> Result<Document<'a>, Error> {
-        if let Some(error) = self.failed {
-            return Err(error);
-        }
-        if !matches!(self.mode, Mode::Done) {
-            return Err(self.error(ErrorKind::Storage));
-        }
-        Ok(Document {
-            bytes: self.bytes,
-            tokens: self.tokens.get(..self.used).ok_or(Error {
-                kind: ErrorKind::Storage,
-                offset: self.position,
-            })?,
-        })
-    }
     fn error(&self, kind: ErrorKind) -> Error {
         Error {
             kind,
@@ -472,7 +571,11 @@ impl<'a> Cursor<'a> {
         }
     }
     fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.position).copied()
+        if self.position < self.input_len {
+            self.bytes.get(self.position).copied()
+        } else {
+            None
+        }
     }
     fn require(&mut self, byte: u8) -> Result<(), Error> {
         if self.peek() != Some(byte) {
@@ -541,7 +644,8 @@ impl<'a> Cursor<'a> {
                 };
                 let bytes = self
                     .bytes
-                    .get(self.position..self.position + width)
+                    .get(..self.input_len)
+                    .and_then(|bytes| bytes.get(self.position..self.position + width))
                     .ok_or(self.error(ErrorKind::Syntax))?;
                 std::str::from_utf8(bytes).map_err(|_| self.error(ErrorKind::Syntax))?;
                 self.position += width;
@@ -908,9 +1012,9 @@ impl<'a> Cursor<'a> {
                     } else if sort.right_count == 0 || sort.right == NONE {
                         true
                     } else {
-                        let left = raw_span(self.bytes, self.token(sort.left)?)
+                        let left = raw_span(&self.bytes, self.token(sort.left)?)
                             .ok_or(self.error(ErrorKind::Storage))?;
-                        let right = raw_span(self.bytes, self.token(sort.right)?)
+                        let right = raw_span(&self.bytes, self.token(sort.right)?)
                             .ok_or(self.error(ErrorKind::Storage))?;
                         match (left.get(sort.compared), right.get(sort.compared)) {
                             (Some(a), Some(b)) if a == b => {
@@ -966,6 +1070,47 @@ impl<'a> Cursor<'a> {
     }
 }
 
+impl<'a> Cursor<'a> {
+    /// Convenience constructor using all borrowed input bytes.
+    pub fn new(
+        bytes: &'a mut [u8],
+        tokens: &'a mut [Token],
+        limits: ParseLimits,
+    ) -> Result<Self, Error> {
+        let input_len = bytes.len();
+        Self::with_input_length(bytes, tokens, input_len, limits).map_err(|refusal| refusal.error)
+    }
+    /// Premature consumption reports Storage (caller misuse); no document is
+    /// available before all parsing and sorting completes.
+    pub fn finish(self) -> Result<Document<'a>, Error> {
+        self.completion()?;
+        let error = self.error(ErrorKind::Storage);
+        Ok(Document {
+            bytes: self.bytes.get(..self.input_len).ok_or(error)?,
+            tokens: self.tokens.get(..self.used).ok_or(error)?,
+        })
+    }
+}
+impl OwnedCursor {
+    /// Preserve both arenas on refusal. Successful views borrow the returned
+    /// owner, which can later return the same buffers for a new request.
+    pub fn finish(self) -> Result<OwnedDocument, OwnedRefusal> {
+        if let Err(error) = self.completion() {
+            return Err(Refusal {
+                error,
+                bytes: self.bytes,
+                tokens: self.tokens,
+            });
+        }
+        Ok(OwnedDocument {
+            bytes: self.bytes,
+            tokens: self.tokens,
+            input_len: self.input_len,
+            used: self.used,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
@@ -981,6 +1126,151 @@ mod tests {
             max_tokens: 32768,
         }
     }
+    #[test]
+    fn borrowed_prefix_ignores_unreceived_capacity() {
+        let mut bytes = *b"null garbage";
+        let mut tokens = [Token::EMPTY; 4];
+        let mut ceiling = limits();
+        ceiling.max_bytes = 4;
+        let mut cursor =
+            Cursor::with_input_length(&mut bytes[..], &mut tokens[..], 4, ceiling).unwrap();
+        while !cursor.step().unwrap() {}
+        let document = cursor.finish().unwrap();
+        assert!(document.root().is_null());
+        assert_eq!(document.bytes.len(), 4);
+    }
+
+    #[test]
+    fn occupied_limit_is_independent_of_capacity_and_storage_errors_win() {
+        let mut bytes = vec![0xff; 64].into_boxed_slice();
+        bytes[..3].copy_from_slice(b"[1]");
+        let mut ceiling = limits();
+        ceiling.max_bytes = 3;
+        let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+        let mut cursor = OwnedCursor::with_input_length(bytes, tokens, 3, ceiling).unwrap();
+        while !cursor.step().unwrap() {}
+        let (bytes, tokens) = cursor.finish().unwrap().into_buffers();
+        let refusal = OwnedCursor::with_input_length(bytes, tokens, 99, ceiling)
+            .err()
+            .unwrap();
+        assert_eq!(refusal.error().kind, ErrorKind::Storage);
+    }
+
+    #[test]
+    fn string_and_escape_reads_stop_at_occupied_prefix() {
+        for (input, length) in [(br#""abc""#.as_slice(), 4), (br#""\u0041""#.as_slice(), 5)] {
+            let bytes = input.to_vec().into_boxed_slice();
+            let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+            let mut cursor =
+                OwnedCursor::with_input_length(bytes, tokens, length, limits()).unwrap();
+            loop {
+                match cursor.step() {
+                    Ok(false) => (),
+                    Ok(true) => panic!("accepted an incomplete string"),
+                    Err(error) => {
+                        assert_eq!(error.kind, ErrorKind::Syntax);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_cursor_moves_between_turns_and_reuses_exact_arenas() {
+        fn is_send<T: Send>() {}
+        is_send::<OwnedCursor>();
+        is_send::<OwnedDocument>();
+        let mut bytes = vec![0xff; 8192].into_boxed_slice();
+        let mut tokens = vec![Token::EMPTY; 32].into_boxed_slice();
+        let byte_ptr = bytes.as_ptr();
+        let token_ptr = tokens.as_ptr();
+        for input in [
+            format!("[\"{}\",42]", "x".repeat(4096)),
+            "{\"a\":true}".into(),
+        ] {
+            bytes[..input.len()].copy_from_slice(input.as_bytes());
+            let mut queue =
+                Some(OwnedCursor::with_input_length(bytes, tokens, input.len(), limits()).unwrap());
+            loop {
+                let mut cursor = queue.take().unwrap();
+                if cursor.step().unwrap() {
+                    let owner = cursor.finish().unwrap();
+                    let view = owner.view().unwrap();
+                    let mut output = String::new();
+                    view.root().write_json(&mut output).unwrap();
+                    assert_eq!(output, input);
+                    (bytes, tokens) = owner.into_buffers();
+                    break;
+                }
+                queue = Some(cursor);
+            }
+            assert_eq!(bytes.as_ptr(), byte_ptr);
+            assert_eq!(tokens.as_ptr(), token_ptr);
+            assert_eq!(bytes.len(), 8192);
+            assert_eq!(tokens.len(), 32);
+        }
+    }
+
+    #[test]
+    fn owned_refusals_return_buffers_without_disclosing_contents() {
+        let bytes = b"secret".to_vec().into_boxed_slice();
+        let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+        let pointers = (bytes.as_ptr(), tokens.as_ptr());
+        let refusal = OwnedCursor::with_input_length(bytes, tokens, 7, limits())
+            .err()
+            .unwrap();
+        assert_eq!(refusal.error().kind, ErrorKind::Storage);
+        assert!(!format!("{refusal:?}").contains("secret"));
+        let (bytes, tokens) = refusal.into_buffers();
+        let cursor = OwnedCursor::with_input_length(bytes, tokens, 6, limits()).unwrap();
+        let refusal = cursor.finish().err().unwrap();
+        assert_eq!(refusal.error().kind, ErrorKind::Storage);
+        let (bytes, tokens) = refusal.into_buffers();
+        let mut cursor = OwnedCursor::with_input_length(bytes, tokens, 6, limits()).unwrap();
+        let error = cursor.step().unwrap_err();
+        assert_eq!(cursor.step(), Err(error));
+        let refusal = cursor.finish().err().unwrap();
+        assert_eq!(refusal.error(), error);
+        let (bytes, tokens) = refusal.into_buffers();
+        assert_eq!((bytes.as_ptr(), tokens.as_ptr()), pointers);
+        let mut ceiling = limits();
+        ceiling.max_bytes = 5;
+        let refusal = OwnedCursor::with_input_length(bytes, tokens, 6, ceiling)
+            .err()
+            .unwrap();
+        assert_eq!(refusal.error().kind, ErrorKind::Limit(ParseLimit::Bytes));
+        let (bytes, tokens) = refusal.into_buffers();
+        let cursor = OwnedCursor::with_input_length(bytes, tokens, 6, limits()).unwrap();
+        let (bytes, tokens) = cursor.into_buffers();
+        assert_eq!((bytes.as_ptr(), tokens.as_ptr()), pointers);
+    }
+
+    #[test]
+    fn occupied_prefix_is_the_utf8_and_grammar_boundary() {
+        for (input, length) in [
+            (b"null false".as_slice(), 4),
+            (b"\"\xc3\xa9\"".as_slice(), 2),
+        ] {
+            let bytes = input.to_vec().into_boxed_slice();
+            let tokens = vec![Token::EMPTY; 8].into_boxed_slice();
+            let mut cursor =
+                OwnedCursor::with_input_length(bytes, tokens, length, limits()).unwrap();
+            if length == 4 {
+                while !cursor.step().unwrap() {}
+                assert!(cursor.finish().unwrap().view().unwrap().root().is_null());
+            } else {
+                assert_eq!(
+                    cursor.step().unwrap_err(),
+                    Error {
+                        kind: ErrorKind::Syntax,
+                        offset: 1
+                    }
+                );
+            }
+        }
+    }
+
     #[test]
     fn large_last_sorting_key_does_not_revalidate_utf8_per_comparison() {
         let large = "\u{ffef}".repeat(200_000);

@@ -127,7 +127,7 @@ redacted, allocation-free classifications with raw byte offsets; insufficient
 caller token storage is distinct from the configured token ceiling. Storage
 also reports caller misuse when finish consumes an incomplete cursor. This is
 ordinary JSON; protocol-specific I-JSON character restrictions stay with the
-caller. There is no heap tree or owned conversion in this API.
+caller. There is no heap tree or copying conversion in this API.
 
 `arena::Cursor` advances the same parser in fixed steps of at most 256
 transitions, including UTF-8 validation, string decoding, number grammar,
@@ -148,3 +148,20 @@ Those byte slices contain validated decoded UTF-8 and borrow the immutable
 Document backing. A consumer decoding chunks must preserve scalar boundaries;
 no owned string or new authority is created. Ordinary string views and
 object iteration retain their existing synchronous string conversion.
+
+`OwnedCursor` runs the same generic parser over preallocated boxed byte and
+token slices. Moving it between worker turns does not move or copy their
+contents. `with_input_length` inspects only the occupied byte prefix and
+returns both original backings on constructor refusal; its redacted Refusal
+never formats their contents. `finish` returns an `OwnedDocument` on success,
+or a Refusal retaining both boxes on failure or premature completion.
+The document lends immutable views and recovers its arenas through consuming
+`into_buffers`; the parser can also abandon work through `into_buffers`.
+No path allocates replacement storage or wipes old contents. Callers must
+replace the next occupied prefix and apply their own secret-erasure policy.
+The convenience `new` constructor exists only for borrowed storage; owned
+pools use `with_input_length`. Both storage forms share the same
+4 KiB state bound and step budget. Storage is sealed to mutable slices and
+boxed slices, preventing custom backing substitution between parser turns.
+Only two borrowed slices or two owned boxes may form a parser; mixed pairs
+cannot be constructed.

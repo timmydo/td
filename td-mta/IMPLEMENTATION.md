@@ -2838,7 +2838,12 @@ basic envelope at the advertised method count.
 
 The shared arena now has a fixed-state resumable Cursor for UTF-8 validation,
 tokenization and key sorting; its synchronous parse helper drives that same
-implementation. The inert JMAP Validation owner also makes whole-envelope,
+implementation. Its OwnedCursor form owns preallocated boxed arenas and
+moves between worker turns without reparsing or copying storage. Completion
+lends document views from an owned backing; consuming that owner, abandoning
+a parser, or recovering a refusal returns the same arenas for reuse.
+JMAP Validation still uses borrowed arenas and needs runtime ownership
+integration. The inert JMAP Validation owner also makes whole-envelope,
 I-JSON, capability and creation-ID validation resumable. It exposes a Request
 only after every call is valid. Envelope error precedence remains: using
 shape, method-call count and tuples, creation map, then unknown capability.

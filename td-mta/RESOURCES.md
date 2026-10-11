@@ -116,6 +116,13 @@ encoded-header adapters or combined service RSS.
   fixed state, including the parser cursor, fits 8 KiB of the same scratch.
   Activation must check live admission between turns and avoid unbounded
   scalar-view, object-lookup and serialization helpers on worker turns.
+  The shared OwnedCursor can move preallocated boxed request/token arenas
+  between worker turns and returns those same arenas after completion,
+  cancellation or refusal. Its completed owner lends immutable document
+  views. It adds no arena copy, allocation or parser state allowance;
+  the occupied prefix bounds parsing even when capacity is larger.
+  JMAP validation still borrows its arenas; runtime ownership integration
+  remains required before activation.
   Whole-buffer bounded allocation alone is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
