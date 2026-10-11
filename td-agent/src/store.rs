@@ -1347,6 +1347,87 @@ pub fn backgrounds(events: &[Event]) -> Vec<Background> {
     out
 }
 
+/// What an MCP server's start or listing came to (DESIGN.md §12, The
+/// prefix).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Served {
+    /// Its tools exactly as the prefix would carry them, each a
+    /// definition's JSON, under protocol version `protocol`, and what was
+    /// left out and why.
+    Listed {
+        protocol: String,
+        tools: Vec<String>,
+        left: Vec<String>,
+    },
+    /// The same as the listing at `of`, the last one logged for this
+    /// server and command.
+    Same { of: u64 },
+    /// It failed: why, and the tail of its standard error.
+    Failed { why: String, tail: Option<String> },
+}
+
+/// A server's listing as the log holds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Listing<'a> {
+    /// The `Listed` event's sequence number.
+    pub seq: u64,
+    pub protocol: &'a str,
+    pub tools: &'a [String],
+    pub left: &'a [String],
+}
+
+/// The last listing logged for `server` run as `command`, a `Same`
+/// taken as the listing it names; none when there is none, or when
+/// `failures` and a failure of `server` is logged after it, whatever its
+/// command (DESIGN.md §12, The prefix).
+pub fn mcp_listing<'a>(
+    events: &'a [Event],
+    server: &str,
+    command: &[String],
+    failures: bool,
+) -> Option<Listing<'a>> {
+    let listed = |seq: u64| {
+        events.iter().find_map(|event| match &event.kind {
+            Kind::Mcp {
+                outcome:
+                    Served::Listed {
+                        protocol,
+                        tools,
+                        left,
+                    },
+                ..
+            } if event.seq == seq => Some(Listing {
+                seq,
+                protocol,
+                tools,
+                left,
+            }),
+            _ => None,
+        })
+    };
+    for event in events.iter().rev() {
+        let Kind::Mcp {
+            server: named,
+            command: run,
+            outcome,
+        } = &event.kind
+        else {
+            continue;
+        };
+        if named != server {
+            continue;
+        }
+        match outcome {
+            Served::Failed { .. } if failures => return None,
+            Served::Failed { .. } => {}
+            _ if run.as_slice() != command => {}
+            Served::Listed { .. } => return listed(event.seq),
+            Served::Same { of } => return listed(*of),
+        }
+    }
+    None
+}
+
 /// One log event's content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Kind {
@@ -1369,8 +1450,10 @@ pub enum Kind {
     Notice { text: String },
     /// td-agent's own news of the conversation's workspace, a worktree
     /// ready or failed or a base that moved upstream (DESIGN.md §3,
-    /// Notifications): shown as a notice is, and given to the model too.
-    Notification { text: String },
+    /// Notifications), or, when `mcp`, of its MCP servers (§12): shown
+    /// as a notice is, and given to the model too, under a label that
+    /// says which.
+    Notification { text: String, mcp: bool },
     /// A request prefix (DESIGN.md §6, §13) superseding the `prefix` file
     /// and any earlier one from here on, as exact text: a JSON object of
     /// the tools and the messages every request of the conversation begins
@@ -1531,6 +1614,13 @@ pub enum Kind {
         tail: Option<String>,
         held: Option<Held>,
     },
+    /// MCP server `server`, run as `command`, started or listed its
+    /// tools again, or failed (DESIGN.md §12, MCP servers).
+    Mcp {
+        server: String,
+        command: Vec<String>,
+        outcome: Served,
+    },
     /// The human paused or resumed the conversation (DESIGN.md §3).
     Pause { paused: bool },
     /// The human chose the conversation's model and reasoning effort
@@ -1603,9 +1693,12 @@ impl Event {
                 put("kind", Json::Str("notice".into()));
                 put("text", Json::Str(text.clone()));
             }
-            Kind::Notification { text } => {
+            Kind::Notification { text, mcp } => {
                 put("kind", Json::Str("notification".into()));
                 put("text", Json::Str(text.clone()));
+                if *mcp {
+                    put("mcp", Json::Bool(true));
+                }
             }
             Kind::Prefix { text } => {
                 put("kind", Json::Str("prefix".into()));
@@ -1847,6 +1940,40 @@ impl Event {
                     put("held", Json::Str(held.word().into()));
                 }
             }
+            Kind::Mcp {
+                server,
+                command,
+                outcome,
+            } => {
+                put("kind", Json::Str("mcp".into()));
+                put("server", Json::Str(server.clone()));
+                let words = command.iter().map(|word| Json::Str(word.clone()));
+                put("command", Json::Arr(words.collect()));
+                match outcome {
+                    Served::Listed {
+                        protocol,
+                        tools,
+                        left,
+                    } => {
+                        put("protocol", Json::Str(protocol.clone()));
+                        // Each definition is JSON td-agent encoded, so it
+                        // parses; one that did not would be logged as text.
+                        let tools = tools.iter().map(|tool| {
+                            td_json::parse(tool).unwrap_or_else(|_| Json::Str(tool.clone()))
+                        });
+                        put("tools", Json::Arr(tools.collect()));
+                        let left = left.iter().map(|why| Json::Str(why.clone()));
+                        put("left", Json::Arr(left.collect()));
+                    }
+                    Served::Same { of } => put("same", Json::from(*of)),
+                    Served::Failed { why, tail } => {
+                        put("failed", Json::Str(why.clone()));
+                        if let Some(tail) = tail {
+                            put("tail", Json::Str(tail.clone()));
+                        }
+                    }
+                }
+            }
             Kind::Compaction { pruned, summary } => {
                 put("kind", Json::Str("compaction".into()));
                 put(
@@ -1957,6 +2084,7 @@ impl Event {
             },
             Some("notification") => Kind::Notification {
                 text: string("text")?,
+                mcp: flag("mcp")?,
             },
             Some("prefix") => Kind::Prefix {
                 text: string("text")?,
@@ -2105,6 +2233,49 @@ impl Event {
                 call: number("call")?,
                 command: string("command")?,
             },
+            Some("mcp") => {
+                let strings = |name: &str| -> Result<Vec<String>, String> {
+                    let items = value.get(name).and_then(Json::as_arr);
+                    items
+                        .ok_or_else(|| format!("no {name}"))?
+                        .iter()
+                        .map(|item| {
+                            item.as_str()
+                                .map(str::to_string)
+                                .ok_or_else(|| format!("{name} holds a non-string"))
+                        })
+                        .collect()
+                };
+                let outcome = if let Some(of) = value.get("same") {
+                    Served::Same {
+                        of: of.as_u64().ok_or("same is not a sequence number")?,
+                    }
+                } else if value.get("failed").is_some() {
+                    Served::Failed {
+                        why: string("failed")?,
+                        tail: optional("tail")?,
+                    }
+                } else {
+                    let tools = value.get("tools").and_then(Json::as_arr);
+                    Served::Listed {
+                        protocol: string("protocol")?,
+                        tools: tools
+                            .ok_or("no tools")?
+                            .iter()
+                            .map(|tool| match tool {
+                                Json::Str(text) => text.clone(),
+                                tool => tool.to_string(),
+                            })
+                            .collect(),
+                        left: strings("left")?,
+                    }
+                };
+                Kind::Mcp {
+                    server: string("server")?,
+                    command: strings("command")?,
+                    outcome,
+                }
+            }
             Some("ended") => Kind::Ended {
                 number: number("number")?,
                 how: string("how")?,
@@ -3079,6 +3250,47 @@ pub mod tests {
                 bytes: 0,
                 reserved: 5,
             },
+            Kind::Mcp {
+                server: "gh".into(),
+                command: vec!["gh-mcp".into(), "--stdio".into()],
+                outcome: Served::Listed {
+                    protocol: "2025-06-18".into(),
+                    tools: vec![
+                        "{\"type\":\"function\",\"function\":{\"name\":\"mcp__gh__x\",\"description\":\"X \\\"y\\\".\",\"parameters\":{\"type\":\"object\"}}}"
+                            .into(),
+                    ],
+                    left: vec!["y: its name does not fit".into()],
+                },
+            },
+            Kind::Mcp {
+                server: "gh".into(),
+                command: vec!["gh-mcp".into()],
+                outcome: Served::Same { of: 3 },
+            },
+            Kind::Mcp {
+                server: "gh".into(),
+                command: vec!["gh-mcp".into()],
+                outcome: Served::Failed {
+                    why: "the server exited".into(),
+                    tail: Some("oops\n".into()),
+                },
+            },
+            Kind::Mcp {
+                server: "gh".into(),
+                command: vec!["gh-mcp".into()],
+                outcome: Served::Failed {
+                    why: "it timed out".into(),
+                    tail: None,
+                },
+            },
+            Kind::Notification {
+                text: "MCP server gh failed: it timed out".into(),
+                mcp: true,
+            },
+            Kind::Notification {
+                text: "td is ready".into(),
+                mcp: false,
+            },
         ] {
             let event = Event {
                 seq: 9,
@@ -3087,6 +3299,53 @@ pub mod tests {
             };
             assert_eq!(Event::from_json(&event.to_json()).unwrap(), event);
         }
+    }
+
+    /// A server's last listing for its command, a `Same` taken as the
+    /// listing it names, and none past a failure when failures count
+    /// (DESIGN.md §12, The prefix).
+    #[test]
+    fn an_mcp_servers_last_listing_is_its_commands_until_a_failure() {
+        let run = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let (old, new) = (run(&["gh-mcp"]), run(&["gh-mcp", "--v2"]));
+        let mcp = |seq: u64, server: &str, command: &[String], outcome: Served| Event {
+            seq,
+            time: seq,
+            kind: Kind::Mcp {
+                server: server.into(),
+                command: command.to_vec(),
+                outcome,
+            },
+        };
+        let listed = |protocol: &str| Served::Listed {
+            protocol: protocol.into(),
+            tools: vec!["{}".into()],
+            left: Vec::new(),
+        };
+        let failed = Served::Failed {
+            why: "it exited".into(),
+            tail: None,
+        };
+        let events = vec![
+            mcp(1, "gh", &old, listed("2024-11-05")),
+            mcp(2, "other", &old, listed("2025-03-26")),
+            mcp(3, "gh", &old, Served::Same { of: 1 }),
+            mcp(4, "gh", &new, failed),
+            mcp(5, "gh", &new, listed("2025-06-18")),
+        ];
+        let seq = |n: usize, command: &[String], failures: bool| {
+            mcp_listing(events.get(..n).unwrap_or_default(), "gh", command, failures)
+                .map(|l| (l.seq, l.protocol))
+        };
+        assert_eq!(seq(1, &old, true), Some((1, "2024-11-05")));
+        assert_eq!(seq(3, &old, true), Some((1, "2024-11-05")));
+        // A failure under another command ends the server's listing.
+        assert_eq!(seq(4, &old, true), None);
+        assert_eq!(seq(4, &old, false), Some((1, "2024-11-05")));
+        assert_eq!(seq(4, &new, false), None);
+        assert_eq!(seq(5, &new, true), Some((5, "2025-06-18")));
+        assert_eq!(seq(5, &old, false), Some((1, "2024-11-05")));
+        assert_eq!(mcp_listing(&events, "none", &old, false), None);
     }
 
     #[test]

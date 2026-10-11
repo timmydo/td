@@ -2165,7 +2165,10 @@ removal whose lock nobody holds), holding:
   - a todo list as written (§12);
   - the human's choice of the conversation's model and effort (§4);
   - a background process started, exited, killed or lost (§12);
-  - a notification or notice delivered to the conversation (§3, §7, §12);
+  - an MCP server's listing, a start that listed the same, or its
+    failure (§12, MCP servers);
+  - a notification or notice delivered to the conversation, of its
+    workspace or of its MCP servers (§3, §7, §12);
   - usage and cost;
   - a compaction (§14);
   - an interruption;
@@ -5539,17 +5542,17 @@ servers with it, and what a server held (a browser session, say) does
 not outlive the process. A turn waits for a server's listing only the
 first time it is started in the conversation, while none of its listings
 is logged, for at most the start's 30 seconds (*The protocol*, below),
-an interrupt ending the wait; a first start that failed logs no listing,
-so the next turn, within the restarts allowed (*Failures*), waits again;
-after that a turn never waits for a start, and offers the tools last
-logged (*The prefix*, below). A call to a server not yet up waits for
-it within the call's timeout. A change to the workspace's mounts or
-policy (a worktree made ready, shared directories, the network policy)
-restarts each server at the next turn, which is not counted as a
-failure's restart. A change to the template's `mcp` takes effect at the
-next turn: a server no longer named is ended and its tools dropped, one
-changed is restarted. Ending a server closes its input, waits two
-seconds and tears its instance down.
+an interrupt ending the wait and the turn; a first start that failed
+logs no listing, so the next turn, within the restarts allowed
+(*Failures*), waits again; after that a turn never waits for a start,
+and offers the tools last logged (*The prefix*, below). A call to a
+server not yet up waits for it within the call's timeout. A change to
+the workspace's mounts or policy (a worktree made ready, shared
+directories, the network policy) restarts each server at the next turn,
+which is not counted as a failure's restart. A change to the template's
+`mcp` takes effect at the next turn: a server no longer named is ended
+and its tools dropped, one changed is restarted. Ending a server closes
+its input, waits two seconds and tears its instance down.
 
 *The protocol.* td-agent reads standard output as lines of at most
 1 MiB, a trailing carriage return dropped, each one JSON-RPC 2.0 message;
@@ -5586,12 +5589,13 @@ included, which a newer protocol allows), repeats another's, or whose
 `inputSchema` is not a JSON object with `"type": "object"`, is left out
 and said in the server's record. Its description is made visible (§11,
 `<U+XXXX>`) and then cut to 2 KiB; its schema is re-encoded, a top-level
-`$schema` member dropped, and is at most 16 KiB. Every server's tools
-together are at most 128 tools and 128 KiB as the prefix carries them,
-the later servers' and tools' left out and said; and the prefix with
-them must fit one log line at the store's worst case beside the
-instructions and skills it carries (§13), or the servers' tools are left
-out, last server first, and said. Only `name`, `description` and
+`$schema` member dropped, and is at most 16 KiB, nesting at most 64
+levels, well within what the log's and the window's JSON may nest. Every
+server's tools together are at most 128 tools and 128 KiB as the prefix
+carries them, the later servers' and tools' left out and said; and the
+prefix with them must fit one log line at the store's worst case beside
+the instructions and skills it carries (§13), or the servers' tools are
+left out, last server first, and said. Only `name`, `description` and
 `inputSchema` are used: `title`, `outputSchema` and `annotations` are
 not, and a server's `readOnlyHint` lowers no bar, since it is the
 server's own claim (§11). A description is the server's text, which
@@ -5679,7 +5683,8 @@ why, and the window shows it under the conversation's notes; a failure
 the same as the last one told for that server is not told again. A
 server that failed is started again at the next turn, at most twice in a
 process's life, its tools listed afresh; then not until the process
-starts again.
+starts again, or until its template changes it or its workspace's mounts
+or policy change, when it starts as a new one would.
 
 *Credentials.* None is given to a server. One the person places in a
 directory the workspace binds is the model's too, readable by any
@@ -5778,6 +5783,51 @@ and the tool's as the prefix would carry it, at most those two words;
 an allow names the tool, and a repository's rules may deny or ask. No
 call is named `mcp` yet, so no such rule matches one, and a card
 offers no `mcp` answer to remember.
+
+**As built (MCP, servers running).** A conversation process starts its
+template's servers at a turn's start, once its workspace is ready and
+there is a key, after the window's stores are awaited and before the
+turn's first request (`src/serving.rs`): each in an instance of its own
+launched on the main thread, its `serve` call's client moved to a thread
+of its own (`src/servers.rs`), which starts the server within 30 seconds
+and then reads it, answers its requests, and takes the main thread's
+asks to call it or list its tools, until it is ended or fails. Its
+transport holds what the input's credit has no room for, at most 1 MiB,
+sending it as the server reads and looking every 20 milliseconds while
+any is held, since a `Took` wakes no wait, and keeps the last 2 KiB of
+the standard error. What the servers told before the turn is logged
+first, so a failure is started again and a change listed again at that
+turn. The turn waits for a server whose start has not listed while no
+listing of its for its command is logged, whichever turn began it, and
+for the listing again of one that said its tools changed, at most 8
+times in a process's life, each for a start's 30 seconds and 2 more at
+most; an interrupt ends the turn, and a turn that waits for nothing
+takes none. A listing is offered and fitted on its own, at most 128
+tools and 128 KiB, so its `mcp` event fits a log line, and logged; one
+equal to the last for its server and command is logged as the same as
+it. A failure, a start that could not be made included, is logged with
+its tail and told as news under the servers' label, unless the last news
+of that server said the same. The open conversation's transcript shows a
+listing or a failure, its tail's lines marked as a background process's
+output is, and neither the model's copy of the news nor a start that
+listed the same. A failed server starts again at the next turn, twice in
+a process's life, and afresh once changed or launched otherwise. At a
+turn's start a server no longer named, or changed, is ended, and every
+server is started again when an instance would be launched with other
+shared directories, prepared repositories, network policy or allowlist;
+rules are judged live and restart nothing. Ending one sets its end,
+drops its asks, closes its input, waits 2 seconds and drops its client,
+which tears the instance down; a server started again does not wait for
+that, so for those seconds its old instance and its new one both run.
+The process ends them all as it exits and waits for their threads, about
+9 seconds at most, or as long as a tool host that stopped reading holds
+a frame's write. Not yet: the servers' tools in the prefix and their
+calls (the next step), and their connections' cards, so a server's
+connection that would be asked is refused, its instance having no one to
+ask. A template that names servers still makes no conversation in the
+window; a conversation made before its template named them runs them. A
+turn with no key plans nothing, so a server its template dropped runs on
+until a turn with one or the process's end.
 
 **As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
 the caller's turn and answers the call with its final report. It is

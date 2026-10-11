@@ -82,6 +82,7 @@ pub mod review_workspace;
 pub mod rules;
 pub mod scan;
 pub mod schedule;
+pub mod servers;
 #[allow(dead_code, reason = "shared dependency-free SHA-256 implementation")]
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;

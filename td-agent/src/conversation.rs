@@ -71,6 +71,8 @@ use crate::workspace::{Entry, Workspace};
 // `task`'s sub-agent, a child of this module for its private session.
 #[path = "reviewing.rs"]
 mod reviewing;
+#[path = "serving.rs"]
+mod serving;
 #[path = "subagent.rs"]
 mod subagent;
 
@@ -101,7 +103,7 @@ const MAX_FRAMED: usize = 2 * NOTICE_TAIL;
 /// Output a process wrote, as a notice shows it: each line made visible
 /// and marked, so none can pass for a line of td-agent's, its last lines
 /// within `MAX_FRAMED`.
-fn framed(text: &str) -> String {
+pub(crate) fn framed(text: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut used = 0;
     for line in text.rsplit('\n') {
@@ -442,6 +444,8 @@ enum Inbound {
         model: String,
         result: Result<td_json::Json, String>,
     },
+    /// What an MCP server's thread told (DESIGN.md §12, MCP servers).
+    Mcp(crate::servers::Told),
 }
 
 /// How a background process ended: `how` as `process_list` says it, and
@@ -465,6 +469,8 @@ enum Work {
     Ended(End),
     /// Connections decided, their approvals to log.
     Logged,
+    /// What MCP servers told, to log.
+    Mcp,
 }
 
 /// The first id of a card for connections, past any call's sequence
@@ -645,6 +651,8 @@ pub fn serve_in(
         braked: false,
         system_revoked: false,
         routes: Vec::new(),
+        servers: crate::servers::Servers::default(),
+        mcp_reports: VecDeque::new(),
     };
     // What this conversation read or wrote before, so a replacement of an
     // unchanged file needs no read again.
@@ -667,7 +675,9 @@ pub fn serve_in(
         session.send(&Up::Event(event));
     }
     session.ask_stores();
-    session.serve()
+    let served = session.serve();
+    session.servers.end_all();
+    served
 }
 
 /// Watches background call `call` on `client` until it ends, `killed`
@@ -973,6 +983,11 @@ struct Session {
     system_revoked: bool,
     /// The endpoint envelopes fetched (DESIGN.md §5, Routing).
     routes: Vec<Route>,
+    /// The MCP servers this process runs (DESIGN.md §12, MCP servers).
+    servers: crate::servers::Servers,
+    /// What they told, logged at the next point between a turn's steps
+    /// or while idle, never inside a request.
+    mcp_reports: VecDeque<crate::servers::Told>,
 }
 
 /// How long an endpoint envelope is kept before it is fetched again, so
@@ -1036,6 +1051,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed) => self.ended = Some(Ok(())),
                 Ok(Inbound::Broken(e)) => self.ended = Some(Err(e)),
@@ -1052,6 +1068,9 @@ impl Session {
         }
         if let Some(end) = self.exited.pop_front() {
             return Ok(Some(Work::Ended(end)));
+        }
+        if !self.mcp_reports.is_empty() {
+            return Ok(Some(Work::Mcp));
         }
         // No turn runs to ask the classifier in: the person is asked.
         self.unclassified();
@@ -1085,6 +1104,10 @@ impl Session {
                     return Ok(Some(Work::Checked(remote, result)))
                 }
                 Ok(Inbound::Ended(end)) => return Ok(Some(Work::Ended(end))),
+                Ok(Inbound::Mcp(told)) => {
+                    self.mcp_reports.push_back(told);
+                    return Ok(Some(Work::Mcp));
+                }
                 Ok(Inbound::Closed) | Err(_) => return Ok(None),
                 Ok(Inbound::Broken(e)) => return Err(format!("the window: {e}")),
                 // A stream given up on, still reading to its next frame.
@@ -1106,6 +1129,11 @@ impl Session {
                 }
                 Some(Work::Logged) => {
                     self.log_links()?;
+                    self.sync()?;
+                    continue;
+                }
+                Some(Work::Mcp) => {
+                    self.log_mcp(&mut Vec::new())?;
                     self.sync()?;
                     continue;
                 }
@@ -1340,6 +1368,9 @@ impl Session {
         if let Some(outcome) = self.await_stores()? {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.mcp_turn()? {
+            return Ok(outcome);
+        }
         let mut replied = false;
         for _ in 0..MAX_STEPS {
             self.between()?;
@@ -1561,6 +1592,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(RecvTimeoutError::Disconnected) => {
                     self.gone = true;
@@ -1580,16 +1612,22 @@ impl Session {
     /// noted, a late grant released, and the rest waits its turn.
     fn hear(&mut self) {
         while let Ok(inbound) = self.inbox.try_recv() {
-            match inbound {
-                Inbound::Down(Down::Interrupt) => self.interrupt = true,
-                Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
-                Inbound::Down(down) => self.later(down),
-                Inbound::Fetch { .. } | Inbound::Listing { .. } => {}
-                Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
-                Inbound::Ended(end) => self.exit(end),
-                Inbound::Link(asked) => self.link(asked),
-                Inbound::Closed | Inbound::Broken(_) => self.gone = true,
-            }
+            self.heard(inbound);
+        }
+    }
+
+    /// One thing that came, taken up as `hear` takes it.
+    fn heard(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::Down(Down::Interrupt) => self.interrupt = true,
+            Inbound::Down(Down::Reservation { id, refusal: None }) => self.spent(id, 0),
+            Inbound::Down(down) => self.later(down),
+            Inbound::Fetch { .. } | Inbound::Listing { .. } => {}
+            Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
+            Inbound::Ended(end) => self.exit(end),
+            Inbound::Mcp(told) => self.mcp_reports.push_back(told),
+            Inbound::Link(asked) => self.link(asked),
+            Inbound::Closed | Inbound::Broken(_) => self.gone = true,
         }
     }
 
@@ -1939,7 +1977,10 @@ impl Session {
                     Ok(id) => *probe = Some(id),
                     Err(why) => return Ok(Outcome::stop(why)),
                 }
-                self.log(Kind::Notification { text: text.clone() })?;
+                self.log(Kind::Notification {
+                    text: text.clone(),
+                    mcp: false,
+                })?;
                 noticed = true;
                 // Its reply no larger than was reserved for, however the
                 // context's clamp moves with the logged notice.
@@ -2474,6 +2515,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 // The person is asked already: a card held back for the
                 // classifier is put to them too.
                 Ok(Inbound::Link(asked)) => {
@@ -3406,6 +3448,7 @@ impl Session {
                     .collect();
                 // The model's news; it reads it at its next turn.
                 (tell && !told.is_empty()).then(|| Kind::Notification {
+                    mcp: false,
                     text: format!(
                         "upstream's {} in {remote}: each worktree's refs/remotes/origin/<base> names it now",
                         told.join(", ")
@@ -3534,6 +3577,7 @@ impl Session {
         self.hear();
         self.classify_links()?;
         self.log_links()?;
+        self.log_mcp(&mut Vec::new())?;
         while let Some(end) = self.exited.pop_front() {
             self.ended(end, false)?;
         }
@@ -3598,7 +3642,7 @@ impl Session {
     /// Whether `said` says what the last news of `remote` before it said:
     /// a failure each process start meets again, which wakes nothing.
     fn repeated(&self, remote: &str, said: &Event) -> bool {
-        let Kind::Notification { text } = &said.kind else {
+        let Kind::Notification { text, .. } = &said.kind else {
             return false;
         };
         let about = format!("{remote} ");
@@ -3608,7 +3652,7 @@ impl Session {
             .rev()
             .filter(|event| event.seq < said.seq)
             .find_map(|event| match &event.kind {
-                Kind::Notification { text } if text.starts_with(&about) => Some(text),
+                Kind::Notification { text, mcp: false } if text.starts_with(&about) => Some(text),
                 _ => None,
             })
             .is_some_and(|last| last == text)
@@ -3663,7 +3707,7 @@ impl Session {
                 None,
             ),
         };
-        let said = self.log(Kind::Notification { text })?;
+        let said = self.log(Kind::Notification { text, mcp: false })?;
         self.sync()?;
         if let Some(bases) = ready {
             self.send(&Up::Heads {
@@ -3803,6 +3847,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
                     self.gone = true;
@@ -5114,6 +5159,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 // The person is asked already: a card held back for the
                 // classifier is put to them too.
                 Ok(Inbound::Link(asked)) => {
@@ -5680,6 +5726,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => {
                     self.link(asked);
                     self.unclassified();
@@ -6277,6 +6324,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) | Err(_) => {
                     self.gone = true;
@@ -6424,6 +6472,7 @@ impl Session {
                 Ok(Inbound::Fetch { .. } | Inbound::Listing { .. }) => {}
                 Ok(Inbound::Checked { remote, result }) => self.checked.push_back((remote, result)),
                 Ok(Inbound::Ended(end)) => self.exit(end),
+                Ok(Inbound::Mcp(told)) => self.mcp_reports.push_back(told),
                 Ok(Inbound::Link(asked)) => self.link(asked),
                 Ok(Inbound::Closed | Inbound::Broken(_)) => {
                     self.gone = true;
@@ -6483,6 +6532,7 @@ impl Session {
                 Inbound::Fetch { .. } | Inbound::Listing { .. } => {}
                 Inbound::Checked { remote, result } => self.checked.push_back((remote, result)),
                 Inbound::Ended(end) => self.exit(end),
+                Inbound::Mcp(told) => self.mcp_reports.push_back(told),
                 Inbound::Link(asked) => self.link(asked),
                 Inbound::Down(Down::Interrupt) => {
                     break Streamed::Failed {

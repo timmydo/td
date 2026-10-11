@@ -1978,7 +1978,7 @@ impl App {
             // What td-agent tells the human there, such as a wake budget
             // spent, is said here too.
             Update::Up(Up::Event(Event {
-                kind: Kind::Notice { text } | Kind::Notification { text },
+                kind: Kind::Notice { text } | Kind::Notification { text, .. },
                 ..
             })) => {
                 notice = Some(format!("{}: {text}", row.title));
@@ -2489,7 +2489,10 @@ impl App {
                 }
             }
             Kind::Title { .. } | Kind::ToolCall { .. } => {}
-            Kind::Notice { text } | Kind::Notification { text } => self.notice_message(&text),
+            // The model's copy of news of an MCP server; its `mcp` event
+            // says it here.
+            Kind::Notification { mcp: true, .. } => {}
+            Kind::Notice { text } | Kind::Notification { text, .. } => self.notice_message(&text),
             Kind::TaskNote { .. } => {
                 self.notice_message("the sub-agent was told its next request is its last, and asked, without calling a tool, where the work stands")
             }
@@ -2594,6 +2597,15 @@ impl App {
             Kind::Retired { .. } => {}
             // The `shell` call's result says it started.
             Kind::Process { .. } => {}
+            // A start that listed what was listed before says nothing new,
+            // as a conversation retired after each turn starts at each.
+            Kind::Mcp {
+                outcome: crate::store::Served::Same { .. },
+                ..
+            } => {}
+            Kind::Mcp {
+                server, outcome, ..
+            } => self.notice_message(&crate::history::mcp(&server, &outcome)),
             Kind::Ended {
                 number, how, held, ..
             } => self.notice_message(&format!(

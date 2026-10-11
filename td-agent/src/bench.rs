@@ -42,7 +42,11 @@ pub struct Bench {
 pub fn fresh(call: &Call) -> bool {
     matches!(
         call,
-        Call::Shell { .. } | Call::Background { .. } | Call::Grep { .. } | Call::Sed { .. }
+        Call::Shell { .. }
+            | Call::Background { .. }
+            | Call::Grep { .. }
+            | Call::Sed { .. }
+            | Call::Serve { .. }
     )
 }
 
@@ -153,6 +157,14 @@ impl Bench {
                 asker: self.asker.clone(),
                 call: started,
             }),
+            // An MCP server's connections belong to no call, and one that
+            // would be asked is refused until a server has cards of its own
+            // (DESIGN.md §12, Its connections).
+            Call::Serve { .. } if !off => Some(crate::egress::Linked {
+                judge: std::sync::Arc::clone(&self.judge),
+                asker: None,
+                call: started,
+            }),
             _ => None,
         };
         jail::launch_linked(programs, policy, specs, linked)
@@ -182,6 +194,18 @@ impl Bench {
             egress.rules = rules;
             egress.unread = unread;
         }
+    }
+
+    /// What an instance launched now is launched with, which an MCP
+    /// server is started again when it changes (DESIGN.md §12, Lifetime).
+    pub fn launch(&self) -> crate::servers::Launch {
+        let (shared, prepared) = self
+            .policy
+            .as_ref()
+            .map(|(shared, prepared, _, _)| (shared.clone(), prepared.clone()))
+            .unwrap_or_default();
+        let (network, allowlist) = self.network();
+        (shared, prepared, network, allowlist)
     }
 
     /// The network commands are given and the allowlist, as the

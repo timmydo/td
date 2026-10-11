@@ -35,6 +35,9 @@ pub const MAX_TOOL_NAME: usize = 41;
 /// encoded.
 pub const MAX_DESCRIPTION: usize = 2048;
 pub const MAX_SCHEMA: usize = 16 * 1024;
+/// The deepest a schema nests, well within td-json's depth beside the
+/// definition, the log event and the window's frame that carry it.
+pub const MAX_SCHEMA_DEPTH: usize = 64;
 /// Every server's tools together, as the prefix carries them.
 pub const MAX_TOOLS: usize = 128;
 pub const MAX_TOOLS_BYTES: usize = 128 * 1024;
@@ -694,6 +697,12 @@ pub fn offer(server: &str, tools: &[Json], keep: Option<&[String]>) -> (Vec<Offe
             ));
             continue;
         }
+        if depth(&schema) > MAX_SCHEMA_DEPTH {
+            left.push(format!(
+                "{shown}: its input schema nests past {MAX_SCHEMA_DEPTH} levels"
+            ));
+            continue;
+        }
         let description = quoted(
             tool.get("description")
                 .and_then(Json::as_str)
@@ -729,6 +738,18 @@ pub fn offer(server: &str, tools: &[Json], keep: Option<&[String]>) -> (Vec<Offe
         }
     }
     (offered, left.done())
+}
+
+/// How deep `value` nests: 1 for a scalar or an empty array or object.
+/// What td-json parsed is at most its own depth, so this recursion is
+/// bounded.
+fn depth(value: &Json) -> usize {
+    let below = match value {
+        Json::Arr(items) => items.iter().map(depth).max().unwrap_or(0),
+        Json::Obj(members) => members.iter().map(|(_, v)| depth(v)).max().unwrap_or(0),
+        _ => 0,
+    };
+    below.saturating_add(1)
 }
 
 /// Every server's tools, in order, kept within `MAX_TOOLS` and
@@ -1364,6 +1385,25 @@ mod tests {
                 "gone: the server lists no such tool",
             ]
         );
+        // A schema nests at most 64 levels: two objects and its arrays.
+        let nested = |name: &str, arrays: usize| {
+            let deep = format!("{}{}", "[".repeat(arrays), "]".repeat(arrays));
+            td_json::parse(&format!(
+                r#"{{"name":"{name}","inputSchema":{{"type":"object","properties":{deep}}}}}"#
+            ))
+            .unwrap()
+        };
+        let (offered, left) = offer(
+            "s",
+            &[
+                nested("fits", MAX_SCHEMA_DEPTH - 1),
+                nested("deep", MAX_SCHEMA_DEPTH),
+            ],
+            None,
+        );
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].tool, "fits");
+        assert_eq!(left, ["deep: its input schema nests past 64 levels"]);
         let sized = |name: &str, bytes: usize| Offered {
             name: format!("mcp__s__{name}"),
             tool: name.to_string(),

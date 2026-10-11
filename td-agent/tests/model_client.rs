@@ -32,7 +32,9 @@ use td_agent::frame;
 use td_agent::key::Secret;
 use td_agent::models::Models;
 use td_agent::protocol::{Down, ScheduleOp, Up};
-use td_agent::store::{Basis, Conversation, Event, Held, Id, Kind, Purpose, Role, StateDir};
+use td_agent::store::{
+    Basis, Conversation, Event, Held, Id, Kind, Purpose, Role, Served, StateDir,
+};
 
 /// Whether `content` is `text` after its `[received <UTC time>]` line.
 fn is_sent(content: &str, text: &str) -> bool {
@@ -549,6 +551,7 @@ fn kinds(events: &[Event]) -> Vec<&'static str> {
             Kind::Interrupted { .. } => "interrupted",
             Kind::Notice { .. } => "notice",
             Kind::Notification { .. } => "notification",
+            Kind::Mcp { .. } => "mcp",
             Kind::Prefix { .. } => "prefix",
             Kind::Task { .. } => "task",
             Kind::TaskNote { .. } => "task_note",
@@ -3313,7 +3316,7 @@ fn a_checkout_done_while_idle_wakes_its_conversation() {
         assert_eq!(outcome, "replied", "{}", h.said());
         let news = events
             .iter()
-            .rfind(|e| matches!(&e.kind, Kind::Notification { text } if text.contains(what)))
+            .rfind(|e| matches!(&e.kind, Kind::Notification { text, .. } if text.contains(what)))
             .unwrap_or_else(|| panic!("{events:?}"));
         assert!(
             events.iter().any(|e| e.kind
@@ -9577,4 +9580,204 @@ fn git_fetch_asks_the_window_and_says_what_came() {
         "not moved by a fetch whose refs were not set"
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A small MCP server in `sh`: it answers `initialize` and lists one
+/// tool, `echo`, taking each request's id from its line.
+const MCP_SERVER: &str = concat!(
+    r#"while IFS= read -r line; do id=${line#*\"id\":}; id=${id%%[,\}]*}; "#,
+    r#"case $line in *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' "$id";; "#,
+    r#"*'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echoes.","inputSchema":{"type":"object"}}]}}\n' "$id";; "#,
+    r#"esac; done"#
+);
+
+/// Settings whose template `t` names `servers`, each run by `sh`.
+fn mcp_settings(servers: &[(&str, &str)]) -> Client {
+    use td_agent::config::TemplateShared;
+    let mcp = servers
+        .iter()
+        .map(|(name, script)| {
+            td_agent::config::mcp_server(
+                name,
+                vec!["sh".into(), "-c".into(), (*script).into()],
+                None,
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    Client {
+        template_shared: vec![TemplateShared {
+            mcp,
+            system: false,
+            network: None,
+            name: "t".into(),
+            shared: Some(Vec::new()),
+        }],
+        ..Client::default()
+    }
+}
+
+/// A template's MCP server is started in an instance of its own at the
+/// conversation's first turn, which waits for its listing, logged as an
+/// `mcp` event before the turn's first request (DESIGN.md §12, MCP
+/// servers).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_templates_mcp_server_is_started_and_its_listing_logged() {
+    let mut h = Harness::new_in(
+        "mcp",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+    );
+    h.setup(mcp_settings(&[("echo", MCP_SERVER)]));
+    h.say("Hello.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let (at, listed) = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            Kind::Mcp {
+                server, outcome, ..
+            } if server == "echo" => Some((e.seq, outcome.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no mcp event: {events:?}\n{}", h.said()));
+    let Served::Listed {
+        protocol,
+        tools,
+        left,
+    } = listed
+    else {
+        panic!("not listed: {listed:?}\n{}", h.said());
+    };
+    assert_eq!(protocol, "2025-06-18");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert!(
+        tools[0].contains("\"name\":\"mcp__echo__echo\""),
+        "{tools:?}"
+    );
+    assert!(left.is_empty(), "{left:?}");
+    let request = events
+        .iter()
+        .find(|e| matches!(e.kind, Kind::Request { .. }))
+        .unwrap();
+    assert!(at < request.seq);
+    h.close();
+}
+
+/// A server that exits at its start is logged failed with its standard
+/// error's tail, and the model is told under the servers' own label; the
+/// next turn starts it again, and the same failure is not told again
+/// (DESIGN.md §12, Failures).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_failing_mcp_server_is_logged_and_told_once() {
+    let mut h = Harness::new_in(
+        "mcpfail",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(mcp_settings(&[("bad", "echo it broke >&2; exit 3")]));
+    h.say("Hello.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    h.say("Again.");
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    let first = h.mock.requests()[0].text();
+    let (conversation, _h) = h.close();
+    let events = conversation.events();
+    let failed: Vec<(&str, Option<&str>)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Mcp {
+                outcome: Served::Failed { why, tail },
+                ..
+            } => Some((why.as_str(), tail.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed.len(), 2, "{events:?}");
+    for (why, tail) in &failed {
+        assert!(why.contains("exited"), "{why}");
+        assert!(
+            tail.is_some_and(|tail| tail.contains("it broke")),
+            "{tail:?}"
+        );
+    }
+    let told: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::Notification { text, mcp: true } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].starts_with("MCP server bad failed: "), "{told:?}");
+    assert!(
+        first.contains("[td-agent's news of this conversation's MCP servers, not from the person]"),
+        "{first}"
+    );
+}
+
+/// An interrupt while a turn waits for a server's first start ends the
+/// turn, saying so, and it may be asked again (DESIGN.md §12, Lifetime).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn an_interrupt_ends_a_turns_wait_for_a_server() {
+    let mut h = Harness::new_in(
+        "mcpwait",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        Vec::new(),
+    );
+    h.setup(mcp_settings(&[("slow", "read line; sleep 60")]));
+    h.say("Hello.");
+    h.down(&Down::Interrupt);
+    let (_, outcome, retry) = h.turn();
+    assert_eq!(
+        outcome,
+        "interrupted while waiting for the MCP servers to start",
+        "{}",
+        h.said()
+    );
+    assert!(retry);
+    assert!(h.mock.requests().is_empty());
+    h.close();
+}
+
+/// A turn in a template that names no server waits for none, so an
+/// interrupt sent with its message is not taken as one in a server's
+/// wait (DESIGN.md §12, Lifetime).
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn a_turn_with_no_server_takes_no_interrupt_as_a_servers() {
+    let mut h = Harness::new_in(
+        "mcpnone",
+        Role::Conversation,
+        Some("template:t"),
+        true,
+        vec![Reply::sse("stream-sonnet.sse"), Reply::ok("title.json")],
+    );
+    h.setup(mcp_settings(&[]));
+    h.say("Hello.");
+    h.down(&Down::Interrupt);
+    let (_, outcome, _) = h.turn();
+    assert_ne!(
+        outcome,
+        "interrupted while waiting for the MCP servers to start",
+        "{}",
+        h.said()
+    );
+    h.close();
 }

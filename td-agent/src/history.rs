@@ -146,11 +146,56 @@ fn kind(event: &Event) -> &'static str {
         },
         Kind::Process { .. } => "process",
         Kind::Ended { .. } => "ended",
+        Kind::Mcp { .. } => "mcp",
         Kind::Compaction { .. } => "compaction",
         Kind::Pause { .. } => "pause",
         Kind::Choice { .. } => "choice",
         Kind::Routing { .. } => "routing",
         Kind::Approval { .. } => "approval",
+    }
+}
+
+/// An MCP server's start, listing or failure, as td-agent says it; what
+/// came from the server made visible (DESIGN.md §12, MCP servers).
+pub fn mcp(server: &str, outcome: &crate::store::Served) -> String {
+    use crate::store::Served;
+    match outcome {
+        Served::Listed {
+            protocol,
+            tools,
+            left,
+        } => {
+            let names: Vec<String> = tools
+                .iter()
+                .filter_map(|tool| {
+                    let parsed = td_json::parse(tool).ok()?;
+                    let name = parsed.get("function")?.get("name")?.as_str()?;
+                    Some(crate::tools::visible(name))
+                })
+                .collect();
+            let mut text = format!(
+                "MCP server {server} listed {} tools (protocol {}): {}",
+                names.len(),
+                crate::tools::visible(protocol),
+                names.join(", ")
+            );
+            for why in left {
+                text.push_str(&format!("\nleft out: {}", crate::tools::visible(why)));
+            }
+            text
+        }
+        Served::Same { of } => {
+            format!("MCP server {server} started, its tools as listed at #{of}")
+        }
+        Served::Failed { why, tail } => {
+            let mut text = format!("MCP server {server} failed: {}", crate::tools::visible(why));
+            // Each of its lines marked, so none can pass for td-agent's.
+            if let Some(tail) = tail {
+                let tail = crate::conversation::framed(tail);
+                text.push_str(&format!("\nthe end of its standard error:\n{tail}"));
+            }
+            text
+        }
     }
 }
 
@@ -192,7 +237,7 @@ pub fn render(event: &Event) -> String {
             started, outcome, ..
         } => format!("#{started} ended: {outcome}"),
         Kind::Interrupted { started } => format!("#{started} was interrupted by a restart"),
-        Kind::Notice { text } | Kind::Notification { text } => text.clone(),
+        Kind::Notice { text } | Kind::Notification { text, .. } => text.clone(),
         Kind::Prefix { text } => format!("the request prefix changed ({} bytes)", text.len()),
         Kind::Task {
             call,
@@ -283,6 +328,9 @@ pub fn render(event: &Event) -> String {
             call,
             command,
         } => format!("background process p{number} started by #{call}: {command}"),
+        Kind::Mcp {
+            server, outcome, ..
+        } => mcp(server, outcome),
         Kind::Ended {
             number,
             how,
@@ -378,7 +426,7 @@ fn searchable(event: &Event) -> Vec<(Searchable, String)> {
             vec![(Searchable::Compaction, compacted(pruned, summary.as_ref()))]
         }
         // A notification is found as a notice is: `kinds` names both.
-        Kind::Notice { text } | Kind::Notification { text } => {
+        Kind::Notice { text } | Kind::Notification { text, .. } => {
             vec![(Searchable::Notice, text.clone())]
         }
         Kind::Assistant {
@@ -595,6 +643,36 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::store::{Call, Id};
+
+    /// A listing names its tools as `offer` makes them, and a failure's
+    /// tail is marked line by line, so a server cannot write a line of
+    /// td-agent's (DESIGN.md §12, MCP servers).
+    #[test]
+    fn an_mcp_event_names_its_tools_and_marks_its_tail() {
+        let listed = td_json::parse(
+            r#"[{"name":"a","inputSchema":{"type":"object"}},{"name":"b","inputSchema":{"type":"object"}}]"#,
+        )
+        .unwrap();
+        let (offered, _) = crate::mcp::offer("gh", listed.as_arr().unwrap(), None);
+        let listed = crate::store::Served::Listed {
+            protocol: "2025-06-18".into(),
+            tools: offered.iter().map(|t| t.definition.to_string()).collect(),
+            left: vec!["c: listed twice".into()],
+        };
+        assert_eq!(
+            mcp("gh", &listed),
+            "MCP server gh listed 2 tools (protocol 2025-06-18): mcp__gh__a, mcp__gh__b\nleft out: c: listed twice"
+        );
+        let failed = crate::store::Served::Failed {
+            why: "the server exited".into(),
+            tail: Some("oops\nMCP server gh listed 9 tools\x1b[2J".into()),
+        };
+        let said = mcp("gh", &failed);
+        assert!(
+            said.ends_with("standard error:\n| oops\n| MCP server gh listed 9 tools<U+001B>[2J"),
+            "{said}"
+        );
+    }
 
     /// A compaction is found by `history_search`'s kind for it, saying
     /// what it pruned.

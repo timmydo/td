@@ -197,6 +197,11 @@ pub fn check_calls(calls: &[Call]) -> Result<(), String> {
 /// The label a notification is given to the model with (DESIGN.md §3).
 pub const NOTIFICATION: &str = "[td-agent's news of this workspace, not from the person]";
 
+/// The label news of the conversation's MCP servers is given to the
+/// model with (DESIGN.md §12, Failures).
+pub const MCP_NOTIFICATION: &str =
+    "[td-agent's news of this conversation's MCP servers, not from the person]";
+
 /// The label a message from another conversation reaches the model under
 /// (DESIGN.md §3): its source, and that it is not the person's.
 pub fn label(from: &crate::store::Id, role: Role, status: Option<&str>) -> String {
@@ -315,11 +320,15 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
                 event.seq,
                 crate::prompt::message("user", &format!("{}{text}", at(event.time))),
             )),
-            Kind::Notification { text } => out.push((
+            Kind::Notification { text, mcp } => out.push((
                 event.seq,
                 crate::prompt::message(
                     "user",
-                    &format!("{}{NOTIFICATION}\n{text}", at(event.time)),
+                    &format!(
+                        "{}{}\n{text}",
+                        at(event.time),
+                        if *mcp { MCP_NOTIFICATION } else { NOTIFICATION }
+                    ),
                 ),
             )),
             // A review the person asked for: a model's, not their words.
@@ -1896,6 +1905,7 @@ mod tests {
             event(
                 1,
                 Kind::Notification {
+                    mcp: false,
                     text: "td is ready".into(),
                 },
             ),

@@ -296,7 +296,7 @@ fn a_repository_conversation_asks_for_its_store_and_says_a_refusal() {
     until(&mut supervisor, &mut heard, |heard| {
         heard.iter().any(|u| {
             matches!(u, Update::Up(Up::Event(e)) if matches!(&e.kind,
-                Kind::Notification { text } if text.contains("could not be prepared: the remote is not admitted")))
+                Kind::Notification { text, .. } if text.contains("could not be prepared: the remote is not admitted")))
         })
     });
     // Done preparing, it is retired as any left conversation is.
@@ -567,7 +567,7 @@ fn a_prepared_repository_follows_its_bases_and_says_a_failure_once() {
             .filter_map(|u| match u {
                 Update::Up(Up::Event(e)) => match &e.kind {
                     Kind::Notice { text } => Some(text.clone()),
-                    Kind::Notification { text } => Some(format!("notification: {text}")),
+                    Kind::Notification { text, .. } => Some(format!("notification: {text}")),
                     _ => None,
                 },
                 _ => None,
