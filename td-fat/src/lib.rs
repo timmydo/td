@@ -327,8 +327,29 @@ impl<D: Device> Esp<D> {
     /// an earlier staged pair, reclaim, write the files and their chains,
     /// then add both entries in one write of the directory's first sector.
     pub fn stage(&mut self, kernel: Input<'_>, initrd: Input<'_>) -> Result<()> {
-        // The two slots are chosen from the sector as it will be once an
-        // earlier staged pair is deleted, before anything is written.
+        let (kslot, islot) = self.staging_slots()?;
+        let (k, i) = self.prepare(kernel, initrd)?;
+        let mut sector = self.boot.sector.clone();
+        put_entry(&mut sector, kslot, &STAGED_KERNEL, k)?;
+        put_entry(&mut sector, islot, &STAGED_INITRD, i)?;
+        self.write_sector(&sector)?;
+        self.finish()
+    }
+
+    /// Whether a pair of these sizes would be written, in the staged form
+    /// or the direct one, with nothing written: the checks `stage` and
+    /// `write_direct` make before their first write, so a caller can refuse
+    /// before it asks anyone to approve the update.
+    pub fn fits(&self, kernel: u64, initrd: u64, staged: bool) -> Result<()> {
+        if staged {
+            self.staging_slots()?;
+        }
+        self.clusters_needed(kernel, initrd).map(|_| ())
+    }
+
+    /// The staged pair's two slots, chosen from the sector as it will be
+    /// once an earlier staged pair is deleted, before anything is written.
+    fn staging_slots(&self) -> Result<(usize, usize)> {
         let mut cleared = self.boot.sector.clone();
         if let Some(staged) = self.boot.staged {
             delete_entry(&mut cleared, staged.kernel.index)?;
@@ -343,17 +364,36 @@ impl<D: Device> Esp<D> {
             })
             .take(2)
             .collect();
-        let &[kslot, islot] = slots.as_slice() else {
-            return Err(Error::Foreign(
+        match slots.as_slice() {
+            &[kslot, islot] => Ok((kslot, islot)),
+            _ => Err(Error::Foreign(
                 "no room for two entries in its first 512 bytes",
-            ));
-        };
-        let (k, i) = self.prepare(kernel, initrd)?;
-        let mut sector = self.boot.sector.clone();
-        put_entry(&mut sector, kslot, &STAGED_KERNEL, k)?;
-        put_entry(&mut sector, islot, &STAGED_INITRD, i)?;
-        self.write_sector(&sector)?;
-        self.finish()
+            )),
+        }
+    }
+
+    /// Each file's length and cluster count, once the space check passes:
+    /// what an earlier staged pair's deletion and the reclaim will leave
+    /// free must hold both files.
+    fn clusters_needed(&self, kernel: u64, initrd: u64) -> Result<((u32, u32), (u32, u32))> {
+        let klen = file_len(kernel)?;
+        let ilen = file_len(initrd)?;
+        let kc = self
+            .geo
+            .clusters_for(u64::from(klen))
+            .ok_or(Error::Input("its size overflows"))?;
+        let ic = self
+            .geo
+            .clusters_for(u64::from(ilen))
+            .ok_or(Error::Input("its size overflows"))?;
+        let needed = kc
+            .checked_add(ic)
+            .ok_or(Error::Input("its size overflows"))?;
+        let available = self.count(|esp, c| esp.reach_of(c) != 1 && !esp.is_bad(c));
+        if needed > available {
+            return Err(Error::Space { needed, available });
+        }
+        Ok(((klen, kc), (ilen, ic)))
     }
 
     /// The direct form: write the new pair and point `BOOTX64.EFI` and
@@ -436,24 +476,7 @@ impl<D: Device> Esp<D> {
         kernel: Input<'_>,
         initrd: Input<'_>,
     ) -> Result<((u32, u32), (u32, u32))> {
-        let klen = file_len(kernel.len)?;
-        let ilen = file_len(initrd.len)?;
-        let kc = self
-            .geo
-            .clusters_for(u64::from(klen))
-            .ok_or(Error::Input("its size overflows"))?;
-        let ic = self
-            .geo
-            .clusters_for(u64::from(ilen))
-            .ok_or(Error::Input("its size overflows"))?;
-        let needed = kc
-            .checked_add(ic)
-            .ok_or(Error::Input("its size overflows"))?;
-        // What the deletion and the reclaim below will leave free.
-        let available = self.count(|esp, c| esp.reach_of(c) != 1 && !esp.is_bad(c));
-        if needed > available {
-            return Err(Error::Space { needed, available });
-        }
+        let ((klen, kc), (ilen, ic)) = self.clusters_needed(kernel.len, initrd.len)?;
         if let Some(staged) = self.boot.staged {
             let mut sector = self.boot.sector.clone();
             delete_entry(&mut sector, staged.kernel.index)?;

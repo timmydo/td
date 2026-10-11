@@ -1578,9 +1578,24 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 ### Storage operation worker
 
 Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
-commit before its code; nothing implements it yet, and td-authd refuses
+commit before its code. `storage_operation.rs` implements the selector
+update; the disk proof is not yet implemented, and td-authd refuses
 every storage operation in a production build until that document's
-item 9. `td-install storage-operation --uid 1000` is the root worker
+item 9. The worker compiles td-secret's endpoint (`frames.rs`) and
+memory rules (`memory.rs`) and td-authd's consent descriptions by
+`#[path]`, and admits and writes the ESP through `td-fat`. Discovery
+takes the one `td.volume=` UUID of `/proc/cmdline`, asks `td-boot
+volume` for its partition and holds that partition open; the volume's
+files are read through the running system's `/run/td-volume`, and
+`current`'s manifest and signature are verified by `td-boot
+authenticate` under the volume's trusted key, the signature check
+td-boot makes before it boots it. That child reads a manifest and a
+signature and hashes no payload: root's kill on a cancellation or
+timeout reaches the worker alone (neither td-authd nor td-install has a
+process-group kill), so an unbounded child, such as `validate-source`
+hashing `root.erofs`, would outlive it; and the update reads no payload
+but the kernel, which the worker hashes itself. The ESP is the held partition's disk's first GPT
+partition, `td-esp` of the EFI System type, as td's layout writes it. `td-install storage-operation --uid 1000` is the root worker
 td-authd's amendment 10 supervises (td-authd/DESIGN.md, "Login keys
 and session lock"), the one running-system process that runs a
 key-bearing cryptsetup command or writes the ESP ("Full-system volume
@@ -1621,9 +1636,10 @@ consent time holds no I/O.
 - **Selector update** (tag 16). The form must be the one the volume
   byte gives and the ID the baseline's. Before its first `10` it
   reads `current`'s manifest and signature from the held volume and
-  verifies them under the trusted key as td-boot does to boot it, then
-  hashes the deployment's `bzImage` against that manifest (`23`
-  otherwise). The manifest names no selector template; the template is
+  verifies them under the trusted key through `td-boot authenticate`,
+  requires its line to be the ID and the manifest it then reads to hash
+  to it, and hashes the deployment's `bzImage` against that manifest
+  (`23` otherwise). The manifest names no selector template; the template is
   authenticated through `root.erofs`, as the selector's commit
   authenticates it: the baseline requires the running deployment to be
   that `current`, whose root is the `root.erofs` the deployment
@@ -1639,7 +1655,9 @@ consent time holds no I/O.
   header, the running deployment's standing and the ESP's `EFI/BOOT`
   sector, failing as `28` if the header changed since the baseline,
   the deployment is no longer an acknowledged `current` with no pending
-  attempt, or the sector changed since its admission. Then it stages
+  attempt, the sector changed since its admission, or td-fat's `fits`,
+  which writes nothing, now refuses the pair (the ESP's free clusters
+  changed). Then it stages
   the pair or writes it directly (ENCRYPTION.md, "Selector update") and
   sends `14`. It never opens the volume or reads its key.
 - **Disk proof** (tags 13 to 15). With the recovery key: after the
@@ -1680,9 +1698,12 @@ same (`01` to `08` for a disk key's PIN, presence, devices and time,
 After root's `13` any outcome but `14` with a successful exit is
 uncertain to root, as a login write's is, with one exception: `28`,
 which the worker sends only from its checks before its first write, is
-definite, and root forwards it as `91 0d`. Host tests are to drive each
+definite, and root forwards it as `91 0d`. Host tests drive each
 form over a header and an ESP the test builds, every kind at its point,
-the commit margin, the change check and the secret's zeroing; the disk
+the commit margin and the change check, including space taken after the
+presentation, and the production host's standing, template, key and
+authenticated kernel over a scratch root; the disk proof's tests are to
+drive the secret's zeroing, the disk
 proof's against the scripted cryptsetup and the virtual authenticator.
 
 ## 6. Signing and keys

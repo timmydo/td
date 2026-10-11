@@ -1,13 +1,12 @@
 //! Selector-owned SHA-256 PCR 11 measurement through the shared td-tpm
 //! client; no key release or PCR reset.
+use crate::protocol::{MEASUREMENT_POLICY as POLICY, MEASUREMENT_POLICY_PATH as POLICY_PATH};
 use crate::{invalid, read_bounded_real_file, sha256, valid_digest, MAX_CMDLINE_BYTES};
 use std::fs;
 use std::io;
 use std::path::Path;
 use td_tpm::{Client, Device, Transport};
 
-pub const POLICY_PATH: &str = "etc/td/boot-measurement";
-const POLICY: &[u8] = b"td-selector-pcr11-v1\n";
 const PCR: u8 = 11;
 
 pub fn enabled(rootfs: &Path) -> io::Result<bool> {

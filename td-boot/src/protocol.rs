@@ -91,6 +91,13 @@ pub const PREVIOUS_SLOT: &str = "previous";
 pub const EFI_BOOT_FILE: &str = "BOOTX64.EFI";
 #[allow(dead_code)]
 pub const VOLUME_UUID_PATH: &str = "etc/td/volume-uuid";
+// The selector's deployment measurement policy (td-install/DESIGN.md
+// "Selector deployment measurement prerequisite"): td-boot reads it, and
+// td-install's selector update appends it on a protected volume.
+#[allow(dead_code)]
+pub const MEASUREMENT_POLICY_PATH: &str = "etc/td/boot-measurement";
+#[allow(dead_code)]
+pub const MEASUREMENT_POLICY: &[u8] = b"td-selector-pcr11-v1\n";
 #[allow(dead_code)]
 pub const VOLUME_CMDLINE_PREFIX: &str = "td.volume=";
 #[allow(dead_code)]

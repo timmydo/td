@@ -11,8 +11,17 @@ use crate::types::{Recipe, Step};
 // cryptsetup runner formatting uses, and td-tpm (td-protector reaches
 // td-json, td-tpm td-fido), each compiled first as an rlib with the
 // binary's profile and passed by `--extern`, as td-boot passes td-tpm;
-// td-tpm and td-fido include the same engine SHA-256 by `#[path]`.
+// td-tpm and td-fido include the same engine SHA-256 by `#[path]`. The
+// storage worker (`storage-operation`) admits and writes the ESP through
+// td-fat, a std-only rlib like the others, and compiles td-authd's consent
+// descriptions and td-secret's worker endpoint and memory rules by
+// `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
+const STORAGE_OPERATION_RS: &str = include_str!("../../../td-install/src/storage_operation.rs");
+const CONSENT_RS: &str = include_str!("../../../td-authd/src/consent.rs");
+const FRAMES_RS: &str = include_str!("../../../td-secret/src/frames.rs");
+const MEMORY_RS: &str = include_str!("../../../td-secret/src/memory.rs");
+const FAT_LIB_RS: &str = include_str!("../../../td-fat/src/lib.rs");
 const TIMEZONES_RS: &str = include_str!("../../../td-install/src/timezones.rs");
 const INVENTORY_RS: &str = include_str!("../../../td-install/src/inventory.rs");
 const INSTALLATION_PLAN_RS: &str = include_str!("../../../td-install/src/installation_plan.rs");
@@ -194,6 +203,35 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{src}/td-fido/src".into(),
         },
+        Step::MkDir {
+            path: "{src}/td-fat/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-authd/src".into(),
+        },
+        Step::MkDir {
+            path: "{src}/td-secret/src".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-fat/src/lib.rs".into(),
+            content: FAT_LIB_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-authd/src/consent.rs".into(),
+            content: CONSENT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-secret/src/frames.rs".into(),
+            content: FRAMES_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-secret/src/memory.rs".into(),
+            content: MEMORY_RS.into(),
+            exec: false,
+        },
         Step::WriteFile {
             path: "{src}/td-json/src/arena_emit.rs".into(),
             content: JSON_ARENA_EMIT_RS.into(),
@@ -345,6 +383,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-install/src/storage_operation.rs".into(),
+            content: STORAGE_OPERATION_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-boot/src/protocol.rs".into(),
             content: PROTOCOL_RS.into(),
             exec: false,
@@ -399,6 +442,7 @@ pub fn recipe() -> Recipe {
     // The sibling libraries, dependencies first, under the binary's profile.
     for (name, lib, externs) in [
         ("td_fido", "{src}/td-fido/src/lib.rs", &[][..]),
+        ("td_fat", "{src}/td-fat/src/lib.rs", &[]),
         (
             "td_tpm",
             "{src}/td-tpm/src/lib.rs",
@@ -464,6 +508,8 @@ pub fn recipe() -> Recipe {
                 "-C",
                 "panic=abort",
                 "--extern",
+                "td_fat={root}/libtd_fat.rlib",
+                "--extern",
                 "td_protector={root}/libtd_protector.rlib",
                 "--extern",
                 "td_tpm={root}/libtd_tpm.rlib",
@@ -508,7 +554,7 @@ mod tests {
     fn every_sibling_crate_source_is_staged() {
         crate::ladder::assert_sibling_sources_staged(
             super::recipe(),
-            &["td-tpm", "td-fido", "td-json", "td-protector"],
+            &["td-tpm", "td-fido", "td-json", "td-protector", "td-fat"],
         );
     }
 }

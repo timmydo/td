@@ -2314,3 +2314,103 @@ fn only_the_first_login_state_says_the_generation_is_admitted() {
     );
     assert!(machine.marker().exists());
 }
+
+fn begin_storage(session: &mut Session, script: &'static str) {
+    let answer = session
+        .begin_storage(
+            crate::storage::Selection::SelectorUpdate,
+            true,
+            |owner, selection| {
+                assert_eq!(owner, 1000);
+                assert_eq!(selection, crate::storage::Selection::SelectorUpdate);
+                crate::storage::Storage::scripted(script)
+            },
+        )
+        .unwrap();
+    assert_eq!(answer, [&[0xa0, 1][..], &[42; 32]].concat());
+}
+
+/// Amendment 10: `20 01` through the paired session, its one presentation
+/// and commit answered as a login operation's, `91 0b` until the baseline.
+#[test]
+fn a_selector_update_runs_through_the_paired_session() {
+    use crate::consent::SelectorForm;
+    assert_eq!(
+        Request::decode(&[0x20, 1]).unwrap(),
+        Request::Storage(crate::storage::Selection::SelectorUpdate)
+    );
+    let mut session = quiet();
+    prepare(&mut session);
+    begin_storage(&mut session, "staged");
+    let update = crate::storage::tests::update(SelectorForm::Staged);
+    let with = |status: u8| [&[0x91, status][..], &update.encode()].concat();
+    assert_eq!(login_event(&mut session), with(4));
+    assert_eq!(
+        session.answer(Request::Presented(update.clone())).unwrap(),
+        [0x93]
+    );
+    assert_eq!(login_event(&mut session), with(5));
+    assert_eq!(
+        session.answer(Request::Commit(update.clone())).unwrap(),
+        [0x94]
+    );
+    assert_eq!(login_event(&mut session), with(6));
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+    assert!(session.operation.is_none());
+    // A refusal from the baseline carries no description, and a definite
+    // `28` after the commit is `0d`.
+    begin_storage(&mut session, "baseline:not-current");
+    assert_eq!(login_end(&mut session), [0x91, 0x0d, 0x22, 0]);
+    begin_storage(&mut session, "changed");
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0d, 0x28, 0][..], &update.encode()].concat()
+    );
+    begin_storage(&mut session, "lost-after-commit");
+    let direct = crate::storage::tests::update(SelectorForm::DeviceBound);
+    assert_eq!(
+        login_end(&mut session),
+        [&[0x91, 0x0e, 0x10, 0][..], &direct.encode()].concat()
+    );
+    assert_eq!(session.answer(Request::Poll).unwrap(), [0x91, 2]);
+}
+
+/// Until item 9 a production build answers every `20` with `a0 00` before
+/// starting anything, and every build so answers the operations their
+/// increments have not fixed.
+#[test]
+fn production_refuses_every_storage_operation_before_any_worker_starts() {
+    use crate::storage::Selection as Storage;
+    let mut session = quiet();
+    prepare(&mut session);
+    let mut refused = vec![(Storage::SelectorUpdate, false)];
+    refused.extend(
+        (2..=0x0a).flat_map(|byte| [(Storage::Later(byte), false), (Storage::Later(byte), true)]),
+    );
+    for (selection, active) in refused {
+        assert_eq!(
+            session
+                .begin_storage(selection, active, |_, _| panic!("a storage worker started"))
+                .unwrap(),
+            [0xa0, 0]
+        );
+        assert!(session.operation.is_none());
+    }
+    // The slot: a storage operation keeps a login out, and needs it free.
+    begin_storage(&mut session, "presented");
+    assert!(session
+        .begin_login(Selection::Unlock, |_, _| panic!("a login started"))
+        .is_err());
+    assert!(session
+        .begin_storage(
+            crate::storage::Selection::SelectorUpdate,
+            true,
+            |_, _| panic!("a second storage worker started")
+        )
+        .is_err());
+    assert_eq!(
+        session.answer(Request::Cancel([42; 32])).unwrap(),
+        [0x95, 0]
+    );
+    assert_eq!(login_end(&mut session)[..4], [0x91, 0x0d, 0x80, 0]);
+}

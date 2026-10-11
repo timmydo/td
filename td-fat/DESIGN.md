@@ -92,7 +92,9 @@ advisory, and td-fat never reads them.
   clusters must fit in what the deletion and reclaim below leave free,
   every cluster no entry outside a staged pair reaches, bad ones
   excepted; otherwise `Space`. So is the staging's room for two entries
-  in the first sector.
+  in the first sector. `fits` makes both checks alone, writing nothing,
+  so a caller can refuse before anyone approves the update (td-install's
+  storage worker does, before its presentation).
 - **Removing an earlier staged pair**, staging's and the direct form's
   first write when one is there, marks both entries deleted in one
   sector write.

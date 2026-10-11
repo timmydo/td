@@ -5,6 +5,7 @@ use crate::inspection::{Event as InspectionEvent, Inspection};
 use crate::login::{Login, Pin, Selection};
 use crate::rollback::{Refusal, Rollback};
 use crate::set_hostname::Change;
+use crate::storage::Storage;
 use crate::unlock::{Event, Unlock};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -36,6 +37,8 @@ pub(crate) enum Request {
     Hostname,
     /// `1f`: whether a hostname change waits, and the intake's backoff.
     HostnameState,
+    /// `20`: a storage operation (amendment 10).
+    Storage(crate::storage::Selection),
 }
 
 impl Request {
@@ -52,6 +55,7 @@ impl Request {
                 | Self::Login(_)
                 | Self::Rollback
                 | Self::Hostname
+                | Self::Storage(_)
         )
     }
 
@@ -80,6 +84,7 @@ impl Request {
                 Ok(Self::Cancel(nonce))
             }
             [0x1b, rest @ ..] => Ok(Self::Login(Selection::decode(rest)?)),
+            [0x20, rest @ ..] => Ok(Self::Storage(crate::storage::Selection::decode(rest)?)),
             [0x1c, length, rest @ ..] => {
                 let (description, pin) = rest
                     .split_at_checked(usize::from(*length))
@@ -115,6 +120,8 @@ enum Active {
     DiskInstall(Box<crate::disk_install::Installation>),
     /// A login-key worker shares the one operation slot.
     Login(Box<Login>),
+    /// So does a storage worker.
+    Storage(Box<Storage>),
     Rollback(Box<Rollback>),
     Hostname(Box<Change>),
 }
@@ -126,6 +133,7 @@ impl Active {
             Self::Install(op) => Some(op.request()),
             Self::DiskInstall(op) => Some(op.request()),
             Self::Login(op) => op.request(),
+            Self::Storage(op) => op.request(),
             Self::Rollback(op) => Some(op.request()),
             Self::Hostname(op) => Some(op.request()),
         }
@@ -136,6 +144,7 @@ impl Active {
             Self::Install(op) => op.request().nonce(),
             Self::DiskInstall(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
+            Self::Storage(op) => op.nonce(),
             Self::Rollback(op) => op.request().nonce(),
             Self::Hostname(op) => op.request().nonce(),
         }
@@ -146,6 +155,7 @@ impl Active {
             Self::Install(op) => op.presented(request),
             Self::DiskInstall(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
+            Self::Storage(op) => op.presented(request),
             Self::Rollback(op) => op.presented(request),
             Self::Hostname(op) => op.presented(request),
         }
@@ -156,6 +166,7 @@ impl Active {
             Self::Install(op) => op.commit(request),
             Self::DiskInstall(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
+            Self::Storage(op) => op.commit(request),
             Self::Rollback(op) => op.commit(request),
             Self::Hostname(op) => op.commit(request),
         }
@@ -167,6 +178,7 @@ impl Active {
             Self::DiskInstall(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
             Self::Login(op) => op.cancel(),
+            Self::Storage(op) => op.cancel(),
             Self::Rollback(op) => op.cancel(),
             Self::Hostname(op) => op.cancel(),
         }
@@ -177,6 +189,7 @@ impl Active {
             Self::Install(op) => op.poll(),
             Self::DiskInstall(op) => op.poll(),
             Self::Login(op) => op.poll(),
+            Self::Storage(op) => op.poll(),
             Self::Rollback(op) => op.poll(),
             Self::Hostname(op) => op.poll(),
         }
@@ -188,6 +201,7 @@ impl Active {
             // The setup intake owns the service and stops it at teardown.
             Self::DiskInstall(_) => Ok(()),
             Self::Login(op) => op.reap_for_teardown(),
+            Self::Storage(op) => op.reap_for_teardown(),
             Self::Rollback(op) => op.reap_for_teardown(),
             // Root saved the name itself: there is no child.
             Self::Hostname(_) => Ok(()),
@@ -434,6 +448,9 @@ impl Session {
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
             Request::Login(selection) => self.begin_login(selection, Login::start),
+            Request::Storage(selection) => {
+                self.begin_storage(selection, crate::storage::OPERATIONS, Storage::start)
+            }
             Request::Pin(description, pin) => {
                 let Some(Active::Login(operation)) = &mut self.operation else {
                     return Err("no login operation takes a PIN".into());
@@ -777,6 +794,34 @@ impl Session {
         let mut answer = vec![0x9b, 1];
         answer.extend_from_slice(operation.nonce());
         self.operation = Some(Active::Login(Box::new(operation)));
+        self.event = Some(Event::Waiting);
+        Ok(answer)
+    }
+
+    /// A storage operation from the worker's baseline on. Until item 9 a
+    /// production build refuses every one (`active` false), and every
+    /// build the operations its increments have not fixed, before any
+    /// worker starts.
+    fn begin_storage(
+        &mut self,
+        selection: crate::storage::Selection,
+        active: bool,
+        start: impl FnOnce(u32, crate::storage::Selection) -> Result<Storage, String>,
+    ) -> Result<Vec<u8>, String> {
+        if !active || selection != crate::storage::Selection::SelectorUpdate {
+            return Ok(vec![0xa0, 0]);
+        }
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Err("secret session is not ready for a storage operation".into());
+        }
+        let operation = start(self.owner, selection)?;
+        let mut answer = vec![0xa0, 1];
+        answer.extend_from_slice(operation.nonce());
+        self.operation = Some(Active::Storage(Box::new(operation)));
         self.event = Some(Event::Waiting);
         Ok(answer)
     }

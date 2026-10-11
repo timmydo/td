@@ -1226,7 +1226,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xea567d367354db52,
+            0x4ce795e608fe4cc6,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);
@@ -3439,6 +3439,7 @@ pub struct MappedRegion {
              Operation::Install { key, .. } => Some(*key),\n        \
              Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {\n            \
              *approval\n        }\n        \
+             Operation::SelectorUpdate { key, .. } => Some(*key),\n        \
              _ => Elevation::of(request).map(|(_, key)| key),\n    }\n}\n"
         ));
         // The reader, the digit's check, a presented prompt's keeping and

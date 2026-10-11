@@ -574,7 +574,8 @@ impl Guest {
                     shown = menu_row_matches(pixels, HOSTNAME_ROW, row)?;
                     Ok(menu_row_matches(pixels, 276, "TD SECURE ATTENTION")?
                         && menu_row_matches(pixels, 564, "B: ROLL BACK TO THE PREVIOUS SYSTEM")?
-                        && menu_row_matches(pixels, HOSTNAME_ROW + 36, "ESC TO RETURN")?)
+                        && menu_row_matches(pixels, HOSTNAME_ROW + 36, "S: DISK ENCRYPTION")?
+                        && menu_row_matches(pixels, HOSTNAME_ROW + 72, "ESC TO RETURN")?)
                 },
             )?;
             if shown {

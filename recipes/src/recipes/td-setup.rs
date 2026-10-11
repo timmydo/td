@@ -8,7 +8,7 @@ use crate::types::Recipe;
 /// and td-json, are in its lock with the TPM client's td-fido, and the TPM
 /// client and td-fido include the engine's SHA-256 by relative path, as
 /// the protector does with td-fido's HMAC-SHA256, so those trees are
-/// staged too.
+/// staged too, with td-fat, the installer's own ESP writer.
 /// The system image carries it, and a live boot's session starts it
 /// (td-install/INSTALLER.md "Live startup").
 pub fn recipe() -> Recipe {
@@ -22,6 +22,7 @@ pub fn recipe() -> Recipe {
             "td-tpm",
             "td-fido",
             "td-json",
+            "td-fat",
             "engine",
             "td-test-compositor",
         ])
@@ -57,6 +58,7 @@ mod tests {
                 "td-tpm".into(),
                 "td-fido".into(),
                 "td-json".into(),
+                "td-fat".into(),
                 "engine".into(),
                 "td-test-compositor".into(),
             ])

@@ -6471,12 +6471,14 @@ mod tests {
             ]
         );
         // Jail, login and the VM helper share the primary-account reader;
-        // td-setup spells td-authd's setup intake path.
+        // td-setup spells td-authd's setup intake path, and td-install's
+        // storage worker includes its consent codec.
         assert_eq!(
             readers_of("td-authd"),
             [
                 "td-compositor",
                 "td-firstboot",
+                "td-install",
                 "td-jail",
                 "td-login",
                 "td-secret",

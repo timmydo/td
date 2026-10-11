@@ -508,7 +508,7 @@ fn request(bytes: &[u8]) -> Result<Request, String> {
             Ok(Request::Poll(handle))
         }
         [3] => Ok(Request::Heartbeat),
-        [0x10..=0x1f, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
+        [0x10..=0x20, ..] => Ok(Request::Secret(crate::session::Request::decode(bytes)?)),
         _ => Err("invalid terminal authority request".into()),
     }
 }
@@ -663,11 +663,34 @@ fn enrollment_dispatch_reaches_the_secret_decoder() -> Result<(), String> {
         request(&[0x1f])?,
         Request::Secret(crate::session::Request::HostnameState)
     );
-    // None takes an operand, and nothing above `1f` is a request.
+    assert_eq!(
+        request(&[0x20, 1])?,
+        Request::Secret(crate::session::Request::Storage(
+            crate::storage::Selection::SelectorUpdate
+        ))
+    );
+    for byte in 2..=0x0a {
+        assert_eq!(
+            request(&[0x20, byte])?,
+            Request::Secret(crate::session::Request::Storage(
+                crate::storage::Selection::Later(byte)
+            ))
+        );
+    }
+    // None of these takes an operand, `20` takes exactly one, and nothing
+    // above `20` is a request.
     assert!(request(&[0x1d, 0]).is_err());
     assert!(request(&[0x1e, 0]).is_err());
     assert!(request(&[0x1f, 0]).is_err());
-    assert!(request(&[0x20]).is_err());
+    for bad in [
+        &[0x20][..],
+        &[0x20, 0],
+        &[0x20, 0x0b],
+        &[0x20, 1, 1],
+        &[0x21],
+    ] {
+        assert!(request(bad).is_err(), "{bad:?}");
+    }
     assert!(request(&[0x16, 2]).is_err());
     Ok(())
 }

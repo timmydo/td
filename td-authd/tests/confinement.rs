@@ -53,6 +53,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "session.rs",
             "set_hostname.rs",
             "shell_channel.rs",
+            "storage.rs",
             "sys.rs",
             "terminal.rs",
             "terminal_sys.rs",
@@ -90,6 +91,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("portal_files.rs", 0),
         ("primary_account.rs", 0),
         ("revocation.rs", 0),
+        ("storage.rs", 0),
     ] {
         let source = std::fs::read_to_string(root.join("src").join(name)).unwrap();
         assert_eq!(source.matches("unsafe").count(), count, "{name}");
@@ -117,6 +119,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
                     | "application.rs"
                     | "unlock.rs"
                     | "login.rs"
+                    | "storage.rs"
                     | "rollback.rs"
                     | "session.rs"
                     | "revocation.rs"
@@ -135,7 +138,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xea567d367354db52,
+        0x4ce795e608fe4cc6,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -207,6 +210,28 @@ fn the_production_source_and_raw_boundary_are_closed() {
         .unwrap();
     assert!(!session.contains("WRITES"));
     assert!(!session.contains("0x9b, 0]"));
+    // Amendment 10: no storage worker starts in production until
+    // td-install/ENCRYPTION.md's item 9, and the one worker is td-install's
+    // fixed verb.
+    let storage = include_str!("../src/storage.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        storage
+            .matches("pub(crate) const OPERATIONS: bool = cfg!(test);")
+            .count(),
+        1
+    );
+    assert_eq!(storage.matches("if !OPERATIONS ||").count(), 1);
+    assert_eq!(storage.matches("Command::new(").count(), 1);
+    assert!(storage.contains("Command::new(\"/bin/td-install\")"));
+    assert!(storage.contains(".args([\"storage-operation\", \"--uid\", &owner.to_string()])"));
+    assert_eq!(
+        fingerprint(storage),
+        0x3e4eb8fba71b0efa,
+        "storage worker supervisor changed"
+    );
     assert_eq!(
         session
             .matches("Request::Login(selection) => self.begin_login(selection, Login::start),")
@@ -1080,9 +1105,9 @@ const LOGIN_STATE_FINGERPRINT: u64 = 0xfffb5ba28cf59137;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
-const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
-const MAIN_FINGERPRINT: u64 = 0x3edc77a75b2291eb;
-const SESSION_FINGERPRINT: u64 = 0x6fb70a434fb80e06;
+const LAUNCH_FINGERPRINT: u64 = 0xe4f8992811d62954;
+const MAIN_FINGERPRINT: u64 = 0x95f472e5e6b26243;
+const SESSION_FINGERPRINT: u64 = 0x8cd7530b40b227bf;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

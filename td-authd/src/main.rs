@@ -67,6 +67,7 @@ mod set_hostname;
 #[path = "../../engine/src/sha256.rs"]
 mod sha256;
 mod shell_channel;
+mod storage;
 mod sys;
 mod terminal;
 mod terminal_sys;

@@ -3,8 +3,8 @@
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
     Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery,
-    Request, Role, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING,
-    LOGIN_TWO_CEREMONIES,
+    Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING,
+    LOGIN_TWO_CEREMONIES, SELECTOR_UPDATE_CEILING,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -363,6 +363,7 @@ fn approval_key(request: &Request) -> Option<ApprovalKey> {
         Operation::LoginEnroll { approval, .. } | Operation::LoginRemove { approval, .. } => {
             *approval
         }
+        Operation::SelectorUpdate { key, .. } => Some(*key),
         _ => Elevation::of(request).map(|(_, key)| key),
     }
 }
@@ -390,12 +391,17 @@ pub(crate) enum LoginSelection {
     /// the removal leaves of the list it was chosen from, which fix its
     /// ceiling: root's description must agree.
     Remove(Vec<Slot>, u8),
+    /// Storage operation `01` (td-authd/DESIGN.md amendment 10), root's
+    /// `20 01`, polled as a login operation is: one step, confirmed by its
+    /// approval key, then its commit.
+    SelectorUpdate,
 }
 
 impl LoginSelection {
     /// The bytes td-authd's `login::Selection::decode` reads, after `1b`.
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
+            Self::SelectorUpdate => vec![0x20, 1],
             Self::Unlock => vec![0x1b, 7],
             Self::Enroll(keys @ (1 | 2)) => vec![0x1b, 8, *keys],
             Self::Enroll(_) => return Err("a first enrollment has one or two keys".into()),
@@ -434,6 +440,26 @@ impl LoginSelection {
             Self::Remove(..) | Self::Enroll(1) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
             Self::Add => LOGIN_TWO_CEREMONIES,
             Self::Enroll(_) => LOGIN_LONGEST,
+            Self::SelectorUpdate => SELECTOR_UPDATE_CEILING,
+        }
+    }
+
+    /// Root's answer byte to the selection: `9b` for a login operation,
+    /// `a0` for a storage operation.
+    fn answer(&self) -> u8 {
+        if *self == Self::SelectorUpdate {
+            0xa0
+        } else {
+            0x9b
+        }
+    }
+
+    /// The rows an end of this operation shows.
+    fn failure(&self, kind: u8, detail: u8) -> Option<&'static [&'static str]> {
+        if *self == Self::SelectorUpdate {
+            storage_failure(kind, detail)
+        } else {
+            login_failure(kind, detail)
         }
     }
 
@@ -444,6 +470,9 @@ impl LoginSelection {
 
     /// Whether `request` describes this operation for the configured human.
     fn selects(&self, request: &Request) -> bool {
+        if *self == Self::SelectorUpdate {
+            return request.owner() == 1000 && request.selector_update().is_some();
+        }
         request.owner() == 1000
             && request.login_ceiling() == Some(self.ceiling())
             && match (self, request.operation()) {
@@ -465,12 +494,25 @@ impl LoginSelection {
             }
     }
 
-    fn success(&self) -> &'static [&'static str] {
+    /// The success rows; a selector update's name what its form's next
+    /// boot does.
+    fn success(&self, request: Option<&Request>) -> &'static [&'static str] {
         match self {
             Self::Unlock => &["SESSION UNLOCKED"],
             Self::Enroll(_) => &["LOGIN KEYS ENROLLED"],
             Self::Add => &["LOGIN KEY ADDED"],
             Self::Remove(..) => &["LOGIN KEYS REMOVED"],
+            Self::SelectorUpdate => match request.and_then(Request::selector_update) {
+                Some((_, SelectorForm::Staged, _)) => &[
+                    "BOOT SELECTOR UPDATED",
+                    "THE NEXT BOOT ASKS FOR THE DISK PIN",
+                ],
+                Some((_, SelectorForm::DeviceBound, _)) => &[
+                    "BOOT SELECTOR UPDATED",
+                    "THE NEXT BOOT NEEDS THE RECOVERY KEY",
+                ],
+                _ => &["BOOT SELECTOR UPDATED"],
+            },
         }
     }
 }
@@ -597,6 +639,27 @@ pub(crate) fn login_failure(kind: u8, detail: u8) -> Option<&'static [&'static s
         (0x83, 0) => &["KEY LIST CHANGED; REOPEN"],
         (0x84, 0) => &["ENROLLING HERE NEEDS A DISK PROOF"],
         (0x85, 0) => &["THE LAST KEY STAYS ON THIS MACHINE"],
+        _ => return None,
+    })
+}
+
+/// DESIGN.md's "Storage operations" text for a selector update's end, or
+/// none for a pair root never sends one.
+pub(crate) fn storage_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
+    Some(match (kind, detail) {
+        (0x08, 0) => &["TIMED OUT"],
+        (0x0e, 0) => &["RESULT UNCERTAIN"],
+        (0x0f | 0x10, 0) => &["THE OPERATION FAILED"],
+        (0x20, 0) => &["NO ENCRYPTED TD VOLUME"],
+        (0x21, 0) => &["THE DISK CANNOT DO THIS NOW"],
+        (0x22, 0) => &[
+            "RESTART INTO THE CURRENT SYSTEM",
+            "BEFORE UPDATING THE SELECTOR",
+        ],
+        (0x23, 0) => &["THE SYSTEM BOOT FILES DO NOT", "MATCH ITS MANIFEST"],
+        (0x24, 0) => &["THE EFI PARTITION IS FOREIGN", "OR HAS TOO LITTLE SPACE"],
+        (0x28, 0) => &["THE DISK CHANGED; NOTHING WRITTEN"],
+        (0x80, 0) => &[],
         _ => return None,
     })
 }
@@ -1219,11 +1282,14 @@ impl Client {
             return shown;
         }
         let response = wire.exchange(&selection.request()?)?;
-        // Root starts every selection (TOKEN-LOGIN.md increment 5's A5):
-        // any other answer, the old refusal `9b 00` included, is a
-        // violation.
+        // Root starts every login selection (TOKEN-LOGIN.md increment 5's
+        // A5): any other answer, the old refusal `9b 00` included, is a
+        // violation. A storage selection's `a0 00` is root's refusal as
+        // this build's (td-authd/DESIGN.md amendment 10).
+        let answer = selection.answer();
         let nonce = match response.as_slice() {
-            [0x9b, 1, nonce @ ..] => {
+            [0xa0, 0] if answer == 0xa0 => return attempt.notice(Notice::NotAvailable),
+            [tag, 1, nonce @ ..] if *tag == answer => {
                 <[u8; 32]>::try_from(nonce).map_err(|_| "invalid login operation start")?
             }
             _ => return Err("invalid login operation start".into()),
@@ -1279,18 +1345,25 @@ impl Client {
                     login.admit(&description, *status)?;
                 }
                 // Only an acknowledged write's commit can leave its outcome
-                // uncertain, and from then on nothing else can be reported.
+                // uncertain, and from then on nothing else can be reported
+                // but a selector update's `28`, which its worker sends only
+                // before any write.
                 let uncertain = *status == 0x0e;
-                if uncertain != (login.committed && login.selection.writes()) {
+                let definite = login.selection == LoginSelection::SelectorUpdate && *kind == 0x28;
+                if uncertain != (login.committed && login.selection.writes() && !definite) {
                     return Err("login operation reported the wrong kind of end".into());
                 }
                 if !login.ends(uncertain, *kind, *detail, described) {
                     return Err("login operation ended in a way root cannot".into());
                 }
-                let rows = login_failure(*kind, *detail).ok_or("invalid login failure kind")?;
+                let rows = login
+                    .selection
+                    .failure(*kind, *detail)
+                    .ok_or("invalid login failure kind")?;
                 let attempt = Arc::clone(&login.attempt);
+                let login_operation = login.selection != LoginSelection::SelectorUpdate;
                 self.login = None;
-                self.login_ended = true;
+                self.login_ended = login_operation;
                 return if uncertain {
                     attempt.notice(Notice::Uncertain(if *kind == 0x0e { &[] } else { rows }))
                 } else if rows.is_empty() {
@@ -1363,10 +1436,11 @@ impl Client {
             }
             0x06 if login.committed => {
                 let attempt = Arc::clone(&login.attempt);
-                let rows = login.selection.success();
+                let rows = login.selection.success(login.request.as_ref());
                 let unlock = login.selection == LoginSelection::Unlock;
+                let login_operation = login.selection != LoginSelection::SelectorUpdate;
                 self.login = None;
-                self.login_ended = true;
+                self.login_ended = login_operation;
                 attempt.notice(Notice::Login(rows))?;
                 // Only root's success for the unlock this client committed,
                 // whose every step it admitted, leaves the lock surface.
@@ -1768,6 +1842,19 @@ impl LoginPending {
     /// client's, and each refusal of a selection only before any
     /// description, since root refuses at the worker's baseline.
     fn ends(&self, uncertain: bool, kind: u8, detail: u8, described: bool) -> bool {
+        if self.selection == LoginSelection::SelectorUpdate {
+            // td-compositor/DESIGN.md, "Storage operations": `20` to `22`
+            // from the baseline, before any description; `28` and `0e`
+            // only after the acknowledged commit.
+            return match (kind, detail) {
+                (0x20..=0x22, 0) => !described,
+                (0x23 | 0x24 | 0x08 | 0x0f | 0x10, 0) => true,
+                (0x28, 0) => self.committed && !uncertain,
+                (0x0e, 0) => uncertain,
+                (0x80, 0) => self.cancelled,
+                _ => false,
+            };
+        }
         match (kind, detail) {
             (0x01, _) | (0x06, 1..=6) | (0x02..=0x05 | 0x07..=0x0d | 0x0f..=0x12, 0) => true,
             (0x0e, 1..=5) => uncertain,
@@ -1798,12 +1885,20 @@ impl LoginPending {
             {
                 return Err("root login request changed the selected operation".into());
             }
-            description.login_start()?;
+            if self.selection == LoginSelection::SelectorUpdate {
+                // One step: its presentation is also its last.
+                self.last = true;
+            } else {
+                description.login_start()?;
+            }
             self.request = Some(description.clone());
             return Ok(());
         };
         if current == description {
             return Ok(());
+        }
+        if self.selection == LoginSelection::SelectorUpdate {
+            return Err("a selector update has one description".into());
         }
         // `03` too: root that read the next invitation, then stopped at its
         // deadline or a cancellation, describes that step while it reaps.
@@ -3569,6 +3664,7 @@ mod tests {
                     retries: 8,
                 }),
             ],
+            LoginSelection::SelectorUpdate => panic!("storage tests drive their own"),
         }
     }
     fn selections() -> Vec<LoginSelection> {
@@ -3684,8 +3780,170 @@ mod tests {
             let pins = steps.iter().filter(|step| asks_pin(step)).count();
             assert!(pins > 0);
             assert_eq!(sent(&wire, 0x1c), pins, "{selection:?}");
-            assert_eq!(screen.shown(), Some(Notice::Login(selection.success())));
+            assert_eq!(screen.shown(), Some(Notice::Login(selection.success(None))));
             assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    // Storage operations (DESIGN.md, "Storage operations").
+
+    fn selector_update(form: SelectorForm) -> Request {
+        Request::new(
+            NONCE,
+            1000,
+            Operation::SelectorUpdate {
+                key: ApprovalKey::new(*b"47").unwrap(),
+                form,
+                current: "ab".repeat(32),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Root's statuses for a selector update to its receipt: `a0 01`, the
+    /// wait for the worker's baseline, the description at `03`, its
+    /// presentation at one `04` and its receipt, the key typed, at the
+    /// next; and the client's requests.
+    fn storage_presented(update: &Request) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            vec![
+                [&[0xa0, 1][..], &NONCE].concat(),
+                vec![0x91, 0x0b],
+                status(3, update),
+                status(4, update),
+                status(4, update),
+                vec![0x93],
+            ],
+            vec![
+                vec![0x20, 1],
+                vec![0x11],
+                vec![0x11],
+                vec![0x11],
+                vec![0x11],
+                description(&[0x13], update),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_selector_update_runs_to_each_forms_success() {
+        for (form, rows) in [
+            (
+                SelectorForm::Staged,
+                &[
+                    "BOOT SELECTOR UPDATED",
+                    "THE NEXT BOOT ASKS FOR THE DISK PIN",
+                ][..],
+            ),
+            (
+                SelectorForm::DeviceBound,
+                &[
+                    "BOOT SELECTOR UPDATED",
+                    "THE NEXT BOOT NEEDS THE RECOVERY KEY",
+                ],
+            ),
+            (SelectorForm::Fido2, &["BOOT SELECTOR UPDATED"]),
+        ] {
+            let update = selector_update(form);
+            let screen = Screen::login(LoginSelection::SelectorUpdate);
+            let (mut replies, mut calls) = storage_presented(&update);
+            replies.extend([status(5, &update), vec![0x94], status(6, &update)]);
+            calls.extend([vec![0x11], description(&[0x14], &update), vec![0x11]]);
+            let (mut client, wire, result) = drive(&screen, replies);
+            assert_eq!(result, Ok(()), "{form:?}");
+            assert!(client.login.is_none());
+            assert_eq!(wire.calls, calls, "{form:?}");
+            assert_eq!(screen.shown(), Some(Notice::Login(rows)));
+            // Nothing about login keys changed.
+            assert!(!client.take_login_end());
+        }
+    }
+
+    /// Every end the table names where root can send it, and the
+    /// violations: an end where root cannot send it, a second description
+    /// and a commit request before the receipt.
+    #[test]
+    fn a_selector_update_ends_only_where_root_can_end_it() {
+        let update = selector_update(SelectorForm::Staged);
+        let before: Vec<Vec<u8>> = vec![[&[0xa0, 1][..], &NONCE].concat(), vec![0x91, 0x0b]];
+        let (presented, _) = storage_presented(&update);
+        let committed: Vec<Vec<u8>> = presented
+            .iter()
+            .cloned()
+            .chain([status(5, &update), vec![0x94]])
+            .collect();
+        let end = |code: u8, kind: u8, described: bool| {
+            let mut bytes = vec![0x91, code, kind, 0];
+            if described {
+                bytes.extend_from_slice(&update.encode());
+            }
+            bytes
+        };
+        let run = |prefix: &[Vec<u8>], last: Vec<u8>| {
+            let screen = Screen::login(LoginSelection::SelectorUpdate);
+            let replies = prefix.iter().cloned().chain([last]).collect();
+            let (client, _, result) = drive(&screen, replies);
+            (client.login.is_none(), result, screen.shown())
+        };
+        for kind in [0x20, 0x21, 0x22] {
+            let (ended, result, shown) = run(&before, end(0x0d, kind, false));
+            assert!(ended && result.is_ok(), "{kind:02x}");
+            assert_eq!(shown, storage_failure(kind, 0).map(Notice::Login));
+            // Not once a description exists.
+            assert!(run(&presented, end(0x0d, kind, true)).1.is_err());
+        }
+        for kind in [0x23, 0x24, 0x08, 0x0f, 0x10] {
+            let (ended, result, shown) = run(&presented, end(0x0d, kind, true));
+            assert!(ended && result.is_ok(), "{kind:02x}");
+            assert_eq!(shown, storage_failure(kind, 0).map(Notice::Login));
+        }
+        // After the commit: `28` is definite, any other end uncertain.
+        let (ended, result, shown) = run(&committed, end(0x0d, 0x28, true));
+        assert!(ended && result.is_ok());
+        assert_eq!(
+            shown,
+            Some(Notice::Login(&["THE DISK CHANGED; NOTHING WRITTEN"]))
+        );
+        let (ended, result, shown) = run(&committed, end(0x0e, 0x0e, true));
+        assert!(ended && result.is_ok());
+        assert_eq!(shown, Some(Notice::Uncertain(&[])));
+        assert!(run(&committed, end(0x0d, 0x23, true)).1.is_err());
+        // `28` and an uncertain end need the commit.
+        assert!(run(&presented, end(0x0d, 0x28, true)).1.is_err());
+        assert!(run(&presented, end(0x0e, 0x0e, true)).1.is_err());
+        // A kind the table does not name.
+        assert!(run(&presented, end(0x0d, 0x25, true)).1.is_err());
+        // A second description.
+        let other = selector_update(SelectorForm::Fido2);
+        assert!(run(&presented, status(3, &other)).1.is_err());
+        // A commit request before the receipt.
+        assert!(run(&presented[..3], status(5, &update)).1.is_err());
+        // A login operation's answer is not a storage operation's.
+        let (_, result, _) = run(&[], [&[0x9b, 1][..], &NONCE].concat());
+        assert!(result.is_err());
+        let (ended, result, shown) = run(&[], vec![0xa0, 0]);
+        assert!(ended && result.is_ok());
+        assert_eq!(shown, Some(Notice::NotAvailable));
+    }
+
+    /// Every storage end's rows fit the narrowest output's chrome.
+    #[test]
+    fn storage_texts_fit_the_narrowest_chrome() {
+        let columns = crate::attention::layout(320, 200).1;
+        for kind in 0..=u8::MAX {
+            for row in storage_failure(kind, 0).unwrap_or_default() {
+                assert!(row.bytes().all(crate::ui::is_mapped), "{row}");
+                assert!(row.len() <= columns, "{row}");
+            }
+        }
+        for form in [
+            SelectorForm::Staged,
+            SelectorForm::DeviceBound,
+            SelectorForm::Fido2,
+        ] {
+            for row in LoginSelection::SelectorUpdate.success(Some(&selector_update(form))) {
+                assert!(row.len() <= columns, "{row}");
+            }
         }
     }
 
@@ -4310,11 +4568,14 @@ mod tests {
                 LoginSelection::Enroll(_) => (0x82, 0),
                 LoginSelection::Add => (0x81, 0),
                 LoginSelection::Remove(..) => (0x83, 0),
+                LoginSelection::SelectorUpdate => panic!("storage tests drive their own"),
             });
             match selection {
                 LoginSelection::Enroll(_) => ends.insert((0x84, 0)),
                 LoginSelection::Remove(..) => ends.insert((0x85, 0)),
-                LoginSelection::Unlock | LoginSelection::Add => false,
+                LoginSelection::Unlock | LoginSelection::Add | LoginSelection::SelectorUpdate => {
+                    false
+                }
             };
         }
         ends
@@ -4465,7 +4726,7 @@ mod tests {
         let rows = named
             .iter()
             .filter_map(|(kind, detail)| login_failure(*kind, *detail))
-            .chain(selections.iter().map(LoginSelection::success))
+            .chain(selections.iter().map(|selection| selection.success(None)))
             .chain([&["TIMED OUT"][..], &["THE OPERATION FAILED"]]);
         for rows in rows {
             for row in rows {

@@ -70,6 +70,59 @@ pub enum Storage {
 /// The first four bytes of a credential ID's SHA-256, shown as hex.
 pub type Fingerprint = [u8; 4];
 
+/// How a selector update writes the pair, tag 16's form byte, which root
+/// derives from the volume's state (td-install/ENCRYPTION.md, "Selector
+/// update").
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectorForm {
+    /// Direct, on a device-bound volume: the next boot needs the recovery
+    /// key and a confirmed reseal.
+    DeviceBound,
+    /// Direct, on a FIDO2-primary volume: every boot asks for a key anyway.
+    Fido2,
+    /// Staged, on a TPM-primary volume: the next PIN boot completes it.
+    Staged,
+}
+
+impl SelectorForm {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::DeviceBound => 1,
+            Self::Fido2 => 2,
+            Self::Staged => 3,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::DeviceBound),
+            2 => Some(Self::Fido2),
+            3 => Some(Self::Staged),
+            _ => None,
+        }
+    }
+
+    /// The consent rows naming what the next boot does.
+    pub fn rows(self) -> [&'static str; 2] {
+        match self {
+            Self::Staged => [
+                "THE NEXT BOOT ASKS FOR THE DISK PIN",
+                "AND COMPLETES THE UPDATE",
+            ],
+            Self::DeviceBound => [
+                "THE NEXT BOOT NEEDS THE RECOVERY KEY",
+                "AND A CONFIRMED RESEAL",
+            ],
+            Self::Fido2 => ["EVERY BOOT ASKS FOR A SECURITY KEY", "AS IT DOES NOW"],
+        }
+    }
+}
+
+/// A selector update's ceiling, root's and the worker's: 120 seconds for
+/// the worker's reads and the approval key, 120 for the writes
+/// (td-authd/DESIGN.md, amendment 10).
+pub const SELECTOR_UPDATE_CEILING: Duration = Duration::from_secs(240);
+
 /// The renderer's columns at its narrowest accepted output, 320 pixels less
 /// 48 of margin in 8-pixel Unifont cells (td-compositor/src/attention.rs).
 /// Every login row fits, so wrapping never splits a fingerprint.
@@ -524,6 +577,14 @@ pub enum Operation {
         old: String,
         new: String,
     },
+    /// Storage operation `01`: write the running deployment `current`'s
+    /// kernel and selector to the ESP in `form`. One step, confirmed by
+    /// typing `key`.
+    SelectorUpdate {
+        key: ApprovalKey,
+        form: SelectorForm,
+        current: String,
+    },
 }
 
 impl Operation {
@@ -723,6 +784,9 @@ impl Request {
             } if !deployment_id(current) || !deployment_id(previous) || current == previous => {
                 return Err("invalid consent rollback pair".into());
             }
+            Operation::SelectorUpdate { current, .. } if !deployment_id(current) => {
+                return Err("invalid consent selector update deployment".into());
+            }
             Operation::SetHostname {
                 key: _,
                 requester,
@@ -774,6 +838,15 @@ impl Request {
     /// its kind and counts and so the same at every step.
     pub fn login_ceiling(&self) -> Option<Duration> {
         self.operation.login().map(|login| login.ceiling())
+    }
+
+    /// The ceiling a prompt's time line counts from where the operation
+    /// fixes one: a login operation's, or a selector update's.
+    pub fn ceiling(&self) -> Option<Duration> {
+        match self.operation {
+            Operation::SelectorUpdate { .. } => Some(SELECTOR_UPDATE_CEILING),
+            _ => self.login_ceiling(),
+        }
     }
 
     /// The only next presentation in this same enrollment operation.
@@ -1074,8 +1147,22 @@ impl Request {
                 put_text(&mut bytes, old);
                 put_text(&mut bytes, new);
             }
+            Operation::SelectorUpdate { key, form, current } => {
+                bytes.push(16);
+                bytes.extend_from_slice(&key.digits());
+                bytes.push(form.byte());
+                bytes.extend_from_slice(current.as_bytes());
+            }
         }
         bytes
+    }
+
+    /// A selector update's approval key; none on every other description.
+    pub fn selector_update(&self) -> Option<(ApprovalKey, SelectorForm, &str)> {
+        match &self.operation {
+            Operation::SelectorUpdate { key, form, current } => Some((*key, *form, current)),
+            _ => None,
+        }
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -1245,6 +1332,16 @@ impl Request {
                     new: input.text()?,
                 }
             }
+            16 => {
+                let key = input.approval_key()?;
+                let form = SelectorForm::from_byte(input.byte()?)
+                    .ok_or("invalid consent selector update form")?;
+                Operation::SelectorUpdate {
+                    key,
+                    form,
+                    current: input.deployment()?,
+                }
+            }
             _ => return Err("unknown consent operation".into()),
         };
         if !input.0.is_empty() {
@@ -1405,6 +1502,13 @@ impl Request {
                 lines.push("A RESTART COMPLETES THE CHANGE".into());
                 approval_lines(&mut lines, *key);
             }
+            Operation::SelectorUpdate { key, form, current } => {
+                lines.push("UPDATE THE BOOT SELECTOR ON DISK".into());
+                lines.push("FROM THE RUNNING SYSTEM".into());
+                lines.push(format!("DEPLOYMENT: {current}"));
+                lines.extend(form.rows().map(String::from));
+                approval_lines(&mut lines, *key);
+            }
         }
         // A key's rows carry their own Escape.
         if !matches!(
@@ -1413,6 +1517,7 @@ impl Request {
                 | Operation::InstallDisk { .. }
                 | Operation::DeployRollback { .. }
                 | Operation::SetHostname { .. }
+                | Operation::SelectorUpdate { .. }
         ) && self.login_approval().is_none()
         {
             lines.push("ESC TO CANCEL".into());
@@ -1796,8 +1901,17 @@ mod tests {
         match request.operation() {
             Operation::Install { key, .. }
             | Operation::DeployRollback { key, .. }
-            | Operation::SetHostname { key, .. } => Some(*key),
+            | Operation::SetHostname { key, .. }
+            | Operation::SelectorUpdate { key, .. } => Some(*key),
             _ => None,
+        }
+    }
+
+    fn selector_update(form: SelectorForm, current: &str) -> Operation {
+        Operation::SelectorUpdate {
+            key: approval(b"58"),
+            form,
+            current: current.into(),
         }
     }
 
@@ -1927,6 +2041,7 @@ mod tests {
             install(CURRENT, 1000),
             rollback(CURRENT, PREVIOUS),
             rename(1000, "td", "my-laptop"),
+            selector_update(SelectorForm::Staged, CURRENT),
         ] {
             let request = Request::new([1; 32], 1000, operation).unwrap();
             let bytes = request.encode();
@@ -1970,6 +2085,7 @@ mod tests {
             install(CURRENT, 1000),
             rollback(CURRENT, PREVIOUS),
             rename(1000, "td", "my-laptop"),
+            selector_update(SelectorForm::Staged, CURRENT),
         ] {
             let bytes = Request::new([1; 32], 1000, operation).unwrap().encode();
             for index in [45, 46] {
@@ -1989,6 +2105,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Tag 16: the key, one form byte of 1 to 3 and the running
+    /// deployment's canonical ID, 112 bytes in all, with one step and the
+    /// form's rows (td-authd/DESIGN.md, amendment 10).
+    #[test]
+    fn a_selector_update_names_its_form_and_the_running_deployment() {
+        for (form, byte, rows) in [
+            (
+                SelectorForm::DeviceBound,
+                1,
+                [
+                    "THE NEXT BOOT NEEDS THE RECOVERY KEY",
+                    "AND A CONFIRMED RESEAL",
+                ],
+            ),
+            (
+                SelectorForm::Fido2,
+                2,
+                ["EVERY BOOT ASKS FOR A SECURITY KEY", "AS IT DOES NOW"],
+            ),
+            (
+                SelectorForm::Staged,
+                3,
+                [
+                    "THE NEXT BOOT ASKS FOR THE DISK PIN",
+                    "AND COMPLETES THE UPDATE",
+                ],
+            ),
+        ] {
+            let request = Request::new([1; 32], 1000, selector_update(form, CURRENT)).unwrap();
+            let mut literal = b"TDCONS01".to_vec();
+            literal.extend([1; 32]);
+            literal.extend(1000u32.to_be_bytes());
+            literal.extend([16, b'5', b'8', byte]);
+            literal.extend(CURRENT.as_bytes());
+            assert_eq!(literal.len(), 112);
+            assert_eq!(request.encode(), literal);
+            assert_eq!(Request::decode(&literal).unwrap(), request);
+            assert_eq!(
+                request.selector_update(),
+                Some((approval(b"58"), form, CURRENT))
+            );
+            assert!(!request.is_login());
+            assert_eq!(
+                request.lines(),
+                [
+                    "TD SECURE ATTENTION",
+                    "SESSION USER 1000",
+                    "UPDATE THE BOOT SELECTOR ON DISK",
+                    "FROM THE RUNNING SYSTEM",
+                    &format!("DEPLOYMENT: {CURRENT}"),
+                    rows[0],
+                    rows[1],
+                    "APPROVE: TYPE 5 THEN 8",
+                    "ESC: CANCEL",
+                ]
+            );
+        }
+        let bytes = Request::new(
+            [1; 32],
+            1000,
+            selector_update(SelectorForm::Staged, CURRENT),
+        )
+        .unwrap()
+        .encode();
+        for form in [0, 4, 0xff] {
+            let mut bad = bytes.clone();
+            bad[47] = form;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "invalid consent selector update form"
+            );
+        }
+        for byte in *b"Ag\n" {
+            let mut bad = bytes.clone();
+            bad[48] = byte;
+            assert_eq!(
+                Request::decode(&bad).err().unwrap(),
+                "invalid consent selector update deployment"
+            );
+        }
+        assert_eq!(
+            Request::decode(&bytes[..111]).err().unwrap(),
+            "truncated consent request"
+        );
+        let mut long = bytes.clone();
+        long.push(b'a');
+        assert_eq!(
+            Request::decode(&long).err().unwrap(),
+            "trailing consent request bytes"
+        );
+        for id in ["a".repeat(63), "A".repeat(64), String::new()] {
+            assert_eq!(
+                Request::new([1; 32], 1000, selector_update(SelectorForm::Fido2, &id))
+                    .err()
+                    .unwrap(),
+                "invalid consent selector update deployment"
+            );
+        }
+        // No other description answers as a selector update.
+        let rollback = Request::new([1; 32], 1000, rollback(CURRENT, PREVIOUS)).unwrap();
+        assert_eq!(rollback.selector_update(), None);
     }
 
     /// Both IDs are canonical and differ; each is exactly 64 bytes, so the

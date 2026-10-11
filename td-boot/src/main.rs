@@ -3802,7 +3802,10 @@ fn live_trust_root(rootfs: &Path) -> io::Result<TrustRoot> {
     }
     for (path, what) in [
         (protocol::VOLUME_UUID_PATH, "an installed volume identity"),
-        (measurement::POLICY_PATH, "a boot measurement policy"),
+        (
+            protocol::MEASUREMENT_POLICY_PATH,
+            "a boot measurement policy",
+        ),
     ] {
         match fs::symlink_metadata(rootfs.join(path)) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -7146,7 +7149,7 @@ mod tests {
     #[test]
     fn measurement_policy_is_explicit_bounded_and_never_a_symlink() {
         let fixture = Fixture::new();
-        let path = fixture.root.join(measurement::POLICY_PATH);
+        let path = fixture.root.join(protocol::MEASUREMENT_POLICY_PATH);
         assert!(!measurement::enabled(&fixture.root).unwrap());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         for bytes in [
@@ -8836,7 +8839,10 @@ mod tests {
         fs::remove_file(&marker).unwrap();
         fs::write(&marker, protocol::LIVE_MEDIA_MARKER).unwrap();
 
-        for path in [protocol::VOLUME_UUID_PATH, measurement::POLICY_PATH] {
+        for path in [
+            protocol::VOLUME_UUID_PATH,
+            protocol::MEASUREMENT_POLICY_PATH,
+        ] {
             let extra = rootfs.join(path);
             fs::write(&extra, b"x").unwrap();
             let error = live_trust_root(rootfs).err().unwrap();

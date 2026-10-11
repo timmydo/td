@@ -518,6 +518,7 @@ mod tests {
                 "td-dua",
                 "td-editor",
                 "td-encoding",
+                "td-fat",
                 "td-fetch-client",
                 "td-fido",
                 "td-firstboot",

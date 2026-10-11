@@ -332,6 +332,8 @@ enum LoginScreen {
     Closed,
     Menu,
     Removing(crate::secret_client::Removal),
+    /// The storage screen (DESIGN.md, "Storage operations").
+    Storage,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -680,6 +682,13 @@ impl KeyBindings {
             }
             return;
         }
+        if self.login_screen == LoginScreen::Storage {
+            decision.secret = match code {
+                KEY_U => Some(Selection::Login(LoginSelection::SelectorUpdate)),
+                _ => None,
+            };
+            return;
+        }
         if self.login_screen == LoginScreen::Menu {
             decision.secret = match code {
                 KEY_1 => Some(Selection::Login(LoginSelection::Enroll(1))),
@@ -720,6 +729,11 @@ impl KeyBindings {
             KEY_K => {
                 self.login_screen = LoginScreen::Menu;
                 decision.notice = Some(Notice::LoginKeys);
+                None
+            }
+            KEY_S => {
+                self.login_screen = LoginScreen::Storage;
+                decision.notice = Some(Notice::DiskEncryption);
                 None
             }
             // A rollback: root's `1d`.
@@ -10657,6 +10671,77 @@ mod tests {
                 2
             ))]
         );
+    }
+
+    /// `S` opens the storage screen (DESIGN.md, "Storage operations"), whose
+    /// `U` is the lifetime's one operation; the menu's letters choose
+    /// nothing there, and outside attention both are ordinary keys.
+    #[test]
+    fn the_storage_screen_selects_the_selector_update() {
+        use crate::attention::Notice;
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S, KEY_U], 1));
+        {
+            let target = target.lock().unwrap();
+            assert!(target.secret_roles.is_empty() && target.notices.is_empty());
+            assert_eq!(target.keys.len(), 4);
+        }
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        let typed = target.lock().unwrap().keys.len();
+        read_reports(
+            &target,
+            &bindings,
+            0,
+            &presses(
+                &[KEY_S, KEY_W, KEY_I, KEY_R, KEY_E, KEY_K, KEY_L, KEY_B],
+                20,
+            ),
+        );
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        read_reports(&target, &bindings, 0, &presses(&[KEY_U, KEY_U, KEY_S], 30));
+        let target = target.lock().unwrap();
+        assert_eq!(target.attention_events, [true]);
+        assert_eq!(target.notices, [Notice::DiskEncryption]);
+        assert_eq!(
+            target.secret_roles,
+            [Selection::Login(LoginSelection::SelectorUpdate)]
+        );
+        assert_eq!(target.keys.len(), typed);
+    }
+
+    /// The storage screen chooses nothing until its paint is on glass, nor
+    /// at all when that paint fails.
+    #[test]
+    fn a_storage_screen_not_on_glass_selects_nothing() {
+        use crate::attention::Notice;
+        use crate::secret_client::{LoginSelection, Selection};
+        let target = Mutex::new(RecordingTarget {
+            notices_owed: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S, KEY_U], 20));
+        assert!(target.lock().unwrap().secret_roles.is_empty());
+        let clock = Arc::clone(&target.lock().unwrap().clock);
+        clock.publish_for_test(1);
+        read_reports(&target, &bindings, 0, &presses(&[KEY_U], 30));
+        assert_eq!(
+            target.lock().unwrap().secret_roles,
+            [Selection::Login(LoginSelection::SelectorUpdate)]
+        );
+        let target = Mutex::new(RecordingTarget {
+            notice_fails: true,
+            ..RecordingTarget::default()
+        });
+        let bindings = attention_bindings(None);
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_S, KEY_U], 20));
+        let target = target.lock().unwrap();
+        assert_eq!(target.notices, [Notice::DiskEncryption]);
+        assert!(target.secret_roles.is_empty());
     }
 
     #[test]

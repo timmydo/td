@@ -85,6 +85,26 @@ mod loop_device;
 #[path = "device_bound.rs"]
 mod device_bound;
 
+// td-authd's consent descriptions, which the storage worker decodes and
+// derives as root does (td-authd/DESIGN.md amendment 10).
+#[path = "../../td-authd/src/consent.rs"]
+#[allow(dead_code)]
+mod consent;
+
+// The private worker endpoint td-secret's workers hold to td-authd.
+#[path = "../../td-secret/src/frames.rs"]
+#[allow(dead_code)]
+mod frames;
+
+// td-secret's memory rules for a process that may hold a secret.
+#[path = "../../td-secret/src/memory.rs"]
+mod memory;
+
+// `storage-operation`'s selector update (DESIGN.md "Storage operation
+// worker").
+#[path = "storage_operation.rs"]
+mod storage_operation;
+
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -101,7 +121,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install storage-operation --uid <uid> (stdin: td-authd's private socket)\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
                      td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
@@ -137,6 +157,10 @@ enum Mode {
         output: PathBuf,
     },
     Timezones,
+    /// td-authd's root storage worker, for the account `uid`.
+    StorageOperation {
+        uid: u32,
+    },
     LayoutPreview {
         sector_bytes: u64,
         capacity_bytes: u64,
@@ -461,34 +485,79 @@ fn selector_parts(
     uuid: &VolumeUuid,
 ) -> io::Result<SelectorParts> {
     let key = read_trusted_key(trusted_key)?;
-    // A key the booted selector could not decode makes an unbootable disk,
-    // found only after the destructive write, so its shape is refused here
-    // by td-boot's rule: 64 hex digits once surrounding whitespace is gone.
-    let digits = key.trim_ascii();
-    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
-        return Err(invalid(format!(
-            "trusted deployment key {} is not 64 hexadecimal digits",
-            trusted_key.display()
-        )));
-    }
+    let appendix = selector_appendix(&key, uuid, false)
+        .map_err(|error| invalid(format!("{}: {error}", trusted_key.display())))?;
     let (file, metadata) = td_fs::open_real_file(template, "selector template")?;
     let len = metadata.len();
+    let padding = selector_join_padding(len, appendix.len())
+        .map_err(|error| invalid(format!("{}: {error}", template.display())))?;
+    Ok(SelectorParts {
+        file,
+        len,
+        padding,
+        appendix,
+    })
+}
+
+/// A prepared selector in memory, by `prepare-selector`'s rules: the
+/// template, its padding and the appended archive (the storage worker's
+/// selector update, DESIGN.md "Storage operation worker").
+fn selector_bytes(
+    template: &[u8],
+    key: &[u8],
+    uuid: &VolumeUuid,
+    measured: bool,
+) -> io::Result<Vec<u8>> {
+    let appendix = selector_appendix(key, uuid, measured).map_err(invalid)?;
+    let padding = selector_join_padding(template.len() as u64, appendix.len())?;
+    let zeros = [0u8; 3];
+    let padding = zeros
+        .get(..padding)
+        .ok_or_else(|| invalid("invalid selector padding".into()))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(template.len() + padding.len() + appendix.len())
+        .map_err(|_| invalid("prepared selector exceeds memory".into()))?;
+    bytes.extend_from_slice(template);
+    bytes.extend_from_slice(padding);
+    bytes.extend_from_slice(&appendix);
+    Ok(bytes)
+}
+
+/// The archive preparing a selector appends: the trust root, the volume
+/// identity it boots and, when `measured`, the deployment measurement
+/// policy. A key the booted selector could not decode makes an unbootable
+/// disk, found only after the destructive write, so its shape is refused
+/// here by td-boot's rule: 64 hex digits once surrounding whitespace is
+/// gone.
+fn selector_appendix(key: &[u8], uuid: &VolumeUuid, measured: bool) -> Result<Vec<u8>, String> {
+    let digits = key.trim_ascii();
+    if digits.len() != 64 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err("trusted deployment key is not 64 hexadecimal digits".into());
+    }
     let uuid_line = format!("{}\n", uuid.0);
-    let mut entries: Vec<cpio::Entry> = Vec::new();
-    for (path, bytes) in [
-        (protocol::TRUSTED_KEY_PATH, key.as_slice()),
+    let mut members: Vec<(&str, &[u8])> = vec![
+        (protocol::TRUSTED_KEY_PATH, key),
         (protocol::VOLUME_UUID_PATH, uuid_line.as_bytes()),
-    ] {
+    ];
+    if measured {
+        members.push((
+            protocol::MEASUREMENT_POLICY_PATH,
+            protocol::MEASUREMENT_POLICY,
+        ));
+    }
+    let mut entries: Vec<cpio::Entry> = Vec::new();
+    for (path, bytes) in members {
         // Every proper directory prefix, shallowest first and once: the
         // kernel creates nothing under a parent the archive does not name.
         let mut end = 0usize;
         while let Some(slash) = path.get(end..).and_then(|tail| tail.find('/')) {
             end = end
                 .checked_add(slash)
-                .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+                .ok_or_else(|| String::from("selector parent offset overflow"))?;
             let parent = path
                 .get(..end)
-                .ok_or_else(|| invalid("invalid selector parent".into()))?;
+                .ok_or_else(|| String::from("invalid selector parent"))?;
             if !entries.iter().any(|entry| entry.name == parent) {
                 entries.push(cpio::Entry {
                     name: parent,
@@ -498,7 +567,7 @@ fn selector_parts(
             }
             end = end
                 .checked_add(1)
-                .ok_or_else(|| invalid("selector parent offset overflow".into()))?;
+                .ok_or_else(|| String::from("selector parent offset overflow"))?;
         }
         entries.push(cpio::Entry {
             name: path,
@@ -506,15 +575,7 @@ fn selector_parts(
             kind: cpio::Kind::File(bytes),
         });
     }
-    let appendix = cpio::build(&entries).map_err(invalid)?;
-    let padding = selector_join_padding(len, appendix.len())
-        .map_err(|error| invalid(format!("{}: {error}", template.display())))?;
-    Ok(SelectorParts {
-        file,
-        len,
-        padding,
-        appendix,
-    })
+    cpio::build(&entries)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -814,6 +875,14 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
             })
         }
         (Some("timezones"), []) => Ok(Mode::Timezones),
+        (Some("storage-operation"), [flag, uid]) if flag.as_os_str() == "--uid" => {
+            let uid = uid
+                .to_str()
+                .filter(|text| text.bytes().all(|byte| byte.is_ascii_digit()))
+                .and_then(|text| text.parse::<u32>().ok())
+                .ok_or_else(|| invalid("storage-operation requires --uid N".into()))?;
+            Ok(Mode::StorageOperation { uid })
+        }
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
             capacity_bytes: preview_number(capacity.as_os_str(), "capacity bytes")?,
@@ -2993,6 +3062,10 @@ mod paths {
         std::fs::symlink_metadata(path).at(path)
     }
 
+    pub fn read_link(path: &Path) -> io::Result<PathBuf> {
+        std::fs::read_link(path).at(path)
+    }
+
     /// What is at `path`, symlinks followed.
     pub fn metadata(path: &Path) -> io::Result<Metadata> {
         std::fs::metadata(path).at(path)
@@ -3548,6 +3621,41 @@ fn read_at(file: &mut File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
 /// is parsed — which also refuses a destination that was never laid out, and a
 /// disk whose two copies of the table disagree.
 fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Result<(u64, u64)> {
+    partition_region(
+        file,
+        sector_size,
+        disk_sectors,
+        protocol::VOLUME_PARTITION_NAME,
+        gpt::TYPE_LINUX_FS,
+        false,
+    )
+}
+
+/// Where the ESP is, by `volume_region`'s rules: the one `td-esp`
+/// partition of the EFI System type, which td's layout makes the table's
+/// first entry (the storage worker's selector update, DESIGN.md "Storage
+/// operation worker").
+fn esp_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Result<(u64, u64)> {
+    partition_region(
+        file,
+        sector_size,
+        disk_sectors,
+        protocol::ESP_PARTITION_NAME,
+        gpt::TYPE_ESP,
+        true,
+    )
+}
+
+/// The one partition named `name` of type `kind`, its byte offset and
+/// length; with `first`, it must also be the table's first entry.
+fn partition_region(
+    file: &mut File,
+    sector_size: u64,
+    disk_sectors: u64,
+    name: &str,
+    kind: gpt::Guid,
+    first: bool,
+) -> io::Result<(u64, u64)> {
     let [primary, backup] = table_ranges(sector_size, disk_sectors).map_err(invalid)?;
     let primary = read_at(file, primary.0, primary.1)?;
     let backup = read_at(file, backup.0, backup.1)?;
@@ -3576,37 +3684,40 @@ fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Re
     // is what says what the partition is FOR.
     let mut found = None;
     let mut matches = 0usize;
-    for part in &table.partitions {
-        if part.name == protocol::VOLUME_PARTITION_NAME && part.type_guid == gpt::TYPE_LINUX_FS {
+    for (index, part) in table.partitions.iter().enumerate() {
+        if part.name == name && part.type_guid == kind {
             matches += 1;
             if found.is_none() {
-                found = Some(part);
+                found = Some((index, part));
             }
         }
     }
     if matches > 1 {
         return Err(invalid(format!(
-            "this disk has {matches} partitions named {}",
-            protocol::VOLUME_PARTITION_NAME
+            "this disk has {matches} partitions named {name}"
         )));
     }
-    let part = found.ok_or_else(|| {
+    let (index, part) = found.ok_or_else(|| {
         invalid(format!(
-            "no {} partition on this disk — run `layout` first",
-            protocol::VOLUME_PARTITION_NAME
+            "no {name} partition on this disk — run `layout` first"
         ))
     })?;
+    if first && index != 0 {
+        return Err(invalid(format!(
+            "the {name} partition is not this disk's first"
+        )));
+    }
     let offset = part
         .start_lba
         .checked_mul(sector_size)
-        .ok_or_else(|| invalid("the volume offset overflowed".to_string()))?;
+        .ok_or_else(|| invalid(format!("the {name} offset overflowed")))?;
     // INCLUSIVE end, as GPT stores it.
     let len = part
         .end_lba
         .checked_sub(part.start_lba)
         .and_then(|span| span.checked_add(1))
         .and_then(|sectors| sectors.checked_mul(sector_size))
-        .ok_or_else(|| invalid("the volume length overflowed".to_string()))?;
+        .ok_or_else(|| invalid(format!("the {name} length overflowed")))?;
     // ...and the region must not overlap either copy of the TABLE that named
     // it. `gpt::parse` bounds partitions by the header's OWN `first_usable` and
     // `last_usable`, which are fields in the same table — so a table declaring
@@ -3618,7 +3729,7 @@ fn volume_region(file: &mut File, sector_size: u64, disk_sectors: u64) -> io::Re
     let end = offset.saturating_add(len);
     if offset < primary_end || end > backup.0 {
         return Err(invalid(format!(
-            "the volume at {offset}..{end} overlaps a partition table \
+            "{name} at {offset}..{end} overlaps a partition table \
              ({}..{primary_end} and {}..)",
             primary.0, backup.0
         )));
@@ -5072,6 +5183,7 @@ fn main() -> ExitCode {
             let mut output = io::BufWriter::new(stdout.lock());
             timezones::run(Path::new(TIMEZONE_ROOT), &mut output).and_then(|()| output.flush())
         }
+        Mode::StorageOperation { uid } => storage_operation::run(uid).map_err(invalid),
         Mode::PrepareSelector {
             template,
             trusted_key,
@@ -6090,6 +6202,32 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// The storage worker's selector is `prepare-selector`'s, byte for byte,
+    /// and a protected volume's adds the measurement policy member.
+    #[test]
+    fn the_selector_in_memory_is_prepare_selector_s_plus_the_policy() {
+        let dir = ScratchDirectory(scratch::path("selector-bytes"));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let template = dir.0.join("template");
+        std::fs::write(&template, b"kkkkk").unwrap();
+        let key = key_file(&dir.0);
+        let key_bytes = std::fs::read(&key).unwrap();
+        let uuid = VolumeUuid::parse("12345678-1234-4234-8234-123456789abc").unwrap();
+        let output = dir.0.join("out");
+        prepare_selector(&template, &key, &uuid, &output).unwrap();
+        let plain = selector_bytes(b"kkkkk", &key_bytes, &uuid, false).unwrap();
+        assert_eq!(plain, std::fs::read(&output).unwrap());
+        let measured = selector_bytes(b"kkkkk", &key_bytes, &uuid, true).unwrap();
+        let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        let member = format!("{}\0", protocol::MEASUREMENT_POLICY_PATH);
+        assert!(!has(&plain, member.as_bytes()));
+        assert!(has(&measured, member.as_bytes()));
+        assert!(has(&measured, protocol::MEASUREMENT_POLICY));
+        assert_eq!(&measured[..8], b"kkkkk\0\0\0");
+        assert!(selector_bytes(b"kkkkk", b"not a key", &uuid, true).is_err());
+        assert!(selector_bytes(b"", &key_bytes, &uuid, true).is_err());
     }
 
     #[test]
@@ -7128,6 +7266,56 @@ mod tests {
         // ...and it ends on the last usable sector, so the partition the
         // filesystem is sized for is the whole of what the table set aside.
         assert_eq!(offset + len, (plan.volume_end + 1) * 512);
+    }
+
+    /// The storage worker's ESP is the table's `td-esp` partition of the EFI
+    /// System type, and only as its first entry.
+    #[test]
+    fn the_esp_region_is_the_tables_first_partition() {
+        let scratch = Scratch::disk(DISK);
+        run_layout(&scratch.path, &mut Vec::new()).unwrap();
+        let plan = plan(512, DISK, VolumeEnd::LastUsable).unwrap();
+        let mut file = File::open(&scratch.path).unwrap();
+        assert_eq!(
+            esp_region(&mut file, 512, DISK / 512).unwrap(),
+            (
+                plan.esp_start * 512,
+                (plan.esp_end - plan.esp_start + 1) * 512
+            )
+        );
+        let esp = |start: u64, end: u64, tag: u8| gpt::Partition {
+            type_guid: gpt::TYPE_ESP,
+            unique_guid: gpt::Guid::parse(&format!("00000000-0000-4000-8000-00000000000{tag}"))
+                .unwrap(),
+            start_lba: start,
+            end_lba: end,
+            attributes: 0,
+            name: protocol::ESP_PARTITION_NAME.to_string(),
+        };
+        let other = gpt::Partition {
+            name: protocol::VOLUME_PARTITION_NAME.to_string(),
+            type_guid: gpt::TYPE_LINUX_FS,
+            ..esp(2048, 4095, 1)
+        };
+        let scratch = Scratch::disk(DISK);
+        let layout = gpt::Layout {
+            sector_size: 512,
+            disk_sectors: DISK / 512,
+            disk_guid: gpt::Guid::parse("12345678-1234-4234-8234-123456789abc").unwrap(),
+            align_sectors: protocol::PARTITION_ALIGN_BYTES / 512,
+            partitions: vec![other, esp(4096, 8191, 2)],
+        };
+        let image = gpt::build(&layout).unwrap();
+        {
+            let mut file = OpenOptions::new().write(true).open(&scratch.path).unwrap();
+            write_at(&mut file, image.primary_offset, &image.primary).unwrap();
+            write_at(&mut file, image.backup_offset, &image.backup).unwrap();
+        }
+        let mut file = File::open(&scratch.path).unwrap();
+        let error = esp_region(&mut file, 512, DISK / 512)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not this disk's first"), "{error}");
     }
 
     /// A table that is INTERNALLY consistent but describes a different disk is
@@ -8458,7 +8646,7 @@ mod tests {
     /// inventory uses paths; timezones uses the regular-file reader.
     type Compiled = (&'static str, &'static str, &'static [&'static str]);
 
-    fn compiled_files() -> [Compiled; 19] {
+    fn compiled_files() -> [Compiled; 23] {
         [
             ("main.rs", include_str!("main.rs"), MAIN_CHOKE.as_slice()),
             (
@@ -8535,6 +8723,26 @@ mod tests {
                 include_str!("device_bound.rs"),
                 [].as_slice(),
             ),
+            (
+                "consent.rs",
+                include_str!("../../td-authd/src/consent.rs"),
+                [].as_slice(),
+            ),
+            (
+                "frames.rs",
+                include_str!("../../td-secret/src/frames.rs"),
+                [].as_slice(),
+            ),
+            (
+                "memory.rs",
+                include_str!("../../td-secret/src/memory.rs"),
+                [].as_slice(),
+            ),
+            (
+                "storage_operation.rs",
+                include_str!("storage_operation.rs"),
+                [].as_slice(),
+            ),
         ]
     }
 
@@ -8569,7 +8777,7 @@ mod tests {
         // include inside a `stringify!`, which satisfied the search while
         // `compiled_files` went on reading the original.
         let table_body = {
-            const HEAD: &str = "fn compiled_files() -> [Compiled; 19] {";
+            const HEAD: &str = "fn compiled_files() -> [Compiled; 23] {";
             let Some(at) = index_of(&text, HEAD) else {
                 panic!("the compiled-file table is not where this scan looks for it")
             };
@@ -8770,7 +8978,7 @@ mod tests {
         }
         // A naming test that found nothing to check would pass whatever the
         // wrappers did.
-        assert_eq!(checked, 25, "{checked} wrappers were checked");
+        assert_eq!(checked, 26, "{checked} wrappers were checked");
     }
 
     /// The text of the item opened at `marker`, up to the next line that is a

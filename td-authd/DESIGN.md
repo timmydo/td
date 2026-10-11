@@ -2635,7 +2635,12 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    with the generation's first `1a` answer whatever that answer's
    state.
 10. **Storage operations.** Fixed by ENCRYPTION.md increment 8e's
-    documentation commit, before their code; none is implemented yet.
+    documentation commit, before their code. The selector update is
+    implemented (`storage.rs`, `20 01`); like the login worker's writes
+    it starts no worker outside test builds (`OPERATIONS`) until
+    ENCRYPTION.md's item 9, so a production build answers every `20`
+    `a0 00`. The disk proofs and every later operation are not yet
+    implemented.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
     operation worker"), launched and supervised as the login worker is
@@ -2667,7 +2672,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     and is refused as this build's. `20` needs completed preparation and
     an empty slot, as `1b` does, or ends the generation; it answers `a0
     01` and the operation's 32-byte nonce, started, or `a0 00`, refused
-    in this build. The private channel routes `20` to the paired session
+    in this build. `a0 00` comes first: an operation this build refuses,
+    and every `20` in a production build, is answered `a0 00` before
+    preparation or the slot is checked, so such a `20` never ends the
+    generation. The private channel routes `20` to the paired session
     beside `10` to `1f`, and still refuses `21` and above. Polls `11`,
     cancellation `15`, presentation `13`, commit `14` and the secret
     request `1c` are a login operation's, with the same answers (`91 0b`
@@ -2713,11 +2721,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     ceremony: a removal by disk proof 120 seconds, an addition 240, a
     first enrollment 240 for one key and 360 for two, each plus the
     reading allowance where it discloses, so `LOGIN_LONGEST` becomes
-    480. Until activation `login::WRITES` refuses every disk-proof
-    selection with `9b 00`, as it refuses every login write; 8e's
-    disk-proof commit lifts 8d's interim refusal in test builds, where a
-    first enrollment on a protected machine without a proof still ends
-    with `84`.
+    480. Until 8e's disk-proof commit no build decodes a disk-proof
+    selection, so one is a protocol violation, and 8d's interim refusals
+    stand; that commit lifts them in test builds, where a first
+    enrollment on a protected machine without a proof still ends with
+    `84`.
 
     **Consent tags.** Tags 13, 14 and 15 are a first enrollment, an
     addition and a removal authorized by a disk proof: each is tag 8's,
@@ -2781,7 +2789,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     fixed at the selection: 120 for the worker's reads and the key, which
     the worker presents only once its reads are done, and 120 for the
     writes, which the worker begins only with 120 seconds of its
-    deadline left (its commit margin). After root's `13` an outcome
+    deadline left (its commit margin). Root enforces only the whole 240
+    seconds, accepting the typed key's receipt until then; the split is
+    the worker's, which answers a receipt with under 120 seconds left
+    with `08` before its commit invitation. After root's `13` an outcome
     other than `14` and a successful exit is uncertain (`91 0e`), as a
     login write's is, but for the worker's `28` CHANGED with its
     successful exit: the worker sends it only from its checks after
@@ -2806,9 +2817,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
     Until ENCRYPTION.md's item 9 a production build answers every `20`
     with `a0 00` before starting anything (`storage::OPERATIONS`, false
-    there as `login::WRITES` is), so nothing in production starts the
-    storage worker; test builds set it, so host fixtures drive every
-    implemented operation.
+    there as `login::WRITES` was before activation), so nothing in
+    production starts the storage worker; test builds set it, so host
+    fixtures drive every implemented operation.
 
 TOKEN-LOGIN.md, "Placement", owns the rule that only physical input starts
 a login operation.

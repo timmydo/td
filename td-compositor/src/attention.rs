@@ -38,6 +38,8 @@ pub(crate) enum Notice {
     Busy,
     /// The key-management screen `K` opens.
     LoginKeys,
+    /// The storage screen `S` opens (DESIGN.md, "Storage operations").
+    DiskEncryption,
     /// Removal digits: the enrolled key count and the chosen positions as
     /// bits, position 1 lowest.
     Removing {
@@ -47,6 +49,8 @@ pub(crate) enum Notice {
     /// A login selection (`K`'s keys, `D`, `L`) with no login state from
     /// root's `1a` answer: the direct profile, which has no authority.
     StateUnknown,
+    /// Root refused a storage operation as this build's (`a0 00`).
+    NotAvailable,
     /// A login-key operation's end (td-login/TOKEN-LOGIN.md, "Failure
     /// texts").
     Login(&'static [&'static str]),
@@ -156,7 +160,7 @@ impl Prepared {
             .ok_or("output cannot hold a complete trusted prompt")?;
         let mut lines = request.lines();
         let ceiling = request
-            .login_ceiling()
+            .ceiling()
             .map_or(OPERATION_SECONDS, |ceiling| ceiling.as_secs());
         if let Some(seconds) = remaining {
             if !(1..=ceiling).contains(&seconds) {
@@ -522,10 +526,11 @@ const MENU_ROWS: usize = 7;
 /// The first row's top for rows `block` pixels tall, the last row's foot
 /// included: the menu's long-standing place, where the boot oracles read
 /// its rows, wherever the whole block fits below it; on an output too short
-/// for that, the least shift up that makes it fit.
+/// for that, the least shift up that makes it fit with the output's last
+/// line clear, so a foot on that line can only be a clipped row's.
 fn rows_top(height: usize, block: usize) -> usize {
     let top = height.saturating_sub(248) / 2;
-    top.min(height.saturating_sub(block))
+    top.min(height.saturating_sub(block).saturating_sub(1))
 }
 
 /// The chrome font's scale on an output, the prompt's rule, and the columns
@@ -604,6 +609,8 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::Busy => "PREVIOUS REQUEST IS STILL FINISHING",
         Notice::LoginKeys => "LOGIN KEYS",
         Notice::StateUnknown => "LOGIN KEY STATE NOT KNOWN",
+        Notice::DiskEncryption => "DISK ENCRYPTION",
+        Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
         Notice::Restarting => RESTARTING_NOTICE,
         Notice::Login(rows) => return rows.iter().map(|row| String::from(*row)).collect(),
@@ -641,6 +648,8 @@ fn notice_rows(notice: Notice) -> Vec<String> {
             "A: ADD A KEY",
             "D: REMOVE KEYS",
         ],
+        // One row per storage operation, in operation-byte order.
+        Notice::DiskEncryption => &["U: UPDATE THE BOOT SELECTOR"],
         Notice::HostnameSaved => &["A RESTART COMPLETES THE CHANGE"],
         Notice::Uncertain(rows) => rows,
         _ => &[],
@@ -651,6 +660,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         .collect();
     if let Notice::Menu(intake) = notice {
         rows.push(hostname_row(intake));
+        rows.push("S: DISK ENCRYPTION".into());
     }
     rows
 }
@@ -982,12 +992,12 @@ mod tests {
     /// The menu's rows where the update and setup oracles read them on a
     /// 1280x800 output, as before `L`: the title at 276, the selections
     /// from 312 and `I` at 456, 36 apart; `K` below `I`, `L` below `K` at
-    /// 528, `B` below `L` at 564, `H` below `B` at 600, and the last row,
-    /// which every other screen keeps at 528, three lower at 636. On
-    /// 800x600 the eleven rows start at 176, and on 320x200, at single
-    /// scale, the fit rule moves them up to 0.
+    /// 528, `B` below `L` at 564, `H` below `B` at 600, `S` below `H` at
+    /// 636, and the last row, which every other screen keeps at 528, four
+    /// lower at 672. On 800x600 the twelve rows start at 176, and on
+    /// 320x200, at single scale, the fit rule moves them up to 0.
     #[test]
-    fn the_menu_keeps_its_rows_and_adds_k_l_b_and_h_below_i() {
+    fn the_menu_keeps_its_rows_and_adds_k_l_b_h_and_s_below_i() {
         const MENU: &[&str] = &[
             "TD SECURE ATTENTION",
             "U: UNLOCK  R: RECOVERY TOKEN",
@@ -999,11 +1009,14 @@ mod tests {
             "L: LOCK SCREEN",
             "B: ROLL BACK TO THE PREVIOUS SYSTEM",
             "H: NO HOSTNAME CHANGE WAITING",
+            "S: DISK ENCRYPTION",
             "ESC TO RETURN",
         ];
-        for (width, height, top, scale) in
-            [(1280, 800, 276, 2), (800, 600, 176, 2), (320, 200, 0, 1)]
-        {
+        for (width, height, top, scale, pitch) in [
+            (1280, 800, 276, 2, 36),
+            (800, 600, 176, 2, 36),
+            (320, 200, 0, 1, 17),
+        ] {
             let stride = width * 4;
             let mut painted = vec![0; stride * height];
             paint(
@@ -1033,7 +1046,7 @@ mod tests {
                     height,
                     stride,
                     24,
-                    top + index * 18 * scale,
+                    top + index * pitch,
                     scale,
                     text,
                     [0xff, 0xff, 0xff, 0],
@@ -1042,12 +1055,12 @@ mod tests {
             }
             assert!(painted == expected, "{width}x{height}");
         }
-        // Eleven doubled rows, the last row's foot included, are 374
-        // tall and keep their top on 800 and 600 lines; on 200 single rows
-        // fit only from the top.
-        assert_eq!(rows_top(800, 10 * 36 + 14), 276);
-        assert_eq!(rows_top(600, 10 * 36 + 14), 176);
-        assert_eq!(rows_top(200, 10 * 18 + 7), 0);
+        // Twelve doubled rows, the last row's foot included, are 410
+        // tall and keep their top on 800 and 600 lines; on 200 twelve
+        // single rows, 205 tall at their pitch, close up to 17 from the top.
+        assert_eq!(rows_top(800, 11 * 36 + 14), 276);
+        assert_eq!(rows_top(600, 11 * 36 + 14), 176);
+        assert_eq!(rows_top(200, 11 * 18 + 7), 0);
     }
 
     /// The `H` row says what root's last `9f` answer said: nothing waits,
@@ -1076,7 +1089,9 @@ mod tests {
             assert!(text.bytes().all(ui::is_mapped), "{text}");
             assert_eq!(
                 notice_rows(Notice::Menu(HostnameIntake::decode(answer).unwrap()))
-                    .last()
+                    .iter()
+                    .rev()
+                    .nth(1)
                     .map(String::as_str),
                 Some(text)
             );
@@ -1180,7 +1195,7 @@ mod tests {
         // The eight doubled rows end 266 below the title, inside 800.
         assert_eq!(rows_top(800, 7 * 36 + 14), 276);
         // Rows the old place cannot hold move up only as far as they must.
-        assert_eq!(rows_top(800, 600), 200);
+        assert_eq!(rows_top(800, 600), 199);
         assert_eq!(rows_top(250, 7 * 36 + 14), 0);
         assert_eq!(rows_top(200, 7 * 18 + 7), 0);
     }
@@ -1222,6 +1237,8 @@ mod tests {
         Notice::Busy,
         Notice::LoginKeys,
         Notice::StateUnknown,
+        Notice::DiskEncryption,
+        Notice::NotAvailable,
         Notice::Removing {
             keys: 8,
             chosen: 0xff,
@@ -1483,8 +1500,8 @@ mod tests {
                 .enumerate()
                 .collect();
             assert_eq!(rows[5], (5, "I: REVIEW PENDING SYSTEM INSTALLATION".into()));
-            rows.push((10, text.into()));
-            rows.push((11, "ESC TO RETURN".into()));
+            rows.push((11, text.into()));
+            rows.push((12, "ESC TO RETURN".into()));
             let rows: Vec<(usize, &str)> =
                 rows.iter().map(|(at, row)| (*at, row.as_str())).collect();
             assert!(painted == expected(&rows), "menu {text}");
@@ -1529,7 +1546,8 @@ mod tests {
             Some(RESTARTING_NOTICE),
         );
         let inked = |y: usize| (0..width).any(|x| small[y * stride + x * 4] == 0xff);
-        assert!(inked(0) && (190..200).any(inked));
+        // Fourteen rows at a 14-pixel pitch: the last foot ends at 188.
+        assert!(inked(0) && (180..200).any(inked) && !inked(199));
     }
 
     /// The lock surface's rows end in `02`'s or `03`'s notice; `00` and

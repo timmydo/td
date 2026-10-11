@@ -6353,7 +6353,10 @@ nothing but cancelling.
 ### Storage operations
 
 Fixed by `td-install/ENCRYPTION.md` increment 8e's documentation
-commit before their code; none is implemented yet. td-authd/DESIGN.md
+commit before their code. The storage screen and the selector update
+are implemented (`LoginSelection::SelectorUpdate`, polled as a login
+operation is, with its own end table); the disk proofs and the
+recovery-key profile are not yet. td-authd/DESIGN.md
 amendment 10 gives the wire, and ENCRYPTION.md the operations. Until
 that document's item 9, root refuses every storage operation and every
 disk proof in a production build, so these screens end at `NOT
@@ -6363,9 +6366,11 @@ AVAILABLE IN THIS BUILD` there.
 below `H`'s row, so every row above keeps its place and only `ESC TO
 RETURN` moves down (on 1280x800 `S` at 636 and `ESC TO RETURN` at
 672; the twelve-row menu, 410 pixels at double scale, still starts at
-176 on 800x600, and `rows_top`'s fit rule moves it up only where it
-must). `S` is not modhex, but the exclusion of a security key's own
-keyboard applies to it as to every selection. A fresh physical `S`,
+176 on 800x600; `rows_top`'s fit rule, which keeps the output's last
+line clear, moves rows up only where they must, and on 320x200 the
+twelve single-scale rows close up to a 17-pixel pitch from 0). `S` is
+not modhex, but the exclusion of a security key's own keyboard applies
+to it as to every selection. A fresh physical `S`,
 under the menu's rules and before the lifetime's operation, opens the
 storage screen, which names its paint as the key-management screen
 does and chooses nothing until that paint is on glass. Its rows are
@@ -6399,8 +6404,8 @@ NEXT BOOT NEEDS THE RECOVERY KEY` (direct, device-bound) or nothing more
 | `20` VOLUME | `NO ENCRYPTED TD VOLUME` |
 | `21` STATE | `THE DISK CANNOT DO THIS NOW` |
 | `22` NOT CURRENT | `RESTART INTO THE CURRENT SYSTEM` / `BEFORE UPDATING THE SELECTOR` |
-| `23` DEPLOYMENT | `THE SYSTEM'S BOOT FILES DO NOT` / `MATCH ITS MANIFEST` |
-| `24` ESP | `THE EFI PARTITION IS NOT TD'S` / `OR HAS TOO LITTLE SPACE` |
+| `23` DEPLOYMENT | `THE SYSTEM BOOT FILES DO NOT` / `MATCH ITS MANIFEST` |
+| `24` ESP | `THE EFI PARTITION IS FOREIGN` / `OR HAS TOO LITTLE SPACE` |
 | `28` CHANGED | `THE DISK CHANGED; NOTHING WRITTEN` |
 | `08`, `0f`, `10` | `TIMED OUT`, `THE OPERATION FAILED` |
 | `0e` uncertain | `RESULT UNCERTAIN` |

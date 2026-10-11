@@ -830,6 +830,38 @@ fn too_little_space_is_refused_before_anything_is_written() {
     stage(&mut esp, &fits).unwrap();
 }
 
+/// `fits` answers what staging and the direct form would before their
+/// first write, and writes nothing itself.
+#[test]
+fn fits_answers_the_space_check_and_writes_nothing() {
+    let big = files(11, 16 << 20, 1 << 20);
+    let fitting = files(12, 14 << 20, 1 << 20);
+    let esp = open(image(&SMALL, &big), &SMALL).unwrap();
+    for staged in [true, false] {
+        match esp.fits(big.kernel.len() as u64, big.initrd.len() as u64, staged) {
+            Err(Error::Space { needed, available }) => assert!(needed > available),
+            other => panic!("{other:?}"),
+        }
+        esp.fits(
+            fitting.kernel.len() as u64,
+            fitting.initrd.len() as u64,
+            staged,
+        )
+        .unwrap();
+    }
+    // An empty file is refused as staging refuses it.
+    assert!(matches!(
+        esp.fits(0, fitting.initrd.len() as u64, true),
+        Err(Error::Input(_))
+    ));
+    assert_eq!(esp.into_device().writes, 0);
+    // A staged pair's clusters count as free, as staging replaces it.
+    let old = files(1, 12 << 20, 1 << 20);
+    let mut esp = open(image(&SMALL, &old), &SMALL).unwrap();
+    stage(&mut esp, &files(2, 12 << 20, 1 << 20)).unwrap();
+    esp.fits(12 << 20, 1 << 20, true).unwrap();
+}
+
 #[test]
 fn space_counts_what_the_reclaim_and_a_replaced_staging_free() {
     let old = files(1, 12 << 20, 1 << 20);
