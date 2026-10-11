@@ -18,6 +18,8 @@ use crate::types::{Recipe, Step};
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const ADMISSION_RS: &str = include_str!("../../../td-boot/src/admission.rs");
 const ADMIT_RS: &str = include_str!("../../../td-boot/src/admit.rs");
+const AUTHENTICODE_RS: &str = include_str!("../../../td-boot/src/authenticode.rs");
+const EVENTLOG_RS: &str = include_str!("../../../td-boot/src/eventlog.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
@@ -204,6 +206,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/admit.rs".into(),
             content: ADMIT_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/authenticode.rs".into(),
+            content: AUTHENTICODE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/eventlog.rs".into(),
+            content: EVENTLOG_RS.into(),
             exec: false,
         },
         Step::WriteFile {

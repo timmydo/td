@@ -56,3 +56,6 @@ target/
 # build output, hundreds of MiB to GiB of images, never versioned. Upload them
 # to a release page instead.
 /dist/
+
+# Python bytecode from host-side test helpers (td-boot/tests/eventlog).
+__pycache__/

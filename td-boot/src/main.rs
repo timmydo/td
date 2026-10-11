@@ -15,6 +15,11 @@ mod admission;
 // The deployment initramfs's `admit` verb.
 #[path = "admit.rs"]
 mod admit;
+// The staged selector update's digests and prediction
+// (td-install/ENCRYPTION.md "Prediction"); 8e's pre-seal calls them.
+#[path = "authenticode.rs"]
+#[allow(dead_code, reason = "the selector update's pre-seal calls it")]
+mod authenticode;
 #[path = "cap.rs"]
 mod cap;
 // Which terminal `/dev/console` is, td-init's, shared with its secret-line
@@ -22,6 +27,9 @@ mod cap;
 // recipe stages it at `{src}/td-init/src/console.rs`.
 #[path = "../../td-init/src/console.rs"]
 mod console;
+#[path = "eventlog.rs"]
+#[allow(dead_code, reason = "the selector update's pre-seal calls it")]
+mod eventlog;
 // The selector's FIDO2 client and its `fido-worker` verb.
 #[path = "fido.rs"]
 mod fido;

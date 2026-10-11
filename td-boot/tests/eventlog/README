@@ -1,0 +1,38 @@
+TPM event logs OVMF recorded, for td-boot's prediction tests
+(src/eventlog_tests.rs; td-install/ENCRYPTION.md "Prediction").
+
+    ovmf-a.log   chain a's log, as Linux presents it in securityfs
+    ovmf-b.log   chain b's log
+    ovmf.txt     per chain: SHA-256 PCRs 4, 7 and 9 as read in the guest,
+                 the kernel file's SHA-256, its Authenticode SHA-256
+                 (`application`) and the INITRD's SHA-256
+    record.py    the host fixture that recorded them
+
+record.py booted each chain under the host's QEMU 10.2.1 with its bundled
+edk2-stable202408 firmware (edk2-x86_64-code.fd, a fresh copy of
+edk2-i386-vars.fd, so Secure Boot off), q35, KVM and swtpm 0.10.1 on
+tpm-tis, a fresh TPM state per boot, the way the encrypted oracles attach
+it; the ESP was a vvfat directory holding EFI/BOOT/BOOTX64.EFI and
+EFI/BOOT/INITRD. Its arguments were
+
+    KERNEL         bzImage of linux-x86-64 7.1.4 built from this recipe
+                   with CONFIG_SECURITY=y and CONFIG_INTEGRITY off added
+                   (td's shipped kernel cannot mount securityfs yet; see
+                   "Prediction"), SHA-256 548673b3...caf21f
+    SELECTOR_CPIO  a system-x86-64 build's boot/selector-initramfs.cpio
+
+Chain b is chain a with 512 zero bytes after the kernel, which Authenticode
+hashes, and 512 after the initramfs, which the kernel's unpacker skips. The
+same firmware and variables give the same PCR 7, and a's log with b's
+digests substituted predicts b's PCR 4 and PCR 9 exactly.
+
+record.py writes the `application` digests from the logs' one PCR 4
+boot-application event each; td-boot's own Authenticode code gives the same digests over the
+kernel and its padded copy (the ignored test
+`authenticode_agrees_with_ovmf_over_the_recorded_kernel`, run with
+TD_BOOT_RECORDED_KERNEL naming that bzImage). The kernel is not committed.
+
+No hardware machine's log is recorded here yet. A hardware log goes beside
+these with its own README entry naming the machine and firmware version, and
+is never constructed or edited by hand; the refusal cases in the tests are
+built from these logs in code instead.

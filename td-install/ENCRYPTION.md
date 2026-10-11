@@ -1682,24 +1682,50 @@ The update takes one of two forms:
 
   **Prediction.** The selector mounts securityfs and reads the TCG
   event log as Linux presents it, the firmware's crypto-agile log with
-  the final-events table appended. It requires the Spec ID event to
-  list SHA-256, takes each event's SHA-256 digest, skips `EV_NO_ACTION`
-  events, which extend nothing, and replays PCR 4, PCR 7 and PCR 9 from
-  zero. PCR 9 then takes td's own extensions, which follow
-  ExitBootServices and so are in no firmware log: under Secure Boot the
-  configuration event ("Firmware authentication"), whose digest the
-  selector recorded when it extended it. Each replay must equal the
-  PCR as read. It refuses a log whose events may not recur at the next
-  boot: an `EV_EFI_ACTION` "Returning from EFI Application from Boot
-  Option" (a boot attempt that failed or returned), more than one
-  `EV_EFI_BOOT_SERVICES_APPLICATION` in PCR 4 (a boot menu, shell or
-  one-time boot entry that ran before the selector), or any PCR 4 event
-  but the calling action, separators and that one application. It
-  requires that application's digest to be the Authenticode SHA-256 of
-  the running `BOOTX64.EFI` and exactly one PCR 9 event, the EFI stub's
-  initrd measurement, to be the running `INITRD`'s SHA-256. Replaying
-  with the staged files' digests in those events gives the predicted
-  PCR 4 and PCR 9; PCR 7 keeps its value.
+  the final-events table appended, at most 1 MiB.
+  It requires the Spec ID event to come first, at version 2, and to
+  list SHA-256 with a 32-byte digest, every later event to carry digests
+  only of listed algorithms, SHA-256's among them, and the log to end at
+  an event's end. It takes each event's SHA-256 digest, skips
+  `EV_NO_ACTION` events, which extend nothing, and replays PCR 4, PCR 7
+  and PCR 9 from zero. PCR 9 then takes td's own extensions, which
+  follow ExitBootServices and so are in no firmware log: under Secure
+  Boot the configuration event ("Firmware authentication"), whose digest
+  the selector recorded when it extended it; until Secure Boot
+  enrollment exists td extends nothing there. Each replay must equal
+  the PCR as read. It refuses a log whose events may not recur at the
+  next boot: an `EV_EFI_ACTION` "Returning from EFI Application from
+  Boot Option" in any PCR (a boot attempt that failed or returned), more
+  than one `EV_EFI_BOOT_SERVICES_APPLICATION` in PCR 4 (a boot menu,
+  shell or one-time boot entry that ran before the selector), or any
+  PCR 4 event but the calling action "Calling EFI Application from Boot
+  Option", the separator and that one application, each of the three
+  exactly once. It requires that application's digest to be the
+  Authenticode SHA-256 of the running `BOOTX64.EFI`, computed as EDK2
+  measures an image (the PE/COFF hash, then the bytes after the last
+  section but the certificate table), and exactly one PCR 9 event, the
+  EFI stub's `EV_EVENT_TAG` "Linux initrd", to be the running `INITRD`'s
+  SHA-256; nonempty load options would add the stub's second PCR 9
+  event and are refused. These refusals also catch ordinary machines:
+  EDK2 logs the returning action and a second calling action when an
+  earlier boot option fails (a network entry first, or a stale one), and
+  AMI firmware's automatic entries carry optional data the stub measures
+  as load options. On such a machine every staged update fails its
+  prediction and completes only through the retry's `update`. The remedy
+  is td's own boot entry first in `BootOrder` with empty optional data;
+  td-install writes no boot entry today (it boots the removable-media
+  path, DESIGN.md), and writing one so is owed with increment 8i's
+  efivarfs. Replaying with the staged files' digests in
+  those events gives the predicted PCR 4 and PCR 9; PCR 7 keeps its
+  value. td-boot's `eventlog.rs` and `authenticode.rs` hold this, tested
+  over logs OVMF recorded under swtpm (`td-boot/tests/eventlog`); no
+  hardware machine's log is recorded yet. td's kernel does not register
+  securityfs today, and pinning `SECURITYFS` (which `TCG_TPM` only
+  implies) is not enough: Linux 7.1 registers it from the LSM
+  framework's initcall alone, so it also needs `SECURITY`, which turns
+  on `INTEGRITY` by default. Whether the shipped kernel takes the LSM
+  framework for this is an owner decision still open; until it is made
+  no selector reads the log, and the pre-seal cannot run.
 
 | Interrupted | ESP and header after | Next boot |
 | --- | --- | --- |
@@ -2402,10 +2428,11 @@ commit.
      proof's consent steps, `1b` selection and PIN-field profile, all
      before their code; the `td-fat` crate (bounded FAT32 reader,
      reclaim, staging and the one-sector commits); td-boot's event-log
-     reader, its refusal rules and PCR 4 and PCR 9 prediction, with the
-     kernel's `SECURITYFS` pin; td-init's `losetup` applet linked into
-     the selector initramfs, with its D6 binding and the image check
-     that requires it; `storage-operation`'s `selector-update` in both
+     reader, its refusal rules and PCR 4 and PCR 9 prediction, then the
+     kernel configuration securityfs needs ("Prediction"); td-init's
+     `losetup` applet linked into the selector initramfs, with its D6
+     binding and the image check that requires it;
+     `storage-operation`'s `selector-update` in both
      forms, with td-authd's supervision and the compositor's storage
      screen, which production refuses; the selector's pre-seal, its
      authentication against `current`'s `bzImage` and `root.erofs`, its
