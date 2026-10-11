@@ -131,10 +131,25 @@ encoded-header adapters or combined service RSS.
   its ResourcePlan, checks token capacity and derives the method limit from
   that same plan. Runtime retains the original work/deadline admission
   throughout all phases.
+  Shared OwnedEmitter supplies bounded value serialization in at most
+  8 KiB of the 16 KiB spool-walker/escaping partition. Its existing document
+  boxes remain the request/token arenas, not a second copy. Its caller's
+  output uses the separate 16 KiB JSON-output partition. Each turn has at
+  most 256 transitions, each copying at most 256 number bytes, five literal
+  bytes, or at most 32 shared string-frame scalar/escape steps. Exact counting uses
+  that same encoder. Its 128 frames cover parser-produced request values;
+  they are not ADMISSION.md's separate 160-frame retained-response walker.
+  The partition leaves 8 KiB for that walker's future fixed state. Both may
+  coexist only if their combined state fits 16 KiB; runtime must prove this
+  before activation, without an additional scratch allocation.
+  Runtime must retain document-bound request indices,
+  enforce live admission, charge retention and publish only complete values.
+  This serializer is not Core dispatch, response reservation or a release
+  gate for capabilities; scalar-view and lookup helpers remain synchronous.
   Whole-buffer bounded allocation alone is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
-  contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
-  without pinning storage views between emissions.
+  contract in ADMISSION.md, never extra per-method heap trees. Event streams
+  use slots without pinning storage views between emissions.
 - Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
   Nested parsing and transfer decoding share that reservation.
 - Read view: 292 KiB caller-owned key/value/cursor scratch and one cold

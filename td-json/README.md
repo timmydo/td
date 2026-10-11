@@ -181,3 +181,30 @@ position and carries no source-identity guarantee.
 OwnedDocument retains its exact parser ceilings and exposes token capacity
 for a protocol handoff to verify the configured resource plan. These are
 observations of successful parsing, not new admission or deadline grants.
+
+## Owned arena emission
+
+`arena_emit::OwnedEmitter` keeps one immutable OwnedDocument and a fixed
+writer with at most MAX_DEPTH container frames. It serializes a selected
+value using the shared scalar escaper, preserving number lexemes, array order
+and the arena's decoded-key object order. There is no recursive traversal,
+heap tree, whole-string UTF-8 scan or allocation. A number byte view exposes
+only parser-validated ASCII without rescanning its complete lexeme.
+
+Each poll performs at most 256 transitions. One transition copies at most
+256 number bytes or five literal bytes, or advances at most 32 shared string-frame
+steps (one scalar or at most six pending bytes each). Small or empty caller output
+buffers never hide a drain or unbounded scan. Complete is cached; failures
+latch. Total includes staged string bytes and equals emitted length only at
+completion. A per-value byte cap charges the same encoder that emits output;
+it is not external storage, time or work admission.
+
+The owner fits 8 KiB, excluding its existing byte/token boxes and caller
+output. It can move between worker turns and lend immutable views without
+moving its source. Successful completion permits restarting another value
+from that document with a fresh per-value limit; external admission is never
+renewed. Constructor/completion refusals retain the document. Abandonment
+returns it unchanged, and its consuming into_buffers recovers the arenas.
+All emitted bytes remain provisional until successful completion and the
+caller's final live admission check. A failure retires the entire value,
+including output from earlier polls; no partial success is implied.

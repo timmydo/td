@@ -124,6 +124,7 @@ const TPM_AND_FIDO: &[(&str, &str)] = &[
         include_str!("../../../td-fido/src/fido_virtual_tests.rs"),
     ),
 ];
+const JSON_ARENA_EMIT_RS: &str = include_str!("../../../td-json/src/arena_emit.rs");
 const JSON_ARENA_RS: &str = include_str!("../../../td-json/src/arena.rs");
 const JSON_RS: &str = include_str!("../../../td-json/src/lib.rs");
 const JSON_RETAIN_RS: &str = include_str!("../../../td-json/src/retain.rs");
@@ -255,6 +256,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/ed25519.rs".into(),
             content: ED25519_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-json/src/arena_emit.rs".into(),
+            content: JSON_ARENA_EMIT_RS.into(),
             exec: false,
         },
         Step::WriteFile {

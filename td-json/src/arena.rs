@@ -164,6 +164,13 @@ impl<'a> Value<'a> {
             .then(|| span(self.bytes, token))
             .flatten()
     }
+    /// Validated JSON number bytes without whole-number UTF-8 rescanning.
+    pub fn as_number_bytes(self) -> Option<&'a [u8]> {
+        let token = self.token()?;
+        (token.kind == Kind::Number)
+            .then(|| raw_span(self.bytes, token))
+            .flatten()
+    }
     pub fn as_number(self) -> Option<&'a str> {
         let token = self.token()?;
         (token.kind == Kind::Number)

@@ -41,6 +41,7 @@
 )]
 
 pub mod arena;
+pub mod arena_emit;
 pub mod retain;
 pub mod string;
 pub mod string_array;

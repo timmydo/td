@@ -2863,9 +2863,13 @@ refusal is planned as HTTP 400 with a redacted generic problem body; it is
 neither notJSON nor an advertised Core limit. Storage/configuration faults
 remain HTTP 500 server failures. The unreachable parser-byte Resource display
 arm is defensive: byte admission maps to MaxSizeRequest. HTTP mapping still
-needs integration tests. No discovery, dispatch or response retention is
-activated. Disk-backed results and the Core dispatcher remain required before
-advertising JMAP.
+needs integration tests. Shared OwnedEmitter provides bounded emission
+and exact per-value counting from the immutable owned arena,
+using the shared scalar escaper and a fixed traversal stack. It returns the
+source on completion, refusal or cancellation. It does not resolve result
+references, reserve response capacity or check live admission. No discovery,
+dispatch or response retention is activated. Disk-backed results and the
+Core dispatcher remain required before advertising JMAP.
 
 **Private response retention.**
 
