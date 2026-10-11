@@ -11,11 +11,45 @@ type Files = BTreeMap<String, Vec<u8>>;
 
 const ARCHIVE_SIZE: u64 = 1_080_786;
 const ARCHIVE_SHA: &str = "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4";
-const HEADER_SHA: &str = "a673b15579a83881c2d9aa61a65ce26dd62557d16c497e5a04e4e6a8bb6d601b";
-fn source_receipt() -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Architecture {
+    X86_64,
+    Aarch64,
+}
+
+impl Architecture {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "x86_64" => Ok(Self::X86_64),
+            "aarch64" => Ok(Self::Aarch64),
+            _ => Err("musl header architecture must be x86_64 or aarch64".into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    fn header_sha(self) -> &'static str {
+        match self {
+            Self::X86_64 => "a673b15579a83881c2d9aa61a65ce26dd62557d16c497e5a04e4e6a8bb6d601b",
+            Self::Aarch64 => "28de375648bca0be1af345c98b542e3eac2cc714b473ee4d9a831d96a3cc5c5c",
+        }
+    }
+}
+
+fn source_receipt(architecture: Architecture) -> String {
+    let scope = match architecture {
+        Architecture::X86_64 => "libc comes from the pinned Rust target std",
+        Architecture::Aarch64 => "header preparation only; no libc or Rust target library included",
+    };
+    let architecture = architecture.name();
     format!(
         "https://musl.libc.org/releases/musl-1.2.5.tar.gz\nsha256 {ARCHIVE_SHA}\n\
-         headers x86_64 musl-1.2.5; libc comes from the pinned Rust target std\n"
+         headers {architecture} musl-1.2.5; {scope}\n"
     )
 }
 
@@ -152,11 +186,12 @@ fn header_digest(headers: &Files) -> String {
     crate::sha256::to_base16(&hash.finalize())
 }
 
-fn collect_headers(source: &Path) -> Result<Files> {
+fn collect_headers(source: &Path, architecture: Architecture) -> Result<Files> {
     let mut headers = Files::new();
     files(&source.join("include"), "", 0, &mut headers)?;
     headers.retain(|name, _| name.ends_with(".h") && name.split('/').count() <= 2);
-    for dir in ["arch/generic/bits", "arch/x86_64/bits"] {
+    let arch_bits = format!("arch/{}/bits", architecture.name());
+    for dir in ["arch/generic/bits", arch_bits.as_str()] {
         let mut bits = Files::new();
         files(&source.join(dir), "", 0, &mut bits)?;
         for (name, bytes) in bits {
@@ -165,7 +200,7 @@ fn collect_headers(source: &Path) -> Result<Files> {
             }
         }
     }
-    let declarations = text(&source.join("arch/x86_64/bits/alltypes.h.in"))?
+    let declarations = text(&source.join(&arch_bits).join("alltypes.h.in"))?
         + &text(&source.join("include/alltypes.h.in"))?;
     headers.insert(
         "bits/alltypes.h".into(),
@@ -173,15 +208,19 @@ fn collect_headers(source: &Path) -> Result<Files> {
     );
     headers.insert(
         "bits/syscall.h".into(),
-        syscalls(&text(&source.join("arch/x86_64/bits/syscall.h.in"))?).into_bytes(),
+        syscalls(&text(&source.join(&arch_bits).join("syscall.h.in"))?).into_bytes(),
     );
     Ok(headers)
 }
 
-fn generate(source: &Path) -> Result<Files> {
-    let headers = collect_headers(source)?;
-    if headers.len() != 218 || header_digest(&headers) != HEADER_SHA {
-        return Err("musl headers differ from upstream install-headers output".into());
+fn generate(source: &Path, architecture: Architecture) -> Result<Files> {
+    let headers = collect_headers(source, architecture)?;
+    let digest = header_digest(&headers);
+    if headers.len() != 218 || digest != architecture.header_sha() {
+        return Err(format!(
+            "musl {} headers differ from upstream install-headers output: {} files (expected 218), SHA-256 {digest} (expected {})",
+            architecture.name(), headers.len(), architecture.header_sha()
+        ));
     }
     let mut output: Files = headers
         .into_iter()
@@ -191,7 +230,7 @@ fn generate(source: &Path) -> Result<Files> {
         "COPYRIGHT".into(),
         read(&source.join("COPYRIGHT"), 1024 * 1024)?,
     );
-    output.insert("SOURCE".into(), source_receipt().into_bytes());
+    output.insert("SOURCE".into(), source_receipt(architecture).into_bytes());
     Ok(output)
 }
 
@@ -205,6 +244,14 @@ fn verify_tree(path: &Path, expected: &Files) -> Result<()> {
 }
 
 pub(crate) fn prepare(root: &Path, archive: &Path) -> Result<PathBuf> {
+    prepare_architecture(root, archive, Architecture::X86_64)
+}
+
+pub(crate) fn prepare_architecture(
+    root: &Path,
+    archive: &Path,
+    architecture: Architecture,
+) -> Result<PathBuf> {
     // Hash the bytes we extract, not a path reopened after verification.
     let bytes = read(archive, ARCHIVE_SIZE)?;
     if bytes.len() as u64 != ARCHIVE_SIZE || crate::sha256::hex_digest(&bytes) != ARCHIVE_SHA {
@@ -215,13 +262,19 @@ pub(crate) fn prepare(root: &Path, archive: &Path) -> Result<PathBuf> {
     let source = scratch.0.join("source");
     let tar = crate::gzip::decompress_bytes(&bytes)?;
     crate::tar::extract_tar_reader(&mut Cursor::new(tar), "verified musl-1.2.5", &source)?;
-    let expected = generate(&source.join("musl-1.2.5"))?;
-    publish(&scratch, &parent, &expected)
+    let expected = generate(&source.join("musl-1.2.5"), architecture)?;
+    publish(&scratch, &parent, &expected, architecture)
 }
 
-fn publish(scratch: &Scratch, parent: &Path, expected: &Files) -> Result<PathBuf> {
+fn publish(
+    scratch: &Scratch,
+    parent: &Path,
+    expected: &Files,
+    architecture: Architecture,
+) -> Result<PathBuf> {
     let destination = parent.join(format!(
-        "crypto-musl-x86_64-1.2.5-{}",
+        "crypto-musl-{}-1.2.5-{}",
+        architecture.name(),
         header_digest(expected)
     ));
     match fs::symlink_metadata(&destination) {
@@ -327,7 +380,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, contents).unwrap();
         }
-        let headers = collect_headers(&scratch.0).unwrap();
+        let headers = collect_headers(&scratch.0, Architecture::X86_64).unwrap();
         assert_eq!(headers.len(), 6);
         assert_eq!(headers.get("bits/override.h").unwrap(), b"architecture\n");
         assert_eq!(headers.get("bits/retained.h").unwrap(), b"retained\n");
@@ -341,32 +394,111 @@ mod tests {
             headers.get("bits/syscall.h").unwrap(),
             b"#define __NR_read 0\n#define SYS_read 0\n"
         );
-        assert!(generate(&scratch.0)
+        assert!(generate(&scratch.0, Architecture::X86_64)
             .unwrap_err()
             .contains("upstream install-headers"));
     }
 
     #[test]
+    fn architecture_selection_cannot_fall_back_or_escape_the_source() {
+        assert_eq!(Architecture::parse("x86_64").unwrap(), Architecture::X86_64);
+        assert_eq!(
+            Architecture::parse("aarch64").unwrap(),
+            Architecture::Aarch64
+        );
+        for invalid in ["", "arm64", "../x86_64", "aarch64-unknown-linux-musl"] {
+            assert!(Architecture::parse(invalid).is_err());
+        }
+        let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
+        for (path, contents) in [
+            ("include/alltypes.h.in", "TYPEDEF int pid_t;\n"),
+            ("arch/generic/bits/override.h", "generic\n"),
+            ("arch/x86_64/bits/override.h", "x86 header\n"),
+            ("arch/x86_64/bits/alltypes.h.in", "#define _Addr long\n"),
+            ("arch/x86_64/bits/syscall.h.in", "#define __NR_read 0\n"),
+            ("arch/aarch64/bits/override.h", "arm header\n"),
+            (
+                "arch/aarch64/bits/alltypes.h.in",
+                "#define _Addr long int\n",
+            ),
+            ("arch/aarch64/bits/syscall.h.in", "#define __NR_read 63\n"),
+        ] {
+            let path = scratch.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let arm = collect_headers(&scratch.0, Architecture::Aarch64).unwrap();
+        let x86 = collect_headers(&scratch.0, Architecture::X86_64).unwrap();
+        assert_eq!(arm.get("bits/override.h").unwrap(), b"arm header\n");
+        assert_eq!(x86.get("bits/override.h").unwrap(), b"x86 header\n");
+        assert_eq!(
+            arm.get("bits/syscall.h").unwrap(),
+            b"#define __NR_read 63\n#define SYS_read 63\n"
+        );
+        let pid = "#if defined(__NEED_pid_t) && !defined(__DEFINED_pid_t)\ntypedef int pid_t;\n#define __DEFINED_pid_t\n#endif\n\n";
+        assert_eq!(
+            arm.get("bits/alltypes.h").unwrap(),
+            format!("#define _Addr long int\n{pid}").as_bytes()
+        );
+        assert_eq!(
+            x86.get("bits/alltypes.h").unwrap(),
+            format!("#define _Addr long\n{pid}").as_bytes()
+        );
+        fs::remove_file(scratch.0.join("arch/aarch64/bits/alltypes.h.in")).unwrap();
+        assert!(collect_headers(&scratch.0, Architecture::Aarch64).is_err());
+        assert!(collect_headers(&scratch.0, Architecture::X86_64).is_ok());
+        assert_ne!(
+            Architecture::X86_64.header_sha(),
+            Architecture::Aarch64.header_sha()
+        );
+        assert!(source_receipt(Architecture::Aarch64).contains("headers aarch64"));
+    }
+
+    #[test]
     fn publication_and_reuse_bind_receipt_bytes_to_the_cache_name() {
+        let architecture = Architecture::X86_64;
         let scratch = Scratch::new(&std::env::temp_dir()).unwrap();
         let parent = scratch.0.join("cache");
         fs::create_dir(&parent).unwrap();
         let expected = Files::from([
             ("include/header.h".into(), b"header".to_vec()),
-            ("SOURCE".into(), source_receipt().into_bytes()),
+            ("SOURCE".into(), source_receipt(architecture).into_bytes()),
         ]);
-        let first = publish(&scratch, &parent, &expected).unwrap();
-        assert_eq!(publish(&scratch, &parent, &expected).unwrap(), first);
+        let first = publish(&scratch, &parent, &expected, architecture).unwrap();
+        assert_eq!(
+            publish(&scratch, &parent, &expected, architecture).unwrap(),
+            first
+        );
         let mut changed = expected.clone();
         changed.insert("SOURCE".into(), b"new receipt".to_vec());
-        let second = publish(&scratch, &parent, &changed).unwrap();
+        let second = publish(&scratch, &parent, &changed, architecture).unwrap();
         assert_ne!(first, second);
         verify_tree(&first, &expected).unwrap();
         verify_tree(&second, &changed).unwrap();
         fs::write(first.join("include/header.h"), b"changed").unwrap();
-        assert!(publish(&scratch, &parent, &expected)
+        assert!(publish(&scratch, &parent, &expected, architecture)
             .unwrap_err()
             .contains("remove this cache entry and retry"));
-        assert!(source_receipt().contains(ARCHIVE_SHA));
+        assert!(source_receipt(architecture).contains(ARCHIVE_SHA));
+        let arm = Files::from([
+            ("include/header.h".into(), b"arm header".to_vec()),
+            (
+                "SOURCE".into(),
+                source_receipt(Architecture::Aarch64).into_bytes(),
+            ),
+        ]);
+        let arm_path = publish(&scratch, &parent, &arm, Architecture::Aarch64).unwrap();
+        assert!(arm_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("crypto-musl-aarch64-1.2.5-"));
+        assert_ne!(arm_path, first);
+        assert_eq!(
+            publish(&scratch, &parent, &arm, Architecture::Aarch64).unwrap(),
+            arm_path
+        );
+        verify_tree(&arm_path, &arm).unwrap();
     }
 }

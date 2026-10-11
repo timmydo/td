@@ -1032,7 +1032,8 @@ contact no external service and add no fixture dependency.
 M03b1 pins versions, features, licenses and roots; M03b2 pins the portable
 native build inputs.
 M03b2a implements checksum-pinned x86-64 musl header preparation as specified
-in `PORTABLE.md`. It invokes no compiler or upstream script. M03b2b adds the
+in `PORTABLE.md`. Its aarch64 extension prepares headers for the planned ARM
+artifact. Neither invokes a compiler or upstream script. M03b2b adds the
 pinned host Rust kit and retained td GNU recipe outputs. M03b2c implements the
 isolated static musl build, packaging binary and clean-runtime smoke specified
 in PORTABLE.md. M03b2d1 adds compiler-resolved API confinement;

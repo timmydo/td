@@ -3436,6 +3436,19 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
                 Err(e) => fail(&e),
             }
         }
+        [op, flag, archive, arch_flag, arch]
+            if op == "crypto-musl-headers" && flag == "--archive" && arch_flag == "--arch" =>
+        {
+            match crate::crypto_headers::Architecture::parse(arch).and_then(|architecture| {
+                crate::crypto_headers::prepare_architecture(&root, Path::new(archive), architecture)
+            }) {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e),
+            }
+        }
         [op, flag, archives] if op == "crypto-portable-prepare" && flag == "--archives" => {
             match crate::crypto_portable::prepare(&root, Path::new(archives)) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -3510,7 +3523,7 @@ pub(crate) fn gate_crates_cli(args: &[String]) -> ExitCode {
             eprintln!("       td-builder gate-crates names");
             eprintln!("       td-builder gate-crates crypto-cargo test|clippy --manifest-path CRATE/Cargo.toml");
             eprintln!(
-                "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz"
+                "       td-builder gate-crates crypto-musl-headers --archive musl-1.2.5.tar.gz [--arch x86_64|aarch64]"
             );
             eprintln!("       td-builder gate-crates crypto-portable-prepare --archives DIRECTORY");
             eprintln!("       td-builder gate-crates crypto-portable-build --archives DIRECTORY");
