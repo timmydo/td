@@ -97,10 +97,14 @@ encoded-header adapters or combined service RSS.
   16 KiB state. The fixed recipient cell must hold the SMTP path plus metadata.
 - HTTPS: request bytes, 16 bytes per JSON token, 128 bytes per largest
   get/set/query result window entry, and 96 KiB framing/output scratch.
-  Escaped values are streamed; property keys are unescaped in place before
-  request tokens borrow the request arena. Unescaping cannot expand the UTF-8
-  byte length; the future JSON parser must validate escapes and update token
-  extents before immutable borrowing. No separate decoded-key arena is owned.
+  Keys and string values are unescaped in place before request tokens borrow
+  the request arena. Unescaping cannot expand the UTF-8 byte length; the
+  shared JSON arena parser validates escapes and updates token extents
+  before immutable borrowing. Output re-escapes strings into the bounded
+  sink. No separate decoded-string arena is owned. The current arena parser
+  runs synchronously and is inert in HTTPS. Resumable tokenization and key
+  sorting under the bounded-step rule below remain activation obligations;
+  whole-buffer bounded allocation is not scheduler qualification.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams use slots
   without pinning storage views between emissions.

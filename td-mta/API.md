@@ -1315,11 +1315,18 @@ original requested key and its field capitalization are preserved.
 Convenience aliases use the standard canonical field names, forms and last-
 occurrence behavior only in Email context. BodyPart context recognizes
 parameterized keys; an Email convenience alias returns None so the body-part
-dispatcher can reject unsupported properties. The future JSON parser decodes
-property keys in place in the admitted request arena before borrowing them
-here; unescaping cannot expand their UTF-8 byte length. It must validate
-JSON escapes and update token extents before sharing immutable keys. This
+dispatcher can reject unsupported properties. The shared JSON arena parser
+decodes keys and string values in place in the admitted request arena before
+borrowing them here; unescaping cannot expand their UTF-8 byte length. It validates
+escapes and updates token extents before sharing immutable views. This
 selector neither decodes JSON nor owns a second key copy.
+
+Before JMAP activation, bridge the raw escaped-fragment body-property cursors
+in sections 1.145/1.146 to these decoded arena views. Their current input is
+not a slice of the mutated request buffer: container tokens have no raw JSON
+span and decoded strings leave stale trailing bytes. Use a bounded charged
+serialization adapter or migrate those readers to borrowed value traversal;
+do not pass the original encoded fragment after arena parsing.
 
 Raw is permitted for every field. Other forms enforce RFC 8621 sections
 4.1.2.2-7, including obsolete Resent-Reply-To and the RFC 2369 list fields.
@@ -6217,6 +6224,8 @@ admission and current authenticated publication remain unqualified.
 
 ### 1.145 Decode a bodyProperties JSON argument
 
+JMAP activation must satisfy section 1.28's decoded-arena bridge obligation.
+
 M06en adds body_properties::json::Cursor over an already UTF-8 admitted
 argument fragment, fixed caller-owned key-reference slots and cells
 borrowing caller-preallocated Strings. Cold Cell::new clears each String;
@@ -6275,6 +6284,8 @@ selection-to-composition wiring and current authenticated publication
 remain unqualified.
 
 ### 1.146 Decode and select one bodyProperties argument
+
+JMAP activation must satisfy section 1.28's decoded-arena bridge obligation.
 
 M06eo adds body_properties::request::Cursor, a facade joining §1.145's
 JSON argument decoder with §1.144's semantic selection over the same

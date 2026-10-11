@@ -37,6 +37,7 @@ pub mod http_request;
 pub mod https;
 pub mod ids;
 pub use td_mime::json_string;
+pub mod jmap_request;
 pub mod limits;
 pub mod mailbox_parents;
 pub mod mailbox_sweep;

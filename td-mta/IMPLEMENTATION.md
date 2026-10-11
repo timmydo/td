@@ -2827,6 +2827,26 @@ Mail listing/retrieval/download integration and a real td-mail fixture
 follow in M14. DESIGN section 10 owns the initial framing restrictions
 and the enclosing driver's outstanding admission obligations.
 
+M13d adds the inert `jmap_request` boundary with shared 16-byte token storage with
+in-place string decoding and no parser allocation. It validates the entire
+RFC 8620 Request before exposing borrowed invocations. It rejects I-JSON
+noncharacters in keys and values, preserves opaque call IDs and the optional
+creation map, and ignores unknown top-level properties. Input byte/method
+limits remain distinct from internal depth and token exhaustion. Core
+activation must validate that configured bytes, depth and tokens admit the
+basic envelope at the advertised method count.
+
+The parser is synchronous. Resumable tokenization/sorting under RESOURCES.md's
+bounded-step rule, and API.md's bridge from raw escaped body-property fragments
+to decoded values, remain required before activation. Internal depth/token
+refusal is planned as HTTP 400 with a redacted generic problem body; it is
+neither notJSON nor an advertised Core limit. Storage/configuration faults
+remain HTTP 500 server failures. The unreachable parser-byte Resource display
+arm is defensive: byte admission maps to MaxSizeRequest. HTTP mapping still
+needs integration tests. No discovery, dispatch or response retention is
+activated. Disk-backed results and the Core dispatcher remain required before
+advertising JMAP.
+
 Use ADMISSION.md's exact bounded response spool, creation-ID map, result
 reference evaluation and per-method capacity preflight. Required tests include
 query/mutation/reference ordering and failure after an earlier committed method.

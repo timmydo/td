@@ -40,6 +40,7 @@
     clippy::indexing_slicing
 )]
 
+pub mod arena;
 pub mod retain;
 pub mod string;
 pub mod string_array;

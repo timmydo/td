@@ -113,3 +113,17 @@ Manifest or lock changes require a matching reviewed policy amendment;
 ordinary source changes do not change those pins. The crate remains std-only
 and shared by other td consumers. Unsafe code is forbidden crate-wide; the
 incremental string module denies warnings during Clippy runs.
+
+## Borrowed token arena
+
+The `arena` module parses without allocation into caller-owned mutable bytes
+and 16-byte token cells. Its `Document` borrows both backings immutably after
+in-place string/key decoding; failed parsing invalidates both. Arrays retain
+input order, while object iteration sorts decoded keys using token links and
+rejects duplicates without a separate key arena. `ParseLimits` bounds bytes,
+container depth (capped by `MAX_DEPTH`) and tokens. Inputs
+and token storage must each have fewer than `u32::MAX` entries. Errors are
+redacted, allocation-free classifications with raw byte offsets; insufficient
+caller token storage is distinct from the configured token ceiling. This is
+ordinary JSON; protocol-specific I-JSON character restrictions stay with the
+caller. There is no heap tree or owned conversion in this API.
