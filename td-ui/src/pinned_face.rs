@@ -4,15 +4,14 @@
 //! `./install-fonts`; it never fails to start for want of it. A consumer
 //! passes its `SETTING` value, as it passes the Wayland endpoint's, and
 //! `bitmap` keeps it on the bitmap face without reading anything. A widget
-//! program reads the regular style alone, since the draw stream has no bold
-//! weight; a terminal reads all four as one `Face`, fitted to its cell or
-//! at a size of its own (`styles_or_note`), which `vt_render::render_with`
-//! draws through.
+//! program reads the regular style alone unless it draws bold or italic
+//! glyphs, when it reads all four (`load_styled_or_note`); a terminal reads
+//! all four as one `Face`, fitted to its cell or at a size of its own
+//! (`styles_or_note`), which `vt_render::render_with` draws through.
 
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::face::{Face, Sizing};
 pub use crate::face_file::SETTING;
@@ -35,6 +34,45 @@ pub fn load_in(places: &[Place]) -> Result<Typeface, String> {
 pub fn load_from(dir: &Path) -> Result<Typeface, String> {
     let bytes = face_file::read(dir, REGULAR)?;
     Typeface::new(bytes, None).map_err(|why| format!("{}: {why}", dir.join(REGULAR).display()))
+}
+
+/// The four styles from `dir` as a widget program's `Typeface`, for one
+/// whose glyphs are bold or italic; a refused face is an error naming the
+/// directory and the pair of styles the refusing step read.
+pub fn load_styled_from(dir: &Path) -> Result<Typeface, String> {
+    four_styles(dir, |[regular, bold, italic, bold_italic]| {
+        let upright = Typeface::new(regular, Some(bold)).map_err(|why| ([REGULAR, BOLD], why))?;
+        upright
+            .with_slant(Some(italic), Some(bold_italic))
+            .map_err(|why| ([ITALIC, BOLD_ITALIC], why))
+    })
+}
+
+/// `load_styled_from` the first of `places` that holds the regular style:
+/// every style is read from that one directory.
+pub fn load_styled_in(places: &[Place]) -> Result<Typeface, String> {
+    load_styled_from(&face_file::find(places)?)
+}
+
+/// `load_or_note` reading the four styles: a missing style is the whole
+/// face refused, as `styles_or_note` says, so the program's styled text
+/// never draws upright in an outline face beside a bitmap fallback.
+pub fn load_styled_or_note(program: &str, setting: Option<&OsStr>) -> Option<Typeface> {
+    load_styled_in_or_note(&face_file::host_places(), program, setting)
+}
+
+/// `load_styled_or_note` from `places`.
+pub fn load_styled_in_or_note(
+    places: &[Place],
+    program: &str,
+    setting: Option<&OsStr>,
+) -> Option<Typeface> {
+    if !face_file::wanted(setting) {
+        return None;
+    }
+    load_styled_in(places)
+        .map_err(|why| note(program, &why))
+        .ok()
 }
 
 /// `load`, or a line on standard error naming `program`, why it draws
@@ -64,15 +102,31 @@ pub fn load_in_or_note(
 /// refused face is an error naming the directory and the pair of styles
 /// the refusing step read.
 pub fn styles_from(dir: &Path, sizing: Sizing) -> Result<Face, String> {
-    let read = |name: &str| face_file::read(dir, name).map(Arc::<[u8]>::from);
-    let refused = |styles: [&str; 2], why: crate::sfnt::Error| {
-        let [first, second] = styles;
-        format!("{} ({first} or {second}): {why}", dir.display())
-    };
-    Face::with_sizing(read(REGULAR)?, Some(read(BOLD)?), sizing)
-        .map_err(|why| refused([REGULAR, BOLD], why))?
-        .with_slant(Some(read(ITALIC)?), Some(read(BOLD_ITALIC)?))
-        .map_err(|why| refused([ITALIC, BOLD_ITALIC], why))
+    four_styles(dir, |[regular, bold, italic, bold_italic]| {
+        let upright = Face::with_sizing(regular.into(), Some(bold.into()), sizing)
+            .map_err(|why| ([REGULAR, BOLD], why))?;
+        upright
+            .with_slant(Some(italic.into()), Some(bold_italic.into()))
+            .map_err(|why| ([ITALIC, BOLD_ITALIC], why))
+    })
+}
+
+/// The four styles' bytes from `dir`, read in turn, made into a face by
+/// `make`, whose refusal names the pair of styles the refusing step read;
+/// an error names the directory.
+fn four_styles<T>(
+    dir: &Path,
+    make: impl FnOnce([Vec<u8>; 4]) -> Result<T, ([&'static str; 2], crate::sfnt::Error)>,
+) -> Result<T, String> {
+    let read = |name: &str| face_file::read(dir, name);
+    let bytes = [
+        read(REGULAR)?,
+        read(BOLD)?,
+        read(ITALIC)?,
+        read(BOLD_ITALIC)?,
+    ];
+    make(bytes)
+        .map_err(|([first, second], why)| format!("{} ({first} or {second}): {why}", dir.display()))
 }
 
 /// The four styles from the first of `places` that holds the regular

@@ -339,7 +339,10 @@ of its own files may name each module.
   `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
   consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
   `MIME_BYTES`.
-- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle`, `Primitive`
+- `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle` (its
+  ink, background, weight and `font_style`, an `atlas::Style`; `medium`
+  and `regular` over an ink and a background, `bold` and `italic` the
+  same style bold or italic), `Primitive`
   (`Fill`, `Glyph`, and `Mark`, a scalar of the hint face in one ink),
   `Draw`, `fill` (a `Fill` of a whole rectangle clipped to the damage,
   the one most widgets and clients stream), `Surface`, the `Composition`
@@ -400,7 +403,10 @@ of its own files may name each module.
   `MAX_CELL_AXIS`; refusals are `sfnt::Error`.
 - `typeface`: `Typeface` (`new` over the regular style's bytes and an
   optional bold style's, refused as a face fitted to the grid's cell at
-  scale one is; `face` at a `Scale`, refitted when the scale changes).
+  scale one is; `with_slant` over optional italic and bold italic
+  styles' bytes, refused as `Face::with_slant` refuses them at scale
+  one; `face` at a `Scale`, every style refitted when the scale
+  changes).
 - `face_file`: `DIR`, `INSTALLED` (the same directory under the XDG
   data home) and the four styles' file names (`REGULAR`, `BOLD`,
   `ITALIC`, `BOLD_ITALIC`); `SETTING` (`TD_UI_FACE`), the variable whose
@@ -463,7 +469,11 @@ of its own files may name each module.
   four styles as one `Face` sized as a `Sizing` asks, read from the one
   directory that holds the regular style and refused whole if a style
   is missing or refused, with `styles_or_note` and `styles_in_or_note`
-  taking the setting and saying so as the regular loaders do.
+  taking the setting and saying so as the regular loaders do; and, for
+  a widget program whose glyphs are bold or italic, `load_styled_from`
+  and `load_styled_in`, the four styles as a `Typeface`, refused whole
+  as the terminal's are, with `load_styled_or_note` and
+  `load_styled_in_or_note`.
 - `hint`: the hint face, a hand-authored 4x5 glyph (`WIDTH`, `HEIGHT`,
   `ADVANCE` 5) per printable ASCII scalar, `glyph` and the pixel `width`
   of a text; a scalar it lacks is a box. It is the small lighter text a
@@ -1524,7 +1534,9 @@ relative path rather than carrying a copy.
 
 `tests/raster.rs` holds the pixel oracles moved from td-editor's render
 suite (fills and glyphs at every scale and weight against per-pixel
-references), the validation order, a literal surface's ceilings, a
+references), the bitmap face's bold smear and italic lean with Medium's
+fringe following them, per pixel at two scales and clipped to the cell,
+the validation order, a literal surface's ceilings, a
 composition for another surface refused unpainted, and scrollbar
 proportions along both axes. td-editor's render suite keeps the
 scene-level oracles and the `--preview` checksum, which is byte-identical
@@ -1566,11 +1578,13 @@ once with misses remembered, and pixel oracles over a buffer of garbage
 explicit background, the cell and draw clips, blank glyphs writing
 nothing, the missing glyph equal to a bitmap raster's centred one at
 scales one and two, every weight drawing the regular style even when the
-face has a bold one, the bold style at the bold file's own units per em
-and falling back to its regular outline, a Bold lookup on a face without
-one the regular slot, fills and marks unchanged, and a padded stride at
-scale three whose padding is never written, with origins at the i64
-extremes writing nothing. For the fit it holds the cell, size, baseline
+face has a bold one, a glyph's font style drawing the style the face has
+(bold, italic upright without an italic, bold italic as bold, and a
+scalar the face lacks bold through the bitmap fallback), the bold style
+at the bold file's own units per em and falling back to its regular
+outline, a Bold lookup on a face without one the regular slot, fills
+and marks unchanged, and a padded stride at scale three whose padding is
+never written, with origins at the i64 extremes writing nothing. For the fit it holds the cell, size, baseline
 and pen for the four grid cells and two others, the fit's refusals, an
 exact square from the pen and baseline, a full-width glyph leaving no seam
 between two cells, an integral advance centred to the pixel, a tall line
@@ -1589,7 +1603,11 @@ its scale, at two scales in turn, the `notices` literal naming the
 directory the loader reads, and the loader over a directory the test
 writes: the regular style read, and a missing file, a file past the
 reader's bound (refused before it is read), a refused font and a
-directory each an error naming the path.
+directory each an error naming the path; and a widget program's four
+styles loaded as a typeface whose faces keep bold, italic and bold
+italic at scales one, two and one again, an upright typeface resolving
+every style to regular, a refused slant, the bitmap setting, and a
+missing style refusing the typeface.
 
 `tests/chrome.rs` holds the band oracles, draw-stream checks that read each
 band's fills and glyphs: the menu bar's fill, its labels from cell
@@ -3531,12 +3549,16 @@ from the explicit background a caller paints, and it means a repaint is
 independent of old pixels. It is also exactly a GPU fragment shader with
 blending off, so a CPU frame and a GPU frame of one draw stream are
 pixel-identical by construction. Zero coverage writes nothing, as an unset
-bitmap pixel does. Every weight draws the regular style: `Weight::Medium`
-is the bitmap face's body text, its fringe thickening a thin face, not a
-bold. The bold, italic and bold italic styles, each covered at its own
-file's units per em, are reached through `Face::glyph`; the stream has no
-bold weight, and td-term, which draws them, reads the atlas directly
-(see "td-term"). An entry is valid
+bitmap pixel does. A weight is no bold: `Weight::Medium` is the bitmap
+face's body text, its fringe thickening a thin face. A glyph's
+`font_style` picks the outline's style through `Face::glyph`, which
+resolves it to what the face has (bold italic to italic, then bold, any
+to regular); the bold, italic and bold italic styles are each covered at
+its own file's units per em. On the bitmap face, which has one style, a
+bold glyph lights the column right of each lit pixel and an italic one
+leans its top half a pixel right, td-term's own bitmap rendition, both
+clipped to the cell; Medium's fringe follows the shape so drawn.
+td-term reads the atlas directly (see "td-term"). An entry is valid
 in the epoch that placed it, and any miss may reset the page: a GPU
 backend holding a frame's entries compares epochs. Each entry's gutter is
 zeroed as it is placed, so a sampler filtering across its edge never
@@ -3574,8 +3596,10 @@ cells coincide.
 `typeface::Typeface` holds the style bytes once, shared, and fits a face
 at the scale asked for, refitting when it changes, so one atlas is held.
 `pinned_face::load` reads the regular style from the directory
-`face_file::find` finds (see "Delivery and trust position"), the only
-style the draw stream selects; the other three styles ship for td-term.
+`face_file::find` finds (see "Delivery and trust position"), which is all
+a program drawing no bold or italic glyph needs; one that draws them
+(td-agent's transcript) reads the four with `load_styled_or_note`, and
+td-term reads them as its own face.
 A program calls `load_or_note` at startup with the value of
 `TD_UI_FACE`, which it reads as it reads the Wayland endpoint's
 variables: `bitmap` keeps it on Unifont without reading anything;

@@ -71,9 +71,8 @@ fn surface(width: usize, height: usize, scale: u8) -> Surface {
 
 fn style(weight: Weight) -> GlyphStyle {
     GlyphStyle {
-        ink: INK,
-        background: PAPER,
         weight,
+        ..GlyphStyle::medium(INK, PAPER)
     }
 }
 
@@ -515,6 +514,71 @@ fn every_weight_draws_the_regular_style() {
         100
     );
     assert_eq!(both.atlas().len(), 1, "the regular slot alone");
+}
+
+#[test]
+fn a_glyph_draws_in_its_font_style_as_the_face_has_it() {
+    let s = surface(40, 30, 1);
+    let lit = |pixels: &[u8]| {
+        (0..30)
+            .flat_map(|y| (0..40).map(move |x| (x, y)))
+            .filter(|&(x, y)| !untouched(pixels, s, x, y))
+            .count()
+    };
+    let styled = |style: GlyphStyle| Draw {
+        clip: s.bounds(),
+        primitive: Primitive::Glyph {
+            x: 5,
+            y: 3,
+            scalar: 'a',
+            style,
+        },
+    };
+    let medium = GlyphStyle::medium(INK, PAPER);
+    let regular = lit(&paint(
+        &mut Face::new(face_bytes(false), None, 20).unwrap(),
+        s,
+        &[styled(medium)],
+    ));
+    let mut both = Face::new(face_bytes(false), Some(face_bytes(true)), 20).unwrap();
+    // The bold 'a' is a quarter of the regular one.
+    let bold = lit(&paint(&mut both, s, &[styled(medium.bold())]));
+    assert!(0 < bold && bold < regular, "{bold} of {regular}");
+    assert_eq!(both.atlas().len(), 1, "the bold slot alone");
+    // A face without italic draws an italic glyph upright, and a bold
+    // italic one bold.
+    assert_eq!(
+        lit(&paint(&mut both, s, &[styled(medium.italic())])),
+        regular
+    );
+    assert_eq!(
+        lit(&paint(&mut both, s, &[styled(medium.italic().bold())])),
+        bold
+    );
+    // Without a bold style, a bold glyph draws regular.
+    let mut plain = Face::new(face_bytes(false), None, 20).unwrap();
+    assert_eq!(
+        lit(&paint(&mut plain, s, &[styled(medium.bold())])),
+        regular
+    );
+    // A scalar the face lacks draws from the bitmap face in its style:
+    // bold, smeared to more pixels than upright.
+    let mut missing = |style: GlyphStyle| {
+        let draw = Draw {
+            primitive: Primitive::Glyph {
+                x: 5,
+                y: 3,
+                scalar: 'q',
+                style,
+            },
+            ..styled(style)
+        };
+        lit(&paint(&mut plain, s, &[draw]))
+    };
+    assert!(missing(medium.bold()) > missing(medium));
+    assert_eq!(medium.bold().italic(), medium.italic().bold());
+    assert_eq!(medium.bold().font_style, Style::Bold);
+    assert_eq!(medium.bold().italic().font_style, Style::BoldItalic);
 }
 
 #[test]

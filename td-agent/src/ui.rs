@@ -38,8 +38,7 @@ use td_ui::editor_model::TabId;
 use td_ui::keys::{self, Section};
 use td_ui::messages::{self, Error as MessagesError, Message, Side, Target, Tone};
 use td_ui::raster::{
-    self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK,
-    PAPER,
+    self, Composition, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER,
 };
 use td_ui::split;
 use td_ui::tree_table::{self, Cell, Column, Model, Row as TreeRow};
@@ -6407,11 +6406,7 @@ impl App {
                     rect.y + ((at * ROW + 4) * s) as i64,
                 ),
                 rect,
-                GlyphStyle {
-                    ink: INK,
-                    background: CHROME,
-                    weight: Weight::Regular,
-                },
+                GlyphStyle::regular(INK, CHROME),
                 damage,
                 sink,
             );
@@ -6447,11 +6442,7 @@ impl App {
             line.chars(),
             (rect.x + (CELL_WIDTH * s) as i64, rect.y + (4 * s) as i64),
             rect,
-            GlyphStyle {
-                ink: INK,
-                background: CHROME,
-                weight: Weight::Regular,
-            },
+            GlyphStyle::regular(INK, CHROME),
             damage,
             sink,
         );
@@ -6483,11 +6474,7 @@ impl Composition for App {
                 "window too small".chars(),
                 (0, 0),
                 bounds,
-                GlyphStyle {
-                    ink: INK,
-                    background: PAPER,
-                    weight: Weight::Regular,
-                },
+                GlyphStyle::regular(INK, PAPER),
                 damage,
                 sink,
             );

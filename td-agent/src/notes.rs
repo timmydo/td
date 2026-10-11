@@ -15,9 +15,7 @@ use std::collections::VecDeque;
 
 use td_ui::chrome::ROW;
 use td_ui::messages::{self, Controller, Message};
-use td_ui::raster::{
-    self, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK, PAPER,
-};
+use td_ui::raster::{self, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, PAPER};
 use td_ui::window::{Clipboard, Input, NoClipboard, PointerPhase};
 use td_ui::CELL_WIDTH;
 
@@ -417,11 +415,7 @@ impl Panel {
                 text.chars(),
                 (rect.x + (CELL_WIDTH * s) as i64, rect.y + (4 * s) as i64),
                 rect,
-                GlyphStyle {
-                    ink: INK,
-                    background,
-                    weight: Weight::Regular,
-                },
+                GlyphStyle::regular(INK, background),
                 damage,
                 sink,
             );

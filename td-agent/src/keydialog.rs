@@ -21,7 +21,7 @@ use td_ui::confirmations::{
 };
 use td_ui::entry_model::{Action, EntryModel, Outcome as Typed, Refusal};
 use td_ui::raster::{
-    self, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK, LINE_NUMBER,
+    self, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, LINE_NUMBER,
 };
 use td_ui::window::{Clipboard, PointerPhase};
 use td_ui::CELL_WIDTH;
@@ -624,11 +624,7 @@ impl KeyDialog {
                 sink,
             );
         };
-        let plain = GlyphStyle {
-            ink: INK,
-            background: CHROME,
-            weight: Weight::Regular,
-        };
+        let plain = GlyphStyle::regular(INK, CHROME);
         line(layout.title, TITLE, GlyphStyle::medium(INK, CHROME), sink);
         let row = (ROW * s) as i64;
         for (at, text) in self.lines.iter().enumerate() {

@@ -26,7 +26,7 @@ use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SU
 use td_ui::clipboard::MAX_BYTES;
 use td_ui::data::{PLAIN, UTF8};
 use td_ui::keys::{self, Section};
-use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight, PAPER, SELECTED};
+use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, PAPER, SELECTED};
 use td_ui::theme::{HARBOR, MOSS, SAND};
 use td_ui::typeface::Typeface;
 use td_ui::wayland::{backing_file, peer, Connection, IDLE_WAIT};
@@ -172,11 +172,7 @@ impl td_ui::raster::Composition for Corner {
                 x: 40,
                 y: 16,
                 scalar: '0',
-                style: GlyphStyle {
-                    ink: BLUE,
-                    background: PAPER,
-                    weight: Weight::Regular,
-                },
+                style: GlyphStyle::regular(BLUE, PAPER),
             },
         });
     }

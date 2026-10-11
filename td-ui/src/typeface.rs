@@ -17,6 +17,9 @@ use crate::{CELL_HEIGHT, CELL_WIDTH};
 pub struct Typeface {
     regular: Arc<[u8]>,
     bold: Option<Arc<[u8]>>,
+    /// The italic and bold italic styles, for a program that draws them.
+    italic: Option<Arc<[u8]>>,
+    bold_italic: Option<Arc<[u8]>>,
     /// The face fitted at the scale last asked for, or its refusal, and
     /// that scale; another scale's replaces it, so one atlas is held and a
     /// refused fit is not retried until the scale changes.
@@ -33,8 +36,45 @@ impl Typeface {
         Ok(Self {
             regular,
             bold,
+            italic: None,
+            bold_italic: None,
             face: (1, Some(face)),
         })
+    }
+
+    /// This typeface with italic and bold italic styles, either absent,
+    /// refused as `Face::with_slant` refuses them at scale one.
+    pub fn with_slant(
+        mut self,
+        italic: Option<Vec<u8>>,
+        bold_italic: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        self.italic = italic.map(Arc::from);
+        self.bold_italic = bold_italic.map(Arc::from);
+        // The face fitted at scale one takes the slant, not a second fit.
+        let upright = match std::mem::replace(&mut self.face, (1, None)) {
+            (1, Some(face)) => face,
+            _ => self.upright(1)?,
+        };
+        let face = upright.with_slant(self.italic.clone(), self.bold_italic.clone())?;
+        self.face = (1, Some(face));
+        Ok(self)
+    }
+
+    /// The regular and bold styles fitted to the grid's cell at `scale`.
+    fn upright(&self, scale: usize) -> Result<Face, Error> {
+        Face::fit(
+            self.regular.clone(),
+            self.bold.clone(),
+            CELL_WIDTH.saturating_mul(scale),
+            CELL_HEIGHT.saturating_mul(scale),
+        )
+    }
+
+    /// Every style fitted to the grid's cell at `scale`.
+    fn fit(&self, scale: usize) -> Result<Face, Error> {
+        self.upright(scale)?
+            .with_slant(self.italic.clone(), self.bold_italic.clone())
     }
 
     /// The face fitted to the grid's cell at `scale`, refitted when the
@@ -42,14 +82,7 @@ impl Typeface {
     pub fn face(&mut self, scale: Scale) -> Option<&mut Face> {
         let scale = scale.value();
         if self.face.0 != scale {
-            let face = Face::fit(
-                self.regular.clone(),
-                self.bold.clone(),
-                CELL_WIDTH.saturating_mul(scale),
-                CELL_HEIGHT.saturating_mul(scale),
-            )
-            .ok();
-            self.face = (scale, face);
+            self.face = (scale, self.fit(scale).ok());
         }
         self.face.1.as_mut()
     }

@@ -67,15 +67,49 @@ pub struct GlyphStyle {
     pub ink: u32,
     pub background: u32,
     pub weight: Weight,
+    /// The outline face's style it draws in, as the face has it
+    /// (`Face::style`). The bitmap face draws a bold one with the column
+    /// right of each lit one lit too and an italic one with its top half a
+    /// pixel right, as td-term's bitmap cells do.
+    pub font_style: Style,
 }
 
 impl GlyphStyle {
+    /// `ink` over `background` at the bitmap face's body weight, in the
+    /// regular font style.
     pub fn medium(ink: u32, background: u32) -> Self {
         Self {
             ink,
             background,
             weight: Weight::Medium,
+            font_style: Style::Regular,
         }
+    }
+
+    /// `medium` at the regular weight, which has no fringe.
+    pub fn regular(ink: u32, background: u32) -> Self {
+        Self {
+            weight: Weight::Regular,
+            ..Self::medium(ink, background)
+        }
+    }
+
+    /// This style, bold.
+    pub fn bold(self) -> Self {
+        let font_style = match self.font_style {
+            Style::Italic | Style::BoldItalic => Style::BoldItalic,
+            Style::Regular | Style::Bold => Style::Bold,
+        };
+        Self { font_style, ..self }
+    }
+
+    /// This style, italic.
+    pub fn italic(self) -> Self {
+        let font_style = match self.font_style {
+            Style::Bold | Style::BoldItalic => Style::BoldItalic,
+            Style::Regular | Style::Italic => Style::Italic,
+        };
+        Self { font_style, ..self }
     }
 
     fn fringe(self) -> u32 {
@@ -472,6 +506,8 @@ enum Shape {
     Glyph {
         index: usize,
         fringe: Option<[u8; 4]>,
+        bold: bool,
+        italic: bool,
     },
     Mark([u8; hint::HEIGHT]),
 }
@@ -519,9 +555,9 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
 
     /// Executes every `Glyph` through `face` from here on: in the face's
     /// cell at the draw's origin, from its pen, covered into its atlas on
-    /// first use and blended over the style's explicit background, every
-    /// weight in the regular style (`Weight::Medium` is the bitmap face's
-    /// body text, not bold). A scalar
+    /// first use and blended over the style's explicit background, in the
+    /// style its `font_style` picks as the face has it (a weight is no
+    /// bold: `Weight::Medium` is the bitmap face's body text). A scalar
     /// the face lacks draws from the bitmap face, centred in the cell. The
     /// face is sized for the surface's pixels, scale included, by its
     /// owner, and the composition must lay its glyphs out on the face's
@@ -596,9 +632,9 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
             return;
         };
         // The stream's weights are the bitmap face's: Medium is its body
-        // text, the fringe thickening a thin face, so every weight draws the
-        // outline's regular style.
-        match face.glyph(Style::Regular, scalar) {
+        // text, the fringe thickening a thin face, so a weight is no bold;
+        // the glyph's font style picks the outline's.
+        match face.glyph(style.font_style, scalar) {
             Slot::Placed(entry) => {
                 let origin = (
                     x.saturating_add(cell.pen as i64),
@@ -650,6 +686,8 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                     index: self.font.index(scalar),
                     fringe: (style.weight == Weight::Medium)
                         .then(|| (style.fringe() | 0xff000000).to_le_bytes()),
+                    bold: matches!(style.font_style, Style::Bold | Style::BoldItalic),
+                    italic: matches!(style.font_style, Style::Italic | Style::BoldItalic),
                 },
             ),
             Primitive::Mark { x, y, scalar, ink } => (
@@ -677,16 +715,31 @@ impl<'pixels, 'font> Raster<'pixels, 'font> {
                 let mut paint = &bytes;
                 match &shape {
                     Shape::Solid => {}
-                    Shape::Glyph { index, fringe } => {
+                    Shape::Glyph {
+                        index,
+                        fringe,
+                        bold,
+                        italic,
+                    } => {
                         let col = x.saturating_sub(rect.x) as usize / scale;
-                        if !self.font.pixel(*index, col, row) {
+                        // Italic leans the top half a pixel right; bold
+                        // lights the column right of each lit one.
+                        let lean = usize::from(*italic && row < self.font.height() / 2);
+                        let font = self.font;
+                        let lit = |column: usize| {
+                            column.checked_sub(lean).is_some_and(|source| {
+                                font.pixel(*index, source, row)
+                                    || (*bold
+                                        && source
+                                            .checked_sub(1)
+                                            .is_some_and(|left| font.pixel(*index, left, row)))
+                            })
+                        };
+                        if !lit(col) {
                             let Some(fringe) = fringe else {
                                 continue;
                             };
-                            if !col
-                                .checked_sub(1)
-                                .is_some_and(|left| self.font.pixel(*index, left, row))
-                            {
+                            if !col.checked_sub(1).is_some_and(lit) {
                                 continue;
                             }
                             paint = fringe;

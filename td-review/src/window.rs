@@ -52,8 +52,8 @@ use td_ui::editor_error::Error as PaneError;
 use td_ui::editor_model::TabId;
 use td_ui::pointer::DoubleClick;
 use td_ui::raster::{
-    self, fill, Composition, Draw, GlyphStyle, Raster, Rect, Scrollbar, Surface, Weight, ACCENT,
-    CHROME, INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
+    self, fill, Composition, Draw, GlyphStyle, Raster, Rect, Scrollbar, Surface, ACCENT, CHROME,
+    INK, LINE_NUMBER, MISSPELLED, PAPER, SELECTED, SUCCESS, WARNING,
 };
 #[cfg(test)]
 use td_ui::window::NoClipboard;
@@ -175,14 +175,7 @@ fn paint_of(style: Style) -> (Option<u32>, GlyphStyle) {
         (false, Some(code)) => (None, ink(code)),
         (false, None) => (None, INK),
     };
-    (
-        band,
-        GlyphStyle {
-            ink,
-            background: band.unwrap_or(PAPER),
-            weight: Weight::Medium,
-        },
-    )
+    (band, GlyphStyle::medium(ink, band.unwrap_or(PAPER)))
 }
 
 /// A frame laid out over a surface: what the window paints and a test reads.

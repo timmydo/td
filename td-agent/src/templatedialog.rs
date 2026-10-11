@@ -19,7 +19,7 @@ use td_ui::confirmations::{
 };
 use td_ui::entry_model::{Action, EntryModel, Outcome as Typed, Refusal};
 use td_ui::raster::{
-    self, Draw, GlyphStyle, Primitive, Rect, Surface, Weight, BORDER, CHROME, INK, LINE_NUMBER,
+    self, Draw, GlyphStyle, Primitive, Rect, Surface, BORDER, CHROME, INK, LINE_NUMBER,
 };
 use td_ui::window::{Clipboard, PointerPhase};
 use td_ui::CELL_WIDTH;
@@ -923,11 +923,7 @@ impl TemplateDialog {
                 sink,
             );
         };
-        let plain = GlyphStyle {
-            ink: INK,
-            background: CHROME,
-            weight: Weight::Regular,
-        };
+        let plain = GlyphStyle::regular(INK, CHROME);
         let title = if self.editing.is_some() {
             EDIT_TITLE
         } else {

@@ -28,8 +28,10 @@ use td_ui::face_file::{
 };
 use td_ui::font::pinned;
 use td_ui::notices::OUTLINE_FACE;
-use td_ui::pinned_face::{load_from, load_in, load_in_or_note, styles_in_or_note, SETTING};
-use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface, Weight};
+use td_ui::pinned_face::{
+    load_from, load_in, load_in_or_note, load_styled_in_or_note, styles_in_or_note, SETTING,
+};
+use td_ui::raster::{Draw, GlyphStyle, Primitive, Raster, Rect, Scale, Surface};
 use td_ui::sfnt::{Error, MAX_FONT_BYTES};
 use td_ui::typeface::Typeface;
 use td_ui::{CELL_HEIGHT, CELL_WIDTH};
@@ -97,11 +99,7 @@ fn a_raster_given_a_typeface_draws_through_the_face_fitted_at_its_scale() {
                 x,
                 y: 0,
                 scalar,
-                style: GlyphStyle {
-                    ink: 0x102030,
-                    background: 0xf0e0d0,
-                    weight: Weight::Medium,
-                },
+                style: GlyphStyle::medium(0x102030, 0xf0e0d0),
             },
         })
     };
@@ -162,6 +160,45 @@ fn style(left: i32, bottom: i32, right: i32, top: i32) -> Vec<u8> {
     builder.advance = Some(500);
     builder.format4 = vec![Segment::Delta(0x30, 0x30, 1u16.wrapping_sub(0x30))];
     builder.font()
+}
+
+/// A widget program drawing styled glyphs loads the four styles as a
+/// typeface whose faces keep the slanted ones at every scale; a style
+/// missing, or the bitmap setting, is no typeface.
+#[test]
+fn a_styled_program_loads_four_styles_kept_at_every_scale() {
+    let dir = scratch("styled");
+    for (name, bytes) in [
+        (REGULAR, style(0, 0, 500, 500)),
+        (BOLD, style(0, 0, 250, 250)),
+        (ITALIC, style(250, 0, 500, 250)),
+        (BOLD_ITALIC, style(0, 250, 250, 500)),
+    ] {
+        fs::write(dir.join(name), bytes).unwrap();
+    }
+    let load = |setting: Option<&str>| {
+        let setting = setting.map(std::ffi::OsString::from);
+        load_styled_in_or_note(&[exact(&dir)], "test", setting.as_deref())
+    };
+    let mut typeface = load(None).expect("the four styles load");
+    for scale in [1, 2, 1] {
+        let face = typeface.face(Scale::new(scale).unwrap()).unwrap();
+        assert_eq!(face.style(true, true), Style::BoldItalic, "scale {scale}");
+        assert_eq!(face.style(false, true), Style::Italic, "scale {scale}");
+        assert_eq!(face.style(true, false), Style::Bold, "scale {scale}");
+    }
+    assert!(load(Some("bitmap")).is_none());
+    // An upright typeface has no slant; a refused slant is no typeface.
+    let mut upright = Typeface::new(style(0, 0, 500, 500), None).unwrap();
+    let face = upright.face(Scale::new(1).unwrap()).unwrap();
+    assert_eq!(face.style(true, true), Style::Regular);
+    assert!(Typeface::new(style(0, 0, 500, 500), None)
+        .unwrap()
+        .with_slant(Some(vec![0; 3]), None)
+        .is_err());
+    fs::remove_file(dir.join(BOLD_ITALIC)).unwrap();
+    assert!(load(None).is_none());
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A terminal's four styles load as one face fitted to its cell unless the

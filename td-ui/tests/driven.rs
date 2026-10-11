@@ -21,9 +21,7 @@ use td_ui::control_socket::Socket;
 use td_ui::control_worker::{Job, Worker};
 use td_ui::driven::{self, Binding, Controller, Input, Outcome, Payload, PointerPhase};
 use td_ui::keyboard::Held;
-use td_ui::raster::{
-    Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, Weight, INK, PAPER,
-};
+use td_ui::raster::{Composition, Draw, GlyphStyle, Primitive, Rect, Scale, Surface, INK, PAPER};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Error {
@@ -113,11 +111,7 @@ impl Counter {
                     x: (column + index as i64) * 8 * scale,
                     y: row * 16 * scale,
                     scalar,
-                    style: GlyphStyle {
-                        ink: INK,
-                        background: PAPER,
-                        weight: Weight::Regular,
-                    },
+                    style: GlyphStyle::regular(INK, PAPER),
                 },
             });
         }

@@ -215,10 +215,9 @@ fn glyph_scaling_clipping_and_fallback_match_font_row_bits() {
                                     y,
                                     scalar,
                                     style: GlyphStyle {
-                                        ink: 0xabcdef,
-                                        // Blue is 413/3: the oracle distinguishes floor from rounding.
-                                        background: 0x123457,
                                         weight,
+                                        // Blue is 413/3: the oracle distinguishes floor from rounding.
+                                        ..GlyphStyle::medium(0xabcdef, 0x123457)
                                     },
                                 },
                             });
@@ -262,6 +261,86 @@ fn glyph_scaling_clipping_and_fallback_match_font_row_bits() {
                             actual, expected,
                             "{scalar}, scale {scale}, {weight:?}, ({x},{y})"
                         );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The bitmap face draws a bold glyph with the column right of each lit
+/// pixel lit too, and an italic one with its top half a pixel right, at
+/// every scale; Medium's fringe follows the shape drawn.
+#[test]
+fn bitmap_bold_and_italic_glyphs_smear_and_lean_per_pixel() {
+    let font = font::pinned().unwrap();
+    for scale in [1u8, 2] {
+        let size = usize::from(scale);
+        let (width, height) = (16 * size, 16 * size);
+        let s = surface(width, height, scale);
+        for scalar in ['H', 'a', '/'] {
+            let index = font.index(scalar);
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                for weight in [Weight::Regular, Weight::Medium] {
+                    let mut style = GlyphStyle {
+                        weight,
+                        ..GlyphStyle::medium(INK, PAPER)
+                    };
+                    if bold {
+                        style = style.bold();
+                    }
+                    if italic {
+                        style = style.italic();
+                    }
+                    let mut pixels = vec![0xaa; width * height * 4];
+                    Raster::new(&mut pixels, &font, s, width * 4)
+                        .unwrap()
+                        .draw(Draw {
+                            clip: s.bounds(),
+                            primitive: Primitive::Glyph {
+                                x: 0,
+                                y: 0,
+                                scalar,
+                                style,
+                            },
+                        });
+                    let lit = |column: usize, row: usize| {
+                        let lean = usize::from(italic && row < font.height() / 2);
+                        column.checked_sub(lean).is_some_and(|source| {
+                            font.pixel(index, source, row)
+                                || (bold
+                                    && source
+                                        .checked_sub(1)
+                                        .is_some_and(|left| font.pixel(index, left, row)))
+                        })
+                    };
+                    for y in 0..height {
+                        for x in 0..width {
+                            let (column, row) = (x / size, y / size);
+                            // A glyph is clipped to its cell.
+                            let expected = if column >= font.width() {
+                                None
+                            } else if lit(column, row) {
+                                Some(INK)
+                            } else if weight == Weight::Medium
+                                && column.checked_sub(1).is_some_and(|left| lit(left, row))
+                            {
+                                Some(0)
+                            } else {
+                                None
+                            };
+                            let at = (y * width + x) * 4;
+                            let got = u32::from_le_bytes(pixels[at..at + 4].try_into().unwrap());
+                            match expected {
+                                Some(INK) => assert_eq!(got, INK | 0xff000000),
+                                // A fringe: neither ink nor untouched.
+                                Some(_) => assert!(
+                                    got != INK | 0xff000000 && got != 0xaaaaaaaa,
+                                    "{scalar} {x},{y}"
+                                ),
+                                None => assert_eq!(got, 0xaaaaaaaa, "{scalar} {x},{y}"),
+                            }
+                        }
                     }
                 }
             }
