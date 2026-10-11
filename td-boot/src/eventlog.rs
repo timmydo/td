@@ -114,6 +114,10 @@ pub struct Event<'a> {
 /// included where Linux appended it.
 #[derive(Debug)]
 pub struct Log<'a> {
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the tests rebuild logs with its digest sizes")
+    )]
     pub algorithms: Vec<(u16, usize)>,
     pub events: Vec<Event<'a>>,
 }

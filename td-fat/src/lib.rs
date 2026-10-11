@@ -139,6 +139,31 @@ impl From<io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Where a staged commit failed, against its one directory-sector write.
+#[derive(Debug)]
+pub enum CommitError {
+    /// Before the write: the ESP is as it was, the staged pair staged.
+    Before(Error),
+    /// At the write: the sector may or may not hold the new pair.
+    Uncertain(Error),
+    /// After the write and its sync, freeing the old chains or updating
+    /// FSInfo: the new pair is `EFI/BOOT`'s, and the next update's reclaim
+    /// recovers what this left allocated.
+    After(Error),
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Before(e) => write!(f, "{e}; nothing was written"),
+            Self::Uncertain(e) => write!(f, "{e}; the new pair may or may not be committed"),
+            Self::After(e) => write!(f, "the new pair is committed, then {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
 /// One file entry of `EFI/BOOT`'s first sector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileEntry {
@@ -413,8 +438,20 @@ impl<D: Device> Esp<D> {
     /// first clusters and sizes `read` named and delete the staged entries,
     /// in one sector write, then free the old chains. `read` is the
     /// directory as the caller read and hashed it; the device must still
-    /// hold exactly that sector.
-    pub fn commit_staged(&mut self, read: &BootDir) -> Result<()> {
+    /// hold exactly that sector. A failure says whether it came before,
+    /// at or after that write.
+    pub fn commit_staged(&mut self, read: &BootDir) -> std::result::Result<(), CommitError> {
+        let sector = self.staged_sector(read).map_err(CommitError::Before)?;
+        self.write_sector(&sector).map_err(CommitError::Uncertain)?;
+        let old = read.pair;
+        self.free_chains(&[old.kernel.first_cluster, old.initrd.first_cluster])
+            .and_then(|()| self.finish())
+            .map_err(CommitError::After)
+    }
+
+    /// The directory sector a staged commit writes, from `read` once it is
+    /// unchanged.
+    fn staged_sector(&self, read: &BootDir) -> Result<Vec<u8>> {
         self.require_unchanged(read)?;
         let Some(staged) = read.staged else {
             return Err(Error::Foreign("it holds no staged pair"));
@@ -433,9 +470,7 @@ impl<D: Device> Esp<D> {
         )?;
         delete_entry(&mut sector, staged.kernel.index)?;
         delete_entry(&mut sector, staged.initrd.index)?;
-        self.write_sector(&sector)?;
-        self.free_chains(&[old.kernel.first_cluster, old.initrd.first_cluster])?;
-        self.finish()
+        Ok(sector)
     }
 
     /// Delete the staged entries `read` names in one sector write, then free

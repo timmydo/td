@@ -226,7 +226,12 @@ verified root with them, and the installed selector's staged-update
 commit (ENCRYPTION.md "Selector update", from 8e) binds `current`'s
 `root.erofs` read-only to read its template, making `/dev/loop0` first
 when devtmpfs has none; so the image build refuses either initramfs
-whose `/bin/losetup` or `/bin/mknod` does not link td-init.
+whose `/bin/losetup` or `/bin/mknod` does not link td-init. The selector
+initramfs alone links td-init's `reboot` (td-boot's `REBOOT_APPLET`),
+which the installed selector runs once `update` completed a staged
+update without a predicted protector; the image build refuses a selector
+initramfs whose `/bin/reboot` does not link td-init and a deployment
+initramfs that carries it.
 
 **D7. `mkfs.btrfs` is an approved install-time exception, bound at build
 time.** `td-install` execs the shipped, source-built `btrfs-progs` to create

@@ -24,7 +24,7 @@ mod sha256;
 use engine_fat::{Node, Volume};
 use std::collections::BTreeMap;
 use std::io;
-use td_fat::{BootDir, Device, Error, Esp, Input};
+use td_fat::{BootDir, CommitError, Device, Error, Esp, Input};
 
 /// Where the ESP starts on the test disk, so no offset can pass for zero.
 const BASE: u64 = 1 << 20;
@@ -536,6 +536,46 @@ fn restaging_cut_anywhere_never_leaves_half_of_either_staged_pair() {
     );
 }
 
+/// The staged commit's failure as the cut tests compare it, whatever its
+/// place.
+fn commit(esp: &mut Esp<Disk>) -> Result<(), Error> {
+    let read = esp.boot().clone();
+    esp.commit_staged(&read).map_err(|error| match error {
+        CommitError::Before(e) | CommitError::Uncertain(e) | CommitError::After(e) => e,
+    })
+}
+
+/// A device that fails at the directory sector's write is uncertain; one
+/// that fails once that write is synced, freeing the old chains, is after
+/// it, the new pair already `EFI/BOOT`'s.
+#[test]
+fn a_staged_commit_failure_says_where_it_failed() {
+    let (old, new) = (old(), new());
+    let staged = || {
+        let mut esp = open(image(&SMALL, &old), &SMALL).unwrap();
+        stage(&mut esp, &new).unwrap();
+        esp.into_device().after_cut(false)
+    };
+    for (budget, after) in [(0, false), (1, true)] {
+        let mut disk = staged();
+        disk.budget = Some(budget);
+        let mut esp = open(disk, &SMALL).unwrap();
+        let read = esp.boot().clone();
+        let error = esp.commit_staged(&read).unwrap_err();
+        match (&error, after) {
+            (CommitError::Uncertain(_), false) | (CommitError::After(_), true) => {}
+            _ => panic!("budget {budget}: {error}"),
+        }
+        let next = esp.into_device().after_cut(false);
+        let expected = if after {
+            Found::Pair(new.clone())
+        } else {
+            Found::Staged(old.clone(), new.clone())
+        };
+        assert_eq!(found(next, &SMALL), expected, "budget {budget}");
+    }
+}
+
 #[test]
 fn the_staged_commit_cut_anywhere_leaves_the_staged_or_the_new_pair() {
     let (old, new) = (old(), new());
@@ -547,10 +587,7 @@ fn the_staged_commit_cut_anywhere_leaves_the_staged_or_the_new_pair() {
     cut_everywhere(
         &SMALL,
         &make,
-        &|esp| {
-            let read = esp.boot().clone();
-            esp.commit_staged(&read)
-        },
+        &commit,
         &[
             Found::Staged(old.clone(), new.clone()),
             Found::Pair(new.clone()),
@@ -953,13 +990,19 @@ fn a_changed_directory_sector_is_refused_and_nothing_is_written() {
     let at = boot_sector(&disk) + 2 * 32 + 13;
     disk.poke(at, &[1]);
     let mut esp = open(disk, &SMALL).unwrap();
-    assert!(matches!(esp.commit_staged(&read), Err(Error::Changed)));
+    assert!(matches!(
+        esp.commit_staged(&read),
+        Err(CommitError::Before(Error::Changed))
+    ));
     assert!(matches!(esp.delete_staged(&read), Err(Error::Changed)));
     assert_eq!(esp.into_device().writes, 0);
     // A directory read without a staged pair commits nothing.
     let mut esp = open(image(&SMALL, &old), &SMALL).unwrap();
     let plain: BootDir = esp.boot().clone();
-    assert!(matches!(esp.commit_staged(&plain), Err(Error::Foreign(_))));
+    assert!(matches!(
+        esp.commit_staged(&plain),
+        Err(CommitError::Before(Error::Foreign(_)))
+    ));
 }
 
 #[test]
@@ -1200,7 +1243,10 @@ fn a_commit_takes_only_the_directory_this_esp_read() {
     resized.pair.initrd.size -= 1;
     for forged in [moved, resized] {
         let mut esp = open(disk.clone(), &SMALL).unwrap();
-        assert!(matches!(esp.commit_staged(&forged), Err(Error::Changed)));
+        assert!(matches!(
+            esp.commit_staged(&forged),
+            Err(CommitError::Before(Error::Changed))
+        ));
         assert!(matches!(esp.delete_staged(&forged), Err(Error::Changed)));
         assert_eq!(esp.into_device().writes, 0);
     }
@@ -1225,10 +1271,7 @@ fn a_4096_byte_sector_commit_cut_inside_its_sector_leaves_one_pair_or_the_other(
     cut_everywhere(
         &BIG_SECTORS,
         &make,
-        &|esp| {
-            let read = esp.boot().clone();
-            esp.commit_staged(&read)
-        },
+        &commit,
         &[
             Found::Staged(old.clone(), new.clone()),
             Found::Pair(new.clone()),

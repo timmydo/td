@@ -24,7 +24,10 @@ use td_protector::cryptsetup::{
     dump_volume_key_args, exit_code, open_args, open_slot_args, test_args, EXIT_BAD_PASSPHRASE,
 };
 use td_protector::luks2::{Header, Kind};
-use td_protector::protected_release::{self as protected, Fido, FidoError, FidoToken, Prompt};
+use td_protector::protected::TpmPin;
+use td_protector::protected_release::{
+    self as protected, Fido, FidoError, FidoToken, PreSeal, Prompt,
+};
 use td_protector::recovery::RecoveryKey;
 use td_protector::release::{self, Outcome, Resealed, Runner, Tpm};
 use td_protector::transition::RECOVERY_SLOT;
@@ -92,6 +95,10 @@ pub(crate) enum Unlock {
         keyslot: u8,
         key: VolumeKey,
         admission: Option<admission::Method>,
+        /// A staged selector update's predicted protector, naming the
+        /// keyslot that released, for the commit (ENCRYPTION.md "Selector
+        /// update"); only a protected TPM PIN release carries one.
+        predicted: Option<TpmPin>,
     },
     /// Refuse boot and halt, naming the reason. Nothing secret is held.
     Halt(String),
@@ -254,6 +261,7 @@ pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
     cryptsetup: &mut C,
     line: &mut dyn SecretLine,
     keys: &mut F,
+    preseal: PreSeal<'_>,
     key_directory: &Path,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
@@ -265,6 +273,7 @@ pub(crate) fn unlock<T: Tpm, C: Runner, F: Fido>(
             cryptsetup,
             line,
             keys,
+            preseal,
             key_directory,
             console,
         );
@@ -327,6 +336,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
     cryptsetup: &mut C,
     line: &mut dyn SecretLine,
     keys: &mut F,
+    preseal: PreSeal<'_>,
     key_directory: &Path,
     console: &mut dyn FnMut(&str),
 ) -> Unlock {
@@ -338,6 +348,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
         cryptsetup,
         keys,
         &mut prompt,
+        preseal,
         console,
     ) {
         protected::Outcome::Released(released) => released,
@@ -366,7 +377,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
             protected::Method::RecoveryKey => "the recovery key",
         }
     ));
-    protected::finish(
+    let finished = protected::finish(
         released,
         header,
         partition,
@@ -379,6 +390,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
         keyslot,
         key,
         admission,
+        predicted: finished.predicted,
     }
 }
 
@@ -407,7 +419,7 @@ fn refused(reason: &str) -> String {
 
 /// secret-line as td-protector's prompt: each entry is copied into
 /// td-protector's zeroing entry and this one dropped, which zeroes it.
-struct Lines<'a>(&'a mut dyn SecretLine);
+pub(crate) struct Lines<'a>(pub(crate) &'a mut dyn SecretLine);
 
 impl Prompt for Lines<'_> {
     fn read(&mut self, prompt: &str) -> Result<protected::Entered, String> {
@@ -764,6 +776,7 @@ fn open<C: Runner>(
             keyslot,
             key: volume,
             admission: None,
+            predicted: None,
         },
         Err(error) => Unlock::Failed(error),
     }
@@ -1399,6 +1412,7 @@ pub(crate) mod tests {
             script,
             console,
             keys,
+            &mut |_| None,
             &scratch.keys(),
             &mut |line: &str| lines.push(line.to_owned()),
         );

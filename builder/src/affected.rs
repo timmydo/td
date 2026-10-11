@@ -312,7 +312,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/crc32.rs",
-        "td-builder's xz decoder, the shared gzip decoder, target-static td-install (through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
+        "td-builder's xz decoder, the shared gzip decoder, target-static td-install and target-static td-boot (each through gpt.rs), target-static td-util's gzip applets, and td-png's chunk CRCs",
     ),
     (
         "engine/src/gzip.rs",
@@ -320,7 +320,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/gpt.rs",
-        "target-static td-install; neither control-plane bin uses it",
+        "target-static td-install and target-static td-boot's selector update, which finds the ESP with it; neither control-plane bin uses it",
     ),
     (
         "engine/src/cpio.rs",
@@ -328,7 +328,7 @@ const TARGET_INCLUDED_ENGINE_SOURCES: &[(&str, &str)] = &[
     ),
     (
         "engine/src/fat.rs",
-        "target-static td-install; neither control-plane bin uses it",
+        "target-static td-install, and td-boot's tests, which build ESP images with it; neither control-plane bin uses it",
     ),
     (
         "engine/src/ed25519.rs",
@@ -2486,6 +2486,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_contains!("engine/src/crc32.rs", "td-png's chunk CRCs");
     assert_contains!("engine/src/gzip.rs", "td-png's image data");
     assert_contains!("engine/src/gpt.rs", "target-static td-install");
+    assert_contains!("engine/src/gpt.rs", "target-static td-boot");
+    assert_contains!("engine/src/crc32.rs", "target-static td-boot");
     assert_contains!("engine/src/fat.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-install");
     assert_contains!("engine/src/cpio.rs", "target-static td-boot");

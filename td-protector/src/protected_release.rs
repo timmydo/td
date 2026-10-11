@@ -4,7 +4,10 @@
 //! check and its warning, the TPM PIN, a security key through `Fido`, the
 //! recovery key and the verified reseal; the cap; the released keyslot's
 //! test; then, once the selector holds the volume key (`finish`), the plan,
-//! the lockout's take or proof, the counter and its reset. Every TPM
+//! the lockout's take or proof, the counter and its reset. A selector
+//! update's pre-seal (ENCRYPTION.md "Selector update") seals the PIN's
+//! released secret to the caller's predicted PCRs before the cap, and
+//! `write_tokens` runs its commit's token steps. Every TPM
 //! operation opens its own client through `Tpm`, every cryptsetup command
 //! runs through `Runner`, and every secret is zeroed when dropped. Library
 //! code: td-boot dispatches a protected header here.
@@ -209,9 +212,42 @@ pub struct Released {
     pub method: Method,
     opened: Opened,
     reseal: Option<NewPin>,
+    /// A selector update's pre-seal: the PIN's released secret sealed under
+    /// the typed PIN to the predicted chain, naming no keyslot yet.
+    predicted: Option<Box<TpmPin>>,
     /// This boot's own cap closed PCR 12, on a TPM with a SHA-256 bank.
     capped: bool,
 }
+
+/// A staged selector update's predicted PCRs (ENCRYPTION.md "Selector
+/// update", "Prediction"): PCR 7 as it reads, PCRs 4 and 9 replayed with
+/// the staged pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Predicted {
+    pub pcr4: [u8; 32],
+    pub pcr7: [u8; 32],
+    pub pcr9: [u8; 32],
+}
+
+impl Predicted {
+    /// The values a policy over `pcrs` takes, in its order.
+    fn values(&self, pcrs: PinPcrs) -> Option<Vec<[u8; 32]>> {
+        pcrs.measured()
+            .iter()
+            .map(|pcr| match pcr {
+                4 => Some(self.pcr4),
+                7 => Some(self.pcr7),
+                9 => Some(self.pcr9),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// The selector's pre-seal hook: after a TPM PIN release, before the cap,
+/// the predicted PCRs of a staged update it read and predicted, or `None`
+/// when there is none or the prediction failed, which it has said.
+pub type PreSeal<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&str)) -> Option<Predicted>;
 
 /// What the protected release decided.
 pub enum Outcome {
@@ -249,8 +285,11 @@ struct Chain {
 /// passing, the offered reseal, sealed and verified before the cap. The
 /// cap whenever a TPM device exists. After it, the released keyslot's
 /// test, a wrong key asking again for a security key or the recovery key.
-/// No cryptsetup command runs before the cap, and no secret but the one
-/// returned and a verified reseal's outlives this.
+/// After a TPM PIN release `preseal` runs, still before the cap, and a
+/// prediction it returns is sealed under the typed PIN. No cryptsetup
+/// command runs before the cap, and no secret but the one returned and a
+/// verified reseal's outlives this.
+#[allow(clippy::too_many_arguments)]
 pub fn release<T: Tpm, C: Runner, F: Fido>(
     header: &Header,
     device: &Path,
@@ -258,6 +297,7 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
     cryptsetup: &mut C,
     fido: &mut F,
     prompt: &mut dyn Prompt,
+    preseal: PreSeal<'_>,
     console: &mut dyn FnMut(&str),
 ) -> Outcome {
     // td-boot dispatches only a protected header here; an upgrading one
@@ -273,6 +313,7 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
     };
     let mut chain = Chain::default();
     let mut released = None;
+    let mut predicted = None;
     match tpm.as_deref_mut() {
         None if shape == Shape::Tpm => console(NO_TPM),
         None => {}
@@ -280,7 +321,13 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
             chain = chain_stage(header, tpm, console);
             if let Some((number, token)) = &chain.passed {
                 match pin_loop(*number, token, tpm, prompt, console) {
-                    Ok(Some(secret)) => {
+                    Ok(Some((secret, pin))) => {
+                        predicted = preseal(console)
+                            .and_then(|values| {
+                                seal_predicted(token, &values, &pin, &secret, tpm, console)
+                            })
+                            .map(Box::new);
+                        drop(pin);
                         released = Some((Opened::TpmPin { token: *number }, Key::Secret(secret)))
                     }
                     Ok(None) => {}
@@ -359,6 +406,12 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
                     describe(header, opened)
                 ));
                 drop(key);
+                if predicted.take().is_some() {
+                    console(
+                        "the update's predicted protector seals what does not open: it is \
+                         discarded",
+                    );
+                }
                 // A reseal confirmed after a key that opens nothing is
                 // someone's, not the owner's: the next key's release must
                 // not install it.
@@ -385,6 +438,7 @@ pub fn release<T: Tpm, C: Runner, F: Fido>(
         method: method(header, opened),
         opened,
         reseal,
+        predicted,
         capped,
     })
 }
@@ -396,6 +450,11 @@ pub struct Finished {
     pub resealed: Option<u8>,
     /// This boot took or proved the TPM's lockout authorization.
     pub lockout: bool,
+    /// A selector update's predicted protector, naming the keyslot that
+    /// released, for the commit to import; none once this boot refused
+    /// any header change, or without a lockout this boot took or proved
+    /// whose token anchors the object's primary.
+    pub predicted: Option<TpmPin>,
 }
 
 /// After the selector opened the mapping and took `volume_key` with the
@@ -421,9 +480,15 @@ pub fn finish<T: Tpm, C: Runner>(
         method,
         opened,
         reseal,
+        predicted,
         capped,
     } = released;
     let mut finished = Finished::default();
+    let dropped = |console: &mut dyn FnMut(&str)| {
+        if predicted.is_some() {
+            console("the update's predicted protector is discarded: the header is unchanged");
+        }
+    };
     let mut tpm = tpm.filter(|_| capped);
     let discard = |console: &mut dyn FnMut(&str), why: &str| {
         console(&format!(
@@ -437,6 +502,7 @@ pub fn finish<T: Tpm, C: Runner>(
             if reseal.is_some() {
                 discard(console, &refusal.to_string());
             }
+            dropped(console);
             return finished;
         }
     };
@@ -461,6 +527,7 @@ pub fn finish<T: Tpm, C: Runner>(
             if reseal.is_some() {
                 discard(console, "cryptsetup's metadata does not confirm the header");
             }
+            dropped(console);
             return finished;
         }
     }
@@ -490,11 +557,7 @@ pub fn finish<T: Tpm, C: Runner>(
         // this header records under the volume key: the header's tpm-pin
         // tokens, and so the Name a reseal required before the cap, are
         // unauthenticated, and a first seal required none.
-        let anchored = lockout::volume_uuid(&header.uuid).is_some_and(|uuid| {
-            protected_plan::lockout(header).is_some_and(|(_, token)| {
-                lockout::open(volume_key, &uuid, token, &new.token.primary).is_ok()
-            })
-        });
+        let anchored = protected_plan::anchors(header, volume_key, &new.token.primary);
         match (&lockout, &plan) {
             (Some(_), Some(_)) if !anchored => discard(
                 console,
@@ -526,6 +589,33 @@ pub fn finish<T: Tpm, C: Runner>(
         }
     }
     drop(reseal);
+    // The update's predicted protector goes on to the commit under the
+    // reseal's rule: only beside a lockout this boot took or proved, whose
+    // token on the header read at release records the object's primary
+    // under the volume key.
+    if let Some(token) = predicted {
+        let why = if lockout.is_none() {
+            Some("td holds no proven lockout authorization for this TPM")
+        } else if !protected_plan::anchors(header, volume_key, &token.primary) {
+            Some(
+                "no lockout token on this header verifies under the volume key for the storage \
+                 primary it was sealed under",
+            )
+        } else {
+            None
+        };
+        match why {
+            Some(why) => console(&format!(
+                "the update's predicted protector is discarded: {why}"
+            )),
+            None => {
+                finished.predicted = Some(TpmPin {
+                    keyslot: Some(opener),
+                    ..*token
+                });
+            }
+        }
+    }
     match counter {
         Some(Ok(state)) if state.counter > 0 => console(&format!(
             "td: the TPM counted {} wrong PINs since its last reset",
@@ -719,14 +809,15 @@ fn attempts(state: &td_tpm::DictionaryAttack) -> String {
 /// The TPM PIN, while the TPM is not locked out: an entry the codec
 /// refuses asks again with no TPM command, an empty one turns to another
 /// way, and a wrong PIN asks again with the new count. `Ok(None)` is
-/// another way; `Err` the halt reason.
+/// another way; `Err` the halt reason. A release returns the PIN too, for
+/// a selector update's pre-seal.
 fn pin_loop<T: Tpm>(
     number: u8,
     token: &TpmPin,
     tpm: &mut T,
     prompt: &mut dyn Prompt,
     console: &mut dyn FnMut(&str),
-) -> Result<Option<Secret>, String> {
+) -> Result<Option<(Secret, Pin)>, String> {
     let unreadable = |console: &mut dyn FnMut(&str), error: String| {
         console(&format!(
             "td: the TPM's dictionary-attack state cannot be read ({error}); use a security \
@@ -761,11 +852,10 @@ fn pin_loop<T: Tpm>(
             }
         };
         let auth = pin.auth_value(&token.salt);
-        drop(pin);
         match tpm.unseal_pin(token, &auth) {
             Ok(secret) => {
                 console(&format!("td token {number} (tpm-pin) released"));
-                return Ok(Some(secret));
+                return Ok(Some((secret, pin)));
             }
             Err(error) => match error.authorization() {
                 Some(AuthRefusal::AuthFail) => {
@@ -1100,6 +1190,108 @@ fn seal_new<T: Tpm>(
             format!("the new protector did not verify: {error}"),
         ),
     }
+}
+
+/// A selector update's pre-seal (ENCRYPTION.md "Selector update"): the
+/// secret `token` released this boot, sealed under the PIN typed this boot
+/// with a fresh salt to `predicted` and a literal-zero PCR 12, under the
+/// storage primary the token records, before the cap. Its chain is not
+/// running, so it cannot be unsealed to verify it; its bounds, its policy
+/// and its primary are checked instead, and the object stays in RAM until
+/// the commit imports it.
+fn seal_predicted<T: Tpm>(
+    token: &TpmPin,
+    predicted: &Predicted,
+    pin: &Pin,
+    secret: &Secret,
+    tpm: &mut T,
+    console: &mut dyn FnMut(&str),
+) -> Option<TpmPin> {
+    let refuse = |console: &mut dyn FnMut(&str), why: String| {
+        console(&format!(
+            "no predicted protector for the staged update: {why}"
+        ));
+        None
+    };
+    let policy = match predicted
+        .values(token.pcrs)
+        .ok_or_else(|| "the token names a PCR td does not predict".to_string())
+        .and_then(|values| PinPolicy::new(token.pcrs, &values))
+    {
+        Ok(policy) => policy,
+        Err(error) => return refuse(console, error),
+    };
+    let mut salt = [0u8; SALT_LEN];
+    if let Err(error) = read_random(Path::new(SALT_SOURCE), &mut salt, "PIN salt") {
+        return refuse(console, error);
+    }
+    let auth = pin.auth_value(&salt);
+    let sealed = match tpm.seal_pin(&policy, Some(&token.primary), &auth, secret) {
+        Ok(sealed) => sealed,
+        Err(error) => return refuse(console, format!("the seal failed: {error}")),
+    };
+    let (public, private) = (sealed.object.public.len(), sealed.object.private.len());
+    if public > MAX_PIN_PUBLIC_BYTES || private > MAX_PIN_PRIVATE_BYTES {
+        return refuse(
+            console,
+            format!(
+                "the sealed object has {public}- and {private}-byte areas, over td's \
+                 {MAX_PIN_PUBLIC_BYTES} and {MAX_PIN_PRIVATE_BYTES}"
+            ),
+        );
+    }
+    if protected_auth_policy(&sealed.object.public) != Ok(policy.digest()) {
+        return refuse(console, "the TPM sealed another policy".into());
+    }
+    if sealed.primary_name != token.primary {
+        return refuse(
+            console,
+            "the TPM sealed under another storage primary".into(),
+        );
+    }
+    console("the staged update's predicted protector is sealed before the cap");
+    Some(TpmPin {
+        keyslot: None,
+        pcrs: token.pcrs,
+        primary: token.primary,
+        salt,
+        sealed: sealed.object,
+    })
+}
+
+/// A selector update's token writes after the release (ENCRYPTION.md
+/// "Selector update"): one confirmation of cryptsetup's metadata against
+/// `header`, read afresh by the caller, then each step in order. Only
+/// token imports and removals run; a step that needs a keyslot's key is
+/// refused. `Err` names the step that failed, and later ones do not run.
+pub fn write_tokens<C: Runner>(
+    header: &Header,
+    device: &Path,
+    steps: &[Step],
+    cryptsetup: &mut C,
+    console: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if steps
+        .iter()
+        .any(|step| !matches!(step, Step::ImportToken { .. } | Step::RemoveToken { .. }))
+    {
+        return Err("a selector update writes tokens only".into());
+    }
+    let dump = cryptsetup
+        .metadata(device)
+        .map_err(|error| format!("cryptsetup's metadata cannot be read: {error}"))?;
+    protected_plan::confirm(&header.metadata(), &dump).map_err(|refusal| refusal.to_string())?;
+    let keys = Keys {
+        opener: 0,
+        opener_key: &[],
+        new: None,
+    };
+    for step in steps {
+        run_step(step, device, &keys, cryptsetup)
+            .map_err(|error| format!("{} failed: {error}", describe_step(step)))?;
+        console(&describe_step(step));
+    }
+    Ok(())
 }
 
 /// A tpm-pin object's salt is public, but drawn as a secret is.
@@ -2029,6 +2221,8 @@ mod tests {
         disk: Disk,
         keys: SecurityKeys,
         tpm: bool,
+        /// What the selector's pre-seal predicts this boot.
+        predict: Option<Predicted>,
     }
 
     impl World {
@@ -2056,6 +2250,7 @@ mod tests {
                 disk,
                 keys,
                 tpm: true,
+                predict: None,
             }
         }
 
@@ -2160,6 +2355,12 @@ mod tests {
             let mut model = self.model.clone();
             let mut tpm = self.tpm.then_some(&mut model);
             let device = Path::new(DEVICE);
+            let predict = self.predict;
+            let preseal_log = self.log.clone();
+            let mut preseal = move |_: &mut dyn FnMut(&str)| {
+                note(&preseal_log, "preseal".into());
+                predict
+            };
             let outcome = release(
                 &header,
                 device,
@@ -2167,6 +2368,7 @@ mod tests {
                 &mut self.disk,
                 &mut self.keys,
                 &mut prompt,
+                &mut preseal,
                 &mut console,
             );
             let mut run = Run::default();
@@ -2281,7 +2483,8 @@ mod tests {
             run.finished,
             Some(Finished {
                 resealed: None,
-                lockout: true
+                lockout: true,
+                predicted: None,
             })
         );
         let Some(Token::Lockout(token)) = world.disk.tokens.get(&3).cloned() else {
@@ -3259,5 +3462,314 @@ mod tests {
         assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
         assert_eq!(world.count(ASK_PIN), 1);
         assert!(world.at(&format!("say {LOCKED_OUT}")) < world.at(ANOTHER));
+    }
+
+    /// The chain a staged update predicts: PCRs 4 and 9 its own, PCR 7 as
+    /// the TPM reads it.
+    fn prediction(world: &World) -> Predicted {
+        Predicted {
+            pcr4: [0x44; 32],
+            pcr7: world.model.wire.pcr(7),
+            pcr9: [0x99; 32],
+        }
+    }
+
+    /// A PIN release with a staged update: the pre-seal runs after the
+    /// release and seals the released secret, under the typed PIN with a
+    /// fresh salt, to the prediction and the recorded primary, before the
+    /// cap (the model refuses a seal after it); `finish` hands it on naming
+    /// the keyslot that released. The commit's import beside the released
+    /// token, and the next boot on the predicted chain releases through it
+    /// with the same PIN while the old token's chain check fails, and its
+    /// plan retires the old token, the keyslot staying.
+    #[test]
+    fn a_pin_release_seals_the_prediction_and_the_next_chain_releases_with_it() {
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        let predicted = prediction(&world);
+        world.predict = Some(predicted);
+        let run = world.boot(vec![say(PIN)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        assert!(world.at("tpm unseal") < world.at("preseal"));
+        assert!(world.at("preseal") < world.at("tpm seal"));
+        assert!(world.at("tpm seal") < world.at("say PCR 12 release cap closed"));
+        assert!(world.has("tpm seal expects recorded true"));
+        let finished = run.finished.unwrap();
+        let token = finished.predicted.unwrap();
+        let Some(Token::TpmPin(old)) = world.disk.tokens.get(&1).cloned() else {
+            panic!("no tpm-pin token");
+        };
+        assert_eq!(token.keyslot, Some(1));
+        assert_eq!(token.pcrs, PinPcrs::Selector);
+        assert_eq!(token.primary, old.primary);
+        assert_ne!(token.salt, old.salt);
+        let policy = PinPolicy::new(PinPcrs::Selector, &[predicted.pcr4, predicted.pcr9]).unwrap();
+        assert_eq!(
+            protected_auth_policy(&token.sealed.public),
+            Ok(policy.digest())
+        );
+
+        // The commit's token write, through the runner's confirmation.
+        let header = world.disk.header();
+        let step = protected_plan::predicted_import(&header, 1, &token, &VOLUME_KEY).unwrap();
+        let mut lines = Vec::new();
+        write_tokens(
+            &header,
+            Path::new(DEVICE),
+            &[step],
+            &mut world.disk,
+            &mut |line| lines.push(line.to_string()),
+        )
+        .unwrap();
+        assert_eq!(lines, ["tpm-pin token imported"]);
+        let pins: Vec<Option<u8>> = world
+            .disk
+            .tokens
+            .values()
+            .filter_map(|token| match token {
+                Token::TpmPin(pin) => Some(pin.keyslot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pins, [Some(1), Some(1)]);
+
+        // The next boot runs the predicted chain.
+        {
+            let mut wire = world.model.wire.0.borrow_mut();
+            wire.pcrs[4] = predicted.pcr4;
+            wire.pcrs[9] = predicted.pcr9;
+        }
+        world.predict = None;
+        let run = world.boot(vec![say(PIN)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        assert!(world.has("say td token 1 (tpm-pin): "));
+        assert!(!world.has(&format!("say {CHAIN_WARNING}")));
+        assert!(world.has("cs remove 1"));
+        let (slots, tokens) = world.disk.shape();
+        assert!(slots.contains(&1));
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(_, kind, _)| *kind == "tpm-pin")
+                .map(|(_, _, slot)| *slot)
+                .collect::<Vec<_>>(),
+            [Some(1)]
+        );
+    }
+
+    /// The predicted protector goes on to the commit only beside a lockout
+    /// this boot took or proved whose token, on the header read at
+    /// release, anchors its primary: a first take anchors the next boot's,
+    /// and a token recording another primary takes no lockout step.
+    #[test]
+    fn a_prediction_without_the_lockout_anchor_is_discarded() {
+        let mut world = World::tpm_shape();
+        world.predict = Some(prediction(&world));
+        let run = world.boot(vec![say(PIN)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        assert!(world.has("tpm seal"));
+        let finished = run.finished.unwrap();
+        assert!(finished.lockout);
+        assert_eq!(finished.predicted, None);
+        assert!(world.has(
+            "say the update's predicted protector is discarded: no lockout token on this header"
+        ));
+
+        let mut world = World::tpm_shape();
+        world.taken(&[0x42; 32]);
+        if let Some(Token::Lockout(token)) = world.disk.tokens.get_mut(&3) {
+            token.primary[3] ^= 1;
+        }
+        world.predict = Some(prediction(&world));
+        let run = world.boot(vec![say(PIN)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        let finished = run.finished.unwrap();
+        assert!(!finished.lockout);
+        assert_eq!(finished.predicted, None);
+        assert!(world
+            .has("say the update's predicted protector is discarded: td holds no proven lockout"));
+    }
+
+    /// No staged update, or a failed prediction: the pre-seal asks and
+    /// nothing is sealed. A security key's or the recovery key's release
+    /// runs no pre-seal at all.
+    #[test]
+    fn only_a_pin_release_with_a_prediction_seals_ahead() {
+        let mut world = World::tpm_shape();
+        let run = world.boot(vec![say(PIN)]);
+        assert_eq!(released(&run, &world), (1, Method::TpmPin));
+        assert!(world.has("preseal"));
+        assert!(!world.has("tpm seal"));
+        assert_eq!(run.finished.unwrap().predicted, None);
+
+        let mut world = World::tpm_shape();
+        world.predict = Some(prediction(&world));
+        let run = world.boot(vec![say(b""), say(RECOVERY)]);
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert!(!world.has("preseal"));
+        assert_eq!(run.finished.unwrap().predicted, None);
+    }
+
+    /// A PIN whose released secret does not open its keyslot: the
+    /// prediction sealed from it is discarded with the key, and whatever
+    /// releases next carries none.
+    #[test]
+    fn a_failed_keyslot_test_discards_the_prediction() {
+        let mut world = World::tpm_shape();
+        world.predict = Some(prediction(&world));
+        world.disk.keyslots.insert(1, vec![0x5a; SECRET_LEN]);
+        let run = world.boot(vec![say(PIN), say(RECOVERY)]);
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert!(world.has("tpm seal"));
+        assert!(world.has("say the update's predicted protector seals what does not open"));
+        assert_eq!(run.finished.unwrap().predicted, None);
+    }
+
+    /// A seal the TPM refuses, or one over the token's bounds: no
+    /// prediction is kept, and the release stands.
+    #[test]
+    fn a_refused_seal_keeps_no_prediction() {
+        for fault in ["fail", "oversize"] {
+            let mut world = World::tpm_shape();
+            world.predict = Some(prediction(&world));
+            world.model.state.borrow_mut().seal_fault = Some(fault);
+            let run = world.boot(vec![say(PIN)]);
+            assert_eq!(released(&run, &world), (1, Method::TpmPin), "{fault}");
+            assert!(world.has("say no predicted protector for the staged update"));
+            assert_eq!(run.finished.unwrap().predicted, None, "{fault}");
+        }
+        let mut world = World::tpm_shape();
+        world.predict = Some(prediction(&world));
+        if let Some(Token::TpmPin(pin)) = world.disk.tokens.get_mut(&1) {
+            pin.primary[3] ^= 1;
+        }
+        // The chain check refuses a token recording another primary, so
+        // nothing releases by PIN and nothing is sealed.
+        let run = world.boot(vec![say(RECOVERY)]);
+        assert_eq!(released(&run, &world), (0, Method::RecoveryKey));
+        assert!(!world.has("tpm seal"));
+    }
+
+    /// The commit's token steps: the predicted import only beside the one
+    /// tpm-pin token naming the released keyslot and a lockout token that
+    /// verifies for its primary under the volume key; the retry's write
+    /// replacing its own, and its removal; `write_tokens` refuses a step
+    /// that needs a key, and a header cryptsetup does not confirm.
+    #[test]
+    fn the_update_token_steps_and_their_runner() {
+        let mut world = World::tpm_shape();
+        let Some(Token::TpmPin(pin)) = world.disk.tokens.get(&1).cloned() else {
+            panic!("no tpm-pin token");
+        };
+        let new = TpmPin {
+            keyslot: None,
+            salt: [0x5e; SALT_LEN],
+            ..pin.clone()
+        };
+        // No lockout token, then one under another volume key, or one
+        // recording another primary: no anchor.
+        assert_eq!(
+            protected_plan::predicted_import(&world.disk.header(), 1, &new, &VOLUME_KEY),
+            Err(protected_plan::Refusal::NotAnchored)
+        );
+        world.taken(&[0x42; 32]);
+        let header = world.disk.header();
+        assert_eq!(
+            protected_plan::predicted_import(&header, 1, &new, &[0x55; 64]),
+            Err(protected_plan::Refusal::NotAnchored)
+        );
+        let mut elsewhere = new.clone();
+        elsewhere.primary[3] ^= 1;
+        assert_eq!(
+            protected_plan::predicted_import(&header, 1, &elsewhere, &VOLUME_KEY),
+            Err(protected_plan::Refusal::NotAnchored)
+        );
+        assert_eq!(
+            protected_plan::predicted_import(&header, 2, &new, &VOLUME_KEY),
+            Err(protected_plan::Refusal::NotPredicted)
+        );
+        let Ok(Step::ImportToken {
+            token: Token::TpmPin(imported),
+            id: None,
+            replace: false,
+        }) = protected_plan::predicted_import(&header, 1, &new, &VOLUME_KEY)
+        else {
+            panic!("no import");
+        };
+        assert_eq!(imported.keyslot, Some(1));
+        // Beside two tpm-pin tokens, as a cut commit leaves them.
+        world.disk.tokens.insert(5, Token::TpmPin(pin.clone()));
+        assert_eq!(
+            protected_plan::predicted_import(&world.disk.header(), 1, &new, &VOLUME_KEY),
+            Err(protected_plan::Refusal::NotPredicted)
+        );
+        world.disk.tokens.remove(&5);
+
+        let retry = crate::protected::UpdateRetry {
+            pair: [1; 32],
+            tag: [2; 32],
+        };
+        assert_eq!(protected_plan::retry_remove(&header), None);
+        let first = protected_plan::retry_write(&header, &retry).unwrap();
+        assert_eq!(
+            first,
+            Step::ImportToken {
+                token: Token::UpdateRetry(retry.clone()),
+                id: Some(4),
+                replace: false,
+            }
+        );
+        world.model.wire.0.borrow_mut().pcrs[usize::from(CAP_PCR)] = capped();
+        let mut lines = Vec::new();
+        let mut console = |line: &str| lines.push(line.to_string());
+        write_tokens(
+            &header,
+            Path::new(DEVICE),
+            &[first],
+            &mut world.disk,
+            &mut console,
+        )
+        .unwrap();
+        let header = world.disk.header();
+        assert_eq!(protected_plan::update_retry(&header), Some((4, &retry)));
+        assert_eq!(
+            protected_plan::retry_write(&header, &retry),
+            Ok(Step::ImportToken {
+                token: Token::UpdateRetry(retry.clone()),
+                id: Some(4),
+                replace: true,
+            })
+        );
+        let remove = protected_plan::retry_remove(&header).unwrap();
+        assert_eq!(remove, Step::RemoveToken { token: 4 });
+        // A key step, and a header that is not the disk's, run nothing.
+        assert!(write_tokens(
+            &header,
+            Path::new(DEVICE),
+            &[Step::Test { slot: 1 }],
+            &mut world.disk,
+            &mut console
+        )
+        .is_err());
+        let mut stale = World::tpm_shape();
+        stale.taken(&[0x42; 32]);
+        let stale = stale.disk.header();
+        assert!(write_tokens(
+            &stale,
+            Path::new(DEVICE),
+            std::slice::from_ref(&remove),
+            &mut world.disk,
+            &mut console
+        )
+        .is_err());
+        write_tokens(
+            &header,
+            Path::new(DEVICE),
+            &[remove],
+            &mut world.disk,
+            &mut console,
+        )
+        .unwrap();
+        assert_eq!(protected_plan::update_retry(&world.disk.header()), None);
     }
 }

@@ -348,7 +348,11 @@ the eleventh, secret-line's wait over its two lines (below). Both
 initramfs link `losetup` and `mknod`: the deployment's binds the
 verified root, and the selector's binds `current`'s `root.erofs`
 read-only to authenticate a staged selector update
-(`td-install/ENCRYPTION.md` "Selector update"). Each mounts devtmpfs on
+(`td-install/ENCRYPTION.md` "Selector update"); that loop stays bound
+until the selector's kexec, since no applet detaches one. The selector's
+alone links `reboot`, whose `sync(2)` and `reboot(2)` the installed
+selector runs once `update` completed a staged selector update without a
+predicted protector; the deployment's links none. Each mounts devtmpfs on
 `/dev` first thing, so `/dev/loop0` normally comes from the kernel; this is the fallback for
 when the loop driver registered none, and it cannot come from a cpio
 `nod` line because the devtmpfs mount shadows whatever was there. Unlike

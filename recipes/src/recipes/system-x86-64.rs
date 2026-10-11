@@ -4352,6 +4352,14 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
                 "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0\n",
                 td_boot_protocol::SECRET_LINE_APPLET
             ));
+            // A staged selector update that `update` completes without a
+            // predicted protector restarts the machine at once, so that its
+            // owner is present for the warning boot (td-install/ENCRYPTION.md
+            // "Selector update"). The deployment's /init never restarts.
+            s.push_str(&format!(
+                "slink /bin/{} {{in:td-init}}/bin/td-init 0777 0 0\n",
+                td_boot_protocol::REBOOT_APPLET
+            ));
         }
         // The pivot applet, and ONLY here. /init execs `/bin/switch_root`, and
         // the selector has no branch that enters a root: it kexecs. Carrying the
@@ -5145,6 +5153,8 @@ fn shape_check() -> String {
      for a in \"$selector\" \"$init\"; do for p in losetup mknod; do \"$tu\" cpio -tv < \"$a\" 2>/dev/null | grep -q -x -F \"bin/$p -> {in:td-init}/bin/td-init\" || { echo \"initramfs $a: /bin/$p must link td-init - the deployment binds its verified root with it and a staged selector update's commit binds current's root.erofs\" >&2; exit 1; }; done; done; \
      \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/secret-line must link td-init - the recovery flow could not read the recovery key and an encrypted boot that reaches recovery would halt' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then echo 'deployment initramfs: secret-line must be selector-only - only the selector has a recovery flow' >&2; exit 1; fi; \
+     \"$tu\" cpio -tv < \"$selector\" 2>/dev/null | grep -q -x -F 'bin/reboot -> {in:td-init}/bin/td-init' || { echo 'selector initramfs: /bin/reboot must link td-init - a selector update completed by update could not restart the machine' >&2; exit 1; }; \
+     if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/reboot; then echo 'deployment initramfs: reboot must be selector-only - its /init never restarts' >&2; exit 1; fi; \
      if [ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]; then echo 'root tree: secret-line must be selector-only - no root farm links it' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
@@ -14167,8 +14177,26 @@ different deployment'; healthy=0; else echo {marker}; fi; fi;",
                 "secret-line and td-boot disagree: {theirs} / {ours}"
             );
         }
+        // The selector update's restart: td-init serves `reboot`, and only
+        // the selector initramfs links it.
+        let reboot = td_boot_protocol::REBOOT_APPLET;
+        assert_eq!(reboot, "reboot");
+        assert!(
+            applet_table(include_str!("../../../td-init/src/main.rs"))
+                .iter()
+                .any(|applet| applet == reboot),
+            "td-boot runs /bin/{reboot}, which td-init does not serve"
+        );
+        assert!(
+            selector.contains(&format!(
+                "slink /bin/{reboot} {{in:td-init}}/bin/td-init 0777 0 0\n"
+            )) && !deployment.contains(&format!("slink /bin/{reboot} ")),
+            "only the selector initramfs may link /bin/{reboot}"
+        );
         let shape = shape_check();
         for leg in [
+            "grep -q -x -F 'bin/reboot -> {in:td-init}/bin/td-init'",
+            "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/reboot; then",
             "grep -q -x -F 'bin/secret-line -> {in:td-init}/bin/td-init'",
             "printf '%s\\n' \"$init_list\" | grep -q -x -F bin/secret-line; then",
             "[ -e \"$root/bin/secret-line\" ] || [ -L \"$root/bin/secret-line\" ]",

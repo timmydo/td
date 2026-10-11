@@ -127,7 +127,7 @@ pub fn sha256(image: &[u8]) -> Result<[u8; 32], &'static str> {
     clippy::panic,
     clippy::indexing_slicing
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn put16(image: &mut [u8], at: usize, value: u16) {
@@ -152,7 +152,7 @@ mod tests {
     /// A PE32+ image: headers to 0x200, section `b` at 0x400 listed before
     /// section `a` at 0x200, then 0x100 bytes of trailing data and a 0x80
     /// byte certificate table.
-    fn image() -> Vec<u8> {
+    pub(crate) fn image() -> Vec<u8> {
         let mut image: Vec<u8> = (0..0x780u32).map(|i| (i * 7 + 3) as u8).collect();
         put16(&mut image, 0, 0x5a4d);
         put32(&mut image, 0x3c, PE as u32);

@@ -644,7 +644,8 @@ commit, the plans on protected headers and the runner's `token import
 lockout's take, proof, counter and reset, which td-boot's installed
 selector runs on a protected header from its third, and the deployment
 initramfs's PolicyPCR-only check of tpm-pin tokens, and, from 8e, the
-update-retry token's codec, reader bound and tag (`update_retry`).
+update-retry token's codec, reader bound and tag (`update_retry`) and a
+selector update's pre-seal and token steps (below).
 Before item 9 only a header root wrote through the worker, or one forged
 on the disk, reaches them. The lockout's clear, the secure-boot and
 config tokens and the upgrade's plans and `reencrypt` shapes are not.
@@ -870,6 +871,14 @@ failing closed:
   `lockout_proven` replaces it there with `proven` set, and
   `lockout_remove` removes it. Only a header `check` admits in the TPM
   shape takes one; a FIDO2-shape header is refused with `NoLockout`.
+- A selector update's token steps are the planner's too, since 8e:
+  `predicted_import` imports the pre-seal's object as a tpm-pin token
+  naming the keyslot that released, at the lowest free number, only on a
+  TPM-shape header whose one tpm-pin token names that keyslot
+  (`NotPredicted` otherwise, as a cut commit leaves two); `retry_write`
+  writes the `update-retry` token in place of the header's own, with
+  `--token-replace`, or as the lowest free number; `retry_remove`
+  removes it; `update_retry` reads it.
 
 Every kill carries the key of a keyslot that remains, and `Plan::confirm`
 compares cryptsetup's own metadata with the header the plan was
@@ -964,6 +973,26 @@ failing closed:
 - A sealed object over the token's bounds is refused at its seal, before
   the cap, with no keyslot added and no tpm-pin token imported; the
   boot's lockout step runs as without a reseal.
+- A selector update's pre-seal (ENCRYPTION.md "Selector update", since
+  8e): after a TPM PIN release and before the cap, `release` calls the
+  caller's `PreSeal` hook, and a `Predicted` it returns (PCRs 4, 7 and
+  9) is sealed from the released secret under the typed PIN with a
+  fresh `/dev/random` salt, to the token's own selection at the
+  predicted values and a literal-zero PCR 12, under the primary the
+  token records (`expected`). Its chain is not running, so no unseal
+  verifies it; its bounds, its public area's policy digest and the
+  primary's Name are checked instead, and any refusal keeps no object.
+  `pin_loop` returns the PIN with the secret for this, dropped once the
+  hook has run. The object is discarded if the released keyslot's test
+  fails, and `finish` hands it on in `Finished::predicted`, naming the
+  keyslot that released, unless it refused every header change this
+  boot, and only beside a lockout this boot took or proved whose token
+  on the header read at release verifies for the object's primary
+  under the volume key (`protected_plan::anchors`), the reseal's
+  anchor; `predicted_import` requires that anchor again
+  (`NotAnchored`). `write_tokens` runs the commit's token steps,
+  imports and removals only, after one confirmation of cryptsetup's
+  metadata against the header the caller read afresh.
 
 Its bounds grow by the FIDO2 attempts and the entries, which are the
 person's, one seal and one verifying unseal per reseal, and the

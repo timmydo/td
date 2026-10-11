@@ -16,23 +16,29 @@ mod admission;
 #[path = "admit.rs"]
 mod admit;
 // The staged selector update's digests and prediction
-// (td-install/ENCRYPTION.md "Prediction"); 8e's pre-seal calls them.
+// (td-install/ENCRYPTION.md "Prediction"), which its pre-seal takes.
 #[path = "authenticode.rs"]
-#[allow(dead_code, reason = "the selector update's pre-seal calls it")]
 mod authenticode;
 #[path = "cap.rs"]
 mod cap;
 // engine's newc writer, for the selector appendix below.
 #[path = "../../engine/src/cpio.rs"]
-#[allow(dead_code, reason = "the selector update's commit calls it")]
+#[allow(dead_code, reason = "the appendix uses its writer alone")]
 mod cpio;
+// engine's GPT reader and its CRC-32, through which the staged update
+// finds the ESP as td-install does (`gpt::locate`).
+#[path = "../../engine/src/crc32.rs"]
+#[allow(dead_code, reason = "the GPT reader uses its checksum alone")]
+mod crc32;
+#[path = "../../engine/src/gpt.rs"]
+#[allow(dead_code, reason = "the selector reads a table and writes none")]
+mod gpt;
 // Which terminal `/dev/console` is, td-init's, shared with its secret-line
 // applet: it lives outside this crate, so the `#[path]` is required, and the
 // recipe stages it at `{src}/td-init/src/console.rs`.
 #[path = "../../td-init/src/console.rs"]
 mod console;
 #[path = "eventlog.rs"]
-#[allow(dead_code, reason = "the selector update's pre-seal calls it")]
 mod eventlog;
 // The selector's FIDO2 client and its `fido-worker` verb.
 #[path = "fido.rs"]
@@ -43,12 +49,14 @@ mod measurement;
 mod mirror;
 mod protocol;
 // The archive preparing a selector appends, shared with td-install by its
-// path; 8e's staged-update commit rebuilds it to authenticate `INITRD.NEW`.
+// path; the staged-update commit rebuilds it to authenticate `INITRD.NEW`.
 #[path = "selector_appendix.rs"]
-#[allow(dead_code, reason = "the selector update's commit calls it")]
 mod selector_appendix;
 #[path = "selector_release.rs"]
 mod selector_release;
+// A staged selector update's pre-seal and commit.
+#[path = "selector_update.rs"]
+mod selector_update;
 #[path = "unlock.rs"]
 mod unlock;
 #[path = "volume.rs"]
@@ -75,6 +83,11 @@ mod td_fs;
 #[cfg(test)]
 #[path = "fixture.rs"]
 mod fixture;
+// td's FAT32 writer, which builds the selector update tests' ESPs.
+#[cfg(test)]
+#[path = "../../engine/src/fat.rs"]
+#[allow(dead_code, reason = "the tests build images with its writer alone")]
+mod fat;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code)]
 mod sha256;
@@ -3192,6 +3205,7 @@ fn run_boot(
     mountpoint: &Path,
     base_cmdline: &OsStr,
     handoff: Option<Handoff<'_>>,
+    mut commit: Option<&mut dyn FnMut(&Path)>,
 ) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
@@ -3207,6 +3221,7 @@ fn run_boot(
         "read-only Btrfs mount",
     )?;
     if let Some((decision, deployment)) = read_only_current(mountpoint, &key) {
+        before_kexec(&mut commit, mountpoint);
         let result = kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff);
         best_effort_unmount(mountpoint);
         return result;
@@ -3216,6 +3231,7 @@ fn run_boot(
     {
         let result = (|| {
             let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error, &key)?;
+            before_kexec(&mut commit, mountpoint);
             kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
         })();
         best_effort_unmount(mountpoint);
@@ -3238,6 +3254,7 @@ fn run_boot(
                 )?;
                 let deployment =
                     authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
+                before_kexec(&mut commit, mountpoint);
                 kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
@@ -3247,6 +3264,7 @@ fn run_boot(
             let result = (|| {
                 let (decision, deployment) =
                     read_only_recovery(mountpoint, &transaction_error, &key)?;
+                before_kexec(&mut commit, mountpoint);
                 kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
@@ -3264,6 +3282,7 @@ fn run_boot(
             let result = (|| {
                 let (decision, deployment) =
                     read_only_recovery(mountpoint, &transaction_error, &key)?;
+                before_kexec(&mut commit, mountpoint);
                 kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
             })();
             best_effort_unmount(mountpoint);
@@ -3281,10 +3300,21 @@ fn run_boot(
         // The writable transaction closed its payload handles before unmounting.
         // Reverify under the mount whose handles are passed to kexec.
         let deployment = authenticated_deployment(mountpoint, &decision.deployment_id, &key)?;
+        before_kexec(&mut commit, mountpoint);
         kexec_boot_decision(deployment, &decision, base_cmdline, measured, handoff)
     })();
     best_effort_unmount(mountpoint);
     result
+}
+
+/// A staged selector update's commit (td-install/ENCRYPTION.md "Selector
+/// update"), once, with the volume mounted read-only at `mountpoint` and
+/// the deployment to boot already authenticated: after the release cap,
+/// before the kexec, on whichever path `run_boot` took.
+fn before_kexec(commit: &mut Option<&mut dyn FnMut(&Path)>, mountpoint: &Path) {
+    if let Some(commit) = commit.take() {
+        commit(mountpoint);
+    }
 }
 
 /// Mount the volume and publish into it, under an optional named trust root.
@@ -4164,13 +4194,24 @@ fn boot_encrypted(
     let mut line = selector_release::Applet(Path::new("/bin").join(protocol::SECRET_LINE_APPLET));
     // A protected header's security keys, one FIDO2 client per Enter.
     let mut keys = selector_release::SecurityKeys::root();
-    let (keyslot, key, admission) = match selector_release::unlock(
+    // A staged selector update, read and predicted after a TPM PIN release
+    // and before the cap (td-install/ENCRYPTION.md "Selector update").
+    let mut machine = selector_update::Selector {
+        partition: &partition,
+        uuid: uuid.to_string(),
+    };
+    let mut staged = None;
+    let (keyslot, key, admission, mut predicted) = match selector_release::unlock(
         &header,
         &partition.path(),
         tpm.as_mut(),
         &mut cryptsetup,
         &mut line,
         &mut keys,
+        &mut |console: &mut dyn FnMut(&str)| {
+            staged = selector_update::preseal(&mut machine, console);
+            staged.as_ref().and_then(selector_update::Staged::predicted)
+        },
         Path::new(selector_release::KEY_DIRECTORY),
         &mut console,
     ) {
@@ -4178,7 +4219,8 @@ fn boot_encrypted(
             keyslot,
             key,
             admission,
-        } => (keyslot, key, admission),
+            predicted,
+        } => (keyslot, key, admission, predicted),
         selector_release::Unlock::Halt(reason) => halt(&reason),
         selector_release::Unlock::Failed(error) => return Err(error),
     };
@@ -4187,6 +4229,37 @@ fn boot_encrypted(
         "volume {uuid} opened with keyslot {keyslot} as {}",
         mapping.describe()
     ));
+    // Its commit, once `run_boot` has the volume mounted read-only, and only
+    // after the TPM PIN released: a PIN whose keyslot did not open is no
+    // owner's.
+    let mut update = match staged {
+        Some(staged) if admission == Some(admission::Method::TpmPin) => Some(staged),
+        Some(_) => {
+            console("the staged selector update waits for a TPM PIN boot");
+            None
+        }
+        None => None,
+    };
+    let mut commit = |root: &Path| {
+        let Some(staged) = update.take() else {
+            return;
+        };
+        let mut prompt = selector_release::Lines(&mut line);
+        let committed = selector_update::commit(
+            staged,
+            predicted.take(),
+            root,
+            &mut machine,
+            &mut cryptsetup,
+            &partition.path(),
+            key.expose(),
+            &mut prompt,
+            &mut console,
+        );
+        if committed == selector_update::Outcome::Restart {
+            halt(&selector_update::restart());
+        }
+    };
     run_boot(
         &mapping.path(),
         mountpoint,
@@ -4195,6 +4268,7 @@ fn boot_encrypted(
             key: &key,
             admission,
         }),
+        Some(&mut commit),
     )
 }
 
@@ -4351,7 +4425,7 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             device,
             mountpoint,
             cmdline,
-        } => run_boot(&device, &mountpoint, &cmdline, None),
+        } => run_boot(&device, &mountpoint, &cmdline, None, None),
         Mode::Install {
             device,
             mountpoint,
@@ -8963,12 +9037,13 @@ mod tests {
             assert!(!body.contains(release), "the live selector names {release}");
         }
         // Halts: the live selector's cap, the installed one's release
-        // (`boot_encrypted`, two calls) and the deployment initramfs's
-        // unlock (`on_volume`).
+        // (`boot_encrypted`, two calls) and a selector update's failed
+        // restart there, and the deployment initramfs's unlock
+        // (`on_volume`).
         assert_eq!(
             production.matches("halt(").count(),
-            5,
-            "its definition and the four calls"
+            6,
+            "its definition and the five calls"
         );
         let encrypted = source
             .split_once("\nfn boot_encrypted(")
@@ -8976,7 +9051,8 @@ mod tests {
             .map(|(body, _)| body)
             .unwrap();
         assert_eq!(body.matches("halt(").count(), 1);
-        assert_eq!(encrypted.matches("halt(").count(), 2);
+        assert_eq!(encrypted.matches("halt(").count(), 3);
+        assert!(encrypted.contains("halt(&selector_update::restart());"));
 
         let halt = source
             .split_once("\nfn halt(reason: &str) -> ! {\n")
@@ -9180,7 +9256,9 @@ mod tests {
             "let mut line = selector_release::Applet(Path::new(\"/bin\").join(protocol::SECRET_LINE_APPLET));",
         );
         let keys = position("let mut keys = selector_release::SecurityKeys::root();");
-        let released = position("let (keyslot, key, admission) = match selector_release::unlock(");
+        let released = position(
+            "let (keyslot, key, admission, mut predicted) = match selector_release::unlock(",
+        );
         assert!(position("&mut line,") > released);
         assert!(applet < keys && keys < released && position("&mut keys,") > released);
         assert_eq!(protocol::SECRET_LINE_APPLET, "secret-line");
@@ -9191,14 +9269,20 @@ mod tests {
         );
         // The release's own admission, and nothing else, reaches the handoff.
         let boot = "run_boot(\n        &mapping.path(),\n        mountpoint,\n        cmdline,\n        \
-                    Some(Handoff {\n            key: &key,\n            admission,\n        }),\n    )";
+                    Some(Handoff {\n            key: &key,\n            admission,\n        }),\n        \
+                    Some(&mut commit),\n    )";
         let booted = position(boot);
         assert!(pre_active < header && header < waited);
         assert!(waited < device && device < program && program < applet && applet < released);
         assert!(released < halted && halted < failed && failed < admitted);
         assert!(admitted < booted);
         assert!(body.trim_end().ends_with(boot));
-        assert_eq!(body.matches("admission").count(), 4);
+        // Beside it, the staged update's commit asks only whether the TPM
+        // PIN released.
+        assert_eq!(body.matches("admission").count(), 6);
+        assert!(body.contains(
+            "Some(staged) if admission == Some(admission::Method::TpmPin) => Some(staged),"
+        ));
         for later in [
             "mount_command(",
             "select_boot_deployment(",
@@ -9235,7 +9319,9 @@ mod tests {
         let (signature, body) = production_body("run_boot")
             .split_once(") -> io::Result<()> {")
             .unwrap();
-        assert!(signature.ends_with("handoff: Option<Handoff<'_>>,\n"));
+        assert!(signature.ends_with(
+            "handoff: Option<Handoff<'_>>,\n    mut commit: Option<&mut dyn FnMut(&Path)>,\n"
+        ));
         for absent in [
             "selector_release::",
             "cap::",
@@ -9257,7 +9343,7 @@ mod tests {
         assert_eq!(production.matches("SECRET_LINE_APPLET").count(), 1);
         assert!(production_body("boot_encrypted").contains("SECRET_LINE_APPLET"));
         assert!(production_body("dispatch")
-            .contains("} => run_boot(&device, &mountpoint, &cmdline, None),"));
+            .contains("} => run_boot(&device, &mountpoint, &cmdline, None, None),"));
         let decision = production_body("kexec_boot_decision");
         assert!(decision.contains("let key_pipe = handoff"));
         assert!(decision

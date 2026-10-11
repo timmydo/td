@@ -11,9 +11,10 @@ use crate::types::{Recipe, Step};
 // volume discovery, the live selector's PCR 12 release cap and the installed
 // selector's release and the deployment initramfs's unlock over
 // td-protector, which reaches td-json, and its FIDO2 client over td-fido
-// (`fido.rs`, whose `fido-worker` verb nothing runs yet); each is
-// compiled first as an rlib with the binary's profile and passed by
-// `--extern`, as td-install passes them. td-tpm and td-fido include the
+// (`fido.rs`, whose `fido-worker` verb nothing runs yet), and a staged
+// selector update's ESP over td-fat, found through engine's GPT reader;
+// each is compiled first as an rlib with the binary's profile and passed
+// by `--extern`, as td-install passes them. td-tpm and td-fido include the
 // same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
 const ADMISSION_RS: &str = include_str!("../../../td-boot/src/admission.rs");
@@ -27,6 +28,7 @@ const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs")
 const MIRROR_RS: &str = include_str!("../../../td-boot/src/mirror.rs");
 const FIDO_RS: &str = include_str!("../../../td-boot/src/fido.rs");
 const SELECTOR_RELEASE_RS: &str = include_str!("../../../td-boot/src/selector_release.rs");
+const SELECTOR_UPDATE_RS: &str = include_str!("../../../td-boot/src/selector_update.rs");
 const VOLUME_RS: &str = include_str!("../../../td-boot/src/volume.rs");
 const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const TD_FS_RS: &str = include_str!("../../../td-fs/src/real_file.rs");
@@ -36,6 +38,9 @@ const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 const SHA512_RS: &str = include_str!("../../../engine/src/sha512.rs");
 const ED25519_RS: &str = include_str!("../../../engine/src/ed25519.rs");
 const CPIO_RS: &str = include_str!("../../../engine/src/cpio.rs");
+const CRC32_RS: &str = include_str!("../../../engine/src/crc32.rs");
+const GPT_RS: &str = include_str!("../../../engine/src/gpt.rs");
+const FAT_LIB_RS: &str = include_str!("../../../td-fat/src/lib.rs");
 /// td-tpm's files and td-fido's, whose P-256, AES and HMAC-SHA256 td-tpm's
 /// sessions use, each crate's whole `src` (test-only files included, as
 /// the staging test below holds). td-protector's PIN derivation also
@@ -196,6 +201,14 @@ pub fn recipe() -> Recipe {
         Step::MkDir {
             path: "{src}/td-fido/src".into(),
         },
+        Step::MkDir {
+            path: "{src}/td-fat/src".into(),
+        },
+        Step::WriteFile {
+            path: "{src}/td-fat/src/lib.rs".into(),
+            content: FAT_LIB_RS.into(),
+            exec: false,
+        },
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
             content: MAIN_RS.into(),
@@ -257,6 +270,11 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::WriteFile {
+            path: "{src}/td-boot/src/selector_update.rs".into(),
+            content: SELECTOR_UPDATE_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
             path: "{src}/td-boot/src/volume.rs".into(),
             content: VOLUME_RS.into(),
             exec: false,
@@ -304,6 +322,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/engine/src/cpio.rs".into(),
             content: CPIO_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/crc32.rs".into(),
+            content: CRC32_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/engine/src/gpt.rs".into(),
+            content: GPT_RS.into(),
             exec: false,
         },
         Step::WriteFile {
@@ -467,6 +495,7 @@ pub fn recipe() -> Recipe {
         let tpm = format!("td_tpm={root}/libtd_tpm.rlib");
         let protector = format!("td_protector={root}/libtd_protector.rlib");
         let fido = format!("td_fido={root}/libtd_fido.rlib");
+        let fat = format!("td_fat={root}/libtd_fat.rlib");
         // td-protector's own dependency, td-json, is found here.
         let dependencies = format!("dependency={root}");
         target_rustc_at_roots(
@@ -491,6 +520,8 @@ pub fn recipe() -> Recipe {
                 &protector,
                 "--extern",
                 &fido,
+                "--extern",
+                &fat,
                 "-L",
                 &dependencies,
                 &linker,
@@ -516,6 +547,7 @@ pub fn recipe() -> Recipe {
     // transform must all converge byte for byte.
     for root in ["{root}/profile-repro-a", "{root}/profile-repro-b"] {
         steps.push(library(root, "td_fido", "td-fido", &[]));
+        steps.push(library(root, "td_fat", "td-fat", &[]));
         steps.push(library(root, "td_tpm", "td-tpm", &["td_fido"]));
         steps.push(library(root, "td_json", "td-json", &[]));
         steps.push(library(
@@ -567,7 +599,7 @@ mod tests {
     fn every_sibling_crate_source_is_staged() {
         crate::ladder::assert_sibling_sources_staged(
             super::recipe(),
-            &["td-tpm", "td-fido", "td-json", "td-protector"],
+            &["td-tpm", "td-fido", "td-json", "td-protector", "td-fat"],
         );
     }
 }

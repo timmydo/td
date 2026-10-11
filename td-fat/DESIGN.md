@@ -116,7 +116,11 @@ advisory, and td-fat never reads them.
   those bytes (`Changed` otherwise, writing nothing), points the pair's
   entries at the first clusters and sizes that `BootDir` names and
   deletes the staged entries, in one sector write, then frees the old
-  chains. It never re-reads which clusters to point at.
+  chains. It never re-reads which clusters to point at. Its error
+  (`CommitError`) says where it failed: `Before` that write, the ESP
+  unchanged; `Uncertain`, at the write or its sync; or `After` it,
+  freeing the old chains or updating FSInfo, the new pair already
+  `EFI/BOOT`'s and the clusters it left allocated the next reclaim's.
 - **Deletion** (`delete_staged`) under the same check marks both staged
   entries deleted in one sector write, then frees their chains.
 

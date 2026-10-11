@@ -1743,6 +1743,79 @@ The update takes one of two forms:
 No previous selector is kept; a selector that does not boot is repaired
 from the live medium, by hand.
 
+**Implementation.** td-boot's `selector_update.rs` holds the pre-seal
+and the commit, and td-protector the seal (`protected_release`'s
+pre-seal hook) and the token steps (`protected_plan::predicted_import`,
+`retry_write` and `retry_remove`, run by `write_tokens` after one
+confirmation of cryptsetup's metadata), since 8e's selector-update
+commit. Before item 9 only root running the storage worker by hand, or
+someone writing the disk, stages a pair. They read:
+
+- The pre-seal runs only after a TPM PIN release, in the TPM-primary
+  shape, before the cap. The ESP is the pinned partition's disk's
+  first GPT partition, `td-esp` of the EFI System type, found through
+  sysfs and engine's `gpt::locate` as td-install finds it, and held
+  open read-write to the commit. It mounts securityfs itself (an
+  existing mount is no failure), reads the log, and reads PCRs 4, 7
+  and 9 in one command. A staged pair td-fat cannot read is left as it
+  is, and the boot goes on. An ESP the selector cannot locate, or one
+  td-fat refuses, shows no staged pair and prints nothing, since the
+  worker stages only through the same admission. The initramfs is
+  hashed as it is read; the kernel is held whole for Authenticode.
+- The commit runs once, after `finish`, inside the boot's deployment
+  selection: with the volume mounted (read-only, or writable where an
+  earlier unmount failed) and only read, and the deployment to
+  boot already authenticated, just before that deployment's handoff,
+  on whichever path the selection took. It reads `current` from that
+  mount. The loop it binds `current`'s `root.erofs` on stays bound until
+  the handoff, since td-init has no detach. It commits only when the
+  TPM PIN released this boot: a pair read before a PIN whose keyslot
+  did not open waits.
+- "Any authenticity failure" is a `current` the selector cannot
+  authenticate as it does to boot it (no `current` link, a manifest
+  whose signature fails, a `root.erofs` that does not hash to it, a
+  root without the template) and either digest that differs. A
+  `current` that cannot be reached for another reason (the selector's
+  trust root, the loop or its mount) keeps the staged update, writing
+  nothing.
+- Only a prediction that failed this boot, the running pair unreadable
+  included, takes the retry path, so `update`'s warning is true when
+  it shows. A prediction that held but left no object at the commit (a
+  seal the TPM refused, or one `finish` discarded) keeps the staged
+  update and any retry token as they are, for the next PIN boot. The
+  retry token is written in place of the header's own when there is
+  one, so a forged or stale token is replaced, never offered.
+- `finish` hands the predicted object on only beside a lockout this boot
+  took or proved, whose token on the header read at release verifies
+  under the volume key for the object's primary, and the import checks
+  that anchor again on the header it writes: the reseal's rule ("Lockout").
+  A first take anchors the next boot's object, not this one's. On a TPM
+  whose lockout td can neither take nor prove, every PIN boot discards
+  the object; the prediction holds, so `update` is never offered, and
+  the update stays staged while the running selector keeps booting and
+  each PIN boot says why. Staging again replaces it to the same end.
+  The exit is the lockout's own: clear the TPM from firmware and
+  re-enroll it (8g), after which a PIN boot takes the lockout and the
+  next commits. The worker does not refuse to stage there: it holds no
+  volume key, so it can see only that a lockout token exists, not that
+  it verifies.
+- An import the planner refuses (the header holds other than the one
+  tpm-pin token that released, as a cut commit leaves it, or no anchor)
+  keeps the staged update for the next PIN boot, whose plan retires an
+  extra token first; a commit's sector write that fails after the
+  import is the table's row for it.
+- A commit removes the retry token before its sector write and goes no
+  further when that removal fails, the update kept: a token left behind
+  verifies for the same pair staged again. A deletion removes it first
+  too, and deletes whatever the removal did.
+- td-fat says where a commit failed: before its sector write, the
+  update kept; at it, or after it while freeing the old chains, the new
+  pair committed or possibly so. `update`'s restart follows either of
+  the last two, and an import's commit reports either and boots on, both
+  selectors having a token.
+- The `update` answer is read through secret-line without echo, as every
+  selector entry is, and only exactly `update` completes.
+
 **Threat and limits.** Staging needs root on the running system and
 physical consent. Anyone who can write the ESP can also stage files, but
 the predicted object leaves RAM only after the pair is authenticated
@@ -2871,7 +2944,11 @@ Increment 8's evidence, by sub-increment:
   with an authentic pair keeps it and writes the retry token, and only
   the retry's failure with that token verifying offers `update`, which
   reboots at once; a retry token forged, copied from another volume or
-  naming another pair offers nothing. Disk-proof tests: a login-key
+  naming another pair offers nothing. They are td-boot's
+  `selector_update_tests.rs`, over an ESP td's FAT32 writer builds and a
+  scripted cryptsetup, with td-protector's pre-seal seal and the next
+  boot's release through the predicted object in its own tests; the
+  guest leg is 8h's "Predicted update". Disk-proof tests: a login-key
   operation on a protected machine authorized by a fresh recovery key
   or disk-token assertion whose derived passphrase opens its keyslot,
   tested through `storage-operation`, and refused with a wrong one, a

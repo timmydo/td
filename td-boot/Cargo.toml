@@ -21,6 +21,7 @@ name = "td-boot"
 path = "src/main.rs"
 
 [dependencies]
+td-fat = { path = "../td-fat" }
 td-fido = { path = "../td-fido" }
 td-protector = { path = "../td-protector" }
 td-tpm = { path = "../td-tpm" }

@@ -8,8 +8,10 @@
 //! and device-bound ones `transition`'s; this one refuses both.
 
 use crate::cryptsetup;
+use crate::lockout;
 use crate::luks2::{self, Header, Metadata, MAX_TPM_PIN_TOKENS};
-use crate::protected::{Lockout, Shape, Token, TpmPin};
+use crate::pin::PRIMARY_NAME_LEN;
+use crate::protected::{Lockout, Shape, Token, TpmPin, UpdateRetry};
 use crate::token::MAX_SLOT;
 use std::ffi::OsString;
 use std::fmt;
@@ -121,6 +123,13 @@ pub enum Refusal {
     NoFreeToken,
     /// A token to import is outside the token format.
     Token(String),
+    /// The update's predicted protector is imported only beside the one
+    /// tpm-pin token that released this boot, the plan having retired the
+    /// rest.
+    NotPredicted,
+    /// No lockout token on the header verifies under the volume key for the
+    /// storage primary the update's predicted protector was sealed under.
+    NotAnchored,
     /// cryptsetup's own metadata could not be read or does not agree with
     /// the header the plan was computed from.
     Metadata(String),
@@ -147,6 +156,13 @@ impl fmt::Display for Refusal {
             Self::NoFreeKeyslot => f.write_str("the LUKS2 header has no free keyslot"),
             Self::NoFreeToken => f.write_str("the LUKS2 header has no free token number"),
             Self::Token(error) => write!(f, "the token to import: {error}"),
+            Self::NotPredicted => f.write_str(
+                "the header holds other than the one tpm-pin token that released this boot",
+            ),
+            Self::NotAnchored => f.write_str(
+                "no lockout token on the header verifies under the volume key for the storage \
+                 primary the protector was sealed under",
+            ),
             Self::Metadata(error) => f.write_str(error),
         }
     }
@@ -469,13 +485,7 @@ pub fn lockout_import(header: &Header, token: &Lockout) -> Result<(u8, Step), Re
     }
     let (id, replace) = match lockout(header) {
         Some((number, _)) => (number, true),
-        None => {
-            let used = header.token_numbers();
-            let free = (0..=MAX_SLOT)
-                .find(|number| !used.contains(number))
-                .ok_or(Refusal::NoFreeToken)?;
-            (free, false)
-        }
+        None => (free_token(header)?, false),
     };
     let token = Token::Lockout(token.clone());
     token.encode().map_err(Refusal::Token)?;
@@ -507,6 +517,95 @@ pub fn lockout_proven(number: u8, token: &Lockout) -> Result<Step, Refusal> {
 /// An unproven lockout token's removal after a refused proof.
 pub fn lockout_remove(number: u8) -> Step {
     Step::RemoveToken { token: number }
+}
+
+/// The update-retry token, with its number.
+pub fn update_retry(header: &Header) -> Option<(u8, &UpdateRetry)> {
+    header
+        .protected
+        .iter()
+        .find_map(|(number, token)| match token {
+            Token::UpdateRetry(retry) => Some((*number, retry)),
+            _ => None,
+        })
+}
+
+/// The lowest token number no token holds.
+fn free_token(header: &Header) -> Result<u8, Refusal> {
+    let used = header.token_numbers();
+    (0..=MAX_SLOT)
+        .find(|number| !used.contains(number))
+        .ok_or(Refusal::NoFreeToken)
+}
+
+/// A selector update's commit (ENCRYPTION.md "Selector update"): the
+/// pre-seal's object as a second tpm-pin token naming `keyslot`, the
+/// keyslot the PIN released this boot, beside that one token alone, as the
+/// lowest free number. Only a header `check` admits in the TPM-primary
+/// shape takes one, and only when its lockout token verifies under
+/// `volume_key` for the object's primary, as a reseal's import requires.
+pub fn predicted_import(
+    header: &Header,
+    keyslot: u8,
+    token: &TpmPin,
+    volume_key: &[u8],
+) -> Result<Step, Refusal> {
+    if check(header)? != Shape::Tpm {
+        return Err(Refusal::NotPredicted);
+    }
+    match tpm_pins(header).as_slice() {
+        [(_, released)] if released.keyslot == Some(keyslot) => {}
+        _ => return Err(Refusal::NotPredicted),
+    }
+    if !anchors(header, volume_key, &token.primary) {
+        return Err(Refusal::NotAnchored);
+    }
+    free_token(header)?;
+    let token = Token::TpmPin(TpmPin {
+        keyslot: Some(keyslot),
+        ..token.clone()
+    });
+    token.encode().map_err(Refusal::Token)?;
+    Ok(Step::ImportToken {
+        token,
+        id: None,
+        replace: false,
+    })
+}
+
+/// The header's lockout token verifies under `volume_key` and the header's
+/// UUID for the storage primary `primary`: the anchor a reseal's and a
+/// predicted protector's import require (ENCRYPTION.md "Lockout").
+pub fn anchors(header: &Header, volume_key: &[u8], primary: &[u8; PRIMARY_NAME_LEN]) -> bool {
+    lockout::volume_uuid(&header.uuid).is_some_and(|uuid| {
+        lockout(header)
+            .is_some_and(|(_, token)| lockout::open(volume_key, &uuid, token, primary).is_ok())
+    })
+}
+
+/// The update-retry token's write: replacing the header's own, or as the
+/// lowest free number. Only the TPM-primary shape stages an update.
+pub fn retry_write(header: &Header, retry: &UpdateRetry) -> Result<Step, Refusal> {
+    if check(header)? != Shape::Tpm {
+        return Err(Refusal::NotProtected);
+    }
+    let (id, replace) = match update_retry(header) {
+        Some((number, _)) => (number, true),
+        None => (free_token(header)?, false),
+    };
+    let token = Token::UpdateRetry(retry.clone());
+    token.encode().map_err(Refusal::Token)?;
+    Ok(Step::ImportToken {
+        token,
+        id: Some(id),
+        replace,
+    })
+}
+
+/// The update-retry token's removal, when the header holds one: a commit
+/// and a deletion of the staged update both remove it.
+pub fn retry_remove(header: &Header) -> Option<Step> {
+    update_retry(header).map(|(number, _)| Step::RemoveToken { token: number })
 }
 
 #[cfg(test)]
