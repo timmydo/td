@@ -35,6 +35,7 @@ pub use td_mime::header_value;
 pub mod http_auth;
 pub mod http_request;
 pub mod https;
+pub mod https_upload;
 pub mod ids;
 pub use td_mime::json_string;
 pub mod jmap_events;

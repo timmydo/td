@@ -1022,3 +1022,42 @@ must retry Busy within their original deadlines or return a transient refusal;
 they must never replace admission with an unbounded mutex wait. A panic while
 publication holds the guard poisons the shared registry and deliberately
 requires service restart, even if the registry itself was only read.
+
+### HTTPS upload worker
+
+The mailbox-access profile routes authenticated POST requests at
+`/jmap/upload/{accountId}` to one dedicated synchronous worker. The account
+must match the configured account. A single permit lasts through final
+response flush or connection retirement; competing uploads receive 429.
+The worker retains its client slot while storage work runs, and the network
+loop uses try_lock to keep unrelated HTTPS connections progressing.
+
+Content-Length and chunked bodies pass through BodyReader into a reserved
+Upload. The decoded ceiling is message_bytes (or the smaller declared length);
+total wire input is bounded by eight times that ceiling plus 64 KiB. Two 16 KiB
+worker buffers suffice; neither the complete upload nor its body is retained
+in memory. Header credentials are retired before the transfer. Content type
+is limited to 1024 ASCII header bytes and serialized with the shared JSON
+string frame. Missing Content-Type uses application/octet-stream.
+
+Expect: 100-continue is acknowledged only after body bounds and storage quota
+admission. The body phase has an absolute transfer deadline and idle timeout,
+both capped by the connection lifetime. Publication has its enclosing exchange
+deadline through receipt flushing, rechecks the device, and allows the
+coordinator's single sequence replan. The JSON success receipt uses only a known durable outcome and includes
+accountId, blobId, type and size. A stopped ledger or cleanup error after a
+known commit attempts that receipt and a bounded TLS close before retiring.
+Any intervening clock, connection or encoding failure still retires the
+service; a client cannot prevent retirement by refusing the receipt.
+An indeterminate outcome never produces success.
+
+Shutdown stops body transfer, joins the upload worker and releases incomplete
+spool/quota owners. A commit already underway settles before the worker joins;
+a lost connection or expired exchange can leave a durable upload without an
+observed receipt. The fixed connection cap is one hour; raised transfer limits
+remain subject to that cap. Body progress does not extend the absolute limit.
+The worker wakes on admission and polls nonblocking TLS progress at 5 ms.
+Oldest-first eviction under upload quota pressure and complete Core discovery,
+API, download and EventSource activation remain prerequisites to advertising
+Core. This endpoint currently refuses quota exhaustion rather than performing
+that pending eviction policy.

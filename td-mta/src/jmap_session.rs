@@ -156,7 +156,7 @@ impl Source for Text<'_> {
         Ok(self.0.next().map(Scalar::Value).unwrap_or(Scalar::Complete))
     }
 }
-fn quoted(out: &mut TextBuffer<'_>, value: &str) -> Result<(), Error> {
+pub(crate) fn quoted(out: &mut TextBuffer<'_>, value: &str) -> Result<(), Error> {
     let mut source = Text(value.chars());
     let mut frame = Frame::new();
     loop {

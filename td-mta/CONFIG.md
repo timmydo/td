@@ -1920,8 +1920,13 @@ and configured HTTPS listeners with file-provisioned TLS identities. Provision
 `data/devices` mode 0700 under the same service owner and create an initial
 device offline before starting. The registry must exist and validate; startup
 does not silently initialize it. The profile has no public administration
-HTTP route. Discovery and mail access remain unavailable until the JMAP
+HTTP route. Discovery and reading mail remain unavailable until the JMAP
 increments; authenticated `/.well-known/jmap` currently returns 503.
+Authenticated POST `/jmap/upload/{accountId}` now streams binary uploads into
+the configured account, with one upload at a time, bounded framing and a
+JSON durable receipt. It shares the app-password registry and storage quota
+coordinator. Quota-pressure eviction remains pending, so this does not yet
+make Core discoverable.
 
 Run `td-mta device create --runtime PATH --label LABEL`, `device list --runtime
 PATH`, or `device revoke --runtime PATH --id ID` for the running profile.
@@ -1934,10 +1939,11 @@ status ok and the operation's data; failures carry fixed stage/error codes.
 
 The ready announcement and status report profile mailbox-access. Readiness
 waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS workers. This reports transport readiness, not available JMAP
+network/TLS/upload workers. This reports transport readiness, not available JMAP
 methods. Stop, SIGTERM and SIGINT use the same shared stop flag. HTTPS closes
-its current nonmutating exchanges, then joins its worker; SMTP preserves its
-normal drain and known committed replies. Outbound delivery, reload and ACME
+its exchanges and joins its TLS and upload workers; an upload publication
+already underway settles before shutdown returns. SMTP preserves its normal
+drain and known committed replies. Outbound delivery, reload and ACME
 remain inactive in both profiles.
 
 ### Response retention admission

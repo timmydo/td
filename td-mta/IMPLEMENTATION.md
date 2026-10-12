@@ -3775,3 +3775,10 @@ The device registry now supplies current account/device activity to a guarded
 UploadAuthorization adapter. Admission is deadline-bounded and nonblocking;
 a live guard excludes revocation through storage publication. HTTPS worker
 and upload route integration remain separate.
+
+The mailbox-access HTTPS worker now joins authenticated upload routing to the
+native quota/spool/publication coordinator. Real TLS fixtures cover fixed and
+chunked bodies, empty uploads, Continue admission, device revocation before
+commit and reopened durable bytes/leases. The single upload permit survives
+through response flush. Core remains unadvertised pending quota-pressure
+eviction and the remaining endpoint/dispatch activation work.

@@ -1837,13 +1837,17 @@ permit, and retries a busy pool within the original handshake deadline.
 All socket operations
 are nonblocking. Request-head parsing uses at most 16 KiB per turn. The current
 profile permits one request per connection and sends Connection: close with
-all responses. It performs no mail/body mutation and can reject without
-consuming a request body. After responding it applies RESOURCES.md's bounded
-write-half closure and unread-data drain; those slots remain active for
-connection admission until retired. It never emits 100 Continue, accepts an upload or
-claims JMAP conformance yet. A valid authenticated discovery request gets 503;
-other authenticated targets get 404. Missing, invalid and revoked credentials
-receive the same 401 Basic challenge. No credential enters error output. A failed local credential publication
+all responses. Authenticated upload POSTs use the dedicated bounded worker
+specified in ADMISSION.md, with quota admission before 100 Continue and
+commit-time device authorization. Other refusals need not consume the body.
+After responding it applies RESOURCES.md's bounded write-half closure.
+Refusals may drain bounded unread data; successful uploads already consumed
+their body and do not drain. Slots remain active until retired.
+This does not yet claim JMAP conformance: authenticated discovery gets 503
+until the complete Core contract is ready, and unknown targets get 404.
+Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
+credentials receive the same 401 Basic challenge. No credential enters error
+output. A failed local credential publication
 marks the service failed and initiates orderly shutdown; restart must recover
 a healthy registry before serving again.
 
@@ -1855,7 +1859,8 @@ DNS origin and port (case-insensitive host, omitted port means 443). An Origin
 header must match that HTTPS origin; no CORS permission is emitted. A bounded
 strict Basic decoder compares the configured username exactly and verifies
 the generated device token. Each request observes current revocation state.
-A future mutation must still acquire its commit-time authorization guard.
+Upload publication acquires a fresh commit-time authorization guard; future
+mutations must do the same.
 
 At most two active HTTPS connections per IP and the configured global count
 are admitted. Authentication uses fixed one-second monotonic windows: 64
@@ -1865,9 +1870,11 @@ wrong authority or cross-origin requests are refused before verification.
 Exhaustion receives 429 with Retry-After: 1. This permits boundary bursts,
 not a rolling-window rate guarantee. Header total/idle, TLS, response idle
 and absolute transfer/session caps use the configured timer plan. Shutdown
-stops HTTPS admission and closes these nonmutating exchanges immediately,
-while SMTP retains its orderly final-reply behavior. Fixed native/kernel work
-already running must return before joins complete.
+stops HTTPS admission and cancels unfinished upload transfers. It joins any
+publication already running; a durable commit can outlive its connection or
+exchange deadline without an observed receipt. Nonmutating exchanges close
+immediately, while SMTP retains its orderly final-reply behavior. Fixed
+native/kernel work already running must return before joins complete.
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous

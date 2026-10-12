@@ -8,6 +8,8 @@ use crate::{
     generations::GenerationLease,
     http_auth::{self, Attempts},
     http_request::{self, HeadReader, HEAD_BYTES, QUANTUM},
+    https_upload,
+    ids::DeviceId,
     limits::ResourcePlan,
     ports::{
         Clock, Deadline, Error, FlushProgress, Handshake, IoProgress, Tick, TlsPolicyId,
@@ -65,6 +67,7 @@ enum Phase {
     Tls,
     Head,
     Authorize,
+    Upload,
     Response,
     Close,
     Drain,
@@ -83,6 +86,9 @@ struct Client {
     response: Vec<u8>,
     sent: usize,
     attempt_admitted: bool,
+    device: Option<DeviceId>,
+    upload_slot: bool,
+    stop_after_response: bool,
     absolute: Deadline,
     phase_deadline: Deadline,
     idle: Deadline,
@@ -115,6 +121,7 @@ pub struct Https<'a, 'r> {
     pub resources: &'a ResourcePlan,
     pub timeouts: &'a TimeoutPlan,
     pub clock: Arc<dyn Clock>,
+    pub uploads: Option<&'a dyn https_upload::Backend>,
     pub ready: &'a AtomicBool,
 }
 impl Https<'_, '_> {
@@ -129,6 +136,7 @@ impl Https<'_, '_> {
             .map_err(|_| Error::Capacity)?;
         slots.extend((0..count).map(|_| Mutex::new(None)));
         let done = AtomicBool::new(false);
+        let upload_active = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let worker = std::thread::Builder::new()
                 .name("https-tls".into())
@@ -160,12 +168,66 @@ impl Https<'_, '_> {
                 done: &done,
                 worker: worker.thread(),
             };
-            let result = self.network(&slots, &worker, control);
+            let uploader = match std::thread::Builder::new()
+                .name("https-upload".into())
+                .spawn_scoped(scope, || {
+                    while !done.load(Ordering::Acquire) {
+                        for cell in &slots {
+                            let mut slot = match cell.try_lock() {
+                                Ok(slot) => slot,
+                                Err(TryLockError::WouldBlock) => continue,
+                                Err(_) => {
+                                    control.fail();
+                                    return;
+                                }
+                            };
+                            let Some(client) = slot.as_mut().filter(|c| c.phase == Phase::Upload)
+                            else {
+                                continue;
+                            };
+                            if self.upload(client, control).is_err() {
+                                if client.stop_after_response {
+                                    control.fail();
+                                }
+                                *slot = None;
+                                upload_active.store(false, Ordering::Release);
+                            }
+                        }
+                        std::thread::park_timeout(SCAN);
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    drop(finish);
+                    let _ = worker.join();
+                    return Err(error.into());
+                }
+            };
+            let upload_finish = Finish {
+                done: &done,
+                worker: uploader.thread(),
+            };
+            let result = self.network(&slots, &worker, &uploader, &upload_active, control);
             if result.is_err() {
                 control.fail();
             }
+            drop(upload_finish);
             drop(finish);
+            if uploader.join().is_err() {
+                control.fail();
+                return Err(Error::WriterStopped);
+            }
             if worker.join().is_err() {
+                control.fail();
+                return Err(Error::WriterStopped);
+            }
+            let retired = slots.iter().any(|slot| {
+                slot.lock().map_or(true, |slot| {
+                    slot.as_ref()
+                        .is_some_and(|client| client.stop_after_response)
+                })
+            });
+            if retired || control.state() == crate::smtp_receiving::State::Failed {
                 control.fail();
                 return Err(Error::WriterStopped);
             }
@@ -246,6 +308,8 @@ impl Https<'_, '_> {
         &self,
         slots: &[Mutex<Option<Client>>],
         worker: &std::thread::ScopedJoinHandle<'_, ()>,
+        uploader: &std::thread::ScopedJoinHandle<'_, ()>,
+        upload_active: &AtomicBool,
         control: &Control,
     ) -> Result<(), Error> {
         for listener in self.listeners {
@@ -261,7 +325,7 @@ impl Https<'_, '_> {
         let mut cursor = 0;
         let mut accept_after = Tick(0);
         while !control.stop_requested() {
-            if worker.is_finished() {
+            if worker.is_finished() || uploader.is_finished() {
                 control.fail();
                 return Err(Error::WriterStopped);
             }
@@ -287,13 +351,37 @@ impl Https<'_, '_> {
                     *peers.get_mut(index).ok_or(Error::Invalid)? = None;
                     continue;
                 };
-                if client.phase == Phase::Tls {
+                if matches!(client.phase, Phase::Tls | Phase::Upload) {
                     continue;
                 }
-                match self.step(client, &mut attempts) {
-                    Ok(true) => (),
+                let mut wake_upload = false;
+                match self.step(client, &mut attempts, upload_active) {
+                    Ok(true) => {
+                        if client.phase == Phase::Upload {
+                            wake_upload = true;
+                        }
+                        if client.phase == Phase::Close
+                            && client.upload_slot
+                            && !client.stop_after_response
+                        {
+                            client.upload_slot = false;
+                            upload_active.store(false, Ordering::Release);
+                        }
+                    }
                     Err(Error::WriterStopped) => return Err(Error::WriterStopped),
-                    Ok(false) | Err(_) => *slot = None,
+                    Ok(false) | Err(_) => {
+                        if client.stop_after_response {
+                            return Err(Error::WriterStopped);
+                        }
+                        if client.upload_slot {
+                            upload_active.store(false, Ordering::Release);
+                        }
+                        *slot = None;
+                    }
+                }
+                drop(slot);
+                if wake_upload {
+                    uploader.thread().unpark();
                 }
             }
             cursor = (cursor + 1) % slots.len();
@@ -380,6 +468,9 @@ impl Https<'_, '_> {
                     response,
                     sent: 0,
                     attempt_admitted: false,
+                    device: None,
+                    upload_slot: false,
+                    stop_after_response: false,
                     absolute,
                     phase_deadline,
                     idle: phase_deadline,
@@ -393,7 +484,12 @@ impl Https<'_, '_> {
         }
         Ok(())
     }
-    fn step(&self, client: &mut Client, attempts: &mut Attempts) -> Result<bool, Error> {
+    fn step(
+        &self,
+        client: &mut Client,
+        attempts: &mut Attempts,
+        upload_active: &AtomicBool,
+    ) -> Result<bool, Error> {
         let time = self.clock.sample()?;
         if client.absolute.expired(time.monotonic)
             || client.phase_deadline.expired(time.monotonic)
@@ -462,8 +558,39 @@ impl Https<'_, '_> {
                         Err(_) => return Err(Error::WriterStopped),
                     };
                     match http_auth::basic(&devices, self.username, head.authorization) {
-                        Ok(Some(_)) => {
-                            if head.target == "/.well-known/jmap" {
+                        Ok(Some(device)) => {
+                            if let Some(backend) = self.uploads {
+                                if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
+                                    if head.method != "POST" {
+                                        405
+                                    } else if crate::wire::Id::parse(account)
+                                        .ok()
+                                        .and_then(|id| id.local())
+                                        != Some(backend.account())
+                                    {
+                                        404
+                                    } else if upload_active
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
+                                        .is_err()
+                                    {
+                                        429
+                                    } else {
+                                        client.upload_slot = true;
+                                        client.device = Some(device);
+                                        client.phase = Phase::Upload;
+                                        return Ok(true);
+                                    }
+                                } else if head.target == "/.well-known/jmap" {
+                                    503
+                                } else {
+                                    404
+                                }
+                            } else if head.target == "/.well-known/jmap" {
                                 503
                             } else {
                                 404
@@ -503,6 +630,9 @@ impl Https<'_, '_> {
                 if client.connection.as_mut().ok_or(Error::Invalid)?.close()?
                     == FlushProgress::Complete
                 {
+                    if client.stop_after_response {
+                        return Err(Error::WriterStopped);
+                    }
                     client.phase = Phase::Drain;
                 }
             }
@@ -513,23 +643,127 @@ impl Https<'_, '_> {
                     &mut client.drain_left,
                 );
             }
-            Phase::Tls => return Err(Error::Invalid),
+            Phase::Tls | Phase::Upload => return Err(Error::Invalid),
         }
         Ok(true)
     }
+    fn upload(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
+        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let head = client.head.head().map_err(|_| Error::Invalid)?;
+        let now = self.clock.sample()?.monotonic;
+        let configured_max =
+            u64::try_from(self.resources.limits().message_bytes).map_err(|_| Error::Capacity)?;
+        let maximum = match head.framing {
+            http_request::Framing::Length(n) => n.min(configured_max),
+            http_request::Framing::Chunked => configured_max,
+        };
+        let transfer = deadline(
+            now,
+            self.timeouts
+                .http_transfer_seconds(maximum)
+                .map_err(|_| Error::Invalid)?,
+        )?
+        .min(client.absolute);
+        let operation = deadline(
+            now,
+            self.timeouts
+                .http_exchange_seconds(maximum, 4096)
+                .map_err(|_| Error::Invalid)?,
+        )?
+        .min(client.absolute);
+        // This connection serves one exchange; tighten its cap through flush.
+        client.absolute = operation;
+        let framing = head.framing;
+        let expect_continue = head.expect_continue;
+        let media = head.content_type.unwrap_or("application/octet-stream");
+        let mut media_bytes = [0; 1024];
+        let media_len = media.len();
+        let Some(media_out) = media_bytes.get_mut(..media_len) else {
+            return self.respond(client, 431, self.clock.sample()?.utc_ms);
+        };
+        media_out.copy_from_slice(media.as_bytes());
+        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        let media = std::str::from_utf8(media_bytes.get(..media_len).ok_or(Error::Invalid)?)
+            .map_err(|_| Error::Invalid)?;
+        let result = backend.receive(
+            https_upload::Request {
+                account: backend.account(),
+                device: client.device.ok_or(Error::Invalid)?,
+                framing,
+                content_type: media,
+                prefix: client
+                    .input
+                    .get(..client.input_used)
+                    .ok_or(Error::Invalid)?,
+                deadline: operation,
+                body_deadline: transfer,
+                expect_continue,
+            },
+            client.connection.as_mut().ok_or(Error::Invalid)?,
+            control,
+        );
+        client.drain_left = if result.is_ok() {
+            0
+        } else {
+            match framing {
+                http_request::Framing::Length(n) => n.min(DRAIN_BYTES as u64) as usize,
+                http_request::Framing::Chunked => DRAIN_BYTES,
+            }
+        }
+        .saturating_sub(client.input_used);
+        client.input_used = 0;
+        client.input.fill(0);
+        if let Ok(response) = &result {
+            client.stop_after_response = response.stop;
+        } else if matches!(result, Err(Error::WriterStopped)) {
+            control.fail();
+            return Err(Error::WriterStopped);
+        }
+        let time = self.clock.sample()?;
+        match result {
+            Ok(response) => self.respond_body(client, 200, time.utc_ms, response.bytes()?),
+            Err(error) => {
+                let status = match error {
+                    Error::Forbidden => 403,
+                    Error::Capacity => 413,
+                    Error::Quota => 507,
+                    Error::Invalid => 400,
+                    _ => 503,
+                };
+                self.respond(client, status, time.utc_ms)
+            }
+        }
+    }
     fn respond(&self, client: &mut Client, status: u16, utc_ms: i64) -> Result<(), Error> {
+        self.respond_body(client, status, utc_ms, &[])
+    }
+    fn respond_body(
+        &self,
+        client: &mut Client,
+        status: u16,
+        utc_ms: i64,
+        body: &[u8],
+    ) -> Result<(), Error> {
         use std::io::Write;
+        client
+            .response
+            .try_reserve(512usize.checked_add(body.len()).ok_or(Error::Capacity)?)
+            .map_err(|_| Error::Capacity)?;
         let reason = match status {
+            200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            413 => "Content Too Large",
+            507 => "Insufficient Storage",
             421 => "Misdirected Request",
             429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
             _ => "Service Unavailable",
         };
-        write!(&mut client.response, "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nConnection: close\r\nContent-Length: 0\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", http_date(utc_ms)?)?;
+        write!(&mut client.response, "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nConnection: close\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", http_date(utc_ms)?, body.len())?;
         if status == 401 {
             client.response.extend_from_slice(
                 b"WWW-Authenticate: Basic realm=\"td-mta\", charset=\"UTF-8\"\r\n",
@@ -538,7 +772,16 @@ impl Https<'_, '_> {
         if status == 429 {
             client.response.extend_from_slice(b"Retry-After: 1\r\n");
         }
+        if !body.is_empty() {
+            client
+                .response
+                .extend_from_slice(b"Content-Type: application/json\r\n");
+        }
+        if status == 405 {
+            client.response.extend_from_slice(b"Allow: POST\r\n");
+        }
         client.response.extend_from_slice(b"\r\n");
+        client.response.extend_from_slice(body);
         // A known body boundary releases the slot without waiting for peer EOF.
         if let Ok(head) = client.head.head() {
             if let http_request::Framing::Length(bytes) = head.framing {

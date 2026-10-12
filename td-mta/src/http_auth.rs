@@ -121,6 +121,23 @@ impl<'r> crate::store_fs::UploadAuthorization for DevicePolicy<'_, 'r> {
     }
 }
 
+impl<'r> crate::store_fs::UploadAuthorization for Option<DevicePolicy<'_, 'r>> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        self.as_ref()
+            .ok_or(Error::Forbidden)?
+            .authorize(account, device, deadline)
+    }
+}
+
 fn sextet(byte: u8) -> Option<u32> {
     Some(u32::from(match byte {
         b'A'..=b'Z' => byte - b'A',

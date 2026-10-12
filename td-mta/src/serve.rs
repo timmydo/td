@@ -134,8 +134,8 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
             let spool =
                 IngressSpool::open(&mut spool_root, resources, Arc::clone(&clock), deadline)
                     .map_err(|error| adapter("spool-open", error))?;
-            // One lease per SMTP delivery plus the serial publication effect ticket.
-            let count = limits.smtp_sessions + 1;
+            // SMTP deliveries, one optional upload and the serial publication ticket.
+            let count = limits.smtp_sessions + 1 + usize::from(mailbox_access);
             let mut states = Vec::new();
             let mut cells = Vec::new();
             states
@@ -159,7 +159,13 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                 },
                 &mut states,
                 &mut cells,
-                (),
+                devices.as_ref().map(|devices| {
+                    td_mta::http_auth::DevicePolicy::new(
+                        devices,
+                        clock.as_ref(),
+                        policies.id().get(),
+                    )
+                }),
                 deadline,
             )
             .map_err(|error| match error {
@@ -197,6 +203,15 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                         .map_err(|error| adapter("https-listen", error))?,
                 );
             }
+            let upload_service = td_mta::https_upload::Service {
+                coordinator: &coordinator,
+                spool: &spool,
+                account: records.routes().account(),
+                maximum: u64::try_from(limits.message_bytes)
+                    .map_err(|_| config_failure("https", "capacity"))?,
+                clock: clock.as_ref(),
+                timeouts: plans.timeouts(),
+            };
             let https_ready = AtomicBool::new(false);
             let https = if let Some(devices) = devices.as_ref() {
                 Some(td_mta::https::Https {
@@ -216,6 +231,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                     resources,
                     timeouts: plans.timeouts(),
                     clock: Arc::clone(&clock),
+                    uploads: Some(&upload_service),
                     ready: &https_ready,
                 })
             } else {
