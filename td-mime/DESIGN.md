@@ -125,3 +125,46 @@ traversal keeps its existing outer admission and passive completion policy.
 The public interpreter has a compiled 2 KiB owner ceiling, with input backing
 reserved separately. Resident traversal still fits its existing 16 KiB
 cursor-plus-header-budget ceiling; no heap indirection stores phase state.
+
+Complete MIME traversal now shares one explicit-frame implementation between
+resident input and the fragmented structure cursor. Its requests identify
+already-clipped entity headers or an exact body offset and end. Headers may
+be a retained prefix only when the shared interpreter proves a definitive
+boundary; EOF is accepted only for the entire declared entity. Body fragments
+are borrowed for one turn and cannot exceed the requested range. Empty
+fragments do not invent EOF. Quoted-printable replay may request an earlier
+body offset; source retention and funded native reads belong to the caller.
+
+The fragmented cursor binds its original Meter and HeaderBudget on first
+admission, keeps interpretation credit across entities, and rejects replacement
+owners before debit. Its polls and consuming finish are fresh even after
+completion; descriptors remain passive and hidden until the whole tree
+succeeds. The resident adapter preserves its passive cached completion API.
+Both use identical outer-boundary clipping, digest defaults, depth/part/header
+ceilings, decoded leaf sizing and diagnostics. No attached-message recursion
+or source authority is introduced.
+
+Each multipart frame now owns the shared bounded delimiter Scanner. Boundary
+retention adds its one record and boundary-length I/O charge. After a closing
+delimiter, traversal drains the epilogue through the declared body end before
+finishing that scanner; epilogue events do not create children or diagnostics.
+This adds funded turns and visits compared with the former resident early
+exit, while preserving tree contents. Parent scanners retain consumed offsets,
+not native read-ahead positions, so an adapter may discard and reread unused
+input when switching entities. Per-turn parser bounds remain unchanged.
+The shared cursor plus HeaderBudget and the resident adapter plus HeaderBudget
+both fit the existing 16 KiB ceiling; descriptor/header/native-read backing is
+reserved separately. The shared crate performs no I/O or whole-body allocation.
+
+Every supplied header prefix must remain immutable for the whole fragmented
+cursor lifetime, even after its entity phase finishes. A native adapter uses
+cumulative disjoint header backing, not a refillable per-entity header buffer.
+It reserves and enforces actual retained-prefix capacity separately from the
+recognized-header ceiling. Delimiter lookahead and tentative non-header bytes
+can exceed recognized-header accounting; no formula using that count alone
+proves enough witness storage. Unused arena backing remains reusable for later
+entities, and a short arena refuses instead of growing. Body backing alone can
+be overwritten immediately after each turn. A complete supplied entity must
+carry Eof; a shorter definitive header prefix must carry Prefix. Header or body
+range overruns refuse as InvalidRange; inconsistent EOF labels refuse as
+IncompleteSource. These passive labels do not authenticate the source.

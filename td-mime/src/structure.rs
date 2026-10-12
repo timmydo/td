@@ -13,6 +13,8 @@ use crate::{
 pub mod classify;
 #[path = "structure/entity.rs"]
 pub mod entity;
+#[path = "structure/stream.rs"]
+pub mod stream;
 pub const MAX_DEPTH: usize = 64;
 /// Parsing ceilings, independent of any service configuration or account.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,32 +155,8 @@ pub enum Status {
     Yield,
     Complete,
 }
-struct Frame<'a> {
-    scanner: delimiter::Core<'a>,
-    boundary: [u8; 70],
-    length: u8,
-    ordinal: u16,
-    next_start: Option<u64>,
-    closed: bool,
-    digest: bool,
-}
-enum Phase {
-    Entity,
-    FirstOpening,
-    NextDelimiter,
-    Leaf,
-    Advance,
-    Complete,
-}
-enum Decode {
-    Base64 {
-        decoder: base64::Decoder,
-        position: usize,
-    },
-    QuotedPrintable(quoted_printable::Decoder),
-}
-/// Original job and email admission stay exclusively borrowed through completion.
-/// Input must be the complete authorized entity, never a captured prefix.
+/// Resident adapter over the shared explicit-frame traversal.
+/// Input is the complete authorized entity; source authorization is external.
 /// ```compile_fail,E0277
 /// fn copied<T: Copy>() {} copied::<td_mime::structure::Cursor<'_, '_>>();
 /// ```
@@ -188,23 +166,10 @@ enum Decode {
 pub struct Cursor<'a, 'w> {
     source: &'a [u8],
     base: u64,
+    max_headers: u64,
+    core: stream::Cursor<'a, 'w>,
     work: &'w mut Meter,
     budget: &'w mut HeaderBudget,
-    credit: u8,
-    parts: &'w mut [Part],
-    used: usize,
-    max_parts: usize,
-    max_depth: usize,
-    max_headers: u64,
-    headers: u64,
-    frames: [Option<Frame<'a>>; MAX_DEPTH],
-    depth: usize,
-    current: Part,
-    phase: Phase,
-    entity: Option<entity::Core<'a>>,
-    decoder: Option<Decode>,
-    decoded: [u8; 32],
-    failure: Option<Error>,
 }
 impl<'a, 'w> Cursor<'a, 'w> {
     pub fn new(
@@ -216,420 +181,69 @@ impl<'a, 'w> Cursor<'a, 'w> {
         work: &'w mut Meter,
         budget: &'w mut HeaderBudget,
     ) -> Result<Self, Error> {
-        let limits = limits.into();
         if source_end != SourceEnd::Eof {
             return Err(Error::IncompleteSource);
-        }
-        if !(1..=MAX_DEPTH).contains(&limits.mime_depth)
-            || !(1..=4096).contains(&limits.mime_parts)
-            || !(1..=1024 * 1024).contains(&limits.header_bytes)
-            || limits.mime_depth > limits.mime_parts
-        {
-            return Err(Error::InvalidLimits);
         }
         let end = base
             .checked_add(u64::try_from(source.len()).map_err(|_| Error::InvalidRange)?)
             .ok_or(Error::InvalidRange)?;
-        let max_headers = u64::try_from(limits.header_bytes).map_err(|_| Error::InvalidLimits)?;
-        let entity = entity::Core::new(entity::Input {
-            source,
-            base,
-            header_limit: max_headers,
-            context: metadata::Context::Normal,
-            source_end: SourceEnd::Eof,
-        })?;
+        let limits = limits.into();
         Ok(Self {
             source,
             base,
+            max_headers: u64::try_from(limits.header_bytes).map_err(|_| Error::InvalidLimits)?,
+            core: stream::Cursor::new(base..end, limits, parts)?,
             work,
             budget,
-            credit: 0,
-            parts,
-            used: 0,
-            max_parts: limits.mime_parts,
-            max_depth: limits.mime_depth,
-            max_headers,
-            headers: 0,
-            frames: std::array::from_fn(|_| None),
-            depth: 0,
-            current: Part {
-                entity_start: base,
-                entity_end: end,
-                depth: 1,
-                ..Part::default()
-            },
-            phase: Phase::Entity,
-            entity: Some(entity),
-            decoder: None,
-            decoded: [0; 32],
-            failure: None,
         })
     }
-    fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
-        if let Err(error) = result {
-            self.failure = Some(error);
-            self.used = 0;
-        }
-        result
-    }
     pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        let result = self
-            .budget
-            .charge_local(self.work, now, 0, 0, &mut self.credit)
-            .map_err(decode_work::Error::from)
-            .map_err(Error::from);
-        self.outcome(result)
+        self.core.check_deadline(now, self.work, self.budget)
     }
-    /// Cached passive descriptors appear only after the complete tree succeeds.
     pub fn parts(&self) -> Result<Option<&[Part]>, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if matches!(self.phase, Phase::Complete) {
-            return self
-                .parts
-                .get(..self.used)
-                .map(Some)
-                .ok_or(Error::InvalidState);
-        }
-        Ok(None)
+        self.core.parts()
     }
     pub fn header_bytes(&self) -> Option<u64> {
-        if self.failure.is_none() && matches!(self.phase, Phase::Complete) {
-            Some(self.headers)
-        } else {
-            None
-        }
+        self.core.header_bytes()
     }
-    /// Passive original input labels; this supplies no file or account authority.
+    /// Passive original source labels; these grant no file or account authority.
     pub fn input(&self) -> (&'a [u8], u64, u64) {
         (self.source, self.base, self.max_headers)
     }
     pub fn finish(
-        mut self,
+        self,
         now: Tick,
     ) -> Result<(&'w [Part], &'w mut Meter, &'w mut HeaderBudget), Error> {
-        self.check_deadline(now)?;
-        if !matches!(self.phase, Phase::Complete) {
-            return Err(Error::InvalidState);
-        }
-        let parts: &'w [Part] = self.parts;
-        Ok((
-            parts.get(..self.used).ok_or(Error::InvalidState)?,
-            self.work,
-            self.budget,
-        ))
+        let parts = self.core.finish(now, self.work, self.budget)?;
+        Ok((parts, self.work, self.budget))
     }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
-        if let Some(error) = self.failure {
-            return Err(error);
-        }
-        if matches!(self.phase, Phase::Complete) {
+        if self.core.parts()?.is_some() {
             return Ok(Status::Complete);
         }
-        self.check_deadline(now)?;
-        let result = self.step(now);
-        self.outcome(result)
-    }
-    fn range(&self, start: u64, end: u64) -> Result<&'a [u8], Error> {
-        td_header::resident::slice(self.source, self.base, start..end).ok_or(Error::InvalidRange)
-    }
-    fn append(&mut self, now: Tick) -> Result<u16, Error> {
-        if self.used >= self.max_parts {
-            return Err(Error::PartLimit);
-        }
-        let ordinal = u16::try_from(self.used.checked_add(1).ok_or(Error::PartLimit)?)
-            .map_err(|_| Error::PartLimit)?;
-        let target = self.parts.get_mut(self.used).ok_or(Error::OutputCapacity)?;
-        self.work
-            .charge(
-                now,
-                Charge {
-                    output_bytes: u64::try_from(std::mem::size_of::<Part>())
-                        .map_err(|_| Error::InvalidState)?,
-                    ..Charge::default()
+        let result = (|| {
+            let input = match self.core.request()? {
+                stream::Request::None => stream::Input::None,
+                stream::Request::Headers { start, end, .. } => stream::Input::Headers {
+                    bytes: td_header::resident::slice(self.source, self.base, start..end)
+                        .ok_or(Error::InvalidRange)?,
+                    source_end: SourceEnd::Eof,
                 },
-            )
-            .map_err(Error::Work)?;
-        self.current.ordinal = ordinal;
-        *target = self.current;
-        self.used += 1;
-        Ok(ordinal)
-    }
-    fn finish_entity(&mut self, now: Tick, value: entity::Value) -> Result<(), Error> {
-        self.headers = self
-            .headers
-            .checked_add(value.selection.end.header_bytes)
-            .ok_or(Error::HeaderLimit)?;
-        if self.headers > self.max_headers {
-            return Err(Error::HeaderLimit);
-        }
-        self.current.body_start = value.selection.end.body_start;
-        self.current.size = self
-            .current
-            .entity_end
-            .checked_sub(self.current.body_start)
-            .ok_or(Error::InvalidRange)?;
-        let classified = value.classified;
-        self.current.media = classified.media;
-        self.current.encoding = classified.encoding;
-        self.current.type_start = classified.type_start;
-        self.current.type_end = classified.type_end;
-        self.current.diagnostics |= classified.diagnostics;
-        if self.current.media == Media::Multipart {
-            let boundary = value.boundary().ok_or(Error::InvalidState)?;
-            let body = self.range(self.current.body_start, self.current.entity_end)?;
-            let scanner = delimiter::Core::new(body, self.current.body_start, boundary.len())
-                .map_err(Error::Delimiter)?;
-            let ordinal = self.append(now)?;
-            let frame = Frame {
-                scanner,
-                boundary: value.boundary,
-                length: value.boundary_len,
-                ordinal,
-                next_start: None,
-                closed: false,
-                digest: classified.digest,
-            };
-            *self.frames.get_mut(self.depth).ok_or(Error::DepthLimit)? = Some(frame);
-            self.depth += 1;
-            self.phase = Phase::FirstOpening;
-        } else {
-            self.decoder = match self.current.encoding {
-                Encoding::Identity => None,
-                Encoding::Base64 => Some(Decode::Base64 {
-                    decoder: base64::Decoder::default(),
-                    position: 0,
-                }),
-                Encoding::QuotedPrintable => Some(Decode::QuotedPrintable(
-                    quoted_printable::Decoder::new(self.current.size),
-                )),
-            };
-            if self.decoder.is_some() {
-                self.current.size = 0;
-            }
-            self.phase = Phase::Leaf;
-        }
-        Ok(())
-    }
-    fn frame_index(&self) -> Result<usize, Error> {
-        self.depth.checked_sub(1).ok_or(Error::InvalidState)
-    }
-    fn frame(&mut self) -> Result<&mut Frame<'a>, Error> {
-        let index = self.frame_index()?;
-        self.frames
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or(Error::InvalidState)
-    }
-    fn diagnostic(&mut self, ordinal: u16, flag: u8) -> Result<(), Error> {
-        let index = usize::from(ordinal)
-            .checked_sub(1)
-            .ok_or(Error::InvalidState)?;
-        let part = self.parts.get_mut(index).ok_or(Error::InvalidState)?;
-        part.diagnostics |= flag;
-        Ok(())
-    }
-    fn start_child(
-        &mut self,
-        start: u64,
-        end: u64,
-        parent: u16,
-        digest: bool,
-    ) -> Result<(), Error> {
-        let depth = self.depth.checked_add(1).ok_or(Error::DepthLimit)?;
-        if depth > self.max_depth {
-            return Err(Error::DepthLimit);
-        }
-        if self.used >= self.max_parts {
-            return Err(Error::PartLimit);
-        }
-        if self.parts.get(self.used).is_none() {
-            return Err(Error::OutputCapacity);
-        }
-        let source = self.range(start, end)?;
-        let remaining = self
-            .max_headers
-            .checked_sub(self.headers)
-            .ok_or(Error::HeaderLimit)?;
-        let context = if digest {
-            metadata::Context::DigestChild
-        } else {
-            metadata::Context::Normal
-        };
-        let entity = entity::Core::new(entity::Input {
-            source,
-            base: start,
-            header_limit: remaining,
-            context,
-            source_end: SourceEnd::Eof,
-        })?;
-        self.current = Part {
-            entity_start: start,
-            entity_end: end,
-            parent,
-            diagnostics: if digest { DIGEST_CHILD_CONTEXT } else { 0 },
-            depth: u8::try_from(depth).map_err(|_| Error::DepthLimit)?,
-            ..Part::default()
-        };
-        self.entity = Some(entity);
-        self.phase = Phase::Entity;
-        Ok(())
-    }
-    fn delimiter(&mut self, now: Tick) -> Result<delimiter::Status, Error> {
-        let index = self.frame_index()?;
-        let frame = self
-            .frames
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .ok_or(Error::InvalidState)?;
-        let boundary = frame
-            .boundary
-            .get(..usize::from(frame.length))
-            .ok_or(Error::InvalidState)?;
-        frame
-            .scanner
-            .poll(now, self.work, boundary)
-            .map_err(|e| match e {
-                delimiter::Error::Work(stop) => Error::Work(stop),
-                e => Error::Delimiter(e),
-            })
-    }
-    fn step(&mut self, now: Tick) -> Result<Status, Error> {
-        self.work
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    ..Charge::default()
+                stream::Request::Body { start, end } => stream::Input::Body {
+                    offset: start,
+                    bytes: td_header::resident::slice(self.source, self.base, start..end)
+                        .ok_or(Error::InvalidRange)?,
                 },
-            )
-            .map_err(Error::Work)?;
-        match &mut self.phase {
-            Phase::Entity => {
-                let entity = self.entity.as_mut().ok_or(Error::InvalidState)?;
-                if entity.poll(now, self.work, self.budget, &mut self.credit)? == Status::Complete {
-                    let value = entity.value().ok_or(Error::InvalidState)?;
-                    self.finish_entity(now, value)?;
-                    self.entity = None;
-                }
-            }
-            Phase::FirstOpening => match self.delimiter(now)? {
-                delimiter::Status::Yield => {}
-                delimiter::Status::Complete => return Err(Error::NotParsable),
-                delimiter::Status::Delimiter(d) => {
-                    if d.closing {
-                        return Err(Error::NotParsable);
-                    }
-                    let ordinal = self.frame()?.ordinal;
-                    if d.ignored_suffix {
-                        self.diagnostic(ordinal, IGNORED_SUFFIX)?;
-                    }
-                    self.frame()?.next_start = Some(d.after_line);
-                    self.phase = Phase::NextDelimiter;
-                }
-            },
-            Phase::NextDelimiter => {
-                let event = self.delimiter(now)?;
-                if event == delimiter::Status::Yield {
-                    return Ok(Status::Yield);
-                }
-                let frame = self.frame()?;
-                let start = frame.next_start.ok_or(Error::InvalidState)?;
-                let parent = frame.ordinal;
-                let digest = frame.digest;
-                let (end, next, closed, flag) = match event {
-                    delimiter::Status::Delimiter(d) => (
-                        d.preceding_end.max(start),
-                        Some(d.after_line),
-                        d.closing,
-                        if d.ignored_suffix { IGNORED_SUFFIX } else { 0 },
-                    ),
-                    delimiter::Status::Complete => {
-                        let index = usize::from(parent)
-                            .checked_sub(1)
-                            .ok_or(Error::InvalidState)?;
-                        (
-                            self.parts.get(index).ok_or(Error::InvalidState)?.entity_end,
-                            None,
-                            true,
-                            MISSING_CLOSE,
-                        )
-                    }
-                    delimiter::Status::Yield => return Err(Error::InvalidState),
-                };
-                let frame = self.frame()?;
-                frame.next_start = next;
-                frame.closed = closed;
-                self.diagnostic(parent, flag)?;
-                self.start_child(start, end, parent, digest)?;
-            }
-            Phase::Leaf => {
-                let body = self.range(self.current.body_start, self.current.entity_end)?;
-                let (written, complete, problem) = match self.decoder.as_mut() {
-                    None => (0, true, false),
-                    Some(Decode::Base64 { decoder, position }) => {
-                        let input = body.get(*position..).ok_or(Error::InvalidState)?;
-                        let p = decoder
-                            .poll(input, &mut self.decoded, true, now, self.work)
-                            .map_err(Error::Work)?;
-                        *position = position
-                            .checked_add(p.consumed)
-                            .ok_or(Error::InvalidState)?;
-                        (
-                            p.written,
-                            p.status == base64::Status::Complete,
-                            decoder.is_encoding_problem(),
-                        )
-                    }
-                    Some(Decode::QuotedPrintable(decoder)) => {
-                        let position =
-                            usize::try_from(decoder.position()).map_err(|_| Error::InvalidState)?;
-                        let input = body.get(position..).ok_or(Error::InvalidState)?;
-                        let p = decoder
-                            .poll(input, &mut self.decoded, now, self.work)
-                            .map_err(Error::Work)?;
-                        (
-                            p.written,
-                            p.status == quoted_printable::Status::Complete,
-                            decoder.is_encoding_problem(),
-                        )
-                    }
-                };
-                self.current.size = self
-                    .current
-                    .size
-                    .checked_add(u64::try_from(written).map_err(|_| Error::InvalidState)?)
-                    .ok_or(Error::InvalidState)?;
-                if complete {
-                    if problem {
-                        self.current.diagnostics |= ENCODING_PROBLEM;
-                    }
-                    self.append(now)?;
-                    self.decoder = None;
-                    self.phase = Phase::Advance;
-                }
-            }
-            Phase::Advance => {
-                if self.depth == 0 {
-                    self.phase = Phase::Complete;
-                    return Ok(Status::Complete);
-                }
-                if self.frame()?.closed {
-                    self.depth = self.depth.checked_sub(1).ok_or(Error::InvalidState)?;
-                    *self.frames.get_mut(self.depth).ok_or(Error::InvalidState)? = None;
-                } else {
-                    self.phase = Phase::NextDelimiter;
-                }
-            }
-            Phase::Complete => return Ok(Status::Complete),
-        }
-        Ok(Status::Yield)
+            };
+            self.core.poll(input, now, self.work, self.budget)
+        })();
+        self.core.outcome(result)
     }
 }
+
+const _: () = assert!(
+    std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 16 * 1024
+);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -690,6 +304,31 @@ mod tests {
             cursor.parts()?.unwrap().to_vec(),
             cursor.header_bytes().unwrap(),
         ))
+    }
+    #[test]
+    fn resident_range_failure_retires_all_observations() {
+        let mut parts = [Part::default(); 1];
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut cursor = Cursor::new(
+            b"\nbody",
+            17,
+            SourceEnd::Eof,
+            Limits::default(),
+            &mut parts,
+            &mut work,
+            &mut budget,
+        )
+        .unwrap();
+        // Inject an impossible adapter/source mismatch to pin the error path.
+        cursor.source = &[];
+        let error = Error::InvalidRange;
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert_eq!(cursor.parts(), Err(error));
+        assert_eq!(cursor.header_bytes(), None);
+        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+        assert_eq!(cursor.poll(Tick(1)), Err(error));
+        assert!(matches!(cursor.finish(Tick(1)), Err(found) if found == error));
     }
     #[test]
     fn nested_preorder_exact_extents_sizes_and_digest_defaults() {
