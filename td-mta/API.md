@@ -8530,3 +8530,34 @@ finished map returns the original selection handoff; it adds no account
 permission or capability advertisement. Outer Email object composition,
 preview, full Email/get dispatch and aggregate response admission remain
 separate.
+
+## Email preview plaintext projection
+
+`email_preview::Cursor` borrows the original job Meter and Clock while
+consuming already-decoded plaintext scalars. Construction seeds its checked
+clock with the caller's last observed job Tick, refusing a first sample that
+regresses. It folds the six ASCII whitespace characters, U+00A0, NEL, LINE
+SEPARATOR and PARAGRAPH SEPARATOR, trims edge whitespace, replaces
+noncharacters and remaining C0/C1 controls (including DEL), and retains at
+most 256 scalars (at most 1024 UTF-8 bytes). There is no NFC or grapheme
+segmentation; the scalar cap may cut a combining or grapheme sequence. HTML extraction, charset
+decoding, native custody and part selection remain caller responsibilities;
+this filter is not an HTML renderer or sanitizer.
+
+Each poll emits at most one scalar. Keep an unconsumed input/last pair for
+the next poll; an inserted separator consumes no input. None with last=false
+requests more input, and None with last=true ends the source. A consumed last
+scalar also closes input; fresh finish may follow that consumed-last turn
+without a further Complete poll, including a final Scalar or Yield result.
+The filter still consumes and charges suffix input
+after its display cap, and drops trailing whitespace. With one remaining
+position before a separated word, it drops the separator and suffix together.
+All output remains provisional through complete source and response success.
+
+Until a failure latches, construction, polls (including cached completion),
+explicit check and finish freshly sample the checked job clock. A late
+admission refusal wins over the turn's provisional result. Failures hide
+summary values and later calls return the same error without additional work.
+The value accessor is passive; only check and finish freshly admit its counts.
+Healthy consuming finish returns the exact original Meter and scalar/byte
+counts. This does not implement a native Email preview or advertise Mail.

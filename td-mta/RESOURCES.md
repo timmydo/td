@@ -4622,3 +4622,20 @@ Selection traversal and map framing are linear in selected parts and emitted
 framing bytes. Metadata replay and body decoding retain their original bounds
 and native I/O charges. This compositional ceiling is not whole-worker or
 pinned-musl memory qualification.
+
+## Email preview scalar storage
+
+The plaintext preview cursor fits 128 bytes and retains no source or output
+buffer. The external caller admits source decoding/HTML extraction and
+response backing. Each active nonempty or EOF turn spends one original work
+record; a generated separator turn also spends one record. Each emitted
+scalar charges its UTF-8 length before returning it. The display retains at
+most 256 scalars and charges at most 1024 output bytes, independently of the
+source suffix length. A suppressed suffix still costs one record per input
+scalar. Empty nonfinal polls, cached completion and explicit freshness checks
+spend no positive allowance. The original Meter is never copied or reset;
+the cursor's checked-clock watermark starts at the supplied prior job Tick.
+Work remains linear in the entire chosen decoded source, even after the cap.
+A large source may exhaust the enclosing job and refuse preview rather than
+publish its prefix. Source selection and worker admission must account for
+that availability tradeoff; this cursor claims no constant-time whole preview.

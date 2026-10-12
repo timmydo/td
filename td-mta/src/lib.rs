@@ -23,6 +23,7 @@ pub mod body_value_options;
 pub mod bounded;
 pub mod clock;
 pub mod config;
+pub mod email_preview;
 pub mod email_properties;
 pub mod email_property;
 pub mod email_response;

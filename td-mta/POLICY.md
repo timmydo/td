@@ -667,6 +667,19 @@ search, not body search. Unknown charsets use section 2's fallback, never
 silently skip their bytes. An unparseable body needed by a filter is a method
 failure, not a nonmatch.
 
+Email preview retains at most 256 Unicode scalars of projected plaintext.
+Collapse SP, HT, CR, LF, VT, FF, U+00A0, NEL, LINE SEPARATOR and PARAGRAPH
+SEPARATOR runs to one SP, removing leading and trailing runs. Preserve other
+Unicode whitespace; apply no NFC or case mapping. The cap may separate a
+combining or grapheme sequence, but never splits a Unicode scalar. Replace
+noncharacters and remaining C0/C1 controls (including DEL) with U+FFFD. If only one scalar position remains before a whitespace-separated
+next word, omit that separator and the remaining suffix rather than end with
+a generated space. Continue consuming the chosen source after the display cap
+so later decoding or admission refusal cannot become successful preview data.
+HTML sources first use the extraction policy below; literal markup is never
+fed directly to this plaintext projection. Source selection and native response
+composition remain separate implementation work.
+
 HTML extraction is a bounded tokenizer, not a renderer or sanitizer. Ignore
 tags, comments, declarations and contents of head/script/style; include text
 and decoded alt/title attribute values, with SP on either side of each
