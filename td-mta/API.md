@@ -8197,3 +8197,25 @@ capacity remain distinct limits. Every subsequent read and interpretation
 uses the original job and header budgets and retains the original native
 snapshot through publication. These passive header views do not bind a
 complete MIME tree or authorize a response.
+
+## Native entity-header interpretation
+
+`blob_entity::Cursor` retains one original PinnedBlob, Meter and aggregate
+HeaderBudget across clipped header collection and shared entity-header
+interpretation. Settings carry the already-authorized extent, aggregate
+header ceiling supplied by the enclosing traversal and MIME default context.
+The collector freezes its consumed-plus-one witness and returns disjoint
+backing; the interpreter selects metadata and validates any boundary using
+the shared resident core. The two passes must agree on the absolute header
+end. Each poll performs one bounded collection or interpretation turn,
+including the consuming handoff when that stage completes. It does not scan a multipart body or create a part locator.
+
+Native and job admission are checked before and after progress, including
+cached completion; a late native refusal overrides a would-be result and
+retirement is sticky. A refused consuming handoff preserves its own fenced
+error even after it has released its handles. Job refusals and internal
+state failures have the same error classification across stages. Passive value observation does
+not freshly authorize publication. Consuming finish freshly checks admission
+and returns the same native/job/header owners beside immutable header input,
+passive interpretation and disjoint reusable backing. The caller retains
+those owners through traversal and eventual response publication.

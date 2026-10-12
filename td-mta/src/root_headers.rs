@@ -110,9 +110,12 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             failure: None,
         })
     }
-    fn check(&mut self, now: Tick) -> Result<(), Error> {
+    pub(crate) fn check_native(&mut self) -> Result<(), PolicyError> {
         // The native pin checks its retained snapshot as well as its clock.
-        self.source.check_deadline().map_err(Error::Policy)?;
+        self.source.check_deadline()
+    }
+    pub(crate) fn check(&mut self, now: Tick) -> Result<(), Error> {
+        self.check_native().map_err(Error::Policy)?;
         self.work
             .charge(now, Charge::default())
             .map_err(Error::Work)
@@ -239,7 +242,14 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
     /// Freeze only the complete header witness and return unused arena capacity.
     /// A nonconsumed lookahead byte may prove liberal end-of-headers; retain it.
     /// The returned view is passive and the caller retains the original pin/job.
-    pub fn finish_split(mut self, now: Tick) -> Result<(View<'b>, &'b mut [u8]), Error> {
+    pub fn finish_split(self, now: Tick) -> Result<(View<'b>, &'b mut [u8]), Error> {
+        let (_, _, view, remaining) = self.into_split_parts(now)?;
+        Ok((view, remaining))
+    }
+    pub(crate) fn into_split_parts(
+        mut self,
+        now: Tick,
+    ) -> Result<SplitParts<'p, 'v, 'c, 'b, 'w>, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -259,6 +269,8 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             .split_at_mut_checked(retained)
             .ok_or(Error::State)?;
         Ok((
+            self.source,
+            self.work,
             View {
                 bytes,
                 base: self.base,
@@ -304,6 +316,12 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
     }
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_, '_, '_, '_>>() <= 512);
+pub(crate) type SplitParts<'p, 'v, 'c, 'b, 'w> = (
+    &'p mut PinnedBlob<'v, 'c>,
+    &'w mut Meter,
+    View<'b>,
+    &'b mut [u8],
+);
 pub(crate) type JsonParts<'p, 'v, 'c, 'b, 'w> =
     (&'p mut PinnedBlob<'v, 'c>, &'w mut Meter, View<'b>, u64);
 

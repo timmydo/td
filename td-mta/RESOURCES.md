@@ -4404,3 +4404,16 @@ the original outer exchange deadline, with tighter phase budgets still the
 future dispatcher's responsibility. Cleanup can outlive that deadline.
 These inert boundaries do not qualify HTTP dispatch, response indexing,
 reference walking or whole-service memory/scheduling integration.
+
+## Native entity-header owner
+
+The composed native entity-header cursor has a compiled 4 KiB owner ceiling.
+It moves the original pin and work borrows between collection and shared
+interpretation without allocating, reserving caller header backing and the
+native connection separately. The existing collector retains its 4096-byte
+native-read bound; interpreter turns retain shared header/parameter bounds.
+Each poll advances one bounded collection or interpretation turn, including
+its consuming handoff on completion. Boundary output is at most 70 bytes and
+uses the original work budget. A handoff returns original live owners and
+unused backing; it reserves no new job or interpretation quota. This is not
+whole-tree or whole-service memory qualification.
