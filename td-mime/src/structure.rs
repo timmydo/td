@@ -9,6 +9,8 @@ use crate::{
     time::Tick,
     work::{Charge, Meter, Stop},
 };
+#[path = "structure/classify.rs"]
+pub mod classify;
 pub const MAX_DEPTH: usize = 64;
 /// Parsing ceilings, independent of any service configuration or account.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -356,25 +358,6 @@ impl<'a, 'w> Cursor<'a, 'w> {
     fn range(&self, start: u64, end: u64) -> Result<&'a [u8], Error> {
         td_header::resident::slice(self.source, self.base, start..end).ok_or(Error::InvalidRange)
     }
-    fn head(&self, selected: metadata::Selected, second: bool) -> Result<&'a [u8], Error> {
-        let raw = self.range(selected.field.value_start, selected.field.value_end)?;
-        let extent = if second {
-            selected.head.second.ok_or(Error::InvalidState)?
-        } else {
-            selected.head.first
-        };
-        raw.get(extent.start..extent.end).ok_or(Error::InvalidState)
-    }
-    fn equal(&mut self, now: Tick, source: &[u8], wanted: &[u8]) -> Result<bool, Error> {
-        if source.len() != wanted.len() {
-            return Ok(false);
-        }
-        let count = u64::try_from(source.len()).map_err(|_| Error::InvalidState)?;
-        self.budget
-            .charge_local(self.work, now, count, count, &mut self.credit)
-            .map_err(decode_work::Error::from)?;
-        Ok(source.eq_ignore_ascii_case(wanted))
-    }
     fn append(&mut self, now: Tick) -> Result<u16, Error> {
         if self.used >= self.max_parts {
             return Err(Error::PartLimit);
@@ -411,49 +394,23 @@ impl<'a, 'w> Cursor<'a, 'w> {
             .entity_end
             .checked_sub(self.current.body_start)
             .ok_or(Error::InvalidRange)?;
-        self.digest = false;
-        self.current.media = match selected.content_type {
-            metadata::ContentType::Default(metadata::DefaultType::TextPlain) => Media::TextPlain,
-            metadata::ContentType::Default(metadata::DefaultType::MessageRfc822) => {
-                Media::MessageRfc822
-            }
-            metadata::ContentType::Field(value) => {
-                self.current.type_start = value.field.value_start;
-                self.current.type_end = value.field.value_end;
-                let first = self.head(value, false)?;
-                let second = self.head(value, true)?;
-                if self.equal(now, first, b"multipart")? {
-                    self.digest = self.equal(now, second, b"digest")?;
-                    Media::Multipart
-                } else if self.equal(now, first, b"text")? && self.equal(now, second, b"plain")? {
-                    Media::TextPlain
-                } else if self.equal(now, first, b"message")?
-                    && self.equal(now, second, b"rfc822")?
-                {
-                    Media::MessageRfc822
-                } else {
-                    Media::Other
-                }
-            }
-        };
-        self.current.encoding = if let Some(value) = selected.transfer_encoding {
-            let name = self.head(value, false)?;
-            if self.equal(now, name, b"base64")? {
-                Encoding::Base64
-            } else if self.equal(now, name, b"quoted-printable")? {
-                Encoding::QuotedPrintable
-            } else {
-                if !(self.equal(now, name, b"7bit")?
-                    || self.equal(now, name, b"8bit")?
-                    || self.equal(now, name, b"binary")?)
-                {
-                    self.current.diagnostics |= UNKNOWN_ENCODING;
-                }
-                Encoding::Identity
-            }
-        } else {
-            Encoding::Identity
-        };
+        let classified = classify::local(
+            classify::Input {
+                source: self.source,
+                base: self.base,
+                selected,
+            },
+            now,
+            self.work,
+            self.budget,
+            &mut self.credit,
+        )?;
+        self.current.media = classified.media;
+        self.current.encoding = classified.encoding;
+        self.current.type_start = classified.type_start;
+        self.current.type_end = classified.type_end;
+        self.current.diagnostics |= classified.diagnostics;
+        self.digest = classified.digest;
         if self.current.media == Media::Multipart {
             if self.current.encoding != Encoding::Identity {
                 return Err(Error::NotParsable);

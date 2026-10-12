@@ -96,3 +96,14 @@ exhaustion refuses construction. This owner binding does not authenticate
 source bytes: the caller retains source identity, extent and fragment order.
 The borrowed Stream and resident Cursor keep their existing costs and
 passive cached-completion behavior.
+
+Structure classification shares one implementation between resident traversal
+and consumers of retained entity headers. It accepts a completed metadata
+selection with the same immutable header bytes and absolute base; it never
+needs body bytes. Default context, known transfer encodings and unknown
+encoding diagnostics are unchanged. Its public entry charges the original
+Meter and aggregate HeaderBudget through owner-bound Credit, including fresh
+zero-cost admission for defaults. One turn compares at most 31 source bytes;
+each comparison byte spends one source visit and one interpretation step.
+Values remain passive; the enclosing owner retains source custody and makes
+any refusal terminal for its operation.
