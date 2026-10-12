@@ -80,6 +80,7 @@ pub struct StoreCoordinator<'r, 'a, P> {
     authorization: P,
     work: crate::admission::WorkLimits,
     response_bytes: u64,
+    sort_bytes: u64,
 }
 struct AdmissionState<'a> {
     ledger: Leases<'a>,
@@ -114,6 +115,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             authorization,
             work: *plan.work(),
             response_bytes: plan.disk().response_bytes,
+            sort_bytes: plan.sort_bytes(),
         })
     }
     pub fn admission_stopped(&self) -> bool {
@@ -793,7 +795,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
 
 #[path = "response_retention.rs"]
 mod response_retention;
-pub use response_retention::{ResponseError, ResponseRetention};
+pub use response_retention::{ResponseError, ResponseRetention, SortError, SortRetention};
 
 #[path = "blob_access.rs"]
 mod blob_access;

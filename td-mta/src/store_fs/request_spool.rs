@@ -1,4 +1,4 @@
-//! Private disposable response files. Byte quota is owned by StoreCoordinator.
+//! Private disposable request files. Byte quota is owned by StoreCoordinator.
 use super::{LockedRoot, MAX_PATH_BYTES};
 use crate::{
     ports,
@@ -11,6 +11,8 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 const MAX_BYTES: u64 = 1 << 30;
+/// Keep eight of the shared slots unavailable to sort-file reservations.
+pub const SORT_FILE_SLOTS: u8 = SLOTS - 8;
 const _: () = assert!(SLOTS > 0 && SLOTS <= u32::BITS as u8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,7 +40,7 @@ pub struct RequestSpool<'r> {
     retired: AtomicU32,
 }
 impl<'r> RequestSpool<'r> {
-    /// Validate the entire closed namespace before discarding abandoned responses.
+    /// Validate the entire closed namespace before discarding abandoned request files.
     /// Only LOCK and request-00..request-31 directories containing response exist.
     pub fn open(
         root: &'r mut LockedRoot,
@@ -155,10 +157,16 @@ impl<'r> RequestSpool<'r> {
         }
     }
     pub(crate) fn reserve(&self) -> Result<Temporary<'_, 'r>, ports::Error> {
+        self.reserve_with_limit(SLOTS)
+    }
+    pub(crate) fn reserve_sort(&self) -> Result<Temporary<'_, 'r>, ports::Error> {
+        self.reserve_with_limit(SORT_FILE_SLOTS)
+    }
+    fn reserve_with_limit(&self, limit: u8) -> Result<Temporary<'_, 'r>, ports::Error> {
         let mut occupied = self.occupied.load(Ordering::SeqCst);
         // Contention may refuse Busy despite spare slots; retries stay bounded.
         for _ in 0..SLOTS {
-            let slot = (0..SLOTS)
+            let slot = (0..limit)
                 .find(|slot| mask(*slot).is_ok_and(|bit| occupied & bit == 0))
                 .ok_or(ports::Error::Busy)?;
             match self.occupied.compare_exchange(

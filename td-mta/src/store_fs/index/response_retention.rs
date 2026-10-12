@@ -49,6 +49,15 @@ pub struct ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
     meter: Meter,
     failed: Option<ports::Error>,
 }
+/// Sort files use the same custody failures as response retention.
+pub type SortError = ResponseError;
+
+/// One bounded scratch file charged to SortBytes until proven removal.
+/// Runs and merge metadata are the sorter caller's responsibility.
+#[must_use = "sort scratch remains charged until discarded"]
+pub struct SortRetention<'c, 's, 'r, 'sr, 'a, P> {
+    inner: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+}
 impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
     /// Trusted worker entry after authentication, before any method effects.
     /// Reserve the entire configured per-request cap in the existing ledger.
@@ -58,6 +67,32 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         &'c self,
         spool: &'s RequestSpool<'sr>,
         deadline: Deadline,
+    ) -> Result<ResponseRetention<'c, 's, 'r, 'sr, 'a, P>, ResponseError> {
+        self.retain_temporary(spool, deadline, Kind::ResponseBytes, self.response_bytes)
+    }
+    /// Reserve one sort file's whole cap before creating it. All simultaneous
+    /// inputs, outputs and other sort scratch share the existing SortBytes quota.
+    pub fn retain_sort<'c, 's, 'sr>(
+        &'c self,
+        spool: &'s RequestSpool<'sr>,
+        maximum: u64,
+        deadline: Deadline,
+    ) -> Result<SortRetention<'c, 's, 'r, 'sr, 'a, P>, SortError> {
+        if maximum == 0 {
+            return Err(ports::Error::Invalid.into());
+        }
+        if maximum > self.sort_bytes {
+            return Err(ports::Error::Capacity.into());
+        }
+        self.retain_temporary(spool, deadline, Kind::SortBytes, maximum)
+            .map(|inner| SortRetention { inner })
+    }
+    fn retain_temporary<'c, 's, 'sr>(
+        &'c self,
+        spool: &'s RequestSpool<'sr>,
+        deadline: Deadline,
+        kind: Kind,
+        maximum: u64,
     ) -> Result<ResponseRetention<'c, 's, 'r, 'sr, 'a, P>, ResponseError> {
         let mut state = self.try_state()?;
         if state.stopped {
@@ -69,11 +104,10 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         }
         let mut last = self.store.clock.sample()?.monotonic;
         let now = check_time(&self.store, deadline, &mut last)?.monotonic;
-        let maximum = self.response_bytes;
         let lease = state.ledger.reserve(
             &[[
                 Charge {
-                    kind: Kind::ResponseBytes,
+                    kind,
                     amount: maximum,
                 },
                 Charge::ZERO,
@@ -119,7 +153,11 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             ),
             failed: None,
         };
-        response.temporary = Some(spool.reserve()?);
+        response.temporary = Some(if kind == Kind::SortBytes {
+            spool.reserve_sort()?
+        } else {
+            spool.reserve()?
+        });
         response.temporary()?.create()?;
         response.check()?;
         Ok(response)
@@ -304,6 +342,57 @@ impl<'c, 's, 'r, 'sr, P> ResponseRetention<'c, 's, 'r, 'sr, '_, P> {
         cleanup.map_err(Into::into)
     }
 }
+impl<P> SortRetention<'_, '_, '_, '_, '_, P> {
+    pub fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn maximum(&self) -> u64 {
+        self.inner.maximum()
+    }
+    pub fn failure(&self) -> Option<ports::Error> {
+        self.inner.failure()
+    }
+    pub fn work_failure(&self) -> Option<crate::admission::work::Stop> {
+        self.inner.work_failure()
+    }
+    /// Passive readable-prefix metadata; no freshness or view check is implied.
+    pub fn sealed_len(&self) -> u64 {
+        self.inner.published_len()
+    }
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), ports::Error> {
+        self.inner.append(bytes)
+    }
+    /// Make the current prefix readable; later appends remain unreadable until
+    /// another seal. This does not publish any client-visible query result.
+    pub fn seal(&mut self) -> Result<u64, ports::Error> {
+        self.inner.admit_work_turn()?;
+        // Shared publication remains repeatable and permits later appends.
+        self.inner.publish()
+    }
+    pub fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), ports::Error> {
+        self.inner.read_at(offset, output)
+    }
+    /// Discard this file's old runs only after callers stop using their offsets.
+    /// The original quota, clock and work meter remain held across reuse.
+    pub fn reset(&mut self) -> Result<(), ports::Error> {
+        self.inner.check()?;
+        self.inner.charge(0, false)?;
+        let result = self
+            .inner
+            .temporary()
+            .and_then(|temporary| temporary.truncate(0));
+        self.inner.record(result)?;
+        self.inner.length = 0;
+        self.inner.published = 0;
+        self.inner.check()
+    }
+    pub fn discard(self) -> Result<(), SortError> {
+        self.inner.discard()
+    }
+}
 impl<P> Drop for ResponseRetention<'_, '_, '_, '_, '_, P> {
     fn drop(&mut self) {
         let _ = self.cleanup();
@@ -322,7 +411,7 @@ mod tests {
     };
     use std::{
         fs,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         sync::atomic::{AtomicU64, Ordering},
     };
     struct Timer(AtomicU64);
@@ -338,6 +427,12 @@ mod tests {
         Deadline::after(Tick(0), 100).unwrap()
     }
     fn run(test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer)) {
+        run_with_cells(4, test);
+    }
+    fn run_with_cells(
+        count: usize,
+        test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer),
+    ) {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
         let files = Fixture::new();
@@ -370,8 +465,8 @@ mod tests {
             deadline(),
         )
         .unwrap();
-        let mut states = [const { SlotState::EMPTY }; 4];
-        let mut cells = [const { LeaseCell::EMPTY }; 4];
+        let mut states: Vec<_> = (0..count).map(|_| SlotState::EMPTY).collect();
+        let mut cells: Vec<_> = (0..count).map(|_| LeaseCell::EMPTY).collect();
         let coordinator = StoreCoordinator::new(
             store,
             &plan,
@@ -726,6 +821,336 @@ mod tests {
                 Err(ports::Error::Capacity)
             ));
             assert_eq!(response.failure(), Some(ports::Error::Capacity));
+        });
+    }
+    #[test]
+    fn sort_reservations_share_one_quota_and_leave_response_charges_separate() {
+        run(|coordinator, spool, files, _| {
+            let maximum = coordinator.sort_bytes;
+            assert!(matches!(
+                coordinator.retain_sort(spool, 0, deadline()),
+                Err(SortError::Store(ports::Error::Invalid))
+            ));
+            assert!(matches!(
+                coordinator.retain_sort(spool, maximum + 1, deadline()),
+                Err(SortError::Store(ports::Error::Capacity))
+            ));
+            assert_eq!(spool.status().occupied_slots, 0);
+            let first = coordinator
+                .retain_sort(spool, maximum / 2, deadline())
+                .unwrap();
+            let second = coordinator
+                .retain_sort(spool, maximum - maximum / 2, deadline())
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                maximum
+            );
+            assert!(matches!(
+                coordinator.retain_sort(spool, 1, deadline()),
+                Err(SortError::Ledger(logical::Error::Quota(Kind::SortBytes)))
+            ));
+            let response = coordinator.retain_response(spool, deadline()).unwrap();
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::ResponseBytes)
+                    .unwrap(),
+                coordinator.response_bytes
+            );
+            assert!(files.path.join("request-02/response").exists());
+            first.discard().unwrap();
+            assert!(!files.path.join("request-00/response").exists());
+            drop(second);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::ResponseBytes)
+                    .unwrap(),
+                coordinator.response_bytes
+            );
+            response.discard().unwrap();
+            assert_eq!(spool.status().occupied_slots, 0);
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 0);
+        });
+    }
+    #[test]
+    fn sort_sealed_prefix_and_reset_preserve_capacity_and_the_original_meter() {
+        run(|coordinator, spool, files, _| {
+            let mut sort = coordinator.retain_sort(spool, 4, deadline()).unwrap();
+            assert!(sort.is_empty());
+            assert_eq!(sort.maximum(), 4);
+            sort.append(b"ab").unwrap();
+            assert_eq!(sort.read_at(0, &mut [0; 2]), Err(ports::Error::Invalid));
+            assert_eq!(sort.sealed_len(), 0);
+            assert_eq!(sort.seal().unwrap(), 2);
+            assert_eq!(sort.sealed_len(), 2);
+            assert_eq!(sort.read_at(1, &mut [0; 2]), Err(ports::Error::Invalid));
+            sort.append(b"cd").unwrap();
+            let mut bytes = [0; 2];
+            sort.read_at(0, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"ab");
+            assert_eq!(sort.read_at(2, &mut bytes), Err(ports::Error::Invalid));
+            assert_eq!(sort.append(b"e"), Err(ports::Error::Capacity));
+            assert_eq!(sort.failure(), None);
+            assert_eq!(sort.seal().unwrap(), 4);
+            sort.read_at(2, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"cd");
+            sort.reset().unwrap();
+            assert_eq!(sort.len(), 0);
+            assert_eq!(sort.sealed_len(), 0);
+            assert_eq!(
+                fs::metadata(files.path.join("request-00/response"))
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                4
+            );
+            assert_eq!(sort.read_at(0, &mut bytes), Err(ports::Error::Invalid));
+            sort.append(b"xy").unwrap();
+            sort.seal().unwrap();
+            sort.read_at(0, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"xy");
+            assert_eq!(
+                fs::metadata(files.path.join("request-00/response"))
+                    .unwrap()
+                    .len(),
+                2
+            );
+            sort.discard().unwrap();
+            for budget in [3, 4] {
+                let mut sort = coordinator.retain_sort(spool, 4, deadline()).unwrap();
+                sort.inner.test_record_budget(budget);
+                sort.append(b"a").unwrap();
+                sort.seal().unwrap();
+                sort.reset().unwrap();
+                if budget == 3 {
+                    assert_eq!(sort.append(b"b"), Err(ports::Error::Capacity));
+                    assert!(sort.work_failure().is_some());
+                    assert_eq!(sort.reset(), Err(ports::Error::Capacity));
+                } else {
+                    sort.append(b"b").unwrap();
+                    assert_eq!(sort.len(), 1);
+                }
+                sort.discard().unwrap();
+            }
+        });
+    }
+    #[test]
+    fn sort_deadline_and_short_read_failures_are_sticky_but_cleanup_can_finish() {
+        run(|coordinator, spool, files, clock| {
+            let mut sort = coordinator.retain_sort(spool, 16, deadline()).unwrap();
+            sort.append(b"abcd").unwrap();
+            sort.seal().unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(files.path.join("request-00/response"))
+                .unwrap()
+                .set_len(1)
+                .unwrap();
+            let error = sort.read_at(0, &mut [0; 4]).unwrap_err();
+            assert!(matches!(error, ports::Error::Io { .. }));
+            assert_eq!(sort.reset(), Err(error));
+            assert_eq!(sort.seal(), Err(error));
+            sort.discard().unwrap();
+            let mut sort = coordinator.retain_sort(spool, 16, deadline()).unwrap();
+            sort.append(b"a").unwrap();
+            clock.0.store(100, Ordering::SeqCst);
+            assert_eq!(sort.reset(), Err(ports::Error::Deadline));
+            assert_eq!(sort.len(), 1);
+            assert_eq!(sort.append(b"b"), Err(ports::Error::Deadline));
+            assert_eq!(
+                fs::metadata(files.path.join("request-00/response"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            sort.discard().unwrap();
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(spool.status().occupied_slots, 0);
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 0);
+        });
+    }
+    #[test]
+    fn uncertain_sort_cleanup_retires_the_slot_and_only_its_sort_charge() {
+        run(|coordinator, spool, files, _| {
+            let mut sort = coordinator.retain_sort(spool, 16, deadline()).unwrap();
+            sort.append(b"x").unwrap();
+            let path = files.path.join("request-00/response");
+            fs::remove_file(&path).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            assert!(sort.discard().is_err());
+            assert!(path.exists());
+            assert_eq!(spool.status().retired_slots, 1);
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 16);
+            assert_eq!(coordinator.used(Kind::ResponseBytes).unwrap(), 0);
+            let response = coordinator.retain_response(spool, deadline()).unwrap();
+            response.discard().unwrap();
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 16);
+        });
+    }
+    #[test]
+    fn failed_sort_creation_reconciles_its_reservation_without_refunding_response() {
+        run(|coordinator, spool, files, _| {
+            let response = coordinator.retain_response(spool, deadline()).unwrap();
+            fs::remove_dir(files.path.join("request-01")).unwrap();
+            assert!(coordinator.retain_sort(spool, 16, deadline()).is_err());
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::ResponseBytes)
+                    .unwrap(),
+                coordinator.response_bytes
+            );
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 0);
+            assert_eq!(spool.status().occupied_slots, 1);
+            assert_eq!(spool.status().retired_slots, 0);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(files.path.join("request-01"))
+                .unwrap();
+            coordinator
+                .retain_sort(spool, 16, deadline())
+                .unwrap()
+                .discard()
+                .unwrap();
+            response.discard().unwrap();
+        });
+    }
+    #[test]
+    fn sort_slot_exhaustion_preserves_response_slots_and_unwinds_the_new_charge() {
+        run_with_cells(64, |coordinator, spool, _, _| {
+            let mut sorts = Vec::new();
+            for _ in 0..crate::store_fs::SORT_FILE_SLOTS {
+                sorts.push(coordinator.retain_sort(spool, 1, deadline()).unwrap());
+            }
+            let count = u64::from(crate::store_fs::SORT_FILE_SLOTS);
+            assert!(matches!(
+                coordinator.retain_sort(spool, 1, deadline()),
+                Err(SortError::Store(ports::Error::Busy))
+            ));
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                count
+            );
+            assert_eq!(coordinator.used(Kind::SortBytes).unwrap(), 0);
+            assert_eq!(spool.status().occupied_slots, count as u32);
+            assert_eq!(spool.status().retired_slots, 0);
+            let response = coordinator.retain_response(spool, deadline()).unwrap();
+            assert_eq!(spool.status().occupied_slots, count as u32 + 1);
+            sorts.clear();
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes)
+                    .unwrap(),
+                0
+            );
+            coordinator
+                .retain_sort(spool, 1, deadline())
+                .unwrap()
+                .discard()
+                .unwrap();
+            response.discard().unwrap();
+            assert_eq!(spool.status().occupied_slots, 0);
+        });
+    }
+    #[test]
+    fn sort_chunk_bounds_and_stopped_coordinator_refuse_before_effects() {
+        run(|coordinator, spool, files, _| {
+            let maximum = 2 * crate::limits::SQLITE_BODY_CHUNK_BYTES;
+            let mut sort = coordinator
+                .retain_sort(spool, maximum as u64, deadline())
+                .unwrap();
+            let mut bytes = vec![7; crate::limits::SQLITE_BODY_CHUNK_BYTES + 1];
+            assert_eq!(sort.append(&bytes), Err(ports::Error::Capacity));
+            assert_eq!(sort.len(), 0);
+            sort.append(&bytes[..crate::limits::SQLITE_BODY_CHUNK_BYTES])
+                .unwrap();
+            sort.append(b"x").unwrap();
+            sort.seal().unwrap();
+            assert_eq!(sort.read_at(0, &mut bytes), Err(ports::Error::Capacity));
+            sort.read_at(0, &mut bytes[..crate::limits::SQLITE_BODY_CHUNK_BYTES])
+                .unwrap();
+            assert!(bytes[..crate::limits::SQLITE_BODY_CHUNK_BYTES]
+                .iter()
+                .all(|b| *b == 7));
+            assert_eq!(sort.failure(), None);
+            sort.discard().unwrap();
+            coordinator.state.lock().unwrap().stopped = true;
+            assert!(matches!(
+                coordinator.retain_sort(spool, 1, deadline()),
+                Err(SortError::Store(ports::Error::WriterStopped))
+            ));
+            assert!(!files.path.join("request-00/response").exists());
+            assert_eq!(spool.status().occupied_slots, 0);
         });
     }
 }

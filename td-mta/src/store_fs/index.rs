@@ -76,9 +76,9 @@ use completion::{CommitPhase, CommitWork};
 pub use upload::{
     smtp_trace_allowance, BlobAuthorization, BlobReadRequest, Delivery, DeliveryAuthorization,
     DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest, ResponseError,
-    ResponseRetention, StoreCoordinator, Upload, UploadAttempt, UploadAuthorization, UploadCleanup,
-    UploadCompletion, UploadError, UploadGuard, UploadMaintenance, UploadRequest,
-    UploadSweepDisposition,
+    ResponseRetention, SortError, SortRetention, StoreCoordinator, Upload, UploadAttempt,
+    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
+    UploadMaintenance, UploadRequest, UploadSweepDisposition,
 };
 #[path = "index/backup.rs"]
 mod backup;

@@ -1166,3 +1166,45 @@ between frames. A silent stream has no response-idle timeout, but retains its
 absolute connection deadline and detects peer EOF. No request body or pipeline
 is accepted. Disconnect, revocation and shutdown retire the stream and its
 slot without retained database or temporary-file ownership.
+
+### Retained sort files
+
+StoreCoordinator::retain_sort reserves a caller-selected nonzero file cap
+against the existing SortBytes bucket, before creating a private file.
+A single cap above configured sort_disk_bytes is a deterministic Capacity
+refusal; contention or aggregate reservations can still refuse admission.
+All concurrent runs, merge outputs and other sort scratch must hold these
+reservations simultaneously. There is no uncharged intermediate-file path.
+
+SortRetention wraps the same file/effect custody used by response retention.
+It shares RequestSpool's 32 slots and closed namespace. Sort reservations
+use only the first 24 slots, leaving eight unavailable to sorts for response
+admission; existing responses in the first 24 may reduce sort availability.
+The internal filename remains response for both purposes, and cold cleanup
+discards either kind. The filename alone does not identify a file's purpose.
+Its API supports bounded append, sealing a readable prefix, exact reads and
+resetting a file for a later merge pass. Reset retains the original quota,
+deadline and work meter. It invalidates prior run offsets; the sorter must
+stop using them before reset. It does not publish a client response.
+Cleanup proves removal before releasing SortBytes. Uncertain cleanup charges
+the entire file cap as used in SortBytes and retires the slot; it never
+refunds unrelated ResponseBytes. The existing owner failure and recovery
+rules apply unchanged.
+
+This boundary supplies file custody, not an external-sort implementation or
+whole-job work admission. A multi-file sorter must additionally retain one
+cumulative job meter and original execution deadline, enforce at most eight
+merge inputs and 32 total open files, bound resident records, and freshly
+validate the retained read view before publishing query results. Each new
+file has its own foreground work meter, which is not a job budget; the
+cumulative caller-owned job meter must cover every file and reset. No query
+method is enabled here.
+
+The per-file admission cap and SortBytes quota both derive from
+Plan::sort_bytes, the validated resources sort_disk_bytes value. This is
+currently the only runtime file-creation path that charges SortBytes;
+AuxiliaryUsage may initialize retained usage during quiescent recovery.
+Do not reserve a second SortBytes charge for the same files in a future job
+owner. An uncertain cleanup of a file holding the entire sort cap can block
+all further sort admission until quiescent cold recovery; the conservative
+full-cap charge is intentional.

@@ -18,11 +18,11 @@ pub use index::{
     BlobReadRequest, BlobSource, CommitCompletion, CommitError, CommitFileUsage, CommitRequest,
     Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
     DeliveryPeer, DeliveryRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
-    LedgerInitError, LogicalUsage, MailboxCounts, ResponseError, ResponseRetention,
-    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails, Upload,
-    UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
-    UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence, MAX_MAILBOX_COUNTS,
-    MAX_THREAD_EMAILS,
+    LedgerInitError, LogicalUsage, MailboxCounts, ResponseError, ResponseRetention, SortError,
+    SortRetention, StoreCoordinator, StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails,
+    Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError,
+    UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
+    MAX_MAILBOX_COUNTS, MAX_THREAD_EMAILS,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;
@@ -89,7 +89,7 @@ pub use spool::{IngressSpool, SpoolCapacity, SpoolInput, SpoolStatus, SpoolWrite
 
 #[path = "store_fs/request_spool.rs"]
 mod request_spool;
-pub use request_spool::{RequestSpool, RequestSpoolStatus};
+pub use request_spool::{RequestSpool, RequestSpoolStatus, SORT_FILE_SLOTS};
 
 /// Qualified by the host and portable allocation probes, including errors.
 /// This is a service limit, not a promise about every Rust implementation.

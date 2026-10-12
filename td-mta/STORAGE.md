@@ -50,15 +50,15 @@ Both locks remain held until process exit; offline store commands continue
 to name the data directory itself.
 
 A third, separate locked root at `[paths] data/tmp/requests` holds disposable
-JMAP response retention. The mailbox-access profile opens RequestSpool there;
-the SMTP-only profile also recovers it when present, but does not require
-it. The boundary accepts only LOCK
-and request-00 through request-31 directories, each with an optional
+JMAP response retention and quota-charged sort scratch. The mailbox-access
+profile opens RequestSpool there; the SMTP-only profile also recovers it
+when present, but does not require it. The boundary accepts only LOCK and
+request-00 through request-31 directories, each with an optional
 mode-0600 response file (cold cleanup also accepts an owner-only subset
 left by a creation-time umask). Deployment provisions both private tmp and
 requests directories under the service owner. Startup keeps this root separate
 from database and ingress, cleans abandoned files under its retained lock
-before initializing zero auxiliary response usage, and requires process
+before initializing zero auxiliary response/sort usage, and requires process
 quiescence before recovery. ADMISSION.md owns
 its namespace validation, permissions repair and quota settlement. Future
 response offsets and creation-ID records share this single file with JSON;

@@ -7427,3 +7427,19 @@ remain distinct, as do canonically equivalent operands when their lowered
 scalar sequences differ. For example, precomposed j-caron does not match
 capital J plus combining caron here. Decoders must not silently introduce
 normalization or folding that changes the specified matching policy.
+
+## Quota-charged sort scratch
+
+StoreCoordinator::retain_sort takes the shared RequestSpool, a nonzero
+maximum byte count and the original deadline. It returns SortRetention,
+whose append/seal/read_at operations expose only a sealed prefix. reset
+truncates its whole file and retires old offsets while preserving the
+reservation, deadline and work meter. Accessors expose length, sealed_len, cap and sticky
+failure without granting a descriptor or path. Each I/O operation is bounded
+to 64 KiB. SortError uses the shared retention store/ledger error surface.
+
+discard or drop proves file removal before refunding SortBytes. All sort
+files share the existing filesystem slots with responses; at most 24 slots admit sorts,
+leaving eight unavailable to sorts. Their bytes use a separate quota bucket. ADMISSION.md owns accounting,
+cleanup uncertainty and the cumulative multi-file job requirements. No
+sorting algorithm, query admission or client-visible publication is added.
