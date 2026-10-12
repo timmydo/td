@@ -50,9 +50,12 @@ mod row_history;
 use operations::Operations;
 #[path = "index/history.rs"]
 mod history;
+#[path = "index/mailbox_counts.rs"]
+mod mailbox_counts;
 #[path = "index/threading.rs"]
 mod threading;
 pub use history::{HistoryPruneRequest, HistoryPruned};
+pub use mailbox_counts::{MailboxCounts, MAX_MAILBOX_COUNTS};
 #[path = "index/usage.rs"]
 mod usage;
 pub use usage::LogicalUsage;

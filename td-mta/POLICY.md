@@ -593,6 +593,17 @@ request can inject generated envelope commands.
 
 ## 4. Search, sort and query state
 
+### 4.1. Mailbox counts
+
+Mailbox totalEmails and totalThreads count members and distinct member
+threads. unreadEmails excludes both `$seen` and `$draft`; unreadThreads
+counts threads with at least one such unread member in this mailbox. This
+uses RFC 8621's permitted mailbox-local definition, including for Trash.
+A thread's unread members elsewhere do not change this mailbox's counts.
+STORAGE.md owns snapshot consistency and count resource/failure behavior.
+
+### 4.2. Queries and state
+
 All standard filters in CONFORMANCE.md are required. No inThread extension is
 accepted. An unknown filter property/operator returns unsupportedFilter; wrong
 JSON shape/type returns invalidArguments. AND/OR/NOT follow RFC 8620, with

@@ -64,6 +64,33 @@ its namespace validation, permissions repair and quota settlement. Future
 response offsets and creation-ID records share this single file with JSON;
 the current raw boundary implements none of those indexes.
 
+### Snapshot mailbox totals
+
+`IndexReadView::mailbox_counts_many` counts up to 256 distinct mailbox IDs
+from one retained account view, preserving input order and representing
+absent mailboxes as None. The single-mailbox helper delegates to this batch.
+The typed adapter validates each selected mailbox row. One ordered pass
+visits all account Emails and their memberships, including unselected
+mailboxes: work depends on account size, not selected mailbox size. Selected
+slots use binary lookup; counters and one previous-thread ID per slot use
+memory bounded by the input cap, not matching rows. Two vectors are reserved
+before the scan, for slots and results. No per-message allocation, temporary
+sort, automatic index or materialized distinct set is retained. The pinned
+query-plan test requires account/ID-constrained searches for every join and
+mailbox-constrained membership cross-checks.
+
+Email, Thread, membership and selected keyword sequence values must fit the
+snapshot; missing Threads and orphan memberships refuse. This is not a
+whole-account integrity check or authorization grant. The original snapshot
+work and deadline limits apply; failure returns no partial totals. Calls do
+not renew that budget, and repeated point calls repeat the account scan.
+Mailbox/get must use the batch path when it needs several mailbox counts.
+This increment does not qualify maximum-size accounts against that budget.
+
+POLICY.md defines unread Emails and the mailbox-local unread-thread
+policy. Counts do not emit change records, advertise Mail, or implement
+Mailbox/get.
+
 ## 2. SQLite and resource policy
 
 Measurement reports below identify historical fixtures and artifacts. Results
