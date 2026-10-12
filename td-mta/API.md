@@ -7310,3 +7310,25 @@ The id-only existence check currently scans the thread using a one-member
 window; STORAGE.md's repeated-scan work cost applies to that projection too.
 Worker::check charges through ResponseRetention::admit_before and its
 admit_work_turn before testing execution-phase expiry.
+
+## Retained Thread/changes dispatch
+
+Thread/changes uses the retained changes argument, numeric parsing,
+transaction-page, snapshot and rollback contracts described under
+Mailbox/changes above. The method selects the state data type
+and the typed result ID encoding. Thread state tokens cannot be used for
+Mailbox changes or vice versa. Only Mailbox responses carry
+updatedProperties; Thread responses omit that field. Admitted Mail opt-in
+is required, and live capability activation remains separate.
+
+Thread changes are driven by explicit committed Thread history records,
+not inferred from Email or Mailbox history. Writers must record thread
+creation, membership updates and destruction in the same transaction as
+the corresponding objects. A created result may feed Thread/get through
+the standard result-reference resolver.
+
+Mail activation is blocked until every enabled writer of Thread rows or
+Email thread membership has evidence that it commits matching Thread
+history atomically. This dispatcher does not enforce that pairing at the
+generic storage boundary. Delivery has its own history tests; future
+import, set and purge paths must supply their own evidence before admission.

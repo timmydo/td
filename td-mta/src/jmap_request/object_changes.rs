@@ -1,11 +1,11 @@
-//! Retained Mailbox/changes; capability activation remains separate.
+//! Retained object changes; capability activation remains separate.
 use super::{
     mailbox_get::storage,
     push::{Children, Item},
     Error, Worker,
 };
 use crate::{
-    ids::MailboxId,
+    ids::{MailboxId, ThreadId},
     jmap_changes,
     ports::ChangeAction,
     sync::{DataState, DataType},
@@ -14,6 +14,26 @@ use crate::{
 use std::ops::Range;
 use td_json::{arena, scan};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ChangesKind {
+    Mailbox,
+    Thread,
+}
+impl ChangesKind {
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Mailbox => DataType::Mailbox,
+            Self::Thread => DataType::Thread,
+        }
+    }
+    fn encode(self, id: [u8; 16], output: &mut [u8]) -> Result<&str, Error> {
+        match self {
+            Self::Mailbox => wire::encode_id(MailboxId::from_bytes(id), output),
+            Self::Thread => wire::encode_id(ThreadId::from_bytes(id), output),
+        }
+        .map_err(|_| Error::State)
+    }
+}
 fn changes(error: jmap_changes::Error) -> Error {
     match error {
         jmap_changes::Error::CannotCalculateChanges => Error::CannotCalculateChanges,
@@ -22,10 +42,11 @@ fn changes(error: jmap_changes::Error) -> Error {
     }
 }
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
-    pub(super) fn mailbox_changes(
+    pub(super) fn object_changes(
         &mut self,
         arguments: Range<u64>,
         maximum: usize,
+        kind: ChangesKind,
     ) -> Result<Range<u64>, Error> {
         let mut fields = Children::new(arguments, scan::Kind::Object)?;
         let (mut account, mut since, mut limit) = (None, None, None);
@@ -57,7 +78,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             .retention
             .method_view(self.account, self.execution)
             .map_err(storage)?;
-        let mut cursor = jmap_changes::Cursor::new(&mut view, DataType::Mailbox, since, maximum)
+        let mut cursor = jmap_changes::Cursor::new(&mut view, kind.data_type(), since, maximum)
             .map_err(changes)?;
         loop {
             self.check()?;
@@ -106,16 +127,15 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 }
                 first = false;
                 self.append(b"\"")?;
-                self.append(
-                    wire::encode_id(MailboxId::from_bytes(change.id), &mut id)
-                        .map_err(|_| Error::State)?
-                        .as_bytes(),
-                )?;
+                self.append(kind.encode(change.id, &mut id)?.as_bytes())?;
                 self.append(b"\"")?;
             }
             self.append(b"]")?;
         }
-        self.append(br#","updatedProperties":null}"#)?;
+        if kind == ChangesKind::Mailbox {
+            self.append(br#","updatedProperties":null"#)?;
+        }
+        self.append(b"}")?;
         view.check_snapshot().map_err(storage)?;
         self.check()?;
         let end = self.retention.publish().map_err(Error::Storage)?;
@@ -251,3 +271,7 @@ impl Unsigned {
 #[cfg(test)]
 #[path = "mailbox_changes_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "thread_changes_tests.rs"]
+mod thread_tests;

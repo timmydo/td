@@ -1941,6 +1941,10 @@ and streams received-date member
 windows from one original snapshot. Its argument, projection and rollback
 contract is in API.md; this does not activate the Mail capability.
 
+Retained Thread/changes shares the checked changes encoder with Mailbox,
+selecting Thread state and wire IDs and omitting Mailbox-only fields.
+API.md owns this contract; Mail activation remains separate.
+
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:
 

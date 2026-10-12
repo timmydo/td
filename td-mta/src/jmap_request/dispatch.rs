@@ -5,10 +5,10 @@ use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "get_ids.rs"]
 mod get_ids;
-#[path = "mailbox_changes.rs"]
-mod mailbox_changes;
 #[path = "mailbox_get.rs"]
 mod mailbox_get;
+#[path = "object_changes.rs"]
+mod object_changes;
 #[path = "push.rs"]
 mod push;
 #[path = "thread_get.rs"]
@@ -282,6 +282,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"PushSubscription/set" if core => "PushSubscription/set",
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
+            b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
         };
@@ -295,7 +296,17 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         let result = if name == "Blob/copy" {
             self.blob_copy(start..end)
         } else if name == "Mailbox/changes" {
-            self.mailbox_changes(start..end, responses.request().envelope.maximum_objects)
+            self.object_changes(
+                start..end,
+                responses.request().envelope.maximum_objects,
+                object_changes::ChangesKind::Mailbox,
+            )
+        } else if name == "Thread/changes" {
+            self.object_changes(
+                start..end,
+                responses.request().envelope.maximum_objects,
+                object_changes::ChangesKind::Thread,
+            )
         } else if name == "Thread/get" {
             self.thread_get(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Mailbox/get" {
