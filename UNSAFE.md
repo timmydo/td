@@ -125,11 +125,14 @@ cryptography td-fido's safe P-256, AES and HMAC-SHA256. Since increment
 8b td-boot depends on td-fido too and serves its sessions' HID worker as
 its `fido-worker` verb, which since 8c the installed selector's
 protected release runs, one root worker per security-key attempt
-(`td-install/ENCRYPTION.md` "Protected release"): the worker
+(`td-install/ENCRYPTION.md` "Protected release"); since 8e td-install
+depends on it as well and serves the same worker as its own
+`fido-worker` verb, which its storage worker's disk proof runs
+(`td-install/DESIGN.md` "Storage operation worker"). The worker
 reads and writes `/dev/hidrawN` with std file I/O, reads the report
 descriptor from sysfs and bounds its life with a sleeping thread, so no
 hidraw ioctl (`HIDIOCGRDESC` or another) joins any roster, and td-boot
-keeps `unsafe` forbidden.
+and td-install keep `unsafe` forbidden for it.
 
 Planned, not current: `td-install/ENCRYPTION.md` increment 8's protected
 tier is planned to add no surface ("Unsafe and syscall surfaces" there).

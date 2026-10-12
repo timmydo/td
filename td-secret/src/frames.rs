@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 
 const LIMIT: usize = 289;
 pub(crate) const FRAME_TIME: Duration = Duration::from_secs(5);
+/// Root's PIN frame, sent after a presented secret step: this tag, then a
+/// PIN's 4 to 63 bytes or a recovery key's 48 digits.
+pub(crate) const SECRET: u8 = 0x16;
+/// The longest secret frame: its tag and 63 bytes.
+const SECRET_FRAME: usize = 64;
 
 pub(crate) struct Wire {
     stream: UnixStream,
@@ -140,6 +145,29 @@ impl Wire {
         let mut frame = Cleared(vec![0; length].into_boxed_slice());
         self.read(&mut frame.0, deadline)?;
         Ok(frame)
+    }
+
+    /// One secret frame. A person types it, so its header waits for the
+    /// operation deadline, or an open session's, rather than a frame's; the
+    /// rest then has one frame time. The bytes land in clearing storage and
+    /// never enter a diagnostic; the caller admits them under its own
+    /// profile.
+    pub(crate) fn receive_secret(&mut self) -> Result<Cleared, String> {
+        let mut header = [0; 2];
+        self.read(&mut header, self.bound())?;
+        let length = usize::from(u16::from_be_bytes(header));
+        if !(2..=SECRET_FRAME).contains(&length) {
+            return Err("invalid operation PIN frame length".into());
+        }
+        let deadline = self.frame_deadline()?;
+        let mut tag = [0];
+        self.read(&mut tag, deadline)?;
+        if tag != [SECRET] {
+            return Err("operation frame is not a PIN".into());
+        }
+        let mut secret = Cleared(vec![0; length - 1].into_boxed_slice());
+        self.read(&mut secret.0, deadline)?;
+        Ok(secret)
     }
 
     pub(crate) fn send(&mut self, bytes: &[u8]) -> Result<(), String> {

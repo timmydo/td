@@ -179,6 +179,88 @@ pub fn release<D: Devices>(
             "a release is an unlock or an authorization".into(),
         )));
     }
+    selected(
+        devices,
+        deadline,
+        tokens,
+        &operation.volume,
+        Identified {
+            phase,
+            description: operation.description,
+        },
+        &mut |_, retries, random| {
+            let pin = person.pin(phase, retries)?;
+            person.touch(phase);
+            Ok((pin, client_data_hash(phase, operation.description, random)?))
+        },
+        entropy,
+    )
+}
+
+/// The steps of an authorization presented one at a time
+/// (td-authd/DESIGN.md amendment 10, a login operation's disk proof): its
+/// assertion's description names the identified token and the key's PIN
+/// retries, so it exists only once the key has answered.
+pub trait Steps {
+    /// The authorize step for `token`, an index into the release's tokens,
+    /// with the key's own retry count, an untrusted claim: the step's
+    /// canonical description, once presented, and the PIN typed for it. An
+    /// error ends the operation before the PIN reaches the key.
+    fn authorize(&mut self, token: usize, retries: u8) -> Result<(Pin, Vec<u8>), String>;
+}
+
+/// `release` under the authorize phase in two presented steps: the
+/// identify hash binds `identify`, the identify step's description, and
+/// the assertion's binds the description `steps` gives for the selected
+/// token. Every check is `release`'s.
+pub fn authorize<D: Devices>(
+    devices: &mut D,
+    deadline: Instant,
+    tokens: &[Token<'_>],
+    volume: &[u8; 16],
+    identify: &[u8],
+    steps: &mut impl Steps,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<Released, DiskError> {
+    selected(
+        devices,
+        deadline,
+        tokens,
+        volume,
+        Identified {
+            phase: Phase::Authorize,
+            description: identify,
+        },
+        &mut |token, retries, random| {
+            let (pin, description) = steps.authorize(token, retries)?;
+            Ok((
+                pin,
+                client_data_hash(Phase::Authorize, &description, random)?,
+            ))
+        },
+        entropy,
+    )
+}
+
+/// What the silent identify's hash binds.
+struct Identified<'a> {
+    phase: Phase,
+    description: &'a [u8],
+}
+
+/// The PIN step for the selected token and the key's retries, under the
+/// assertion's fresh random bytes: the PIN and the client-data hash.
+type Answer<'a> = dyn FnMut(usize, u8, &[u8; 32]) -> Result<(Pin, [u8; 32]), String> + 'a;
+
+fn selected<D: Devices>(
+    devices: &mut D,
+    deadline: Instant,
+    tokens: &[Token<'_>],
+    volume: &[u8; 16],
+    identified: Identified<'_>,
+    answer: &mut Answer<'_>,
+    entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<Released, DiskError> {
     if tokens.is_empty() || tokens.len() > MAX_TOKENS {
         return Err(DiskError::Failed(Error::Protocol(
             "a release names one to four tokens".into(),
@@ -192,8 +274,8 @@ pub fn release<D: Devices>(
     }
     let node = one(devices)?;
     let ids: Vec<&[u8]> = tokens.iter().map(|token| token.credential).collect();
-    let hash =
-        client_data_hash(phase, operation.description, &fresh(entropy)?).map_err(protocol)?;
+    let hash = client_data_hash(identified.phase, identified.description, &fresh(entropy)?)
+        .map_err(protocol)?;
     let selected = Transaction::new(open(devices, node, deadline)?)
         .map_err(LoginError::from)
         .and_then(|transaction| transaction.identify(&ids, hash))?;
@@ -214,19 +296,11 @@ pub fn release<D: Devices>(
                     key,
                     salt: token.salt,
                 },
-                &mut |_, retries| {
-                    let pin = person.pin(phase, retries)?;
-                    person.touch(phase);
-                    Ok((
-                        pin,
-                        client_data_hash(phase, operation.description, &random)?,
-                    ))
-                },
+                &mut |_, retries| answer(index, retries, &random),
                 entropy,
             )
         })?;
-    let passphrase =
-        passphrase(output.bytes(), &operation.volume, token.credential).map_err(protocol)?;
+    let passphrase = passphrase(output.bytes(), volume, token.credential).map_err(protocol)?;
     Ok(Released {
         token: index,
         passphrase,
@@ -1123,5 +1197,131 @@ mod tests {
             Some(DiskError::OneKey)
         );
         assert_eq!(console.pins.len(), 2);
+    }
+
+    /// A two-step authorization's presented steps: each selected token and
+    /// retry count asked about, the PIN typed, and whether the person ends
+    /// the step.
+    #[derive(Default)]
+    struct Presented {
+        asked: Vec<(usize, u8)>,
+        pin: Option<&'static [u8]>,
+        ends: bool,
+    }
+
+    fn step(token: usize, retries: u8) -> Vec<u8> {
+        [b"authorize step ".as_slice(), &[token as u8, retries]].concat()
+    }
+
+    impl Steps for Presented {
+        fn authorize(&mut self, token: usize, retries: u8) -> Result<(Pin, Vec<u8>), String> {
+            self.asked.push((token, retries));
+            if self.ends {
+                return Err("the person ended it".into());
+            }
+            Ok((
+                Pin::new(self.pin.unwrap_or(PIN).into())?,
+                step(token, retries),
+            ))
+        }
+    }
+
+    const IDENTIFY: &[u8] = b"identify step";
+
+    fn authorize_on(
+        keys: &mut Keys,
+        tokens: &[Token<'_>],
+        steps: &mut Presented,
+        draws: &Rc<RefCell<Vec<[u8; 32]>>>,
+    ) -> Result<Released, DiskError> {
+        authorize(
+            keys,
+            later(),
+            tokens,
+            &VOLUME,
+            IDENTIFY,
+            steps,
+            &mut entropy(draws),
+        )
+    }
+
+    #[test]
+    fn an_authorization_binds_its_identify_step_then_the_step_it_presents() {
+        let key = blank("disk-authorize");
+        let created = create_on(&key, &mut Console::default()).unwrap();
+        let other = blank("disk-authorize-other");
+        let foreign = create_on(&other, &mut Console::default()).unwrap();
+        let tokens = [token(&foreign), token(&created)];
+        let draws = Rc::new(RefCell::new(Vec::new()));
+        let mut keys = Keys::one(&key);
+        let mut steps = Presented::default();
+        let released = authorize_on(&mut keys, &tokens, &mut steps, &draws).unwrap();
+        // The second token's passphrase, as its creation derived it.
+        assert_eq!(released.token, 1);
+        assert_eq!(released.passphrase.bytes(), created.passphrase.bytes());
+        assert_eq!(steps.asked, [(1, 8)]);
+        assert_eq!(keys.opened, 2);
+        // Identify binds the identify step, the assertion the step the
+        // caller presented for the selected token, each under authorize.
+        let assertions = hashes(&key, 2, 2);
+        let [identify, assertion] = assertions[assertions.len() - 2..] else {
+            panic!("two assertions")
+        };
+        let draws = draws.borrow().clone();
+        let bound = |hash: &[u8; 32], description: &[u8]| {
+            draws
+                .iter()
+                .any(|draw| client_data_hash(Phase::Authorize, description, draw).unwrap() == *hash)
+        };
+        assert!(bound(&identify, IDENTIFY));
+        assert!(bound(&assertion, &step(1, 8)));
+        assert!(!bound(&assertion, IDENTIFY));
+        assert!(!bound(&identify, &step(1, 8)));
+    }
+
+    #[test]
+    fn an_authorization_refuses_a_stranger_an_ended_step_and_a_wrong_pin() {
+        let key = blank("disk-authorize-refusals");
+        let created = create_on(&key, &mut Console::default()).unwrap();
+        let tokens = [token(&created)];
+        let draws = Rc::new(RefCell::new(Vec::new()));
+        // A key holding no token's credential is asked nothing.
+        let stranger = blank("disk-authorize-stranger");
+        let mut steps = Presented::default();
+        assert_eq!(
+            authorize_on(&mut Keys::one(&stranger), &tokens, &mut steps, &draws).err(),
+            Some(DiskError::NotEnrolled)
+        );
+        assert!(steps.asked.is_empty());
+        // An ended step never reaches the key's PIN check.
+        let mut steps = Presented {
+            ends: true,
+            ..Presented::default()
+        };
+        assert_eq!(
+            authorize_on(&mut Keys::one(&key), &tokens, &mut steps, &draws).err(),
+            Some(DiskError::Ended)
+        );
+        assert_eq!(steps.asked, [(0, 8)]);
+        // A wrong PIN is the key's typed status, and the next step names
+        // the key's own falling count.
+        let mut steps = Presented {
+            pin: Some(b"9999"),
+            ..Presented::default()
+        };
+        assert_eq!(
+            authorize_on(&mut Keys::one(&key), &tokens, &mut steps, &draws).err(),
+            Some(DiskError::Failed(Error::Status(Status::PinInvalid)))
+        );
+        let mut steps = Presented::default();
+        assert!(authorize_on(&mut Keys::one(&key), &tokens, &mut steps, &draws).is_ok());
+        assert_eq!(steps.asked, [(0, 7)]);
+        // Two keys connected: refused before any session.
+        let mut both = Keys::sessions(&[&key, &stranger], vec![vec![0, 1]]);
+        assert_eq!(
+            authorize_on(&mut both, &tokens, &mut Presented::default(), &draws).err(),
+            Some(DiskError::OneKey)
+        );
+        assert_eq!(both.opened, 0);
     }
 }

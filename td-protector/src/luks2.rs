@@ -602,6 +602,118 @@ pub fn identity<R: Read + Seek>(device: &mut R) -> Result<Identity, String> {
     })
 }
 
+/// The largest keyslots area cryptsetup itself formats (its
+/// `LUKS2_MAX_KEYSLOTS_SIZE`): a test area is at most two 16 KiB copies
+/// and this.
+pub const MAX_KEYSLOTS_SIZE: u64 = 128 << 20;
+/// The most PBKDF2 iterations a tested keyslot may ask: td forces 1000
+/// on every keyslot it adds, so this leaves margin and no more.
+pub const MAX_KEYSLOT_ITERATIONS: u64 = 100_000;
+/// The most PBKDF2 iterations a tested keyslot's digest may ask: cryptsetup
+/// benchmarks a digest's count at formatting, for about an eighth of a
+/// second.
+pub const MAX_DIGEST_ITERATIONS: u64 = 4_000_000;
+
+/// What a keyslot test reads of the used copy beyond `read`: the bytes a
+/// detached copy of the header must hold, both copies and the keyslots
+/// area, and each keyslot's cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestArea {
+    pub header: Header,
+    /// Two copies of `hdr_size` and `config.keyslots_size`.
+    pub length: u64,
+    costs: Vec<(u8, Result<Cost, String>)>,
+}
+
+/// A keyslot's PBKDF2-SHA256 iterations and its digest's, each within
+/// its ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cost {
+    pub keyslot: u64,
+    pub digest: u64,
+}
+
+impl TestArea {
+    /// The cost of testing `slot`, or why td does not bound it: a keyslot
+    /// or digest that is not PBKDF2-SHA256, such as Argon2, whose memory
+    /// and time td does not run, or one over its ceiling.
+    pub fn cost(&self, slot: u8) -> Result<Cost, String> {
+        match self.costs.iter().find(|(number, _)| *number == slot) {
+            Some((_, cost)) => cost.clone(),
+            None => Err(format!("LUKS2 header has no keyslot {slot}")),
+        }
+    }
+}
+
+/// `read`, and what a keyslot test against a detached copy of the header
+/// needs: the area's length, `config.keyslots_size` bounded by
+/// `MAX_KEYSLOTS_SIZE`, and each keyslot's cost.
+pub fn test_area<R: Read + Seek>(device: &mut R) -> Result<TestArea, String> {
+    let (copy, which) = used_copy(device)?;
+    let header = header_from(&copy, which)?;
+    let json = json_area(copy.json.as_deref().unwrap_or_default())?;
+    let keyslots_size = json
+        .get_path(&["config", "keyslots_size"])
+        .and_then(Json::as_str)
+        .and_then(|size| size.parse::<u64>().ok())
+        .filter(|size| *size <= MAX_KEYSLOTS_SIZE)
+        .ok_or("LUKS2 keyslots area size is missing or over its bound")?;
+    let length = copy
+        .hdr_size
+        .checked_mul(2)
+        .and_then(|copies| copies.checked_add(keyslots_size))
+        .ok_or("LUKS2 header area overflows")?;
+    let digests = numbered(&json, "digests")?;
+    let costs = numbered(&json, "keyslots")?
+        .into_iter()
+        .map(|(number, keyslot)| (number, cost(number, keyslot, &digests)))
+        .collect();
+    Ok(TestArea {
+        header,
+        length,
+        costs,
+    })
+}
+
+/// PBKDF2-SHA256 iterations of `value`, at most `ceiling`.
+fn pbkdf2(value: Option<&Json>, ceiling: u64, what: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{what} names no PBKDF"))?;
+    if value.get("type").and_then(Json::as_str) != Some("pbkdf2")
+        || value.get("hash").and_then(Json::as_str) != Some("sha256")
+    {
+        return Err(format!("{what} is not PBKDF2-SHA256"));
+    }
+    value
+        .get("iterations")
+        .and_then(Json::as_u64)
+        .filter(|iterations| (1..=ceiling).contains(iterations))
+        .ok_or_else(|| format!("{what} asks more than {ceiling} PBKDF2 iterations"))
+}
+
+fn cost(number: u8, keyslot: &Json, digests: &[(u8, &Json)]) -> Result<Cost, String> {
+    let keyslot = pbkdf2(
+        keyslot.get("kdf"),
+        MAX_KEYSLOT_ITERATIONS,
+        &format!("LUKS2 keyslot {number}"),
+    )?;
+    let name = number.to_string();
+    let mut covering = digests.iter().filter(|(_, digest)| {
+        digest
+            .get("keyslots")
+            .and_then(Json::as_arr)
+            .is_some_and(|slots| slots.iter().any(|slot| slot.as_str() == Some(&name)))
+    });
+    let (Some((_, digest)), None) = (covering.next(), covering.next()) else {
+        return Err(format!("LUKS2 keyslot {number} has no one digest"));
+    };
+    let digest = pbkdf2(
+        Some(digest),
+        MAX_DIGEST_ITERATIONS,
+        &format!("LUKS2 keyslot {number}'s digest"),
+    )?;
+    Ok(Cost { keyslot, digest })
+}
+
 fn used_copy<R: Read + Seek>(device: &mut R) -> Result<(ValidCopy, HeaderCopy), String> {
     let primary = read_copy(device, 0, false)?;
     let secondary = match &primary {
@@ -1288,5 +1400,93 @@ mod tests {
         assert!(identity_of(device(7, &json, 7, &other))
             .unwrap_err()
             .contains("disagree"));
+    }
+
+    fn tested_json(keyslot_kdf: &str, digest: &str, keyslots_size: &str) -> String {
+        format!(
+            r#"{{"keyslots":{{"0":{{"type":"luks2","kdf":{keyslot_kdf}}},"1":{{"type":"luks2","kdf":{{"type":"pbkdf2","hash":"sha256","iterations":1000}}}}}},"tokens":{{}},"segments":{{"0":{{"type":"crypt"}}}},"digests":{{"0":{digest}}},"config":{{"json_size":"12288","keyslots_size":"{keyslots_size}"}}}}"#
+        )
+    }
+
+    const TD_KDF: &str = r#"{"type":"pbkdf2","hash":"sha256","iterations":1000,"salt":"AA=="}"#;
+    const DIGEST: &str = r#"{"type":"pbkdf2","keyslots":["0","1"],"segments":["0"],"hash":"sha256","iterations":250000}"#;
+
+    fn area(json: &str) -> Result<TestArea, String> {
+        test_area(&mut Cursor::new(device(5, json, 5, json)))
+    }
+
+    #[test]
+    fn a_test_area_is_both_copies_and_the_keyslots_area_with_bounded_costs() {
+        let json = tested_json(TD_KDF, DIGEST, "16744448");
+        let area = area(&json).unwrap();
+        assert_eq!(area.header, read_bytes(device(5, &json, 5, &json)).unwrap());
+        assert_eq!(area.length, 2 * 0x4000 + 16744448);
+        let td = Cost {
+            keyslot: 1000,
+            digest: 250000,
+        };
+        assert_eq!(area.cost(0), Ok(td));
+        assert_eq!(area.cost(1), Ok(td));
+        assert!(area.cost(2).is_err());
+        // cryptsetup's largest keyslots area, and one byte past it.
+        let largest = MAX_KEYSLOTS_SIZE.to_string();
+        assert!(super::tests::area(&tested_json(TD_KDF, DIGEST, &largest)).is_ok());
+        let past = (MAX_KEYSLOTS_SIZE + 1).to_string();
+        for size in [past.as_str(), "-1", "", "0x1000"] {
+            assert!(super::tests::area(&tested_json(TD_KDF, DIGEST, size)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_keyslot_or_digest_td_does_not_bound_has_no_cost() {
+        for (kdf, digest) in [
+            // Argon2, whose memory and time td never runs.
+            (
+                r#"{"type":"argon2id","time":4,"memory":1048576,"cpus":4}"#,
+                DIGEST,
+            ),
+            (
+                r#"{"type":"pbkdf2","hash":"sha512","iterations":1000}"#,
+                DIGEST,
+            ),
+            (
+                r#"{"type":"pbkdf2","hash":"sha256","iterations":100001}"#,
+                DIGEST,
+            ),
+            (
+                r#"{"type":"pbkdf2","hash":"sha256","iterations":0}"#,
+                DIGEST,
+            ),
+            (r#"{"type":"pbkdf2","hash":"sha256"}"#, DIGEST),
+            (
+                TD_KDF,
+                r#"{"type":"pbkdf2","keyslots":["0","1"],"hash":"sha256","iterations":4000001}"#,
+            ),
+            // No digest covers the keyslot, or two do.
+            (
+                TD_KDF,
+                r#"{"type":"pbkdf2","keyslots":["1"],"hash":"sha256","iterations":1000}"#,
+            ),
+        ] {
+            let area = area(&tested_json(kdf, digest, "16744448")).unwrap();
+            assert!(area.cost(0).is_err(), "{kdf} {digest}");
+        }
+        let two = format!(
+            r#"{{"keyslots":{{"0":{{"type":"luks2","kdf":{TD_KDF}}}}},"tokens":{{}},"segments":{{}},"digests":{{"0":{DIGEST},"1":{DIGEST}}},"config":{{"keyslots_size":"4096"}}}}"#
+        );
+        assert!(area(&two).unwrap().cost(0).is_err());
+        // At the ceilings exactly, the cost is admitted.
+        let ceiling = tested_json(
+            r#"{"type":"pbkdf2","hash":"sha256","iterations":100000}"#,
+            r#"{"type":"pbkdf2","keyslots":["0","1"],"hash":"sha256","iterations":4000000}"#,
+            "4096",
+        );
+        assert_eq!(
+            area(&ceiling).unwrap().cost(0),
+            Ok(Cost {
+                keyslot: MAX_KEYSLOT_ITERATIONS,
+                digest: MAX_DIGEST_ITERATIONS
+            })
+        );
     }
 }

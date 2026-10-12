@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// The most a child's input may be: one page, which any pipe holds, so
 /// filling it never blocks. A secret is at most 48 bytes, and a token's JSON
@@ -258,6 +259,32 @@ pub fn test_args(device: &Path, slot: u8) -> Vec<OsString> {
     args
 }
 
+/// `test_args` against `header`, a detached copy of the device's header
+/// area: cryptsetup reads and repairs metadata only there, and the device
+/// is named for its data alone, which a test never reads or writes.
+pub fn detached_test_args(header: &Path, device: &Path, slot: u8) -> Vec<OsString> {
+    let mut args = os(&["open", "--test-passphrase", "--type", "luks2", "--header"]);
+    args.push(header.into());
+    args.push("--key-slot".into());
+    args.push(slot.to_string().into());
+    args.push("--key-file=-".into());
+    args.push(device.into());
+    args
+}
+
+/// How long a bounded run sleeps between looks at its child.
+const BOUNDED_POLL: Duration = Duration::from_millis(10);
+
+/// How a bounded run ended.
+#[derive(Debug)]
+pub enum Bounded {
+    Exited(ExitStatus),
+    /// The deadline passed first: the child was killed and reaped.
+    Expired,
+    /// The caller was abandoned first: the child was killed and reaped.
+    Abandoned,
+}
+
 /// What `status` said of a mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mapping {
@@ -384,6 +411,47 @@ impl Cryptsetup {
         Ok(())
     }
 
+    /// Runs one cryptsetup command with `input` on its standard input,
+    /// keeping none of its output, until it exits, `deadline` passes or
+    /// `abandoned` says the caller is gone. Past either of those the child
+    /// is killed and reaped, so no child outlives the run holding its
+    /// input, however long its own work or a lock it waits on would last.
+    pub fn run_bounded(
+        &self,
+        args: &[OsString],
+        input: &[u8],
+        deadline: Instant,
+        abandoned: &mut dyn FnMut() -> bool,
+    ) -> io::Result<Bounded> {
+        self.checked(args, input)?;
+        let stdin = filled_pipe(input)?;
+        let mut child = Command::new(&self.program)
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| invalid(format!("cannot run {}: {error}", self.program.display())))?;
+        loop {
+            let ended = match child.try_wait() {
+                Ok(Some(status)) => return Ok(Bounded::Exited(status)),
+                Ok(None) if Instant::now() >= deadline => Ok(Bounded::Expired),
+                Ok(None) if abandoned() => Ok(Bounded::Abandoned),
+                Ok(None) => {
+                    std::thread::sleep(BOUNDED_POLL);
+                    continue;
+                }
+                Err(error) => Err(error),
+            };
+            // A child that exited meanwhile refuses the kill; the wait
+            // reaps it either way.
+            let _ = child.kill();
+            child.wait()?;
+            return ended;
+        }
+    }
+
     /// The JSON metadata of the header copy cryptsetup uses on `device`,
     /// returned rather than copied to standard error.
     pub fn metadata(&self, device: &Path) -> io::Result<Vec<u8>> {
@@ -420,31 +488,7 @@ impl Cryptsetup {
     /// One child: its exit and at most `MAX_OUTPUT` bytes of its standard
     /// output.
     fn child(&self, args: &[OsString], input: &[u8]) -> io::Result<(ExitStatus, Vec<u8>)> {
-        if !self.program.is_absolute() {
-            return Err(invalid(format!(
-                "cannot run {}: not an absolute path",
-                self.program.display()
-            )));
-        }
-        // Other luksDump forms can print key material to the standard output
-        // `run` copies to standard error: `--dump-volume-key` (or its alias
-        // `--dump-master-key`) without a file, and `--unbound`. cryptsetup
-        // takes options before its action too, so the verb is looked for
-        // anywhere.
-        if args.iter().any(|arg| arg == "luksDump") && !known_dump(args) {
-            return Err(invalid(
-                "luksDump runs only as --dump-json-metadata or as --dump-volume-key \
-                 into a --volume-key-file"
-                    .to_string(),
-            ));
-        }
-        if args.first().is_some_and(|verb| verb == "luksKillSlot") && input.len() < MIN_KILL_KEY {
-            return Err(invalid(format!(
-                "luksKillSlot needs a key of at least {MIN_KILL_KEY} bytes on standard input, \
-                 not {}",
-                input.len()
-            )));
-        }
+        self.checked(args, input)?;
         let stdin = filled_pipe(input)?;
         let mut child = Command::new(&self.program)
             .args(args)
@@ -473,6 +517,36 @@ impl Cryptsetup {
             )));
         }
         Ok((status, output))
+    }
+
+    /// The refusals every child passes before it starts.
+    fn checked(&self, args: &[OsString], input: &[u8]) -> io::Result<()> {
+        if !self.program.is_absolute() {
+            return Err(invalid(format!(
+                "cannot run {}: not an absolute path",
+                self.program.display()
+            )));
+        }
+        // Other luksDump forms can print key material to the standard output
+        // `run` copies to standard error: `--dump-volume-key` (or its alias
+        // `--dump-master-key`) without a file, and `--unbound`. cryptsetup
+        // takes options before its action too, so the verb is looked for
+        // anywhere.
+        if args.iter().any(|arg| arg == "luksDump") && !known_dump(args) {
+            return Err(invalid(
+                "luksDump runs only as --dump-json-metadata or as --dump-volume-key \
+                 into a --volume-key-file"
+                    .to_string(),
+            ));
+        }
+        if args.first().is_some_and(|verb| verb == "luksKillSlot") && input.len() < MIN_KILL_KEY {
+            return Err(invalid(format!(
+                "luksKillSlot needs a key of at least {MIN_KILL_KEY} bytes on standard input, \
+                 not {}",
+                input.len()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1030,5 +1104,119 @@ mod tests {
         assert_eq!(cryptsetup.mapping(NAME).unwrap(), Mapping::Inactive);
         assert_eq!(recorder.argv(5), ["status", NAME]);
         assert!(!recorder.dir.join(NAME).exists());
+    }
+
+    #[test]
+    fn a_detached_test_names_the_copy_as_its_header_and_the_device_last() {
+        assert_eq!(
+            words(&detached_test_args(
+                Path::new("/run/td-keyslot-test.7/header"),
+                Path::new("/dev/nvme0n1p2"),
+                3
+            )),
+            [
+                "open",
+                "--test-passphrase",
+                "--type",
+                "luks2",
+                "--header",
+                "/run/td-keyslot-test.7/header",
+                "--key-slot",
+                "3",
+                "--key-file=-",
+                "/dev/nvme0n1p2"
+            ]
+        );
+    }
+
+    /// A bounded run passes the key by standard input alone, reports the
+    /// exit, and kills and reaps a child that outlasts its deadline or
+    /// whose caller is abandoned; the refusals every run has still apply.
+    #[test]
+    fn a_bounded_run_kills_and_reaps_a_stalled_child() {
+        let recorder = Recorder::new();
+        let device = Path::new("/dev/loop7");
+        let far = Instant::now() + Duration::from_secs(60);
+        let args = detached_test_args(Path::new("/run/h"), device, 1);
+        match recorder
+            .cryptsetup
+            .run_bounded(&args, b"secret", far, &mut || false)
+            .unwrap()
+        {
+            Bounded::Exited(status) => assert!(status.success()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(recorder.read("stdin", 1), b"secret");
+        recorder.exit_with(2, EXIT_BAD_PASSPHRASE);
+        match recorder
+            .cryptsetup
+            .run_bounded(&args, b"secret", far, &mut || false)
+            .unwrap()
+        {
+            Bounded::Exited(status) => assert_eq!(status.code(), Some(EXIT_BAD_PASSPHRASE)),
+            other => panic!("{other:?}"),
+        }
+        let sleep = tool("sleep");
+        let stalled = recorder.dir.join("stalled");
+        let body = format!(
+            "#!/bin/sh\necho $$ > '{dir}/pid.'$1\nexec '{sleep}' 60\n",
+            dir = recorder.dir.display(),
+            sleep = sleep.display()
+        );
+        let written = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"",
+                "sh",
+            ])
+            .arg(&stalled)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(written.success());
+        let stalled = Cryptsetup::new(stalled);
+        let gone = |name: &str| {
+            let path = recorder.dir.join(name);
+            let pid = (0..500)
+                .find_map(|_| {
+                    let pid = std::fs::read_to_string(&path).ok();
+                    if pid.is_none() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    pid
+                })
+                .unwrap();
+            !Path::new(&format!("/proc/{}", pid.trim())).exists()
+        };
+        let started = Instant::now();
+        let ended = stalled
+            .run_bounded(
+                &os(&["expired"]),
+                b"secret",
+                Instant::now() + Duration::from_millis(300),
+                &mut || false,
+            )
+            .unwrap();
+        assert!(matches!(ended, Bounded::Expired), "{ended:?}");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(gone("pid.expired"));
+        let mut looks = 0;
+        let ended = stalled
+            .run_bounded(&os(&["abandoned"]), b"secret", far, &mut || {
+                looks += 1;
+                looks > 20
+            })
+            .unwrap();
+        assert!(matches!(ended, Bounded::Abandoned), "{ended:?}");
+        assert!(gone("pid.abandoned"));
+        // The refusals `run` has hold before any child starts.
+        assert!(Cryptsetup::new(PathBuf::from("cryptsetup"))
+            .run_bounded(&args, b"secret", far, &mut || false)
+            .is_err());
+        assert!(recorder
+            .cryptsetup
+            .run_bounded(&kill_slot_args(device, 1), &[], far, &mut || false)
+            .is_err());
+        assert_eq!(std::fs::read(recorder.dir.join("count")).unwrap(), b"2\n");
     }
 }

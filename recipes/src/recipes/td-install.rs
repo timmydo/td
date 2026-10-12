@@ -13,8 +13,9 @@ use crate::types::{Recipe, Step};
 // binary's profile and passed by `--extern`, as td-boot passes td-tpm;
 // td-tpm and td-fido include the same engine SHA-256 by `#[path]`. The
 // storage worker (`storage-operation`) admits and writes the ESP through
-// td-fat, a std-only rlib like the others, and compiles td-authd's consent
-// descriptions and td-secret's worker endpoint and memory rules by
+// td-fat, a std-only rlib like the others, asks a disk proof's security key
+// through td-fido's disk flows, linked directly, and compiles td-authd's
+// consent descriptions and td-secret's worker endpoint and memory rules by
 // `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-install/src/main.rs");
 const STORAGE_OPERATION_RS: &str = include_str!("../../../td-install/src/storage_operation.rs");
@@ -521,6 +522,8 @@ pub fn recipe() -> Recipe {
                 "panic=abort",
                 "--extern",
                 "td_fat={root}/libtd_fat.rlib",
+                "--extern",
+                "td_fido={root}/libtd_fido.rlib",
                 "--extern",
                 "td_protector={root}/libtd_protector.rlib",
                 "--extern",

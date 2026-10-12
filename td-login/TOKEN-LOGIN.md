@@ -1042,7 +1042,11 @@ token alone is something anyone who can write the disk can add:
 
 The keyslot test runs only through `td-install storage-operation`, the
 running system's one keyslot-test surface (`td-install/DESIGN.md`,
-"Full-system volume consumers"), never in td-secret's login worker.
+"Full-system volume consumers"), never in td-secret's login worker. It
+reads only a private copy of the header area the worker verified
+(`--header`), so a repair cryptsetup would make of a stale copy never
+writes the disk, and its child is killed at the operation's deadline or
+cancellation (`td-install/DESIGN.md`, "Storage operation worker").
 ENCRYPTION.md increment 8e's documentation commit fixes the rest, and
 its last commit implements it after the storage-operation wire exists
 (td-authd/DESIGN.md amendment 10):

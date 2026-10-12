@@ -1,17 +1,24 @@
 //! `td-install storage-operation --uid 1000`: td-authd's root storage
 //! worker (DESIGN.md "Storage operation worker", td-authd/DESIGN.md
 //! amendment 10). In increment 8e it carries the selector update in both
-//! forms; td-authd starts it only in test builds until ENCRYPTION.md's
-//! item 9, so nothing in production runs it.
+//! forms and the keyslot test of a login-key operation's disk proof;
+//! td-authd starts it only in test builds until ENCRYPTION.md's item 9, so
+//! nothing in production runs it.
 //!
 //! The worker reads everything an update needs before it presents the
 //! description, so the approval key's time holds no I/O, and after root's
 //! commit acknowledgement it re-reads the header, the deployment's
 //! standing and the ESP's `EFI/BOOT` sector before its first write: a
 //! change there is `28`, definite because nothing was written, and the
-//! worker exits successfully after sending it.
+//! worker exits successfully after sending it. A disk proof writes
+//! nothing: it presents the proof's steps, takes the recovery key or a
+//! disk security key's assertion, and tests the keyslot that secret opens
+//! against an unchanged header.
 
-use crate::consent::{Operation, Request, SelectorForm, SELECTOR_UPDATE_CEILING};
+use crate::consent::{
+    DiskProofs, LoginStep, Operation, Proof, Request, SelectorForm, LOGIN_LONGEST,
+    SELECTOR_UPDATE_CEILING,
+};
 use crate::frames::{self, remaining, Wire};
 use crate::{
     esp_region, inventory, logical_sector_size, paths, protocol, read_trusted_key, sha256, td_fs,
@@ -23,9 +30,18 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use td_fido::fido_ctap::fingerprint;
+use td_fido::fido_device::{self, Interruption, Program, MAX_LIFETIME};
+use td_fido::fido_disk::{self, DiskError, Released, Steps};
+use td_fido::fido_p256::PublicKey;
+use td_fido::fido_pin::{LoginRefusal, Pin};
+use td_fido::fido_transaction::{Devices, Error as FidoError, Status};
+use td_protector::cryptsetup::{self, Bounded, Cryptsetup};
+use td_protector::lockout::volume_uuid;
 use td_protector::luks2::{self, Header, Kind};
-use td_protector::protected::{FidoRole, Shape, Token};
+use td_protector::protected::{Fido2, FidoRole, Shape, Token};
 use td_protector::protected_plan;
+use td_protector::recovery::RecoveryKey;
 
 const PRESENT: u8 = 0x10;
 const PRESENTED: u8 = 0x11;
@@ -37,30 +53,81 @@ const BASELINE: u8 = 0x18;
 /// What the commit invitation must leave of the deadline: the writes'.
 pub(crate) const COMMIT_MARGIN: Duration = Duration::from_secs(120);
 
-/// Why an operation failed, as its `15` frame carries it. Root ends the
-/// operation with `20` to `22` from the baseline itself, so the worker
-/// never sends them.
+/// Why an operation failed, as its `15` frame carries it. Root ends a
+/// selector update with `20` to `22` from the baseline itself; the worker
+/// sends `20` only from a disk proof's re-read of the header. A disk key's
+/// kinds are td-secret's login worker's (td-secret/DESIGN.md, "Login-key
+/// worker").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
+    /// The key's retry count as it reported it before this attempt.
+    WrongPin(u8),
+    PinAuthBlocked,
+    PinBlocked,
+    /// The connected key holds none of the header's fido2 credentials.
+    NotEnrolled,
+    /// None or several FIDO devices, or another than identify's.
+    OneKey,
+    Refused(LoginRefusal),
+    /// The key denied presence.
+    Denied,
     Timeout,
     Failed,
     Internal,
+    /// The held header is gone, or td's reader now refuses it.
+    Volume,
     Deployment,
     Esp,
-    /// After root's `13` and before any write.
+    /// The recovery-key codec refused the entry.
+    Mistyped,
+    /// The keyslot refused the recovery key or the derived passphrase.
+    WrongKey,
+    /// After root's `13` and before any write, or before a disk proof's
+    /// keyslot test.
     Changed,
 }
 
 impl Failure {
     pub(crate) fn kind(self) -> u8 {
         match self {
+            Self::WrongPin(_) => 0x01,
+            Self::PinAuthBlocked => 0x02,
+            Self::PinBlocked => 0x03,
+            Self::NotEnrolled => 0x04,
+            Self::OneKey => 0x05,
+            Self::Refused(_) => 0x06,
+            Self::Denied => 0x07,
             Self::Timeout => 0x08,
             Self::Failed => 0x0f,
             Self::Internal => 0x10,
+            Self::Volume => 0x20,
             Self::Deployment => 0x23,
             Self::Esp => 0x24,
+            Self::Mistyped => 0x25,
+            Self::WrongKey => 0x26,
             Self::Changed => 0x28,
         }
+    }
+
+    /// `15`, the kind, and the detail byte a wrong PIN and a refusal carry,
+    /// as the login worker frames them.
+    pub(crate) fn frame(self) -> Vec<u8> {
+        let detail = match self {
+            Self::WrongPin(retries) => Some(retries),
+            Self::Refused(refusal) => Some(match refusal {
+                LoginRefusal::NoHmacSecret => 1,
+                LoginRefusal::AlwaysUv => 2,
+                LoginRefusal::PinUnsupported => 3,
+                LoginRefusal::PinNotSet => 4,
+                LoginRefusal::ListTooSmall => 5,
+                // A key that cannot require its PIN has no typed text.
+                LoginRefusal::NoFido21 | LoginRefusal::PinOptional => return Self::Failed.frame(),
+            }),
+            _ => None,
+        };
+        let mut frame = vec![FAILURE, self.kind()];
+        frame.extend(detail);
+        frame
     }
 }
 
@@ -143,15 +210,10 @@ impl Baseline {
             },
         };
         baseline.recovery = protected_plan::marker(header).is_some();
-        // The reader bounds fido2 tokens at four, in token-number order.
-        baseline.tokens = header
-            .protected
-            .iter()
-            .filter_map(|(_, token)| match token {
-                Token::Fido2(fido) => Some((fido.role, fingerprint(&fido.credential))),
-                _ => None,
-            })
-            .take(luks2::MAX_FIDO2_TOKENS)
+        // The same tokens, in the same order, a disk proof identifies among.
+        baseline.tokens = fido_tokens(header)
+            .into_iter()
+            .map(|fido| (fido.role, fingerprint(&fido.credential)))
             .collect();
         baseline
     }
@@ -182,17 +244,6 @@ impl Baseline {
         }
         frame
     }
-}
-
-/// A credential's public short name, td-fido's `fingerprint`: the first
-/// four bytes of its SHA-256 (td-authd/DESIGN.md amendment 10). Restated,
-/// not imported: td-install is not one of td-fido's dependents
-/// (td-fido/DESIGN.md, "Consumers"; `FIDO_DEPENDENTS`).
-pub(crate) fn fingerprint(credential: &[u8]) -> [u8; 4] {
-    let mut hasher = crate::sha256::Sha256::new();
-    hasher.update(credential);
-    let [a, b, c, d, ..] = hasher.finalize();
-    [a, b, c, d]
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -226,6 +277,45 @@ pub(crate) trait Host {
     fn trusted_key(&mut self) -> Result<Vec<u8>, String>;
     /// The held disk's ESP, admitted by td-fat.
     fn esp(&mut self) -> Result<td_fat::Esp<Self::Disk>, String>;
+    /// `cryptsetup open --test-passphrase` of keyslot `slot`, `key` on
+    /// standard input, which maps nothing, against a private detached
+    /// copy of the held partition's header area that must read as
+    /// `expected`: a repair cryptsetup makes lands in the copy, never on
+    /// the disk. The child lives until `deadline` at most. Any failure but
+    /// these outcomes is an error naming no key.
+    fn test_keyslot(
+        &mut self,
+        slot: u8,
+        key: &[u8],
+        expected: &Header,
+        deadline: Instant,
+    ) -> Result<Tested, String>;
+}
+
+/// What a keyslot test found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Tested {
+    Opened,
+    /// cryptsetup's wrong-passphrase exit.
+    Refused,
+    /// The header area no longer reads as the one presented, before or
+    /// while it was copied; nothing ran.
+    Changed,
+    /// The deadline passed first; the child was killed and reaped.
+    Expired,
+}
+
+/// The disk security key a proof asks: td-fido's two-step authorization
+/// over root hidraw in production, a script in host tests.
+pub(crate) trait Keys {
+    fn authorize(
+        &mut self,
+        deadline: Instant,
+        tokens: &[fido_disk::Token<'_>],
+        volume: &[u8; 16],
+        identify: &[u8],
+        steps: &mut Presenter<'_>,
+    ) -> Result<Released, DiskError>;
 }
 
 /// The selector `prepare` builds from the template, key and identity.
@@ -233,21 +323,23 @@ pub(crate) type Prepare<'a> = &'a dyn Fn(&[u8], &[u8], &str, bool) -> Result<Vec
 
 /// The operation, then its failure frame, best effort. A definite `28`
 /// is the one failure the worker exits successfully after.
-pub(crate) fn operate<H: Host>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn operate<H: Host, K: Keys>(
     wire: &mut Wire,
     host: &mut H,
+    keys: &mut K,
     uid: u32,
     started: Instant,
     margin: Duration,
     prepare: Prepare<'_>,
     entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
 ) -> Result<(), Failure> {
-    let result = perform(wire, host, uid, started, margin, prepare, entropy);
+    let result = perform(wire, host, keys, uid, started, margin, prepare, entropy);
     wire.session(None);
     match result {
         Ok(()) => Ok(()),
         Err(failure) => {
-            let _ = wire.send(&[FAILURE, failure.kind()]);
+            let _ = wire.send(&failure.frame());
             if failure == Failure::Changed {
                 Ok(())
             } else {
@@ -257,9 +349,11 @@ pub(crate) fn operate<H: Host>(
     }
 }
 
-fn perform<H: Host>(
+#[allow(clippy::too_many_arguments)]
+fn perform<H: Host, K: Keys>(
     wire: &mut Wire,
     host: &mut H,
+    keys: &mut K,
     uid: u32,
     started: Instant,
     margin: Duration,
@@ -272,6 +366,17 @@ fn perform<H: Host>(
     let frame = wire.receive_cleared().map_err(|_| framing(wire))?;
     let request = Request::decode(frame.bytes()).map_err(|_| Failure::Internal)?;
     drop(frame);
+    if request.owner() != uid {
+        return Err(Failure::Internal);
+    }
+    if request.login_proof().is_some() {
+        let proof = Proved {
+            request: &request,
+            baseline: &baseline,
+            read: &read,
+        };
+        return proof.run(wire, host, keys, started, entropy);
+    }
     // Root derives the description from the baseline, as this does.
     let (form, id) = match (
         request.operation(),
@@ -279,7 +384,7 @@ fn perform<H: Host>(
         baseline.current,
     ) {
         (Operation::SelectorUpdate { form, current, .. }, Some(expected), Some(id))
-            if request.owner() == uid && *form == expected && *current == hex(&id) =>
+            if *form == expected && *current == hex(&id) =>
         {
             (*form, id)
         }
@@ -347,6 +452,317 @@ fn perform<H: Host>(
     wire.send(&[SUCCESS]).map_err(|_| Failure::Internal)
 }
 
+/// A disk proof: root's first description at the proof's first step, the
+/// baseline it was built from, and the header read that baseline holds.
+struct Proved<'a> {
+    request: &'a Request,
+    baseline: &'a Baseline,
+    read: &'a Read,
+}
+
+impl Proved<'_> {
+    /// Presents the proof's first step, takes its secret, and tests the
+    /// keyslot it opens; then `14`. Nothing is written, so there is no
+    /// commit round.
+    fn run<H: Host, K: Keys>(
+        &self,
+        wire: &mut Wire,
+        host: &mut H,
+        keys: &mut K,
+        started: Instant,
+        entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+    ) -> Result<(), Failure> {
+        let Some(Ok(header)) = self.read else {
+            return Err(Failure::Internal);
+        };
+        // What root admitted against the same baseline.
+        let tokens: Vec<[u8; 4]> = self.baseline.tokens.iter().map(|(_, key)| *key).collect();
+        self.request
+            .proof_start(DiskProofs {
+                recovery_key: self.baseline.recovery,
+                tokens: &tokens,
+            })
+            .map_err(|_| Failure::Internal)?;
+        let ceiling = self.request.login_ceiling().ok_or(Failure::Internal)?;
+        wire.limit(started.checked_add(ceiling).ok_or(Failure::Internal)?);
+        // A disclosure's approval key is typed before root acknowledges.
+        let wait = self.request.login_approval().map(|_| wire.bound());
+        let round = entropy().map_err(|_| Failure::Internal)?;
+        wire.exchange(PRESENT, PRESENTED, round, &self.request.encode(), wait)
+            .map_err(|_| framing(wire))?;
+        match self.request.login_proof() {
+            Some(Proof::RecoveryKey) => self.recovery_key(wire, host, header),
+            Some(Proof::DiskKey) => self.disk_key(wire, host, keys, header, &tokens, entropy),
+            None => Err(Failure::Internal),
+        }?;
+        wire.send(&[SUCCESS]).map_err(|_| Failure::Internal)
+    }
+
+    /// The typed key, parsed by td-protector's codec and tested on the
+    /// keyslot the `recovery-key` marker names. The entry, the key and its
+    /// passphrase each live in storage zeroed on drop, and reach
+    /// cryptsetup only through its standard-input pipe.
+    fn recovery_key<H: Host>(
+        &self,
+        wire: &mut Wire,
+        host: &mut H,
+        header: &Header,
+    ) -> Result<(), Failure> {
+        let (_, slot) = protected_plan::marker(header).ok_or(Failure::Internal)?;
+        let entry = wire.receive_secret().map_err(|_| framing(wire))?;
+        let key = RecoveryKey::parse(entry.bytes());
+        drop(entry);
+        let passphrase = key.map_err(|_| Failure::Mistyped)?.passphrase();
+        self.unchanged(host)?;
+        tested(host.test_keyslot(slot, passphrase.expose(), header, wire.deadline()))
+    }
+
+    /// The disk key's two presented steps through td-fido, its verified
+    /// assertion's derived passphrase tested on the keyslot its token
+    /// names.
+    fn disk_key<H: Host, K: Keys>(
+        &self,
+        wire: &mut Wire,
+        host: &mut H,
+        keys: &mut K,
+        header: &Header,
+        fingerprints: &[[u8; 4]],
+        entropy: &mut dyn FnMut() -> Result<[u8; 32], String>,
+    ) -> Result<(), Failure> {
+        // A token whose point td-fido refuses is not tried, as the
+        // selector's release skips it: the rest still prove.
+        let mut fido = Vec::with_capacity(luks2::MAX_FIDO2_TOKENS);
+        let mut tokens = Vec::with_capacity(luks2::MAX_FIDO2_TOKENS);
+        let mut usable = Vec::with_capacity(luks2::MAX_FIDO2_TOKENS);
+        for (token, fingerprint) in fido_tokens(header).into_iter().zip(fingerprints) {
+            if let Ok(key) = PublicKey::from_coordinates(&token.x, &token.y) {
+                tokens.push(fido_disk::Token {
+                    credential: &token.credential,
+                    key,
+                    salt: token.salt,
+                });
+                fido.push(token);
+                usable.push(*fingerprint);
+            }
+        }
+        let volume = volume_uuid(&header.uuid).ok_or(Failure::Internal)?;
+        // One session's lifetime at most, inside the operation's.
+        let deadline = Instant::now()
+            .checked_add(MAX_LIFETIME)
+            .map_or(wire.deadline(), |lifetime| lifetime.min(wire.deadline()));
+        wire.session(Some(deadline));
+        let identify = self.request.encode();
+        let mut presenter = Presenter {
+            wire,
+            request: self.request,
+            fingerprints: &usable,
+            entropy,
+            reported: None,
+            cause: None,
+        };
+        let result = keys.authorize(deadline, &tokens, &volume, &identify, &mut presenter);
+        let Presenter {
+            wire,
+            reported,
+            cause,
+            ..
+        } = presenter;
+        // Classified while the session still bounds the wire.
+        let released = result.map_err(|error| disk_failure(error, cause, reported, wire));
+        wire.session(None);
+        let released = released?;
+        let slot = fido
+            .get(released.token)
+            .and_then(|token| token.keyslot)
+            .ok_or(Failure::WrongKey)?;
+        self.unchanged(host)?;
+        tested(host.test_keyslot(slot, released.passphrase.bytes(), header, wire.deadline()))
+    }
+
+    /// The header as the baseline read it: `20` when it is gone or now
+    /// refused, `28` when it changed, so the keyslot test is of the
+    /// protectors root admitted the proof against.
+    fn unchanged<H: Host>(&self, host: &mut H) -> Result<(), Failure> {
+        let now = host.header();
+        match &now {
+            None | Some(Err(_)) => Err(Failure::Volume),
+            _ if now != *self.read => Err(Failure::Changed),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The header's fido2 tokens in the baseline's order: token-number order,
+/// at most four.
+fn fido_tokens(header: &Header) -> Vec<&Fido2> {
+    header
+        .protected
+        .iter()
+        .filter_map(|(_, token)| match token {
+            Token::Fido2(fido) => Some(fido),
+            _ => None,
+        })
+        .take(luks2::MAX_FIDO2_TOKENS)
+        .collect()
+}
+
+/// A keyslot test's answer.
+fn tested(result: Result<Tested, String>) -> Result<(), Failure> {
+    match result {
+        Ok(Tested::Opened) => Ok(()),
+        Ok(Tested::Refused) => Err(Failure::WrongKey),
+        Ok(Tested::Changed) => Err(Failure::Changed),
+        Ok(Tested::Expired) => Err(Failure::Timeout),
+        Err(_) => Err(Failure::Failed),
+    }
+}
+
+/// The disk authorize step, presented once the key has said its retries,
+/// and the PIN root sends for it.
+pub(crate) struct Presenter<'a> {
+    wire: &'a mut Wire,
+    /// The proof's first step, disk identify.
+    request: &'a Request,
+    fingerprints: &'a [[u8; 4]],
+    entropy: &'a mut dyn FnMut() -> Result<[u8; 32], String>,
+    /// The retries of the step presented, once its PIN was taken.
+    reported: Option<u8>,
+    /// Why the step failed, which td-fido reports only as an ended PIN.
+    cause: Option<Failure>,
+}
+
+impl Presenter<'_> {
+    fn present(&mut self, token: usize, retries: u8) -> Result<(Pin, Vec<u8>), Failure> {
+        let key = *self.fingerprints.get(token).ok_or(Failure::Internal)?;
+        let next = stepped(self.request, LoginStep::DiskAuthorize { key, retries })?;
+        // Exactly what root admits; td-fido never asks for a zero count.
+        if self.request.login_successor(&next).is_err() {
+            return Err(Failure::Internal);
+        }
+        let description = next.encode();
+        let round = (self.entropy)().map_err(|_| Failure::Internal)?;
+        self.wire
+            .exchange(PRESENT, PRESENTED, round, &description, None)
+            .map_err(|_| framing(self.wire))?;
+        let mut secret = self.wire.receive_secret().map_err(|_| framing(self.wire))?;
+        let pin = Pin::new(std::mem::take(&mut secret.0)).map_err(|_| Failure::Internal)?;
+        Ok((pin, description))
+    }
+}
+
+impl Steps for Presenter<'_> {
+    fn authorize(&mut self, token: usize, retries: u8) -> Result<(Pin, Vec<u8>), String> {
+        match self.present(token, retries) {
+            Ok(answer) => {
+                self.reported = Some(retries);
+                Ok(answer)
+            }
+            Err(failure) => {
+                self.cause = Some(failure);
+                Err("disk authorize step failed".into())
+            }
+        }
+    }
+}
+
+/// `request`'s operation at `step`: a proof's later step carries no
+/// disclosure.
+fn stepped(request: &Request, step: LoginStep) -> Result<Request, Failure> {
+    let operation = match request.operation().clone() {
+        Operation::LoginEnroll {
+            account,
+            before,
+            after,
+            key,
+            proof,
+            ..
+        } => Operation::LoginEnroll {
+            account,
+            before,
+            after,
+            key,
+            step,
+            approval: None,
+            proof,
+        },
+        Operation::LoginAdd {
+            account,
+            before,
+            after,
+            proof,
+            ..
+        } => Operation::LoginAdd {
+            account,
+            before,
+            after,
+            step,
+            proof,
+        },
+        Operation::LoginRemove {
+            account,
+            before,
+            after,
+            removed,
+            proof,
+            ..
+        } => Operation::LoginRemove {
+            account,
+            before,
+            after,
+            removed,
+            step,
+            approval: None,
+            proof,
+        },
+        _ => return Err(Failure::Internal),
+    };
+    Request::new(*request.nonce(), request.owner(), operation).map_err(|_| Failure::Internal)
+}
+
+/// td-fido's typed refusals and statuses select the kind, never text; a
+/// wrong PIN is one only after this proof asked for it, and a failed step
+/// is its own cause.
+fn disk_failure(
+    error: DiskError,
+    cause: Option<Failure>,
+    reported: Option<u8>,
+    wire: &Wire,
+) -> Failure {
+    match error {
+        DiskError::OneKey => Failure::OneKey,
+        DiskError::NotEnrolled => Failure::NotEnrolled,
+        DiskError::Refused(refusal) => Failure::Refused(refusal),
+        DiskError::Ended => cause.unwrap_or(Failure::Internal),
+        DiskError::CredentialLength | DiskError::Mismatch | DiskError::Unselectable => {
+            Failure::Failed
+        }
+        DiskError::Failed(error) => match error {
+            FidoError::Status(Status::PinInvalid) => {
+                reported.map_or(Failure::Failed, Failure::WrongPin)
+            }
+            FidoError::Status(Status::PinAuthBlocked) => Failure::PinAuthBlocked,
+            FidoError::Status(Status::PinBlocked) => Failure::PinBlocked,
+            FidoError::Status(Status::Denied) => Failure::Denied,
+            FidoError::Status(Status::TouchTimeout | Status::ActionTimeout)
+            | FidoError::Interrupted(Interruption::Expired) => Failure::Timeout,
+            FidoError::Entropy | FidoError::PinInput => Failure::Internal,
+            FidoError::Status(_)
+            | FidoError::Interrupted(_)
+            | FidoError::Transport
+            | FidoError::Protocol(_) => expired_or(wire, Failure::Failed),
+        },
+    }
+}
+
+/// A deadline that has passed, an open session's included, is a timeout.
+fn expired_or(wire: &Wire, failure: Failure) -> Failure {
+    if remaining(wire.bound()).is_err() {
+        Failure::Timeout
+    } else {
+        failure
+    }
+}
+
 /// A channel failure: TIMEOUT when a deadline ran out, else INTERNAL.
 fn framing(wire: &Wire) -> Failure {
     if wire.expired() {
@@ -360,9 +776,13 @@ fn framing(wire: &Wire) -> Failure {
 /// operation. Its exit is success for `14` and for a definite `28`.
 pub(crate) fn run(uid: u32) -> Result<(), String> {
     let stream = startup()?;
+    // Root's end closing is how cancellation reaches a keyslot test's
+    // child, which the endpoint does not read for.
+    let authority = stream.try_clone().map_err(|_| "clone operation endpoint")?;
     let started = Instant::now();
+    // The longest operation's until the description names one.
     let deadline = started
-        .checked_add(SELECTOR_UPDATE_CEILING)
+        .checked_add(SELECTOR_UPDATE_CEILING.max(LOGIN_LONGEST))
         .ok_or("storage operation deadline overflow")?;
     let mut wire = Wire::new(stream, deadline)?;
     // Before the baseline, as td-secret's workers do: a disk proof holds a
@@ -380,9 +800,21 @@ pub(crate) fn run(uid: u32) -> Result<(), String> {
         }
     };
     let mut host = Machine::discover();
+    host.authority = Some(authority);
+    sweep(&host.root.join(RUN_DIR), ROOT_UID, &|pid| {
+        paths::metadata_if_present(Path::new(&format!("/proc/{pid}"))).is_some()
+    });
+    let mut keys = match paths::open_read(Path::new("/dev/urandom")) {
+        Ok(random) => RootKeys { random },
+        Err(_) => {
+            let _ = wire.send(&Failure::Internal.frame());
+            return Err("storage operation refused its start: no kernel entropy".into());
+        }
+    };
     operate(
         &mut wire,
         &mut host,
+        &mut keys,
         uid,
         started,
         COMMIT_MARGIN,
@@ -422,6 +854,67 @@ fn startup() -> Result<UnixStream, String> {
     })
 }
 
+/// The verb that serves a disk proof's HID sessions: td-fido's root worker
+/// under this program, as td-boot's selector serves its own.
+pub(crate) const FIDO_WORKER: &str = "fido-worker";
+
+/// td-install as its own HID worker. The worker discovers root-admitted
+/// nodes only, so the desktop verb is never built into a worker's argv,
+/// and td-install does not dispatch it.
+pub(crate) struct Worker;
+impl Program for Worker {
+    const PATH: &'static str = "/proc/self/exe";
+    const ROOT: &'static str = FIDO_WORKER;
+    const DESKTOP: &'static str = "fido-worker-desktop";
+}
+
+/// The root USB transport: root-owned mode-0600 `/dev/hidrawN` nodes.
+struct Root;
+impl Devices for Root {
+    type Node = fido_device::Device;
+    type Channel = fido_device::Session<Worker>;
+    fn discover(&mut self) -> Result<Vec<Self::Node>, String> {
+        fido_device::Device::discover()
+    }
+    fn open(&mut self, node: Self::Node, deadline: Instant) -> Result<Self::Channel, String> {
+        fido_device::Session::open(node, deadline)
+    }
+    fn pause(&mut self, time: Duration) {
+        std::thread::sleep(time);
+    }
+}
+
+/// Production's disk security keys, td-fido's draws from the kernel.
+struct RootKeys {
+    random: File,
+}
+
+impl Keys for RootKeys {
+    fn authorize(
+        &mut self,
+        deadline: Instant,
+        tokens: &[fido_disk::Token<'_>],
+        volume: &[u8; 16],
+        identify: &[u8],
+        steps: &mut Presenter<'_>,
+    ) -> Result<Released, DiskError> {
+        let random = &mut self.random;
+        fido_disk::authorize(
+            &mut Root,
+            deadline,
+            tokens,
+            volume,
+            identify,
+            steps,
+            &mut |out| {
+                random
+                    .read_exact(out)
+                    .map_err(|_| "read kernel entropy".into())
+            },
+        )
+    }
+}
+
 /// `prepare-selector`'s rules in memory: the template, its padding and the
 /// appended identity, with the measurement policy on a protected volume.
 fn prepare(template: &[u8], key: &[u8], uuid: &str, measured: bool) -> Result<Vec<u8>, String> {
@@ -444,6 +937,11 @@ pub(crate) struct Machine {
     uuid: String,
     cmdline: String,
     partition: Option<File>,
+    /// The held partition's device node, which a keyslot test names.
+    device: Option<PathBuf>,
+    /// A second handle on root's socket, which a keyslot test peeks for
+    /// root hanging up; none in host tests that do not give one.
+    authority: Option<UnixStream>,
     /// `/`; a scratch directory in host tests.
     root: PathBuf,
 }
@@ -465,13 +963,16 @@ impl Machine {
             (Some(uuid), None) => uuid.to_owned(),
             _ => String::new(),
         };
-        let partition = (!uuid.is_empty())
+        let (device, partition) = (!uuid.is_empty())
             .then(|| volume_partition(&uuid))
-            .flatten();
+            .flatten()
+            .unzip();
         Self {
             uuid,
             cmdline,
             partition,
+            device,
+            authority: None,
             root: PathBuf::from("/"),
         }
     }
@@ -481,9 +982,9 @@ impl Machine {
     }
 }
 
-/// The LUKS2 partition `td-boot volume UUID` names, opened, when its line
-/// is exactly the UUID, a device and a mapping node.
-fn volume_partition(uuid: &str) -> Option<File> {
+/// The LUKS2 partition `td-boot volume UUID` names, and its node opened,
+/// when its line is exactly the UUID, a device and a mapping node.
+fn volume_partition(uuid: &str) -> Option<(PathBuf, File)> {
     let output = Command::new(TD_BOOT)
         .args(["volume", uuid])
         .env_clear()
@@ -502,7 +1003,9 @@ fn volume_partition(uuid: &str) -> Option<File> {
         [found, device, mapping]
             if *found == uuid && device.starts_with("/dev/") && mapping.starts_with("/dev/") =>
         {
-            paths::open_read(Path::new(device)).ok()
+            let device = PathBuf::from(device);
+            let partition = paths::open_read(&device).ok()?;
+            Some((device, partition))
         }
         _ => None,
     }
@@ -679,6 +1182,162 @@ impl Host for Machine {
             esp_region(&mut file, sector, bytes / sector).map_err(|e| e.to_string())?;
         td_fat::Esp::open(file, offset, len).map_err(|e| e.to_string())
     }
+
+    /// The installed cryptsetup against a detached copy of the held
+    /// partition's header area, the node it names checked to be the held
+    /// one; the child is killed and reaped at `deadline` or when root hangs
+    /// up. Its errors name no key.
+    fn test_keyslot(
+        &mut self,
+        slot: u8,
+        key: &[u8],
+        expected: &Header,
+        deadline: Instant,
+    ) -> Result<Tested, String> {
+        let device = self.device.as_ref().ok_or("no held partition")?;
+        let partition = self.partition.as_mut().ok_or("no held partition")?;
+        let held = partition.metadata().map_err(|e| e.to_string())?;
+        let named = paths::metadata(device).map_err(|e| e.to_string())?;
+        if !same_node(&held, &named) {
+            return Err("the partition's node no longer names the held partition".into());
+        }
+        let area = luks2::test_area(partition)?;
+        if area.header != *expected {
+            return Ok(Tested::Changed);
+        }
+        area.cost(slot)?;
+        let copy = DetachedHeader::take(&self.root.join(RUN_DIR), partition, area.length)?;
+        // The copy cryptsetup reads is the header presented, or nothing
+        // runs: a disk that changed while it was copied fails here.
+        let mut reread = paths::open_read(&copy.path).map_err(|e| e.to_string())?;
+        if luks2::test_area(&mut reread).ok() != Some(area) {
+            return Ok(Tested::Changed);
+        }
+        drop(reread);
+        let program = Cryptsetup::new(self.root.join("bin").join(protocol::CRYPTSETUP));
+        let authority = self.authority.as_ref();
+        let mut abandoned = || authority.is_some_and(hung_up);
+        let args = cryptsetup::detached_test_args(&copy.path, device, slot);
+        match program.run_bounded(&args, key, deadline, &mut abandoned) {
+            Ok(Bounded::Exited(status)) if status.success() => Ok(Tested::Opened),
+            Ok(Bounded::Exited(status))
+                if status.code() == Some(cryptsetup::EXIT_BAD_PASSPHRASE) =>
+            {
+                Ok(Tested::Refused)
+            }
+            Ok(Bounded::Exited(_)) => Err("cryptsetup's keyslot test failed".into()),
+            Ok(Bounded::Expired) => Ok(Tested::Expired),
+            Ok(Bounded::Abandoned) => Err("root hung up during the keyslot test".into()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// Where a keyslot test's detached header copy lives: tmpfs, root's.
+const RUN_DIR: &str = "run";
+/// A copy's directory under `RUN_DIR`: this prefix and the worker's pid.
+const COPY_PREFIX: &str = "td-keyslot-test.";
+/// The most `RUN_DIR` entries a sweep reads; past it, it sweeps nothing.
+const RUN_ENTRIES: usize = 4096;
+const ROOT_UID: u32 = 0;
+
+/// Removes the copies killed workers left: each a real directory, owned
+/// by `owner` (root), named for a pid no live process has. A live
+/// worker's, this one's included, and anything else under `run` stay.
+/// Best effort: a copy holds no secret, and reboot empties tmpfs.
+fn sweep(run: &Path, owner: u32, alive: &dyn Fn(u32) -> bool) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = paths::read_dir_bounded(run, RUN_ENTRIES) else {
+        return;
+    };
+    for entry in entries {
+        let Some(pid) = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(COPY_PREFIX))
+            .and_then(|pid| pid.parse::<u32>().ok().filter(|n| n.to_string() == pid))
+        else {
+            continue;
+        };
+        let Ok(metadata) = paths::symlink_metadata(&entry) else {
+            continue;
+        };
+        if metadata.is_dir() && metadata.uid() == owner && !alive(pid) {
+            let _ = paths::remove_dir_all_if_present(&entry);
+        }
+    }
+}
+
+/// A private copy of a header area, in a directory of its own made for
+/// it, mode 0700, and removed with it when dropped.
+struct DetachedHeader {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl DetachedHeader {
+    /// `length` bytes from the start of `partition`, the copies and the
+    /// keyslots area, read through the held descriptor.
+    fn take(run: &Path, partition: &mut File, length: u64) -> Result<Self, String> {
+        let dir = run.join(format!("{COPY_PREFIX}{}", std::process::id()));
+        // Only root writes there: a directory left by a killed worker
+        // under this pid is its own.
+        paths::remove_dir_all_if_present(&dir).map_err(|e| e.to_string())?;
+        paths::create_dir_with_mode(&dir, 0o700).map_err(|e| e.to_string())?;
+        let copy = Self {
+            path: dir.join("header"),
+            dir,
+        };
+        let mut file = paths::create_new_with_mode(&copy.path, 0o600).map_err(|e| e.to_string())?;
+        partition
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        let copied = io::copy(&mut partition.take(length), &mut file).map_err(|e| e.to_string())?;
+        if copied != length {
+            return Err("the held partition ends inside its header area".into());
+        }
+        Ok(copy)
+    }
+}
+
+impl Drop for DetachedHeader {
+    fn drop(&mut self) {
+        let _ = paths::remove_dir_all_if_present(&self.dir);
+    }
+}
+
+/// Whether `named` is the node `held` was opened from: the same block
+/// device, or for anything else the same file.
+fn same_node(held: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let block = |metadata: &std::fs::Metadata| metadata.file_type().is_block_device();
+    match (block(held), block(named)) {
+        (true, true) => held.rdev() == named.rdev(),
+        (false, false) => (held.dev(), held.ino()) == (named.dev(), named.ino()),
+        _ => false,
+    }
+}
+
+/// Whether root closed its end of the socket, or broke the protocol: root
+/// sends nothing while a keyslot test runs, so any byte a read finds,
+/// end of file included, abandons it. The endpoint sets its own read
+/// timeout before each read, so this one's is never left in its way.
+fn hung_up(mut authority: &UnixStream) -> bool {
+    if authority
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .is_err()
+    {
+        return true;
+    }
+    let mut byte = [0; 1];
+    match authority.read(&mut byte) {
+        // End of file, or a byte root never sends during a test.
+        Ok(count) => count <= byte.len(),
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -834,6 +1493,11 @@ mod tests {
         esp_calls: usize,
         /// What the worker asked for, in order.
         log: Vec<&'static str>,
+        /// Each keyslot test's slot and key, and the keyslot's answer.
+        tested: Vec<(u8, Vec<u8>)>,
+        opens: Result<Tested, String>,
+        /// The header and deadline each test was given.
+        expected: Vec<(Header, Instant)>,
     }
 
     impl Fake {
@@ -847,6 +1511,9 @@ mod tests {
                 poke: None,
                 esp_calls: 0,
                 log: Vec::new(),
+                tested: Vec::new(),
+                opens: Ok(Tested::Opened),
+                expected: Vec::new(),
             }
         }
 
@@ -894,6 +1561,78 @@ mod tests {
             }
             td_fat::Esp::open(self.disk.clone(), BASE, SECTORS * 512).map_err(|e| e.to_string())
         }
+        fn test_keyslot(
+            &mut self,
+            slot: u8,
+            key: &[u8],
+            expected: &Header,
+            deadline: Instant,
+        ) -> Result<Tested, String> {
+            self.log.push("test");
+            self.tested.push((slot, key.to_vec()));
+            self.expected.push((expected.clone(), deadline));
+            self.opens.clone()
+        }
+    }
+
+    /// A disk security key's script: which token it selects and the
+    /// retries it reports, the failure before or after its one step, and
+    /// what the worker handed it.
+    struct Scripted {
+        token: usize,
+        retries: u8,
+        before: Option<DiskError>,
+        after: Option<DiskError>,
+        /// The identify description and the authorize step's, as given.
+        identify: Vec<u8>,
+        authorize: Option<Vec<u8>>,
+        deadline: Option<Instant>,
+    }
+
+    impl Scripted {
+        fn selecting(token: usize) -> Self {
+            Self {
+                token,
+                retries: 8,
+                before: None,
+                after: None,
+                identify: Vec::new(),
+                authorize: None,
+                deadline: None,
+            }
+        }
+    }
+
+    /// The hmac-secret output every scripted assertion gives.
+    const OUTPUT: [u8; 32] = [0x6f; 32];
+
+    impl Keys for Scripted {
+        fn authorize(
+            &mut self,
+            deadline: Instant,
+            tokens: &[fido_disk::Token<'_>],
+            volume: &[u8; 16],
+            identify: &[u8],
+            steps: &mut Presenter<'_>,
+        ) -> Result<Released, DiskError> {
+            self.identify = identify.to_vec();
+            self.deadline = Some(deadline);
+            if let Some(error) = self.before.take() {
+                return Err(error);
+            }
+            let (_pin, described) = steps
+                .authorize(self.token, self.retries)
+                .map_err(|_| DiskError::Ended)?;
+            self.authorize = Some(described);
+            if let Some(error) = self.after.take() {
+                return Err(error);
+            }
+            let credential = tokens[self.token].credential;
+            Ok(Released {
+                token: self.token,
+                passphrase: fido_disk::passphrase(&OUTPUT, volume, credential).unwrap(),
+            })
+        }
     }
 
     /// The template, a marker, the key and the identity: what the test's
@@ -921,8 +1660,14 @@ mod tests {
     }
 
     /// Root's side: everything the worker sent, framed, after root sends
-    /// `description` and acknowledges each invitation.
-    fn root(stream: UnixStream, description: Option<Vec<u8>>) -> Vec<Vec<u8>> {
+    /// `description` and acknowledges each invitation, then `secrets` in
+    /// turn, each after the presentation of a step that asks for one.
+    fn root(
+        stream: UnixStream,
+        description: Option<Vec<u8>>,
+        secrets: Vec<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        let mut secrets = secrets.into_iter();
         let mut stream = stream;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -951,6 +1696,17 @@ mod tests {
                 let mut answer = frame.clone();
                 answer[0] = tag + 1;
                 send(&mut stream, &answer);
+                let secret_step = Request::decode(&frame[33..])
+                    .ok()
+                    .and_then(|request| request.login_step())
+                    .is_some_and(LoginStep::asks_pin);
+                if tag == PRESENT && secret_step {
+                    if let Some(secret) = secrets.next() {
+                        let mut message = vec![frames::SECRET];
+                        message.extend(secret);
+                        send(&mut stream, &message);
+                    }
+                }
             }
             seen.push(frame);
         }
@@ -962,17 +1718,31 @@ mod tests {
         frames: Vec<Vec<u8>>,
         log: Vec<&'static str>,
         disk: Disk,
+        tested: Vec<(u8, Vec<u8>)>,
+        expected: Vec<(Header, Instant)>,
     }
 
-    fn run_with(mut host: Fake, description: Option<Vec<u8>>, margin: Duration) -> Run {
+    fn run_with(host: Fake, description: Option<Vec<u8>>, margin: Duration) -> Run {
+        let mut keys = Scripted::selecting(0);
+        proved(host, &mut keys, description, Vec::new(), margin)
+    }
+
+    fn proved(
+        mut host: Fake,
+        keys: &mut Scripted,
+        description: Option<Vec<u8>>,
+        secrets: Vec<Vec<u8>>,
+        margin: Duration,
+    ) -> Run {
         let (worker, parent) = UnixStream::pair().unwrap();
-        let root = std::thread::spawn(move || root(parent, description));
+        let root = std::thread::spawn(move || root(parent, description, secrets));
         let started = Instant::now();
-        let mut wire = Wire::new(worker, started + SELECTOR_UPDATE_CEILING).unwrap();
+        let mut wire = Wire::new(worker, started + LOGIN_LONGEST).unwrap();
         let mut rounds = 0u8;
         let result = operate(
             &mut wire,
             &mut host,
+            keys,
             1000,
             started,
             margin,
@@ -988,6 +1758,8 @@ mod tests {
             frames: root.join().unwrap(),
             log: host.log,
             disk: host.disk,
+            tested: host.tested,
+            expected: host.expected,
         }
     }
 
@@ -1291,6 +2063,8 @@ mod tests {
                 uuid: UUID.into(),
                 cmdline: cmdline.into(),
                 partition: None,
+                device: None,
+                authority: None,
                 root: root.clone(),
             },
             root,
@@ -1451,15 +2225,40 @@ mod tests {
 
     #[test]
     fn failure_kinds_are_the_documented_bytes() {
-        for (failure, byte) in [
-            (Failure::Timeout, 0x08),
-            (Failure::Failed, 0x0f),
-            (Failure::Internal, 0x10),
-            (Failure::Deployment, 0x23),
-            (Failure::Esp, 0x24),
-            (Failure::Changed, 0x28),
+        for (failure, frame) in [
+            (Failure::WrongPin(5), &[0x15, 0x01, 5][..]),
+            (Failure::PinAuthBlocked, &[0x15, 0x02]),
+            (Failure::PinBlocked, &[0x15, 0x03]),
+            (Failure::NotEnrolled, &[0x15, 0x04]),
+            (Failure::OneKey, &[0x15, 0x05]),
+            (
+                Failure::Refused(LoginRefusal::NoHmacSecret),
+                &[0x15, 0x06, 1],
+            ),
+            (Failure::Refused(LoginRefusal::AlwaysUv), &[0x15, 0x06, 2]),
+            (
+                Failure::Refused(LoginRefusal::PinUnsupported),
+                &[0x15, 0x06, 3],
+            ),
+            (Failure::Refused(LoginRefusal::PinNotSet), &[0x15, 0x06, 4]),
+            (
+                Failure::Refused(LoginRefusal::ListTooSmall),
+                &[0x15, 0x06, 5],
+            ),
+            (Failure::Refused(LoginRefusal::NoFido21), &[0x15, 0x0f]),
+            (Failure::Refused(LoginRefusal::PinOptional), &[0x15, 0x0f]),
+            (Failure::Denied, &[0x15, 0x07]),
+            (Failure::Timeout, &[0x15, 0x08]),
+            (Failure::Failed, &[0x15, 0x0f]),
+            (Failure::Internal, &[0x15, 0x10]),
+            (Failure::Volume, &[0x15, 0x20]),
+            (Failure::Deployment, &[0x15, 0x23]),
+            (Failure::Esp, &[0x15, 0x24]),
+            (Failure::Mistyped, &[0x15, 0x25]),
+            (Failure::WrongKey, &[0x15, 0x26]),
+            (Failure::Changed, &[0x15, 0x28]),
         ] {
-            assert_eq!(failure.kind(), byte);
+            assert_eq!(failure.frame(), frame, "{failure:?}");
         }
     }
 
@@ -1468,5 +2267,729 @@ mod tests {
     #[test]
     fn the_fingerprint_is_the_first_four_bytes_of_sha256() {
         assert_eq!(fingerprint(b"abc"), [0xba, 0x78, 0x16, 0xbf]);
+    }
+
+    /// P-256's generator, a public key td-fido admits.
+    const G_X: [u8; 32] = [
+        0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40,
+        0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98,
+        0xc2, 0x96,
+    ];
+    const G_Y: [u8; 32] = [
+        0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c, 0x0f, 0x9e,
+        0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf,
+        0x51, 0xf5,
+    ];
+
+    fn keyed(role: FidoRole, keyslot: Option<u8>, credential: u8) -> Token {
+        Token::Fido2(Fido2 {
+            keyslot,
+            role,
+            credential: vec![credential; 16],
+            salt: [3; 32],
+            x: G_X,
+            y: G_Y,
+        })
+    }
+
+    /// The FIDO2-primary shape with usable keys: the marker on keyslot 0,
+    /// a primary key on 1 and a recovery key on 2.
+    fn proof_header() -> Header {
+        header(vec![
+            (0, Token::RecoveryKey { keyslot: Some(0) }),
+            (1, keyed(FidoRole::Primary, Some(1), 7)),
+            (2, keyed(FidoRole::Recovery, Some(2), 8)),
+        ])
+    }
+
+    /// An addition to a two-key login record, authorized by `proof`.
+    fn adding(proof: Proof, step: LoginStep) -> Request {
+        Request::new(
+            NONCE,
+            1000,
+            Operation::LoginAdd {
+                account: 1000,
+                before: 2,
+                after: 3,
+                step,
+                proof: Some(proof),
+            },
+        )
+        .unwrap()
+    }
+
+    fn recovery_digits() -> Vec<u8> {
+        RecoveryKey::generate()
+            .unwrap()
+            .passphrase()
+            .expose()
+            .to_vec()
+    }
+
+    fn prove(host: Fake, keys: &mut Scripted, request: &Request, secret: &[u8]) -> Run {
+        proved(
+            host,
+            keys,
+            Some(request.encode()),
+            vec![secret.to_vec()],
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn a_recovery_key_proof_tests_the_markers_keyslot_and_writes_nothing() {
+        let digits = recovery_digits();
+        let mut keys = Scripted::selecting(0);
+        let request = adding(Proof::RecoveryKey, LoginStep::RecoveryKey);
+        let run = prove(
+            Fake::new(Some(Ok(proof_header()))),
+            &mut keys,
+            &request,
+            &digits,
+        );
+        assert_eq!(run.result, Ok(()));
+        // The one step, presented exactly, then success: no commit round.
+        assert_eq!(run.frames.len(), 3);
+        assert_eq!(run.frames[1][0], PRESENT);
+        assert_eq!(&run.frames[1][33..], &request.encode()[..]);
+        assert_eq!(run.frames[2], [SUCCESS]);
+        // The 48 digits alone reach the marker's keyslot.
+        assert_eq!(run.tested, [(0, digits)]);
+        bound_to_the_presented_header(&run);
+        // The header again before the test; no kernel, ESP or key.
+        assert_eq!(run.log, ["header", "standing", "header", "test"]);
+        assert!(keys.deadline.is_none());
+    }
+
+    #[test]
+    fn a_recovery_key_proof_ends_at_each_refusal_with_its_kind() {
+        let digits = recovery_digits();
+        let request = adding(Proof::RecoveryKey, LoginStep::RecoveryKey);
+        // One wrong check digit: the codec refuses it before any re-read
+        // or test, and no frame carries the entry.
+        let mut mistyped = digits.clone();
+        mistyped[5] = if mistyped[5] == b'9' {
+            b'0'
+        } else {
+            mistyped[5] + 1
+        };
+        let run = prove(
+            Fake::new(Some(Ok(proof_header()))),
+            &mut Scripted::selecting(0),
+            &request,
+            &mistyped,
+        );
+        assert_eq!(run.result, Err(Failure::Mistyped));
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x25]);
+        assert!(run.tested.is_empty());
+        assert_eq!(run.log, ["header", "standing"]);
+        for frame in &run.frames {
+            assert!(!frame.windows(12).any(|window| window == &mistyped[..12]));
+        }
+        // The keyslot refuses the key, the copy is not the header
+        // presented, cryptsetup outlasts the operation or fails otherwise.
+        for (opens, result, kind) in [
+            (Ok(Tested::Refused), Err(Failure::WrongKey), 0x26),
+            (Ok(Tested::Changed), Ok(()), 0x28),
+            (Ok(Tested::Expired), Err(Failure::Timeout), 0x08),
+            (
+                Err("cryptsetup failed".to_string()),
+                Err(Failure::Failed),
+                0x0f,
+            ),
+        ] {
+            let mut host = Fake::new(Some(Ok(proof_header())));
+            host.opens = opens;
+            let run = prove(host, &mut Scripted::selecting(0), &request, &digits);
+            assert_eq!(run.result, result);
+            assert_eq!(run.frames.last().unwrap(), &[0x15, kind]);
+            assert_eq!(run.tested.len(), 1);
+        }
+        // A header that changed since the baseline is definite and tests
+        // nothing; one gone or refused now is `20`.
+        let mut changed = proof_header();
+        changed.seqid = 2;
+        for (now, result, kind) in [
+            (Some(Ok(changed)), Ok(()), 0x28),
+            (None, Err(Failure::Volume), 0x20),
+            (Some(Err("refused".to_string())), Err(Failure::Volume), 0x20),
+        ] {
+            let mut host = Fake::new(Some(Ok(proof_header())));
+            host.reads.push(now);
+            let run = prove(host, &mut Scripted::selecting(0), &request, &digits);
+            assert_eq!(run.result, result);
+            assert_eq!(run.frames.last().unwrap(), &[0x15, kind]);
+            assert!(run.tested.is_empty());
+        }
+    }
+
+    /// Root's first frame must be a proof's first step the baseline
+    /// offers, for the worker's account; anything else is INTERNAL before
+    /// any presentation.
+    #[test]
+    fn a_proof_the_baseline_does_not_offer_presents_nothing() {
+        let unmarked = header(vec![(1, keyed(FidoRole::Primary, Some(1), 7))]);
+        let other = Request::new(
+            NONCE,
+            1001,
+            Operation::LoginAdd {
+                account: 1001,
+                before: 2,
+                after: 3,
+                step: LoginStep::RecoveryKey,
+                proof: Some(Proof::RecoveryKey),
+            },
+        )
+        .unwrap();
+        let ordinary = Request::new(
+            NONCE,
+            1000,
+            Operation::LoginAdd {
+                account: 1000,
+                before: 2,
+                after: 3,
+                step: LoginStep::Identify,
+                proof: None,
+            },
+        )
+        .unwrap();
+        for (read, request) in [
+            (
+                Some(Ok(unmarked)),
+                adding(Proof::RecoveryKey, LoginStep::RecoveryKey),
+            ),
+            (
+                Some(Ok(tpm_header())),
+                adding(Proof::DiskKey, LoginStep::DiskIdentify),
+            ),
+            (
+                Some(Ok(proof_header())),
+                adding(Proof::DiskKey, LoginStep::Connect),
+            ),
+            (
+                Some(Ok(proof_header())),
+                adding(
+                    Proof::DiskKey,
+                    LoginStep::DiskAuthorize {
+                        key: fingerprint(&[7; 16]),
+                        retries: 8,
+                    },
+                ),
+            ),
+            (Some(Ok(proof_header())), ordinary),
+            (Some(Ok(proof_header())), other),
+            (None, adding(Proof::RecoveryKey, LoginStep::RecoveryKey)),
+            (
+                Some(Err("refused".into())),
+                adding(Proof::RecoveryKey, LoginStep::RecoveryKey),
+            ),
+        ] {
+            let mut keys = Scripted::selecting(0);
+            let run = prove(Fake::new(read), &mut keys, &request, b"1234");
+            assert_eq!(run.result, Err(Failure::Internal), "{request:?}");
+            assert_eq!(run.frames.len(), 2);
+            assert_eq!(run.frames[1], [0x15, 0x10]);
+            assert!(run.tested.is_empty());
+            assert!(keys.deadline.is_none());
+        }
+    }
+
+    #[test]
+    fn a_disk_key_proof_presents_both_steps_and_tests_its_tokens_keyslot() {
+        let mut keys = Scripted::selecting(1);
+        let identify = adding(Proof::DiskKey, LoginStep::DiskIdentify);
+        let before = Instant::now();
+        let run = prove(
+            Fake::new(Some(Ok(proof_header()))),
+            &mut keys,
+            &identify,
+            b"1234",
+        );
+        assert_eq!(run.result, Ok(()));
+        // Identify, then the authorize step naming the selected token and
+        // the key's own retries, then success.
+        let authorize = adding(
+            Proof::DiskKey,
+            LoginStep::DiskAuthorize {
+                key: fingerprint(&[8; 16]),
+                retries: 8,
+            },
+        );
+        assert_eq!(run.frames.len(), 4);
+        assert_eq!(&run.frames[1][33..], &identify.encode()[..]);
+        assert_eq!(&run.frames[2][33..], &authorize.encode()[..]);
+        assert_eq!(run.frames[3], [SUCCESS]);
+        // td-fido binds identify to the first and the assertion to the
+        // second.
+        assert_eq!(keys.identify, identify.encode());
+        assert_eq!(keys.authorize, Some(authorize.encode()));
+        // That token's keyslot, with the passphrase of this volume and its
+        // credential.
+        let volume = volume_uuid(UUID).unwrap();
+        let expected = fido_disk::passphrase(&OUTPUT, &volume, &[8; 16]).unwrap();
+        assert_eq!(run.tested, [(2, expected.bytes().to_vec())]);
+        assert_eq!(run.log, ["header", "standing", "header", "test"]);
+        bound_to_the_presented_header(&run);
+        // The key's sessions live one lifetime at most.
+        let deadline = keys.deadline.unwrap();
+        assert!(deadline <= Instant::now() + MAX_LIFETIME);
+        assert!(deadline >= before + MAX_LIFETIME.min(Duration::from_secs(60)));
+    }
+
+    /// The test is of the header the baseline presented, its child bounded
+    /// by the description's ceiling, an addition's 240 seconds.
+    fn bound_to_the_presented_header(run: &Run) {
+        let [(header, deadline)] = run.expected.as_slice() else {
+            panic!("one keyslot test");
+        };
+        assert_eq!(*header, proof_header());
+        assert!(*deadline <= Instant::now() + Duration::from_secs(240));
+        assert!(*deadline > Instant::now() + Duration::from_secs(200));
+    }
+
+    /// A header token whose point td-fido refuses is not tried, as the
+    /// selector's release skips it: the others still prove, each named by
+    /// its own fingerprint and keyslot.
+    #[test]
+    fn a_token_with_an_unusable_point_is_skipped() {
+        let mut header = proof_header();
+        let Token::Fido2(primary) = &mut header.protected[1].1 else {
+            panic!("the primary key");
+        };
+        primary.x = [0; 32];
+        primary.y = [0; 32];
+        let identify = adding(Proof::DiskKey, LoginStep::DiskIdentify);
+        let mut keys = Scripted::selecting(0);
+        let run = prove(Fake::new(Some(Ok(header))), &mut keys, &identify, b"1234");
+        assert_eq!(run.result, Ok(()));
+        let authorize = adding(
+            Proof::DiskKey,
+            LoginStep::DiskAuthorize {
+                key: fingerprint(&[8; 16]),
+                retries: 8,
+            },
+        );
+        assert_eq!(keys.authorize, Some(authorize.encode()));
+        let volume = volume_uuid(UUID).unwrap();
+        let expected = fido_disk::passphrase(&OUTPUT, &volume, &[8; 16]).unwrap();
+        assert_eq!(run.tested, [(2, expected.bytes().to_vec())]);
+    }
+
+    #[test]
+    fn a_disk_key_proof_ends_with_the_login_workers_kinds() {
+        let identify = adding(Proof::DiskKey, LoginStep::DiskIdentify);
+        let status = |status| DiskError::Failed(FidoError::Status(status));
+        for (before, after, frame, steps) in [
+            (Some(DiskError::NotEnrolled), None, vec![0x15, 0x04], 1),
+            (Some(DiskError::OneKey), None, vec![0x15, 0x05], 1),
+            (
+                Some(DiskError::Refused(LoginRefusal::NoHmacSecret)),
+                None,
+                vec![0x15, 0x06, 1],
+                1,
+            ),
+            (
+                Some(DiskError::Refused(LoginRefusal::NoFido21)),
+                None,
+                vec![0x15, 0x0f],
+                1,
+            ),
+            // A wrong PIN before any step was asked is no PIN of this proof.
+            (Some(status(Status::PinInvalid)), None, vec![0x15, 0x0f], 1),
+            (Some(status(Status::PinBlocked)), None, vec![0x15, 0x03], 1),
+            (
+                None,
+                Some(status(Status::PinInvalid)),
+                vec![0x15, 0x01, 8],
+                2,
+            ),
+            (
+                None,
+                Some(status(Status::PinAuthBlocked)),
+                vec![0x15, 0x02],
+                2,
+            ),
+            (None, Some(status(Status::Denied)), vec![0x15, 0x07], 2),
+            (
+                None,
+                Some(status(Status::TouchTimeout)),
+                vec![0x15, 0x08],
+                2,
+            ),
+            (
+                None,
+                Some(DiskError::Failed(FidoError::Interrupted(
+                    Interruption::Expired,
+                ))),
+                vec![0x15, 0x08],
+                2,
+            ),
+            (
+                None,
+                Some(DiskError::Failed(FidoError::Transport)),
+                vec![0x15, 0x0f],
+                2,
+            ),
+        ] {
+            let mut keys = Scripted::selecting(1);
+            keys.before = before;
+            keys.after = after;
+            let run = prove(
+                Fake::new(Some(Ok(proof_header()))),
+                &mut keys,
+                &identify,
+                b"1234",
+            );
+            assert_eq!(run.frames.last().unwrap(), &frame);
+            assert_eq!(run.frames.len(), 2 + steps, "{frame:?}");
+            assert!(run.tested.is_empty());
+        }
+        // A PIN outside its profile ends the step as INTERNAL.
+        let run = prove(
+            Fake::new(Some(Ok(proof_header()))),
+            &mut Scripted::selecting(1),
+            &identify,
+            b"12",
+        );
+        assert_eq!(run.result, Err(Failure::Internal));
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x10]);
+        // The keyslot refuses the passphrase: a token added to the header
+        // whose keyslot this key does not open, or one naming none.
+        let mut host = Fake::new(Some(Ok(proof_header())));
+        host.opens = Ok(Tested::Refused);
+        let run = prove(host, &mut Scripted::selecting(1), &identify, b"1234");
+        assert_eq!(run.result, Err(Failure::WrongKey));
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x26]);
+        let mut slotless = proof_header();
+        slotless.protected[2].1 = keyed(FidoRole::Recovery, None, 8);
+        let run = prove(
+            Fake::new(Some(Ok(slotless))),
+            &mut Scripted::selecting(1),
+            &identify,
+            b"1234",
+        );
+        assert_eq!(run.result, Err(Failure::WrongKey));
+        assert!(run.tested.is_empty());
+        // A header changed during the ceremony tests nothing.
+        let mut changed = proof_header();
+        changed.seqid = 2;
+        let mut host = Fake::new(Some(Ok(proof_header())));
+        host.reads.push(Some(Ok(changed)));
+        let run = prove(host, &mut Scripted::selecting(1), &identify, b"1234");
+        assert_eq!(run.frames.last().unwrap(), &[0x15, 0x28]);
+        assert!(run.tested.is_empty());
+    }
+
+    /// The secret's path holds it only in storage zeroed on drop: the
+    /// entry frame, the codec's key and its passphrase, and the PIN, none
+    /// copied into an ordinary buffer, a string or a diagnostic.
+    #[test]
+    fn a_proofs_secret_paths_copy_no_secret() {
+        let source = include_str!("storage_operation.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for (start, end) in [
+            ("    fn recovery_key<", "    fn disk_key<"),
+            ("    fn present(", "impl Steps for Presenter"),
+            (
+                "        let device = self.device.as_ref().ok_or(\"no held partition\")?;\n        let partition",
+                "\n/// Where a keyslot test's",
+            ),
+        ] {
+            let body = production
+                .split(start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            for copy in [
+                "to_vec(",
+                "to_owned(",
+                "String::",
+                "format!",
+                ".clone()",
+                "Vec::from",
+                "collect",
+                "from_utf8",
+                "eprintln",
+            ] {
+                assert!(!body.contains(copy), "{start}: {copy}");
+            }
+        }
+    }
+
+    /// One LUKS2 header copy as cryptsetup lays it out, checksummed here.
+    fn luks_copy(secondary: bool, seqid: u64, json: &str) -> Vec<u8> {
+        let mut area = vec![0u8; 0x4000];
+        area[..6].copy_from_slice(if secondary {
+            b"SKUL\xba\xbe"
+        } else {
+            b"LUKS\xba\xbe"
+        });
+        area[6..8].copy_from_slice(&2u16.to_be_bytes());
+        area[8..16].copy_from_slice(&0x4000u64.to_be_bytes());
+        area[16..24].copy_from_slice(&seqid.to_be_bytes());
+        area[24..33].copy_from_slice(b"td-system");
+        area[72..78].copy_from_slice(b"sha256");
+        area[104..168].fill(if secondary { 0x52 } else { 0x51 });
+        area[168..168 + UUID.len()].copy_from_slice(UUID.as_bytes());
+        let offset: u64 = if secondary { 0x4000 } else { 0 };
+        area[256..264].copy_from_slice(&offset.to_be_bytes());
+        area[4096..4096 + json.len()].copy_from_slice(json.as_bytes());
+        let checksum = digest(&area);
+        area[448..480].copy_from_slice(&checksum);
+        area
+    }
+
+    /// The keyslots area the test headers declare.
+    const KEYSLOTS_SIZE: usize = 8192;
+
+    /// A partition whose primary copy is current and whose secondary is a
+    /// stale one cryptsetup would repair, then its keyslots area and data:
+    /// keyslot 0 has td's PBKDF2, keyslot 1 Argon2.
+    fn partition(seqid: u64) -> Vec<u8> {
+        let json = |seqid: u64| {
+            format!(
+                "{{\"keyslots\":{{\"0\":{{\"type\":\"luks2\",\"kdf\":{{\"type\":\"pbkdf2\",\"hash\":\"sha256\",\"iterations\":1000}}}},\"1\":{{\"type\":\"luks2\",\"kdf\":{{\"type\":\"argon2id\",\"time\":4,\"memory\":1048576,\"cpus\":4}}}}}},\"tokens\":{{}},\"segments\":{{\"0\":{{\"type\":\"crypt\",\"offset\":\"{seqid}\"}}}},\"digests\":{{\"0\":{{\"type\":\"pbkdf2\",\"keyslots\":[\"0\",\"1\"],\"hash\":\"sha256\",\"iterations\":250000}}}},\"config\":{{\"json_size\":\"12288\",\"keyslots_size\":\"{KEYSLOTS_SIZE}\"}}}}"
+            )
+        };
+        let mut out = luks_copy(false, seqid, &json(seqid));
+        out.extend(luks_copy(true, seqid - 1, &json(seqid - 1)));
+        out.extend(vec![0x6b; KEYSLOTS_SIZE]);
+        out.extend(vec![0xda; 4096]);
+        out
+    }
+
+    /// Where a scripted cryptsetup writes what it saw, run by the machine
+    /// over a held scratch partition.
+    struct Keyslot {
+        host: Rooted,
+        bin: PathBuf,
+        device: PathBuf,
+        image: Vec<u8>,
+        expected: Header,
+    }
+
+    fn tool(name: &str) -> PathBuf {
+        std::env::var_os("PATH")
+            .and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join(name))
+                    .find(|candidate| candidate.is_file())
+            })
+            .unwrap()
+    }
+
+    fn keyslot() -> Keyslot {
+        let mut host = rooted("");
+        let bin = host.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(host.root.join(RUN_DIR)).unwrap();
+        // It records its arguments, its input and the header it was given,
+        // then repairs that header as cryptsetup repairs a stale copy.
+        crate::scratch::executable(
+            &bin.join(protocol::CRYPTSETUP),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{dir}/argv'\n\
+                 h=\nfor a; do if [ \"$p\" = --header ]; then h=$a; fi; p=$a; done\n\
+                 '{cat}' > '{dir}/stdin'\n'{cat}' \"$h\" > '{dir}/seen'\n\
+                 printf 'REPAIRED' > \"$h\"\n\
+                 read key < '{dir}/stdin' || :\n\
+                 case \"$key\" in right) exit 0;; wrong) exit 2;; \
+                 stall) echo $$ > '{dir}/pid'; exec '{sleep}' 60;; *) exit 1;; esac\n",
+                dir = bin.display(),
+                cat = tool("cat").display(),
+                sleep = tool("sleep").display()
+            ),
+        )
+        .unwrap();
+        let image = partition(5);
+        let device = host.root.join("partition");
+        std::fs::write(&device, &image).unwrap();
+        host.machine.partition = Some(File::open(&device).unwrap());
+        host.machine.device = Some(device.clone());
+        let expected = luks2::read(&mut std::io::Cursor::new(&image)).unwrap();
+        Keyslot {
+            host,
+            bin,
+            device,
+            image,
+            expected,
+        }
+    }
+
+    impl Keyslot {
+        fn test(&mut self, slot: u8, key: &[u8], deadline: Instant) -> Result<Tested, String> {
+            let expected = self.expected.clone();
+            self.host
+                .machine
+                .test_keyslot(slot, key, &expected, deadline)
+        }
+
+        fn ran(&self) -> bool {
+            self.bin.join("argv").exists()
+        }
+
+        /// The disk as it was, and no copy left behind.
+        fn untouched(&self) {
+            assert_eq!(std::fs::read(&self.device).unwrap(), self.image);
+            let copies = std::fs::read_dir(self.host.root.join(RUN_DIR))
+                .unwrap()
+                .filter(|entry| {
+                    let name = entry.as_ref().unwrap().file_name();
+                    name.to_string_lossy().starts_with("td-keyslot-test.")
+                })
+                .count();
+            assert_eq!(copies, 0);
+        }
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// A worker's start sweeps the copies killed workers left: only real
+    /// directories root owns, named exactly for a pid no live process
+    /// has. A live worker's copy, a stranger's, a symlink to a directory
+    /// and any other name stay.
+    #[test]
+    fn a_start_sweeps_only_copies_dead_workers_left() {
+        use std::os::unix::fs::MetadataExt as _;
+        let run = crate::scratch::path("storage-sweep");
+        std::fs::create_dir_all(&run).unwrap();
+        let owner = std::fs::metadata(&run).unwrap().uid();
+        let dir = |name: &str| {
+            let path = run.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("header"), b"copy").unwrap();
+            path
+        };
+        let dead = [dir("td-keyslot-test.41"), dir("td-keyslot-test.43")];
+        let kept = [
+            dir("td-keyslot-test.42"),
+            dir("td-keyslot-test.+44"),
+            dir("td-keyslot-test.044"),
+            dir("td-keyslot-test."),
+            dir("td-other.45"),
+        ];
+        let target = dir("elsewhere");
+        let link = run.join("td-keyslot-test.46");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = run.join("td-keyslot-test.47");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let alive = |pid: u32| pid == 42;
+        // Another owner's are not root's to sweep.
+        sweep(&run, owner.wrapping_add(1), &alive);
+        assert!(dead.iter().all(|path| path.exists()));
+        sweep(&run, owner, &alive);
+        assert!(dead.iter().all(|path| !path.exists()));
+        assert!(kept.iter().all(|path| path.join("header").exists()));
+        assert!(target.join("header").exists());
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(file.exists());
+        // A missing run directory sweeps nothing and fails nothing.
+        sweep(&run.join("missing"), owner, &alive);
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    /// The installed cryptsetup tests the keyslot against a private copy
+    /// of exactly the header area the reader verified, the device named for
+    /// its data alone: the repair a stale second copy draws lands in the
+    /// copy, and the disk is unchanged. The key is on standard input
+    /// alone; a refusal is `Refused`, any other failure an error that
+    /// names no key.
+    #[test]
+    fn the_machine_tests_a_keyslot_against_a_detached_header_copy() {
+        let mut test = keyslot();
+        assert_eq!(test.test(0, b"right", later()), Ok(Tested::Opened));
+        let copy = test
+            .host
+            .root
+            .join(RUN_DIR)
+            .join(format!("td-keyslot-test.{}", std::process::id()))
+            .join("header");
+        let argv = std::fs::read_to_string(test.bin.join("argv")).unwrap();
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            [
+                "open",
+                "--test-passphrase",
+                "--type",
+                "luks2",
+                "--header",
+                copy.to_str().unwrap(),
+                "--key-slot",
+                "0",
+                "--key-file=-",
+                test.device.to_str().unwrap()
+            ]
+        );
+        assert_eq!(std::fs::read(test.bin.join("stdin")).unwrap(), b"right");
+        let length = 2 * 0x4000 + KEYSLOTS_SIZE;
+        assert_eq!(
+            std::fs::read(test.bin.join("seen")).unwrap(),
+            test.image[..length]
+        );
+        test.untouched();
+        assert_eq!(test.test(0, b"wrong", later()), Ok(Tested::Refused));
+        let error = test.test(0, b"broken", later()).unwrap_err();
+        assert!(!error.contains("broken"), "{error}");
+        test.untouched();
+    }
+
+    /// Nothing runs for a header other than the one presented, a keyslot
+    /// whose cost td does not bound, or a node that is not the held one.
+    #[test]
+    fn a_keyslot_test_runs_only_on_the_presented_header_and_the_held_node() {
+        let mut test = keyslot();
+        test.expected.seqid = 6;
+        assert_eq!(test.test(0, b"right", later()), Ok(Tested::Changed));
+        assert!(!test.ran());
+        test.expected.seqid = 5;
+        // Argon2's memory and time are not run.
+        assert!(test.test(1, b"right", later()).is_err());
+        assert!(!test.ran());
+        // The path `td-boot volume` named now names another node.
+        let other = test.host.root.join("other");
+        std::fs::write(&other, &test.image).unwrap();
+        test.host.machine.device = Some(other);
+        assert!(test.test(0, b"right", later()).is_err());
+        assert!(!test.ran());
+        test.untouched();
+    }
+
+    /// A cryptsetup that outlasts the operation, or whose worker root hung
+    /// up on, is killed and reaped, and its copy removed.
+    #[test]
+    fn a_stalled_keyslot_test_is_killed_at_the_deadline_or_a_hangup() {
+        let mut test = keyslot();
+        let pid = |test: &Keyslot| {
+            let pid = std::fs::read_to_string(test.bin.join("pid")).unwrap();
+            std::fs::remove_file(test.bin.join("pid")).unwrap();
+            PathBuf::from(format!("/proc/{}", pid.trim()))
+        };
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(500);
+        assert_eq!(test.test(0, b"stall", deadline), Ok(Tested::Expired));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(!pid(&test).exists());
+        test.untouched();
+        let (authority, root) = UnixStream::pair().unwrap();
+        test.host.machine.authority = Some(authority);
+        let hang = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(root);
+        });
+        let started = Instant::now();
+        assert!(test.test(0, b"stall", later()).is_err());
+        assert!(started.elapsed() < Duration::from_secs(30));
+        hang.join().unwrap();
+        assert!(!pid(&test).exists());
+        test.untouched();
+        // A root still there abandons nothing.
+        let (authority, root) = UnixStream::pair().unwrap();
+        test.host.machine.authority = Some(authority);
+        assert_eq!(test.test(0, b"right", later()), Ok(Tested::Opened));
+        drop(root);
     }
 }

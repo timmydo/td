@@ -4483,7 +4483,13 @@ fn manifest_path_dependencies(
 }
 
 /// The crates td-fido/DESIGN.md ("Consumers") lets depend on td-fido.
-const FIDO_DEPENDENTS: &[&str] = &["td-secret", "td-tpm", "td-protector", "td-boot"];
+const FIDO_DEPENDENTS: &[&str] = &[
+    "td-secret",
+    "td-tpm",
+    "td-protector",
+    "td-boot",
+    "td-install",
+];
 
 /// Refuses a direct td-fido dependency from any other roster crate: a new
 /// dependent is an amendment to td-fido/DESIGN.md and this list.

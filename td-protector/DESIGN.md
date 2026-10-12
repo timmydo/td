@@ -309,6 +309,21 @@ the copy cryptsetup uses: at most `MAX_METADATA_JSON`, 128 KiB, which
 holds cryptsetup's indented rendering of a 12 KiB area, parsed by
 td-json.
 
+### Keyslot test area
+
+`luks2::test_area` is `read` and what a keyslot test against a detached
+copy of the header needs: the area's length, two copies of `hdr_size`
+and `config.keyslots_size`, the latter at most `MAX_KEYSLOTS_SIZE`
+(128 MiB, cryptsetup's own largest), and each keyslot's cost. A cost is
+the keyslot's PBKDF2-SHA256 iterations, at most
+`MAX_KEYSLOT_ITERATIONS` (100000; td forces 1000 on every keyslot it
+adds), and those of the one digest naming it, at most
+`MAX_DIGEST_ITERATIONS` (4000000; cryptsetup benchmarks a digest's
+count for about an eighth of a second at formatting). Any other KDF,
+Argon2 among them, whose memory and time td does not run, or a count
+over its ceiling, or no single digest, has no cost, and the test is
+refused before cryptsetup starts.
+
 ## Cryptsetup runner
 
 `cryptsetup::Cryptsetup` runs one cryptsetup command per child, for the
@@ -363,7 +378,9 @@ handoff, which cryptsetup 2.8.8 writes to a new FILE it creates
 key (ENCRYPTION.md "Selector release" says what was verified); `open`,
 `close`, `status`; `open --key-slot N`, the passphrase tried on that
 keyslot alone, with which the selector's recovery flow opens keyslot 0;
-`open --test-passphrase` on one keyslot; and the
+`open --test-passphrase` on one keyslot, and the same against a
+detached header, `--header FILE` before the keyslot, which the storage
+worker's disk proof runs on a private copy of the header area; and the
 deployment initramfs's `open --volume-key-file KEY-FILE`, the handed-off
 volume key a `KeyFile` with nothing on standard input, which cryptsetup
 2.8.8 reads at the header's volume-key size and activates only when it
@@ -375,6 +392,16 @@ ignores the failed read (`-EPIPE`) and destroys the keyslot unasked. So
 `run` refuses a `luksKillSlot` whose input is shorter than
 `MIN_KILL_KEY`, 32 bytes, td's shortest secret, before any child
 starts.
+
+`run_bounded` is `run` for a child that holds a secret past its caller's
+control: it keeps no output, the child's standard output being null,
+and polls the child's exit every 10 ms until it exits, a deadline passes
+or a caller's `abandoned` says the caller is gone. Past either of those
+it kills the child and reaps it before returning `Expired` or
+`Abandoned`, so no child outlives the run with its input, however long
+a lock, an I/O or a key derivation would keep it. Its refusals before a
+child starts are `run`'s. td-install's storage worker runs its keyslot
+test through it (td-install/DESIGN.md, "Storage operation worker").
 
 ## Transitions
 
@@ -1289,7 +1316,22 @@ least 1 KiB under the 12 KiB area, the two copies equal:
 TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test header_fit -- --ignored
 ```
 
-It needs the host kernel's AF_ALG hash and skcipher interfaces and no
-privilege. The cryptsetup is the `cryptsetup-x86-64` recipe's output,
+The keyslot test (`tests/keyslot_test.rs`) runs the same cryptsetup
+on a 20 MiB volume formatted the same way, keyslot 0 with its
+recovery-key marker and keyslot 26 with a fido2 token, whose second
+copy is one sequence number behind, or damaged. `detached_test_args`
+over a copy of `test_area`'s bytes, through `run_bounded`, exits 0 for
+each keyslot's key and `EXIT_BAD_PASSPHRASE` for a wrong one; the
+volume's SHA-256 is unchanged after each, and the copy's second header
+is not, which is cryptsetup's repair landing there. Naming the volume
+as `--header` changes it, for a wrong key too:
+
+```
+TD_TEST_CRYPTSETUP=/absolute/path/to/cryptsetup cargo test --frozen --manifest-path td-protector/Cargo.toml --test keyslot_test -- --ignored
+```
+
+Both need the host kernel's AF_ALG hash and skcipher interfaces and no
+privilege; a regular file serves as the data device, with no loop. The
+cryptsetup is the `cryptsetup-x86-64` recipe's output,
 `bin/cryptsetup.static` under the path `td-recipe-eval build-run
 cryptsetup-x86-64` prints.

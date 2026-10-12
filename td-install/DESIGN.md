@@ -1588,11 +1588,17 @@ states remains governed by [ENCRYPTION.md](ENCRYPTION.md).
 
 Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
 commit before its code. `storage_operation.rs` implements the selector
-update; the disk proof is not yet implemented, and td-authd refuses
-every storage operation in a production build until that document's
-item 9. The worker compiles td-secret's endpoint (`frames.rs`) and
-memory rules (`memory.rs`) and td-authd's consent descriptions by
-`#[path]`, and admits and writes the ESP through `td-fat`. Discovery
+update and the disk proof's keyslot test; td-authd refuses every
+storage operation in a production build until that document's item 9,
+and starts no disk proof's worker before 8e's last commit. The worker
+compiles td-secret's endpoint (`frames.rs`, whose shared secret frame
+`16` it reads into clearing storage) and memory rules (`memory.rs`) and
+td-authd's consent descriptions by `#[path]`, admits and writes the
+ESP through `td-fat`, and asks a disk security key through td-fido's
+`fido_disk::authorize` over root-admitted devices, each HID session's
+worker this program's own `fido-worker` verb, started from
+`/proc/self/exe` as td-boot's selector starts its own; td-install never
+builds or dispatches the desktop verb. Discovery
 takes the one `td.volume=` UUID of `/proc/cmdline`, asks `td-boot
 volume` for its partition and holds that partition open; the volume's
 files are read through the running system's `/run/td-volume`, and
@@ -1669,23 +1675,65 @@ consent time holds no I/O.
   changed). Then it stages
   the pair or writes it directly (ENCRYPTION.md, "Selector update") and
   sends `14`. It never opens the volume or reads its key.
-- **Disk proof** (tags 13 to 15). With the recovery key: after the
-  recovery-key step's `11` it takes one `16`, parses it with
-  td-protector's recovery-key codec (`25` on a refusal, before any
-  cryptsetup), re-reads the header, failing as `28` if it changed since
-  the baseline (or `20` if the reader now refuses it), and runs
-  `cryptsetup open --test-passphrase` on the keyslot the marker names,
-  the key on standard input (`26` when it refuses). With a disk key: it identifies the one connected key among
-  the header's fido2 tokens, as the selector's worker does, presents the
-  disk authorize step with that token's fingerprint and the key's PIN
+- **Disk proof** (tags 13 to 15). Root's first description must be the
+  proof's first step for the worker's account, one its own baseline
+  offers (consent's `proof_start`: a `recovery-key` marker, or a fido2
+  token), or the worker fails as INTERNAL before presenting it; it then
+  presents that step, waiting for the typed approval key where the step
+  discloses, and narrows its deadline to the description's ceiling.
+  With the recovery key: after the recovery-key step's `11` it takes
+  one `16`, parses it with td-protector's recovery-key codec (`25` on a
+  refusal, before any cryptsetup), re-reads the header, failing as `28`
+  if it changed since the baseline (or `20` if it is gone or the reader
+  now refuses it), and tests the keyslot the marker names, the key on
+  standard input (`26` when it refuses, cryptsetup's wrong-passphrase
+  exit; any other failure `0f`). The entry frame, the codec's key and
+  its passphrase are each zeroed on drop, and the passphrase reaches
+  cryptsetup only through its standard-input pipe: no copy enters a
+  string, an error or a log. With a disk key: it identifies the one
+  connected key among the header's fido2 tokens whose public key td-fido
+  admits, as the selector's release does, skipping any other, presents
+  the disk
+  authorize step with that token's fingerprint and the key's PIN
   retries, takes the PIN, runs the authorize-phase assertion whose
   client data is the disk domain's over that exact step (ENCRYPTION.md,
-  "FIDO2 protectors"), verifies its signature under the token's public
-  key, derives the passphrase, re-reads the header as the recovery key
-  does (`28` or `20`) and tests it on the keyslot the token names (`26`
-  when it refuses), the passphrase as a key file on
-  standard input. Success sends `14` with no commit round, and the
-  worker exits; the secret, output and passphrase are zeroed first.
+  "FIDO2 protectors"; the identify's binds the identify step),
+  verifies its signature under the token's public key, derives the
+  passphrase, re-reads the header as the recovery key does (`28` or
+  `20`) and tests it on the keyslot the token names (`26` when it
+  refuses, or when the token names none), the passphrase on standard
+  input. The key's sessions live one transport lifetime at most, inside
+  the operation's ceiling.
+
+  A keyslot test never runs on the disk's own metadata, which cryptsetup
+  would repair there (a stale or damaged second copy, rewritten before
+  the key is tried), writing outside any commit round. The node `td-boot
+  volume` named must still be the held partition (the same `st_rdev`).
+  td-protector's `test_area` then reads the used copy through the held
+  descriptor, which must equal the presented header (`28` otherwise),
+  and the tested keyslot's cost, whose bounds refuse Argon2 and any
+  PBKDF2 count over its ceiling (`0f`, before cryptsetup starts). The
+  worker copies exactly that area, both copies and the keyslots area,
+  into a file of its own, mode 0600, in a directory it makes for it
+  under `/run`, mode 0700, and reads the copy again, which must equal
+  what it read (`28` otherwise). `cryptsetup open --test-passphrase
+  --header COPY --key-slot N --key-file=- DEVICE` then reads, and
+  repairs, only the copy, which is removed afterwards. A worker killed
+  meanwhile leaves its copy behind, so each worker's start removes the
+  copies dead workers left: real directories root owns, named exactly
+  for a pid no live process has, a live worker's left alone. The
+  child runs through the runner's `run_bounded`: it is killed and
+  reaped at the operation's deadline (`08`) or as soon as root's end of
+  the socket closes, which a second handle on it reads for every 10 ms,
+  so a cancellation, which closes root's end, ends it. Root's side, a
+  proof's storage worker given a bounded grace after its channel
+  closes before it is killed, arrives with 8e's last commit, the first
+  to start one; until then no root starts this path.
+
+  Success sends `14` with no commit round, and
+  the worker exits; the secret, output and passphrase are zeroed first.
+  A `28` here, like a selector update's, precedes any write, and the
+  worker exits successfully after it.
 
 Its failure kinds are td-secret's login worker's where they mean the
 same (`01` to `08` for a disk key's PIN, presence, devices and time,
@@ -1711,9 +1759,25 @@ definite, and root forwards it as `91 0d`. Host tests drive each
 form over a header and an ESP the test builds, every kind at its point,
 the commit margin and the change check, including space taken after the
 presentation, and the production host's standing, template, key and
-authenticated kernel over a scratch root; the disk proof's tests are to
-drive the secret's zeroing, the disk
-proof's against the scripted cryptsetup and the virtual authenticator.
+authenticated kernel over a scratch root. The disk proof's drive each
+proof to success and to every kind at its point: the codec's refusal,
+a keyslot that refuses, a header changed, gone or refused before the
+test, a token naming no keyslot, a description the baseline does not
+offer, a token whose point td-fido refuses, skipped, and the disk key's
+refusals and statuses through a scripted `Keys`; td-fido's own tests
+drive `authorize` against its virtual authenticator. A source test holds
+the secret's path free of copies. The production host's keyslot test
+runs a scripted cryptsetup over a scratch partition whose second copy is
+stale: the repair it makes lands in the copy and the partition is
+unchanged; a header other than the presented one, an Argon2 keyslot and
+a node that is not the held one run nothing; and a stalled cryptsetup
+is killed and reaped at the deadline and when root hangs up. A start's
+sweep removes only dead workers' copies root owns. td-protector's
+`keyslot_test`, run as `header_fit` is, holds the pinned cryptsetup
+2.8.8 itself to the copy: over a td-formatted volume whose second copy
+is stale or damaged, the exact invocation leaves the volume's SHA-256
+unchanged for a right key and a wrong one (exit 2, `26`), while
+cryptsetup repairs the copy.
 
 ## 6. Signing and keys
 

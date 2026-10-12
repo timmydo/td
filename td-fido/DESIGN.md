@@ -48,8 +48,14 @@ prerequisites" onward):
   `create`, over `fido_transaction::Devices`, the device access
   td-secret's login worker shares, and a `Person` that answers PIN steps
   and is told when the key waits for a touch. Creation is the login
-  creation under the `td disk` labels (`Transaction::disk_create`). It
-  holds no header and no policy; td-boot's selector is its consumer.
+  creation under the `td disk` labels (`Transaction::disk_create`).
+  `authorize` is `release` under the authorize phase in two presented
+  steps, for a login operation's disk proof (td-authd/DESIGN.md
+  amendment 10): the identify hash binds the caller's identify step, and
+  the assertion's binds the step its `Steps` presents for the selected
+  token and the key's PIN retries, which exist only once the key has
+  answered. It holds no header and no policy; td-boot's selector and
+  td-install's storage worker are its consumers.
   Its vectors, `tests/disk_vectors.txt`, come from
   `tests/disk_vectors.py`, which computes them with Python's hashlib and
   hmac alone.
@@ -89,11 +95,15 @@ td-secret depends on td-fido by path, `td-fido = { path = "../td-fido"
 modules, and the files td-firstboot and td-portal share with it, name
 them as before. td-tpm depends on it the same way for its salted
 sessions (td-tpm/DESIGN.md). Per `td-install/ENCRYPTION.md` item 8,
-td-protector (its HMAC-SHA256) and td-boot are the only other crates
-that may depend on it directly. Since increment 8b td-boot does, for its
+td-protector (its HMAC-SHA256), td-boot and td-install are the only
+other crates that may depend on it directly. Since increment 8b td-boot does, for its
 selector's FIDO2 client: `fido_disk` over root-admitted devices, each
 session's worker td-boot's own `fido-worker` verb (`Program::ROOT`),
-whose desktop verb it never builds or dispatches; any other
+whose desktop verb it never builds or dispatches. Since increment 8e
+td-install does too, for its storage worker's disk proof
+(td-install/DESIGN.md, "Storage operation worker"): `fido_disk::authorize`
+the same way, each session's worker td-install's own `fido-worker` verb;
+any other
 dependent is an amendment here and to `FIDO_DEPENDENTS` in
 `builder/src/affected.rs`, whose lock preflight refuses the rest. Crates
 that reach it only through td-secret or td-tpm, as td-pass does, are

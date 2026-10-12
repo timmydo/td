@@ -125,7 +125,7 @@ fn invalid(message: String) -> io::Error {
 }
 
 const USAGE: &str =
-    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install storage-operation --uid <uid> (stdin: td-authd's private socket)\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
+    "usage: td-install new-volume-uuid\n       td-install inventory\n       td-install destinations\n       td-install candidate-record\n       td-install observe-plan < plan.bin\n       td-install observe-source-plan <td-boot> <deployment-directory> <trusted-key> < plan.bin\n       td-install serve <td-boot> <deployment-directory> <trusted-key> <verified-root> <td-firstboot> (stdin: connected Unix stream socket)\n       td-install prepare-selector <template> <trusted-key> <volume-uuid> <output>\n       td-install storage-operation --uid <uid> (stdin: td-authd's private socket)\n       td-install fido-worker <index> <inode> <rdev>\n       td-install timezones\n       td-install layout-preview <logical-sector-bytes> <capacity-bytes>\n       td-install format <efi-kernel> <selector-initramfs> <volume-options-and-operands>\n       td-install layout <destination> [<efi-kernel> <selector-initramfs>]\n       \
                      td-install volume [--uuid <uuid>] [--timezone <IANA-id>] [--hostname <name>] [--username <name> <verified-root> <td-firstboot>] <destination> <mkfs.btrfs> <scratch-dir> \
                      [<td-boot> <deployment> <trusted-key> | --trusted-key <trusted-key>]\n       \
                      td-install format ... --trusted-key <trusted-key> --publish <td-boot> <deployment> <mountpoint>";
@@ -164,6 +164,13 @@ enum Mode {
     /// td-authd's root storage worker, for the account `uid`.
     StorageOperation {
         uid: u32,
+    },
+    /// One HID session of the storage worker's disk proof: td-fido's root
+    /// worker, which re-admits the node itself.
+    FidoWorker {
+        index: String,
+        inode: String,
+        rdev: String,
     },
     LayoutPreview {
         sector_bytes: u64,
@@ -830,6 +837,18 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> io::Result<Mode> {
                 .and_then(|text| text.parse::<u32>().ok())
                 .ok_or_else(|| invalid("storage-operation requires --uid N".into()))?;
             Ok(Mode::StorageOperation { uid })
+        }
+        (Some(storage_operation::FIDO_WORKER), [index, inode, rdev]) => {
+            let text = |arg: &PathBuf| {
+                arg.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid("fido-worker operands must be UTF-8".into()))
+            };
+            Ok(Mode::FidoWorker {
+                index: text(index)?,
+                inode: text(inode)?,
+                rdev: text(rdev)?,
+            })
         }
         (Some("layout-preview"), [sector, capacity]) => Ok(Mode::LayoutPreview {
             sector_bytes: preview_number(sector.as_os_str(), "logical sector bytes")?,
@@ -5046,6 +5065,9 @@ fn main() -> ExitCode {
             timezones::run(Path::new(TIMEZONE_ROOT), &mut output).and_then(|()| output.flush())
         }
         Mode::StorageOperation { uid } => storage_operation::run(uid).map_err(invalid),
+        Mode::FidoWorker { index, inode, rdev } => {
+            td_fido::fido_device::worker(&index, &inode, &rdev).map_err(invalid)
+        }
         Mode::PrepareSelector {
             template,
             trusted_key,

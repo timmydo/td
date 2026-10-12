@@ -306,10 +306,10 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("operation.rs")),
-            0x61fb39e8ad0725b4
+            0xfc3b30153d22e6a8
         );
         // The endpoint td-install's storage worker shares.
-        assert_eq!(fingerprint(include_str!("frames.rs")), 0x79f4d987a8fb0901);
+        assert_eq!(fingerprint(include_str!("frames.rs")), 0xd851834505d61637);
         assert_eq!(
             fingerprint(include_str!("login_operation.rs")),
             0x4f1cb1363596b682

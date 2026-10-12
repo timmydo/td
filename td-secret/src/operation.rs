@@ -2,16 +2,16 @@
 
 use super::fido_pin::Pin;
 use super::frames;
-pub(super) use super::frames::{remaining, Cleared, Wire};
+pub(super) use super::frames::{remaining, Wire};
 use super::{consent, crypto, fido_device, fido_enroll, fido_metadata, store, tpm};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
 
-/// Root's PIN frame: this tag, then the PIN's 4 to 63 bytes.
-pub(super) const PIN: u8 = 0x16;
-const PIN_FRAME: usize = 64;
+/// Root's PIN frame, the shared secret frame, as the tests spell it.
+#[cfg(test)]
+pub(super) const PIN: u8 = frames::SECRET;
 pub(super) const OPERATION_TIME: std::time::Duration = fido_device::MAX_LIFETIME;
 
 /// td-secret's frames over the shared endpoint (frames.rs): a credential,
@@ -35,20 +35,7 @@ impl Wire {
     /// rest then has one frame time. The bytes stay in clearing owners and
     /// never enter a diagnostic.
     pub(super) fn receive_pin(&mut self) -> Result<Pin, String> {
-        let mut header = [0; 2];
-        self.read(&mut header, self.bound())?;
-        let length = usize::from(u16::from_be_bytes(header));
-        if !(2..=PIN_FRAME).contains(&length) {
-            return Err("invalid operation PIN frame length".into());
-        }
-        let deadline = self.frame_deadline()?;
-        let mut tag = [0];
-        self.read(&mut tag, deadline)?;
-        if tag != [PIN] {
-            return Err("operation frame is not a PIN".into());
-        }
-        let mut pin = Cleared(vec![0; length - 1].into_boxed_slice());
-        self.read(&mut pin.0, deadline)?;
+        let mut pin = self.receive_secret()?;
         Pin::new(std::mem::take(&mut pin.0))
             .map_err(|_| "operation PIN is outside its profile".into())
     }

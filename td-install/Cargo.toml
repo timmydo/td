@@ -23,10 +23,12 @@ path = "src/main.rs"
 # zero external dependencies. It compiles this source plus the shared engine GPT,
 # FAT32 and CRC-32 writers and td-boot's on-disk protocol directly with rustc.
 # The device-bound service's TPM probe runs over the sibling disk protector and
-# TPM client (td-protector reaches td-json), and the storage worker's selector
-# update over td-fat's ESP reader and writer, each an rlib in the recipe.
+# TPM client (td-protector reaches td-json), the storage worker's selector
+# update over td-fat's ESP reader and writer, and its disk proof's security key
+# over td-fido's disk flows, each an rlib in the recipe.
 [dependencies]
 td-fat = { path = "../td-fat" }
+td-fido = { path = "../td-fido" }
 td-protector = { path = "../td-protector" }
 td-tpm = { path = "../td-tpm" }
 
