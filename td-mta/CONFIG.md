@@ -1920,8 +1920,8 @@ and configured HTTPS listeners with file-provisioned TLS identities. Provision
 `data/devices` mode 0700 under the same service owner and create an initial
 device offline before starting. The registry must exist and validate; startup
 does not silently initialize it. The profile has no public administration
-HTTP route. Discovery and reading mail remain unavailable until the JMAP
-increments; authenticated `/.well-known/jmap` currently returns 503.
+HTTP route. Discovery and mailbox/message APIs remain unavailable until the
+JMAP increments; authenticated `/.well-known/jmap` currently returns 503.
 Authenticated POST `/jmap/upload/{accountId}` now streams binary uploads into
 the configured account, with one upload at a time, bounded framing and a
 JSON durable receipt. It shares the app-password registry and storage quota
@@ -1939,9 +1939,9 @@ status ok and the operation's data; failures carry fixed stage/error codes.
 
 The ready announcement and status report profile mailbox-access. Readiness
 waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS/upload workers. This reports transport readiness, not available JMAP
+network/TLS/body workers. This reports transport readiness, not available JMAP
 methods. Stop, SIGTERM and SIGINT use the same shared stop flag. HTTPS closes
-its exchanges and joins its TLS and upload workers; an upload publication
+its exchanges and joins its TLS and body workers; an upload publication
 already underway settles before shutdown returns. SMTP preserves its normal
 drain and known committed replies. Outbound delivery, reload and ACME
 remain inactive in both profiles.
@@ -1959,3 +1959,10 @@ effects. An uncertain cleanup charges the full cap as used until cold
 recovery, so it may exhaust response admission. Coordinator used-byte
 accounting and RequestSpool status (occupied and retired slot counts)
 expose that state; runtime status and dispatch wiring remain pending.
+
+The authenticated download route is
+`/jmap/download/{accountId}/{blobId}/{name}?type={type}`. GET streams an
+accessible raw blob; other methods receive 405 with Allow: GET. GET bodies
+and Expect are rejected. The name and media type are template values, not
+stored blob metadata. Downloads and uploads share one body-transfer slot.
+This activates raw downloads; discovery and other Core routes remain pending.

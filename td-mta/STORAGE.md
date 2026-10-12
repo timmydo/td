@@ -540,7 +540,7 @@ cannot interrupt arbitrary synchronous callback code. Successful return
 requires a fresh pinned check; a callback error retains its original cause.
 Every request hashes the complete body, even if the callback requests a small
 range. HTTP scheduling must bound verification concurrency and admission.
-This is the storage boundary for downloads, not an activated HTTP endpoint.
+The HTTPS download worker now uses this storage boundary.
 
 ### Snapshots, changes, reclamation and backup
 

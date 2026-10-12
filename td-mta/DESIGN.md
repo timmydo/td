@@ -1805,10 +1805,10 @@ connection/request counts and scheduling. Routes match the raw target;
 only validated endpoint components may be decoded, never used as arbitrary
 filesystem paths. It must authorize and admit
 body storage before sending 100 Continue, check decoder completion before
-publication, and close on framing failure. The current HTTPS runtime performs these admission checks but serves only
-empty refusal responses; JMAP discovery/methods, uploads and downloads
-remain subsequent increments. Device persistence and local administration
-are implemented under section 7. Framing tests
+publication, and close on framing failure. The current HTTPS runtime serves
+authenticated uploads and raw downloads with these bounds; discovery and
+JMAP method activation remain pending. Device persistence and local
+administration are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
 
@@ -1837,12 +1837,13 @@ permit, and retries a busy pool within the original handshake deadline.
 All socket operations
 are nonblocking. Request-head parsing uses at most 16 KiB per turn. The current
 profile permits one request per connection and sends Connection: close with
-all responses. Authenticated upload POSTs use the dedicated bounded worker
+all responses. Authenticated upload POSTs use the shared bounded body worker
 specified in ADMISSION.md, with quota admission before 100 Continue and
 commit-time device authorization. Other refusals need not consume the body.
 After responding it applies RESOURCES.md's bounded write-half closure.
 Refusals may drain bounded unread data; successful uploads already consumed
-their body and do not drain. Slots remain active until retired.
+their body and do not drain. Downloads also close without drain. Slots remain
+active until retired.
 This does not yet claim JMAP conformance: authenticated discovery gets 503
 until the complete Core contract is ready, and unknown targets get 404.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
@@ -1875,6 +1876,16 @@ publication already running; a durable commit can outlive its connection or
 exchange deadline without an observed receipt. Nonmutating exchanges close
 immediately, while SMTP retains its orderly final-reply behavior. Fixed
 native/kernel work already running must return before joins complete.
+
+Authenticated raw downloads now use GET on the fixed download template.
+The body worker is shared with uploads and holds one transfer permit through
+flushing. It verifies the blob before headers, then streams under the same
+snapshot and exchange deadline; storage owns account/device access. Filename
+and media template values are decoded once and cannot inject response
+headers. Pre-output errors return an HTTP refusal; after output starts an
+error retires the connection. ADMISSION.md owns exact bounds and status
+mapping. Other methods return 405 with Allow: GET. Discovery remains disabled
+until the complete Core capability is implemented.
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous

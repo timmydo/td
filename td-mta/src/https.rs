@@ -68,6 +68,7 @@ enum Phase {
     Head,
     Authorize,
     Upload,
+    Download,
     Response,
     Close,
     Drain,
@@ -169,7 +170,7 @@ impl Https<'_, '_> {
                 worker: worker.thread(),
             };
             let uploader = match std::thread::Builder::new()
-                .name("https-upload".into())
+                .name("https-body".into())
                 .spawn_scoped(scope, || {
                     while !done.load(Ordering::Acquire) {
                         for cell in &slots {
@@ -181,11 +182,18 @@ impl Https<'_, '_> {
                                     return;
                                 }
                             };
-                            let Some(client) = slot.as_mut().filter(|c| c.phase == Phase::Upload)
+                            let Some(client) = slot
+                                .as_mut()
+                                .filter(|c| matches!(c.phase, Phase::Upload | Phase::Download))
                             else {
                                 continue;
                             };
-                            if self.upload(client, control).is_err() {
+                            let result = if client.phase == Phase::Download {
+                                self.download(client, control)
+                            } else {
+                                self.upload(client, control)
+                            };
+                            if result.is_err() {
                                 if client.stop_after_response {
                                     control.fail();
                                 }
@@ -351,13 +359,13 @@ impl Https<'_, '_> {
                     *peers.get_mut(index).ok_or(Error::Invalid)? = None;
                     continue;
                 };
-                if matches!(client.phase, Phase::Tls | Phase::Upload) {
+                if matches!(client.phase, Phase::Tls | Phase::Upload | Phase::Download) {
                     continue;
                 }
                 let mut wake_upload = false;
                 match self.step(client, &mut attempts, upload_active) {
                     Ok(true) => {
-                        if client.phase == Phase::Upload {
+                        if matches!(client.phase, Phase::Upload | Phase::Download) {
                             wake_upload = true;
                         }
                         if client.phase == Phase::Close
@@ -585,6 +593,29 @@ impl Https<'_, '_> {
                                         client.phase = Phase::Upload;
                                         return Ok(true);
                                     }
+                                } else if head.target.starts_with("/jmap/download/") {
+                                    if head.method != "GET" {
+                                        405
+                                    } else if head.framing != http_request::Framing::Length(0)
+                                        || head.expect_continue
+                                    {
+                                        400
+                                    } else if upload_active
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
+                                        .is_err()
+                                    {
+                                        429
+                                    } else {
+                                        client.upload_slot = true;
+                                        client.device = Some(device);
+                                        client.phase = Phase::Download;
+                                        return Ok(true);
+                                    }
                                 } else if head.target == "/.well-known/jmap" {
                                     503
                                 } else {
@@ -643,9 +674,65 @@ impl Https<'_, '_> {
                     &mut client.drain_left,
                 );
             }
-            Phase::Tls | Phase::Upload => return Err(Error::Invalid),
+            Phase::Tls | Phase::Upload | Phase::Download => return Err(Error::Invalid),
         }
         Ok(true)
+    }
+    fn download(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
+        use crate::https_download::{Failure, Request, Target};
+        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let target = match Target::parse(client.head.head().map_err(|_| Error::Invalid)?.target) {
+            Ok(target) if target.account() == backend.account() => target,
+            Ok(_) | Err(Error::NotFound) => {
+                return self.respond(client, 404, self.clock.sample()?.utc_ms)
+            }
+            Err(_) => return self.respond(client, 400, self.clock.sample()?.utc_ms),
+        };
+        let maximum =
+            u64::try_from(self.resources.limits().message_bytes).map_err(|_| Error::Capacity)?;
+        let now = self.clock.sample()?.monotonic;
+        let operation = deadline(
+            now,
+            self.timeouts
+                .http_exchange_seconds(0, maximum)
+                .map_err(|_| Error::Invalid)?,
+        )?
+        .min(client.absolute);
+        client.absolute = operation;
+        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        client.input.fill(0);
+        client.input_used = 0;
+        client.drain_left = 0;
+        let result = backend.download(
+            Request {
+                target: &target,
+                device: client.device.ok_or(Error::Invalid)?,
+                deadline: operation,
+            },
+            client.connection.as_mut().ok_or(Error::Invalid)?,
+            control,
+        );
+        match result {
+            Ok(()) => {
+                client.phase = Phase::Close;
+                client.phase_deadline =
+                    deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(operation);
+                client.idle = client.phase_deadline;
+                Ok(())
+            }
+            Err(Failure::Before(Error::WriterStopped) | Failure::Started(Error::WriterStopped)) => {
+                control.fail();
+                Err(Error::WriterStopped)
+            }
+            Err(Failure::Started(error)) => Err(error),
+            Err(Failure::Before(error)) => {
+                let status = match error {
+                    Error::NotFound | Error::Forbidden => 404,
+                    _ => 503,
+                };
+                self.respond(client, status, self.clock.sample()?.utc_ms)
+            }
+        }
     }
     fn upload(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
         let backend = self.uploads.ok_or(Error::Invalid)?;
@@ -778,7 +865,15 @@ impl Https<'_, '_> {
                 .extend_from_slice(b"Content-Type: application/json\r\n");
         }
         if status == 405 {
-            client.response.extend_from_slice(b"Allow: POST\r\n");
+            let download = client
+                .head
+                .head()
+                .is_ok_and(|head| head.target.starts_with("/jmap/download/"));
+            client.response.extend_from_slice(if download {
+                b"Allow: GET\r\n"
+            } else {
+                b"Allow: POST\r\n"
+            });
         }
         client.response.extend_from_slice(b"\r\n");
         client.response.extend_from_slice(body);
@@ -860,7 +955,7 @@ fn buffer<const N: usize>() -> Result<Box<[u8; N]>, Error> {
 fn deadline(now: Tick, seconds: u64) -> Result<Deadline, Error> {
     timers::deadline(now, seconds).map_err(|_| Error::Invalid)
 }
-fn http_date(utc_ms: i64) -> Result<String, Error> {
+pub(crate) fn http_date(utc_ms: i64) -> Result<String, Error> {
     let seconds = u64::try_from(utc_ms).map_err(|_| Error::Invalid)? / 1000;
     if seconds > 253402300799 {
         return Err(Error::Invalid);

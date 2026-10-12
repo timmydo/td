@@ -7,8 +7,8 @@ use crate::{
     ports::{Clock, CommitFailure, Deadline, Error, FlushProgress, IoProgress, Tick, Transport},
     smtp_receiving::Control,
     store_fs::{
-        IngressSpool, StoreCoordinator, UploadAttempt, UploadAuthorization, UploadError,
-        UploadRequest,
+        BlobAuthorization, IngressSpool, StoreCoordinator, UploadAttempt, UploadAuthorization,
+        UploadError, UploadRequest,
     },
     wire,
 };
@@ -55,6 +55,14 @@ pub trait Backend: Sync {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<Response, Error>;
+    fn download(
+        &self,
+        _request: crate::https_download::Request<'_>,
+        _transport: &mut dyn Transport,
+        _control: &Control,
+    ) -> Result<(), crate::https_download::Failure> {
+        Err(crate::https_download::Failure::Before(Error::NotFound))
+    }
 }
 pub struct Service<'s, 'r, 'l, P> {
     pub coordinator: &'s StoreCoordinator<'r, 'l, P>,
@@ -64,9 +72,28 @@ pub struct Service<'s, 'r, 'l, P> {
     pub clock: &'s dyn Clock,
     pub timeouts: &'s TimeoutPlan,
 }
-impl<P: UploadAuthorization + Sync> Backend for Service<'_, '_, '_, P> {
+impl<P: UploadAuthorization + BlobAuthorization + Sync> Backend for Service<'_, '_, '_, P> {
     fn account(&self) -> AccountId {
         self.account
+    }
+    fn download(
+        &self,
+        request: crate::https_download::Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+    ) -> Result<(), crate::https_download::Failure> {
+        if request.target.account() != self.account {
+            return Err(crate::https_download::Failure::Before(Error::NotFound));
+        }
+        crate::https_download::send(
+            self.coordinator,
+            self.maximum,
+            request,
+            transport,
+            control,
+            self.clock,
+            self.timeouts,
+        )
     }
     fn receive(
         &self,

@@ -3787,7 +3787,7 @@ The upload worker now uses coordinator quota-pressure reclamation before
 accepting a new body. Each deletion of an oldest unreferenced upload is atomic;
 bounded retries seek a fitting reservation, preserving referenced mail, foreign accounts and pending
 ingress. Device guards and original deadlines cover each deletion and ledger
-settlement. Core discovery, download, Blob/copy, API and EventSource runtime
+settlement. Core discovery, Blob/copy, API and EventSource runtime
 integration remain pending; the capability is still unadvertised.
 
 Authorized raw blob reading now checks account/device ownership under one
@@ -3795,4 +3795,11 @@ pooled snapshot, verifies all bytes before callback admission, and rechecks
 policy and upload expiry after verification. Referenced mail is account
 readable; unreferenced uploads require the originating device's live lease.
 The personal-account device registry supplies the separate read policy.
-HTTPS download routing and Core capability advertisement remain pending.
+Core capability advertisement remains pending.
+
+Authenticated HTTPS GET downloads now stream verified raw blobs through the
+same bounded body worker as uploads. Real TLS tests download fixed-length,
+chunked and empty uploads, preserve decoded name/type headers, and check
+missing/foreign IDs, methods, GET bodies, shared-slot contention, revoked
+credentials and another device's inaccessible unreferenced upload. Discovery,
+Blob/copy, API and EventSource runtime activation remain pending.

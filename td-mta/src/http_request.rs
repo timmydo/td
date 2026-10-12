@@ -514,6 +514,35 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
     bytes.get(end..).unwrap_or_default()
 }
 
+pub(crate) fn decode_uri_component<'a>(
+    value: &str,
+    out: &'a mut [u8],
+) -> Result<&'a str, crate::ports::Error> {
+    use crate::ports::Error;
+    let mut input = value.bytes();
+    let mut length = 0usize;
+    while let Some(byte) = input.next() {
+        let byte = if byte == b'%' {
+            let high = input.next().and_then(hex).ok_or(Error::Invalid)?;
+            let low = input.next().and_then(hex).ok_or(Error::Invalid)?;
+            (high << 4) | low
+        } else {
+            byte
+        };
+        *out.get_mut(length).ok_or(Error::Capacity)? = byte;
+        length = length.checked_add(1).ok_or(Error::Capacity)?;
+    }
+    std::str::from_utf8(out.get(..length).ok_or(Error::Invalid)?).map_err(|_| Error::Invalid)
+}
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[path = "http_request_tests.rs"]
 mod tests;

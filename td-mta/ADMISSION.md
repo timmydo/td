@@ -1067,7 +1067,7 @@ never reclaims pending ingress, and stops once a fresh reservation fits.
 No available unreferenced victim leaves the original quota refusal. A stopped
 or uncertain cleanup retires admission rather than proceeding to a new body.
 All retries retain the original deadline; native selection also retains its
-existing VM/heap bounds. Discovery, API, download and EventSource activation
+existing VM/heap bounds. Discovery, API, Blob/copy and EventSource activation
 remain prerequisites to advertising Core.
 
 Before each pressure retirement, an aggregate over the same eligible rows
@@ -1086,3 +1086,27 @@ its maximum without eviction and receives the quota refusal if it cannot fit;
 its unknown actual size cannot justify premature deletion of recent uploads.
 Referenced bodies retain any upload-lease charge until ordinary expiry;
 future reference-creating methods must account for that retained charge.
+
+Authenticated GET downloads share the fixed HTTPS body worker and its single
+permit with uploads. A busy body worker returns 429 before storage lookup;
+the permit lasts through body flush or connection retirement. The worker
+verifies the complete raw blob under authorized snapshot ownership before
+sending headers, and checks cancellation and the original exchange deadline
+between output steps. Verification remains bounded by the storage deadline.
+Response idle time starts after verification; output progress never extends
+the absolute exchange or one-hour connection cap. Every request rehashes the
+whole body; no range or verification-cache shortcut is claimed. After
+verification, the output deadline narrows to the actual body length using
+the original operation start, never renewing elapsed time. An admitted read
+can finish after device revocation under its existing bounded snapshot.
+
+The configured download template percent-decodes each component once within
+fixed name/media bounds; plus stays literal. Names never become paths and
+are UTF-8 percent-encoded in Content-Disposition. Content-Type rejects
+non-ASCII and control bytes before header output. A verified blob is streamed
+through one 16 KiB buffer, with Content-Length and attachment disposition.
+Responses use no-store and nosniff. No body or credential enters a log.
+Before output, inaccessible blobs return 404; storage failures, including
+verification corruption, return 503 without exposing provisional bytes. After output begins, errors close the connection without a
+second HTTP response. Shutdown cancels streaming and joins bounded storage
+work already running. Successful downloads close without unread-data drain.

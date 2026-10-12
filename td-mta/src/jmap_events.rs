@@ -35,7 +35,7 @@ impl Options {
         let mut decoded = [0; QUERY_BYTES];
         for field in query.split('&') {
             let (key, value) = field.split_once('=').ok_or(Error::Invalid)?;
-            let value = decode(value, &mut decoded)?;
+            let value = crate::http_request::decode_uri_component(value, &mut decoded)?;
             match key {
                 "types" if types.is_none() => {
                     let mut mask = 0;
@@ -82,31 +82,6 @@ impl Options {
         self.ping_seconds
     }
 }
-fn decode<'a>(value: &str, out: &'a mut [u8]) -> Result<&'a str, Error> {
-    let mut input = value.bytes();
-    let mut length = 0usize;
-    while let Some(byte) = input.next() {
-        let byte = if byte == b'%' {
-            let high = input.next().and_then(hex).ok_or(Error::Invalid)?;
-            let low = input.next().and_then(hex).ok_or(Error::Invalid)?;
-            (high << 4) | low
-        } else {
-            byte
-        };
-        *out.get_mut(length).ok_or(Error::Capacity)? = byte;
-        length = length.checked_add(1).ok_or(Error::Capacity)?;
-    }
-    std::str::from_utf8(out.get(..length).ok_or(Error::Invalid)?).map_err(|_| Error::Invalid)
-}
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Passive account state, captured under authorization before passing it here.
 /// The fixed roster contains only supported account data types. Omit types not
 /// yet available to this credential; no PushSubscription/account state exists.
