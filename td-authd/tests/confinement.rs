@@ -186,7 +186,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0xe713a5be359ae7cb,
+        0x2a7b03cb2ec47e43,
         "login worker supervisor changed"
     );
     assert_eq!(

@@ -103,6 +103,7 @@ fn writing(write: &dyn Fn(&Store, Baseline, Change<'_>) -> Outcome) -> Context<'
         uid: UID,
         path: directory(),
         owner: Owner::ROOT,
+        root: Path::new("/"),
         started: Instant::now(),
         lifetime: fido_device::MAX_LIFETIME,
         margin: COMMIT_MARGIN,

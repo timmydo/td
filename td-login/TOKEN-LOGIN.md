@@ -571,6 +571,8 @@ table above uses the first three and `0f`'s.
 | `81` eight keys | | `EIGHT KEYS ALREADY ENROLLED` |
 | `82` already enrolled | | `LOGIN KEYS ALREADY ENROLLED` |
 | `83` slots not the record's | | `KEY LIST CHANGED; REOPEN` |
+| `84` protected: enrollment needs a disk proof | | `ENROLLING HERE NEEDS A DISK PROOF` |
+| `85` protected: the last key | | `THE LAST KEY STAYS ON THIS MACHINE` |
 
 Kinds `0a` to `0c` show the unavailable state's own texts ("The login
 record"), split after the colon. A cancellation shows nothing new: the
@@ -993,7 +995,7 @@ published; publication then makes the cutover above.
 
 **Adding a key** (`A`) refuses at eight keys before any token. One
 enrolled key and its PIN authorize it with an authorize-phase assertion,
-or, on a planned protected volume, a disk proof (below). At a connect
+or, on a protected volume, a disk proof (below). At a connect
 step the person then removes that key and connects only the new one,
 which is created with every enrolled credential excluded, proved,
 repeated and probed, and the record is published against the unchanged
@@ -1003,18 +1005,22 @@ baseline.
 description names each selected key by its position in the record's
 canonical slot order, which the digits show, and its fingerprint, so two
 keys that share a fingerprint stay distinct. One enrolled key and its
-PIN authorize it, or on a planned protected volume a disk proof
-(below), and that key may be in the set. Leaving exactly one
-key requires the one-key disclosure. Removing every key is refused on a
-planned protected volume, where the machine never logs in without a key;
+PIN authorize it, or on a protected volume a disk proof (below), and
+that key may be in the set. Leaving exactly one key requires the one-key
+disclosure. Removing every key is refused on a protected volume, where
+the machine never logs in without a key;
 elsewhere it requires a disclosure that the machine will log in without
 a key and that open SSH sessions end now, confirmed the same way; the
 record is then unlinked and the cutover restores console login and the
 ordinary SSH policy.
 
-**On a planned protected volume** (`td-install/ENCRYPTION.md` increment
-8; td-authd's `/var/lib/td/login/protected` marker present), this is the
-one place the rule is stated. Removing every key is refused, as above.
+**On a protected volume** (`td-install/ENCRYPTION.md` increment 8,
+inert until its item 9; td-authd's `/var/lib/td/login/protected` marker
+or the boot's `/run/td-admit` present), this is the one place the rule
+is stated. Removing every key is refused, as above: td-authd refuses it
+from the worker's baseline with `85`, and the worker, which reads the
+marker and `/run/td-admit` as root does, refuses a description of it as
+INTERNAL. A marker that cannot be read counts as present.
 A first enrollment, an addition, and a removal of keys the person no
 longer holds may each be authorized, instead of an enrolled key's
 assertion, by a disk proof made fresh inside that operation from an
@@ -1023,16 +1029,31 @@ token alone is something anyone who can write the disk can add:
 
 - the volume's 48-digit recovery key, typed into the compositor's PIN
   field on the operation's step, a secure-attention surface no client
-  draws, and tested by the worker with `cryptsetup open
-  --test-passphrase` on the keyslot the volume's `recovery-key` marker
-  names, the key on standard input; or
+  draws, and tested with `cryptsetup open --test-passphrase` on the
+  keyslot the volume's `recovery-key` marker names, the key on standard
+  input; or
 - an authorize-phase assertion from a disk security key, with its PIN
   and touch, whose client data is the disk domain's over this
   operation's canonical description, requesting hmac-secret under UV:
-  the worker verifies the signature under the header token's public
-  key, derives that token's passphrase from the output
-  (ENCRYPTION.md, "FIDO2 protectors"), and tests it with `cryptsetup
-  open --test-passphrase` on the keyslot the token names.
+  the signature is verified under the header token's public key, that
+  token's passphrase derived from the output (ENCRYPTION.md, "FIDO2
+  protectors"), and tested with `cryptsetup open --test-passphrase` on
+  the keyslot the token names.
+
+The keyslot test runs only through `td-install storage-operation`, the
+running system's one keyslot-test surface (`td-install/DESIGN.md`,
+"Full-system volume consumers"), never in td-secret's login worker. The
+disk proof's consent step, its `1b` selection, the PIN-field profile
+that carries the recovery key and its compositor screen land with
+ENCRYPTION.md increment 8e's storage-operation wire (td-authd/DESIGN.md
+amendment 10, fixed by 8e's documentation commit). Until then a
+protected machine refuses every login-key operation that only a disk
+proof can authorize: a first enrollment, which has no enrolled key to
+assert, is refused from the worker's baseline with `84`, and the worker
+refuses a description of it as INTERNAL. An addition and a removal that
+leaves a key are authorized by an enrolled key's assertion, as
+anywhere; their disk-proof forms have no selection yet, so they cannot
+be asked for.
 
 The recovery key is not hardware-backed, and is acceptable here because
 its holder already has equal power offline: from the live medium it

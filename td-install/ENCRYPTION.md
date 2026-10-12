@@ -1792,7 +1792,13 @@ lock as TOKEN-LOGIN.md specifies, and unlock needs a login key.
 login-key operation. Replacing lost login keys on a protected machine
 takes a fresh proof at that moment, the recovery key or a disk security
 key, under the rule TOKEN-LOGIN.md "Enrollment, addition and removal"
-states. Upgrade's first phase requires an enrolled login state, and the
+states. Its keyslot test runs only through `td-install
+storage-operation`, the running system's one keyslot-test surface
+(DESIGN.md "Full-system volume consumers"), and its consent step, `1b`
+selection, PIN-field profile and compositor screen land with 8e's
+storage-operation wire; until then a protected machine refuses every
+login-key operation only a disk proof can authorize. Upgrade's first
+phase requires an enrolled login state, and the
 last login key cannot be removed on a protected machine, so a recovery
 boot never finds an unlocked session.
 
@@ -2380,8 +2386,10 @@ commit.
      consumption with its consumed and protected markers, amendment 9's
      admission byte in `9a`, an unenrolled protected machine locking,
      and the compositor's admitted first paint; then TOKEN-LOGIN.md's
-     protected-volume rule: the disk proof for login-key operations and
-     the last-key refusal (td-authd and td-secret's login operation).
+     protected-volume rule as far as it needs no disk proof: the
+     last-key refusal, and, until 8e's disk proof, the refusal of every
+     login-key operation only that proof can authorize (td-authd and
+     td-secret's login operation).
    - **8e, predicted selector update.** A documentation commit fixing
      td-authd's storage-operation wire (amendment 10) and the
      compositor's storage screen before their code; the `td-fat` crate
@@ -2394,7 +2402,11 @@ commit.
      td-authd's supervision, which refuses it in production; the
      selector's pre-seal, its authentication against `current`'s
      `bzImage` and `root.erofs`, its retry token, deletion and immediate
-     reboot after `update`, and the commit.
+     reboot after `update`, and the commit; and TOKEN-LOGIN.md's disk
+     proof for login-key operations, whose consent step, `1b` selection,
+     PIN-field profile and compositor screen the same documentation
+     commit fixes, and whose keyslot test runs through
+     `storage-operation`, lifting 8d's interim refusal.
    - **8f, re-encrypting upgrade.** td-protector's upgrade planner over
      the states U0 to U5 and the runner's `reencrypt` (initialization in
      both resilience modes and `--resume-only`) and `token import`
@@ -2790,13 +2802,11 @@ Increment 8's evidence, by sub-increment:
   td-authd's: the consumption order (unlinked, consumed marker created,
   then judged), a second record in one boot discarded, each refusal
   (UID, manifest ID, age, unenrolled, method 0), the protected marker
-  making an unenrolled state lock, the admission byte only in the
-  generation's first answer, a login-key operation on a protected
-  machine authorized by a fresh recovery key or disk-token assertion
-  whose derived passphrase opens its keyslot, and refused with a wrong
-  one, a stale one, none (an admitted session included) or a validly
-  signed assertion from a fido2 token added to the header without a
-  keyslot it opens, and the last-key removal refused there. The
+  making an unenrolled state lock, and `/run/td-admit` alone doing so
+  when the marker cannot be made, the admission byte only in the
+  generation's first answer, and on a protected machine the last-key
+  removal and every login-key operation only a disk proof can authorize
+  refused before any token, by root and by the worker. The
   compositor's: an admitted first paint unlocked, every other generation
   locked, and `Super+l` after admission locking.
 - **8e.** FAT tests over images built in the test: admission of td's
@@ -2818,7 +2828,13 @@ Increment 8's evidence, by sub-increment:
   with an authentic pair keeps it and writes the retry token, and only
   the retry's failure with that token verifying offers `update`, which
   reboots at once; a retry token forged, copied from another volume or
-  naming another pair offers nothing.
+  naming another pair offers nothing. Disk-proof tests: a login-key
+  operation on a protected machine authorized by a fresh recovery key
+  or disk-token assertion whose derived passphrase opens its keyslot,
+  tested through `storage-operation`, and refused with a wrong one, a
+  stale one, none (an admitted session included) or a validly signed
+  assertion from a fido2 token added to the header without a keyslot it
+  opens.
 - **8f.** Planner tests drive the upgrade from each state U0 to U5 to
   every cut in the table, crashes inside reencryption in both resilience
   modes among them, and require one final header: tpm-pin or
@@ -2920,11 +2936,11 @@ Increment 8's evidence, by sub-increment:
     keys at once and none are refused; a no-PIN assertion opens nothing.
   - **FIDO2 primary.** A second installation upgraded with A as primary
     and B as recovery: A's boot is admitted and B's is not.
-  - **Recovery on an unenrolled login state.** With the protected marker
-    present, root removes the login record; a recovery-key boot starts
-    locked; the next PIN boot's first frame is the session, where a key
-    is enrolled with the recovery key typed as the disk proof, and a
-    second attempt without a proof is refused.
+  - **Recovery on an unenrolled login state** (8e's disk proof). With
+    the protected marker present, root removes the login record; a
+    recovery-key boot starts locked; the next PIN boot's first frame is
+    the session, where a key is enrolled with the recovery key typed as
+    the disk proof, and a second attempt without a proof is refused.
   - **Management.** The recovery key, authorizing, adds token B; B,
     authorizing, adds C and removes A; A is then refused and the header
     holds no keyslot for it; a PIN change requested on the running

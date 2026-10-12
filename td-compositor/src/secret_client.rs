@@ -595,6 +595,8 @@ pub(crate) fn login_failure(kind: u8, detail: u8) -> Option<&'static [&'static s
         (0x81, 0) => &["EIGHT KEYS ALREADY ENROLLED"],
         (0x82, 0) => &["LOGIN KEYS ALREADY ENROLLED"],
         (0x83, 0) => &["KEY LIST CHANGED; REOPEN"],
+        (0x84, 0) => &["ENROLLING HERE NEEDS A DISK PROOF"],
+        (0x85, 0) => &["THE LAST KEY STAYS ON THIS MACHINE"],
         _ => return None,
     })
 }
@@ -1773,6 +1775,10 @@ impl LoginPending {
             (0x81, 0) => !described && self.selection == LoginSelection::Add,
             (0x82, 0) => !described && matches!(self.selection, LoginSelection::Enroll(_)),
             (0x83, 0) => !described && matches!(self.selection, LoginSelection::Remove(..)),
+            // A protected machine's refusals (td-login/TOKEN-LOGIN.md,
+            // "Enrollment, addition and removal").
+            (0x84, 0) => !described && matches!(self.selection, LoginSelection::Enroll(_)),
+            (0x85, 0) => !described && matches!(self.selection, LoginSelection::Remove(..)),
             _ => false,
         }
     }
@@ -4243,6 +4249,8 @@ mod tests {
             (0x81, 0, &["EIGHT KEYS ALREADY ENROLLED"]),
             (0x82, 0, &["LOGIN KEYS ALREADY ENROLLED"]),
             (0x83, 0, &["KEY LIST CHANGED; REOPEN"]),
+            (0x84, 0, &["ENROLLING HERE NEEDS A DISK PROOF"]),
+            (0x85, 0, &["THE LAST KEY STAYS ON THIS MACHINE"]),
         ];
         for detail in 1..=5 {
             kinds.push((0x0e, detail, &["RESULT UNCERTAIN"]));
@@ -4303,6 +4311,11 @@ mod tests {
                 LoginSelection::Add => (0x81, 0),
                 LoginSelection::Remove(..) => (0x83, 0),
             });
+            match selection {
+                LoginSelection::Enroll(_) => ends.insert((0x84, 0)),
+                LoginSelection::Remove(..) => ends.insert((0x85, 0)),
+                LoginSelection::Unlock | LoginSelection::Add => false,
+            };
         }
         ends
     }
@@ -4425,7 +4438,7 @@ mod tests {
                     let first = steps(&selection)[0].encode();
                     assert!(end_at(&login, status, 0x08, 0, &first).1.is_ok());
                     // A selection's refusal never comes with a description.
-                    for refusal in [0x81, 0x82, 0x83] {
+                    for refusal in [0x81, 0x82, 0x83, 0x84, 0x85] {
                         assert!(end_at(&login, status, refusal, 0, &first).1.is_err());
                     }
                 }
@@ -4476,8 +4489,13 @@ mod tests {
                     Point::Baseline,
                     Notice::Login(rows),
                 ),
-                0x83 => (
+                0x83 | 0x85 => (
                     LoginSelection::Remove(removal(), 1),
+                    Point::Baseline,
+                    Notice::Login(rows),
+                ),
+                0x84 => (
+                    LoginSelection::Enroll(1),
                     Point::Baseline,
                     Notice::Login(rows),
                 ),

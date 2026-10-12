@@ -149,6 +149,8 @@ struct Context<'a> {
     /// Where the record lives and who must own it: root's in production.
     path: &'a Path,
     owner: Owner,
+    /// What the boot's `run/td-admit` is read under: `/` in production.
+    root: &'a Path,
     /// The operation's deadline counts from here.
     started: Instant,
     /// Each token session's longest life: the transport's in production.
@@ -228,6 +230,7 @@ pub(super) fn run(uid: u32) -> Result<(), String> {
         uid,
         path: Path::new(login_store::DIRECTORY),
         owner: Owner::ROOT,
+        root: Path::new("/"),
         started,
         lifetime: fido_device::MAX_LIFETIME,
         margin: COMMIT_MARGIN,
@@ -329,6 +332,12 @@ fn perform<D: Devices>(
     if record.is_none() && !enrolling {
         return Err(Failure::NoRecord);
     }
+    // TOKEN-LOGIN.md's protected-volume rule, which root applies before
+    // it describes anything: there a first enrollment needs a disk proof
+    // this build does not offer, and the last key stays.
+    if refused_when_protected(&operation) && protected(context) {
+        return Err(Failure::Internal);
+    }
     let begun = Request::begin_login(
         *request.nonce(),
         request.owner(),
@@ -369,6 +378,24 @@ fn perform<D: Devices>(
         }
         _ => Err(Failure::Internal),
     }
+}
+
+/// A first enrollment, or a removal of every key.
+fn refused_when_protected(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::LoginEnroll { .. } | Operation::LoginRemove { after: 0, .. }
+    )
+}
+
+/// Whether the protected marker is in the login directory or the boot's
+/// `run/td-admit` exists, as root reads them; a directory or a name that
+/// cannot be read counts as protected.
+fn protected(context: &Context<'_>) -> bool {
+    crate::login_state::boot_protected(context.root)
+        || crate::login_state::Directory::open(context.path, context.owner)
+            .and_then(|login| login.lookup(crate::login_state::PROTECTED))
+            .map_or(true, |found| found.is_some())
 }
 
 /// The version a write that leaves a record uses, chosen before any token
@@ -1217,6 +1244,7 @@ mod tests {
                 uid: UID,
                 path: &self.dir,
                 owner: self.owner,
+                root: &self.root,
                 started: Instant::now(),
                 lifetime: fido_device::MAX_LIFETIME,
                 margin: COMMIT_MARGIN,
@@ -2170,6 +2198,7 @@ mod tests {
             1
         );
         assert_eq!(run.matches("owner: 0,").count(), 1);
+        assert_eq!(run.matches("root: Path::new(\"/\"),").count(), 1);
         assert_eq!(login_tier::VOLUME, "/run/td-volume/td");
         assert_eq!(RETAINED_GIVE_UP, Duration::from_secs(10));
         let fixture = Fixture::new();
@@ -2514,6 +2543,65 @@ mod tests {
                 )
             )
         );
+    }
+
+    /// TOKEN-LOGIN.md's protected-volume rule behind root's: with the
+    /// protected marker, of any type, a first enrollment and a removal of
+    /// every key end before any token I/O and write nothing; an unlock
+    /// still runs.
+    #[test]
+    fn a_protected_machine_refuses_enrollment_and_the_last_key_removal() {
+        let key = Key::new(13);
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let start = key.device.transcript().len();
+        let (result, seen) = unlock(
+            &fixture,
+            &[&key.device],
+            begins(enrolling(1, 1, LoginStep::Connect)),
+        );
+        assert_eq!(result, Err(Failure::Internal));
+        assert_eq!(seen, [vec![0x18, 0], Failure::Internal.frame()]);
+        assert_eq!(key.device.transcript().len(), start);
+        assert!(matches!(fixture.state(), State::Unenrolled));
+        fixture.seed(&record(&[&key], None, None));
+        let slot = Slot {
+            position: 1,
+            key: key.fingerprint(),
+        };
+        let (result, _) = unlock(
+            &fixture,
+            &[&key.device],
+            begins(removing(1, &[slot], LoginStep::Identify)),
+        );
+        assert_eq!(result, Err(Failure::Internal));
+        assert_eq!(key.device.transcript().len(), start);
+        assert!(matches!(fixture.state(), State::Enrolled(_)));
+        let (result, _) = unlock(&fixture, &[&key.device], pin(PIN));
+        assert_eq!(result, Ok(()));
+        // The boot's `run/td-admit` alone refuses the same, as root does
+        // on a protected boot whose marker could not be made.
+        let boot = Fixture::new();
+        fs::create_dir_all(boot.root.join("run/td-admit")).unwrap();
+        let start = key.device.transcript().len();
+        let (result, seen) = unlock(
+            &boot,
+            &[&key.device],
+            begins(enrolling(1, 1, LoginStep::Connect)),
+        );
+        assert_eq!(result, Err(Failure::Internal));
+        assert_eq!(seen, [vec![0x18, 0], Failure::Internal.frame()]);
+        assert_eq!(key.device.transcript().len(), start);
+        assert!(matches!(boot.state(), State::Unenrolled));
+        // Without the marker the same enrollment would begin: the refusal
+        // is the marker's.
+        assert!(!refused_when_protected(&adding(1, LoginStep::Identify)));
+        assert!(!refused_when_protected(&removing(
+            2,
+            &[slot],
+            LoginStep::Identify
+        )));
+        assert!(refused_when_protected(&enrolling(2, 1, LoginStep::Connect)));
     }
 
     #[test]

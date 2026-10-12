@@ -2606,10 +2606,15 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    compositor then paints the session rather than the lock surface for
    that generation's first frame (`td-compositor/DESIGN.md`, "The lock
    surface"), and ends the generation on a `01` in any later answer. The
-   admission authorizes no login-key operation; with the marker present
-   the worker applies TOKEN-LOGIN.md's protected-volume rule
-   ("Enrollment, addition and removal"). Both peers ship the byte
-   atomically, still `TDLA003`, as request `1a` did.
+   admission authorizes no login-key operation; with the marker or
+   `/run/td-admit` present root and the worker apply TOKEN-LOGIN.md's
+   protected-volume rule
+   ("Enrollment, addition and removal"): the last key's removal is
+   refused (`85`), and, until 8e's disk proof lands, so is every
+   operation only that proof can authorize, a first enrollment (`84`).
+   The disk proof's keyslot test runs through amendment 10's
+   `storage-operation`, never in the login worker. Both peers ship the
+   byte atomically, still `TDLA003`, as request `1a` did.
 
    Choices the handoff left open, each the fail-closed reading: the
    record directory must itself be a root:root mode-0700 directory, or
@@ -2633,8 +2638,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     presentation, commit rounds, cancellation and teardown, carries
     ENCRYPTION.md increment 8's selector update, upgrade and its
     cancellation, protector management (token addition and removal,
-    recovery-key removal, the PIN-change and TPM-clear requests) and
-    optional Secure Boot enrollment. Physical selection alone starts
+    recovery-key removal, the PIN-change and TPM-clear requests),
+    optional Secure Boot enrollment, and the keyslot test of
+    TOKEN-LOGIN.md's login-key disk proof, whose consent step, `1b`
+    selection, PIN-field profile and screen 8e's documentation commit
+    fixes with the rest. Physical selection alone starts
     one, from a storage screen of the attention menu; each presented
     step's description names the operation, its tokens' fingerprints
     and, for a PIN or recovery-key step, which secret it asks for;
@@ -2694,14 +2702,17 @@ kind has none, or root's own: `08` TIMEOUT for root's deadline or an
 expired acknowledgement window; `09` NO RECORD when an unlock, addition
 or removal meets an unenrolled baseline; `10` INTERNAL for a malformed,
 unexpected or out-of-order frame, a stale acknowledgement or PIN, a lost
-channel or a failed exit; and four kinds the worker never sends, `80`
+channel or a failed exit; and six kinds the worker never sends, `80`
 cancelled, `81` an addition to a record that already holds eight keys,
-`82` a first enrollment over an enrolled record and `83` removal slots
-that are not the record's. A terminal status is delivered once and
-retires the operation. `15` with the operation's nonce cancels it as it
-does a secret operation (`95 00`, or `95 01` completed, `95 02` already
-ended); a stale acknowledgement or PIN, as for secret operations, also
-ends the generation.
+`82` a first enrollment over an enrolled record, `83` removal slots
+that are not the record's, and on a protected machine (amendment 9; the
+marker and `/run/td-admit` read at the operation's start, a read
+failure counting as present) `84` a first enrollment, which needs the
+disk proof this build does not offer, and `85` a removal of every key.
+A terminal status is delivered once and retires the operation. `15` with
+the operation's nonce cancels it as it does a secret operation (`95 00`,
+or `95 01` completed, `95 02` already ended); a stale acknowledgement or
+PIN, as for secret operations, also ends the generation.
 
 Root reads the baseline (`18`) first, and the baseline, not the request,
 fixes the counts. An unlock, addition or removal against an unenrolled

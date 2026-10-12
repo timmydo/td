@@ -2287,7 +2287,13 @@ step it derives later carries no key.
    one is INTERNAL, since root was shown the record. An addition to eight
    keys has no encoding (its before count is one to seven), so root
    refuses it from the baseline's count and sends no description; any
-   description it sends instead is INTERNAL, before any token I/O. The description fixes the
+   description it sends instead is INTERNAL, before any token I/O. With
+   the protected marker in the login directory or the boot's
+   `/run/td-admit`, or a directory or name it cannot read, a first
+   enrollment or a removal of every key is
+   INTERNAL too, before any token I/O: root refuses both from the
+   baseline (td-login/TOKEN-LOGIN.md, "Enrollment, addition and
+   removal"). The description fixes the
    deadline (below). A write that leaves a record then takes its version
    from `write_version` over the record versions the current and
    previous deployments read, and fails as VERSION when there is none,

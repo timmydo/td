@@ -5,11 +5,13 @@ use crate::consent::{
     Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY,
     LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES,
 };
+use crate::login_status::login_state::Owner;
 use crate::unlock::{command, deadline_after, Event, Wire};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -45,6 +47,12 @@ pub(crate) const FULL: u8 = 0x81;
 pub(crate) const ENROLLED: u8 = 0x82;
 /// A removal whose slots are not the record's.
 pub(crate) const SELECTION: u8 = 0x83;
+/// On a protected machine (td-login/TOKEN-LOGIN.md, "Enrollment, addition
+/// and removal"): a first enrollment, whose only authorization there is a
+/// disk proof, which this build does not offer.
+pub(crate) const PROOF: u8 = 0x84;
+/// On a protected machine: a removal of every key.
+pub(crate) const LAST: u8 = 0x85;
 
 /// The login operation the paired peer selects; root derives the rest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,10 +128,12 @@ impl Selection {
         owner: u32,
         baseline: &[Fingerprint],
         key: ApprovalKey,
+        protected: bool,
     ) -> Result<Operation, u8> {
         let count = u8::try_from(baseline.len()).map_err(|_| INTERNAL)?;
         let operation = match self {
             Self::Enroll(_) if count != 0 => return Err(ENROLLED),
+            Self::Enroll(_) if protected => return Err(PROOF),
             Self::Enroll(after) => Operation::LoginEnroll {
                 account: owner,
                 before: 0,
@@ -147,6 +157,9 @@ impl Selection {
                 after: count.checked_add(1).ok_or(INTERNAL)?,
                 step: LoginStep::Identify,
             },
+            Self::Remove(removed) if protected && removed.len() >= usize::from(count) => {
+                return Err(LAST)
+            }
             Self::Remove(removed) => Operation::LoginRemove {
                 account: owner,
                 before: count,
@@ -163,6 +176,18 @@ impl Selection {
         // most one key, carries a disclosure; consent says which.
         Ok(operation.disclosed(key))
     }
+}
+
+/// Whether the protected marker is in the login directory under `root`,
+/// or this boot's `run/td-admit` exists there (td-install/ENCRYPTION.md,
+/// "Verified account handoff"). A directory or a name that cannot be read
+/// counts as protected, never as unprotected.
+fn protected(root: &Path, owner: Owner) -> bool {
+    use crate::login_status::login_state::{boot_protected, directory, Directory, PROTECTED};
+    boot_protected(root)
+        || Directory::open(&directory(root), owner)
+            .and_then(|login| login.lookup(PROTECTED))
+            .map_or(true, |found| found.is_some())
 }
 
 /// Each digit `2` plus its own random byte modulo 8, as an elevation's: 256
@@ -241,6 +266,9 @@ pub(crate) struct Login {
     /// The key a disclosure step carries, drawn beside the nonce.
     approval: ApprovalKey,
     selection: Selection,
+    /// Whether the protected marker was found, or could not be read, when
+    /// the operation started.
+    protected: bool,
     child: Option<Child>,
     wire: Option<Wire>,
     phase: Phase,
@@ -312,6 +340,7 @@ impl Login {
             nonce,
             approval_key(key)?,
             selection,
+            protected(Path::new("/"), Owner::ROOT),
             command("login-operation", owner),
         )
     }
@@ -323,6 +352,7 @@ impl Login {
         nonce: [u8; 32],
         approval: ApprovalKey,
         selection: Selection,
+        protected: bool,
         mut command: Command,
     ) -> Result<Self, String> {
         let started = Instant::now();
@@ -340,6 +370,7 @@ impl Login {
             nonce,
             approval,
             selection,
+            protected,
             child: Some(child),
             wire: Some(wire),
             phase: Phase::Baseline,
@@ -586,17 +617,18 @@ impl Login {
     /// sees any description and so before any token I/O.
     fn begin(&mut self, frame: &[u8]) -> Result<Event, String> {
         let baseline = baseline(frame).ok_or("malformed login baseline")?;
-        let refused = match self
-            .selection
-            .operation(self.owner, &baseline, self.approval)
-        {
-            Err(kind) => Err(kind),
-            Ok(operation) => Request::begin_login(self.nonce, self.owner, operation, &baseline)
-                .map_err(|_| match self.selection {
-                    Selection::Remove(_) => SELECTION,
-                    _ => INTERNAL,
-                }),
-        };
+        let refused =
+            match self
+                .selection
+                .operation(self.owner, &baseline, self.approval, self.protected)
+            {
+                Err(kind) => Err(kind),
+                Ok(operation) => Request::begin_login(self.nonce, self.owner, operation, &baseline)
+                    .map_err(|_| match self.selection {
+                        Selection::Remove(_) => SELECTION,
+                        _ => INTERNAL,
+                    }),
+            };
         let request = match refused {
             Ok(request) => request,
             Err(kind) => {
@@ -758,6 +790,19 @@ impl Login {
             [42; 32],
             tests::approval(),
             selection,
+            false,
+            tests::fixture(script),
+        )
+    }
+
+    /// The same on a protected machine.
+    pub(crate) fn scripted_protected(selection: Selection, script: &str) -> Result<Self, String> {
+        Self::spawn(
+            1000,
+            [42; 32],
+            tests::approval(),
+            selection,
+            true,
             tests::fixture(script),
         )
     }

@@ -656,6 +656,88 @@ fn refusals_from_the_baseline_send_the_worker_no_step() {
     assert_eq!(login.request, Some(request(adding(3, LoginStep::Identify))));
 }
 
+/// TOKEN-LOGIN.md's protected-volume rule: a first enrollment, whose only
+/// authorization there is a disk proof this build does not offer, and a
+/// removal of every key are refused from the baseline; a removal that
+/// leaves a key, an addition and an unlock begin as anywhere else.
+#[test]
+fn a_protected_machine_refuses_enrollment_and_the_last_key_removal() {
+    let remove = |slots: &[(u8, Fingerprint)]| {
+        Selection::Remove(
+            slots
+                .iter()
+                .map(|(position, key)| Slot {
+                    position: *position,
+                    key: *key,
+                })
+                .collect(),
+        )
+    };
+    assert_eq!((PROOF, LAST), (0x84, 0x85));
+    for (selection, script, kind) in [
+        (Selection::Enroll(1), "baseline-none", PROOF),
+        (Selection::Enroll(2), "baseline-none", PROOF),
+        // Over an enrolled record, the more specific refusal.
+        (Selection::Enroll(1), "baseline-three", ENROLLED),
+        (remove(&[(1, A), (2, B), (3, C)]), "baseline-three", LAST),
+        (remove(&[(1, A)]), "baseline-none", NO_RECORD),
+        // A login state the worker cannot read ends as it, first.
+        (Selection::Enroll(1), "unavailable", 0x0a),
+    ] {
+        let mut login = Login::scripted_protected(selection, script).unwrap();
+        let (event, presented) = drive(&mut login);
+        assert_eq!(event, ended(false, kind, 0), "{script} {kind:02x}");
+        assert!(presented.is_empty() && login.request.is_none());
+        assert!(login.child.is_none());
+    }
+    for (selection, first) in [
+        (Selection::Add, request(adding(3, LoginStep::Identify))),
+        (
+            Selection::Unlock,
+            request(unlocking(3, LoginStep::Identify)),
+        ),
+    ] {
+        let mut login = Login::scripted_protected(selection, "baseline-three").unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while login.request.is_none() {
+            assert_eq!(login.poll(), Ok(Event::Waiting));
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(login.request, Some(first));
+    }
+    // A removal leaving one key discloses, as anywhere else.
+    let selection = remove(&[(1, A), (2, B)]);
+    let operation = selection.operation(1000, &[A, B, C], approval(), true);
+    assert!(matches!(
+        operation,
+        Ok(Operation::LoginRemove { after: 1, .. })
+    ));
+}
+
+/// The marker, or the boot's `run/td-admit`, is read under a root, and a
+/// directory or name that cannot be read counts as protected.
+#[test]
+fn the_protected_marker_is_read_fail_closed() {
+    use crate::login_status::tests::Root;
+    let root = Root::new();
+    let meta = std::fs::metadata(root.path()).unwrap();
+    let owner = Owner {
+        uid: std::os::unix::fs::MetadataExt::uid(&meta),
+        gid: std::os::unix::fs::MetadataExt::gid(&meta),
+    };
+    assert!(!protected(root.path(), owner));
+    std::fs::write(root.path().join("var/lib/td/login/protected"), b"").unwrap();
+    assert!(protected(root.path(), owner));
+    std::fs::remove_file(root.path().join("var/lib/td/login/protected")).unwrap();
+    std::fs::create_dir_all(root.path().join("run/td-admit")).unwrap();
+    assert!(protected(root.path(), owner));
+    std::fs::remove_dir(root.path().join("run/td-admit")).unwrap();
+    assert!(!protected(root.path(), owner));
+    root.damage();
+    assert!(protected(root.path(), owner));
+}
+
 #[test]
 fn malformed_or_out_of_order_worker_frames_end_the_operation() {
     for (selection, script) in [
@@ -786,7 +868,9 @@ fn deadlines_are_the_workers_ceilings_counted_from_before_its_start() {
             Selection::Enroll(_) => &[],
             _ => &[A, B, C],
         };
-        let operation = selection.operation(1000, baseline, approval()).unwrap();
+        let operation = selection
+            .operation(1000, baseline, approval(), false)
+            .unwrap();
         let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
         assert_eq!(request.login_ceiling(), Some(ceiling));
         let before = Instant::now();
@@ -1036,7 +1120,9 @@ fn root_puts_its_key_on_exactly_the_disclosure_steps() {
         (Selection::Unlock, &three, false),
         (Selection::Add, &three, false),
     ] {
-        let operation = selection.operation(1000, baseline, approval()).unwrap();
+        let operation = selection
+            .operation(1000, baseline, approval(), false)
+            .unwrap();
         let request = Request::begin_login(NONCE, 1000, operation, baseline).unwrap();
         assert_eq!(
             request.login_approval(),
