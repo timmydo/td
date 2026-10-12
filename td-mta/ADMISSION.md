@@ -566,7 +566,7 @@ compiled MIME level. Reject an internal output exceeding this bound before
 method effects; do not recurse on an unbounded worker stack.
 
 Before processing any method reserve the request's mandatory framing, the
-exact escaped call IDs, one bounded method-error result for every allowed call,
+exact escaped call IDs, one bounded method-error result for every admitted call,
 and the initial createdIds map and its possible response copy. Count emitted
 bytes with the same checked encoder used for output. This reserve lies inside
 the per-request/aggregate retention quota and is unavailable to optional body
@@ -579,6 +579,30 @@ for server diagnostics is 512 UTF-8 bytes per diagnostic, with redacted stable
 codes; response/property IDs and paths are counted separately at their full
 escaped lengths. Bound the number of generated properties by the method
 schema/input tokens, never an unbounded diagnostic list.
+
+The inert `jmap_request::response::Preflight` counts mandatory wire framing
+through the same bounded writer used by its all-call fallback. It owns the
+admitted request and borrows the captured Session state; exact escaped call
+IDs, state and the initial creation map are counted without copying them.
+Its passive Plan additionally covers a second serialized seed-map copy and
+one method error per actual call with a type of at most 64 ASCII letters or
+digits and a diagnostic of at most 512 UTF-8 bytes. Other error properties,
+index structures, created-map overlays, successes and implicit responses
+need their separate capacity plans. The seed map is counted, not written
+or indexed. This boundary acquires no disk reservation and performs no method
+effects. Runtime must bind its cap to the actual reservation and preserve
+original work/deadline admission while counting, executing and retaining.
+The fallback emits ordered serverFail responses with the stable redacted
+description responseCapacity; it is usable only before any method effects
+for a whole-request deterministic capacity failure. One method's capacity
+failure must instead produce that call's error and continue later calls.
+The fallback is not a transient-pressure mapping or a way to replace earlier
+committed results. It uses the captured pre-dispatch Session state; a normal
+dispatcher must replan if it needs to emit a different state. The writer does
+not publish HTTP headers; all fragments remain provisional until retention
+completes. Cancellation and step refusals allow recovering the same arenas
+with into_request. Constructor and consuming finish refusals drop them;
+this new owner promises no recovery through those consuming error returns.
 
 Before the first mutation of each method, additionally reserve its complete
 possible normal per-object success/error maps, new creation-ID records/final

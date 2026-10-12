@@ -2871,6 +2871,17 @@ references, reserve response capacity or check live admission. No discovery,
 dispatch or response retention is activated. Disk-backed results and the
 Core dispatcher remain required before advertising JMAP.
 
+The inert `jmap_request::response` preflight now binds mandatory-response
+counting to the admitted owned request and captured Session state. One shared
+writer counts and emits exact framing, escaped call IDs and the optional
+initial creation map. Its plan also covers the seed-map copy and bounded
+method-error type/diagnostic space. An all-call serverFail fallback preserves
+call order and duplicate IDs; it is restricted to deterministic refusal before
+any method effects. This implements no method execution, response index,
+creation-map lookup or HTTP activation. Binding the plan to actual retained
+capacity, charging live work/time and reserving each method's additional
+outcomes remain dispatcher responsibilities.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's

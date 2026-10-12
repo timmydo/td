@@ -147,6 +147,21 @@ encoded-header adapters or combined service RSS.
   This serializer is not Core dispatch, response reservation or a release
   gate for capabilities; scalar-view and lookup helpers remain synchronous.
   Whole-buffer bounded allocation alone is not scheduler qualification.
+  The inert mandatory-response Preflight and fallback writer reuse that same
+  owned document and encoder. A turn writes at most 16 KiB into caller scratch
+  and performs one literal/structural transition, one OwnedEmitter poll, or
+  at most 256 shared string-frame steps for the captured Session state. No
+  string, response tree or arena copy is allocated. Counting output is private
+  scratch, not a retained response. The passive plan includes exact wire
+  framing/IDs/state/map bytes, a second seed-map copy and the bounded error
+  allowance specified in ADMISSION.md. The enclosing dispatcher still charges
+  live work/time and reserves disk/index/method capacity; no endpoint uses this
+  planner yet. Tests pin Send and a maximum 8 KiB state size for these owners,
+  within the existing writer estimate; any combined retained-response walker
+  still needs its integration measurement. Constructor/consuming refusal drops
+  the request allocations. Cancellation or step refusal can return the same
+  arenas through into_request instead; this is distinct from the earlier
+  validation owners' recoverable consuming refusals.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

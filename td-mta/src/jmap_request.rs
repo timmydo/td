@@ -3,6 +3,8 @@ use crate::limits::ResourcePlan;
 use std::fmt;
 use td_json::arena::{self, Object, ParseLimit, ParseLimits, Token, Value};
 
+pub mod response;
+
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 
 /// Redacted classifications, with internal parser ceilings kept separate from
