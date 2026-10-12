@@ -18,6 +18,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Bounded references; see `td-html/DESIGN.md` for the streaming contract.
+pub mod reference;
+
 /// An RGB colour carried by [`Tag::Colour`] and [`Tag::BgColour`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgb {
@@ -739,99 +742,53 @@ fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
-    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes.get(i).copied().unwrap_or(0);
-        if b != b'&' {
-            // Copy the whole run up to the next '&' in one go.
-            let rest = s.get(i..).unwrap_or("");
-            let end = rest.find('&').unwrap_or(rest.len());
-            out.push_str(rest.get(..end).unwrap_or(""));
-            i += end.max(1);
-            continue;
+    let mut offset = 0usize;
+    while let Some(rest) = s.get(offset..) {
+        if rest.is_empty() {
+            break;
         }
-        match decode_one(s, i) {
-            Some((text, next)) => {
-                out.push(text);
-                i = next;
+        let run = rest.find('&').unwrap_or(rest.len());
+        out.push_str(rest.get(..run).unwrap_or(""));
+        let Some(start) = offset.checked_add(run) else {
+            break;
+        };
+        if start == s.len() {
+            break;
+        }
+        let Some(next) = start.checked_add(1) else {
+            break;
+        };
+        offset = next;
+        let output_start = out.len();
+        let mut reference =
+            reference::Reference::new(reference::Names::Html, reference::Context::Text);
+        loop {
+            let next = s.get(offset..).and_then(|tail| tail.chars().next());
+            let last = next.is_none_or(|c| offset.checked_add(c.len_utf8()) == Some(s.len()));
+            let progress = match reference.poll(next, last) {
+                Ok(progress) => progress,
+                // Roll back this reference before preserving its source.
+                Err(_) => {
+                    out.truncate(output_start);
+                    out.push_str(s.get(start..).unwrap_or(""));
+                    return out;
+                }
+            };
+            if progress.consumed {
+                if let Some(end) = next.and_then(|c| offset.checked_add(c.len_utf8())) {
+                    offset = end;
+                }
             }
-            None => {
-                out.push('&');
-                i += 1;
+            if let Some(c) = progress.scalar {
+                out.push(c);
+            }
+            if progress.status == reference::Status::Complete {
+                break;
             }
         }
     }
     out
-}
-
-/// Decode the reference starting at `start` (which indexes a `&`), returning
-/// the character and the index just past the reference.
-fn decode_one(s: &str, start: usize) -> Option<(char, usize)> {
-    let bytes = s.as_bytes();
-    let mut i = start + 1;
-    if bytes.get(i) == Some(&b'#') {
-        i += 1;
-        let hex = matches!(bytes.get(i), Some(b'x') | Some(b'X'));
-        if hex {
-            i += 1;
-        }
-        let digits_start = i;
-        let mut value: u32 = 0;
-        while let Some(&d) = bytes.get(i) {
-            let v = match (hex, d) {
-                (true, b'0'..=b'9') => u32::from(d - b'0'),
-                (true, b'a'..=b'f') => u32::from(d - b'a') + 10,
-                (true, b'A'..=b'F') => u32::from(d - b'A') + 10,
-                (false, b'0'..=b'9') => u32::from(d - b'0'),
-                _ => break,
-            };
-            // Saturate rather than overflow on absurdly long digit runs.
-            value = value
-                .saturating_mul(if hex { 16 } else { 10 })
-                .saturating_add(v);
-            value = value.min(0x11_0000);
-            i += 1;
-        }
-        if i == digits_start {
-            return None;
-        }
-        if bytes.get(i) == Some(&b';') {
-            i += 1;
-        }
-        return Some((from_codepoint(value), i));
-    }
-    // Named reference: at most 32 alphanumeric characters.
-    let name_start = i;
-    while i < bytes.len() && i - name_start < 32 {
-        match bytes.get(i) {
-            Some(c) if c.is_ascii_alphanumeric() => i += 1,
-            _ => break,
-        }
-    }
-    if i == name_start {
-        return None;
-    }
-    let name = s.get(name_start..i)?;
-    if bytes.get(i) == Some(&b';') {
-        if let Some((c, _)) = lookup_entity(name) {
-            return Some((c, i + 1));
-        }
-    }
-    // Legacy form without a semicolon: longest matching legacy name wins.
-    let mut len = name.len();
-    while len > 1 {
-        if let Some(prefix) = name.get(..len) {
-            if let Some((c, legacy)) = lookup_entity(prefix) {
-                if legacy {
-                    return Some((c, name_start + len));
-                }
-            }
-        }
-        len -= 1;
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
