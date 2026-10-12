@@ -2307,6 +2307,13 @@ pub(super) fn deployment_init_fixture() -> String {
 /// console line and no more: `|| :` keeps `set -e` from failing the boot.
 const LOGIN_DIRECTORY_STEP: &str = "/bin/td-firstboot ensure-login-directory /sysroot || :";
 
+/// The deployment init's admission step (td-install/ENCRYPTION.md "Verified
+/// account handoff"), right after the system's `/run` tmpfs is mounted:
+/// `td-boot admit` moves a protected release's record there from the
+/// initramfs root and removes the member. Its failure writes nothing and is
+/// no refusal, so `|| :` keeps `set -e` from failing the boot.
+const ADMIT_STEP: &str = "/bin/td-boot admit /sysroot/run || :";
+
 /// The selected deployment initramfs requires exactly one td.deployment handoff,
 /// validates that manifest and root payload, and enters the immutable root.
 fn build_deployment_init(sys: &SystemDef) -> String {
@@ -2364,13 +2371,14 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         label = td_boot_protocol::VOLUME_LABEL,
         subvol = td_boot_protocol::VOLUME_SUBVOL,
     ));
-    init.push_str(
+    init.push_str(&format!(
         "/bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
      /bin/td-boot on-volume mount-var /sysroot/var\n\
      /bin/td-util printf '%s\\n' 2 > /proc/sys/kernel/perf_event_paranoid\n\
-     /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || { echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }\n\
-     /bin/umount /sys\n\
+     /bin/td-util test \"$(/bin/td-util cat /proc/sys/kernel/perf_event_paranoid)\" = 2 || {{ echo 'td-init: kernel.perf_event_paranoid did not realize the pinned value 2' >&2; exit 1; }}\n\
      /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
+     {ADMIT_STEP}\n\
+     /bin/umount /sys\n\
      /bin/td-util printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
      /bin/td-util chmod 0600 /sysroot/run/td-deployment\n\
      /bin/td-util mkdir -p /sysroot/run/td-volume\n\
@@ -2381,7 +2389,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      fi\n\
      /bin/mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
      /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home",
-    );
+    ));
     for user in sys.users {
         if gets_generic_persistent_home_setup(user) && user.uid != UI_UID {
             init.push_str(&format!(" /sysroot/var{}", user.home));
@@ -11266,6 +11274,41 @@ mod tests {
                 "the volatile boot key must authorize only the admitted primary account"
             );
         }
+    }
+
+    /// The admission step runs once, right after the system's `/run` tmpfs
+    /// is mounted and before anything else is written there, so the record
+    /// lands only on that tmpfs; its failure is no refusal; `mount-root`,
+    /// which leaves the record, runs before it; and sysfs stays mounted
+    /// until after it, since td-boot's console mirror reads
+    /// `/sys/class/tty/console/active` to reach the VT.
+    #[test]
+    fn the_admission_record_moves_right_after_the_run_tmpfs() {
+        let init = build_deployment_init(&SYSTEM);
+        assert_eq!(ADMIT_STEP, "/bin/td-boot admit /sysroot/run || :");
+        assert_eq!(
+            init.lines()
+                .filter(|line| line.contains("td-boot admit"))
+                .count(),
+            1
+        );
+        let run = "/bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n";
+        assert!(init.contains(&format!("{run}{ADMIT_STEP}\n")), "{init}");
+        let admit = init.find(ADMIT_STEP).expect("admission step");
+        let mount_roots: Vec<usize> = init
+            .match_indices("/bin/td-boot on-volume mount-root /volume")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(mount_roots.len(), 2);
+        assert!(mount_roots.iter().all(|at| *at < admit));
+        assert!(admit < init.find("/sysroot/run/td-deployment").expect("deployment"));
+        assert!(
+            init.contains(&format!("{ADMIT_STEP}\n/bin/umount /sys\n")),
+            "{init}"
+        );
+        assert_eq!(init.matches("/bin/umount /sys\n").count(), 1);
+        let sysfs = init.find("/bin/mount -t sysfs").expect("sysfs mount");
+        assert!(sysfs < admit);
     }
 
     #[test]

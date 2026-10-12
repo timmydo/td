@@ -30,6 +30,7 @@ use td_protector::release::{self, Outcome, Resealed, Runner, Tpm};
 use td_protector::transition::RECOVERY_SLOT;
 use td_protector::Secret;
 
+use crate::admission;
 use crate::fido;
 use crate::protocol::VOLUME_KEY_BYTES;
 use crate::td_fs::open_real_file;
@@ -84,8 +85,14 @@ const EXIT_REFUSED: i32 = 4;
 
 /// What the selector does after the release order.
 pub(crate) enum Unlock {
-    /// The mapping is open; boot with this key for the handoff.
-    Boot { keyslot: u8, key: VolumeKey },
+    /// The mapping is open; boot with this key for the handoff, and after
+    /// a protected release with the admission record's method; a
+    /// device-bound release, an upgrading header's included, writes none.
+    Boot {
+        keyslot: u8,
+        key: VolumeKey,
+        admission: Option<admission::Method>,
+    },
     /// Refuse boot and halt, naming the reason. Nothing secret is held.
     Halt(String),
     /// A cryptsetup step after a release, or after a recovery key opened
@@ -349,6 +356,7 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
     let Unlock::Boot { key, .. } = opened else {
         return opened;
     };
+    let admission = Some(admission_method(released.method));
     console(&format!(
         "keyslot {keyslot} opened with {}",
         match released.method {
@@ -367,7 +375,24 @@ fn unlock_protected<T: Tpm, C: Runner, F: Fido>(
         cryptsetup,
         console,
     );
-    Unlock::Boot { keyslot, key }
+    Unlock::Boot {
+        keyslot,
+        key,
+        admission,
+    }
+}
+
+/// The admission record's method for a protected release
+/// (ENCRYPTION.md "Verified account handoff"): a primary protector's
+/// admits, a recovery one's admits nothing.
+pub(crate) fn admission_method(method: protected::Method) -> admission::Method {
+    match method {
+        protected::Method::TpmPin => admission::Method::TpmPin,
+        protected::Method::Fido2Primary => admission::Method::Fido2Primary,
+        protected::Method::Fido2Recovery | protected::Method::RecoveryKey => {
+            admission::Method::None
+        }
+    }
 }
 
 /// A protected halt's reason, ending once in the zeroing and the refusal,
@@ -738,6 +763,7 @@ fn open<C: Runner>(
         Ok(volume) => Unlock::Boot {
             keyslot,
             key: volume,
+            admission: None,
         },
         Err(error) => Unlock::Failed(error),
     }
@@ -1041,7 +1067,7 @@ pub(crate) mod tests {
         let scratch = Scratch::new();
         let mut script = Script::new(Dump::Key);
         let (unlock, secret) = open_released(&mut script, &scratch.keys());
-        let Unlock::Boot { keyslot, key } = unlock else {
+        let Unlock::Boot { keyslot, key, .. } = unlock else {
             panic!("the release did not boot");
         };
         assert_eq!(keyslot, 2);
@@ -1588,7 +1614,7 @@ pub(crate) mod tests {
             &scratch,
             Resealed::Complete { keyslot: 9 },
         );
-        let Unlock::Boot { keyslot, key } = run.unlock else {
+        let Unlock::Boot { keyslot, key, .. } = run.unlock else {
             panic!("the right key did not boot: {:?}", run.lines);
         };
         assert_eq!(keyslot, 0);
@@ -1836,7 +1862,7 @@ pub(crate) mod tests {
             &mut console,
             &scratch,
         );
-        let Unlock::Boot { keyslot, key } = outcome else {
+        let Unlock::Boot { keyslot, key, .. } = outcome else {
             panic!("{lines:?}");
         };
         assert_eq!((keyslot, key.expose()), (0, &script.key[..]));
@@ -1872,7 +1898,14 @@ pub(crate) mod tests {
                 }
             };
             assert!(
-                matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+                matches!(
+                    outcome,
+                    Unlock::Boot {
+                        keyslot: 0,
+                        admission: None,
+                        ..
+                    }
+                ),
                 "{lines:?}"
             );
             assert_eq!(console.prompts, [KEY_PROMPT]);
@@ -2184,10 +2217,14 @@ pub(crate) mod tests {
             &scratch,
             &mut keys,
         );
-        let Unlock::Boot { keyslot, .. } = outcome else {
+        let Unlock::Boot {
+            keyslot, admission, ..
+        } = outcome
+        else {
             panic!("no boot: {lines:?}");
         };
         assert_eq!(keyslot, 1);
+        assert_eq!(admission, Some(admission::Method::Fido2Primary));
         assert_eq!(made.get(), 2);
         assert_eq!(
             console.prompts,
@@ -2298,7 +2335,14 @@ pub(crate) mod tests {
             &mut SecurityKeys(|| NoKeys),
         );
         assert!(
-            matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+            matches!(
+                outcome,
+                Unlock::Boot {
+                    keyslot: 0,
+                    admission: Some(admission::Method::None),
+                    ..
+                }
+            ),
             "{lines:?}"
         );
         assert_eq!(console.prompts, [protected::ANOTHER_WAY_PROMPT]);
@@ -2337,7 +2381,14 @@ pub(crate) mod tests {
             let (outcome, lines) =
                 run_unlock(&header, Some(&mut tpm), &mut script, &mut console, &scratch);
             assert!(
-                matches!(outcome, Unlock::Boot { keyslot: 0, .. }),
+                matches!(
+                    outcome,
+                    Unlock::Boot {
+                        keyslot: 0,
+                        admission: None,
+                        ..
+                    }
+                ),
                 "{lines:?}"
             );
             let expected: &[&str] = if upgrading {
@@ -2346,6 +2397,24 @@ pub(crate) mod tests {
                 &[KEY_PROMPT, RESEAL_PROMPT]
             };
             assert_eq!(console.prompts, expected, "{lines:?}");
+        }
+    }
+
+    /// A primary protector's release admits; a recovery one's admits
+    /// nothing (ENCRYPTION.md "Verified account handoff").
+    #[test]
+    fn only_a_primary_release_admits() {
+        for (method, expected) in [
+            (protected::Method::TpmPin, admission::Method::TpmPin),
+            (
+                protected::Method::Fido2Primary,
+                admission::Method::Fido2Primary,
+            ),
+            (protected::Method::Fido2Recovery, admission::Method::None),
+            (protected::Method::RecoveryKey, admission::Method::None),
+        ] {
+            assert_eq!(admission_method(method), expected);
+            assert_eq!(expected.admits(), method.admits(), "{method:?}");
         }
     }
 

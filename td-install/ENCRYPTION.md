@@ -583,9 +583,10 @@ td-boot writes each console line to standard error as today and, in both
 initramfs, the same bytes to `/dev/tty1`, opened once, write-only,
 `O_NOCTTY` and `O_NONBLOCK`: in the selector's `on-volume boot` and
 `live-boot`, and in the deployment initramfs's `on-volume mount-root`,
-`on-volume mount-var`, `root-loop`, `live-root` and `live-seed`, the
-verbs those inits run. No other run mirrors, so the running system's VT,
-which the compositor's display covers, gets nothing from td-boot. A line
+`on-volume mount-var`, `admit`, `root-loop`, `live-root` and
+`live-seed`, the verbs those inits run. No other run mirrors, so the
+running system's VT, which the compositor's display covers, gets
+nothing from td-boot. A line
 is mirrored whole, after its standard-error write. There is no mirror
 when `/dev/console` is the VT, or when `active` cannot be read or
 parsed, so no line is written twice to one terminal. Nothing waits on
@@ -1733,16 +1734,31 @@ beside the key, on a second pipe, as a second archive member
 `td-admit-v1`, a regular file of mode 0400 owned by root with exactly
 those bytes, under the rules the key member has (`--fds-key-admit DIGEST
 KEY RECORD CMDLINE`, the record written and its write end closed before
-td-kexec starts).
+td-kexec starts). A protected boot whose selector carries no
+measurement policy, and so makes no PCR 11 measurement, writes the
+record with method 0: it admits nothing, though, as any valid record
+does, it marks the machine protected. So does a protected boot whose
+measurement fails, a missing or failing TPM or a readback after the
+extension that leaves PCR 11 uncertain: the selector says so on the
+consoles in a fixed line and boots, since refusing would leave a
+FIDO2-primary machine without a working TPM unbootable, and method 0
+admits nothing. A device-bound or unencrypted boot, which carries no
+policy, still stops on a measurement failure. A device-bound release
+writes none, an upgrading header's included until 8f's upgrade boot.
 
 The deployment initramfs never carries it to disk. `mount-root` handles
 the key as today and leaves the record; a new verb, `td-boot admit
 /sysroot/run`, which the deployment init runs right after it mounts the
-system's `/run` tmpfs, inspects the member as `mount-root` inspects the
+system's `/run` tmpfs and before it unmounts sysfs (the console mirror
+reads `/sys/class/tty/console/active`, so its lines reach the VT),
+inspects the member as `mount-root` inspects the
 key, writes it to a fresh root:root mode-0700 `/sysroot/run/td-admit` as
 `v1`, a single-link root:root mode-0600 file created exclusively, and
-removes the member, whether or not it passed. A failure writes nothing
-and is no refusal: a lost record costs a login, not a boot. A deployment
+removes the member, whether or not it passed, before it writes. A
+failure writes nothing and is no refusal: a lost record costs a login,
+not a boot, so the init line is `/bin/td-boot admit /sysroot/run || :`;
+the verb reports the failure on the consoles and exits nonzero. Without
+a member it writes nothing and says nothing. A deployment
 from before the verb leaves the member in its initramfs root, which
 `switch_root` frees.
 

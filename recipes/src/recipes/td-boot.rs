@@ -16,6 +16,8 @@ use crate::types::{Recipe, Step};
 // `--extern`, as td-install passes them. td-tpm and td-fido include the
 // same engine SHA-256 by `#[path]`.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
+const ADMISSION_RS: &str = include_str!("../../../td-boot/src/admission.rs");
+const ADMIT_RS: &str = include_str!("../../../td-boot/src/admit.rs");
 const CAP_RS: &str = include_str!("../../../td-boot/src/cap.rs");
 const UNLOCK_RS: &str = include_str!("../../../td-boot/src/unlock.rs");
 const MEASUREMENT_RS: &str = include_str!("../../../td-boot/src/measurement.rs");
@@ -192,6 +194,16 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/admission.rs".into(),
+            content: ADMISSION_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/admit.rs".into(),
+            content: ADMIT_RS.into(),
             exec: false,
         },
         Step::WriteFile {

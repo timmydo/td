@@ -7,6 +7,14 @@
 //! `td-install/DESIGN.md` §6 is why.
 #![forbid(unsafe_code)]
 
+// The protected tier's admission record, shared with td-authd by its path:
+// td-boot writes it, td-authd reads and judges it.
+#[path = "admission.rs"]
+#[allow(dead_code, reason = "the record's reader and judge are td-authd's")]
+mod admission;
+// The deployment initramfs's `admit` verb.
+#[path = "admit.rs"]
+mod admit;
 #[path = "cap.rs"]
 mod cap;
 // Which terminal `/dev/console` is, td-init's, shared with its secret-line
@@ -110,6 +118,11 @@ enum Mode {
     },
     OnVolume {
         operation: Box<Mode>,
+    },
+    /// The deployment initramfs moves the admission record to the
+    /// system's `/run` (td-install/ENCRYPTION.md "Verified account handoff").
+    Admit {
+        run: PathBuf,
     },
     MountVolume {
         device: PathBuf,
@@ -305,7 +318,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot fido-worker <index> <inode> <rdev>",
+        "usage: td-boot on-volume <boot|install|update|rollback|success|mount-root|mount-var> <arguments without device>\n       td-boot volume [UUID]\n       td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory> [trusted-key]\n       td-boot update <device> <mountpoint> <volume> <channel> <trusted-key>\n       td-boot publish <volume-root> <deployment-directory> [trusted-key]\n       td-boot rollback <device> <mountpoint> <current-id> <previous-id>\n       td-boot success <device> <mountpoint> <deployment-id>\n       td-boot authenticate <deployment-directory> [trusted-key]\n       td-boot validate-source <deployment-directory> <trusted-key>\n       td-boot live-boot <mountpoint> <cmdline>\n       td-boot live-root <mountpoint> <deployment-id> <loop-device>\n       td-boot live-seed <mountpoint> <deployment-id> <seed-directory>\n       td-boot admit <run>\n       td-boot fido-worker <index> <inode> <rdev>",
     )
 }
 
@@ -356,6 +369,13 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             Ok(Mode::OnVolume {
                 operation: Box::new(parse_args(inner.into_iter())?),
             })
+        }
+        Some(mode) if mode == OsStr::new("admit") => {
+            let run = PathBuf::from(args.next().ok_or_else(usage_error)?);
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Admit { run })
         }
         Some(mode) if mode == OsStr::new("mount-root") || mode == OsStr::new("mount-var") => {
             let device = PathBuf::from(args.next().ok_or_else(usage_error)?);
@@ -2406,19 +2426,27 @@ fn kexec_command(kernel: File, initramfs: File, cmdline: &OsStr) -> Command {
 
 /// `--fds-key`: as `--fds`, with the initramfs digest td-boot verified and
 /// the volume key on a pipe this process holds, named `/proc/PID/fd/N`
-/// (td-install/ENCRYPTION.md "Boot and authority boundaries").
+/// (td-install/ENCRYPTION.md "Boot and authority boundaries");
+/// `--fds-key-admit` with the admission record on a second such pipe
+/// ("Verified account handoff").
 fn key_kexec_command(
     kernel: File,
     initramfs: File,
     digest: &str,
     key_pipe: &Path,
+    record_pipe: Option<&Path>,
     cmdline: &OsStr,
 ) -> Command {
     let mut command = Command::new(TD_KEXEC);
+    match record_pipe {
+        None => command.arg("--fds-key").arg(digest).arg(key_pipe),
+        Some(record) => command
+            .arg("--fds-key-admit")
+            .arg(digest)
+            .arg(key_pipe)
+            .arg(record),
+    };
     command
-        .arg("--fds-key")
-        .arg(digest)
-        .arg(key_pipe)
         .arg(cmdline)
         .stdin(Stdio::from(kernel))
         .stdout(Stdio::from(initramfs));
@@ -3004,12 +3032,91 @@ fn read_only_recovery(
     }
 }
 
+/// What the installed selector hands the deployment beside the kernel and
+/// initramfs on an encrypted volume: the volume key, and after a protected
+/// release the method its admission record carries.
+#[derive(Clone, Copy)]
+struct Handoff<'a> {
+    key: &'a unlock::VolumeKey,
+    admission: Option<admission::Method>,
+}
+
+/// The admission record for the selected deployment `id`: the primary
+/// account, `method` once the PCR 11 measurement succeeded and no
+/// admission otherwise (td-install/ENCRYPTION.md "Verified account
+/// handoff").
+fn admission_record(
+    id: &str,
+    method: admission::Method,
+    measured: bool,
+) -> io::Result<[u8; admission::RECORD_BYTES]> {
+    let manifest = admission::manifest_id(id.as_bytes())
+        .ok_or_else(|| invalid(format!("deployment id {id:?} is not 64 hex digits")))?;
+    Ok(admission::Record {
+        uid: admission::PRIMARY_UID,
+        method: if measured {
+            method
+        } else {
+            admission::Method::None
+        },
+        manifest,
+    }
+    .encode())
+}
+
+/// The consoles' line when a protected boot's measurement fails: fixed,
+/// so it carries nothing the TPM or the deployment said.
+const MEASUREMENT_FAILED: &str =
+    "td-boot: TD-BOOT-UNMEASURED PCR 11 measurement failed; this boot admits no session";
+
+/// Measures the selected deployment `id` into PCR 11 when the selector
+/// carries a measurement policy, then builds a protected release's
+/// admission record with the result. A failure aborts the boot, except
+/// after a protected release (`admission` set): its record then carries
+/// method 0 and the boot goes on, since refusing would leave a machine
+/// without a working TPM, a FIDO2-primary one included, unbootable, and
+/// method 0 admits nothing. That holds when PCR 11 is uncertain too,
+/// after an extension whose readback failed.
+fn measured_record(
+    id: &str,
+    measured: bool,
+    admission: Option<admission::Method>,
+    measure: impl FnOnce() -> io::Result<[u8; 32]>,
+    console: &mut impl Write,
+) -> io::Result<Option<[u8; admission::RECORD_BYTES]>> {
+    let measured = if !measured {
+        false
+    } else {
+        match measure() {
+            Ok(pcr) => {
+                writeln!(
+                    console,
+                    "td-boot: TD-BOOT-MEASURED-PCR11 {}",
+                    sha256::to_base16(&pcr)
+                )?;
+                true
+            }
+            Err(_) if admission.is_some() => {
+                let _ = writeln!(console, "{MEASUREMENT_FAILED}");
+                false
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // Written only now, after the measurement: a release whose deployment
+    // was not measured admits nothing, though its record still marks the
+    // machine protected.
+    admission
+        .map(|method| admission_record(id, method, measured))
+        .transpose()
+}
+
 fn kexec_boot_decision(
     deployment: Deployment,
     decision: &BootDecision,
     base_cmdline: &OsStr,
     measured: bool,
-    handoff: Option<&unlock::VolumeKey>,
+    handoff: Option<Handoff<'_>>,
 ) -> io::Result<()> {
     report_boot_decision(&mut mirror::stderr(), decision)?;
     let cmdline = kernel_cmdline(
@@ -3017,14 +3124,13 @@ fn kexec_boot_decision(
         &decision.deployment_id,
         decision.bookkeeping_error.is_some(),
     )?;
-    if measured {
-        let pcr = measurement::measure(&deployment.id, cmdline.as_bytes())?;
-        writeln!(
-            mirror::stderr(),
-            "td-boot: TD-BOOT-MEASURED-PCR11 {}",
-            sha256::to_base16(&pcr)
-        )?;
-    }
+    let record = measured_record(
+        &deployment.id,
+        measured,
+        handoff.and_then(|handoff| handoff.admission),
+        || measurement::measure(&deployment.id, cmdline.as_bytes()),
+        &mut mirror::stderr(),
+    )?;
     let Deployment {
         kernel,
         initramfs,
@@ -3034,14 +3140,27 @@ fn kexec_boot_decision(
     // An encrypted volume's key, after the measurement: the whole key and
     // then end of file on a pipe whose write end is closed, which td-kexec
     // opens anew by name and appends to its sealed copy of the initramfs.
-    let key_pipe = handoff.map(|key| KeyFile::new(key.expose())).transpose()?;
-    let mut command = match &key_pipe {
-        None => kexec_command(kernel, initramfs, cmdline.as_os_str()),
-        Some(pipe) => key_kexec_command(
+    // The record rides a second such pipe.
+    let key_pipe = handoff
+        .map(|handoff| KeyFile::new(handoff.key.expose()))
+        .transpose()?;
+    let record_pipe = record.map(|record| KeyFile::new(&record)).transpose()?;
+    let mut command = match (&key_pipe, &record_pipe) {
+        (None, _) => kexec_command(kernel, initramfs, cmdline.as_os_str()),
+        (Some(pipe), None) => key_kexec_command(
             kernel,
             initramfs,
             &initramfs_digest,
             pipe.path(),
+            None,
+            cmdline.as_os_str(),
+        ),
+        (Some(pipe), Some(record)) => key_kexec_command(
+            kernel,
+            initramfs,
+            &initramfs_digest,
+            pipe.path(),
+            Some(record.path()),
             cmdline.as_os_str(),
         ),
     };
@@ -3055,7 +3174,7 @@ fn run_boot(
     device: &Path,
     mountpoint: &Path,
     base_cmdline: &OsStr,
-    handoff: Option<&unlock::VolumeKey>,
+    handoff: Option<Handoff<'_>>,
 ) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
@@ -3900,8 +4019,8 @@ fn run() -> io::Result<()> {
 /// The verbs the two initramfs run, whose console lines are mirrored to the
 /// VT (td-install/ENCRYPTION.md "Keyboard console"): the selector's
 /// `on-volume boot` and `live-boot`, and the deployment initramfs's
-/// `on-volume mount-root`, `on-volume mount-var`, `root-loop`, `live-root`
-/// and `live-seed`. No other run mirrors, so the running system's VT, which
+/// `on-volume mount-root`, `on-volume mount-var`, `admit`, `root-loop`,
+/// `live-root` and `live-seed`. No other run mirrors, so the running system's VT, which
 /// the compositor's display covers, gets nothing from td-boot.
 fn mirrors(mode: &Mode) -> bool {
     match mode {
@@ -3909,6 +4028,7 @@ fn mirrors(mode: &Mode) -> bool {
             matches!(**operation, Mode::Boot { .. } | Mode::MountVolume { .. })
         }
         Mode::LiveBoot { .. }
+        | Mode::Admit { .. }
         | Mode::RootLoop { .. }
         | Mode::LiveRoot { .. }
         | Mode::LiveSeed { .. } => true,
@@ -4024,7 +4144,7 @@ fn boot_encrypted(
     let mut line = selector_release::Applet(Path::new("/bin").join(protocol::SECRET_LINE_APPLET));
     // A protected header's security keys, one FIDO2 client per Enter.
     let mut keys = selector_release::SecurityKeys::root();
-    let (keyslot, key) = match selector_release::unlock(
+    let (keyslot, key, admission) = match selector_release::unlock(
         &header,
         &partition.path(),
         tpm.as_mut(),
@@ -4034,7 +4154,11 @@ fn boot_encrypted(
         Path::new(selector_release::KEY_DIRECTORY),
         &mut console,
     ) {
-        selector_release::Unlock::Boot { keyslot, key } => (keyslot, key),
+        selector_release::Unlock::Boot {
+            keyslot,
+            key,
+            admission,
+        } => (keyslot, key, admission),
         selector_release::Unlock::Halt(reason) => halt(&reason),
         selector_release::Unlock::Failed(error) => return Err(error),
     };
@@ -4043,7 +4167,15 @@ fn boot_encrypted(
         "volume {uuid} opened with keyslot {keyslot} as {}",
         mapping.describe()
     ));
-    run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))
+    run_boot(
+        &mapping.path(),
+        mountpoint,
+        cmdline,
+        Some(Handoff {
+            key: &key,
+            admission,
+        }),
+    )
 }
 
 /// What `bind_volume` decided.
@@ -4136,6 +4268,23 @@ fn bind_volume(
     Ok(Binding::Bound(pinned))
 }
 
+/// `admit RUN`: the deployment init runs it right after mounting the
+/// system's `/run` tmpfs at `RUN`; its failure, which writes nothing, is
+/// no refusal (the init line ends in `|| :`).
+fn run_admit(run: &Path) -> io::Result<()> {
+    require_absolute(run, "run directory")?;
+    if admit::admit(Path::new("/"), run, admit::Owner::ROOT)? {
+        writeln!(
+            mirror::stderr(),
+            "td-boot: admission record moved to {}",
+            run.join(admission::DIRECTORY)
+                .join(admission::RECORD)
+                .display()
+        )?;
+    }
+    Ok(())
+}
+
 fn mount_volume(device: &Path, mountpoint: &Path, var: bool) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
@@ -4162,6 +4311,7 @@ fn dispatch(mode: Mode) -> io::Result<()> {
             fido::worker(&index, &inode, &rdev).map_err(io::Error::other)
         }
         Mode::OnVolume { operation } => on_volume(*operation),
+        Mode::Admit { run } => run_admit(&run),
         Mode::MountVolume {
             device,
             mountpoint,
@@ -7036,17 +7186,197 @@ mod tests {
             handoff.find(needle).unwrap()
         };
         let arguments = position("let cmdline = kernel_cmdline(");
-        let measure = position("measurement::measure(&deployment.id, cmdline.as_bytes())?");
-        // The key is written to its pipe only after the measurement, and
-        // the pipe lives until td-kexec returns.
-        let piped = position(".map(|key| KeyFile::new(key.expose()))");
-        let plain = position("None => kexec_command(kernel, initramfs, cmdline.as_os_str()),");
-        let keyed = position("Some(pipe) => key_kexec_command(");
+        // The admission record is built only after the measurement, with
+        // its result, and from the deployment that was measured.
+        let recorded = position("let record = measured_record(\n        &deployment.id,");
+        let measure = position("|| measurement::measure(&deployment.id, cmdline.as_bytes()),");
+        // The key and the record are written to their pipes only after the
+        // measurement, and the pipes live until td-kexec returns.
+        let piped = position(".map(|handoff| KeyFile::new(handoff.key.expose()))");
+        let record_piped = position("let record_pipe = record.map(|record| KeyFile::new(&record))");
+        let plain = position("(None, _) => kexec_command(kernel, initramfs, cmdline.as_os_str()),");
+        let keyed = position("(Some(pipe), None) => key_kexec_command(");
+        let admitting = position("(Some(pipe), Some(record)) => key_kexec_command(");
         let execute = position("run_command(&mut command, \"td-kexec\")?;");
-        assert!(arguments < measure && measure < piped);
-        assert!(piped < plain && plain < keyed && keyed < execute);
-        assert!(handoff.contains("if measured {"));
+        assert!(arguments < recorded && recorded < measure && measure < piped);
+        assert!(piped < record_piped && record_piped < plain);
+        assert!(plain < keyed && keyed < admitting && admitting < execute);
+        let record = source
+            .split_once("\nfn measured_record(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let at = |needle: &str| {
+            assert_eq!(record.matches(needle).count(), 1, "{needle}");
+            record.find(needle).unwrap()
+        };
+        // Only a protected release survives a failed measurement.
+        assert!(at("match measure() {") < at("Err(_) if admission.is_some() => {"));
+        assert!(at("Err(_) if admission.is_some() => {") < at("Err(error) => return Err(error),"));
+        assert!(
+            at("Err(error) => return Err(error),") < at("admission_record(id, method, measured)")
+        );
         assert!(!handoff.contains("drop(key_pipe)"));
+        assert!(!handoff.contains("drop(record_pipe)"));
+    }
+
+    /// The record names the primary account and the selected deployment,
+    /// and carries the release's method only after a measurement.
+    #[test]
+    fn the_admission_record_follows_the_measurement() {
+        let id = "00112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210";
+        for method in [
+            admission::Method::None,
+            admission::Method::TpmPin,
+            admission::Method::Fido2Primary,
+        ] {
+            for measured in [false, true] {
+                let record =
+                    admission::Record::decode(&admission_record(id, method, measured).unwrap())
+                        .unwrap();
+                assert_eq!(record.uid, 1000);
+                assert_eq!(
+                    record.manifest,
+                    admission::manifest_id(id.as_bytes()).unwrap()
+                );
+                let expected = if measured {
+                    method
+                } else {
+                    admission::Method::None
+                };
+                assert_eq!(record.method, expected, "{method:?} {measured}");
+            }
+        }
+        assert!(admission_record("not an id", admission::Method::TpmPin, true).is_err());
+        // The UID td-protector's tokens name is the record's.
+        assert_eq!(
+            td_protector::protected::ACCOUNT,
+            admission::PRIMARY_UID.to_string()
+        );
+        assert_eq!(admission::RECORD_BYTES, protocol::ADMIT_RECORD_BYTES);
+    }
+
+    /// A protected boot whose measurement fails boots with method 0 and a
+    /// fixed console line: no TPM under a FIDO2-primary release, a failing
+    /// one under a recovery-key release, and a readback after the
+    /// extension (PCR 11 uncertain) under a tpm-pin release. A measured
+    /// boot without a protected release still aborts on the failure, and
+    /// one that succeeds keeps its method.
+    #[test]
+    fn a_protected_boot_whose_measurement_fails_boots_with_method_0() {
+        let id = "00112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210";
+        let failures = [
+            (
+                admission::Method::Fido2Primary,
+                io::ErrorKind::NotFound,
+                "open /dev/tpmrm0: No such file or directory",
+            ),
+            (
+                admission::Method::None,
+                io::ErrorKind::InvalidData,
+                "TPM PCR 11 extension failed; cold boot required: TPM_RC_FAILURE",
+            ),
+            (
+                admission::Method::TpmPin,
+                io::ErrorKind::InvalidData,
+                "read back SHA-256 PCR 11 failed; cold boot required: lost readback",
+            ),
+        ];
+        for (method, kind, why) in failures {
+            let mut console = Vec::new();
+            let record = measured_record(
+                id,
+                true,
+                Some(method),
+                || Err(io::Error::new(kind, why)),
+                &mut console,
+            )
+            .unwrap()
+            .unwrap();
+            let record = admission::Record::decode(&record).unwrap();
+            assert_eq!(record.method, admission::Method::None, "{method:?}");
+            assert_eq!(record.uid, admission::PRIMARY_UID);
+            assert_eq!(
+                String::from_utf8(console).unwrap(),
+                format!("{MEASUREMENT_FAILED}\n")
+            );
+        }
+        // No protected release: unencrypted or device-bound, the failure
+        // aborts, before any record.
+        let mut console = Vec::new();
+        let error = measured_record(
+            id,
+            true,
+            None,
+            || Err(io::Error::new(io::ErrorKind::NotFound, "no TPM")),
+            &mut console,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "no TPM");
+        assert!(console.is_empty());
+        // A measurement that succeeds keeps the method; none is taken
+        // without a policy.
+        let mut console = Vec::new();
+        let record = measured_record(
+            id,
+            true,
+            Some(admission::Method::Fido2Primary),
+            || Ok([7; 32]),
+            &mut console,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            admission::Record::decode(&record).unwrap().method,
+            admission::Method::Fido2Primary
+        );
+        assert!(String::from_utf8(console)
+            .unwrap()
+            .starts_with("td-boot: TD-BOOT-MEASURED-PCR11 0707"));
+        let record = measured_record(
+            id,
+            false,
+            Some(admission::Method::TpmPin),
+            || panic!("measured without a policy"),
+            &mut Vec::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            admission::Record::decode(&record).unwrap().method,
+            admission::Method::None
+        );
+        assert_eq!(
+            measured_record(id, false, None, || panic!("measured"), &mut Vec::new()).unwrap(),
+            None
+        );
+    }
+
+    /// The selector names its pipes to td-kexec by the mode that carries
+    /// them: `--fds-key` with the key alone, `--fds-key-admit` with both.
+    #[test]
+    fn the_admitting_handoff_names_both_pipes() {
+        let args = |record: Option<&Path>| {
+            let command = key_kexec_command(
+                File::open("/dev/null").unwrap(),
+                File::open("/dev/null").unwrap(),
+                "d",
+                Path::new("/proc/1/fd/3"),
+                record,
+                OsStr::new("c"),
+            );
+            command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(None), ["--fds-key", "d", "/proc/1/fd/3", "c"]);
+        assert_eq!(
+            args(Some(Path::new("/proc/1/fd/4"))),
+            ["--fds-key-admit", "d", "/proc/1/fd/3", "/proc/1/fd/4", "c"]
+        );
     }
 
     /// Nothing `run_boot` hands to kexec was read by an unauthenticated
@@ -8827,7 +9157,7 @@ mod tests {
             "let mut line = selector_release::Applet(Path::new(\"/bin\").join(protocol::SECRET_LINE_APPLET));",
         );
         let keys = position("let mut keys = selector_release::SecurityKeys::root();");
-        let released = position("let (keyslot, key) = match selector_release::unlock(");
+        let released = position("let (keyslot, key, admission) = match selector_release::unlock(");
         assert!(position("&mut line,") > released);
         assert!(applet < keys && keys < released && position("&mut keys,") > released);
         assert_eq!(protocol::SECRET_LINE_APPLET, "secret-line");
@@ -8836,14 +9166,16 @@ mod tests {
         let admitted = position(
             "let mapping = volume::admit_mapping(&partition, uuid, selector_release::MAPPING_NAME)?;",
         );
-        let booted = position("run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))");
+        // The release's own admission, and nothing else, reaches the handoff.
+        let boot = "run_boot(\n        &mapping.path(),\n        mountpoint,\n        cmdline,\n        \
+                    Some(Handoff {\n            key: &key,\n            admission,\n        }),\n    )";
+        let booted = position(boot);
         assert!(pre_active < header && header < waited);
         assert!(waited < device && device < program && program < applet && applet < released);
         assert!(released < halted && halted < failed && failed < admitted);
         assert!(admitted < booted);
-        assert!(body
-            .trim_end()
-            .ends_with("run_boot(&mapping.path(), mountpoint, cmdline, Some(&key))"));
+        assert!(body.trim_end().ends_with(boot));
+        assert_eq!(body.matches("admission").count(), 4);
         for later in [
             "mount_command(",
             "select_boot_deployment(",
@@ -8880,7 +9212,7 @@ mod tests {
         let (signature, body) = production_body("run_boot")
             .split_once(") -> io::Result<()> {")
             .unwrap();
-        assert!(signature.ends_with("handoff: Option<&unlock::VolumeKey>,\n"));
+        assert!(signature.ends_with("handoff: Option<Handoff<'_>>,\n"));
         for absent in [
             "selector_release::",
             "cap::",
@@ -8905,7 +9237,8 @@ mod tests {
             .contains("} => run_boot(&device, &mountpoint, &cmdline, None),"));
         let decision = production_body("kexec_boot_decision");
         assert!(decision.contains("let key_pipe = handoff"));
-        assert!(decision.contains("None => kexec_command(kernel, initramfs, cmdline.as_os_str()),"));
+        assert!(decision
+            .contains("(None, _) => kexec_command(kernel, initramfs, cmdline.as_os_str()),"));
     }
 
     /// The handoff's command is td-kexec's `--fds-key` with the manifest's
@@ -8935,6 +9268,7 @@ mod tests {
             initramfs,
             &initramfs_digest,
             pipe.path(),
+            None,
             OsStr::new("quiet td.deployment=test"),
         );
         assert_eq!(command.get_program(), OsStr::new(TD_KEXEC));
