@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::body_properties::json::Cursor;
 use crate::ports::Deadline;
 fn work() -> Meter {
     Meter::new(
@@ -297,22 +298,23 @@ fn decoded_keys_feed_original_body_selection_and_unknown_names_never_default() {
         let Argument::Explicit(keys) = argument else {
             panic!("default");
         };
-        let mut cells = std::array::from_fn::<_, 2, _>(|_| super::super::Cell::new());
-        let mut cursor = super::super::Cursor::new(keys, &mut cells);
+        let mut cells = std::array::from_fn::<_, 2, _>(|_| crate::body_properties::Cell::new());
+        let mut cursor = crate::body_properties::Cursor::new(keys, &mut cells);
         let mut meter = work();
         loop {
-            if cursor.poll(Tick(1), &mut meter).unwrap() == super::super::Status::Complete {
+            if cursor.poll(Tick(1), &mut meter).unwrap() == crate::body_properties::Status::Complete
+            {
                 break;
             }
         }
         let view = cursor.finish().unwrap();
         assert_eq!(
             view.fields(),
-            super::super::Fields {
-                metadata: super::super::Metadata {
+            crate::body_properties::Fields {
+                metadata: crate::body_properties::Metadata {
                     part_id: true,
                     blob_id: true,
-                    ..super::super::Metadata::NONE
+                    ..crate::body_properties::Metadata::NONE
                 },
                 headers: true,
                 sub_parts: true
@@ -334,13 +336,13 @@ fn decoded_keys_feed_original_body_selection_and_unknown_names_never_default() {
             panic!("default");
         };
         let mut cells = [];
-        let mut cursor = super::super::Cursor::new(keys, &mut cells);
+        let mut cursor = crate::body_properties::Cursor::new(keys, &mut cells);
         let mut meter = work();
         loop {
             match cursor.poll(Tick(1), &mut meter) {
-                Ok(super::super::Status::Yield) => {}
+                Ok(crate::body_properties::Status::Yield) => {}
                 Err(error) => {
-                    assert_eq!(error, super::super::Error::InvalidProperty);
+                    assert_eq!(error, crate::body_properties::Error::InvalidProperty);
                     assert!(cursor.value().is_none());
                     break;
                 }

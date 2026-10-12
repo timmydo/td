@@ -7913,3 +7913,37 @@ constructor can create a View. The latter is specialized to body Fields,
 sets its own defaults and keeps the original header-cell loan; Email has
 no default shortcut. DEFAULT_HEADER_CELLS states the eleven
 header cells required by Email defaults; one fewer refuses the selection.
+
+## Email property argument decoding
+
+email_properties::request::Cursor composes bounded JSON decoding with the
+complete Email selector. Omitted or null properties use DEFAULT and traverse
+normal selection with the original work meter and eleven reserved header
+cells. Explicit empty arrays select id alone. Default selection is never a
+preconstructed empty-header view.
+
+property_selection::json owns the existing body-property array decoder once,
+with a type-level null policy. The body alias fixes that policy to false;
+Email fixes it to true. Null scanning consumes one charged byte per turn,
+requires its complete literal and trailing-whitespace-only end, and allocates
+no text cell. Existing array decoding, Unicode escape rules, fixed-capacity
+caller strings, charge bounds and original borrowed key retention remain
+unchanged; diagnostic prefixes now describe generic properties JSON.
+
+The composed request hides partial results and latches JSON, selection and
+work refusals. Decoded-key deduplication follows selection, so equivalent
+escaped names collapse while distinct requested spellings remain separate.
+Storage preparation stays outside cursor work; cached completion and the
+result are passive. The enclosing request retains original-meter continuity
+and performs fresh authorization and publication checks. This adds no method
+dispatch, result-reference resolution or capability advertisement.
+
+RFC 8621 section 4.2 explicitly applies its default list to both omitted
+and null properties, replacing the generic get all-properties rule.
+The decoder-to-selector handoff spends one record before changing owner
+state, even for omission, and therefore freshly admits that active turn.
+Work and internal-state failures are normalized at the composed boundary;
+client syntax/selection and storage-capacity causes remain distinguishable.
+The caller must keep the same original Meter across polls: these passive
+cursors do not own that borrow. New Email-path allocation absence is by
+inspection; the retained allocation probe exercises the body-policy alias.

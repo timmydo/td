@@ -299,3 +299,6 @@ fn charge(now: Tick, work: &mut Meter, visits: usize) -> Result<(), Error> {
 #[cfg(test)]
 #[path = "body_properties/tests.rs"]
 pub(crate) mod body_tests;
+
+#[path = "property_selection/json.rs"]
+pub mod json;

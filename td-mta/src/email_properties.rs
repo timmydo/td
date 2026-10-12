@@ -101,3 +101,6 @@ const _: () = assert!(std::mem::size_of::<Cursor<'_, '_, '_>>() <= 384);
 #[cfg(test)]
 #[path = "email_properties_tests.rs"]
 mod tests;
+
+#[path = "email_properties/request.rs"]
+pub mod request;
