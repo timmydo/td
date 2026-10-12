@@ -7475,3 +7475,51 @@ decoder owns protocol error mapping: malformed JSON/filter shapes and logical
 admission failures must be classified before evaluation; an invalid event
 stream from an otherwise valid decoder is an internal failure. Error Display
 is diagnostic text, not a JMAP response description.
+
+## Incremental external sorting
+
+external_sort::Sorter sorts fixed records in caller-owned buffers and two
+exclusive scratch files. Records are 1..2048 bytes; initial runs contain
+1..256 records, and each merge combines at most eight runs. Run boundaries
+are derived from record counts, so no account-sized run directory is kept.
+The two files alternate across passes; an output is reset only after all
+references to its old contents have been retired. Both files retain their
+whole quota reservations simultaneously until cleanup.
+
+Each poll performs at most one comparison or one backend operation, and
+first charges the original cumulative job meter and checks the original
+deadline through Job::admit. Fixed-record I/O is at most 2048 bytes. Initial
+runs use incremental in-place heap sorting; each sift poll performs at most
+one comparison and one fixed-record swap. Run generation costs O(R log R)
+comparisons for R records, with R at most 256. Merges select among
+at most eight resident heads. Comparisons must implement a consistent total
+order, including the query's final ID tie, and have independently bounded
+work. The caller must schedule polls fairly; there is no internal worker or
+renewed budget. Errors retire the sorter; no successful partial output is
+returned. Completion performs a fresh admission check after sealing and
+checking the exact final byte count.
+
+The maximum caller record buffers total 528 KiB, plus constant sorter
+metadata and bounded fixed-record swap temporaries. They must be
+admitted under the existing global sort-buffer reservation. Job is a trusted
+adapter contract: its source scan, two SortRetention files, cumulative job
+meter, authorization and retained read view remain caller-owned. Source
+reads and comparator work need their own byte/CPU accounting where they
+exceed the fixed-record charge. Per-file retention meters alone do not
+satisfy this contract. This increment supplies the algorithm, not that
+native query adapter or global concurrent-buffer admission. Complete denotes
+only sorted scratch; the caller must freshly validate authorization and
+its retained view before publishing any query result. No method is enabled.
+
+A source step returns Record, Skipped or Complete. Skipped yields after an
+excluded candidate without consuming a run slot or ending input, so filtering
+does not require an unbounded scan inside one backend call. Only Complete
+ends input; admission/deadline refusal remains an error even after any number
+of skipped candidates.
+
+Polling after Complete returns the distinct Completed error without touching
+storage or invalidating the returned Output. Debug prints only scalar state,
+never record contents. The engine charges fixed-record bytes for actual
+scratch reads/writes and one potential source record before each source step
+(including its end/skip result); additional source I/O is adapter-owned.
+Control-only transitions charge work but no scratch I/O bytes.

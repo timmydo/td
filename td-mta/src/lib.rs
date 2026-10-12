@@ -11,6 +11,7 @@ pub mod bounded;
 pub mod clock;
 pub mod config;
 pub use td_mime::encoded_word;
+pub mod external_sort;
 pub mod filter_logic;
 pub mod format;
 pub mod gateway_policy;
