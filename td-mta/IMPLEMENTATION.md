@@ -3753,3 +3753,10 @@ DEPLOYMENT.md supplies systemd and high-port td-svc examples with their
 current readiness, orderly-stop and forced-termination limits. HTTPS/JMAP, gateway, reload,
 ACME, outgoing delivery
 and file logging remain unimplemented activation paths.
+
+Prepared Core Session metadata now covers configured-origin URL templates,
+the single account and username, resource-limit projection and a deterministic
+metadata state token. This is an inert document builder: authenticated HTTP
+discovery, live concurrency admission and the remaining Core endpoints still
+block capability advertisement. Native fixtures check complete field shape,
+all variable-state inputs, canonical origins, escaping and construction bounds.

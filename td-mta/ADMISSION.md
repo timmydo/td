@@ -927,3 +927,36 @@ body/category and physical database/WAL limits, authenticate metadata and
 couple acknowledgements to proven SQLite COMMIT. The existing logical effect
 ledger and ports::Reservation/BlobWriter contracts remain separate; the
 standalone primitive does not manufacture coordinator reservation identities.
+
+### Prepared Core Session metadata
+
+`jmap_session::Session::core` prepares one immutable Session document for the
+configured account and HTTPS origin. Its request/upload byte, method and
+object limits come from the validated ResourcePlan. The caller supplies the
+actual upload/API concurrency admission counts as named Concurrency fields,
+retained for runtime inspection, each nonzero and no greater
+than the HTTPS pool. Construction does not prove those admissions exist and
+does not authenticate or activate discovery: the runtime must enforce the
+same counts and finish the advertised Core contract before serving it.
+
+Only Core is included, both server-wide and for the personal writable
+account; primaryAccounts and collationAlgorithms are empty. Mail/Submission
+capabilities require their own complete implementation. URL templates use
+canonical configured DNS origin/port and fixed paths, never request Host.
+The opaque state is SHA-256 over a version domain and every serialized field
+before state, so metadata changes invalidate API sessionState. Canonically
+equivalent origins produce identical documents. This state is a change token,
+not authentication, account data state or a MAC.
+
+Construction is bounded by the existing 254-byte username, 4096-byte account
+name and DNS-origin limits, with shared JSON string escaping and I-JSON
+noncharacter refusal. A fallibly reserved 32 KiB buffer holds even maximally
+escaped fields. The complete document and its state are exposed only on
+success. HTTP authentication, cache-control, worker handoff and Core endpoint
+activation remain separate; discovery must not expose this preparation early.
+
+Session concurrency limits are per endpoint, not additive reservations of
+connection slots. The runtime also applies its shared HTTPS pool and event
+stream ceiling; simultaneous traffic can exhaust that shared capacity.
+The prepared document retains its bounded 32 KiB allocation and should be
+shared for the selected configuration, rather than rebuilt per connection.
