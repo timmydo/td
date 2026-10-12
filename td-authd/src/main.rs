@@ -1,5 +1,11 @@
 #![deny(unsafe_code)]
 
+// The admission record's bytes, one reviewed copy with td-boot's selector
+// and its `admit` verb (td-install/ENCRYPTION.md, "Verified account
+// handoff").
+#[path = "../../td-boot/src/admission.rs"]
+#[allow(dead_code, reason = "the record's writer is td-boot's")]
+mod admission;
 mod application;
 mod application_files;
 mod application_shell;
@@ -17,6 +23,7 @@ mod cutover;
 mod deployment;
 mod disk_install;
 mod elevation;
+mod handoff;
 // Request 1a's kernel name and consent's hostname descriptions.
 #[path = "../../td-firstboot/src/hostname.rs"]
 mod hostname;

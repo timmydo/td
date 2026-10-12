@@ -159,9 +159,11 @@ every directory, and only then chowns and chmods it through that
 descriptor and syncs it and its parent; anything else is refused and
 left as it is.
 
-The login state is **unenrolled** only when the directory is valid and the
-record name is absent, **enrolled** when a valid record is present, and
-**unavailable** otherwise. The first test is a directory-and-name check,
+The login state is **unenrolled** only when the directory is valid,
+neither the record name nor the protected marker `protected` is in it,
+and the root has no `run/td-admit`, **enrolled** when a valid record is
+present, and **unavailable**
+otherwise. The first test is a directory-and-name check,
 the same predicate in firstboot, td-login and td-authd, one shared
 std-only module (`td-secret/src/login_state.rs`, increment 4) that takes
 the root it reads under, and needs no helper; only a name that exists is
@@ -182,6 +184,15 @@ causes, each with its screen text:
   above, or saw the record change while reading it: `LOGIN KEY STATE
   UNAVAILABLE: STATE COULD NOT BE READ`. It is transient: the compositor
   asks again until it resolves.
+
+The protected marker or `run/td-admit`, of any type, without the record
+name is a fourth cause, `0d`: an unenrolled protected machine or boot
+(`td-install/ENCRYPTION.md`, "Verified account handoff": only a
+protected release leaves `/run/td-admit`, and td-authd makes the marker
+whenever it finds it), shown as `NO LOGIN KEYS ENROLLED`, `BOOT WITH THE
+DISK PIN OR A`, `PRIMARY DISK KEY TO UNLOCK`. It is no failure kind and
+needs no helper; the predicate reports it as its own state, which every
+consumer treats as enforced.
 
 Unavailable keeps every refusal of the enrolled state in force (td-login's,
 SSH's enforced form, the update-consent rule) and the compositor stays
@@ -749,8 +760,9 @@ stage-1 init's `td-firstboot render-primary-sshd /sysroot`, right after
 the directory step ("The login record") and before `sshd` starts,
 renders the form that matches the login state, decided by the
 directory-and-name check alone, with no helper: a valid directory
-without the record name renders the ordinary policy, and anything else
-the enforced form. The ordinary policy is byte for byte the one rendered
+without the record name or the protected marker, on a boot without
+`/run/td-admit`, renders the ordinary policy, and anything else the
+enforced form. The ordinary policy is byte for byte the one rendered
 before this tier but for L7's root line, `PermitRootLogin no` where it
 was `PermitRootLogin prohibit-password`. The cutover renders it within a
 boot. The QEMU root-refusal fixture (`APPLICATIONS.md` §L.1, "Retiring

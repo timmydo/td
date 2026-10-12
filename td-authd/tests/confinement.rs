@@ -36,6 +36,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "deployment.rs",
             "disk_install.rs",
             "elevation.rs",
+            "handoff.rs",
             "inspection.rs",
             "launch.rs",
             "login.rs",
@@ -71,6 +72,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("deployment.rs", 0),
         ("disk_install.rs", 0),
         ("elevation.rs", 0),
+        ("handoff.rs", 0),
         ("rollback.rs", 0),
         ("set_hostname.rs", 0),
         ("backoff.rs", 0),
@@ -211,6 +213,37 @@ fn the_production_source_and_raw_boundary_are_closed() {
             .count(),
         1
     );
+    // Amendment 9: only an installed boot's Prepare consumes the admission
+    // record, with the production paths, and only the generation's first
+    // `1a` carries what it found.
+    let session = include_str!("../src/session.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    let installed = session
+        .split_once("            if crate::disk_install::live_boot()? {\n")
+        .unwrap()
+        .1
+        .split_once("        }\n        let answer = self.answer_with(")
+        .unwrap()
+        .0
+        .split_once("            } else {\n")
+        .unwrap()
+        .1;
+    assert!(installed.ends_with(
+        "                self.admit(&crate::handoff::Paths::production());\n            }\n"
+    ));
+    assert_eq!(session.matches("Paths::production()").count(), 1);
+    assert_eq!(session.matches("crate::handoff::consume(").count(), 1);
+    assert_eq!(session.matches("self.admit(").count(), 1);
+    assert_eq!(session.matches("self.admitted = ").count(), 1);
+    assert_eq!(
+        session
+            .matches("let admitted = std::mem::take(&mut self.admitted);")
+            .count(),
+        1
+    );
+    assert_eq!(session.matches("admitted").count(), 9);
     assert_eq!(
         fingerprint(
             include_str!("../src/inspection.rs")
@@ -1043,13 +1076,13 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LOGIN_STATE_FINGERPRINT: u64 = 0x03208484ef5eb14d;
-const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x82d5e067ac0d3cb6;
+const LOGIN_STATE_FINGERPRINT: u64 = 0xfffb5ba28cf59137;
+const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0x8d0878401a4a3195;
-const MAIN_FINGERPRINT: u64 = 0xb0adcdeec79e50ac;
-const SESSION_FINGERPRINT: u64 = 0x73ac3a99626cb8e7;
+const MAIN_FINGERPRINT: u64 = 0x3edc77a75b2291eb;
+const SESSION_FINGERPRINT: u64 = 0x6fb70a434fb80e06;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;

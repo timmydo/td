@@ -542,6 +542,26 @@ impl Removal {
 /// rather than clipped: the operation ends before its token I/O.
 pub(crate) const TOO_SMALL: &[&str] = &["THIS SCREEN IS TOO SMALL", "FOR THIS PROMPT"];
 
+/// `1a`'s unavailable cause for an unenrolled protected machine
+/// (td-authd/DESIGN.md, amendment 9), which no failure kind shares.
+pub(crate) const PROTECTED: u8 = 0x0d;
+/// Its rows: no login key, and the boot that admits the session.
+pub(crate) const PROTECTED_ROWS: &[&str] = &[
+    "NO LOGIN KEYS ENROLLED",
+    "BOOT WITH THE DISK PIN OR A",
+    "PRIMARY DISK KEY TO UNLOCK",
+];
+
+/// The rows an unavailable `1a` state shows: its cause's failure rows,
+/// or `PROTECTED_ROWS`.
+pub(crate) fn unavailable_rows(cause: u8) -> Option<&'static [&'static str]> {
+    match cause {
+        PROTECTED => Some(PROTECTED_ROWS),
+        0x0a..=0x0c => login_failure(cause, 0),
+        _ => None,
+    }
+}
+
 /// TOKEN-LOGIN.md's text for root's terminal kind and detail, in rows the
 /// narrowest output's chrome holds whole, or none for a pair root never
 /// sends.

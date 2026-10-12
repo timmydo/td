@@ -290,6 +290,9 @@ pub(crate) struct Session {
     revocation: Option<crate::revocation::Revocation>,
     /// Whether the generation's first `1a` began its check.
     checked: bool,
+    /// Whether Prepare's consumption of the admission record admitted
+    /// this generation and its first `1a` has yet to say so (amendment 9).
+    admitted: bool,
 }
 
 impl Session {
@@ -318,6 +321,7 @@ impl Session {
             login_state: crate::login_status::Status::new(owner, username)?,
             revocation: Some(crate::revocation::Revocation::new()),
             checked: false,
+            admitted: false,
         })
     }
 
@@ -327,18 +331,28 @@ impl Session {
                 return Err("secret session already prepared or preparing".into());
             }
             self.intake = Some(crate::secret_intake::Intake::bind(self.owner)?);
-            // A live boot installs disks, never updates itself.
+            // A live boot installs disks, never updates itself, and
+            // consumes no admission record.
             if crate::disk_install::live_boot()? {
                 self.setup = Some(crate::disk_install::Intake::bind(self.owner)?);
                 self.revocation = None;
             } else {
                 self.installations = Some(crate::deployment::Intake::bind(self.owner)?);
                 self.hostnames = Some(crate::set_hostname::Intake::bind(self.owner)?);
+                self.admit(&crate::handoff::Paths::production());
             }
         }
         let answer = self.answer_with(request, cleanup_command, Start::begin);
         self.send_disk_answer();
         answer
+    }
+
+    /// Amendment 9: consumes the admission record before the first `1a`,
+    /// whatever the generation's Prepare then does.
+    fn admit(&mut self, paths: &crate::handoff::Paths) {
+        let outcome = crate::handoff::consume(paths, self.owner);
+        crate::handoff::log(&outcome);
+        self.admitted = outcome.admitted();
     }
 
     /// Forwards the disk installation's answer to its service.
@@ -411,7 +425,10 @@ impl Session {
                     .revocation
                     .as_ref()
                     .map_or(0, |revocation| revocation.status().byte());
-                self.login_state.answer(self.setup.is_some(), revocation)
+                // Only the generation's first answer may say it is admitted.
+                let admitted = std::mem::take(&mut self.admitted);
+                self.login_state
+                    .answer(self.setup.is_some(), revocation, admitted)
             }
             Request::LoginState => Err("login state before session preparation".into()),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),

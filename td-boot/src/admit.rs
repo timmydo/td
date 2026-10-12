@@ -2,8 +2,10 @@
 //! admission record from its RAM-backed root to the system's `/run`
 //! (td-install/ENCRYPTION.md "Verified account handoff"). The record never
 //! reaches a disk. The member is inspected as `mount-root` inspects the key
-//! member and removed on every path; a failure writes nothing and refuses
-//! no boot, since a lost record costs a login, not a boot.
+//! member and removed on every path; a failure writes no record and
+//! refuses no boot, since a lost record costs a login, not a boot. Only a
+//! protected release hands a member over, so a failure leaves the directory,
+//! empty, where it can: the login predicate enforces while it exists.
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -147,8 +149,9 @@ fn write_record(run: &Path, owner: Owner, record: &[u8]) -> io::Result<()> {
 /// Takes the member from the initramfs root `root` and writes it under the
 /// system's `run`: reads it, removes it whether or not it passed, and only
 /// then writes it. Returns whether a record was written; no member is
-/// `false`. A refused member, a failed removal or a failed write writes
-/// nothing and is an error the deployment init ignores.
+/// `false`. A refused member, a failed removal or a failed write writes no
+/// record and is an error the deployment init ignores; when a member was
+/// there, it leaves `run/td-admit` itself, empty, if it can.
 pub(crate) fn admit(root: &Path, run: &Path, owner: Owner) -> io::Result<bool> {
     let member = root.join(protocol::ADMIT_MEMBER);
     let record = read_member(&member, owner);
@@ -156,12 +159,20 @@ pub(crate) fn admit(root: &Path, run: &Path, owner: Owner) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other.map_err(|error| named(&member, "remove", error)),
     };
-    let record = record?;
-    removed?;
-    match record {
-        None => Ok(false),
-        Some(record) => write_record(run, owner, &record).map(|()| true),
+    let present = !matches!(record, Ok(None));
+    let written = record.and_then(|record| {
+        removed?;
+        match record {
+            None => Ok(false),
+            Some(record) => write_record(run, owner, &record).map(|()| true),
+        }
+    });
+    if written.is_err() && present {
+        let _ = DirBuilder::new()
+            .mode(DIRECTORY_MODE)
+            .create(run.join(admission::DIRECTORY));
     }
+    written
 }
 
 #[cfg(test)]
@@ -226,6 +237,17 @@ mod tests {
             assert!(!self.run().join("td-admit").exists());
             assert!(fs::symlink_metadata(self.member()).is_err());
         }
+
+        /// No record, only the empty mode-0700 directory that marks the
+        /// boot protected, and the member gone.
+        fn only_the_directory(&self) {
+            let directory = self.run().join("td-admit");
+            let meta = fs::symlink_metadata(&directory).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.mode() & 0o7777, 0o700);
+            assert!(fs::read_dir(&directory).unwrap().next().is_none());
+            assert!(fs::symlink_metadata(self.member()).is_err());
+        }
     }
 
     impl Drop for Fixture {
@@ -267,9 +289,10 @@ mod tests {
         fixture.nothing_written();
     }
 
-    /// Every refusal of the member removes it and writes nothing.
+    /// Every refusal of the member removes it and writes no record, only
+    /// the directory.
     #[test]
-    fn a_refused_member_is_removed_and_nothing_is_written() {
+    fn a_refused_member_is_removed_and_only_the_directory_is_left() {
         for (bytes, mode) in [
             (record().to_vec(), 0o600),
             (record().to_vec(), 0o440),
@@ -280,7 +303,7 @@ mod tests {
             let fixture = Fixture::new();
             fixture.put(&bytes, mode);
             assert!(fixture.admit().is_err(), "{} {mode:o}", bytes.len());
-            fixture.nothing_written();
+            fixture.only_the_directory();
         }
         // A symlink, even to a valid member, and a directory.
         let fixture = Fixture::new();
@@ -289,11 +312,11 @@ mod tests {
         fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o400)).unwrap();
         symlink(&elsewhere, fixture.member()).unwrap();
         assert!(fixture.admit().is_err());
-        fixture.nothing_written();
+        fixture.only_the_directory();
         let fixture = Fixture::new();
         fs::create_dir(fixture.member()).unwrap();
         assert!(fixture.admit().is_err());
-        assert!(!fixture.run().join("td-admit").exists());
+        assert!(fixture.run().join("td-admit").is_dir());
     }
 
     /// The member's owner is checked as the key's is.
@@ -307,7 +330,7 @@ mod tests {
         };
         let error = admit(&fixture.root(), &fixture.run(), other).unwrap_err();
         assert!(error.to_string().contains("owned by uid"), "{error}");
-        fixture.nothing_written();
+        fixture.only_the_directory();
     }
 
     /// The directory is created fresh: one already there, of any kind,
@@ -330,20 +353,22 @@ mod tests {
         assert!(fs::read_dir(&target).unwrap().next().is_none());
     }
 
-    /// A failed write leaves nothing behind it.
+    /// A failed write leaves no record behind it, only the directory where
+    /// it can.
     #[test]
-    fn a_failed_write_writes_nothing() {
+    fn a_failed_write_leaves_no_record() {
         let fixture = Fixture::new();
         fixture.put(&record(), 0o400);
         fs::set_permissions(fixture.run(), fs::Permissions::from_mode(0o500)).unwrap();
         let result = fixture.admit();
         fs::set_permissions(fixture.run(), fs::Permissions::from_mode(0o755)).unwrap();
         // Root may write a mode-0500 directory; then the write succeeds.
+        // Otherwise the directory cannot be made either.
         if result.is_err() {
             fixture.nothing_written();
         }
         // A directory of another group is refused after its creation, and
-        // removed.
+        // removed; the directory made after it is the process's own.
         let fixture = Fixture::new();
         fixture.put(&record(), 0o400);
         let other = Owner {
@@ -352,6 +377,6 @@ mod tests {
         };
         // The member's owner check reads only the UID, as the key's does.
         assert!(admit(&fixture.root(), &fixture.run(), other).is_err());
-        fixture.nothing_written();
+        fixture.only_the_directory();
     }
 }

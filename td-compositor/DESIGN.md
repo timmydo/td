@@ -6364,14 +6364,19 @@ as D14 keeps such a session locked. Unenrolled, the live medium's every
 answer, starts unlocked, and the direct development profile has no
 authority and never locks. Every generation, a restarted compositor's
 included, therefore starts locked on that rule, and no client pixel of
-that generation precedes the lock surface on glass. Planned, not
-current: `td-install/ENCRYPTION.md` increment 8's verified account
-handoff adds one exception, the connect-time answer's admission byte
-(`td-authd/DESIGN.md`, amendment 9): `01` makes that first paint the
-session instead, for that generation alone, and the source pin then
-names it as the one condition under which an enrolled or unavailable
-answer does not lock the first paint. The same amendment's cause `0d`,
-an unenrolled protected machine, is an unavailable answer and locks.
+that generation precedes the lock surface on glass, with one exception:
+`td-install/ENCRYPTION.md` increment 8's verified account handoff, the
+connect-time answer's admission byte (`td-authd/DESIGN.md`, amendment
+9). `01` makes that first paint the session instead, for that
+generation alone, whatever the answer's state, and the source pin names
+it as the one condition under which an enrolled or unavailable answer
+does not lock the first paint. Only the generation's first answer may
+carry it: the worker's `LoginPoll` ends the generation on a `01` in any
+later one. The same amendment's cause `0d`, an unenrolled protected
+machine, is an unavailable answer and locks; its rows say `NO LOGIN
+KEYS ENROLLED`, `BOOT WITH THE DISK PIN OR A`, `PRIMARY DISK KEY TO
+UNLOCK` (`secret_client::unavailable_rows`), which `K`'s `D` and the
+lock surface's unlock chord show as their refusal too.
 Under fbdev the
 previous generation's last frame stays in `/dev/fb0` across a restart
 until the first paint replaces it; it discloses nothing that generation
@@ -6602,8 +6607,9 @@ excluded from every selection, confirmation and field below.
      the username under td-authd's `primary_account` rule and the
      hostname empty or under td-firstboot's `Hostname::parse`, both
      compiled from those files behind the `auth/` `cfg_attr` pair and
-     kept for the rows; any other answer, a revocation byte past `03`
-     included, ends the paired generation. Implemented in C7: the
+     kept for the rows; any other answer, a revocation byte past `03`,
+     an admission byte past `01` or a `01` after the generation's first
+     answer included, ends the paired generation. Implemented in C7: the
      generation's first paint is the production lock entry ("The lock
      surface" above), and the source pin there names its one caller.
      `Scene::lock` lost its test-only gate; the live entries above it

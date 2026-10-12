@@ -1755,10 +1755,11 @@ inspects the member as `mount-root` inspects the
 key, writes it to a fresh root:root mode-0700 `/sysroot/run/td-admit` as
 `v1`, a single-link root:root mode-0600 file created exclusively, and
 removes the member, whether or not it passed, before it writes. A
-failure writes nothing and is no refusal: a lost record costs a login,
+failure writes no record and is no refusal: a lost record costs a login,
 not a boot, so the init line is `/bin/td-boot admit /sysroot/run || :`;
-the verb reports the failure on the consoles and exits nonzero. Without
-a member it writes nothing and says nothing. A deployment
+the verb reports the failure on the consoles and exits nonzero, and,
+since a member was there, leaves `td-admit` itself, empty, where it can.
+Without a member it writes nothing and says nothing. A deployment
 from before the verb leaves the member in its initramfs root, which
 `switch_root` frees.
 
@@ -1769,10 +1770,15 @@ on a `/run` that is tmpfs, reads it and unlinks it, then creates
 `/run/td-admit/consumed` exclusively (`O_CREAT|O_EXCL`, mode 0600)
 before judging it; an existing marker discards the record, so a boot
 admits at most once, and a record copied back after consumption admits
-nothing. Any valid record makes td-authd create the persistent marker
-`/var/lib/td/login/protected` if absent; with it present, an unenrolled
-login state locks as an enrolled one does (td-authd/DESIGN.md, amendment
-9). A record with method 1 or 2 admits the generation only when its UID
+nothing. Only a protected release leaves `/run/td-admit`, so its
+existence, whatever it holds, marks the boot protected: while it exists
+the login predicate enforces, and every Prepare that finds it makes
+the persistent marker `/var/lib/td/login/protected` if absent, a refused
+record's included, retrying one that failed. With either present, an
+unenrolled login state locks as an enrolled one does
+(td-authd/DESIGN.md, amendment 9); a record admits only once the
+persistent marker exists.
+A record with method 1 or 2 admits the generation only when its UID
 is the primary account's, its manifest ID is the running deployment's
 (`/run/td-deployment`), and the deployment kernel's `CLOCK_BOOTTIME`,
 which starts at the `kexec` just after the selector wrote the record and

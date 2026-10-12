@@ -37,6 +37,9 @@ pub(crate) enum State {
     /// The record's slot fingerprints in canonical slot order, one to eight.
     Enrolled(Vec<[u8; 4]>),
     Unavailable(Cause),
+    /// The predicate's protected state, an unenrolled protected machine:
+    /// unavailable with cause `0d` (amendment 9), so it locks.
+    Protected,
 }
 
 impl State {
@@ -79,6 +82,7 @@ impl State {
                     Cause::Unreadable => 0x0c,
                 },
             ]),
+            Self::Protected => answer.extend_from_slice(&[2, 0x0d]),
         }
         Ok(())
     }
@@ -155,13 +159,21 @@ impl Status {
     pub fn reduced(&self) -> Reduced {
         match login_state::state_as(&self.root, self.directory_owner, self.owner) {
             login_state::State::Unenrolled => Reduced::Unenrolled,
-            login_state::State::Enrolled | login_state::State::Unavailable(_) => Reduced::Enforced,
+            login_state::State::Enrolled
+            | login_state::State::Protected
+            | login_state::State::Unavailable(_) => Reduced::Enforced,
         }
     }
 
-    /// The `9a` answer, ending in `revocation`'s byte. A live boot is
+    /// The `9a` answer, ending in `revocation`'s byte and the admission
+    /// byte, `01` only when `admitted` (amendment 9). A live boot is
     /// unenrolled without any read, so the live medium never locks.
-    pub fn answer(&mut self, live: bool, revocation: u8) -> Result<Vec<u8>, String> {
+    pub fn answer(
+        &mut self,
+        live: bool,
+        revocation: u8,
+        admitted: bool,
+    ) -> Result<Vec<u8>, String> {
         let state = if live {
             State::Unenrolled
         } else {
@@ -176,6 +188,7 @@ impl Status {
         answer.push(u8::try_from(hostname.len()).map_err(|_| "hostname overflow")?);
         answer.extend_from_slice(hostname.as_bytes());
         answer.push(revocation);
+        answer.push(u8::from(admitted));
         Ok(answer)
     }
 
@@ -192,7 +205,7 @@ impl Status {
     /// whose tier marker lists `reads` may become current. The state is
     /// read afresh, and cached, as `refresh` reads it. An unenrolled
     /// machine reads no marker; an enrolled one needs the record's version
-    /// listed, and an unavailable one a marker.
+    /// listed, and an unavailable or protected one a marker.
     pub fn admits(&mut self, reads: impl FnOnce() -> Vec<u8>) -> bool {
         match self.refresh() {
             (State::Unenrolled, _) => true,
@@ -209,6 +222,7 @@ impl Status {
             match login_state::state_as(&self.root, self.directory_owner, self.owner) {
                 login_state::State::Unenrolled => (State::Unenrolled, None),
                 login_state::State::Unavailable(cause) => (State::Unavailable(cause), None),
+                login_state::State::Protected => (State::Protected, None),
                 login_state::State::Enrolled => self.inspect(),
             };
         if !state.unreadable() {

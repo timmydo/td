@@ -148,8 +148,8 @@ fn console_state(root: &Path, owner: Owner) -> State {
     login_state::state_as(root, owner, primary_account::UID)
 }
 
-/// Only unenrolled opens the console; enrolled and every unavailable cause
-/// keep it shut.
+/// Only unenrolled opens the console; enrolled, protected and every
+/// unavailable cause keep it shut.
 fn admits(state: State) -> bool {
     state == State::Unenrolled
 }
@@ -523,6 +523,7 @@ mod tests {
         assert!(admits(State::Unenrolled));
         for shut in [
             State::Enrolled,
+            State::Protected,
             State::Unavailable(Cause::DirectoryDamaged),
             State::Unavailable(Cause::RecordDamaged),
             State::Unavailable(Cause::Unreadable),
@@ -546,6 +547,12 @@ mod tests {
         root.enrol();
         assert_eq!(root.state(), State::Enrolled);
         std::fs::remove_file(root.login().join("1000")).unwrap();
+        assert_eq!(root.state(), State::Unenrolled);
+        // The protected marker shuts it without a record.
+        std::fs::write(root.login().join("protected"), b"").unwrap();
+        assert_eq!(root.state(), State::Protected);
+        assert!(!admits(root.state()));
+        std::fs::remove_file(root.login().join("protected")).unwrap();
         assert_eq!(root.state(), State::Unenrolled);
         // Another owner, a missing directory, a file and a link in its place.
         let other = Owner {

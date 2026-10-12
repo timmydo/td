@@ -1820,7 +1820,10 @@ fn root_login_supervision_meets_the_production_worker() {
             .windows(7)
             .position(|window| window == b"\x06tester")
             .unwrap();
-        assert_eq!((answer[0], answer.last()), (0x9a, Some(&0)));
+        assert_eq!(
+            (answer[0], &answer[answer.len() - 2..]),
+            (0x9a, &[0, 0][..])
+        );
         answer[1..names].to_vec()
     };
     // No directory: the predicate's damage, and the worker's own typed
@@ -1917,10 +1920,12 @@ fn revoking(
     session
 }
 
-/// `9a` for `state` on the test root, ending in `revocation`.
+/// `9a` for `state` on the test root, with the revocation byte
+/// `revocation`.
 fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
     let mut answer = crate::login_status::tests::answer(state, "td-laptop");
-    *answer.last_mut().unwrap() = revocation;
+    let at = answer.len() - 2;
+    answer[at] = revocation;
     answer
 }
 
@@ -1929,7 +1934,7 @@ fn login_state_until(session: &mut Session, byte: u8) -> Vec<u8> {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let answer = session.answer(Request::LoginState).unwrap();
-        if answer.last() == Some(&byte) {
+        if answer[answer.len() - 2] == byte {
             return answer;
         }
         assert!(Instant::now() < until, "revocation byte never {byte}");
@@ -2212,4 +2217,100 @@ fn teardown_abandons_the_cutover_and_the_next_generation_repeats_it() {
     );
     assert_eq!(login_state_until(&mut session, 0), revoked(&[0], 0));
     session.close_with(|_| fixture("cleanup_child")).unwrap();
+}
+
+/// Amendment 9: a protected boot enforces though its persistent marker
+/// cannot be made. The marker's login directory here is damaged, the
+/// predicate's valid and unenrolled: `td-admit` alone makes the state
+/// `02 0d`, whose first paint locks and which revocation enforces, for
+/// a valid primary record that then admits nothing, a method-0 record,
+/// and a later generation that finds none.
+#[test]
+fn a_protected_boot_enforces_when_its_marker_cannot_be_made() {
+    use crate::admission::Method;
+    use crate::cutover::Reduced;
+    use crate::handoff::tests::{id, Machine, UID};
+    use crate::handoff::{Outcome, Paths};
+    use crate::login_status::tests::{answer, never, status_under, Root};
+    let machine = Machine::new();
+    let unmarkable = Root::new();
+    unmarkable.damage();
+    let paths = Paths {
+        run: machine.paths.run.clone(),
+        root: unmarkable.path().to_path_buf(),
+        owner: machine.paths.owner,
+        mountinfo: machine.paths.mountinfo.clone(),
+        uptime: machine.paths.uptime.clone(),
+    };
+    std::fs::write(machine.paths.root.join("hostname"), b"td-laptop\n").unwrap();
+    let protected = answer(&[2, 0x0d], "td-laptop");
+    for record in [Some(Method::TpmPin), Some(Method::None), None] {
+        machine.reset();
+        let mut session = quiet();
+        session.login_state = status_under(&machine.paths.root, never());
+        if let Some(method) = record {
+            machine.admit(UID, method, id());
+        }
+        session.admit(&paths);
+        assert!(!session.admitted, "{record:?}");
+        prepare(&mut session);
+        for _ in 0..2 {
+            assert_eq!(session.answer(Request::LoginState).unwrap(), protected);
+        }
+        assert_eq!(session.login_state.reduced(), Reduced::Enforced);
+        assert!(!machine.marker().exists());
+    }
+    assert!(matches!(
+        crate::handoff::consume(&paths, UID),
+        Outcome::Unmarked(_)
+    ));
+    // The next boot's `/run` has no `td-admit`: unenrolled again.
+    std::fs::remove_dir(machine.paths.run.join("td-admit")).unwrap();
+    let mut session = quiet();
+    session.login_state = status_under(&machine.paths.root, never());
+    session.admit(&paths);
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    assert_eq!(session.login_state.reduced(), Reduced::Unenrolled);
+}
+
+/// Amendment 9: Prepare's consumption admits the generation, and only its
+/// first `1a` says so; a record that admits nothing leaves every answer
+/// `00` and the machine protected.
+#[test]
+fn only_the_first_login_state_says_the_generation_is_admitted() {
+    use crate::admission::Method;
+    use crate::handoff::tests::{id, Machine, UID};
+    use crate::login_status::tests::{answer, never, Root};
+    let root = Root::new();
+    let machine = Machine::new();
+    let mut session = quiet();
+    session.login_state = root.status(never());
+    machine.admit(UID, Method::TpmPin, id());
+    session.admit(&machine.paths);
+    prepare(&mut session);
+    let mut admitted = answer(&[0], "td-laptop");
+    *admitted.last_mut().unwrap() = 1;
+    assert_eq!(session.answer(Request::LoginState).unwrap(), admitted);
+    for _ in 0..2 {
+        assert_eq!(
+            session.answer(Request::LoginState).unwrap(),
+            answer(&[0], "td-laptop")
+        );
+    }
+    let mut session = quiet();
+    session.login_state = root.status(never());
+    machine.reset();
+    machine.admit(UID, Method::None, id());
+    session.admit(&machine.paths);
+    assert!(!session.admitted);
+    prepare(&mut session);
+    assert_eq!(
+        session.answer(Request::LoginState).unwrap(),
+        answer(&[0], "td-laptop")
+    );
+    assert!(machine.marker().exists());
 }

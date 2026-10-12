@@ -75,7 +75,8 @@ pub(crate) enum LoginState {
     Unenrolled,
     /// One to eight fingerprints in canonical slot order.
     Enrolled(Vec<consent::Fingerprint>),
-    /// The cause as its failure kind: `0a`, `0b` or `0c`.
+    /// The cause as its failure kind, `0a`, `0b` or `0c`, or `0d`, an
+    /// unenrolled protected machine (td-authd/DESIGN.md, amendment 9).
     Unavailable(u8),
 }
 
@@ -117,7 +118,8 @@ impl Revocation {
 }
 
 /// Root's `1a` answer: the login state, the primary username and hostname
-/// the lock surface draws above the state's rows, and the revocation.
+/// the lock surface draws above the state's rows, the revocation and the
+/// admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Answer {
     state: LoginState,
@@ -125,13 +127,17 @@ pub(crate) struct Answer {
     /// Empty where root sent none.
     hostname: String,
     revocation: Revocation,
+    /// `01`: a verified account handoff admitted this generation
+    /// (td-install/ENCRYPTION.md, "Verified account handoff"). Only the
+    /// generation's first answer may carry it.
+    admitted: bool,
 }
 
 impl Answer {
     /// Exactly `9a`'s shape, or a protocol violation that ends the paired
     /// generation: a state, an enrolled list or a cause; a primary account
-    /// name; an empty hostname or one under td-firstboot's rules; and the
-    /// revocation byte, `00` to `03`.
+    /// name; an empty hostname or one under td-firstboot's rules; the
+    /// revocation byte, `00` to `03`; and the admission byte, `00` or `01`.
     fn decode(answer: &[u8]) -> Result<Self, String> {
         let invalid = || "invalid login state answer".to_string();
         let [0x9a, state, rest @ ..] = answer else {
@@ -148,7 +154,7 @@ impl Answer {
                 };
                 (LoginState::Enrolled(keys.to_vec()), rest)
             }
-            (2, [cause @ 0x0a..=0x0c, rest @ ..]) => (LoginState::Unavailable(*cause), rest),
+            (2, [cause @ 0x0a..=0x0d, rest @ ..]) => (LoginState::Unavailable(*cause), rest),
             _ => return Err(invalid()),
         };
         let [length, rest @ ..] = rest else {
@@ -165,7 +171,7 @@ impl Answer {
             .ok_or_else(invalid)?;
         let username = std::str::from_utf8(username).map_err(|_| invalid())?;
         let host = std::str::from_utf8(host).map_err(|_| invalid())?;
-        let [revocation] = rest else {
+        let [revocation, admitted @ (0 | 1)] = rest else {
             return Err(invalid());
         };
         let revocation = Revocation::decode(*revocation).ok_or_else(invalid)?;
@@ -185,6 +191,7 @@ impl Answer {
             username: username.to_string(),
             hostname,
             revocation,
+            admitted: *admitted == 1,
         })
     }
 
@@ -209,6 +216,13 @@ impl Answer {
     /// answers on the live medium (TOKEN-LOGIN.md, "Session lock").
     pub(crate) fn locks(&self) -> bool {
         !matches!(self.state, LoginState::Unenrolled)
+    }
+
+    /// Whether this, the generation's first answer, says a verified
+    /// account handoff admitted the generation: its first paint is then
+    /// the session, whatever the state.
+    pub(crate) fn admitted(&self) -> bool {
+        self.admitted
     }
 }
 
@@ -353,15 +367,27 @@ struct LoginPoll {
     /// When to ask again; none unless the state could not be read or a
     /// revocation is pending.
     next: Option<Instant>,
+    /// Whether the generation's first answer has been read.
+    answered: bool,
 }
 
 impl LoginPoll {
     fn new(login: Login) -> Self {
-        Self { login, next: None }
+        Self {
+            login,
+            next: None,
+            answered: false,
+        }
     }
 
     fn read(&mut self, wire: &mut impl Exchange) -> Result<Answer, String> {
         let answer = Answer::decode(&wire.exchange(&[0x1a])?)?;
+        // Only the connect-time answer may admit; a later one that says
+        // so is a protocol violation.
+        if answer.admitted && self.answered {
+            return Err("login state answer admits after the first".into());
+        }
+        self.answered = true;
         self.next = if answer.state == LoginState::Unavailable(UNREADABLE)
             || answer.revocation == Revocation::Pending
         {
@@ -822,15 +848,25 @@ mod tests {
         revoked(state, 0)
     }
 
-    /// `9a` for `state` with the revocation byte `revocation`.
+    /// `9a` for `state` with the revocation byte `revocation`, not
+    /// admitted.
     fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
         [
             &[0x9a][..],
             state,
             b"\x06tester\x09td-laptop",
-            &[revocation],
+            &[revocation, 0],
         ]
         .concat()
+    }
+
+    /// `9a` for `state` with the admission byte `01`.
+    fn admitting(state: &[u8]) -> Vec<u8> {
+        let mut answer = login_state(state);
+        if let Some(admission) = answer.last_mut() {
+            *admission = 1;
+        }
+        answer
     }
 
     fn keys(count: u8) -> Vec<u8> {
@@ -845,7 +881,7 @@ mod tests {
     fn a_login_state_answer_has_exactly_one_shape() {
         let decode = |bytes: &[u8]| Answer::decode(bytes).map(|answer| answer.state);
         assert_eq!(decode(&login_state(&[0])), Ok(LoginState::Unenrolled));
-        for cause in [0x0a, 0x0b, 0x0c] {
+        for cause in [0x0a, 0x0b, 0x0c, 0x0d] {
             assert_eq!(
                 decode(&login_state(&[2, cause])),
                 Ok(LoginState::Unavailable(cause))
@@ -865,9 +901,12 @@ mod tests {
             Ok(LoginState::Enrolled(vec![[7; 4], [7; 4]]))
         );
         // The longest names, and no hostname at all.
-        let longest = [&[0x9a, 0, 32][..], &[b'a'; 32], &[63], &[b'h'; 63], &[0]].concat();
+        let longest = [&[0x9a, 0, 32][..], &[b'a'; 32], &[63], &[b'h'; 63], &[0, 0]].concat();
         assert_eq!(decode(&longest), Ok(LoginState::Unenrolled));
-        assert_eq!(decode(b"\x9a\x00\x01a\x00\x00"), Ok(LoginState::Unenrolled));
+        assert_eq!(
+            decode(b"\x9a\x00\x01a\x00\x00\x00"),
+            Ok(LoginState::Unenrolled)
+        );
         // The names are kept for the lock surface, as root sent them.
         let kept = Answer::decode(&login_state(&[0])).unwrap();
         assert_eq!((kept.username(), kept.hostname()), ("tester", "td-laptop"));
@@ -875,7 +914,9 @@ mod tests {
         assert_eq!(kept.username(), "a".repeat(32));
         assert_eq!(kept.hostname(), "h".repeat(63));
         assert_eq!(
-            Answer::decode(b"\x9a\x00\x01a\x00\x00").unwrap().hostname(),
+            Answer::decode(b"\x9a\x00\x01a\x00\x00\x00")
+                .unwrap()
+                .hostname(),
             ""
         );
         let refused = [
@@ -890,33 +931,38 @@ mod tests {
             login_state(&[&[1, 1][..], &[7; 5]].concat()),
             // A cause that is not the unavailable state's, or none.
             login_state(&[2, 0x09]),
-            login_state(&[2, 0x0d]),
+            login_state(&[2, 0x0e]),
             login_state(&[2]),
             // A state byte with a stray byte after it.
             login_state(&[0, 0]),
             // Usernames: empty, too long, not a primary name, not UTF-8.
-            b"\x9a\x00\x00\x00\x00".to_vec(),
-            [&[0x9a, 0, 33][..], &[b'a'; 33], &[0, 0]].concat(),
-            b"\x9a\x00\x04Root\x00\x00".to_vec(),
-            b"\x9a\x00\x041abc\x00\x00".to_vec(),
-            b"\x9a\x00\x04a.bc\x00\x00".to_vec(),
-            b"\x9a\x00\x02a\xff\x00\x00".to_vec(),
+            b"\x9a\x00\x00\x00\x00\x00".to_vec(),
+            [&[0x9a, 0, 33][..], &[b'a'; 33], &[0, 0, 0]].concat(),
+            b"\x9a\x00\x04Root\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x041abc\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x04a.bc\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x02a\xff\x00\x00\x00".to_vec(),
             // Hostnames: too long, against firstboot's rules, not UTF-8.
-            [&[0x9a, 0, 1, b'a', 64][..], &[b'h'; 64], &[0]].concat(),
-            b"\x9a\x00\x01a\x02TD\x00".to_vec(),
-            b"\x9a\x00\x01a\x05host-\x00".to_vec(),
-            b"\x9a\x00\x01a\x03a b\x00".to_vec(),
-            b"\x9a\x00\x01a\x03td\n\x00".to_vec(),
-            b"\x9a\x00\x01a\x02\xc3\xb6\x00".to_vec(),
+            [&[0x9a, 0, 1, b'a', 64][..], &[b'h'; 64], &[0, 0]].concat(),
+            b"\x9a\x00\x01a\x02TD\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x05host-\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x03a b\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x03td\n\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x02\xc3\xb6\x00\x00".to_vec(),
             // Lengths that overrun the answer.
             b"\x9a\x00\x07tester".to_vec(),
             b"\x9a\x00\x06tester\x09td".to_vec(),
-            // The revocation byte: missing, past `03`, or followed by more.
+            // The revocation byte: missing, past `03`, or followed by more
+            // than the admission byte.
             b"\x9a\x00\x06tester\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x04".to_vec(),
-            b"\x9a\x00\x06tester\x00\xff".to_vec(),
-            b"\x9a\x00\x06tester\x00\x00\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x02\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x04\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\xff\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x02\x01\x00".to_vec(),
+            // The admission byte: missing, or past `01`.
+            b"\x9a\x00\x06tester\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x02".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\xff".to_vec(),
         ];
         for answer in refused {
             assert!(decode(&answer).is_err(), "{answer:02x?}");
@@ -958,9 +1004,46 @@ mod tests {
         for count in 1..=8 {
             assert!(locks(&keys(count)));
         }
-        for cause in [0x0a, 0x0b, 0x0c] {
+        for cause in [0x0a, 0x0b, 0x0c, 0x0d] {
             assert!(locks(&[2, cause]));
         }
+    }
+
+    /// The admission byte is kept; it changes no state and no lock.
+    #[test]
+    fn the_admission_byte_is_kept_beside_the_state() {
+        for state in [&[0][..], &keys(2), &[2, 0x0d], &[2, UNREADABLE]] {
+            let plain = Answer::decode(&login_state(state)).unwrap();
+            let admitted = Answer::decode(&admitting(state)).unwrap();
+            assert!(!plain.admitted());
+            assert!(admitted.admitted());
+            assert_eq!(admitted.state(), plain.state());
+            assert_eq!(admitted.locks(), plain.locks());
+        }
+        assert!(Answer::decode(b"\x9a\x00\x06tester\x00\x02\x01")
+            .unwrap()
+            .admitted());
+    }
+
+    /// Only the generation's first answer may admit: a later one that says
+    /// so ends the paired generation, and is never stored.
+    #[test]
+    fn only_the_first_answer_may_admit() {
+        let login = Login::default();
+        let mut poll = LoginPoll::new(login.clone());
+        let mut w = wire(vec![
+            admitting(&keys(1)),
+            login_state(&keys(1)),
+            admitting(&keys(1)),
+        ]);
+        assert!(poll.read(&mut w).unwrap().admitted());
+        assert!(!poll.read(&mut w).unwrap().admitted());
+        assert!(poll.read(&mut w).is_err());
+        assert!(!login.current().unwrap().admitted());
+        let mut poll = LoginPoll::new(Login::default());
+        let mut w = wire(vec![login_state(&[0]), admitting(&[0])]);
+        poll.read(&mut w).unwrap();
+        assert!(poll.read(&mut w).is_err());
     }
 
     /// The answer at connect is kept apart from the handle: an unreadable

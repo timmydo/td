@@ -427,7 +427,7 @@ pub(crate) fn lock_rows(answer: Option<&crate::authority::Answer>) -> Vec<String
     };
     let state = match answer.state() {
         LoginState::Enrolled(_) => Some(UNLOCK_ROWS),
-        LoginState::Unavailable(cause) => login_failure(*cause, 0),
+        LoginState::Unavailable(cause) => crate::secret_client::unavailable_rows(*cause),
         LoginState::Unenrolled => login_failure(0x09, 0),
     };
     let hostname = Some(answer.hostname()).filter(|name| !name.is_empty());
@@ -1557,6 +1557,46 @@ mod tests {
             .all(ui::is_mapped));
     }
 
+    /// An unenrolled protected machine's cause, `0d`, has its own rows,
+    /// which no failure kind's text shares, each within the prompt's
+    /// columns and drawn in mapped glyphs.
+    #[test]
+    fn an_unenrolled_protected_machine_says_how_to_unlock() {
+        use crate::authority::consent::PROMPT_COLUMNS;
+        use crate::secret_client::{login_failure, unavailable_rows, PROTECTED, PROTECTED_ROWS};
+        assert_eq!(PROTECTED, 0x0d);
+        assert_eq!(
+            PROTECTED_ROWS,
+            [
+                "NO LOGIN KEYS ENROLLED",
+                "BOOT WITH THE DISK PIN OR A",
+                "PRIMARY DISK KEY TO UNLOCK",
+            ]
+        );
+        assert_eq!(
+            lock_rows(Some(&answer(&[2, 0x0d], "td-laptop"))),
+            [
+                "TD-LAPTOP",
+                "TESTER",
+                "LOCKED",
+                "NO LOGIN KEYS ENROLLED",
+                "BOOT WITH THE DISK PIN OR A",
+                "PRIMARY DISK KEY TO UNLOCK",
+            ]
+        );
+        assert_ne!(unavailable_rows(PROTECTED), login_failure(PROTECTED, 0));
+        for cause in [0x0a, 0x0b, 0x0c] {
+            assert_eq!(unavailable_rows(cause), login_failure(cause, 0));
+        }
+        for cause in [0x00, 0x09, 0x0e, 0xff] {
+            assert_eq!(unavailable_rows(cause), None);
+        }
+        for row in PROTECTED_ROWS {
+            assert!(row.len() <= PROMPT_COLUMNS, "{row}");
+            assert!(row.bytes().all(ui::is_mapped), "{row}");
+        }
+    }
+
     /// Root's `9a` for `state`, for the primary `tester`, as the worker
     /// keeps it.
     fn answer(state: &[u8], hostname: &str) -> crate::authority::Answer {
@@ -1573,7 +1613,7 @@ mod tests {
             b"\x06tester",
             &[host],
             hostname.as_bytes(),
-            &[revocation],
+            &[revocation, 0],
         ]
         .concat();
         login.answer(&bytes).unwrap();

@@ -29,9 +29,9 @@ pub(crate) fn reduced(form: ssh_policy::Form) -> Reduced {
 pub(crate) fn ssh_form(state: login_state::State) -> ssh_policy::Form {
     match state {
         login_state::State::Unenrolled => ssh_policy::Form::Ordinary,
-        login_state::State::Enrolled | login_state::State::Unavailable(_) => {
-            ssh_policy::Form::Enforced
-        }
+        login_state::State::Enrolled
+        | login_state::State::Protected
+        | login_state::State::Unavailable(_) => ssh_policy::Form::Enforced,
     }
 }
 

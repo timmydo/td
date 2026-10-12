@@ -6499,9 +6499,10 @@ mod tests {
                 "td-secret"
             ]
         );
+        // td-authd compiles td-boot's admission record codec by `#[path]`.
         assert_eq!(
             readers_of("td-boot"),
-            ["td-install", "td-kexec", "td-update"]
+            ["td-authd", "td-install", "td-kexec", "td-update"]
         );
         // Dev-dependency edges count: a td-source-scan change runs every
         // consumer's confinement tests.

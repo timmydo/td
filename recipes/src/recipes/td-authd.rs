@@ -107,6 +107,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/src/login_status.rs"),
     ),
     (
+        "src/handoff.rs",
+        include_str!("../../../td-authd/src/handoff.rs"),
+    ),
+    (
+        "tests/handoff.rs",
+        include_str!("../../../td-authd/tests/handoff.rs"),
+    ),
+    (
         "src/revocation.rs",
         include_str!("../../../td-authd/src/revocation.rs"),
     ),
@@ -269,6 +277,12 @@ pub fn recipe() -> Recipe {
         (
             "{src}/td-secret/src/login_state.rs",
             include_str!("../../../td-secret/src/login_state.rs"),
+        ),
+        // The admission record's bytes, shared with td-boot's selector and
+        // its `admit` verb.
+        (
+            "{src}/td-boot/src/admission.rs",
+            include_str!("../../../td-boot/src/admission.rs"),
         ),
         // Request 19's tier marker and request 1d's selector reader.
         (

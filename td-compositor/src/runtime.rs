@@ -3033,6 +3033,9 @@ impl Runtime {
     /// before it. It comes before any input reader, overlay or client, so
     /// the lock withdraws nothing. One of two production locks, beside the
     /// live `lock_session` for `Super+l`, `L`, a lid close and a resume.
+    /// The one exception is a connect-time answer whose admission byte is
+    /// `01` (td-install/ENCRYPTION.md, "Verified account handoff"): that
+    /// generation's first paint is the session.
     pub(crate) fn first_paint(
         &mut self,
         connected: Option<&crate::authority::Answer>,
@@ -3047,7 +3050,8 @@ impl Runtime {
                 .set_lock_rows(crate::attention::lock_rows(Some(rows)));
             self.scene.set_revocation(rows.revocation().notice());
         }
-        if self.attention_enabled && connected.is_some_and(crate::authority::Answer::locks) {
+        let locks = connected.is_some_and(|answer| answer.locks() && !answer.admitted());
+        if self.attention_enabled && locks {
             self.scene.lock();
         }
         self.repaint()
@@ -16057,7 +16061,7 @@ mod tests {
     fn login(state: &[u8]) -> crate::authority::Login {
         let login = crate::authority::Login::default();
         login
-            .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat())
+            .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00"].concat())
             .unwrap();
         login
     }
@@ -16095,6 +16099,7 @@ mod tests {
             (&[2, 0x0a], true),
             (&[2, 0x0b], true),
             (&[2, 0x0c], true),
+            (&[2, 0x0d], true),
             (&[0], false),
         ];
         for (state, locks) in states {
@@ -16127,6 +16132,32 @@ mod tests {
             runtime.first_paint(answer, handle).unwrap();
             assert!(!runtime.session_locked());
             assert!(*frames.lock().unwrap() == [ordinary()]);
+        }
+    }
+
+    /// A connect-time answer whose admission byte is `01` paints the
+    /// session first, whatever its state (td-install/ENCRYPTION.md,
+    /// "Verified account handoff"); the rows still follow the answer, and
+    /// the live lock still works.
+    #[test]
+    fn an_admitted_generation_paints_the_session_first() {
+        for state in [
+            &[1, 1, 7, 7, 7, 7][..],
+            &[2, 0x0b],
+            &[2, 0x0c],
+            &[2, 0x0d],
+            &[0],
+        ] {
+            let login = crate::authority::Login::default();
+            login
+                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x01"].concat())
+                .unwrap();
+            let answer = login.current().unwrap();
+            assert!(answer.admitted());
+            let (mut runtime, frames) = recorded(true);
+            runtime.first_paint(Some(&answer), Some(&login)).unwrap();
+            assert!(!runtime.session_locked(), "{state:02x?}");
+            assert!(*frames.lock().unwrap() == [ordinary()], "{state:02x?}");
         }
     }
 
@@ -16198,7 +16229,7 @@ mod tests {
         let revoked = |state: &[u8], byte: u8| {
             let login = crate::authority::Login::default();
             login
-                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop", &[byte]].concat())
+                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop", &[byte, 0]].concat())
                 .unwrap();
             login.current().unwrap()
         };
@@ -16265,7 +16296,7 @@ mod tests {
         let handle = login(&[2, 0x0c]);
         let connected = handle.current().unwrap();
         handle
-            .answer(&[&[0x9a, 0][..], b"\x06tester\x09td-laptop\x00"].concat())
+            .answer(&[&[0x9a, 0][..], b"\x06tester\x09td-laptop\x00\x00"].concat())
             .unwrap();
         let latest = handle.current().unwrap();
         assert!(!latest.locks());
@@ -16306,7 +16337,7 @@ mod tests {
             .answer(
                 &[
                     &[0x9a, 1, 1, 7, 7, 7, 7][..],
-                    b"\x06tester\x09td-laptop\x00",
+                    b"\x06tester\x09td-laptop\x00\x00",
                 ]
                 .concat(),
             )
@@ -16323,7 +16354,7 @@ mod tests {
         // An answer stored after the read reaches the watcher after the
         // paint, and repaints the rows.
         handle
-            .answer(&[&[0x9a, 2, 0x0b][..], b"\x06tester\x09td-laptop\x00"].concat())
+            .answer(&[&[0x9a, 2, 0x0b][..], b"\x06tester\x09td-laptop\x00\x00"].concat())
             .unwrap();
         let damaged = handle.current().unwrap();
         assert!(*frames.lock().unwrap().last().unwrap() == lock_surface(Some(&damaged)));

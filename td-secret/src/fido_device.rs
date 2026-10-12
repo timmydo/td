@@ -1526,9 +1526,9 @@ pub(crate) mod vm_tests {
             use crate::cutover::{self, BootId, Reduced};
             let reduced = match crate::login_state::state(Path::new("/"), 1000) {
                 crate::login_state::State::Unenrolled => Reduced::Unenrolled,
-                crate::login_state::State::Enrolled | crate::login_state::State::Unavailable(_) => {
-                    Reduced::Enforced
-                }
+                crate::login_state::State::Enrolled
+                | crate::login_state::State::Protected
+                | crate::login_state::State::Unavailable(_) => Reduced::Enforced,
             };
             let boot = BootId::read(Path::new(cutover::BOOT_ID)).unwrap();
             cutover::publish(

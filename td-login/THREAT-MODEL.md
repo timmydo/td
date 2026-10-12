@@ -426,8 +426,10 @@ exist, through the directory-and-name predicate it shares with firstboot
 and td-authd, on the real root and before anything else that could start
 a session: `login-primary` before it resolves the primary account,
 interactive `login` before it prompts or looks a name up. Unless the
-root-owned mode-0700 `/var/lib/td/login` opens with valid metadata and the
-record name is absent, interactive `login` and `login-primary` refuse
+root-owned mode-0700 `/var/lib/td/login` opens with valid metadata,
+neither the record name nor the protected marker (`TOKEN-LOGIN.md`, "The
+login record") is in it, and the boot left no `/run/td-admit`,
+interactive `login` and `login-primary` refuse
 **every** account, root included, so no console path bypasses the key.
 The gate concerns a caller root in some uid column. A caller root in none
 can switch to nobody but itself (§4), so it reaches no session it lacked,

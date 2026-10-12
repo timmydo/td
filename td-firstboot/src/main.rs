@@ -2450,6 +2450,7 @@ mod ssh_forms {
         assert_eq!(ssh_form(State::Unenrolled), ssh_policy::Form::Ordinary);
         for state in [
             State::Enrolled,
+            State::Protected,
             State::Unavailable(Cause::DirectoryDamaged),
             State::Unavailable(Cause::RecordDamaged),
             State::Unavailable(Cause::Unreadable),

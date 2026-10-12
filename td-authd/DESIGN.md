@@ -2161,8 +2161,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
 
    Root first applies the same predicate firstboot and td-login use:
    `/var/lib/td/login` opens as a valid root:root mode-0700 directory and
-   the record name is absent. That alone, with no helper, is unenrolled;
-   an invalid directory is unavailable (damaged directory). Only when the
+   the record name is absent. That alone, with no helper, is
+   unenrolled, unless the protected marker is there too or the boot's
+   `/run/td-admit` exists, which is unavailable with cause `0d`
+   (amendment 9); an invalid directory is unavailable (damaged
+   directory). Only when the
    record name exists does root run a fixed read-only `td-secret
    inspect-login --uid 1000` child to tell enrolled from a damaged record.
    It shares store inspection's fixed helper launch (empty environment,
@@ -2306,9 +2309,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    not the `1a` answer, whose helper may also report the record
    unreadable. So root and the verb always reduce alike: a valid
    directory without the record name is unenrolled, and anything else is
-   enforced. A later state that enforces without a record, such as
-   `td-install/ENCRYPTION.md` increment 8's protected marker, extends
-   that shared check, never root's reduction alone.
+   enforced. A later state that enforces without a record extends that
+   shared check, never root's reduction alone:
+   `td-install/ENCRYPTION.md` increment 8's protected marker and the
+   boot's `/run/td-admit` do (amendment 9), so a valid directory without
+   the record name is enforced while either exists.
 
    **The record.** It is exactly three lines, each ending in a newline:
    - `td-login-cutover-v1`;
@@ -2579,26 +2584,49 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    marker; no machine enrolled before increment 5, and an unenrolled
    machine reads no marker. The full-system refusal, in
    `qemu-login-system` (C11), depends on C10b's marked deployments.
-9. **Session admission (planned).** `td-install/ENCRYPTION.md`
-   increment 8's "Verified account handoff" owns the admission record
-   and the rules td-authd applies to it. At a generation's Prepare,
-   before the compositor's first `1a`, root reads, unlinks and judges
+9. **Session admission.** `td-install/ENCRYPTION.md` increment 8's
+   "Verified account handoff" owns the admission record and the rules
+   td-authd applies to it. At an installed boot's Prepare, before the
+   compositor's first `1a`, root reads, unlinks and judges
    `/run/td-admit/v1` after creating `/run/td-admit/consumed`
-   exclusively, and creates `/var/lib/td/login/protected` on a valid
-   record. With that marker present an unenrolled login state is
-   answered as unavailable with the new cause `0d`, so it locks as
-   every unavailable answer does; the lock surface says no login key is
-   enrolled and that a boot with the disk PIN or a primary disk token
-   admits the session. The `9a` answer
-   gains one final byte after the revocation byte: `01` in the first
-   answer of a generation the record admitted, `00` in every other
-   answer. The compositor then paints the session rather than the lock
-   surface for that generation's first frame (`td-compositor/DESIGN.md`,
-   "The lock surface"). The admission authorizes no login-key
-   operation; with the marker present the worker applies
-   TOKEN-LOGIN.md's protected-volume rule ("Enrollment, addition and
-   removal"). Both peers ship the byte atomically, still `TDLA003`, as
-   request `1a` did.
+   exclusively, and creates `/var/lib/td/login/protected` whenever
+   `/run/td-admit` exists, which only a protected release leaves
+   (`handoff.rs`, compiling td-boot's `admission.rs` for the record's
+   bytes). A live boot consumes nothing. With that marker or
+   `/run/td-admit` present an unenrolled login state is answered as
+   unavailable with the new cause `0d`, so it locks as every unavailable
+   answer does; the lock surface says no login key is enrolled and that
+   a boot with the disk PIN or a primary disk key unlocks. The shared
+   predicate reports either without the record name as its own protected
+   state, which firstboot, td-login and the revocation's reduction
+   enforce, and request 19 treats as it treats unavailable. The `9a`
+   answer gains one final byte after the revocation byte: `01` in the
+   first answer of a generation the record admitted, `00` in every other
+   answer. The
+   compositor then paints the session rather than the lock surface for
+   that generation's first frame (`td-compositor/DESIGN.md`, "The lock
+   surface"), and ends the generation on a `01` in any later answer. The
+   admission authorizes no login-key operation; with the marker present
+   the worker applies TOKEN-LOGIN.md's protected-volume rule
+   ("Enrollment, addition and removal"). Both peers ship the byte
+   atomically, still `TDLA003`, as request `1a` did.
+
+   Choices the handoff left open, each the fail-closed reading: the
+   record directory must itself be a root:root mode-0700 directory, or
+   nothing in it is touched; the record must share its device with that
+   directory and with the topmost mount at `/run` in
+   `/proc/self/mountinfo`, which must be tmpfs; a name at `v1` of any
+   kind is unlinked before the consumed marker is made; whatever
+   `/run/td-admit` holds, a refused record, a record of method 0, an
+   untrustworthy directory or nothing, the boot is protected, so the
+   persistent marker is made, and one that cannot be made is retried at
+   every later Prepare while the predicate enforces through
+   `/run/td-admit` alone; `td-boot admit` leaves the directory, empty,
+   after a failure where it can; the age is `/proc/uptime`'s first
+   field, `CLOCK_BOOTTIME`, to the hundredth; a record admits only when
+   the protected marker was made or found; and the admission byte goes
+   with the generation's first `1a` answer whatever that answer's
+   state.
 10. **Storage operations (planned).** One fixed root `td-install
     storage-operation --uid 1000` child per operation, sharing the
     single operation slot and the login worker's launch, framing,
@@ -2633,7 +2661,7 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
-| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, and the revocation byte, `00` to `03` (amendments 1 and 7) |
+| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds, or `0d`, an unenrolled protected machine; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, the revocation byte, `00` to `03`, and the admission byte, `00` or `01` (amendments 1, 7 and 9) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 
@@ -2641,8 +2669,9 @@ argument. The paired requests are:
 needs nor takes the operation slot. The compositor admits only an answer
 of exactly that shape, with a username under `primary_account`'s rules
 and a hostname empty or under `Hostname::parse`'s; anything else, a
-revocation byte past `03` included, is a protocol violation that ends
-the paired generation.
+revocation byte past `03`, an admission byte past `01` or a `01` in any
+answer but the generation's first included, is a protocol violation
+that ends the paired generation.
 
 `1b` needs completed preparation and an empty operation slot, as `12`
 does, or it ends the generation. The login operation then holds the

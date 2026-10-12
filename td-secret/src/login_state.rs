@@ -1,6 +1,7 @@
 //! The login-state predicate (td-login/TOKEN-LOGIN.md, "The login record"):
 //! whether `<root>/var/lib/td/login` is a valid directory and whether the
-//! record's name is in it. It reads no record bytes. td-secret's record
+//! record's name, or else the protected marker's, is in it. It reads no
+//! record bytes. td-secret's record
 //! store, td-firstboot, td-authd and td-login (for its console refusal,
 //! td-login/THREAT-MODEL.md §3) compile this one file; it uses std alone.
 #![forbid(unsafe_code)]
@@ -16,6 +17,16 @@ use std::path::{Component, Path, PathBuf};
 pub const DIRECTORY: &str = "/var/lib/td/login";
 /// Every temporary name starts with this; no other td name does.
 pub const TEMPORARY: &str = "tmp-";
+/// The protected tier's persistent marker (td-install/ENCRYPTION.md,
+/// "Verified account handoff"), which td-authd creates on a valid
+/// admission record: with it, a directory without the record's name
+/// still enforces.
+pub const PROTECTED: &str = "protected";
+/// Under the root, the directory `td-boot admit` creates on the system's
+/// `/run` when the selector handed over an admission record, which only a
+/// protected release does: with it, this boot enforces as the marker does,
+/// even when the marker could not be made.
+pub const BOOT_PROTECTED: &str = "run/td-admit";
 /// Where a held descriptor is named again as a path.
 pub const FD_ROOT: &str = "/proc/self/fd";
 pub const NOFOLLOW: i32 = 0o400000;
@@ -49,6 +60,10 @@ pub enum State {
     Unenrolled,
     /// The record's name exists; only the record store reads what it holds.
     Enrolled,
+    /// A valid directory without the record's name but with `PROTECTED`,
+    /// of any type: an unenrolled protected machine, which enforces as an
+    /// enrolled one does.
+    Protected,
     Unavailable(Cause),
 }
 
@@ -339,6 +354,15 @@ impl Directory {
     }
 }
 
+/// Whether `BOOT_PROTECTED` exists under `root`, as any type; a failure
+/// to tell counts as protected.
+pub fn boot_protected(root: &Path) -> bool {
+    !matches!(
+        fs::symlink_metadata(root.join(BOOT_PROTECTED)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
 /// The predicate: the login state under `root`, for UID `uid`'s record.
 pub fn state(root: &Path, uid: u32) -> State {
     state_as(root, Owner::ROOT, uid)
@@ -346,11 +370,16 @@ pub fn state(root: &Path, uid: u32) -> State {
 
 /// `state` with the owner a parameter, for tests that cannot create root's.
 pub fn state_as(root: &Path, owner: Owner, uid: u32) -> State {
-    match Directory::open(&directory(root), owner).and_then(|d| d.lookup(&uid.to_string())) {
-        Ok(None) => State::Unenrolled,
-        Ok(Some(_)) => State::Enrolled,
-        Err(refusal) => State::Unavailable(refusal.cause),
-    }
+    let read = Directory::open(&directory(root), owner).and_then(|directory| {
+        if directory.lookup(&uid.to_string())?.is_some() {
+            Ok(State::Enrolled)
+        } else if directory.lookup(PROTECTED)?.is_some() || boot_protected(root) {
+            Ok(State::Protected)
+        } else {
+            Ok(State::Unenrolled)
+        }
+    });
+    read.unwrap_or_else(|refusal| State::Unavailable(refusal.cause))
 }
 
 #[cfg(test)]
@@ -461,6 +490,54 @@ mod tests {
         drop(listener);
         fs::remove_file(&record).unwrap();
         assert_eq!(root.state(), State::Unenrolled);
+    }
+
+    /// The protected marker, of any type, turns only an unenrolled
+    /// directory protected: the record's name still reads enrolled, and a
+    /// damaged directory still reads damaged.
+    #[test]
+    fn the_protected_marker_enforces_without_a_record() {
+        assert_eq!(PROTECTED, "protected");
+        let root = Root::new();
+        let marker = root.login().join(PROTECTED);
+        fs::write(&marker, b"").unwrap();
+        assert_eq!(root.state(), State::Protected);
+        fs::write(root.login().join(UID.to_string()), b"").unwrap();
+        assert_eq!(root.state(), State::Enrolled);
+        fs::remove_file(root.login().join(UID.to_string())).unwrap();
+        fs::remove_file(&marker).unwrap();
+        // Nothing about the marker's type or bytes makes it read as absent.
+        fs::create_dir(&marker).unwrap();
+        assert_eq!(root.state(), State::Protected);
+        fs::remove_dir(&marker).unwrap();
+        symlink("missing", &marker).unwrap();
+        assert_eq!(root.state(), State::Protected);
+        fs::remove_file(&marker).unwrap();
+        // Near names are not the marker.
+        for name in ["Protected", "protected.tmp", "tmp-protected", "protecte"] {
+            fs::write(root.login().join(name), b"").unwrap();
+        }
+        assert_eq!(root.state(), State::Unenrolled);
+        // The boot's handoff directory under the root, of any type, is
+        // protected too, until the next boot's `/run` has none.
+        assert_eq!(BOOT_PROTECTED, "run/td-admit");
+        fs::create_dir(root.root.join("run")).unwrap();
+        fs::create_dir(root.root.join(BOOT_PROTECTED)).unwrap();
+        assert_eq!(root.state(), State::Protected);
+        fs::write(root.login().join(UID.to_string()), b"").unwrap();
+        assert_eq!(root.state(), State::Enrolled);
+        fs::remove_file(root.login().join(UID.to_string())).unwrap();
+        fs::remove_dir(root.root.join(BOOT_PROTECTED)).unwrap();
+        fs::write(root.root.join(BOOT_PROTECTED), b"").unwrap();
+        assert_eq!(root.state(), State::Protected);
+        fs::remove_file(root.root.join(BOOT_PROTECTED)).unwrap();
+        assert_eq!(root.state(), State::Unenrolled);
+        fs::write(&marker, b"").unwrap();
+        // A damaged directory reads damaged, marker or not.
+        let held = root.root.join("held");
+        fs::rename(root.login(), &held).unwrap();
+        symlink(&held, root.login()).unwrap();
+        assert_eq!(root.state(), State::Unavailable(Cause::DirectoryDamaged));
     }
 
     #[test]

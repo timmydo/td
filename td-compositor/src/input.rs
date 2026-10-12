@@ -3185,7 +3185,7 @@ fn no_login_keys(state: Option<crate::authority::LoginState>) -> crate::attentio
     use crate::authority::LoginState;
     let rows = match state {
         Some(LoginState::Unenrolled) => crate::secret_client::login_failure(0x09, 0),
-        Some(LoginState::Unavailable(cause)) => crate::secret_client::login_failure(cause, 0),
+        Some(LoginState::Unavailable(cause)) => crate::secret_client::unavailable_rows(cause),
         _ => None,
     };
     rows.map_or(
@@ -9985,7 +9985,7 @@ mod tests {
     fn login_answer(keys: &[[u8; 4]]) -> crate::authority::Login {
         let mut answer = vec![0x9a, 1, keys.len() as u8];
         answer.extend(keys.iter().flatten());
-        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00");
+        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00\x00");
         let login = crate::authority::Login::default();
         login.answer(&answer).unwrap();
         login
@@ -10074,19 +10074,19 @@ mod tests {
             // Unenrolled, and each cause of the unavailable state, as root
             // answers them.
             (
-                Some(&b"\x9a\x00\x06tester\x09td-laptop\x00"[..]),
+                Some(&b"\x9a\x00\x06tester\x09td-laptop\x00\x00"[..]),
                 Notice::Login(&["NO LOGIN KEYS ENROLLED"]),
             ),
             (
-                Some(&b"\x9a\x02\x0a\x06tester\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0a\x06tester\x00\x00\x00"[..]),
                 Notice::Login(unavailable("directory")),
             ),
             (
-                Some(&b"\x9a\x02\x0b\x06tester\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0b\x06tester\x00\x00\x00"[..]),
                 Notice::Login(unavailable("record")),
             ),
             (
-                Some(&b"\x9a\x02\x0c\x06tester\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0c\x06tester\x00\x00\x00"[..]),
                 Notice::Login(unavailable("unreadable")),
             ),
             // No answer: the direct profile, which has no authority.
@@ -10120,12 +10120,12 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = attention_bindings(None);
         let login = bindings.lock().unwrap().login.clone();
-        login.answer(b"\x9a\x00\x06tester\x00\x00").unwrap();
+        login.answer(b"\x9a\x00\x06tester\x00\x00\x00").unwrap();
         // A later answer, taken by the worker's handle, is the one `D` reads.
         let mut answer = vec![0x9a, 1, 2];
         answer.extend_from_slice(&[0xb1; 4]);
         answer.extend_from_slice(&[0xb2; 4]);
-        answer.extend_from_slice(b"\x06tester\x00\x00");
+        answer.extend_from_slice(b"\x06tester\x00\x00\x00");
         login.answer(&answer).unwrap();
         read_reports(&target, &bindings, 0, &chord_reports(10));
         read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_D, KEY_2], 20));
@@ -11997,7 +11997,7 @@ mod tests {
 
     /// Root's `9a` for `state`, with the names `login_answer` gives.
     fn root_answer(state: &[u8]) -> Vec<u8> {
-        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00"].concat()
+        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00"].concat()
     }
 
     /// TOKEN-LOGIN.md's D13: on a lock surface whose state is unavailable
@@ -12128,8 +12128,36 @@ mod tests {
         (&[2, 0x0a], true),
         (&[2, 0x0b], true),
         (&[2, 0x0c], true),
+        (&[2, 0x0d], true),
         (&[0], false),
     ];
+
+    /// An admitted generation (td-install/ENCRYPTION.md, "Verified account
+    /// handoff") starts on the session, but `Super+l` locks it on the same
+    /// rule: the admission byte changes no lock after the first paint.
+    #[test]
+    fn super_l_locks_an_admitted_generation_on_the_same_rule() {
+        for (state, locks) in STATES {
+            let login = crate::authority::Login::default();
+            let mut answer = root_answer(state);
+            if let Some(admission) = answer.last_mut() {
+                *admission = 1;
+            }
+            login.answer(&answer).unwrap();
+            assert!(login.current().unwrap().admitted());
+            let mut bindings = KeyBindings {
+                attention_enabled: true,
+                login,
+                ..KeyBindings::default()
+            };
+            bindings.feed(key(KEY_LEFTMETA, KEY_PRESS));
+            assert_eq!(
+                bindings.feed(key(KEY_L, KEY_PRESS)).lock,
+                *locks,
+                "{state:?}"
+            );
+        }
+    }
 
     /// In the paired profile `Super+l`, from either Super, is always
     /// consumed, press and release, and asks to lock exactly while root's

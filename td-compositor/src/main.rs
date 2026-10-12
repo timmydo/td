@@ -1105,7 +1105,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0xdfecf1a31acf0820;
+    const AUTHORITY_FINGERPRINT: u64 = 0x332a3f1255acc21a;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -3038,12 +3038,17 @@ pub struct MappedRegion {
             .unwrap()
             .0;
         assert_eq!(occurrences(first_paint, "scene.lock()"), 1);
-        // Decided by the answer at connect alone, never the handle's later.
+        // Decided by the answer at connect alone, never the handle's later;
+        // its admission byte is the one condition under which a locking
+        // answer paints the session first.
         assert!(first_paint.contains(
-            "        if self.attention_enabled && connected.is_some_and(crate::authority::Answer::locks) {\n            \
+            "        let locks = connected.is_some_and(|answer| answer.locks() && !answer.admitted());\n        \
+             if self.attention_enabled && locks {\n            \
              self.scene.lock();\n        }\n        self.repaint()"
         ));
-        assert_eq!(occurrences(first_paint, "::locks"), 1);
+        assert_eq!(occurrences(first_paint, "locks()"), 1);
+        assert_eq!(occurrences(first_paint, "admitted()"), 1);
+        assert_eq!(occurrences(first_paint, "connected"), 3);
         // The handle is read inside, under the caller's runtime guard.
         assert!(first_paint.contains(
             "        let latest = login.and_then(crate::authority::Login::current);\n        \
