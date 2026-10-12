@@ -960,3 +960,38 @@ connection slots. The runtime also applies its shared HTTPS pool and event
 stream ceiling; simultaneous traffic can exhaust that shared capacity.
 The prepared document retains its bounded 32 KiB allocation and should be
 shared for the selected configuration, rather than rebuilt per connection.
+
+### Prepared EventSource frames
+
+`jmap_events` parses the three configured EventSource URI-template query
+parameters with one percent-decoding pass. It bounds the query to 4096 bytes,
+refuses missing/duplicate/unknown parameters and malformed numeric/escape
+values, filters the fixed account-type roster, and ignores unknown type
+names. `types=*` selects the roster; closeafter is state or no. Zero disables
+pings; positive intervals clamp to 1..300 seconds, within RFC 8620's permitted
+interoperability range. Plus is a literal URI-template character, not form
+encoding.
+
+A passive Snapshot contains at most four typed DataState values and one
+IdentityState for one account and epoch; duplicate types or cross-account/
+epoch mixtures refuse. The caller supplies only types visible under current
+authorization. A stream retains passive snapshots and one 2048-byte event
+frame, never a storage view. Only selected changed types enter a StateChange
+map. Its opaque event id hashes the type selection and complete visible
+snapshot; a reconnect
+with the current id suppresses redundant initial state, while a missing or
+stale id sends current selected states. This is coalesced synchronization,
+not a replay of every historical transition or an authorization token. A
+changed type selection cannot reuse an acknowledgement. Changes outside the
+selection may cause a redundant selected-state event on reconnect, preserving
+the RFC recommendation to encode all visible state.
+
+A pending frame stays immutable until the runtime reports complete transport
+flush through acknowledge. State changes arriving while it is pending are
+coalesced from the caller's latest snapshot after that acknowledgement. Ping
+intervals run from the last acknowledged event and ping events carry no id.
+Close-after-state closes only after the state frame is acknowledged, never
+on a ping. Clock regressions and account substitution refuse. Authentication,
+revocation, connection limits, snapshot acquisition, socket scheduling and
+stall/total deadlines remain runtime responsibilities. These helpers activate
+no HTTP endpoint and do not advertise Core early.

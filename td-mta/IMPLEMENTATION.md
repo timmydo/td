@@ -3760,3 +3760,13 @@ metadata state token. This is an inert document builder: authenticated HTTP
 discovery, live concurrency admission and the remaining Core endpoints still
 block capability advertisement. Native fixtures check complete field shape,
 all variable-state inputs, canonical origins, escaping and construction bounds.
+
+Prepared EventSource options, account snapshots and SSE frames now cover
+fixed-type filtering, coalesced changes, opaque reconnect ids, bounded ping
+intervals and close-after-state after transport acknowledgement. This is a
+socket-independent adapter with no live storage views. HTTPS scheduling,
+authenticated snapshot acquisition and lifetime/revocation enforcement remain
+required before the EventSource endpoint can activate.
+
+Mail capability activation additionally requires EmailDelivery state and
+push support; the current fixed EventSource roster does not provide it.
