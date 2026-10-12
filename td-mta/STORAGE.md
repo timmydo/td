@@ -2747,3 +2747,38 @@ paths, never row values whose buffers could outlive a lookup. All output reads
 use the same job's actual completed sorter coordinates; failed output reads
 withhold the destination bytes. API.md owns query semantics and publication;
 ADMISSION.md owns the combined resident workspace and accounting policy.
+
+## Native stored Email read projections
+
+IndexReadView::email_metadata reads an Email and its referenced Blob metadata
+under the original account snapshot, returning IDs, raw size and signed UTC
+milliseconds without fetching or parsing MIME body bytes. A missing Email is
+None; a missing referenced Blob is corruption. Caller scratch must fit the
+stored Email and Blob rows; format::MAX_VALUE_BYTES is a sufficient existing
+bound, including SMTP receipt metadata where present.
+
+email_mailboxes and email_keywords return ascending exclusive-after windows
+of at most MAX_EMAIL_VALUES (256), using the existing composite primary keys.
+Separate first/after SQL forms allow an indexed lower-bound seek with no SQL
+sort temporary. Each window validates one additional row to establish has_more;
+no account-sized vector or complete per-email set is retained. Mailbox zero IDs
+are valid first values. Keyword spelling and byte bounds use the canonical
+stored-key validator before allocating a bounded String. An empty set does not
+establish Email existence; consumers first read metadata on the same view.
+
+Every operation retains original snapshot/VM/deadline custody and validates
+changed sequences. Returned structs are passive data, not authorization or
+publication evidence. Consumers must keep and freshly check the original view
+and request before publishing combined metadata/sets. This adds no schema,
+mutation, MIME interpretation, Email/get activation or Mail advertisement.
+
+The email_metadata module is a private child of store_fs::index. Its exact
+path is admitted by the native-type confinement scan; its production and
+test sources join the forbidden native-surface scan. The typed wrappers
+export no native connection, statement or caller-controlled SQL. Existing
+thread_emails and mailbox_counts likewise issue closed SQL inside the private
+index tree. get already validates Email/Blob changed sequences; set windows
+validate their own changed values, including the extra row, without allocating
+an owned keyword for that extra row. Every row also checks the native deadline.
+Invalid keyword cursors return Invalid before snapshot entry; this error-only
+precedence grants no result or freshness claim.

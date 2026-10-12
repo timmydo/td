@@ -32,6 +32,7 @@ fn scan(root: &Path, directory: &Path) {
                 assert!(
                     [
                         "src/store_fs/index.rs",
+                        "src/store_fs/index/email_metadata.rs",
                         "src/store_fs/index/relational.rs",
                         "src/store_fs/index/relational/read.rs",
                     ]
@@ -52,6 +53,8 @@ fn native_sql_is_private_and_has_no_external_query_or_extension_surface() {
     scan(root, &root.join("tests"));
     let source = [
         include_str!("../src/store_fs/index.rs"),
+        include_str!("../src/store_fs/index/email_metadata.rs"),
+        include_str!("../src/store_fs/index/email_metadata_tests.rs"),
         include_str!("../src/store_fs/index/relational.rs"),
         include_str!("../src/store_fs/index/relational/read.rs"),
         include_str!("../src/store_fs/index/relational/schema.rs"),

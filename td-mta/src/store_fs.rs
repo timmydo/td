@@ -17,13 +17,13 @@ pub use index::{
     smtp_trace_allowance, AuxiliaryUsage, BackupError, BackupReceipt, BlobAuthorization,
     BlobReadRequest, BlobSource, CommitCompletion, CommitError, CommitFileUsage, CommitRequest,
     Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
-    DeliveryPeer, DeliveryRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
-    LedgerInitError, LogicalUsage, MailboxCounts, NativeSortJob, ResponseError, ResponseRetention,
-    SortError, SortRetention, SortSource, SortWork, SortWorkspace, StoreCoordinator,
-    StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails, Upload, UploadAttempt,
-    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
-    UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence, MAX_MAILBOX_COUNTS,
-    MAX_THREAD_EMAILS,
+    DeliveryPeer, DeliveryRequest, EmailMetadata, EmailValues, HistoryPruneRequest, HistoryPruned,
+    IndexReadView, IndexStore, LedgerInitError, LogicalUsage, MailboxCounts, NativeSortJob,
+    ResponseError, ResponseRetention, SortError, SortRetention, SortSource, SortWork,
+    SortWorkspace, StoreCoordinator, StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails,
+    Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError,
+    UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
+    MAX_EMAIL_VALUES, MAX_MAILBOX_COUNTS, MAX_THREAD_EMAILS,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

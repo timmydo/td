@@ -48,6 +48,9 @@ mod operations;
 #[path = "index/row_history.rs"]
 mod row_history;
 use operations::Operations;
+#[path = "index/email_metadata.rs"]
+mod email_metadata;
+pub use email_metadata::{EmailMetadata, EmailValues, MAX_EMAIL_VALUES};
 #[path = "index/history.rs"]
 mod history;
 #[path = "index/mailbox_counts.rs"]
