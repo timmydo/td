@@ -4579,13 +4579,23 @@ impl App {
             ));
         }
         let label = format!("image {}", self.next_picture());
-        let reference = match crate::picture::check(bytes, &label) {
+        // One past the bounds a provider takes, or a JPEG its EXIF says to
+        // turn, is written anew.
+        let (bytes, rewritten) = match crate::picture::must_rewrite(bytes) {
+            Ok(false) => (std::borrow::Cow::Borrowed(bytes), None),
+            Ok(true) => match crate::picture::shrink(bytes) {
+                Ok((bytes, was)) => (std::borrow::Cow::Owned(bytes), Some(was)),
+                Err(why) => return self.note(format!("the picture is not taken: {why}")),
+            },
+            Err(why) => return self.note(format!("the picture is not taken: {why}")),
+        };
+        let reference = match crate::picture::check(&bytes, &label) {
             Ok(reference) => reference,
             Err(why) => return self.note(format!("the picture is not taken: {why}")),
         };
         match self.composer.insert(&reference.stand_in()) {
             Ok(true) => {
-                self.note(format!(
+                let said = format!(
                     "pasted {}: {}x{} {}, {:.1} MB",
                     reference.stand_in(),
                     reference.width,
@@ -4596,8 +4606,12 @@ impl App {
                         "JPEG"
                     },
                     reference.bytes as f64 / 1e6
-                ));
-                self.attached.push((reference, Arc::from(bytes)));
+                );
+                self.note(match rewritten {
+                    Some(was) => format!("{said}, {was}"),
+                    None => said,
+                });
+                self.attached.push((reference, Arc::from(&*bytes)));
                 self.touch();
             }
             Ok(false) => self.note("the composer took no picture"),
@@ -7373,6 +7387,36 @@ pub mod tests {
             &mut NoClipboard,
         );
         bytes
+    }
+
+    /// A picture past the bounds a provider takes is shrunk as it is
+    /// pasted, and goes as the JPEG it became.
+    #[test]
+    fn a_pasted_picture_past_the_bounds_goes_shrunk() {
+        let mut app = app();
+        let wide = crate::picture::tests::png(crate::picture::MAX_PICTURE_AXIS + 2, 3, [7; 3]);
+        app.input(
+            Input::PasteImage {
+                mime: "image/png",
+                bytes: &wide,
+            },
+            &mut NoClipboard,
+        );
+        assert_eq!(app.composed(), "[image 1]");
+        key(&mut app, "Return");
+        let mut requests = app.take_requests();
+        let Some(Request::Send(_, pictures)) = requests.pop() else {
+            panic!("not sent")
+        };
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].0.mime, crate::picture::JPEG);
+        assert_eq!((pictures[0].0.width, pictures[0].0.height), (2001, 1));
+        let said = app.notice().unwrap_or_default();
+        assert!(
+            said.starts_with("pasted [image 1]: 2001x1 JPEG")
+                && said.contains(", shrunk from 8002x3 PNG, "),
+            "{said}"
+        );
     }
 
     /// A refused message comes back with its pictures; one whose label a

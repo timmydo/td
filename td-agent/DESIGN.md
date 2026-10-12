@@ -107,7 +107,8 @@ dependencies, all td crates by path: `td-civil`, `td-encoding`,
 `td-fetch-client`, `td-fs`, `td-html`, `td-jpeg`, `td-json`,
 `td-markdown`, `td-png`, `td-toml` and `td-ui`, and its lock lists
 exactly those and td-agent. The person's pictures are read by td-png and
-td-jpeg, the decoders td-ui's other programs share, and sent in base64
+td-jpeg, the decoders td-ui's other programs share, one too large to
+send is written anew by td-jpeg's encoder, and each is sent in base64
 by td-encoding's (§6, Pictures). It
 carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
@@ -1119,23 +1120,24 @@ says.
   ask the clipboard for its picture when the selection offers PNG or
   JPEG (td-ui DESIGN.md, Widget window), and for its text otherwise, so
   a screenshot tool's or a browser's copied image comes as the picture.
-  A pasted picture is checked as §6's Pictures says, held by the window,
-  and named in the composer's text by a label of its own, `[image 1]`,
-  numbered past the highest held; a note says its size. A picture whose
-  label the text no longer names is let go when another is pasted, so
-  at most 8 are held. A message, or a command of the person's (§15),
-  carries the held pictures its text names, in the order it names them,
-  and every held picture is let go when it is sent; deleting the label
-  leaves its picture out. One naming more than 8 is not sent, and says
-  so. A message the window cannot hand on, or the child refuses, comes
-  back to the composer with its pictures; one whose label a picture
-  pasted since holds is labelled anew, in the returned text too. A
-  message carrying pictures does not answer a question the model asked
-  (§12), which wants words; it is refused with why. The transcript shows
-  the person's pictures below their text, read from where the
-  conversation keeps them and decoded within 1024 pixels a side, a JPEG
-  at the DCT scale that brings it within and a PNG halved until it is;
-  one that cannot be read shows as a line saying why.
+  A pasted picture is checked, or shrunk when past a provider's bounds,
+  as §6's Pictures says, held by the window, and named in the composer's
+  text by a label of its own, `[image 1]`, numbered past the highest
+  held; a note says its size. A picture whose label the text no longer
+  names is let go when another is pasted, so at most 8 are held. A
+  message, or a command of the person's (§15), carries the held pictures
+  its text names, in the order it names them, and every held picture is
+  let go when it is sent; deleting the label leaves its picture out. One
+  naming more than 8 is not sent, and says so. A message the window
+  cannot hand on, or the child refuses, comes back to the composer with
+  its pictures; one whose label a picture pasted since holds is labelled
+  anew, in the returned text too. A message carrying pictures does not
+  answer a question the model asked (§12), which wants words; it is
+  refused with why. The transcript shows the person's pictures below
+  their text, read from where the conversation keeps them and decoded
+  within 1024 pixels a side, a JPEG at the DCT scale that brings it
+  within and a PNG halved until it is; one that cannot be read shows as
+  a line saying why.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
   whether the workspace is unconfined, context used against the model's
   length, the resource limits (`no limits` until §8's land), the count
@@ -2381,8 +2383,20 @@ local file; nothing is shared through any service.
 first bytes, whatever the clipboard named it, at most 5 MB (the least of
 the providers' bounds) and 1 to 8000 pixels a side, read from its header
 before it is decoded whole, its pixels then dropped, so a picture is
-never taken that td-agent cannot show. A message carries at most 8, and
-a conversation's messages at most 20 MB in all, so a request carrying
+never taken that td-agent cannot show. One past either bound is shrunk
+as it is pasted rather than refused: decoded within 2048 pixels a side
+(the most a provider looks at: OpenAI's 2048, Anthropic's 1568), a JPEG
+at its DCT scale and a PNG halved by two-by-two means weighted by alpha
+(so a transparent pixel's hidden colour tints nothing), turned as a
+JPEG's EXIF orientation says (the new JPEG carries no EXIF), its
+transparency laid over white, and written as a JPEG at quality 85 by
+td-jpeg's encoder, a band of rows at a time on at most eight threads,
+halved again while it is still past 5 MB; the paste's one note says what
+it was as well as what it is. A JPEG its EXIF says to turn is written
+anew the same way even within the bounds, so what is sent is what the
+transcript shows, upright and carrying no EXIF, which a provider might
+read otherwise or not at all. A message carries at most 8, and a
+conversation's messages at most 20 MB in all, so a request carrying
 every one in base64 stays inside the fetch service's 32 MiB. The window
 writes each picture of a message it sends under the state directory's
 `pasted/<conversation>/<digest>`, owner-only, before the message goes;

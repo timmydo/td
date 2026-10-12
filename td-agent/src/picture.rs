@@ -25,6 +25,13 @@ pub const MAX_PICTURES: usize = 8;
 /// request with every one, in base64, stays inside the fetch service's
 /// 32 MiB with room for the text.
 pub const MAX_CONVERSATION_PICTURE_BYTES: u64 = 20_000_000;
+/// The longest side a picture past the bounds is brought within: the
+/// most a provider looks at (OpenAI's 2048; Anthropic scales to 1568).
+pub const SHRUNK_AXIS: usize = 2048;
+/// The quality a shrunk picture is written as a JPEG at.
+pub const SHRUNK_QUALITY: u8 = 85;
+/// The most threads a shrink's JPEG transform runs on.
+const SHRINK_THREADS: usize = 8;
 /// The longest label, `image 1` and its like.
 pub const MAX_LABEL: usize = 32;
 /// The state directory's staging directory, and a conversation's own.
@@ -197,14 +204,16 @@ pub fn decode(mime: &str, bytes: &[u8], most: usize) -> Result<(usize, usize, Ve
                 rgba.extend_from_slice(pixel);
                 rgba.push(255);
             }
-            Ok((image.width, image.height, rgba))
+            orient(image.width, image.height, rgba, orientation(bytes))
         }
         other => Err(format!("{other} is not a picture td-agent takes")),
     }
 }
 
 /// An RGBA picture at half its size, each pixel the mean of the two by
-/// two it covers, an odd last row or column alone.
+/// two it covers, an odd last row or column alone: its alpha the mean
+/// alpha, its colour the mean weighted by alpha, so a transparent
+/// pixel's colour, which nothing shows, does not tint its neighbours.
 fn halve(width: usize, height: usize, rgba: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
     let (w, h) = (width.div_ceil(2), height.div_ceil(2));
     let mut out = Vec::new();
@@ -217,23 +226,256 @@ fn halve(width: usize, height: usize, rgba: &[u8]) -> Result<(usize, usize, Vec<
     };
     for y in 0..h {
         for x in 0..w {
-            let mut sum = [0u32; 4];
-            let mut n = 0;
+            let mut colour = [0u32; 3];
+            let (mut alpha, mut n) = (0u32, 0u32);
             for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
                 let (sx, sy) = (2 * x + dx, 2 * y + dy);
                 if sx >= width || sy >= height {
                     continue;
                 }
-                let p = pixel(sx, sy).ok_or("a picture shorter than its size")?;
-                for (total, channel) in sum.iter_mut().zip(p) {
-                    *total += u32::from(channel);
+                let [r, g, b, a] = pixel(sx, sy).ok_or("a picture shorter than its size")?;
+                for (total, channel) in colour.iter_mut().zip([r, g, b]) {
+                    *total += u32::from(channel) * u32::from(a);
                 }
+                alpha += u32::from(a);
                 n += 1;
             }
-            out.extend(sum.map(|total| ((total + n / 2) / n.max(1)) as u8));
+            out.extend(
+                colour.map(|total| (total + alpha / 2).checked_div(alpha).unwrap_or(0) as u8),
+            );
+            out.push(((alpha + n / 2) / n.max(1)) as u8);
         }
     }
     Ok((w, h, out))
+}
+
+/// The EXIF orientation a JPEG's APP1 segment gives (TIFF tag 0x0112),
+/// 1 to 8; 1, as it is stored, where it gives none or one out of range.
+fn orientation(jpeg: &[u8]) -> u8 {
+    let u16_at = |b: &[u8], at: usize, big: bool| {
+        let pair = *b.get(at..)?.first_chunk::<2>()?;
+        Some(if big {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        })
+    };
+    let u32_at = |b: &[u8], at: usize, big: bool| {
+        let quad = *b.get(at..)?.first_chunk::<4>()?;
+        Some(if big {
+            u32::from_be_bytes(quad)
+        } else {
+            u32::from_le_bytes(quad)
+        })
+    };
+    let mut at = 2;
+    // The segments before the scan: a marker, a length, its payload.
+    while jpeg.get(at) == Some(&0xff) {
+        // Fill bytes may stand before a marker.
+        while jpeg.get(at + 1) == Some(&0xff) {
+            at += 1;
+        }
+        let Some(&marker) = jpeg.get(at + 1) else {
+            break;
+        };
+        if marker == 0xda || marker == 0xd9 {
+            break;
+        }
+        let Some(length) = u16_at(jpeg, at + 2, true).map(usize::from) else {
+            break;
+        };
+        let payload = jpeg.get(at + 4..at + 2 + length).unwrap_or_default();
+        let exif = (marker == 0xe1)
+            .then(|| payload.strip_prefix(b"Exif\0\0"))
+            .flatten();
+        if let Some(tiff) = exif {
+            let big = match tiff.get(..2) {
+                Some(b"MM") => true,
+                Some(b"II") => false,
+                _ => return 1,
+            };
+            let Some(ifd) = u32_at(tiff, 4, big).and_then(|o| usize::try_from(o).ok()) else {
+                return 1;
+            };
+            let count = u16_at(tiff, ifd, big).unwrap_or(0);
+            for entry in 0..usize::from(count) {
+                let at = ifd.saturating_add(2 + entry * 12);
+                if u16_at(tiff, at, big) == Some(0x0112) {
+                    return match u16_at(tiff, at.saturating_add(8), big) {
+                        Some(o @ 1..=8) => o as u8,
+                        _ => 1,
+                    };
+                }
+            }
+            return 1;
+        }
+        at += 2 + length;
+    }
+    1
+}
+
+/// An RGBA picture turned as EXIF orientation `o` says to show it:
+/// mirrored, turned a half, or turned a quarter either way, transposed
+/// or transversed, the last four swapping its sides.
+fn orient(
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+    o: u8,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    if !(2..=8).contains(&o) {
+        return Ok((width, height, rgba));
+    }
+    let (w, h) = if o >= 5 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let mut out = Vec::new();
+    out.try_reserve_exact(rgba.len())
+        .map_err(|_| "no memory for the picture".to_string())?;
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = match o {
+                2 => (width - 1 - x, y),
+                3 => (width - 1 - x, height - 1 - y),
+                4 => (x, height - 1 - y),
+                5 => (y, x),
+                6 => (y, height - 1 - x),
+                7 => (width - 1 - y, height - 1 - x),
+                _ => (width - 1 - y, x),
+            };
+            let at = (sy * width + sx) * 4;
+            let pixel = rgba
+                .get(at..at + 4)
+                .ok_or("a picture shorter than its size")?;
+            out.extend_from_slice(pixel);
+        }
+    }
+    Ok((w, h, out))
+}
+
+/// Whether a pasted picture is to be written anew before it is taken:
+/// past the bounds a provider takes (longer than `MAX_PICTURE_BYTES`, or
+/// wider or taller than `MAX_PICTURE_AXIS` as its header says), or a JPEG
+/// its EXIF says to turn, so what is sent is what is shown, whatever a
+/// provider makes of EXIF. One neither PNG nor JPEG is refused.
+pub fn must_rewrite(bytes: &[u8]) -> Result<bool, String> {
+    let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
+    Ok(!within_bounds(mime, bytes)? || (mime == JPEG && orientation(bytes) != 1))
+}
+
+/// Whether a picture is within the bytes and sides a provider takes.
+fn within_bounds(mime: &str, bytes: &[u8]) -> Result<bool, String> {
+    let (width, height) = size(mime, bytes)?;
+    let axis = MAX_PICTURE_AXIS as usize;
+    Ok(bytes.len() as u64 <= MAX_PICTURE_BYTES && width <= axis && height <= axis)
+}
+
+/// A picture `must_rewrite` names made one to take: decoded within
+/// `SHRUNK_AXIS` a side (a JPEG at its DCT scale, a PNG halved by two by
+/// two means), its transparency laid over white, and written as a JPEG at
+/// `SHRUNK_QUALITY`, halved again while that is still past
+/// `MAX_PICTURE_BYTES`, a JPEG turned as its EXIF says. What it was, for
+/// a note: shrunk, or only turned upright where it was within bounds.
+pub fn shrink(bytes: &[u8]) -> Result<(Vec<u8>, String), String> {
+    shrink_within(bytes, MAX_PICTURE_BYTES)
+}
+
+/// `shrink` within `most` bytes.
+fn shrink_within(bytes: &[u8], most: u64) -> Result<(Vec<u8>, String), String> {
+    let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
+    let (was_width, was_height) = size(mime, bytes)?;
+    let (mut width, mut height, mut rgba) = decode(mime, bytes, SHRUNK_AXIS)?;
+    while width.max(height) > SHRUNK_AXIS {
+        (width, height, rgba) = halve(width, height, &rgba)?;
+    }
+    loop {
+        let jpeg = jpeg_of(width, height, &rgba)?;
+        if jpeg.len() as u64 <= most {
+            let said = format!(
+                "{} from {was_width}x{was_height} {}, {:.1} MB",
+                if within_bounds(mime, bytes)? {
+                    "turned upright"
+                } else {
+                    "shrunk"
+                },
+                if mime == PNG { "PNG" } else { "JPEG" },
+                bytes.len() as f64 / 1e6
+            );
+            return Ok((jpeg, said));
+        }
+        if width.max(height) <= 64 {
+            return Err("the picture does not come within the bounds".into());
+        }
+        (width, height, rgba) = halve(width, height, &rgba)?;
+    }
+}
+
+/// A picture's width and height as its header says.
+fn size(mime: &str, bytes: &[u8]) -> Result<(usize, usize), String> {
+    match mime {
+        PNG => td_png::header(bytes)
+            .map(|h| (h.width, h.height))
+            .map_err(|e| format!("not a PNG td-agent reads: {e}")),
+        JPEG => td_jpeg::header(bytes)
+            .map(|h| (h.width, h.height))
+            .map_err(|e| format!("not a JPEG td-agent reads: {e}")),
+        other => Err(format!("{other} is not a picture td-agent takes")),
+    }
+}
+
+/// An RGBA picture as a baseline JPEG, its alpha laid over white, fed to
+/// the encoder a band of rows at a time.
+fn jpeg_of(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    const BAND: usize = 64;
+    let pool = Pool(
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(SHRINK_THREADS),
+    );
+    let mut encoder =
+        td_jpeg::Encoder::new(width, height, SHRUNK_QUALITY).map_err(|e| e.to_string())?;
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(width.saturating_mul(BAND).saturating_mul(3))
+        .map_err(|_| "no memory for the picture".to_string())?;
+    for band in rgba.chunks(width.saturating_mul(BAND).saturating_mul(4).max(4)) {
+        rgb.clear();
+        for &[r, g, b, a] in band.as_chunks::<4>().0 {
+            let a = u32::from(a);
+            for c in [r, g, b] {
+                rgb.push(((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8);
+            }
+        }
+        encoder
+            .encode_rows(&rgb, &pool)
+            .map_err(|e| e.to_string())?;
+    }
+    encoder.finish(&pool).map_err(|e| e.to_string())
+}
+
+/// The encoder's pieces taken from one queue by this many scoped
+/// threads, the caller's among them.
+struct Pool(usize);
+
+impl td_jpeg::Runner for Pool {
+    fn run<T: Send>(&self, items: Vec<T>, work: &(dyn Fn(T) + Sync)) {
+        let queue = std::sync::Mutex::new(items);
+        let next = || queue.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        std::thread::scope(|scope| {
+            for _ in 1..self.0 {
+                // One that cannot start leaves its share to the others.
+                let _ = std::thread::Builder::new().spawn_scoped(scope, || {
+                    while let Some(item) = next() {
+                        work(item);
+                    }
+                });
+            }
+            while let Some(item) = next() {
+                work(item);
+            }
+        });
+    }
 }
 
 /// A pasted picture, checked: what it is, by its bytes and a full decode,
@@ -249,14 +491,7 @@ pub fn check(bytes: &[u8], label: &str) -> Result<Reference, String> {
     }
     let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
     // Its size as its header says, refused before it is decoded whole.
-    let (width, height) = match mime {
-        PNG => td_png::header(bytes)
-            .map(|h| (h.width, h.height))
-            .map_err(|e| format!("not a PNG td-agent reads: {e}"))?,
-        _ => td_jpeg::header(bytes)
-            .map(|h| (h.width, h.height))
-            .map_err(|e| format!("not a JPEG td-agent reads: {e}"))?,
-    };
+    let (width, height) = size(mime, bytes)?;
     let axis = |n: usize| {
         u32::try_from(n)
             .ok()
@@ -569,30 +804,91 @@ pub(crate) mod tests {
         out
     }
 
-    /// A `width` by `height` eight-bit RGB PNG of one colour, its pixels
-    /// in one stored deflate block.
+    /// A `width` by `height` eight-bit RGB PNG of one colour.
     pub(crate) fn png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-        let row: Vec<u8> = std::iter::once(0)
-            .chain(rgb.iter().copied().cycle().take(3 * width as usize))
+        let pixels = rgb.repeat(width as usize * height as usize);
+        png_of(width, height, 3, &pixels)
+    }
+
+    /// A `width` by `height` eight-bit PNG of these RGB (`channels` 3) or
+    /// RGBA (4) pixels, in stored deflate blocks.
+    fn png_of(width: u32, height: u32, channels: u8, pixels: &[u8]) -> Vec<u8> {
+        let stride = width as usize * usize::from(channels);
+        let raw: Vec<u8> = pixels
+            .chunks(stride)
+            .flat_map(|row| std::iter::once(0).chain(row.iter().copied()))
             .collect();
-        let raw = row.repeat(height as usize);
         let (mut a, mut b) = (1u32, 0u32);
         for &byte in &raw {
             a = (a + u32::from(byte)) % 65521;
             b = (b + a) % 65521;
         }
-        let mut z = vec![0x78, 0x01, 1];
-        z.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-        z.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
-        z.extend_from_slice(&raw);
+        // Stored blocks, each at most a 16-bit length, the last marked.
+        let mut z = vec![0x78, 0x01];
+        let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
+        for (i, block) in blocks.iter().enumerate() {
+            z.push(u8::from(i + 1 == blocks.len()));
+            z.extend_from_slice(&(block.len() as u16).to_le_bytes());
+            z.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+            z.extend_from_slice(block);
+        }
         z.extend_from_slice(&((b << 16) | a).to_be_bytes());
         let mut ihdr = width.to_be_bytes().to_vec();
         ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        ihdr.extend_from_slice(&[8, if channels == 4 { 6 } else { 2 }, 0, 0, 0]);
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         out.extend(chunk(b"IHDR", &ihdr));
         out.extend(chunk(b"IDAT", &z));
         out.extend(chunk(b"IEND", &[]));
+        out
+    }
+
+    /// A `width` by `height` JPEG of the colour `at(x, y)` gives, written
+    /// by td-jpeg's encoder.
+    fn jpeg_of_rgb(width: usize, height: usize, at: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        let rgb: Vec<u8> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .flat_map(|(x, y)| at(x, y))
+            .collect();
+        let mut encoder = td_jpeg::Encoder::new(width, height, 95).unwrap();
+        encoder.encode_rows(&rgb, &td_jpeg::InOrder).unwrap();
+        encoder.finish(&td_jpeg::InOrder).unwrap()
+    }
+
+    /// `jpeg` with an EXIF APP1 segment after its SOI saying orientation
+    /// `o`, its TIFF big- or little-endian.
+    fn exif(jpeg: &[u8], o: u16, big: bool) -> Vec<u8> {
+        let u16b = |v: u16| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let mut tiff = if big { b"MM".to_vec() } else { b"II".to_vec() };
+        tiff.extend(u16b(42));
+        tiff.extend(u32b(8));
+        tiff.extend(u16b(1));
+        tiff.extend(u16b(0x0112));
+        tiff.extend(u16b(3));
+        tiff.extend(u32b(1));
+        tiff.extend(u16b(o));
+        tiff.extend([0, 0]);
+        tiff.extend(u32b(0));
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend(tiff);
+        let mut out = jpeg[..2].to_vec();
+        out.extend([0xff, 0xe1]);
+        out.extend(((payload.len() + 2) as u16).to_be_bytes());
+        out.extend(payload);
+        out.extend_from_slice(&jpeg[2..]);
         out
     }
 
@@ -655,6 +951,169 @@ pub(crate) mod tests {
             halve(odd, 1, &rgba).unwrap(),
             (2, 1, vec![128, 128, 128, 255, 9, 9, 9, 9])
         );
+    }
+
+    /// A picture past the bounds is brought within `SHRUNK_AXIS` and
+    /// written as a JPEG that `check` takes, its transparency over white.
+    #[test]
+    fn a_picture_past_the_bounds_is_shrunk_to_one_within() {
+        let wide = png(MAX_PICTURE_AXIS + 2, 3, [10, 200, 30]);
+        assert!(must_rewrite(&wide).unwrap());
+        assert!(check(&wide, "image 1").is_err());
+        let (shrunk, said) = shrink(&wide).unwrap();
+        assert!(!must_rewrite(&shrunk).unwrap());
+        let r = check(&shrunk, "image 1").unwrap();
+        assert_eq!(r.mime, JPEG);
+        assert_eq!((r.width, r.height), (2001, 1));
+        assert!(said.starts_with("shrunk from 8002x3 PNG, "), "{said}");
+        let (_, _, rgba) = decode(JPEG, &shrunk, usize::MAX).unwrap();
+        let [r, g, b, _] = rgba[..4] else {
+            unreachable!()
+        };
+        assert!(r.abs_diff(10) <= 8 && g.abs_diff(200) <= 8 && b.abs_diff(30) <= 8);
+        // Transparency is laid over white.
+        assert_eq!(
+            jpeg_of(1, 1, &[0, 0, 0, 0]).map(|j| decode(JPEG, &j, usize::MAX).unwrap().2),
+            Ok(vec![255, 255, 255, 255])
+        );
+        assert!(!must_rewrite(&png(2, 2, [0; 3])).unwrap());
+        assert!(must_rewrite(b"GIF89a").is_err());
+        // Past the bytes alone, within the sides: written as a JPEG at its
+        // own size.
+        let heavy = png(1400, 1300, [90; 3]);
+        assert!(heavy.len() as u64 > MAX_PICTURE_BYTES);
+        assert!(must_rewrite(&heavy).unwrap());
+        let (shrunk, said) = shrink(&heavy).unwrap();
+        let r = check(&shrunk, "image 1").unwrap();
+        assert_eq!((r.mime, r.width, r.height), (JPEG, 1400, 1300));
+        assert!(said.starts_with("shrunk from 1400x1300 PNG, "), "{said}");
+    }
+
+    /// A transparent pixel's colour, which nothing shows, does not tint
+    /// its neighbours as the picture is halved: transparent black between
+    /// opaque white comes out white over white.
+    #[test]
+    fn a_halved_pictures_transparent_pixels_do_not_tint_it() {
+        let pixels: Vec<u8> = (0..8002 * 4)
+            .flat_map(|i| if i % 2 == 0 { [0, 0, 0, 0] } else { [255; 4] })
+            .collect();
+        let (shrunk, _) = shrink(&png_of(8002, 4, 4, &pixels)).unwrap();
+        let (w, h, rgba) = decode(JPEG, &shrunk, usize::MAX).unwrap();
+        assert_eq!((w, h), (2001, 1));
+        assert!(rgba.iter().all(|&c| c >= 250), "{:?}", &rgba[..16]);
+        // Halving alone: colour weighted by alpha, alpha the mean.
+        let (_, _, half) = halve(2, 1, &[0, 0, 0, 0, 200, 100, 50, 128]).unwrap();
+        assert_eq!(half, [200, 100, 50, 64]);
+        let (_, _, none) = halve(2, 1, &[9, 9, 9, 0, 7, 7, 7, 0]).unwrap();
+        assert_eq!(none, [0, 0, 0, 0]);
+    }
+
+    /// Still past the bytes once written, a picture is halved again until
+    /// it is within them.
+    #[test]
+    fn a_shrunk_picture_still_too_long_is_halved_again() {
+        let mut seed = 7u32;
+        let pixels: Vec<u8> = (0..256 * 256 * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let bytes = png_of(256, 256, 3, &pixels);
+        let (_, _, rgba) = decode(PNG, &bytes, usize::MAX).unwrap();
+        let whole = jpeg_of(256, 256, &rgba).unwrap().len() as u64;
+        let (shrunk, _) = shrink_within(&bytes, whole - 1).unwrap();
+        let r = check(&shrunk, "image 1").unwrap();
+        assert_eq!((r.width, r.height), (128, 128));
+        assert!((shrunk.len() as u64) < whole);
+        // Nothing comes within no bytes: refused once it is small.
+        assert!(shrink_within(&bytes, 0).is_err());
+    }
+
+    /// A JPEG past the sides is decoded at the DCT scale that brings it
+    /// within `SHRUNK_AXIS`.
+    #[test]
+    fn a_jpeg_past_the_bounds_is_shrunk_at_its_dct_scale() {
+        let wide = jpeg_of_rgb(8002, 8, |_, _| [40, 120, 220]);
+        assert!(must_rewrite(&wide).unwrap());
+        let (shrunk, said) = shrink(&wide).unwrap();
+        let r = check(&shrunk, "image 1").unwrap();
+        assert_eq!((r.width, r.height), (2001, 2));
+        assert!(said.starts_with("shrunk from 8002x8 JPEG, "), "{said}");
+    }
+
+    /// A JPEG is shown, and written anew, turned as its EXIF orientation
+    /// says, read big- or little-endian: every one of the eight.
+    #[test]
+    fn a_jpeg_is_turned_as_its_exif_orientation_says() {
+        // Thirty-two by sixteen in four quarters: red, green over blue,
+        // yellow.
+        const QUARTERS: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+        let stored = jpeg_of_rgb(32, 16, |x, y| {
+            QUARTERS[usize::from(y >= 8) * 2 + usize::from(x >= 16)]
+        });
+        let quarter = |p: &[u8]| {
+            (0..4)
+                .min_by_key(|&q| {
+                    QUARTERS[q]
+                        .iter()
+                        .zip(p)
+                        .map(|(&a, &b)| u32::from(a.abs_diff(b)).pow(2))
+                        .sum::<u32>()
+                })
+                .unwrap()
+        };
+        // The quarters shown at the top left and the top right.
+        let (r, g, b, y) = (0, 1, 2, 3);
+        for (o, corners) in [
+            (1, (r, g)),
+            (2, (g, r)),
+            (3, (y, b)),
+            (4, (b, y)),
+            (5, (r, b)),
+            (6, (b, r)),
+            (7, (y, g)),
+            (8, (g, y)),
+        ] {
+            let bytes = exif(&stored, o, o % 2 == 0);
+            assert_eq!(u16::from(orientation(&bytes)), o);
+            let (w, h, rgba) = decode(JPEG, &bytes, usize::MAX).unwrap();
+            let size = if o >= 5 { (16, 32) } else { (32, 16) };
+            assert_eq!((w, h), size, "orientation {o}");
+            let top_right = (w - 1) * 4;
+            assert_eq!(
+                (
+                    quarter(&rgba[..4]),
+                    quarter(&rgba[top_right..top_right + 4])
+                ),
+                corners,
+                "orientation {o}"
+            );
+            // Turned, it is written anew, so what is sent is what is shown.
+            assert_eq!(must_rewrite(&bytes).unwrap(), o != 1);
+            if o == 1 {
+                continue;
+            }
+            let (shrunk, said) = shrink(&bytes).unwrap();
+            assert!(
+                said.starts_with("turned upright from 32x16 JPEG, "),
+                "{said}"
+            );
+            let r = check(&shrunk, "image 1").unwrap();
+            assert_eq!((r.width as usize, r.height as usize), size);
+            assert_eq!(orientation(&shrunk), 1);
+        }
+        assert_eq!(orientation(&stored), 1);
+        assert_eq!(orientation(&exif(&stored, 9, true)), 1);
+        let mut cut = exif(&stored, 6, true);
+        cut.truncate(20);
+        assert_eq!(orientation(&cut), 1);
+        // Fill bytes before the marker are passed over.
+        let turned = exif(&stored, 6, true);
+        let mut filled = turned[..2].to_vec();
+        filled.extend([0xff, 0xff]);
+        filled.extend_from_slice(&turned[2..]);
+        assert_eq!(orientation(&filled), 6);
     }
 
     #[test]
