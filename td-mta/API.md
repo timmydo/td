@@ -8433,3 +8433,30 @@ The caller must apply the same requested per-part selection to every retained
 fragment. Descriptor/node correspondence does not compare selection provenance
 or validate fragment bytes; the enclosing original-generation pipeline owns
 that invariant.
+
+## Native body-value part selection
+
+`blob_value_parts::Cursor` retains the original native body-list handoff,
+original per-part metadata facts and caller-admitted membership/output cells.
+Facts pair the complete part descriptor and classified node with a `Kind`
+derived from original interpreted Content-Type. `text/html` selects HTML
+truncation behavior; every other `text/*` remains text, including attachments
+such as `text/calendar`. Non-text parts never enter bodyValues, even when the
+body-list algorithm includes inline media in textBody or htmlBody.
+
+One correspondence/initialization turn per part precedes list membership.
+Enabled textBody and htmlBody lists add their text parts; fetchAllBodyValues
+selects all text parts independently of either list. A final preorder pass
+emits each selected ordinal once. The three flags form a union, with empty
+flags producing an empty result. maxBodyValueBytes is retained unchanged for
+the later per-value encoder. Selection does not decode bodies or emit JSON.
+
+The caller must preserve original metadata provenance and admit all backing.
+Descriptor/node consistency does not authenticate arbitrary facts. Until failure latches, fresh
+native and job deadline checks fence construction, active and cached polls,
+explicit checks and finish. Late native expiry wins; errors are sticky and
+provisional backing must be discarded after refusal. Subsequent calls return
+the original latched error without sampling time or doing work. Passive value is not
+publication permission. Successful finish returns the original owners and
+facts, the selected ordinal prefix, membership storage and options. Account
+permission, native body-value decoding and enclosing Email/get remain external.

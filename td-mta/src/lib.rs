@@ -13,6 +13,7 @@ pub mod blob_part_json;
 pub mod blob_part_locators;
 pub mod blob_selected_metadata;
 pub mod blob_structure;
+pub mod blob_value_parts;
 pub mod body_properties;
 pub mod body_property;
 pub mod body_value;

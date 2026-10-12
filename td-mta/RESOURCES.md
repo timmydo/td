@@ -4564,3 +4564,23 @@ bytes. Every copy is at most 64 bytes; fixed traversal state bounds the
 multipart walk. Cached completion adds no positive charge. Original source
 and native I/O allowances remain unchanged; no body read, quota reset or
 whole-job memory-admission claim is introduced.
+
+## Native body-value selection storage
+
+The native selector plus HeaderBudget fit a compiled 1 KiB ceiling. Callers
+admit one metadata-fact cell and one membership byte per original part, plus
+an ordinal output window. No allocation or body read occurs. Each turn visits
+one part/list entry or performs one fixed phase transition. Work is linear in
+parts plus enabled-list entries; output order is original preorder and union
+membership removes duplicates without an additional scan per part.
+
+Each active turn charges one interpretation step and one explicit original
+work record; interpretation Credit remains in the cursor. Each emitted u16
+additionally charges two output bytes before writing. Cached completion and
+deadline checks add no positive charges. Initialization overwrites every used
+membership cell before any value can complete. Short ordinal capacity refuses
+without growing or replacing backing; partial cells remain provisional.
+
+Interpretation additionally charges one original record per 16 prepaid steps,
+rounding up. For T active turns, the total record debit is T + ceil(T/16).
+Unused stage credit is discarded at finish rather than transferred or refunded.
