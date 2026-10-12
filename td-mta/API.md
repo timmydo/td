@@ -8587,3 +8587,30 @@ Native pin custody, source transfer/charset decoding, preview projection and
 whole-response admission remain the composing caller's responsibility. Emitted
 text is provisional until those owners finish successfully. This standalone
 adapter does not advertise Mail or activate an Email/get worker.
+
+
+## Preview JSON from an admitted text extent
+
+`preview_json::Cursor` retains a typed immutable `InputSource`, caller-owned
+input ring and checkpoints, the original Meter and a checked Clock carrying
+the prior Tick. The caller selects Plain or Html after source admission.
+It composes transfer and charset decoding, optional shared HTML extraction,
+the existing 256-scalar plaintext preview projection and JSON string framing.
+It emits the string value alone, without a property name. The caller retains
+responsibility for native snapshot custody and enclosing response admission;
+this adapter does not select a MIME part or advertise Mail.
+
+Each poll advances one decoding, extraction or projection turn and emits at
+most six JSON bytes. It retains unconsumed scalars through parser drains.
+Reaching the preview cap still consumes and validates the complete admitted
+source, including HTML suffixes, before closing the JSON string. Diagnostics
+retain the completed preview summary, charset/transfer encoding trouble and
+malformed markup. Returned bytes remain provisional until completion and
+source/response admission succeeds.
+
+Construction, explicit check, every poll (including empty output and cached
+completion), and finish sample the original checked clock. Poll fences both
+sides of the operation; failures remain terminal. Passive value exposes only
+completed diagnostics. A healthy finish returns the exact original source,
+input ring, checkpoints and Meter, preserving their exclusive ownership for
+the next stage. No source or work budget is reconstructed by this adapter.

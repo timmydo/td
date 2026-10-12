@@ -4662,3 +4662,29 @@ stages charge their own output. It is not solely the advertised response-size
 ceiling. The composing job must admit all stages; a large source may exhaust
 this work allowance and refuse a small preview. No stage silently replaces or
 increases that original allowance.
+
+## Preview JSON composition storage
+
+The preview JSON cursor fits 2 KiB and uses the existing caller-owned text
+input storage (at most 6 KiB including checkpoints). It retains only fixed
+reader, HTML, preview and JSON framing state, with one pending decoded and
+one pending extracted scalar. It allocates no source-sized or result-sized
+buffer. Each output call writes at most six bytes and leaves the remaining
+caller slice untouched.
+
+All stages borrow the same original Meter. Source decoding, extraction and
+preview projection retain their existing record and intermediate output
+charges, and JSON framing additionally charges its exact wire bytes. These
+transformation charges intentionally accumulate: a plain one-byte `a`
+requires five output-byte units, including the three-byte JSON string.
+They are not interchangeable with the enclosing response wire-byte ceiling.
+Full-source validation continues after the preview cap and can refuse on
+budget exhaustion. Native snapshot and aggregate worker/response admission
+remain obligations of the enclosing operation.
+
+The output-byte grant must cover the text reader's decoding/validation
+charges, plus all emitted extraction UTF-8 bytes for HTML, plus at most
+1024 projected UTF-8 bytes, plus at most 1538 JSON wire bytes (two quotes
+and a conservative six bytes per projected scalar). Reader source visits
+and records retain their separate bounds, including charset prescanning.
+The 256-scalar result cap does not bound the first two terms.

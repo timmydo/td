@@ -100,30 +100,58 @@ impl<'w, 'c> Cursor<'w, 'c> {
                 status: Status::Complete,
             });
         }
-        // Even an input-gap poll may flush a pending reference scalar.
-        self.charge(1, 0)?;
-        let result = self.core.poll(input, last).map_err(|_| Error::State)?;
-        if let Some(value) = result.scalar {
-            let bytes = u64::try_from(value.len_utf8()).map_err(|_| Error::State)?;
-            self.charge(0, bytes)?;
-        }
-        let status = match result.status {
-            td_html::extract::Status::Yield => Status::Yield,
-            td_html::extract::Status::NeedInput => Status::NeedInput,
-            td_html::extract::Status::Complete => Status::Complete,
-        };
+        let progress = poll_shared(&mut self.core, input, last, self.work, &self.clock)?;
+        let status = progress.status;
         self.complete = status == Status::Complete;
-        Ok(Progress {
-            consumed: result.consumed,
-            scalar: result.scalar,
-            status,
-        })
+        Ok(progress)
     }
+
     pub fn finish(mut self) -> Result<(&'w mut Meter, Diagnostics), Error> {
         self.check()?;
         let diagnostics = self.value().ok_or(Error::State)?;
         Ok((self.work, diagnostics))
     }
+}
+// The owning adapter supplies pre/post freshness and sticky retirement.
+pub(crate) fn poll_shared(
+    core: &mut td_html::extract::Extractor,
+    input: Option<char>,
+    last: bool,
+    work: &mut Meter,
+    clock: &CheckedClock<'_>,
+) -> Result<Progress, Error> {
+    // A gap poll can flush a pending reference scalar, so every turn is funded.
+    let now = clock.sample().map_err(Error::Policy)?.monotonic;
+    work.charge(
+        now,
+        Charge {
+            records: 1,
+            ..Charge::default()
+        },
+    )
+    .map_err(Error::Work)?;
+    let result = core.poll(input, last).map_err(|_| Error::State)?;
+    if let Some(value) = result.scalar {
+        let now = clock.sample().map_err(Error::Policy)?.monotonic;
+        let bytes = u64::try_from(value.len_utf8()).map_err(|_| Error::State)?;
+        work.charge(
+            now,
+            Charge {
+                output_bytes: bytes,
+                ..Charge::default()
+            },
+        )
+        .map_err(Error::Work)?;
+    }
+    Ok(Progress {
+        consumed: result.consumed,
+        scalar: result.scalar,
+        status: match result.status {
+            td_html::extract::Status::Yield => Status::Yield,
+            td_html::extract::Status::NeedInput => Status::NeedInput,
+            td_html::extract::Status::Complete => Status::Complete,
+        },
+    })
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_>>() <= 384);
 

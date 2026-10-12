@@ -191,7 +191,7 @@ fn quota_regression_and_post_emit_expiry_latch_without_replacing_work() {
         };
         assert_eq!(cursor.poll(Some('a'), true), Err(error));
         if mode == 3 {
-            assert_eq!(cursor.summary.scalars, 1);
+            assert_eq!(cursor.core.summary.scalars, 1);
         }
         assert!(cursor.value().is_none());
         let before = cursor.work.remaining();

@@ -40,10 +40,7 @@ pub struct Summary {
 pub struct Cursor<'w, 'c> {
     work: &'w mut Meter,
     clock: CheckedClock<'c>,
-    summary: Summary,
-    space: bool,
-    capped: bool,
-    ended: bool,
+    core: Core,
     failure: Option<Error>,
 }
 impl<'w, 'c> Cursor<'w, 'c> {
@@ -51,30 +48,14 @@ impl<'w, 'c> Cursor<'w, 'c> {
         let mut cursor = Self {
             work,
             clock: CheckedClock::new(clock, last),
-            summary: Summary {
-                scalars: 0,
-                utf8_bytes: 0,
-            },
-            space: false,
-            capped: false,
-            ended: false,
+            core: Core::new(),
             failure: None,
         };
         cursor.check()?;
         Ok(cursor)
     }
     fn charge(&mut self, records: u64, output_bytes: u64) -> Result<(), Error> {
-        let now = self.clock.sample().map_err(Error::Policy)?.monotonic;
-        self.work
-            .charge(
-                now,
-                Charge {
-                    records,
-                    output_bytes,
-                    ..Charge::default()
-                },
-            )
-            .map_err(Error::Work)
+        charge(self.work, &self.clock, records, output_bytes)
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
@@ -91,15 +72,54 @@ impl<'w, 'c> Cursor<'w, 'c> {
     }
     /// Passive counts only; use check or finish for fresh admission.
     pub fn value(&self) -> Option<Summary> {
-        (self.failure.is_none() && self.ended).then_some(self.summary)
+        if self.failure.is_none() {
+            self.core.value()
+        } else {
+            None
+        }
     }
     pub fn poll(&mut self, input: Option<char>, last: bool) -> Result<Progress, Error> {
         self.check()?;
-        let result = self.step(input, last);
+        let result = self.core.poll(input, last, self.work, &self.clock);
         let after = self.charge(0, 0);
         self.outcome(after.and(result))
     }
-    fn step(&mut self, input: Option<char>, last: bool) -> Result<Progress, Error> {
+    pub fn finish(mut self) -> Result<(&'w mut Meter, Summary), Error> {
+        self.check()?;
+        let summary = self.value().ok_or(Error::State)?;
+        Ok((self.work, summary))
+    }
+}
+// Private state reused by scalar and source-owning projection adapters.
+// The enclosing owner supplies the original admission and retirement fences.
+pub(crate) struct Core {
+    summary: Summary,
+    space: bool,
+    capped: bool,
+    ended: bool,
+}
+impl Core {
+    pub(crate) const fn new() -> Self {
+        Self {
+            summary: Summary {
+                scalars: 0,
+                utf8_bytes: 0,
+            },
+            space: false,
+            capped: false,
+            ended: false,
+        }
+    }
+    pub(crate) fn value(&self) -> Option<Summary> {
+        self.ended.then_some(self.summary)
+    }
+    pub(crate) fn poll(
+        &mut self,
+        input: Option<char>,
+        last: bool,
+        work: &mut Meter,
+        clock: &CheckedClock<'_>,
+    ) -> Result<Progress, Error> {
         if self.ended {
             return Ok(Progress {
                 consumed: false,
@@ -112,7 +132,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
                 status: Status::NeedInput,
             });
         }
-        self.charge(1, 0)?;
+        charge(work, clock, 1, 0)?;
         let Some(value) = input else {
             self.space = false;
             self.ended = true;
@@ -158,7 +178,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
                     status: Status::Yield,
                 });
             }
-            return self.emit(' ', false);
+            return self.emit(' ', false, work, clock);
         }
         self.ended = last;
         self.emit(
@@ -170,9 +190,17 @@ impl<'w, 'c> Cursor<'w, 'c> {
                 value
             },
             true,
+            work,
+            clock,
         )
     }
-    fn emit(&mut self, value: char, consumed: bool) -> Result<Progress, Error> {
+    fn emit(
+        &mut self,
+        value: char,
+        consumed: bool,
+        work: &mut Meter,
+        clock: &CheckedClock<'_>,
+    ) -> Result<Progress, Error> {
         let scalars = self.summary.scalars.checked_add(1).ok_or(Error::State)?;
         let bytes = u16::try_from(value.len_utf8()).map_err(|_| Error::State)?;
         let utf8_bytes = self
@@ -180,7 +208,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
             .utf8_bytes
             .checked_add(bytes)
             .ok_or(Error::State)?;
-        self.charge(0, u64::from(bytes))?;
+        charge(work, clock, 0, u64::from(bytes))?;
         self.summary = Summary {
             scalars,
             utf8_bytes,
@@ -190,11 +218,23 @@ impl<'w, 'c> Cursor<'w, 'c> {
             status: Status::Scalar(value),
         })
     }
-    pub fn finish(mut self) -> Result<(&'w mut Meter, Summary), Error> {
-        self.check()?;
-        let summary = self.value().ok_or(Error::State)?;
-        Ok((self.work, summary))
-    }
+}
+fn charge(
+    work: &mut Meter,
+    clock: &CheckedClock<'_>,
+    records: u64,
+    output_bytes: u64,
+) -> Result<(), Error> {
+    let now = clock.sample().map_err(Error::Policy)?.monotonic;
+    work.charge(
+        now,
+        Charge {
+            records,
+            output_bytes,
+            ..Charge::default()
+        },
+    )
+    .map_err(Error::Work)
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_>>() <= 128);
 
