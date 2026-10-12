@@ -7443,3 +7443,35 @@ files share the existing filesystem slots with responses; at most 24 slots admit
 leaving eight unavailable to sorts. Their bytes use a separate quota bucket. ADMISSION.md owns accounting,
 cleanup uncertainty and the cumulative multi-file job requirements. No
 sorting algorithm, query admission or client-visible publication is added.
+## Streaming filter logic
+
+filter_logic::Evaluation combines every condition result through bounded
+AND, OR and NOT frames without retaining the filter tree. begin/condition/end
+consume a well-nested traversal, and finish consumes the evaluator after
+exactly one complete root. NOT means none of its children match, not merely
+negation of the first child. Empty AND and NOT are true; empty OR is false.
+
+The caller supplies the admitted logical-node and depth limits, with at most
+64 logical levels (and thus at most 64 active operator frames). A condition
+also counts as one depth level and one
+node; ending an operator does not count again. These are logical tree bounds,
+not a replacement for admission of JSON tokens and container depth. Each feed
+step performs constant work and allocates nothing. Any shape or limit error
+retires the evaluator and prevents a successful partial result.
+
+The query decoder must still validate every child even after a parent's
+truth value is determined. This evaluator never reports a short-circuit hint
+or authorizes skipping malformed, unsupported or over-limit conditions.
+Parsing, condition matching, original work/deadline charging, row validation
+and retained-view publication remain with the caller. No method is enabled.
+
+The configured JSON depth/token admission precedes this helper. Each logical
+operator consumes an object and its conditions array in JSON, so using the
+same admitted ceilings here does not tighten the already admitted JSON tree.
+A chain of 64 operators can end in an empty operator, but a condition below
+that chain would require 65 logical levels and is intentionally refused.
+A null filter bypasses evaluation and matches every row. The activating query
+decoder owns protocol error mapping: malformed JSON/filter shapes and logical
+admission failures must be classified before evaluation; an invalid event
+stream from an otherwise valid decoder is an internal failure. Error Display
+is diagnostic text, not a JMAP response description.
