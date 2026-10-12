@@ -92,6 +92,7 @@ pub mod ownership;
 pub mod ports;
 pub mod recipient_sweep;
 pub mod reference_sweep;
+pub mod root_headers;
 pub mod row_references;
 pub mod smtp_network;
 pub mod smtp_receiving;

@@ -7808,3 +7808,33 @@ read also checks original snapshot custody on the absent-Email path.
 Native email_keywords validates every returned keyword on read, including
 lowercase and JSON-safe atom spelling; serialization does not rely solely on
 writer admission. Typed ID encoding failures are internal corruption.
+
+## Bounded verified root-header input
+
+root_headers::Cursor borrows one verified native PinnedBlob and the original
+work Meter while retaining root-header input in caller-owned bytes. It uses
+the shared MIME header scanner without parsing the message body. Each poll
+reads at most 4096 bytes or performs one bounded scanner turn; source snapshot
+and native deadline checks plus original meter checks surround active work
+and completion. Errors are sticky and hide value; finish requires complete
+scanning and fresh checks. The original meter cannot be replaced mid-cursor.
+
+Caller storage must fit at least min(blob length, header limit + 2), with
+two bytes for a CRLF separator beyond an exactly full recognized header
+block. Its actual capacity independently bounds retained input. A tentative
+field name can extend beyond the recognized-header limit before a later
+byte proves it is body text; callers may admit larger storage to resolve
+such lines. Exhausting resident storage without a boundary is Capacity,
+not HeaderLimit: only the shared scanner enforces recognized-header bytes.
+A read may retain body lookahead within that capacity, but never interprets it. Shared scanner
+End and Eof/Prefix describe the retained input truthfully; no artificial EOF
+is supplied for a truncated source. Read requests are charged before I/O,
+including unused short-read allowance; scanner traversal charges separately.
+No header field table or whole-message buffer is allocated.
+
+The completed View is passive borrowed input, not source custody or response
+permission. value only observes cached completion and does not freshly admit
+access; finish performs fresh checks before its consuming handoff. The caller retains the original PinnedBlob, account/request
+authorization and aggregate header budget through interpretation and final
+publication. This reader neither performs initial blob verification nor
+replaces it, and it activates no Email/get or Mail capability.
