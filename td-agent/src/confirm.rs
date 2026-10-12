@@ -459,6 +459,7 @@ impl Confirm {
             Input::Resize(_)
             | Input::Focus(true)
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::Hover(_)
             | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),

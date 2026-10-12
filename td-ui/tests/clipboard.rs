@@ -18,7 +18,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
-use td_ui::clipboard::{Incoming, Outgoing, MAX_BYTES};
+use td_ui::clipboard::{Incoming, Outgoing, MAX_BYTES, MAX_IMAGE_BYTES};
 
 const CHUNK: usize = 16 * 1024;
 
@@ -47,6 +47,65 @@ fn a_partial_read_waits_for_eof_and_the_text_arrives_whole() {
     // The bytes are handed on as they came: a line ending is the
     // consumer's to normalize.
     assert_eq!(incoming.finish().unwrap(), "é\r\n");
+}
+
+/// Feeds `length` bytes from a writer thread into a picture paste,
+/// stepped at a fixed clock until it ends: its bytes, or the failure.
+fn feed_picture(length: usize) -> io::Result<Vec<u8>> {
+    let (mut incoming, mut peer) = Incoming::begin_image(0).unwrap();
+    // Three bytes first, read alone, so a Vec left to double from its
+    // reads would grow from an odd size past the budget.
+    let writer = std::thread::spawn(move || {
+        let head = length.min(3);
+        if peer.write_all(&vec![0xa5u8; head]).is_err() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let chunk = vec![0xa5u8; 1 << 20];
+        let mut left = length - head;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if peer.write_all(&chunk[..n]).is_err() {
+                return;
+            }
+            left -= n;
+        }
+    });
+    let start = std::time::Instant::now();
+    let ended = loop {
+        match incoming.step(1) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(e) => break Err(e),
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "stalled");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // Finishing drops the reader, so a writer refused mid-way stops.
+    let bytes = ended.and_then(|()| incoming.finish_bytes());
+    writer.join().unwrap();
+    bytes
+}
+
+#[test]
+fn a_picture_arrives_whole_up_to_its_budget_in_no_more_room_than_that() {
+    let bytes = feed_picture(MAX_IMAGE_BYTES).unwrap();
+    assert_eq!(bytes.len(), MAX_IMAGE_BYTES);
+    assert!(bytes.capacity() <= MAX_IMAGE_BYTES, "{}", bytes.capacity());
+    assert!(bytes.iter().all(|&b| b == 0xa5));
+    let over = feed_picture(MAX_IMAGE_BYTES + 1).unwrap_err();
+    assert_eq!(over.to_string(), "clipboard paste byte budget");
+    // Bytes that are not UTF-8 are a picture's, and text's failure.
+    let (mut incoming, mut peer) = Incoming::begin_image(0).unwrap();
+    peer.write_all(&[0xff, 0xfe]).unwrap();
+    drop(peer);
+    assert!(incoming.step(1).unwrap());
+    assert_eq!(incoming.finish_bytes().unwrap(), [0xff, 0xfe]);
+    let (mut incoming, mut peer) = Incoming::begin(0).unwrap();
+    peer.write_all(&[0xff, 0xfe]).unwrap();
+    drop(peer);
+    assert!(incoming.step(1).unwrap());
+    assert!(incoming.finish().is_err());
 }
 
 #[test]

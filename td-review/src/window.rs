@@ -933,9 +933,11 @@ impl Session {
                 }
                 self.send(Event::Close)
             }
-            Input::Wheel { .. } | Input::Hover(_) | Input::Paste(_) | Input::Context { .. } => {
-                Flow::Continue
-            }
+            Input::Wheel { .. }
+            | Input::Hover(_)
+            | Input::Paste(_)
+            | Input::PasteImage { .. }
+            | Input::Context { .. } => Flow::Continue,
         }
     }
 }

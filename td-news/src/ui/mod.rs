@@ -537,6 +537,7 @@ impl App {
             Input::Pointer { .. }
             | Input::Wheel { .. }
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::Context { .. } => {}
         }
         self.underline_link();

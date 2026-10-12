@@ -23,8 +23,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 use td_ui::client::{App, DISPLAY, REGISTRY, SHM, SURFACE, SYNC, TOPLEVEL, XDG_SURFACE};
-use td_ui::clipboard::MAX_BYTES;
-use td_ui::data::{PLAIN, UTF8};
+use td_ui::clipboard::{MAX_BYTES, MAX_IMAGE_BYTES};
+use td_ui::data::{PLAIN, PNG, UTF8};
 use td_ui::keys::{self, Section};
 use td_ui::raster::{GlyphStyle, Primitive, Raster, Rect, Scale, Surface, PAPER, SELECTED};
 use td_ui::theme::{HARBOR, MOSS, SAND};
@@ -52,6 +52,7 @@ enum Record {
     Focus(bool),
     Close,
     Paste(String),
+    PasteImage(String, Vec<u8>),
 }
 
 impl Record {
@@ -73,6 +74,7 @@ impl Record {
             Input::Focus(focused) => Self::Focus(focused),
             Input::Close => Self::Close,
             Input::Paste(text) => Self::Paste(text.to_string()),
+            Input::PasteImage { mime, bytes } => Self::PasteImage(mime.to_string(), bytes.to_vec()),
         }
     }
 }
@@ -97,8 +99,11 @@ struct Recorder {
     /// each input.
     copy_on: Option<(String, Arc<str>)>,
     paste_on: Option<String>,
+    image_on: Option<String>,
     outcomes: Vec<Result<(), Refusal>>,
     states: Vec<(bool, bool, bool)>,
+    /// `has_image` at each picture paste asked.
+    images: Vec<bool>,
     /// Asks the window to withdraw what it copied, answered once.
     withdraw: bool,
     /// Asks the window to clear its frames, answered once.
@@ -126,8 +131,10 @@ impl Recorder {
             title: "Recorder".into(),
             copy_on: None,
             paste_on: None,
+            image_on: None,
             outcomes: Vec::new(),
             states: Vec::new(),
+            images: Vec::new(),
             withdraw: false,
             scrub: false,
             keys: Vec::new(),
@@ -219,6 +226,10 @@ impl Handler for Recorder {
             }
             if self.paste_on.as_deref() == Some(name.as_str()) {
                 self.outcomes.push(clipboard.paste());
+            }
+            if self.image_on.as_deref() == Some(name.as_str()) {
+                self.images.push(clipboard.has_image());
+                self.outcomes.push(clipboard.paste_image());
             }
             if self.help_on.as_deref() == Some(name.as_str()) {
                 self.show_keys = true;
@@ -2038,6 +2049,159 @@ fn a_paste_asks_the_selection_and_its_text_arrives_as_an_input() {
         .inputs
         .iter()
         .any(|r| matches!(r, Record::Paste(_))));
+}
+
+#[test]
+fn a_picture_paste_asks_for_png_and_its_bytes_arrive_whole() {
+    let mut handler = Recorder::new();
+    handler.image_on = Some("v".into());
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    // Nothing selected, and a selection of text only: no picture.
+    press(&mut w, keyboard, 9, 47);
+    assert_eq!(w.handler().outcomes, [Err(Refusal::NoImage)]);
+    selection_offer(&mut w, device, 0xff00_0010, &[UTF8]);
+    release(&mut w, keyboard, 10, 47);
+    press(&mut w, keyboard, 11, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Err(Refusal::NoImage)));
+    assert_eq!(w.handler().images, [false, false]);
+    // Text, a JPEG and a PNG: the PNG is asked for.
+    selection_offer(
+        &mut w,
+        device,
+        0xff00_0011,
+        &[UTF8, "IMAGE/JPEG", PNG, "image/gif"],
+    );
+    drain(&peer);
+    release(&mut w, keyboard, 12, 47);
+    press(&mut w, keyboard, 13, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    assert_eq!(w.handler().images.last(), Some(&true));
+    let (requests, files) = drain(&peer);
+    assert_eq!(requests, [text_request(0xff00_0011, 1, PNG)]);
+    // Bytes that are not text, past text's budget, arrive as they were
+    // sent.
+    let mut sent = vec![0x89, b'P', b'N', b'G', 0xff, 0, 0xfe];
+    sent.extend((0..MAX_BYTES + 1).map(|i| i as u8));
+    let mut file = files.into_iter().next().unwrap();
+    let bytes = sent.clone();
+    let writer = std::thread::spawn(move || file.write_all(&bytes).unwrap());
+    let now = 100;
+    settle(&mut w, now, |w| {
+        matches!(last(w), Some(Record::PasteImage(..)))
+    });
+    assert!(
+        last(&w) == Some(&Record::PasteImage(PNG.into(), sent)),
+        "the picture arrives whole"
+    );
+    writer.join().unwrap();
+    assert!(w.handler().notices.is_empty(), "{:?}", w.handler().notices);
+    // A text paste after it is text again.
+    w.handler_mut().image_on = None;
+    w.handler_mut().paste_on = Some("v".into());
+    release(&mut w, keyboard, 14, 47);
+    press(&mut w, keyboard, 15, 47);
+    let (requests, files) = drain(&peer);
+    assert_eq!(requests, [text_request(0xff00_0011, 1, UTF8)]);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"words").unwrap();
+    drop(file);
+    w.end_turn(now + 1, true).unwrap();
+    assert_eq!(last(&w), Some(&Record::Paste("words".into())));
+    // A JPEG alone is asked for, and delivered, as it was spelled.
+    w.handler_mut().paste_on = None;
+    w.handler_mut().image_on = Some("v".into());
+    selection_offer(&mut w, device, 0xff00_0012, &["IMAGE/JPEG"]);
+    drain(&peer);
+    release(&mut w, keyboard, 16, 47);
+    press(&mut w, keyboard, 17, 47);
+    let (requests, files) = drain(&peer);
+    assert_eq!(requests, [text_request(0xff00_0012, 1, "IMAGE/JPEG")]);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(&[0xff, 0xd8, 0xff, 0xd9]).unwrap();
+    drop(file);
+    w.end_turn(now + 2, true).unwrap();
+    assert_eq!(
+        last(&w),
+        Some(&Record::PasteImage(
+            "IMAGE/JPEG".into(),
+            vec![0xff, 0xd8, 0xff, 0xd9]
+        ))
+    );
+    // A picture paste cancelled by focus lost leaves nothing behind: the
+    // text paste after the refocus is text.
+    release(&mut w, keyboard, 18, 47);
+    press(&mut w, keyboard, 19, 47);
+    assert_eq!(w.handler().outcomes.last(), Some(&Ok(())));
+    drain(&peer);
+    w.event(message(keyboard, 2, &[20, SURFACE])).unwrap();
+    assert_eq!(
+        w.handler().notices.last().map(String::as_str),
+        Some("paste cancelled: focus lost")
+    );
+    w.event(message(keyboard, 1, &[21, SURFACE, 0])).unwrap();
+    w.event(message(keyboard, 4, &[22, 0, 0, 0, 0])).unwrap();
+    selection_offer(&mut w, device, 0xff00_0013, &[UTF8, PNG]);
+    drain(&peer);
+    w.handler_mut().image_on = None;
+    w.handler_mut().paste_on = Some("v".into());
+    press(&mut w, keyboard, 23, 47);
+    let (requests, files) = drain(&peer);
+    assert_eq!(requests, [text_request(0xff00_0013, 1, UTF8)]);
+    let mut file = files.into_iter().next().unwrap();
+    file.write_all(b"after").unwrap();
+    drop(file);
+    w.end_turn(now + 3, true).unwrap();
+    assert_eq!(last(&w), Some(&Record::Paste("after".into())));
+}
+
+/// Ends idle turns at `now`, the clock held below every deadline, with a
+/// real pause between them so a writer thread makes progress, until
+/// `done` or ten seconds pass.
+fn settle(w: &mut Window<'_, Recorder>, now: u64, done: impl Fn(&Window<'_, Recorder>) -> bool) {
+    let start = std::time::Instant::now();
+    while !done(w) && start.elapsed() < Duration::from_secs(10) {
+        w.end_turn(now, true).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_picture_paste_past_its_budget_fails_with_a_notice() {
+    let mut handler = Recorder::new();
+    handler.image_on = Some("v".into());
+    let (mut w, peer, keyboard, _, device) = clipboard_fixture(&mut handler);
+    focus_with_map(&mut w, &peer, keyboard);
+    selection_offer(&mut w, device, 0xff00_0010, &[PNG]);
+    drain(&peer);
+    press(&mut w, keyboard, 9, 47);
+    assert_eq!(w.handler().outcomes, [Ok(())]);
+    let (_, files) = drain(&peer);
+    let mut file = files.into_iter().next().unwrap();
+    // A picture's own budget bounds it.
+    let writer = std::thread::spawn(move || {
+        let chunk = vec![0u8; 1 << 20];
+        let mut left = MAX_IMAGE_BYTES + 1;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if file.write_all(&chunk[..n]).is_err() {
+                return;
+            }
+            left -= n;
+        }
+    });
+    settle(&mut w, 100, |w| !w.handler().notices.is_empty());
+    assert_eq!(
+        w.handler().notices,
+        ["paste failed: clipboard paste byte budget"]
+    );
+    assert!(!w
+        .handler()
+        .inputs
+        .iter()
+        .any(|r| matches!(r, Record::PasteImage(..))));
+    drop(w);
+    writer.join().unwrap();
 }
 
 /// A typeface whose '0' is a square of half the em on the baseline.

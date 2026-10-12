@@ -237,6 +237,7 @@ impl App {
             Input::Wheel { rows, .. } => self.wheel(rows),
             Input::Hover(_) | Input::Context { .. } => {}
             Input::Paste(text) => self.pasted(text),
+            Input::PasteImage { .. } => {}
         }
         self.reveal_fields();
     }

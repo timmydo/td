@@ -1,16 +1,18 @@
-//! Bounded, nonblocking clipboard endpoints under an explicit clock: the
-//! text a window offered, written to the right a `wl_data_source.send`
-//! hands it (`Outgoing`), and the selection's text, read from the private
-//! socket pair a `wl_data_offer.receive` is given the far end of
-//! (`Incoming`). Each transfer has a five-second deadline from `begin`
-//! and makes at most four 16 KiB I/O attempts a step, so a peer that
-//! stalls or floods holds up no turn; a failure is terminal and no prefix
-//! of a failed or unfinished transfer is ever handed on. These are
-//! transport owners, not clipboard ownership: the data device, its
-//! offers and the live source are the client's (`client`), and what is
-//! offered or pasted is the consumer's. The widget window (`window`)
-//! owns one of each; td-editor's window owns its own `Outgoing` and an
-//! `Incoming` of its own that admits the paste as it arrives.
+//! Bounded, nonblocking clipboard endpoints under an explicit clock:
+//! the text a window offered, written to the right a
+//! `wl_data_source.send` hands it (`Outgoing`), and the selection's
+//! text or picture, read from the private socket pair a
+//! `wl_data_offer.receive` is given the far end of (`Incoming`). Each
+//! transfer has a five-second deadline from `begin` and makes at most
+//! four I/O attempts a step, of 16 KiB, or 256 KiB for a picture, so a
+//! peer that stalls or floods holds up no turn; a failure is terminal
+//! and no prefix of a failed or unfinished transfer is ever handed on.
+//! These are transport owners, not clipboard ownership: the data
+//! device, its offers and the live source are the client's (`client`),
+//! and what is offered or pasted is the consumer's. The widget window
+//! (`window`) owns one of each; td-editor's window owns its own
+//! `Outgoing` and an `Incoming` of its own that admits the paste as it
+//! arrives.
 //!
 //! The send's right is a pipe or socket the compositor created, whose
 //! open-file description it may still share; `Outgoing` adds
@@ -30,7 +32,12 @@ use std::sync::Arc;
 
 /// The most text a transfer carries either way.
 pub const MAX_BYTES: usize = 1024 * 1024;
+/// The most a picture paste carries: a screenshot's PNG, whole.
+pub const MAX_IMAGE_BYTES: usize = 32 << 20;
 const CHUNK: usize = 16 * 1024;
+/// A picture's read size, so its larger budget arrives within the
+/// same deadline at the loop's transfer pace.
+const IMAGE_CHUNK: usize = 256 * 1024;
 const DEADLINE_MS: u64 = 5000;
 const O_NONBLOCK: usize = 0o4000;
 const O_ACCMODE: usize = 3;
@@ -222,13 +229,15 @@ impl Outgoing {
     }
 }
 
-/// A bounded reader of the selection's text over a private socket pair;
-/// dropping it cancels the paste. The bytes are handed on only whole,
-/// at EOF, as UTF-8; a text past `MAX_BYTES`, a failed read or a missed
-/// deadline poisons the transfer for good.
+/// A bounded reader of the selection's text, or its picture, over a
+/// private socket pair; dropping it cancels the paste. The bytes are
+/// handed on only whole, at EOF, text as UTF-8; bytes past the budget
+/// (`MAX_BYTES`, or `MAX_IMAGE_BYTES` for a picture), a failed read or
+/// a missed deadline poisons the transfer for good.
 pub struct Incoming {
     stream: UnixStream,
     bytes: Vec<u8>,
+    limit: usize,
     deadline: u64,
     clock: u64,
     read: Box<[u8]>,
@@ -245,6 +254,15 @@ impl Incoming {
     /// offer; the caller drops its own copy of that endpoint after the
     /// hand-off, so EOF can arrive.
     pub fn begin(now: u64) -> io::Result<(Self, File)> {
+        Self::open(now, MAX_BYTES, CHUNK)
+    }
+
+    /// The same for a picture, under `MAX_IMAGE_BYTES`.
+    pub fn begin_image(now: u64) -> io::Result<(Self, File)> {
+        Self::open(now, MAX_IMAGE_BYTES, IMAGE_CHUNK)
+    }
+
+    fn open(now: u64, limit: usize, chunk: usize) -> io::Result<(Self, File)> {
         let deadline = now
             .checked_add(DEADLINE_MS)
             .ok_or_else(|| io::Error::other("clipboard clock exhausted"))?;
@@ -254,9 +272,10 @@ impl Incoming {
             Self {
                 stream,
                 bytes: Vec::new(),
+                limit,
                 deadline,
                 clock: now,
-                read: vec![0; CHUNK].into_boxed_slice(),
+                read: vec![0; chunk].into_boxed_slice(),
                 state: State::Pending,
             },
             File::from(OwnedFd::from(peer)),
@@ -303,8 +322,19 @@ impl Incoming {
                         .read
                         .get(..count)
                         .ok_or_else(|| io::Error::other("clipboard read length"))?;
-                    if self.bytes.len().saturating_add(count) > MAX_BYTES {
+                    let needed = self.bytes.len().saturating_add(count);
+                    if needed > self.limit {
                         return Err(io::Error::other("clipboard paste byte budget"));
+                    }
+                    // Doubled as a Vec grows, but never past the budget,
+                    // and a failed allocation fails the paste.
+                    if needed > self.bytes.capacity() {
+                        let want = needed
+                            .max(self.bytes.capacity().saturating_mul(2))
+                            .min(self.limit);
+                        self.bytes
+                            .try_reserve_exact(want - self.bytes.len())
+                            .map_err(|_| io::Error::other("clipboard paste memory"))?;
                     }
                     self.bytes.extend_from_slice(bytes);
                 }
@@ -319,9 +349,15 @@ impl Incoming {
     /// The text, whole, of a transfer that reached EOF; not UTF-8 is a
     /// failure, as an unfinished transfer is.
     pub fn finish(self) -> io::Result<String> {
+        String::from_utf8(self.finish_bytes()?)
+            .map_err(|_| io::Error::other("clipboard text is not UTF-8"))
+    }
+
+    /// The bytes, whole, of a transfer that reached EOF.
+    pub fn finish_bytes(self) -> io::Result<Vec<u8>> {
         if self.state != State::Complete {
             return Err(io::Error::other("clipboard transfer has no successful EOF"));
         }
-        String::from_utf8(self.bytes).map_err(|_| io::Error::other("clipboard text is not UTF-8"))
+        Ok(self.bytes)
     }
 }

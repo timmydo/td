@@ -110,6 +110,13 @@ pub enum Input<'a> {
     Close,
     /// The selection's text, whole, that `Clipboard::paste` asked for.
     Paste(&'a str),
+    /// The selection's picture, whole and undecoded, that
+    /// `Clipboard::paste_image` asked for, and the MIME it came as
+    /// (`data::PNG` or `data::JPEG`, in the offer's spelling).
+    PasteImage {
+        mime: &'a str,
+        bytes: &'a [u8],
+    },
 }
 
 /// Why the clipboard refused a copy or a paste; `Display` says it for a
@@ -129,6 +136,8 @@ pub enum Refusal {
     Pasting,
     /// The selection offers no text.
     NoSelection,
+    /// The selection offers no picture a paste could ask for.
+    NoImage,
     /// The text is past `clipboard::MAX_BYTES`.
     TooLong,
     /// No private endpoint for the paste could be made: the process is
@@ -145,6 +154,7 @@ impl std::fmt::Display for Refusal {
             Self::Sending => "the last copy is still being sent",
             Self::Pasting => "a paste is still arriving",
             Self::NoSelection => "the clipboard holds no text",
+            Self::NoImage => "the clipboard holds no picture",
             Self::TooLong => "the text is too long for the clipboard",
             Self::NoEndpoint => "no endpoint for the paste could be made",
         })
@@ -153,7 +163,8 @@ impl std::fmt::Display for Refusal {
 
 /// The clipboard as a handler reaches it with each input: a copy offers
 /// text as the seat's selection, a paste asks the selection for its
-/// text, which arrives as `Input::Paste` once it is whole. The window's
+/// text, which arrives as `Input::Paste` once it is whole, or for its
+/// picture, which arrives as `Input::PasteImage`. The window's
 /// is `WindowClipboard`; a test or a headless run hands `NoClipboard`,
 /// which refuses everything.
 pub trait Clipboard {
@@ -172,6 +183,17 @@ pub trait Clipboard {
     /// window focused; it arrives as `Input::Paste` when whole, or a
     /// notice says why not.
     fn paste(&mut self) -> std::result::Result<(), Refusal>;
+    /// Whether the selection offers a picture `paste_image` could ask
+    /// for; none without a clipboard.
+    fn has_image(&self) -> bool {
+        false
+    }
+    /// Asks the selection for its picture as `paste` asks for text; it
+    /// arrives as `Input::PasteImage` when whole. Refused as `NoImage`
+    /// where `has_image` is false.
+    fn paste_image(&mut self) -> std::result::Result<(), Refusal> {
+        Err(Refusal::NoImage)
+    }
 }
 
 /// No clipboard: every request is refused as `Refusal::NoDevice`.
@@ -193,6 +215,9 @@ impl Clipboard for NoClipboard {
     fn paste(&mut self) -> std::result::Result<(), Refusal> {
         Err(Refusal::NoDevice)
     }
+    fn paste_image(&mut self) -> std::result::Result<(), Refusal> {
+        Err(Refusal::NoDevice)
+    }
 }
 
 /// The window's half of the clipboard, over its client and its transfers.
@@ -209,6 +234,10 @@ impl Clipboard for WindowClipboard<'_> {
 
     fn has_text(&self) -> bool {
         self.client.selection_mime().is_some()
+    }
+
+    fn has_image(&self) -> bool {
+        self.client.selection_image_mime().is_some()
     }
 
     fn pasting(&self) -> bool {
@@ -248,6 +277,17 @@ impl Clipboard for WindowClipboard<'_> {
     }
 
     fn paste(&mut self) -> std::result::Result<(), Refusal> {
+        self.begin_paste(false)
+    }
+
+    fn paste_image(&mut self) -> std::result::Result<(), Refusal> {
+        self.begin_paste(true)
+    }
+}
+
+impl WindowClipboard<'_> {
+    /// A paste of the selection's text, or its picture.
+    fn begin_paste(&mut self, image: bool) -> std::result::Result<(), Refusal> {
         if self.board.error.is_some() {
             return Err(Refusal::NoDevice);
         }
@@ -260,25 +300,43 @@ impl Clipboard for WindowClipboard<'_> {
         if self.board.incoming.is_some() {
             return Err(Refusal::Pasting);
         }
-        if self.client.selection_mime().is_none() {
+        if image && self.client.selection_image_mime().is_none() {
+            return Err(Refusal::NoImage);
+        }
+        if !image && self.client.selection_mime().is_none() {
             return Err(Refusal::NoSelection);
         }
         // An endpoint the process cannot make is the paste's refusal,
         // not the connection's failure: the window goes on, as the
         // editor's does.
-        let (incoming, peer) = match Incoming::begin(self.clock) {
+        let begun = if image {
+            Incoming::begin_image(self.clock)
+        } else {
+            Incoming::begin(self.clock)
+        };
+        let (incoming, peer) = match begun {
             Ok(pair) => pair,
             Err(e) => {
                 self.board.notice = Some(format!("paste refused: clipboard endpoint: {e}"));
                 return Err(Refusal::NoEndpoint);
             }
         };
-        if let Err(e) = self.client.receive(&peer) {
-            self.board.error = Some(e);
-            return Err(Refusal::NoDevice);
-        }
+        // A picture keeps the MIME its receive named, so what arrives is
+        // delivered as what was asked for.
+        let asked = if image {
+            self.client.receive_image(&peer).map(Some)
+        } else {
+            self.client.receive(&peer).map(|()| None)
+        };
+        let mime = match asked {
+            Ok(mime) => mime,
+            Err(e) => {
+                self.board.error = Some(e);
+                return Err(Refusal::NoDevice);
+            }
+        };
         drop(peer);
-        self.board.incoming = Some(incoming);
+        self.board.incoming = Some((incoming, mime));
         Ok(())
     }
 }
@@ -288,7 +346,9 @@ impl Clipboard for WindowClipboard<'_> {
 struct Board {
     text: Option<Arc<str>>,
     outgoing: Option<Outgoing>,
-    incoming: Option<Incoming>,
+    /// The paste in flight, with the picture MIME it asked for (none for
+    /// text), kept together so neither outlives the other.
+    incoming: Option<(Incoming, Option<String>)>,
     /// The serial of the press being delivered, for a copy it asks.
     serial: Option<u32>,
     /// A notice a request raised, given to the handler once the input
@@ -887,15 +947,25 @@ impl<'h, H: Handler> Window<'h, H> {
             .board
             .incoming
             .as_ref()
-            .is_some_and(|incoming| due(incoming.expired(now)))
+            .is_some_and(|(incoming, _)| due(incoming.expired(now)))
         {
-            if let Some(mut incoming) = self.board.incoming.take() {
+            if let Some((mut incoming, image)) = self.board.incoming.take() {
                 match incoming.step(now) {
-                    Ok(false) => self.board.incoming = Some(incoming),
-                    Ok(true) => match incoming.finish() {
-                        Ok(text) if self.focused => self.deliver(Input::Paste(&text))?,
-                        Ok(_) => self.handler.notice("paste cancelled: focus lost"),
-                        Err(e) => self.handler.notice(&format!("paste failed: {e}")),
+                    Ok(false) => self.board.incoming = Some((incoming, image)),
+                    Ok(true) => match image {
+                        Some(mime) => match incoming.finish_bytes() {
+                            Ok(bytes) if self.focused => self.deliver(Input::PasteImage {
+                                mime: &mime,
+                                bytes: &bytes,
+                            })?,
+                            Ok(_) => self.handler.notice("paste cancelled: focus lost"),
+                            Err(e) => self.handler.notice(&format!("paste failed: {e}")),
+                        },
+                        None => match incoming.finish() {
+                            Ok(text) if self.focused => self.deliver(Input::Paste(&text))?,
+                            Ok(_) => self.handler.notice("paste cancelled: focus lost"),
+                            Err(e) => self.handler.notice(&format!("paste failed: {e}")),
+                        },
                     },
                     Err(e) => self.handler.notice(&format!("paste failed: {e}")),
                 }

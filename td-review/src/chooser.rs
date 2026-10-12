@@ -677,6 +677,7 @@ impl<T> Handler for Window<T> {
             }
             Input::Key { chord, repeat } => self.chooser.key(chord, repeat),
             Input::Paste(text) => self.chooser.paste(text),
+            Input::PasteImage { .. } => Step::Continue,
             Input::Pointer {
                 phase: PointerPhase::Press,
                 x,

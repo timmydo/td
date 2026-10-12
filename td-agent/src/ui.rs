@@ -4457,8 +4457,8 @@ impl App {
                 self.apply_focus();
             }
             Input::Close => {}
-            // Taken above, by `pasted`.
-            Input::Paste(_) => {}
+            // Text was taken above, by `pasted`; no picture is asked for.
+            Input::Paste(_) | Input::PasteImage { .. } => {}
         }
     }
 
@@ -4602,6 +4602,7 @@ impl App {
             | Input::Focus(true)
             | Input::Close
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::CancelPointer => return false,
         };
         self.menu_event(event);
@@ -5966,7 +5967,7 @@ impl App {
                 extend,
                 ..
             } => template.pointer(phase, x, y, extend),
-            Input::Paste(_) => return,
+            Input::Paste(_) | Input::PasteImage { .. } => return,
             Input::CancelPointer => {
                 template.cancel_pointer();
                 TemplateReply::Stay(true)
@@ -6041,8 +6042,8 @@ impl App {
                 }
                 dialog.pointer(phase, x, y, extend)
             }
-            // Taken first, by `input`.
-            Input::Paste(_) => return,
+            // Text was taken first, by `input`; no picture is asked for.
+            Input::Paste(_) | Input::PasteImage { .. } => return,
             Input::CancelPointer => {
                 dialog.cancel_pointer();
                 Reply::Stay(true)

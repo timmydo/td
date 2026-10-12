@@ -367,6 +367,7 @@ impl Panel {
             Input::Resize(_)
             | Input::Focus(_)
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::Hover(_)
             | Input::Context { .. }
             | Input::Close => return Reply::Stay(false),

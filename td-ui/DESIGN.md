@@ -335,10 +335,11 @@ of its own files may name each module.
   which of the seat's two selections a device serves, with its manager
   global and version, its request and send opcodes, and its schemas by
   board; `Offer`, the record the client keeps
-  per server offer, with `mime`, its preferred supported text type, and
-  `announce` under the budgets; `UTF8` and `PLAIN`, the two text MIMEs a
-  consumer offers and accepts; `OFFER_LIMIT`, `ANNOUNCEMENTS` and
-  `MIME_BYTES`.
+  per server offer, with `mime`, its preferred supported text type,
+  `image_mime`, its preferred picture type, and `announce` under the
+  budgets; `UTF8` and `PLAIN`, the two text MIMEs a consumer offers and
+  accepts; `PNG` and `JPEG`, the two picture MIMEs a paste may ask for;
+  `OFFER_LIMIT`, `ANNOUNCEMENTS` and `MIME_BYTES`.
 - `raster`: `Rect`, `Scale` (1 through 4), `Weight`, `GlyphStyle` (its
   ink, background, weight and `font_style`, an `atlas::Style`; `medium`
   and `regular` over an ink and a background, `bold` and `italic` the
@@ -725,34 +726,38 @@ of its own files may name each module.
   `Payload`, the worker's request type for a driven consumer; `text`,
   the read-back of a composition's draw stream; `paint` and the `Frame`
   it returns with its `ppm`; and `fnv1a64`, the frame digest.
-- `clipboard`: `MAX_BYTES`, the text ceiling either way; `Outgoing`
-  (`begin` over the send's right, `step`, `expired`, `cancel`), the
-  bounded nonblocking writer of an offered text, which owns the right's
-  status flags for the transfer and restores them; and `Incoming`
-  (`begin`, `step`, `expired`, `finish`), the bounded reader of the
-  selection's text over a private socket pair, handing it on whole at
-  EOF as UTF-8. Both take the caller's clock in milliseconds, keep a
-  five-second deadline from `begin` and make at most four 16 KiB
-  attempts a step; a failure is terminal. They are transport owners
-  over the raw module's pinned `fcntl` status commands (`UNSAFE.md`
-  §19), not clipboard ownership, which is the client's.
+- `clipboard`: `MAX_BYTES`, the text ceiling either way, and
+  `MAX_IMAGE_BYTES`, a picture paste's; `Outgoing` (`begin` over the
+  send's right, `step`, `expired`, `cancel`), the bounded nonblocking
+  writer of an offered text, which owns the right's status flags for the
+  transfer and restores them; and `Incoming` (`begin`, `begin_image`,
+  `step`, `expired`, `finish`, `finish_bytes`), the bounded reader of
+  the selection's text, or its picture, over a private socket pair,
+  handing it on whole at EOF, text as UTF-8. Both take the caller's
+  clock in milliseconds, keep a five-second deadline from `begin` and
+  make at most four attempts a step, of 16 KiB, or 256 KiB for a picture
+  so its larger budget arrives in the same deadline; a failure is
+  terminal. They are transport owners over the raw module's pinned
+  `fcntl` status commands (`UNSAFE.md` §19), not clipboard ownership,
+  which is the client's.
 - `window`: `DEFAULT_WIDTH` and `DEFAULT_HEIGHT`; `Flow`;
   `PointerPhase`, the driven seam's, re-exported; `Input<'a>`, the
-  vocabulary a widget program reads, `Paste` among it; `Refusal`, why a
-  copy or paste was not made (`NoDevice`, `NoFocus`, `NoSerial`,
-  `Sending`, `Pasting`, `NoSelection`, `TooLong`, `NoEndpoint`), with
-  its `Display`; the `Clipboard` trait
-  (`available`, `has_text`, `pasting`, `copy`, `paste`), what a handler
-  reaches with each input, `WindowClipboard<'w>`, the window's, and
-  `NoClipboard`, which refuses everything, for a test or a headless run;
-  the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
+  vocabulary a widget program reads, `Paste` and `PasteImage` among it;
+  `Refusal`, why a copy or paste was not made (`NoDevice`, `NoFocus`,
+  `NoSerial`, `Sending`, `Pasting`, `NoSelection`, `NoImage`, `TooLong`,
+  `NoEndpoint`), with its `Display`; the `Clipboard` trait (`available`,
+  `has_text`, `pasting`, `copy`, `paste`, and `has_image` and
+  `paste_image`, which default to none and a `NoImage` refusal), what a
+  handler reaches with each input, `WindowClipboard<'w>`, the window's,
+  and `NoClipboard`, which refuses everything, for a test or a headless
+  run; the `Handler` trait (`app_id`, `title`, `input` with a clipboard,
   `poll`, `wait_ms`, `needs_redraw`, `paint`, `notice`,
   `take_withdrawal`, `take_scrub`, `keys`, `take_show_keys`); `Object`,
   the empty tag; `Window<'h, H>` (`new`, `with_typeface`,
   `with_theme_file`, `theme`, `help`, `handler`, `handler_mut`,
-  `surface`), the `App` over a handler it
-  borrows; and `run` with an optional `Typeface`, which reads the
-  program's theme file, under "Widget window" below.
+  `surface`), the `App` over a handler it borrows; and `run` with an
+  optional `Typeface`, which reads the program's theme file, under
+  "Widget window" below.
 - The editor core, under "Editor core" below: `editor_text`, the text
   bounds and lossless codec; `editor_model`, the `Editor` with its
   documents, transactions and `RevisionPoint`s; `editor_fill`, the fill
@@ -1399,7 +1404,8 @@ not frames, and stays its own).
   first `ANNOUNCEMENTS` MIMEs are inspected and later ones drained and
   ignored, of which the two text spellings, in any ASCII case and up to
   `MIME_BYTES`, are kept as announced, the explicit UTF-8 one preferred and
-  no other encoding or parameter form considered. The selection names a live
+  no other encoding or parameter form considered, and likewise the two
+  picture types, PNG preferred. The selection names a live
   offer or nothing and retires every other; keyboard leave, keyboard loss
   and the device's release retire every offer and clear the selection; a
   drag's offer is retired without accepting, finishing or selecting it, a
@@ -1973,6 +1979,24 @@ keyboard extending the press; wheel frames in cells; the poll and wait
 each turn, the keyboard capability's loss as focus loss once; and the
 whole loop over a socket.
 
+For a picture paste `tests/window.rs` holds: no selection and a
+selection of text alone refused as `NoImage` with `has_image` false; a
+selection of text, a JPEG, a PNG and another picture asked for its PNG,
+its bytes, not text, arriving whole as `PasteImage` with that MIME; a
+text paste after it asking for text and arriving as text; a JPEG alone
+asked for and delivered in its own spelling; a picture paste cancelled
+by focus lost followed by a text paste that arrives as text; and a
+picture past `MAX_IMAGE_BYTES` a notice and no input, where text's
+budget is the smaller; the transfers driven by a writer thread and
+idle turns at a held clock with a real pause between them, so a loaded
+runner only waits longer. `tests/clipboard.rs` holds a picture of
+exactly `MAX_IMAGE_BYTES` arriving whole in no more capacity than that
+after an odd first read, one byte more refused, and bytes that are not
+UTF-8 a picture's and text's failure. `data`'s unit
+tests hold the two picture spellings kept in any case, the first
+kept, PNG preferred and neither taken as text, and none on a retired
+offer.
+
 `tests/window.rs` also presents the corner composition, whose glyph
 the window executes through a typeface's fitted face when it is given
 one, exactly as a raster with that face paints it.
@@ -2122,7 +2146,15 @@ was drained, so a focus loss, a selection change or a close request
 still queued behind it is seen first. A paste in flight is dropped, with
 a notice, when the selection changes, when focus is lost, when the device
 goes, when a copy replaces the selection, or when the compositor asks
-the window to close (a handler that keeps the window asks again). Both
+the window to close (a handler that keeps the window asks again).
+`paste_image` asks the selection for its picture in the same way, when
+it offers `image/png` or `image/jpeg` (PNG preferred, in the spelling
+announced), refused as `NoImage` otherwise; the bytes, undecoded and at
+most `clipboard::MAX_IMAGE_BYTES` (32 MiB) in a buffer grown fallibly
+and never past that, arrive whole as `Input::PasteImage` with the MIME
+the receive named, kept with the transfer, under the same rules. Only a
+handler that asks for a picture receives one; decoding is the
+handler's, the toolkit holding no image format. Both
 transfers are stepped at the end of every idle turn under their own
 bounds, and at any turn once expired, the loop's wait capped at ten
 milliseconds while one is pending; a transfer that fails or expires is

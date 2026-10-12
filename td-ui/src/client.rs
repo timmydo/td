@@ -758,6 +758,15 @@ impl<T: Tag> Client<T> {
         self.mime(Board::Primary)
     }
 
+    /// The selection's supported picture MIME in the spelling it was
+    /// announced with, PNG preferred; none when it announced neither.
+    pub fn selection_image_mime(&self) -> Option<&str> {
+        let data = self.board(Board::Clipboard)?;
+        data.offers
+            .get(&data.selection?)
+            .and_then(Offer::image_mime)
+    }
+
     fn mime(&self, board: Board) -> Option<&str> {
         let data = self.board(board)?;
         data.offers.get(&data.selection?).and_then(Offer::mime)
@@ -779,27 +788,40 @@ impl<T: Tag> Client<T> {
     /// producer side of a socket pair the consumer reads from; the
     /// request names the selection's preferred MIME.
     pub fn receive(&mut self, endpoint: &File) -> Result<()> {
-        self.receive_from(Board::Clipboard, endpoint)
+        let mime = self.mime(Board::Clipboard).map(str::to_string);
+        self.receive_from(Board::Clipboard, mime, endpoint)
+            .map(drop)
     }
 
     /// The same from the primary selection's offer.
     pub fn receive_primary(&mut self, endpoint: &File) -> Result<()> {
-        self.receive_from(Board::Primary, endpoint)
+        let mime = self.mime(Board::Primary).map(str::to_string);
+        self.receive_from(Board::Primary, mime, endpoint).map(drop)
     }
 
-    fn receive_from(&mut self, board: Board, endpoint: &File) -> Result<()> {
+    /// Asks the selection's offer for its picture, in its preferred
+    /// picture MIME, over `endpoint`; the MIME asked for.
+    pub fn receive_image(&mut self, endpoint: &File) -> Result<String> {
+        let mime = self.selection_image_mime().map(str::to_string);
+        self.receive_from(Board::Clipboard, mime, endpoint)
+    }
+
+    fn receive_from(
+        &mut self,
+        board: Board,
+        mime: Option<String>,
+        endpoint: &File,
+    ) -> Result<String> {
         let offer = self
             .board(board)
             .and_then(|d| d.selection)
             .ok_or_else(|| format!("no {} selection", board.name()))?;
-        let mime = self
-            .mime(board)
-            .ok_or_else(|| format!("no supported {} offer", board.name()))?
-            .to_string();
+        let mime = mime.ok_or_else(|| format!("no supported {} offer", board.name()))?;
         let mut body = Builder::new();
         body.string(&mime)?;
         self.connection
-            .send(offer, board.receive(), body, Some(endpoint))
+            .send(offer, board.receive(), body, Some(endpoint))?;
+        Ok(mime)
     }
 
     /// Offers text on the clipboard: a fresh source advertising both text
@@ -1028,10 +1050,7 @@ impl<T: Tag> Client<T> {
                     offer,
                     Offer {
                         sequence: data.sequence,
-                        retired: false,
-                        utf8: None,
-                        plain: None,
-                        count: 0,
+                        ..Offer::default()
                     },
                 );
                 if !active {

@@ -2,9 +2,9 @@
 //! the client keeps per server-created offer: exact schemas for the core
 //! data-device v3 and primary-selection v1 device, source and offer
 //! events, each board's request and event opcodes, the two text MIME
-//! spellings a consumer offers and accepts, and the budgets on offers and
-//! their announcements. No display, descriptor, environment or clock is
-//! accessed.
+//! spellings a consumer offers and accepts, the two picture MIMEs a paste
+//! may ask for, and the budgets on offers and their announcements. No
+//! display, descriptor, environment or clock is accessed.
 
 use crate::wire::{Cursor, Message};
 
@@ -12,6 +12,10 @@ use crate::wire::{Cursor, Message};
 pub const UTF8: &str = "text/plain;charset=utf-8";
 /// Plain text, accepted as UTF-8 only.
 pub const PLAIN: &str = "text/plain";
+/// A picture as PNG, what a screenshot tool offers; preferred.
+pub const PNG: &str = "image/png";
+/// A picture as JPEG, what a browser's copied photograph may offer.
+pub const JPEG: &str = "image/jpeg";
 /// Retained offers, live and retired, at most.
 pub const OFFER_LIMIT: usize = 32;
 /// MIME announcements inspected per offer; later ones are drained.
@@ -130,14 +134,17 @@ impl Board {
 }
 
 /// One server-created offer: its generation, whether it was destroyed
-/// (and waits for its barrier), the exact spellings of the two supported
-/// MIMEs it announced, and how many announcements were inspected.
-#[derive(Debug, Eq, PartialEq)]
+/// (and waits for its barrier), the exact spellings of the supported
+/// text and picture MIMEs it announced, and how many announcements were
+/// inspected.
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct Offer {
     pub sequence: u64,
     pub retired: bool,
     pub utf8: Option<String>,
     pub plain: Option<String>,
+    pub png: Option<String>,
+    pub jpeg: Option<String>,
     pub count: usize,
 }
 
@@ -149,6 +156,16 @@ impl Offer {
             None
         } else {
             self.utf8.as_deref().or(self.plain.as_deref())
+        }
+    }
+
+    /// The picture MIME to receive with, PNG preferred; none for a
+    /// retired offer or one without a supported picture type.
+    pub fn image_mime(&self) -> Option<&str> {
+        if self.retired {
+            None
+        } else {
+            self.png.as_deref().or(self.jpeg.as_deref())
         }
     }
 
@@ -167,6 +184,10 @@ impl Offer {
             self.utf8 = Some(mime);
         } else if mime.eq_ignore_ascii_case(PLAIN) && self.plain.is_none() {
             self.plain = Some(mime);
+        } else if mime.eq_ignore_ascii_case(PNG) && self.png.is_none() {
+            self.png = Some(mime);
+        } else if mime.eq_ignore_ascii_case(JPEG) && self.jpeg.is_none() {
+            self.jpeg = Some(mime);
         }
     }
 }
@@ -473,27 +494,21 @@ mod tests {
     fn announcements_are_budgeted_and_the_explicit_utf8_spelling_is_preferred() {
         let mut offer = Offer {
             sequence: 1,
-            retired: false,
-            utf8: None,
-            plain: None,
-            count: 0,
+            ..Offer::default()
         };
         offer.announce("x".repeat(MIME_BYTES + 1));
         offer.announce("Text/Plain".into());
         offer.announce(PLAIN.into());
         assert_eq!((offer.mime(), offer.count), (Some("Text/Plain"), 3));
         for _ in 0..ANNOUNCEMENTS {
-            offer.announce("image/png".into());
+            offer.announce("image/gif".into());
         }
         assert_eq!(offer.count, ANNOUNCEMENTS);
         offer.announce("TEXT/PLAIN;CHARSET=UTF-8".into());
         assert_eq!(offer.mime(), Some("Text/Plain"), "over budget: ignored");
         let mut offer = Offer {
             sequence: 2,
-            retired: false,
-            utf8: None,
-            plain: None,
-            count: 0,
+            ..Offer::default()
         };
         offer.announce(PLAIN.into());
         offer.announce("TEXT/PLAIN;CHARSET=UTF-8".into());
@@ -502,5 +517,22 @@ mod tests {
         assert_eq!(offer.mime(), None);
         offer.announce(UTF8.into());
         assert_eq!(offer.count, 3, "retired offers drain their announcements");
+    }
+
+    #[test]
+    fn a_picture_is_offered_as_png_or_jpeg_and_png_is_preferred() {
+        let mut offer = Offer::default();
+        offer.announce("image/gif".into());
+        assert_eq!(offer.image_mime(), None);
+        offer.announce("IMAGE/JPEG".into());
+        assert_eq!(offer.image_mime(), Some("IMAGE/JPEG"));
+        offer.announce(PNG.into());
+        offer.announce("image/PNG".into());
+        assert_eq!(offer.image_mime(), Some(PNG), "the first spelling kept");
+        assert_eq!(offer.mime(), None, "a picture is not text");
+        offer.announce(UTF8.into());
+        assert_eq!((offer.mime(), offer.image_mime()), (Some(UTF8), Some(PNG)));
+        offer.retired = true;
+        assert_eq!(offer.image_mime(), None);
     }
 }

@@ -367,6 +367,7 @@ impl Dialog {
                 Flow::Continue
             }
             Input::Close => self.finish(Answer::Cancelled),
+            Input::PasteImage { .. } => Flow::Continue,
             Input::Paste(text) => {
                 let (focus, texts) = (self.focus, self.texts());
                 let pasted = match self.model(focus) {

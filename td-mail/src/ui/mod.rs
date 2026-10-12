@@ -604,6 +604,7 @@ impl Session {
             }
             Input::Focus(_)
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::CancelPointer
             | Input::Hover(_)
             | Input::Context { .. } => return false,
@@ -1264,6 +1265,7 @@ impl Session {
             Input::Focus(true)
             | Input::Close
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::CancelPointer
             | Input::Hover(_) => {
                 return false;
@@ -1562,6 +1564,8 @@ impl Handler for Session {
         let taken = taken || (self.chooser.is_some() && self.chooser_input(&input));
         if !taken {
             match input {
+                // td-mail asks for no picture.
+                Input::PasteImage { .. } => {}
                 // The clipboard's text, into the draft it was asked for, over
                 // its selection, while that draft is still the one being
                 // edited: closed, or under its save question, or another

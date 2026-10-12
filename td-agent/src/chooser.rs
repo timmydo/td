@@ -217,6 +217,7 @@ impl Chooser {
             Input::Resize(_)
             | Input::Focus(_)
             | Input::Paste(_)
+            | Input::PasteImage { .. }
             | Input::CancelPointer
             | Input::Hover(_)
             | Input::Context { .. }
