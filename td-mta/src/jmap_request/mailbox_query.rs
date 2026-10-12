@@ -1,7 +1,9 @@
 //! Mailbox/query over one native snapshot and quota-charged external sort.
 use super::{
-    mailbox_get::storage, mailbox_query_args::Arguments, mailbox_query_filter::Filter, Error,
-    Worker,
+    mailbox_get::storage,
+    mailbox_query_args::{Arguments, Mode},
+    mailbox_query_filter::Filter,
+    Error, Worker,
 };
 use crate::{
     external_sort::{self, Next, Progress, Sorter},
@@ -168,6 +170,9 @@ impl<P> Source<'_, '_, '_, '_, '_, '_, '_, P> {
                     .poll(self.worker, None, work)?
                     .is_some()
                 {
+                    if self.arguments.mode == Mode::Changes {
+                        return Err(Error::CannotCalculateChanges);
+                    }
                     self.filter
                         .as_mut()
                         .ok_or(Error::State)?
@@ -352,8 +357,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         page: usize,
         depth: usize,
         nodes: usize,
+        mode: Mode,
     ) -> Result<Range<u64>, Error> {
-        let arguments = self.mailbox_query_arguments(range, page)?;
+        let arguments = self.mailbox_query_arguments(range, page, mode)?;
         let execution = self.execution;
         let (coordinator, spool, cap) = self
             .retention
@@ -405,6 +411,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             }
         };
         drop(workspace);
+        if job.source_mut().arguments.mode != Mode::Query {
+            return Err(Error::State);
+        }
         let mut record = [0; RECORD];
         let mut position = {
             let args = &job.source_mut().arguments;
@@ -496,3 +505,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
 #[cfg(test)]
 #[path = "mailbox_query_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mailbox_query_changes_tests.rs"]
+mod changes_tests;

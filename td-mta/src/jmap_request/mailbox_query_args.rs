@@ -10,7 +10,14 @@ use crate::{
 use std::ops::Range;
 use td_json::scan;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    Query,
+    Changes,
+}
+
 pub(super) struct Arguments {
+    pub mode: Mode,
     pub account: Name,
     pub filter: Option<Range<u64>>,
     pub sort: Vec<Comparator>,
@@ -43,9 +50,11 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         &mut self,
         range: Range<u64>,
         page: usize,
+        mode: Mode,
     ) -> Result<Arguments, Error> {
         let mut fields = Children::new(range, scan::Kind::Object)?;
         let mut account = None;
+        let mut since = false;
         let mut filter = None;
         let mut sort = Vec::new();
         let (mut sort_tree, mut filter_tree, mut total) = (false, false, false);
@@ -62,15 +71,19 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 },
                 b"sort" if item.kind == scan::Kind::Null => (),
                 b"sort" => sort = self.mailbox_query_sort(item)?,
-                b"sortAsTree" => sort_tree = self.query_boolean(&item)?,
-                b"filterAsTree" => filter_tree = self.query_boolean(&item)?,
+                b"sortAsTree" if mode == Mode::Query => sort_tree = self.query_boolean(&item)?,
+                b"filterAsTree" if mode == Mode::Query => {
+                    filter_tree = self.query_boolean(&item)?
+                }
                 b"calculateTotal" => total = self.query_boolean(&item)?,
-                b"position" => position = self.query_integer(&item)?,
-                b"anchorOffset" => offset = self.query_integer(&item)?,
-                b"anchor" if item.kind == scan::Kind::Null => (),
-                b"anchor" => anchor = Some(self.push_string(&item)?.wire_id()?.local()),
-                b"limit" if item.kind == scan::Kind::Null => (),
-                b"limit" => {
+                b"position" if mode == Mode::Query => position = self.query_integer(&item)?,
+                b"anchorOffset" if mode == Mode::Query => offset = self.query_integer(&item)?,
+                b"anchor" if mode == Mode::Query && item.kind == scan::Kind::Null => (),
+                b"anchor" if mode == Mode::Query => {
+                    anchor = Some(self.push_string(&item)?.wire_id()?.local())
+                }
+                b"limit" if mode == Mode::Query && item.kind == scan::Kind::Null => (),
+                b"limit" if mode == Mode::Query => {
                     let requested = self.query_integer(&item)?;
                     if requested < 0 {
                         return Err(Error::InvalidArguments);
@@ -78,8 +91,27 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     limit = page.min(usize::try_from(requested).unwrap_or(usize::MAX));
                     include_limit = requested as u64 > page as u64;
                 }
+                b"sinceQueryState" if mode == Mode::Changes => {
+                    if item.kind != scan::Kind::String {
+                        return Err(Error::InvalidArguments);
+                    }
+                    since = true;
+                }
+                b"maxChanges" if mode == Mode::Changes => {
+                    if item.kind != scan::Kind::Null && self.query_integer(&item)? < 0 {
+                        return Err(Error::InvalidArguments);
+                    }
+                }
+                b"upToId" if mode == Mode::Changes => {
+                    if item.kind != scan::Kind::Null {
+                        self.push_string(&item)?.wire_id()?;
+                    }
+                }
                 _ => return Err(Error::InvalidArguments),
             }
+        }
+        if mode == Mode::Changes && !since {
+            return Err(Error::InvalidArguments);
         }
         let account = account.ok_or(Error::InvalidArguments)?;
         let local = account.wire_id()?.local();
@@ -87,6 +119,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::AccountNotFound);
         }
         Ok(Arguments {
+            mode,
             account,
             filter,
             sort,

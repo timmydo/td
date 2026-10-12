@@ -7355,8 +7355,9 @@ comparing only sequences is invalid. matches_current compares all fields
 with current trusted metadata and the compiled interpretation version, but
 still does not compare query arguments or establish authority. Consumer
 admission tests must cover each
-mismatch before that consumer is enabled. No queryChanges consumer is added
-here: the policy continues to require refusal. Query inputs must obey the
+mismatch before a delta-producing consumer is enabled. The retained
+Mailbox/queryChanges handler validates arguments and refuses without decoding
+a state: the policy continues to require refusal. Query inputs must obey the
 stable-result and interpretation-version contract in POLICY.md section 4.2;
 this token cannot enforce visibility, index or time-dependent semantics.
 
@@ -7688,3 +7689,27 @@ page cap forces a full client resync from that boundary. Future bulk writers
 must account for that cost; the reader does not split a transaction or claim
 an unlimited default page. The fixture tests journal reading, not complete
 writer invariants such as each Email retaining a mailbox membership.
+
+## Retained Mailbox/queryChanges refusal
+
+The opt-in Mail dispatcher validates standard queryChanges argument shapes,
+account scope, comparator semantics and the complete retained Mailbox filter.
+It then returns cannotCalculateChanges as POLICY.md requires, including for
+the current queryState and maxChanges=0. No state token is treated as authority,
+no old result is reconstructed and no partial delta is emitted. sinceQueryState
+must be a string but is not decoded when no state can yield a supported delta.
+
+Filter validation shares the single native query workspace and original job
+meter, then refuses before the first mailbox scan. As for Mailbox/query,
+view/workspace pressure can precede filter-semantic errors. The refusal drops
+all job and workspace custody, so later methods remain eligible. Query-only
+position/anchor/anchorOffset/limit/tree arguments are not standard
+queryChanges arguments and are rejected. No live Mail capability is advertised by this method.
+
+This handler deliberately reports malformed argument or unsupported filter/
+comparator errors before its normal cannotCalculateChanges refusal, preserving
+the shared decoder classifications. Before any future delta support, define
+how tree-query semantics are bound to state, since the standard queryChanges
+arguments do not carry the tree flags; the current tokens claim no such delta
+reconstruction. Refusal allocates the fixed query workspace and bounded filter
+frames, not a result array sized to query_page or json_tokens.

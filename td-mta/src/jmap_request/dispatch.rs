@@ -303,6 +303,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"PushSubscription/get" if core => "PushSubscription/get",
             b"PushSubscription/set" if core => "PushSubscription/set",
             b"Mailbox/query" if mail => "Mailbox/query",
+            b"Mailbox/queryChanges" if mail => "Mailbox/queryChanges",
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
             b"Email/changes" if mail => "Email/changes",
@@ -339,13 +340,18 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             )
         } else if name == "Thread/get" {
             self.thread_get(start..end, responses.request().envelope.maximum_objects)
-        } else if name == "Mailbox/query" {
+        } else if name == "Mailbox/query" || name == "Mailbox/queryChanges" {
             let limits = &responses.request().envelope;
             self.mailbox_query(
                 start..end,
                 limits.query_page,
                 limits.query_depth,
                 limits.query_nodes,
+                if name == "Mailbox/queryChanges" {
+                    mailbox_query_args::Mode::Changes
+                } else {
+                    mailbox_query_args::Mode::Query
+                },
             )
         } else if name == "Mailbox/get" {
             self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
