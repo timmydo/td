@@ -7270,5 +7270,43 @@ and windows are passive metadata, not authorization or view pins.
 The same view must remain alive across windows and be checked before
 response publication. Allocation refusal and expired/lost views never
 become empty successful windows. STORAGE.md owns the selection algorithm
-and cumulative work cost. This surface does not dispatch Thread/get or
-advertise Mail.
+and cumulative work cost. The storage reader itself does not dispatch
+methods or advertise Mail.
+
+## Retained Thread/get dispatch
+
+The retained dispatcher executes Thread/get only for an admitted request
+opting into Mail; live HTTPS and Session remain Core-only until the complete
+Mail gate. Null or omitted ids enumerate visible threads in ascending local
+ID order if the complete result fits maxObjectsInGet; otherwise return
+requestTooLarge. Empty explicit arrays are valid. accountId is required;
+unknown arguments and properties are invalidArguments. properties null or
+omitted selects id and emailIds; an explicit array selects only its named
+properties, with id always included.
+
+Shared typed /get ID planning counts the raw array against maxObjectsInGet
+before deduplication, preserves first occurrence order, and retains compact
+references to foreign IDs for notFound. Malformed IDs are invalidArguments.
+Foreign accounts return accountNotFound after argument validation. Missing
+threads and stored rows without members return notFound, including when
+only id is requested.
+
+One original view supplies the Thread state and every object. emailIds streams
+received-date windows from the storage reader in STORAGE.md into bounded
+response retention; it does not collect the whole thread in memory. Every
+window and emitted ID consumes the enclosing request's original work and
+execution allowance. The view stays alive and is checked before publication.
+Common result references and method rollback apply. Exhausted storage or
+response budgets refuse the whole method without exposing a partial thread.
+
+Thread/get has no protocol pagination. There is no promised maximum
+returnable member count: configured response capacity is shared by the
+batch, and the original native/service work and deadline also bound it.
+MAX_THREAD_EMAILS is a storage window size, not a thread-size cap. The store
+does not impose a matching Thread/get member cap. A larger thread may
+therefore be persistently unreturnable even though its individual Emails
+remain stored. No maximum-thread conformance qualification is claimed.
+The id-only existence check currently scans the thread using a one-member
+window; STORAGE.md's repeated-scan work cost applies to that projection too.
+Worker::check charges through ResponseRetention::admit_before and its
+admit_work_turn before testing execution-phase expiry.

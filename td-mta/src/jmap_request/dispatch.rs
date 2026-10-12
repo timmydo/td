@@ -3,12 +3,16 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "get_ids.rs"]
+mod get_ids;
 #[path = "mailbox_changes.rs"]
 mod mailbox_changes;
 #[path = "mailbox_get.rs"]
 mod mailbox_get;
 #[path = "push.rs"]
 mod push;
+#[path = "thread_get.rs"]
+mod thread_get;
 const MAIL: &str = "urn:ietf:params:jmap:mail";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +282,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"PushSubscription/set" if core => "PushSubscription/set",
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
+            b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
         };
         let start = self.retention.len();
@@ -291,6 +296,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             self.blob_copy(start..end)
         } else if name == "Mailbox/changes" {
             self.mailbox_changes(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Thread/get" {
+            self.thread_get(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Mailbox/get" {
             self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
         } else {

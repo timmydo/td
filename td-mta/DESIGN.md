@@ -1933,7 +1933,13 @@ separate from this passive cursor.
 The passive thread member reader returns bounded received-date windows
 from one retained snapshot without an SQL sort or account-sized collection.
 API.md and STORAGE.md own the fixed-memory and repeated-scan tradeoff.
-Thread/get dispatch and Mail advertisement remain separate.
+The storage reader itself performs no method dispatch; Mail advertisement
+remains separate.
+
+Retained Thread/get handles explicit IDs or bounded all-thread enumeration
+and streams received-date member
+windows from one original snapshot. Its argument, projection and rollback
+contract is in API.md; this does not activate the Mail capability.
 
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:

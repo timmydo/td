@@ -436,7 +436,7 @@ fn empty_selections_and_response_capacity_never_publish_partial_lists() {
         response["methodResponses"][1][1]["ok"].as_bool(),
         Some(true)
     );
-    assert!(std::mem::size_of::<Requested>() <= 128);
+    assert!(std::mem::size_of::<Requested<MailboxId>>() <= 128);
 }
 
 #[test]
