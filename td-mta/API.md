@@ -7765,3 +7765,46 @@ formatter. A stored receivedAt outside this range cannot become null or a
 fabricated date: the Email projection must return a storage-corruption/server
 failure, never invalidArguments for a read request. Validation of incoming
 import/set values belongs to their method admission before storage.
+
+## Provisional stored Email JSON
+
+email_response::write_stored emits a complete object for the explicit seven
+stored Email fields, always including id. Stored::include refuses derived
+fields; the full Email/get projection will route those through MIME/header
+consumers. This helper does not implement a partial Email/get method or
+advertise Mail. An absent Email emits nothing and returns false.
+
+Metadata and every mailbox/keyword window come from the same original native
+snapshot. Sets retain one bounded 256-value page; the keyword lower bound
+retains at most one additional canonical string. Output uses a fixed 512-byte
+buffer and each sink call carries at most that many bytes. Stored keywords
+are validated ASCII atoms excluding JSON quotes, backslashes and controls,
+so their spelling needs no additional escaping. IDs use the shared wire
+encoder and receivedAt uses checked JMAP UTCDate formatting.
+
+The sink owns cumulative request work/output accounting and provisional
+retention. It must publish no prefix: any native, timestamp, sink or freshness
+failure invalidates the whole object's emitted bytes. View checks surround
+every successful sink callback and final completion, but consumers still
+check original request authorization before publishing. Neither a passive
+Stored selection nor a successful helper call supplies that authorization.
+An out-of-range stored date or non-JMAP size is corruption when selected.
+Date conversion and JSON numeric-range checks are projection-specific;
+native row validation still applies to every metadata read.
+
+When mailboxIds is selected, an existing Email with no memberships is
+corruption, not a successful empty map (RFC 8621 section 4.1.1). As with
+other late failures, already-emitted bytes remain provisional and must be
+discarded. Low-level reader tests may deliberately construct such invalid
+writer states; production writers must keep at least one membership until
+the Email is destroyed. Explicit id-only projection does not inspect sets.
+
+Map members are batched into the fixed output buffer. A failed capacity
+append restores its visible prefix, flushes that prefix under fresh view
+checks, then retries the one bounded member; it never emits the overwritten
+invisible tail. MAX_CHUNK_BYTES fixes the 512-byte sink ceiling. The last
+flush's post-callback check is the final freshness check. The native metadata
+read also checks original snapshot custody on the absent-Email path.
+Native email_keywords validates every returned keyword on read, including
+lowercase and JSON-safe atom spelling; serialization does not rely solely on
+writer admission. Typed ID encoding failures are internal corruption.
