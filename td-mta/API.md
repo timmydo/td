@@ -8352,3 +8352,24 @@ A failed constructor or consuming finish terminates this traversal handoff;
 no retry handoff is returned. The underlying borrowed owners remain owned by
 the caller, but provisional traversal/list results cannot be reused as a
 successful completion.
+
+## Body-value request options
+
+`body_value_options::Cursor` decodes the resolved raw JSON arguments for
+Email/get's `fetchTextBodyValues`, `fetchHTMLBodyValues`,
+`fetchAllBodyValues` and `maxBodyValueBytes` (RFC 8621 section 4.2). Omission
+defaults to false/false/false/zero. Explicit null and wrong scalar types
+refuse; the byte cap must be an exact integral UnsignedInt from 0 through 2^53-1.
+Decimal and exponent spellings are accepted when their mathematical value
+is integral; conversion never rounds through floating point. Zero disables
+only client-requested truncation, not the enclosing server resource limits.
+
+The caller resolves names, duplicates and result references and admits the
+source spans before this stage. Their aggregate is checked against the
+4 MiB request ceiling. The decoder retains the original Meter, processes
+at most 64 input bytes per poll, and checks the job deadline even for cached
+completion and consuming finish. Refusals are terminal, hide completion and
+preserve the original work error. Passive value is neither a clock check nor
+permission to publish. Successful finish returns the options and original
+Meter. This scalar decoder does not implement Email/get dispatch, select MIME
+parts, serialize body values or enable the Mail capability.

@@ -4511,3 +4511,21 @@ admission or authorize Mail capability advertisement.
 After N correspondence turns, one constant-size handoff turn constructs the
 shared selector and yields without a positive charge. Selection starts on the
 following turn; this single transition does not scale with message size.
+
+## Body-value option decoder storage
+
+The body-value option cursor has a compiled 2 KiB ceiling, borrows four raw
+argument spans and allocates no input-sized storage. Its fixed JSON scanner
+accepts only scalar option types. Aggregate input is at most 4 MiB; the
+caller admits that retained input alongside the request's other backing.
+Exact decimal conversion uses the existing JMAP integer parser, shared with
+changes/query argument handling; its coefficient counters rely on this cap.
+
+Each omitted argument or scanner initialization costs one original record.
+Each subsequent poll costs one record plus the requested input span length
+(at most 64) as I/O bytes, charged before scanning. Scanner event boundaries
+can leave part of a requested span unconsumed, so revisiting those bytes is
+conservatively charged again. Numeric conversion sees only consumed bytes.
+Cached completion and explicit deadline checks add no positive charge.
+Output/unlink allowances are unchanged. No HeaderBudget, quota reset, source
+read or whole-job memory-admission claim is introduced.
