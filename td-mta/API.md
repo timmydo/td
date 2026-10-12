@@ -7359,3 +7359,27 @@ mismatch before that consumer is enabled. No queryChanges consumer is added
 here: the policy continues to require refusal. Query inputs must obey the
 stable-result and interpretation-version contract in POLICY.md section 4.2;
 this token cannot enforce visibility, index or time-dependent semantics.
+
+## Passive Mailbox comparator plans
+
+mailbox_order::Plan implements POLICY.md section 4.2's flat/sibling Mailbox
+sort comparisons, with the default comparator list for an empty plan and
+at most MAX_COMPARATORS supplied entries. Comparator accepts only the named
+supported properties and collations. Numeric sortOrder ignores any supplied
+string collation; JSON shape validation remains the method decoder's job.
+
+Borrowed keys bound name bytes and sortOrder to their stored-field ceilings,
+but do not validate complete rows, normalize names, pin views or authorize
+reads. Comparison allocates nothing, applies at most the bounded comparator
+count to bounded names, and always breaks final ties by ascending local ID.
+The caller charges these CPU comparisons and checks its original deadline;
+this helper owns no work meter. Pinned Unicode lookup failure is an error,
+not an arbitrary comparison result. The sorting algorithm must propagate
+comparison failures; a std sort callback cannot replace an error with Equal
+or another Ordering. One comparison performs at most
+2 * MAX_COMPARATORS * MAX_MAILBOX_NAME pinned scalar lookups; octet modes
+inspect no more name bytes than that bound.
+
+This is not a sort implementation or query dispatcher. Tree ancestor order,
+filtering, bounded external sorting, paging and retained-view publication
+remain caller work. The helper activates no capability or query method.
