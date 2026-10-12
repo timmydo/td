@@ -174,6 +174,13 @@ encoded-header adapters or combined service RSS.
   allocated. This is not file custody or an authorization to read a Span.
   Runtime must bind the index to retention and charge work/deadline checks;
   combined-owner memory and actual disk traversal still need qualification.
+  The shared retained-JSON Scanner has 160 fixed structural frames and no
+  retained string/value allocations. Its test pins scanner state to at most
+  512 bytes, leaving the rest of the walker estimate for integration; combined owners still need measurement.
+  It consumes at most 4096 source bytes and emits at most one structure/key
+  event per poll, preserving lexical progress across arbitrary read splits.
+  Source custody, reads, work/time admission and JSON Pointer selection stay
+  with the future enclosing retained-response walker.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

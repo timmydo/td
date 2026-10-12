@@ -748,6 +748,14 @@ reference objects, apply JSON Pointer, resolve creation IDs, bind the actual
 retention owner or activate dispatch. Internal index-state errors remain
 separate from invalidResultReference.
 
+The shared [Scanner](../td-json/src/scan.rs) is the lexical/structural reader
+for the retained-response walker; its API owns the fragmentation, event,
+completion and error contract. Retained producers must prove unique object
+keys and I-JSON scalar policy before publication. The enclosing walker binds
+the source, checks span arithmetic, charges reads/work/deadlines, discards
+provisional selections on error and applies the reference's Pointer rules.
+The scanner alone does not read a file, select a value or activate dispatch.
+
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument
 type is invalidArguments when the method validates it. Simultaneous normal and

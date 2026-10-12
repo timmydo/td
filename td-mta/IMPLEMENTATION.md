@@ -2890,6 +2890,13 @@ missing/self/forward references, checked spans and all 128 entries. Its spans
 are passive metadata: actual retention binding, disk JSON Pointer evaluation,
 creation-map lookup and method dispatch remain required before activation.
 
+Shared `td-json::scan` now supplies a bounded 160-frame streaming reader
+for retained JSON structure, exact value spans and decoded object keys. It
+checks grammar/UTF-8 without constructing response-sized trees. Tests cover
+fragmented escapes and numbers, exact limits, malformed tails and long-scalar
+yielding. Retained producers still prove unique keys and I-JSON policy;
+actual source custody and Pointer/wildcard selection remain integration work.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's
