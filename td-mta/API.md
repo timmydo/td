@@ -7383,3 +7383,47 @@ inspect no more name bytes than that bound.
 This is not a sort implementation or query dispatcher. Tree ancestor order,
 filtering, bounded external sorting, paging and retained-view publication
 remain caller work. The helper activates no capability or query method.
+
+## Passive Mailbox filter conditions
+
+mailbox_filter::Condition applies the standard parentId, name, role,
+hasAnyRole and isSubscribed condition fields conjunctively. An empty
+condition matches every bounded row. Parent::Any and Role::Any represent
+omitted fields; Parent::Root and Role::Exact(None) require null. A valid
+foreign-format or wrong-kind parent ID becomes Parent::NoLocal and matches
+no local parent. Parent::exact takes a present ID; explicit null uses Root. Role
+matching is exact and case sensitive; hasAnyRole compares role presence.
+
+NamePattern compiles at most 4096 UTF-8 bytes into caller-owned lowercase
+scalar and prefix-fallback buffers. It uses pinned Unicode simple lowercase
+and linear substring matching, with no phrase syntax, case folding,
+normalization or locale. Empty text matches every bounded name. Compilation
+and matching allocate nothing; at most one scalar and one usize scratch
+entry per input scalar are retained. Compilation errors may change scratch
+but expose no partial pattern. Callers reserve and charge all scratch and
+CPU work, and check their original deadline around each bounded operation.
+
+Conditions bound row name and role bytes to their storage ceilings but do
+not validate full rows, authorize access or pin a read view. JSON shapes,
+aggregate text-operand limits, AND/OR/NOT composition, tree eligibility and
+query scans/publication remain caller responsibilities. Role operands are
+borrowed; their syntax and method admission are also caller responsibilities.
+This helper does not enable a method or advertise Mail.
+
+NamePattern::scratch_len checks the operand byte ceiling and returns the
+exact entry count for both scratch slices. Supplying one entry per UTF-8
+byte is also a safe upper bound. Scratch errors describe short caller
+buffers; Invariant describes defensive internal index-check failures.
+Pinned simple_lowercase has an identity mapping for every unmapped Rust
+char, including unassigned scalars and emoji. Unicode errors indicate a
+bad compiled table, not an unsupported input character. Evaluation may
+stop at a decisive prefix; it does not validate the complete Unicode table.
+
+POLICY.md section 4.2 binds these results to the query interpretation
+version. Any changed matching semantics, including a Unicode table change
+that alters results, requires the policy's version/cache treatment before
+activation. Simple lowercase is not case folding: final sigma and sigma
+remain distinct, as do canonically equivalent operands when their lowered
+scalar sequences differ. For example, precomposed j-caron does not match
+capital J plus combining caron here. Decoders must not silently introduce
+normalization or folding that changes the specified matching policy.

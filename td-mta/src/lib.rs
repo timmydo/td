@@ -46,6 +46,7 @@ pub mod jmap_events;
 pub mod jmap_request;
 pub mod jmap_session;
 pub mod limits;
+pub mod mailbox_filter;
 pub mod mailbox_order;
 pub mod mailbox_parents;
 pub mod mailbox_response;
