@@ -8037,3 +8037,26 @@ The retained clock reference is wrapped in a cursor-local monotonic watermark
 starting at construction. The enclosing clock must retain any earlier
 watermark across this handoff; the planner cannot infer an earlier sample
 from Meter alone. No original-clock history is manufactured by this wrapper.
+
+## Complete text replay
+
+mime_text::Reader::new_replayable configures its initial poll to save the
+original transfer position in caller-owned private checkpoint slots before
+scanning/decoding. Ordinary new keeps
+its existing operation and cost sequence. After a replayable reader reaches
+actual Complete, restart restores that same source position and resets scalar-decoder progress, pending-byte/EOF state and the decode phase, retaining selected charset, accumulated encoding
+diagnostics, source/buffer/checkpoint borrows and the monotonic watermark.
+Each restart spends the transfer checkpoint's one record and performs fresh
+clock/work checks before and after it. No source I/O happens in that turn;
+later polls fund every replay read, decoded byte and scalar operation. A
+charset prescan is not repeated after selection.
+
+A restart before Complete, on an ordinary reader, or after any failure
+refuses permanently. A post-operation admission failure takes precedence
+and retires even a restored checkpoint. Invalid-state invocations also
+perform this post-check, whose failure takes precedence over InvalidState.
+The caller must keep the original
+Meter/Clock and retain immutable native source custody throughout every pass;
+this helper cannot supply or replace source authorization. This is bounded
+replay support for callers such as HTML cutoff projection, not HTML JSON
+integration or a new publication boundary.

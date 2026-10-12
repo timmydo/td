@@ -61,7 +61,8 @@ pub struct Reader<'r, 'b> {
     byte: [u8; 1],
     buffered: bool,
     end: bool,
-    transfer_problem: bool,
+    accumulated_problem: bool,
+    replayable: bool,
     last: Tick,
     failure: Option<Error>,
 }
@@ -118,10 +119,63 @@ impl<'r, 'b> Reader<'r, 'b> {
             byte: [0; 1],
             buffered: false,
             end: false,
-            transfer_problem: false,
+            accumulated_problem: false,
+            replayable: false,
             last: Tick(0),
             failure: None,
         })
+    }
+    /// Also saves the original transfer position for bounded complete-pass replay.
+    /// Source immutability/authorization and original work custody are external.
+    pub fn new_replayable(
+        input: Input<'r>,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+    ) -> Result<Self, Error> {
+        let mut reader = Self::new(input, buffer, checkpoints)?;
+        reader.replayable = true;
+        // Even empty extents first fund and retain their original checkpoint.
+        reader.phase = Phase::Save;
+        Ok(reader)
+    }
+    /// Restart only a healthy, completed replayable reader. The original source,
+    /// transfer checkpoint, selected charset and clock watermark survive. Caller
+    /// supplies the same original meter and clock; this grants no new allowance.
+    /// Failure permanently retires this reader, including premature restart.
+    pub fn restart(&mut self, source_clock: &dyn Clock, meter: &mut Meter) -> Result<(), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let clock = CheckedClock::new(source_clock, self.last);
+        let result = (|| {
+            let now = clock.sample().map_err(Error::Policy)?.monotonic;
+            meter.charge(now, Charge::default()).map_err(Error::Work)?;
+            let result = (|| {
+                if !self.replayable || self.phase != Phase::Complete {
+                    return Err(Error::InvalidState);
+                }
+                let selection = self.selection.ok_or(Error::InvalidState)?;
+                self.input
+                    .restore_checkpoint(0, &clock, meter)
+                    .map_err(Error::Input)?;
+                self.accumulated_problem |= self.decoder.is_encoding_problem();
+                self.decoder = Decoder::new(selection.charset);
+                self.buffered = false;
+                self.end = false;
+                self.phase = Phase::Decode;
+                Ok(())
+            })();
+            let after = clock.sample().map_err(Error::Policy)?.monotonic;
+            meter
+                .charge(after, Charge::default())
+                .map_err(Error::Work)?;
+            result
+        })();
+        self.last = clock.last();
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
     }
     pub const fn selection(&self) -> Option<Selection> {
         if self.failure.is_some() {
@@ -132,7 +186,7 @@ impl<'r, 'b> Reader<'r, 'b> {
     }
     /// Provisional until Complete; combine with later body projection diagnostics.
     pub fn is_encoding_problem(&self) -> bool {
-        self.transfer_problem
+        self.accumulated_problem
             || self.decoder.is_encoding_problem()
             || self.selection.is_some_and(|s| s.is_encoding_problem)
     }
@@ -175,7 +229,11 @@ impl<'r, 'b> Reader<'r, 'b> {
                 self.input
                     .save_checkpoint(0, clock, meter)
                     .map_err(Error::Input)?;
-                self.phase = Phase::Scan;
+                self.phase = if self.replayable && self.selection.is_some() {
+                    Phase::Decode
+                } else {
+                    Phase::Scan
+                };
                 return Ok(Status::Yield);
             }
             Phase::Restore => {
@@ -200,7 +258,7 @@ impl<'r, 'b> Reader<'r, 'b> {
             }
             self.buffered = step.written == 1;
             self.end = step.status == Bytes::Complete;
-            self.transfer_problem |= self.input.is_encoding_problem();
+            self.accumulated_problem |= self.input.is_encoding_problem();
             return Ok(Status::Yield);
         }
         let bytes = if self.buffered {
@@ -657,3 +715,7 @@ mod tests {
         assert_eq!(raw.reads, vec![2, 2]);
     }
 }
+
+#[cfg(test)]
+#[path = "mime_text/replay_tests.rs"]
+mod replay_tests;
