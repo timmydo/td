@@ -1913,8 +1913,10 @@ and the associated get/set behavior rather than silently omit Core methods.
 The passive Mailbox projection reads typed rows and emits every standard
 object property or a validated selection, with caller-supplied account rights
 and same-view batch counts. API.md owns its snapshot, provisional-output and
-fixed-buffer contract. It does not activate Mailbox/get or advertise Mail;
-method argument handling and retained response integration are separate.
+fixed-buffer contract. The retained dispatcher implements Mailbox/get,
+including result references, bounded enumeration and same-view counts. The
+live HTTPS capability preflight remains Core-only until the complete Mail
+surface satisfies the conformance gate.
 
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:

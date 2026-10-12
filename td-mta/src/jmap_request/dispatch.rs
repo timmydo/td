@@ -1,10 +1,13 @@
-//! Ordered, retained Core method batches. This worker adapter activates no API.
+//! Ordered retained method batches; capability admission remains separate.
 use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "mailbox_get.rs"]
+mod mailbox_get;
 #[path = "push.rs"]
 mod push;
+const MAIL: &str = "urn:ietf:params:jmap:mail";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -19,6 +22,8 @@ pub enum Error {
     Forbidden,
     RequestTooLarge,
     ResponseCapacity,
+    StorageCapacity,
+    StorageBusy,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,9 +94,11 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     let mut responses = result_index::Responses::new(plan.into_request());
     let request = responses.request().view().map_err(|_| Error::State)?;
     let mut core = false;
+    let mut mail = false;
     for capability in request.using {
         retention.admit_work_turn().map_err(Error::Storage)?;
         core |= capability.as_string_bytes() == Some(CORE.as_bytes());
+        mail |= capability.as_string_bytes() == Some(MAIL.as_bytes());
     }
     let mut calls = Vec::new();
     calls
@@ -108,7 +115,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
-        let result = worker.method(&responses, ordinal, token, core);
+        let result = worker.method(&responses, ordinal, token, core, mail);
         let (name, range) = match result {
             Ok(result) => result,
             Err(error) => {
@@ -125,6 +132,12 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     Error::RequestTooLarge => br#"{"type":"requestTooLarge"}"#,
                     Error::ExecutionDeadline => {
                         br#"{"type":"serverUnavailable","description":"executionDeadline"}"#
+                    }
+                    Error::StorageCapacity => {
+                        br#"{"type":"serverFail","description":"storageWorkLimit"}"#
+                    }
+                    Error::StorageBusy => {
+                        br#"{"type":"serverUnavailable","description":"storageBusy"}"#
                     }
                     Error::ResponseCapacity => {
                         br#"{"type":"serverFail","description":"responseCapacity"}"#
@@ -225,6 +238,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         ordinal: usize,
         token: usize,
         core: bool,
+        mail: bool,
     ) -> Result<(&'static str, Range<u64>), Error> {
         self.check()?;
         let document = responses
@@ -253,14 +267,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 range,
             });
         }
-        if !core {
-            return Err(Error::UnknownMethod);
-        }
         let name = match call.name {
-            b"Core/echo" => "Core/echo",
-            b"Blob/copy" => "Blob/copy",
-            b"PushSubscription/get" => "PushSubscription/get",
-            b"PushSubscription/set" => "PushSubscription/set",
+            b"Core/echo" if core => "Core/echo",
+            b"Blob/copy" if core => "Blob/copy",
+            b"PushSubscription/get" if core => "PushSubscription/get",
+            b"PushSubscription/set" if core => "PushSubscription/set",
+            b"Mailbox/get" if mail => "Mailbox/get",
             _ => return Err(Error::UnknownMethod),
         };
         let start = self.retention.len();
@@ -272,6 +284,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let result = if name == "Blob/copy" {
             self.blob_copy(start..end)
+        } else if name == "Mailbox/get" {
+            self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
         } else {
             self.push_method(
                 name,
@@ -469,6 +483,13 @@ pub(super) mod tests {
         request_with_limits(input, Limits::default())
     }
     fn request_with_limits(input: &str, limits: Limits) -> OwnedRequest {
+        request_with_capabilities(input, limits, &[CORE])
+    }
+    pub(super) fn request_with_capabilities(
+        input: &str,
+        limits: Limits,
+        capabilities: &[&str],
+    ) -> OwnedRequest {
         let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
         let tokens = vec![arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
@@ -484,9 +505,12 @@ pub(super) mod tests {
         )
         .unwrap();
         while !parser.step().unwrap() {}
-        let mut validation =
-            OwnedValidation::new(parser.finish().unwrap(), &limits.plan().unwrap(), &[CORE])
-                .unwrap();
+        let mut validation = OwnedValidation::new(
+            parser.finish().unwrap(),
+            &limits.plan().unwrap(),
+            capabilities,
+        )
+        .unwrap();
         while !validation.step().unwrap() {}
         validation.finish().unwrap()
     }

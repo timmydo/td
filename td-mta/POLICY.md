@@ -816,3 +816,15 @@ ADMISSION.md describe the protocol but are unreachable in v1; supporting a
 second account would require a separate reviewed design change. Blob/copy has
 its own RFC 8620 section 6.3 contract and no such distinct-account
 requirement.
+
+## 8. Personal-account Mailbox rights
+
+The configured personal account owns every stored Mailbox. All nine rights
+are true except mayRename and mayDelete on the mailbox with the inbox role.
+The permanent Inbox remains the reception target; other Mailboxes may be
+renamed, reparented and deleted subject to method validation and structural
+constraints. Rights describe account authorization, not a relaxation of quota,
+hierarchy or mutation preconditions. Mailbox/get reports this policy from the
+same snapshot as the Mailbox object. The Mail capability release gate still
+requires the corresponding mutation methods before live advertisement.
+

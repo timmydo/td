@@ -1,4 +1,4 @@
-//! Bounded Core argument walks and single-account method policies.
+//! Shared retained argument walks and Core single-account method policies.
 use super::{AccountId, Error, Worker};
 use std::ops::Range;
 use td_json::{arena, scan};
@@ -6,18 +6,18 @@ use td_json::{arena, scan};
 const STRING_BYTES: usize = 1538;
 
 #[derive(Clone, Eq, PartialEq)]
-struct Name {
+pub(super) struct Name {
     bytes: [u8; 256],
     length: usize,
 }
 impl Name {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             bytes: [0; 256],
             length: 0,
         }
     }
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         self.bytes.get(..self.length).unwrap_or_default()
     }
     fn push(&mut self, value: &[u8]) -> Result<(), Error> {
@@ -32,7 +32,7 @@ impl Name {
         self.length = end;
         Ok(())
     }
-    fn wire_id(&self) -> Result<crate::wire::Id<'_>, Error> {
+    pub(super) fn wire_id(&self) -> Result<crate::wire::Id<'_>, Error> {
         let text = std::str::from_utf8(self.bytes()).map_err(|_| Error::InvalidArguments)?;
         crate::wire::Id::parse(text).map_err(|_| Error::InvalidArguments)
     }
@@ -40,14 +40,14 @@ impl Name {
         self.wire_id().map(|_| ())
     }
 }
-struct Item {
-    key: Name,
-    kind: scan::Kind,
-    range: Range<u64>,
+pub(super) struct Item {
+    pub(super) key: Name,
+    pub(super) kind: scan::Kind,
+    pub(super) range: Range<u64>,
 }
 /// Walk only direct children, retaining no subtree. The producer already
 /// guarantees unique I-JSON; a malformed retained source is an internal error.
-struct Children {
+pub(super) struct Children {
     range: Range<u64>,
     scanner: scan::Scanner,
     buffer: [u8; 4096],
@@ -61,7 +61,7 @@ struct Children {
     complete: bool,
 }
 impl Children {
-    fn new(range: Range<u64>, expected: scan::Kind) -> Result<Self, Error> {
+    pub(super) fn new(range: Range<u64>, expected: scan::Kind) -> Result<Self, Error> {
         let length = range.end.checked_sub(range.start).ok_or(Error::State)?;
         Ok(Self {
             scanner: scan::Scanner::new(length, scan::MAX_DEPTH).map_err(|_| Error::State)?,
@@ -77,7 +77,7 @@ impl Children {
             complete: false,
         })
     }
-    fn next<P>(
+    pub(super) fn next<P>(
         &mut self,
         worker: &mut Worker<'_, '_, '_, '_, '_, '_, P>,
     ) -> Result<Option<Item>, Error> {
@@ -139,7 +139,7 @@ impl Children {
     }
 }
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
-    fn push_string(&mut self, item: &Item) -> Result<Name, Error> {
+    pub(super) fn push_string(&mut self, item: &Item) -> Result<Name, Error> {
         if item.kind != scan::Kind::String {
             return Err(Error::InvalidArguments);
         }
@@ -175,7 +175,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         self.check()?;
         Ok(name)
     }
-    fn push_id(&mut self, value: &Name) -> Result<(), Error> {
+    pub(super) fn push_id(&mut self, value: &Name) -> Result<(), Error> {
         self.append(b"\"")?;
         self.append(value.bytes())?;
         self.append(b"\"")

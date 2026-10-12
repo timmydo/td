@@ -125,7 +125,18 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         Ok(response)
     }
 }
-impl<'s, 'sr, P> ResponseRetention<'_, 's, '_, 'sr, '_, P> {
+impl<'c, 's, 'r, 'sr, P> ResponseRetention<'c, 's, 'r, 'sr, '_, P> {
+    pub(crate) fn method_view(
+        &mut self,
+        account: AccountId,
+        phase: Deadline,
+    ) -> Result<IndexReadView<'c, 'r>, ports::Error> {
+        if !self.admit_before(phase)? {
+            return Err(ports::Error::Deadline);
+        }
+        self.coordinator.store.view(account, phase)
+    }
+
     pub fn len(&self) -> u64 {
         self.length
     }
@@ -707,6 +718,14 @@ mod tests {
             assert_eq!(response.admit_work_turn(), Err(ports::Error::Capacity));
             assert!(response.work_failure().is_some());
             assert_eq!(response.admit_work_turn(), Err(ports::Error::Capacity));
+            assert!(matches!(
+                response.method_view(
+                    AccountId::from_bytes([1; 16]),
+                    Deadline::after(Tick(0), 90).unwrap()
+                ),
+                Err(ports::Error::Capacity)
+            ));
+            assert_eq!(response.failure(), Some(ports::Error::Capacity));
         });
     }
 }

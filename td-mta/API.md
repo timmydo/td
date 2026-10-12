@@ -7137,3 +7137,38 @@ bytes, sufficient for every valid stored mailbox including worst-case
 escaping. Counts and rights are passive scalar metadata. This component
 adds no running worker, admission reservation or response-file publication;
 method envelopes and retained response ownership remain separate.
+
+## Retained Mailbox/get
+
+The retained dispatcher accepts Mailbox/get only when the validated request
+opts into Mail. The live HTTPS preflight and Session remain Core-only;
+this method does not activate or advertise a partial Mail capability.
+Arguments are accountId, ids and properties. The account must be the sole
+configured personal account. Unknown arguments, invalid shapes and unknown
+properties return invalidArguments; a well-formed unavailable account returns
+accountNotFound. Omitted/null ids enumerate all Mailboxes only if the complete
+set fits the configured object limit. Explicit arrays count every input ID
+against that limit and emit each distinct ID once. Missing and other-type IDs
+appear in notFound. Omitted/null properties select all, and an empty selection
+still emits id. Result references use the common retained argument resolver.
+
+One account read view supplies the response state, rows and counts. Count
+queries batch at most MAX_MAILBOX_COUNTS selected IDs per scan under that
+view's original deadline and cumulative SQLite work allowance. No count query
+runs when no count property is selected. POLICY.md owns personal-account
+rights. Each completed object streams into the existing response reservation;
+check the same snapshot once more before publishing the complete method.
+An unsuccessful method rolls back its unpublished response tail, preserving
+prior responses and allowing later calls under the original outer budget.
+Deterministic storage work exhaustion is serverFail/storageWorkLimit;
+read-slot contention is serverUnavailable/storageBusy, and execution expiry
+is serverUnavailable/executionDeadline. Terminal response I/O/work/outer
+failures still abort the whole batch, as do read I/O, corrupt storage and
+invalid/lost snapshot failures. No error returns a successful prefix.
+
+Requested-ID descriptors retain source ranges, typed local IDs and found bits,
+not per-ID strings. Their object-limited vector fits within the existing 128-byte
+per-object planning estimate; this is not an allocation or RSS proof. Row scratch, bounded count batches and one
+8192-byte object buffer are independent of account size. The retained request
+file supplies unknown-ID spellings for duplicate checks and notFound output.
+All scans and repeated comparisons retain the enclosing work/time checks.
