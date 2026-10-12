@@ -1939,9 +1939,9 @@ status ok and the operation's data; failures carry fixed stage/error codes.
 
 The ready announcement and status report profile mailbox-access. Readiness
 waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS/body workers. Core API methods are available; discovery still
-waits for EventSource activation. Stop, SIGTERM and SIGINT use the same
-shared stop flag. HTTPS closes
+network/TLS/body workers. Core API methods, EventSource and authenticated
+Core discovery are available. Stop, SIGTERM and SIGINT use the same shared
+stop flag. HTTPS closes
 its exchanges and joins its TLS and body workers; an upload publication
 already underway settles before shutdown returns. SMTP preserves its normal
 drain and known committed replies. Outbound delivery, reload and ACME
@@ -1968,7 +1968,7 @@ and Expect are rejected. The name and media type are template values, not
 stored blob metadata. Downloads, uploads and API requests share one body
 worker. The independent advertised maxima are upper bounds; cross-kind
 contention receives 503. Same-kind contention receives 429.
-This activates raw downloads; discovery remains pending EventSource activation.
+Raw downloads form part of the advertised Core capability.
 
 Authenticated POST `/jmap/api` now executes Core/echo, PushSubscription/get,
 PushSubscription/set and the single-account Blob/copy contract. Provision
@@ -1979,4 +1979,16 @@ root from a previous mailbox run, but does not require one. The API accepts
 application/json with fixed or chunked bodies and returns ordered retained
 responses, result references, createdIds and the prepared Session state.
 Malformed requests and advertised limits receive standard JMAP problem details.
-Discovery still returns 503; no incomplete Core capability is advertised.
+Authenticated GET `/.well-known/jmap` now returns the Core Session. Mail and
+Submission remain unadvertised. The event_streams limit defaults to two and
+must be nonzero for mailbox-access. The resource plan already requires it
+strictly below https_connections, reserving capacity for other requests. The
+profile-neutral config check permits zero for SMTP-only; mailbox-access
+startup additionally validates Core-specific admission. EventSource GET uses
+the Session URL template and an independent stream ceiling within the shared
+HTTPS/per-peer connection caps. Core has no account state types, so these
+streams emit requested pings only; closeafter=state closes after an actual
+state event, not a ping. A zero ping interval keeps the stream silent until
+revocation, disconnect, shutdown or the absolute connection deadline. Each
+output frame has a fixed stall deadline. Event streams do not consume the
+API/upload body permit.

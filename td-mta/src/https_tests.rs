@@ -433,6 +433,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     let resolved = resolved(&source);
     let resource = Limits {
         message_bytes: 131072,
+        event_streams: 1,
         header_bytes: 32,
         ..Limits::default()
     }
@@ -443,7 +444,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&admission).unwrap();
     let clock = Arc::new(Now(Instant::now(), AtomicU64::new(0)));
-    let until = Deadline::after(clock.sample().unwrap().monotonic, 120_000).unwrap();
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 600_000).unwrap();
     let data_fixture = Fixture::new();
     let spool_fixture = Fixture::new();
     let mut root = data_fixture.locked();
@@ -528,7 +529,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 .find(|r| r.kind == Kind::Https)
                 .unwrap();
             let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
-            let server = Https {
+            let mut server = Https {
                 uploads: Some(&api),
                 listeners: &listeners,
                 policies: &lease,
@@ -541,11 +542,19 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 clock: clock.clone(),
                 ready: &ready,
             };
+            let zero_events = Limits { event_streams: 0, ..*resource.limits() }.plan().unwrap();
+            server.resources = &zero_events;
+            assert_eq!(server.run(&Control::default()), Err(Error::Invalid));
+            server.resources = &resource;
             std::thread::scope(|scope| {
                 let worker = scope.spawn(|| server.run(&control));
                 let stop = Stop(&control);
                 wait(|| ready.load(Ordering::Acquire));
-                api_cases(address, &lease, clock.clone(), &authorization, account_wire, session.state().unwrap(), &resource, &devices);
+                let discovered = discovery_cases(address, &lease, clock.clone(), &authorization, session.bytes(), &devices);
+                let api_url = discovered["apiUrl"].as_str().unwrap();
+                let upload_url = discovered["uploadUrl"].as_str().unwrap().replace("{accountId}", account_wire);
+                let download_template = discovered["downloadUrl"].as_str().unwrap();
+                api_cases(address, &lease, clock.clone(), &authorization, account_wire, session.state().unwrap(), &resource, &devices, api_url);
                 assert_eq!(request_spool.status().occupied_slots, 0);
                 assert_eq!(coordinator.used(crate::admission::quota::Kind::ResponseBytes).unwrap(), 0);
                 let large = "x".repeat(65537);
@@ -561,7 +570,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 ] {
                     let mut wire = client(address, &lease, clock.clone());
                     let request = format!(
-                        "POST /jmap/upload/{account_wire} HTTP/1.1\r\n\
+                        "POST {upload_url} HTTP/1.1\r\n\
                 Host: localhost:{}\r\n\
                 Authorization: Basic {authorization}\r\n\
                 Content-Type: text/plain; charset=\"utf-8\"\r\n\
@@ -608,7 +617,8 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                     clock.1.fetch_add(2000, Ordering::Relaxed);
                     let blob = json["blobId"].as_str().unwrap();
                     let mut download = client(address, &lease, clock.clone());
-                    let head = format!("GET /jmap/download/{account_wire}/{blob}/report%20%E2%98%83.txt?type=text%2Fplain%3B%20charset%3Dutf-8 HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port());
+                    let target = download_template.replace("{accountId}", account_wire).replace("{blobId}", blob).replace("{name}", "report%20%E2%98%83.txt").replace("{type}", "text%2Fplain%3B%20charset%3Dutf-8");
+                    let head = format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port());
                     send(&mut download, head.as_bytes());
                     std::thread::sleep(Duration::from_millis(50));
                     let (status, headers, bytes) = full_reply(&mut download);
@@ -741,9 +751,13 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 let cancel_head = head.replace(&authorization, &second);
                 assert!(request(&mut cancelled, cancel_head.as_bytes())
                     .starts_with("HTTP/1.1 100 Continue"));
+                let mut event_shutdown = client(address, &lease, clock.clone());
+                let event_head = format!("GET /jmap/events?types=*&closeafter=no&ping=0 HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {second}\r\n\r\n", address.port());
+                assert!(request(&mut event_shutdown, event_head.as_bytes()).starts_with("HTTP/1.1 200 OK"));
                 drop(stop);
                 worker.join().unwrap().unwrap();
                 cancelled.abort();
+                finish_event(&mut event_shutdown);
             });
         })
         .unwrap();
@@ -1140,6 +1154,7 @@ fn api_cases(
     state: &str,
     resources: &crate::limits::ResourcePlan,
     devices: &Mutex<DeviceStore<'_>>,
+    api_url: &str,
 ) {
     let calls = format!(
         r##"{{"using":["urn:ietf:params:jmap:core"],"createdIds":{{"seed":"seed-id"}},"methodCalls":[
@@ -1184,7 +1199,7 @@ fn api_cases(
         } else {
             ""
         };
-        let head = format!("POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json; charset=utf-8\r\n{framing}\r\n{interim}\r\n", address.port());
+        let head = format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json; charset=utf-8\r\n{framing}\r\n{interim}\r\n", address.port());
         let body_wire = if chunked {
             format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
         } else {
@@ -1254,7 +1269,7 @@ fn api_cases(
     ] {
         clock.1.fetch_add(2000, Ordering::Relaxed);
         let mut wire = client(address, lease, clock.clone());
-        let head = format!("{method} /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: {media}\r\nContent-Length: {length}\r\nExpect: 100-continue\r\n\r\n", address.port());
+        let head = format!("{method} {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: {media}\r\nContent-Length: {length}\r\nExpect: 100-continue\r\n\r\n", address.port());
         send(&mut wire, head.as_bytes());
         let (actual, _, body) = full_reply(&mut wire);
         assert_eq!(actual, status);
@@ -1268,7 +1283,7 @@ fn api_cases(
     }
     clock.1.fetch_add(2000, Ordering::Relaxed);
     let head = format!(
-        "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\n\
+        "POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\n\
          Authorization: Basic {authorization}\r\nContent-Type: application/json\r\n\
          Content-Length: 2\r\nExpect: 100-continue\r\n\r\n",
         address.port()
@@ -1349,6 +1364,192 @@ fn finish_api(wire: &mut impl Transport) {
         Ok(IoProgress::Pending) => false,
         Ok(IoProgress::Closed) | Err(_) => true,
         other => panic!("unexpected bytes after complete API response: {other:?}"),
+    });
+    wire.abort();
+}
+
+fn discovery_cases(
+    address: std::net::SocketAddr,
+    lease: &GenerationLease<TlsPolicies>,
+    clock: Arc<Now>,
+    authorization: &str,
+    session: &[u8],
+    devices: &Mutex<DeviceStore<'_>>,
+) -> td_json::Json {
+    let mut discovered = None;
+    for (target, host, status) in [
+        (
+            "/.well-known/jmap".to_owned(),
+            format!("localhost:{}", address.port()),
+            200,
+        ),
+        (
+            format!("HTTPS://LOCALHOST:{}/.well-known/jmap", address.port()),
+            "other.example".to_owned(),
+            200,
+        ),
+        (
+            format!("https://localhost:{}?x=1", address.port()),
+            format!("localhost:{}", address.port()),
+            404,
+        ),
+        (
+            "/?x=1".to_owned(),
+            format!("localhost:{}", address.port()),
+            404,
+        ),
+        (
+            "https://other.example/.well-known/jmap".to_owned(),
+            format!("localhost:{}", address.port()),
+            421,
+        ),
+        (
+            format!("http://localhost:{}/.well-known/jmap", address.port()),
+            format!("localhost:{}", address.port()),
+            421,
+        ),
+    ] {
+        clock.1.fetch_add(2000, Ordering::Relaxed);
+        let mut wire = client(address, lease, clock.clone());
+        send(&mut wire, format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\n\r\n").as_bytes());
+        let (actual, headers, body) = full_reply(&mut wire);
+        assert_eq!(actual, status);
+        if status == 200 {
+            assert_eq!(body.as_bytes(), session);
+            assert!(headers
+                .lines()
+                .any(|line| line == "Content-Type: application/json"));
+            let json = td_json::parse(&body).unwrap();
+            assert!(json["capabilities"]["urn:ietf:params:jmap:core"]
+                .as_obj()
+                .is_some());
+            assert_eq!(json["capabilities"].as_obj().unwrap().len(), 1);
+            assert!(json["capabilities"]["urn:ietf:params:jmap:mail"].is_null());
+            discovered = Some(json);
+        }
+        finish_event(&mut wire);
+    }
+    let discovered = discovered.unwrap();
+    let event_template = discovered["eventSourceUrl"].as_str().unwrap();
+    let api_url = discovered["apiUrl"].as_str().unwrap();
+    let event_head = |auth: &str, ping: u64| {
+        let target = event_template
+            .replace("{types}", "%2A")
+            .replace("{closeafter}", "state")
+            .replace("{ping}", &ping.to_string());
+        format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {auth}\r\nLast-Event-ID: unknown\r\n\r\n", address.port())
+    };
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let (device, password) = devices
+        .lock()
+        .unwrap()
+        .create(
+            "events",
+            1,
+            &mut td_crypto::SystemEntropy::try_new().unwrap(),
+        )
+        .unwrap();
+    let temporary = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let mut stream = client(address, lease, clock.clone());
+    let headers = request(&mut stream, event_head(&temporary, 1).as_bytes());
+    assert!(headers.starts_with("HTTP/1.1 200 OK"));
+    assert!(headers.contains("Content-Type: text/event-stream"));
+    assert!(!headers.contains("Content-Length:"));
+    let mut scratch = [0; 1024];
+    assert!(matches!(
+        stream.read(&mut scratch).unwrap(),
+        IoProgress::Pending
+    ));
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let mut ping = Vec::new();
+    wait(|| {
+        match stream.read(&mut scratch).unwrap() {
+            IoProgress::Bytes(n) => ping.extend_from_slice(&scratch[..n]),
+            IoProgress::Pending => (),
+            IoProgress::Closed => panic!("event stream closed before ping"),
+        }
+        ping.ends_with(b"\n\n")
+    });
+    assert_eq!(ping, b"event: ping\ndata: {\"interval\":1}\n\n");
+    {
+        // Registry contention must not block the reactor's origin refusals.
+        let guard = devices.lock().unwrap();
+        let mut probe = client(address, lease, clock.clone());
+        send(
+            &mut probe,
+            b"GET /.well-known/jmap HTTP/1.1\r\nHost: foreign.example\r\n\r\n",
+        );
+        assert_eq!(full_reply(&mut probe).0, 421);
+        finish_event(&mut probe);
+        drop(guard);
+    }
+    let mut excess = client(address, lease, clock.clone());
+    send(&mut excess, event_head(authorization, 0).as_bytes());
+    assert_eq!(full_reply(&mut excess).0, 429);
+    finish_event(&mut excess);
+    let mut api = client(address, lease, clock.clone());
+    let body = r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{},"a"]]}"#;
+    send(&mut api, format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", address.port(), body.len()).as_bytes());
+    assert_eq!(full_reply(&mut api).0, 200);
+    finish_event(&mut api);
+    devices.lock().unwrap().revoke(device, 2).unwrap();
+    finish_event(&mut stream);
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let mut silent = client(address, lease, clock.clone());
+    assert!(
+        request(&mut silent, event_head(authorization, 0).as_bytes())
+            .starts_with("HTTP/1.1 200 OK")
+    );
+    // Complete another exchange so the reactor has acknowledged the SSE header
+    // flush before moving the synthetic clock beyond its output-stall window.
+    for advance in [0, 31000] {
+        clock.1.fetch_add(advance, Ordering::Relaxed);
+        let mut probe = client(address, lease, clock.clone());
+        send(&mut probe, format!("GET /.well-known/jmap HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
+        assert_eq!(full_reply(&mut probe).0, 200);
+        finish_event(&mut probe);
+    }
+    assert!(matches!(
+        silent.read(&mut scratch).unwrap(),
+        IoProgress::Pending
+    ));
+    silent.abort();
+    // Discovery remains independently available while the reactor retires EOF.
+    for (method, target, framing, status) in [
+        ("POST", "/.well-known/jmap", "", 405),
+        ("GET", "/.well-known/jmap", "Content-Length: 1\r\n", 400),
+        (
+            "GET",
+            "/jmap/events?types=*&closeafter=no&ping=bad",
+            "",
+            400,
+        ),
+        ("POST", "/jmap/events?types=*&closeafter=no&ping=0", "", 405),
+        (
+            "GET",
+            "/jmap/events?types=*&closeafter=no&ping=0",
+            "Expect: 100-continue\r\n",
+            400,
+        ),
+    ] {
+        clock.1.fetch_add(2000, Ordering::Relaxed);
+        let mut wire = client(address, lease, clock.clone());
+        send(&mut wire, format!("{method} {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n{framing}\r\n", address.port()).as_bytes());
+        let (actual, headers, _) = full_reply(&mut wire);
+        assert_eq!(actual, status);
+        if status == 405 {
+            assert!(headers.contains("Allow: GET"));
+        }
+        finish_event(&mut wire);
+    }
+    discovered
+}
+fn finish_event(wire: &mut impl Transport) {
+    let mut scratch = [0; 1024];
+    wait(|| match wire.read(&mut scratch) {
+        Ok(IoProgress::Pending) => false,
+        Ok(IoProgress::Closed) | Err(_) => true,
+        _ => false,
     });
     wire.abort();
 }

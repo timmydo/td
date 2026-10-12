@@ -4298,16 +4298,18 @@ and streaming fixtures are not a claim about kernel page-cache residency.
 ## HTTPS authentication runtime
 
 The mailbox-access profile adds one fixed HTTPS network thread and one fixed
-TLS worker to the receiver/control threads. A startup vector contains at most
-https_connections mutex-protected slots (compiled maximum 32); each occupied
-slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head, a 16 KiB
-plaintext input buffer, bounded response headers (under 512 bytes), deadlines
-and transport state. Head storage may be owned; retiring it clears credentials.
+TLS worker to the receiver/control threads. A startup vector contains at
+most https_connections mutex-protected slots (compiled maximum 32); each
+occupied slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head,
+a 16 KiB plaintext input buffer, bounded response headers (under 512 bytes),
+an optional fixed 2 KiB event frame plus stream bookkeeping, deadlines and
+transport state. Head storage may be owned; retiring it clears credentials.
 Consumed input is cleared after each framing turn; bytes beyond the head
-remain in the same buffer until body dispatch or refusal. All input is cleared
-on retirement. These are ordinary buffer hygiene measures, not guaranteed erasure of provider/compiler copies.
-Native TLS, thread stacks and allocation overhead still require integrated
-M23 measurement; no whole-service memory qualification is added here.
+remain in the same buffer until body dispatch or refusal. All input is
+cleared on retirement. These are ordinary buffer hygiene measures, not
+guaranteed erasure of provider/compiler copies. Native TLS, thread stacks
+and allocation overhead still require integrated M23 measurement; no
+whole-service memory qualification is added here.
 
 The TLS worker constructs sessions and visits each eligible handshake at most
 once per ten milliseconds, under the receiver's shared HandshakePool. Network
@@ -4327,8 +4329,13 @@ control request/reply buffers have 256-byte/12-KiB caps. Successful publication
 precedes password output. Authentication attempts use a fixed 64-entry table,
 64 attempts globally and eight per IP per one-second monotonic window. Native
 work already executing is joined on shutdown, not forcibly canceled. The
-current HTTPS profile returns empty refusals and neither buffers nor commits
-request bodies; body/JMAP dispatch and streaming response ownership follow.
+current HTTPS profile uses a separate fixed body worker for uploads, raw
+downloads and retained Core API responses; ADMISSION.md owns those lifetimes.
+Discovery retires the 32 KiB credential head before allocating its at-most
+32 KiB Session response. EventSource retains only its fixed frame and passive
+snapshot; it never holds a store view or a response file. The prepared
+Session is shared startup metadata. These bounds fit the existing per-client
+scratch reservation; integrated whole-service measurement remains pending.
 
 The shared handshake pool bounds work, not availability against deliberate
 starvation: one peer sending partial TLS records on two connections can hold

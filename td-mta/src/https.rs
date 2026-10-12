@@ -70,6 +70,7 @@ enum Phase {
     Upload,
     Download,
     Api,
+    Events,
     Response,
     Close,
     Drain,
@@ -90,11 +91,18 @@ struct Client {
     attempt_admitted: bool,
     device: Option<DeviceId>,
     body_slot: bool,
+    events: Option<EventState>,
     stop_after_response: bool,
     absolute: Deadline,
     phase_deadline: Deadline,
     idle: Deadline,
     tls_at: Tick,
+}
+struct EventState {
+    stream: crate::jmap_events::Stream,
+    headers: bool,
+    pending: bool,
+    last: Tick,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -130,6 +138,16 @@ impl Https<'_, '_> {
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         if self.listeners.is_empty() {
             return Err(Error::Invalid);
+        }
+        if let Some(session) = self.uploads.and_then(|backend| backend.session()) {
+            if self.resources.limits().event_streams == 0
+                || session.concurrency().requests != 1
+                || session.concurrency().uploads != 1
+            {
+                return Err(Error::Invalid);
+            }
+            crate::jmap_request::Request::validate_resources(self.resources)
+                .map_err(|_| Error::Invalid)?;
         }
         let count = self.resources.limits().https_connections;
         let mut slots: Vec<Mutex<Option<Client>>> = Vec::new();
@@ -334,6 +352,7 @@ impl Https<'_, '_> {
         let mut peers = [None; 32];
         let mut cursor = 0;
         let mut accept_after = Tick(0);
+        let mut event_count = 0usize;
         while !control.stop_requested() {
             if worker.is_finished() || uploader.is_finished() {
                 control.fail();
@@ -368,10 +387,13 @@ impl Https<'_, '_> {
                     continue;
                 }
                 let mut wake_body = false;
-                match self.step(client, &mut attempts, body_active) {
+                match self.step(client, &mut attempts, body_active, &mut event_count) {
                     Ok(true) => {
                         if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
                             wake_body = true;
+                        }
+                        if client.phase == Phase::Close && client.events.take().is_some() {
+                            event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
                         }
                         if client.phase == Phase::Close
                             && client.body_slot
@@ -388,6 +410,9 @@ impl Https<'_, '_> {
                         }
                         if client.body_slot {
                             body_active.store(0, Ordering::Release);
+                        }
+                        if client.events.take().is_some() {
+                            event_count = event_count.checked_sub(1).ok_or(Error::Invalid)?;
                         }
                         *slot = None;
                     }
@@ -483,6 +508,7 @@ impl Https<'_, '_> {
                     attempt_admitted: false,
                     device: None,
                     body_slot: false,
+                    events: None,
                     stop_after_response: false,
                     absolute,
                     phase_deadline,
@@ -502,6 +528,7 @@ impl Https<'_, '_> {
         client: &mut Client,
         attempts: &mut Attempts,
         body_active: &AtomicU8,
+        event_count: &mut usize,
     ) -> Result<bool, Error> {
         let time = self.clock.sample()?;
         if client.absolute.expired(time.monotonic)
@@ -554,7 +581,15 @@ impl Https<'_, '_> {
             }
             Phase::Authorize => {
                 let head = client.head.head().map_err(|_| Error::Invalid)?;
-                let status = if !http_auth::same_authority(self.origin, head.host) {
+                let status = if !head.target_origin.map_or_else(
+                    || http_auth::same_authority(self.origin, head.host),
+                    |value| {
+                        value.split_once("://").is_some_and(|(scheme, authority)| {
+                            scheme.eq_ignore_ascii_case("https")
+                                && http_auth::same_authority(self.origin, authority)
+                        })
+                    },
+                ) {
                     421
                 } else if head.origin.is_some_and(|value| {
                     !Origin::parse(value).is_ok_and(|origin| self.origin.same_origin(origin))
@@ -651,7 +686,74 @@ impl Https<'_, '_> {
                                         return Ok(true);
                                     }
                                 } else if head.target == "/.well-known/jmap" {
-                                    503
+                                    if head.method != "GET" {
+                                        405
+                                    } else if head.framing != http_request::Framing::Length(0)
+                                        || head.expect_continue
+                                    {
+                                        400
+                                    } else if let Some(session) = backend.session() {
+                                        drop(devices);
+                                        return self
+                                            .respond_body(client, 200, time.utc_ms, session.bytes())
+                                            .map(|()| true);
+                                    } else {
+                                        503
+                                    }
+                                } else if let Some(query) =
+                                    head.target.strip_prefix("/jmap/events?")
+                                {
+                                    if backend.session().is_none() {
+                                        404
+                                    } else if head.method != "GET" {
+                                        405
+                                    } else if head.framing != http_request::Framing::Length(0)
+                                        || head.expect_continue
+                                    {
+                                        400
+                                    } else if *event_count >= self.resources.limits().event_streams
+                                    {
+                                        429
+                                    } else {
+                                        let options =
+                                            match crate::jmap_events::Options::parse(query) {
+                                                Ok(options) => options,
+                                                Err(_) => {
+                                                    drop(devices);
+                                                    return self
+                                                        .respond(client, 400, time.utc_ms)
+                                                        .map(|()| true);
+                                                }
+                                            };
+                                        drop(devices);
+                                        let snapshot =
+                                            match backend.event_snapshot(device, client.absolute) {
+                                                Ok(snapshot) => snapshot,
+                                                Err(Error::Busy) => return Ok(true),
+                                                Err(Error::Forbidden) => {
+                                                    return self
+                                                        .respond(client, 401, time.utc_ms)
+                                                        .map(|()| true);
+                                                }
+                                                Err(error) => return Err(error),
+                                            };
+                                        let stream = crate::jmap_events::Stream::new(
+                                            options,
+                                            snapshot,
+                                            head.last_event_id,
+                                            time.monotonic,
+                                        )?;
+                                        client.device = Some(device);
+                                        self.begin_events(
+                                            client,
+                                            stream,
+                                            time.utc_ms,
+                                            time.monotonic,
+                                        )?;
+                                        *event_count =
+                                            event_count.checked_add(1).ok_or(Error::Capacity)?;
+                                        return Ok(true);
+                                    }
                                 } else {
                                     404
                                 }
@@ -667,6 +769,7 @@ impl Https<'_, '_> {
                 };
                 self.respond(client, status, time.utc_ms)?;
             }
+            Phase::Events => return self.events(client, time.monotonic),
             Phase::Response => {
                 let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
                 if client.sent < client.response.len() {
@@ -905,6 +1008,103 @@ impl Https<'_, '_> {
             }
         }
     }
+    fn begin_events(
+        &self,
+        client: &mut Client,
+        stream: crate::jmap_events::Stream,
+        utc_ms: i64,
+        now: Tick,
+    ) -> Result<(), Error> {
+        use std::io::Write;
+        let idle = deadline(now, self.timeouts.limits().event_stall_seconds)?.min(client.absolute);
+        client.input.fill(0);
+        client.input_used = 0;
+        client.drain_left = 0;
+        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        client.response.clear();
+        client
+            .response
+            .try_reserve(512)
+            .map_err(|_| Error::Capacity)?;
+        write!(&mut client.response,
+            "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",
+            http_date(utc_ms)?)?;
+        client.events = Some(EventState {
+            stream,
+            headers: true,
+            pending: false,
+            last: now,
+        });
+        client.sent = 0;
+        client.phase = Phase::Events;
+        client.phase_deadline = client.absolute;
+        client.idle = idle;
+        Ok(())
+    }
+    fn events(&self, client: &mut Client, now: Tick) -> Result<bool, Error> {
+        let state = client.events.as_mut().ok_or(Error::Invalid)?;
+        if now < state.last {
+            return Err(Error::WriterStopped);
+        }
+        state.last = now;
+        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let snapshot =
+            match backend.event_snapshot(client.device.ok_or(Error::Invalid)?, client.absolute) {
+                Ok(snapshot) => snapshot,
+                Err(Error::Busy) => return Ok(true),
+                Err(error) => return Err(error),
+            };
+        let event = client.events.as_mut().ok_or(Error::Invalid)?;
+        let connection = client.connection.as_mut().ok_or(Error::Invalid)?;
+        if event.headers {
+            if client.sent < client.response.len() {
+                match connection.write(client.response.get(client.sent..).ok_or(Error::Invalid)?)? {
+                    IoProgress::Bytes(n) if n > 0 && n <= client.response.len() - client.sent => {
+                        client.sent += n
+                    }
+                    IoProgress::Pending => (),
+                    _ => return Ok(false),
+                }
+            } else if connection.flush()? == FlushProgress::Complete {
+                event.headers = false;
+                client.sent = 0;
+                client.response.clear();
+                client.idle = client.absolute;
+            }
+            return Ok(true);
+        }
+        let frame = event.stream.prepare(snapshot, now)?;
+        if frame.is_empty() {
+            // A silent stream still detects EOF; no pipelined requests are accepted.
+            return match connection.read(&mut client.input)? {
+                IoProgress::Pending => Ok(true),
+                _ => Ok(false),
+            };
+        }
+        if !event.pending {
+            event.pending = true;
+            client.idle =
+                deadline(now, self.timeouts.limits().event_stall_seconds)?.min(client.absolute);
+        }
+        if client.sent < frame.len() {
+            match connection.write(frame.get(client.sent..).ok_or(Error::Invalid)?)? {
+                IoProgress::Bytes(n) if n > 0 && n <= frame.len() - client.sent => client.sent += n,
+                IoProgress::Pending => (),
+                _ => return Ok(false),
+            }
+        } else if connection.flush()? == FlushProgress::Complete {
+            event.stream.acknowledge(self.clock.sample()?.monotonic)?;
+            event.pending = false;
+            client.sent = 0;
+            client.idle = client.absolute;
+            if event.stream.closed() {
+                client.phase = Phase::Close;
+                client.phase_deadline = deadline(now, DRAIN_SECONDS)?.min(client.absolute);
+                client.idle = client.phase_deadline;
+            }
+        }
+        Ok(true)
+    }
     fn respond(&self, client: &mut Client, status: u16, utc_ms: i64) -> Result<(), Error> {
         self.respond_body(client, status, utc_ms, &[])
     }
@@ -916,6 +1116,24 @@ impl Https<'_, '_> {
         body: &[u8],
     ) -> Result<(), Error> {
         use std::io::Write;
+        let get = client.head.head().is_ok_and(|head| {
+            head.target.starts_with("/jmap/download/")
+                || head.target.starts_with("/jmap/events?")
+                || head.target == "/.well-known/jmap"
+        });
+        // Known framing and already-read bytes bound unread-body discard.
+        if let Ok(head) = client.head.head() {
+            if let http_request::Framing::Length(bytes) = head.framing {
+                client.drain_left = client
+                    .drain_left
+                    .min(bytes.min(DRAIN_BYTES as u64) as usize);
+            }
+        }
+        client.drain_left = client.drain_left.saturating_sub(client.input_used);
+        client.input.fill(0);
+        client.input_used = 0;
+        // Retire credentials before allocating or waiting on Session output.
+        client.head = HeadReader::new(Vec::new().into_boxed_slice());
         client
             .response
             .try_reserve(512usize.checked_add(body.len()).ok_or(Error::Capacity)?)
@@ -952,11 +1170,7 @@ impl Https<'_, '_> {
             });
         }
         if status == 405 {
-            let download = client
-                .head
-                .head()
-                .is_ok_and(|head| head.target.starts_with("/jmap/download/"));
-            client.response.extend_from_slice(if download {
+            client.response.extend_from_slice(if get {
                 b"Allow: GET\r\n"
             } else {
                 b"Allow: POST\r\n"
@@ -964,20 +1178,6 @@ impl Https<'_, '_> {
         }
         client.response.extend_from_slice(b"\r\n");
         client.response.extend_from_slice(body);
-        // A known body boundary releases the slot without waiting for peer EOF.
-        if let Ok(head) = client.head.head() {
-            if let http_request::Framing::Length(bytes) = head.framing {
-                client.drain_left = client
-                    .drain_left
-                    .min(bytes.min(DRAIN_BYTES as u64) as usize);
-            }
-        }
-        // Already-read body bytes count against the same bounded discard allowance.
-        client.drain_left = client.drain_left.saturating_sub(client.input_used);
-        client.input.fill(0);
-        client.input_used = 0;
-        // Retire the complete credential head before waiting on a slow reader.
-        client.head = HeadReader::new(Vec::new().into_boxed_slice());
         client.phase = Phase::Response;
         let now = self.clock.sample()?.monotonic;
         client.phase_deadline = deadline(

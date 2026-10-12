@@ -1116,9 +1116,9 @@ a competing API gets the maxConcurrentRequests problem with HTTP 429, while
 a binary transfer occupying the worker gives temporary HTTP 503. Conversely,
 a binary request refused behind an API receives 503, not an upload-limit
 refusal. The permit lasts through response flush, including error output.
-The prepared
-Session records one API request and one upload; discovery remains disabled
-until EventSource is active. Content-Type must name application/json.
+The prepared Session records one API request and one upload; authenticated
+discovery advertises Core with these enforced upper bounds. Content-Type
+must name application/json.
 
 Before 100 Continue or method execution, the API reserves the complete response
 cap and allocates the resource plan's byte/token arenas. It decodes bounded
@@ -1143,3 +1143,26 @@ Request syntax/envelope/capability and advertised size/call-limit failures use
 RFC 8620 problem details; internal parser/work/storage ceilings remain resource
 failures rather than being misreported as invalid JSON. Shutdown cancels reads
 and output and joins already bounded storage/dispatch work.
+
+Authenticated discovery and EventSource run on the fixed network reactor.
+Discovery copies the prepared bounded Session only after retiring the request
+head, so credentials and the largest Session response do not coexist in the
+per-connection scratch budget. Absolute-form targets use their URI authority
+for same-origin admission; Host remains syntactically required.
+
+EventSource owns one fixed coalesced frame and no store view, response spool
+or body-worker permit. A separate event_streams counter is bounded by the
+HTTPS connection pool, and the per-peer cap still applies. Startup refuses
+Core activation with zero event capacity. The backend snapshot operation is
+nonblocking and only tries the device registry; every turn rechecks device
+access before output. Core alone exposes no account data types, so no mail
+state or account state is fabricated. The existing snapshot encoder handles
+future StateChange filtering, reconnect and close-after-state behavior.
+
+The HTTP stream is close-delimited text/event-stream. Headers and each frame
+must flush within one original event_stall_seconds window; partial writes do
+not renew it. Acknowledgement follows complete flush, with coalescing only
+between frames. A silent stream has no response-idle timeout, but retains its
+absolute connection deadline and detects peer EOF. No request body or pipeline
+is accepted. Disconnect, revocation and shutdown retire the stream and its
+slot without retained database or temporary-file ownership.

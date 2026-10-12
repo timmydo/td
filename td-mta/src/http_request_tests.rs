@@ -106,7 +106,9 @@ fn smuggling_and_ambiguous_headers_are_terminal() {
         "GET  / HTTP/1.1",
         "GET\t/ HTTP/1.1",
         "GET / HTTP/1.1 extra",
-        "GET https://mail.example/ HTTP/1.1",
+        "GET https://user@mail.example/ HTTP/1.1",
+        "GET https://mail.example/#fragment HTTP/1.1",
+        "GET ftp://mail.example/ HTTP/1.1",
         "CONNECT mail.example:443 HTTP/1.1",
         "GET /#fragment HTTP/1.1",
         "GET /\\evil HTTP/1.1",
@@ -323,4 +325,33 @@ fn request_line_syntax_is_distinct_from_unsupported_version() {
             Err(expected)
         );
     }
+}
+
+#[test]
+fn absolute_targets_and_last_event_id_are_bounded_single_fields() {
+    for (target, origin, path) in [
+        (
+            "https://mail.example/jmap/api?x=1",
+            "https://mail.example",
+            "/jmap/api?x=1",
+        ),
+        ("HTTPS://MAIL.EXAMPLE:443", "HTTPS://MAIL.EXAMPLE:443", "/"),
+        ("http://mail.example?x=1", "http://mail.example", "?x=1"),
+        ("https://[::1]:443/", "https://[::1]:443", "/"),
+    ] {
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: other.example\r\nLast-Event-ID: opaque-id\r\n\r\n"
+        );
+        let mut storage = [0; HEAD_BYTES];
+        let mut reader = HeadReader::new(&mut storage);
+        assert!(reader.feed(request.as_bytes()).unwrap().complete);
+        let head = reader.head().unwrap();
+        assert_eq!(head.target_origin, Some(origin));
+        assert_eq!(head.target, path);
+        assert_eq!(head.host, "other.example");
+        assert_eq!(head.last_event_id, Some("opaque-id"));
+    }
+    rejected(
+        b"GET / HTTP/1.1\r\nHost: mail.example\r\nLast-Event-ID: one\r\nLast-Event-ID: two\r\n\r\n",
+    );
 }

@@ -86,6 +86,20 @@ impl<P: Sync> https_upload::Backend for Service<'_, '_, '_, '_, '_, P> {
     fn account(&self) -> AccountId {
         self.transfers.account()
     }
+    fn session(&self) -> Option<&Session> {
+        Some(self.session)
+    }
+    fn event_snapshot(
+        &self,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<crate::jmap_events::Snapshot, Error> {
+        drop(
+            self.policy
+                .authorize_blob(self.transfers.account(), device, deadline)?,
+        );
+        crate::jmap_events::Snapshot::new(self.transfers.account(), &[], None)
+    }
     fn receive(
         &self,
         request: https_upload::Request<'_>,

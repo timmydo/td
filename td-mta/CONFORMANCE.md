@@ -1,12 +1,12 @@
 # JMAP implementation inventory
 
-This is the M01 coverage inventory for td-mta. Every endpoint, method and
-property below is **unimplemented**. The library skeleton advertises no JMAP
-capability. Tables name acceptance obligations and owning tasks, not passing
-tests. M02 freezes wire/error fixtures; M13-M17 implement them; M22/M24 prove
-real-client compatibility and standards coverage before release. API.md and
-QUEUE.md fix state/error and submission policies; these do not implement the
-endpoints inventoried below.
+This inventory states the complete target obligations. The mailbox-access
+profile now advertises Core only: authenticated Session discovery, complete
+bounded Core batches, upload/download, the single-account Blob/copy outcome,
+PushSubscription policy and EventSource are active. Mail and Submission
+remain unadvertised; their method tables are implementation obligations.
+M22/M24 still own real-client and complete release coverage. API.md and
+QUEUE.md fix state/error and submission policies.
 [POLICY.md](POLICY.md) fixes interpretation, query and thread choices;
 [CASES.md](CASES.md) maps every surface below to stable acceptance case IDs.
 
@@ -261,5 +261,18 @@ precedence when both are unavailable. Copying within the sole accessible
 account is `invalidArguments`: this profile interprets §6.3's distinct-account
 wording consistently with §5.4's explicit rule and Cyrus's copy parser. No distinct accessible pair exists in this profile, so no successful
 copy or per-blob mutation is reachable. Tests cover result references,
-capability opt-in, phase expiry and continued later calls. This worker evidence
-does not activate discovery or the HTTP API.
+capability opt-in, phase expiry and continued later calls. The storage-independent worker
+is integrated into the live Core runtime described below.
+
+## Core runtime evidence
+
+The HTTPS fixture exercises discovery metadata against the prepared Session,
+origin-form and absolute-form authority, fixed/chunked Core requests, ordered
+responses/references/problems, upload publication and raw downloads. Event
+coverage includes requested pings, ping=0 silence, unknown reconnect IDs,
+connection-limit refusal, simultaneous API traffic, revocation and shutdown.
+The passive EventSource tests exercise StateChange coalescing, filtering,
+last-event-ID replay avoidance and closeafter=state. Core exposes no stateful
+account data type, so a Core-only runtime stream produces pings, not mail
+StateChange events. Live mail-state integration belongs with Mail activation.
+This is not a td-mail interoperability result; that remains the next milestone.

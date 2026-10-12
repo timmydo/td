@@ -44,11 +44,15 @@ pub enum Framing {
 /// the complete head. Host is syntax only, never routing or URL authority.
 pub struct Head<'a> {
     pub method: &'a str,
+    /// Borrowed route spelling. An empty absolute path with a query is `?query`;
+    /// its effective path is `/`, whose resource is absent in this profile.
     pub target: &'a str,
+    pub target_origin: Option<&'a str>,
     pub host: &'a str,
     pub authorization: Option<&'a str>,
     pub content_type: Option<&'a str>,
     pub origin: Option<&'a str>,
+    pub last_event_id: Option<&'a str>,
     pub framing: Framing,
     pub close: bool,
     pub expect_continue: bool,
@@ -180,9 +184,6 @@ fn decimal(value: &str) -> Result<u64, Error> {
     value.parse().map_err(|_| Error::Limit)
 }
 fn target(value: &str) -> bool {
-    if !value.starts_with('/') {
-        return false;
-    }
     let mut bytes = value.bytes();
     while let Some(byte) = bytes.next() {
         if byte == b'%' {
@@ -229,13 +230,44 @@ fn authority(value: &str) -> bool {
     };
     !host.is_empty() && port.is_none_or(|p| decimal(p).is_ok_and(|p| (1..=65535).contains(&p)))
 }
+fn request_target(value: &str) -> Result<(&str, Option<&str>), Error> {
+    if value.starts_with('/') {
+        return if target(value) {
+            Ok((value, None))
+        } else {
+            Err(Error::Syntax)
+        };
+    }
+    let (scheme, rest) = value.split_once("://").ok_or(Error::Syntax)?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return Err(Error::Syntax);
+    }
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let host = rest.get(..end).ok_or(Error::Syntax)?;
+    if !authority(host) {
+        return Err(Error::Syntax);
+    }
+    let origin_end = scheme
+        .len()
+        .checked_add(3)
+        .and_then(|n| n.checked_add(end))
+        .ok_or(Error::Limit)?;
+    let origin = value.get(..origin_end).ok_or(Error::Syntax)?;
+    let path = value.get(origin_end..).ok_or(Error::Syntax)?;
+    let path = if path.is_empty() { "/" } else { path };
+    if !target(path) {
+        return Err(Error::Syntax);
+    }
+    Ok((path, Some(origin)))
+}
 fn parse(bytes: &[u8]) -> Result<Head<'_>, Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::Syntax)?;
     let mut lines = text.split("\r\n");
     let mut request = lines.next().ok_or(Error::Syntax)?.split(' ');
     let method = request.next().ok_or(Error::Syntax)?;
     let uri = request.next().ok_or(Error::Syntax)?;
-    if method.is_empty() || !method.bytes().all(token) || !target(uri) {
+    let (uri, target_origin) = request_target(uri)?;
+    if method.is_empty() || !method.bytes().all(token) {
         return Err(Error::Syntax);
     }
     let version = request.next().ok_or(Error::Syntax)?;
@@ -254,6 +286,7 @@ fn parse(bytes: &[u8]) -> Result<Head<'_>, Error> {
     let mut authorization = None;
     let mut content_type = None;
     let mut origin = None;
+    let mut last_event_id = None;
     let mut length = None;
     let mut transfer = None;
     let mut connection = None;
@@ -274,6 +307,8 @@ fn parse(bytes: &[u8]) -> Result<Head<'_>, Error> {
             once(&mut content_type, value)?;
         } else if name.eq_ignore_ascii_case("origin") {
             once(&mut origin, value)?;
+        } else if name.eq_ignore_ascii_case("last-event-id") {
+            once(&mut last_event_id, value)?;
         } else if name.eq_ignore_ascii_case("content-length") {
             once(&mut length, value)?;
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
@@ -313,10 +348,12 @@ fn parse(bytes: &[u8]) -> Result<Head<'_>, Error> {
     Ok(Head {
         method,
         target: uri,
+        target_origin,
         host,
         authorization,
         content_type,
         origin,
+        last_event_id,
         framing,
         close,
         expect_continue: expect.is_some(),

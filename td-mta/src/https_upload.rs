@@ -46,9 +46,20 @@ impl Response {
         self.bytes.get(..self.length).ok_or(Error::Invalid)
     }
 }
-/// Called only by the dedicated upload worker after HTTPS authentication.
+/// Authenticated HTTPS operations. Transfer methods run on the body worker.
 pub trait Backend: Sync {
     fn account(&self) -> AccountId;
+    fn session(&self) -> Option<&crate::jmap_session::Session> {
+        None
+    }
+    /// Called by the network reactor: must not block or acquire a store view.
+    fn event_snapshot(
+        &self,
+        _device: DeviceId,
+        _deadline: Deadline,
+    ) -> Result<crate::jmap_events::Snapshot, Error> {
+        Err(Error::NotFound)
+    }
     fn receive(
         &self,
         request: Request<'_>,

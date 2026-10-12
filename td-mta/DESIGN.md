@@ -1772,22 +1772,23 @@ separate.
 
 ## 10. HTTP and JMAP
 
-The `http_request` module implements transport-independent HTTP/1.1
-request framing. Its head storage may be borrowed or owned; the HTTPS
-runtime uses owned bounded buffers without self-referential state.
-A caller-owned head buffer admits at most 32 KiB, 8192 bytes per line
-including CRLF, and 100 fields. Parsing requires strict CRLF, one Host,
-origin-form targets and unambiguous framing. Duplicate security/framing
-fields, obs-fold, Content-Length with Transfer-Encoding, request content
-coding, upgrades and declared trailers refuse. Only chunked transfer coding
-is supported. Host is passive syntax, never configured-origin authority.
-Authorization and optional Origin are borrowed without Debug output;
-duplicate Origin fields refuse. Other unrecognized fields are discarded;
-future endpoints needing additional fields must add explicit handling.
-Retiring the reader clears its backing. This is ordinary buffer hygiene,
-not guaranteed erasure of compiler or caller copies; a black_box barrier
-discourages dead-store removal without adding unsafe code. The caller must clear
-consumed TLS/plaintext input too and must not log or retain credentials.
+The `http_request` module implements transport-independent HTTP/1.1 request
+framing. Its head storage may be borrowed or owned; the HTTPS runtime uses
+owned bounded buffers without self-referential state. A caller-owned head
+buffer admits at most 32 KiB, 8192 bytes per line including CRLF, and 100
+fields. Parsing requires strict CRLF, one Host, origin-form or absolute-form
+targets and unambiguous framing. Duplicate security/framing fields,
+obs-fold, Content-Length with Transfer-Encoding, request content coding,
+upgrades and declared trailers refuse. Only chunked transfer coding is
+supported. Host is passive syntax, never configured-origin authority.
+Authorization, optional Origin and Last-Event-ID are borrowed without Debug
+output; duplicate security/event fields refuse. Other unrecognized fields
+are discarded; future endpoints needing additional fields must add explicit
+handling. Retiring the reader clears its backing. This is ordinary buffer
+hygiene, not guaranteed erasure of compiler or caller copies; a black_box
+barrier discourages dead-store removal without adding unsafe code. The
+caller must clear consumed TLS/plaintext input too and must not log or
+retain credentials.
 
 BodyReader streams length-delimited or chunked bytes into caller output,
 with independent decoded and aggregate wire ceilings chosen before reading.
@@ -1799,33 +1800,34 @@ Backpressure does not consume body bytes without output space. Syntax,
 limit and premature-EOF errors are sticky; provisional body bytes cannot
 be committed after a framing error. No parser reset can revive failure.
 
-The enclosing HTTPS driver must enforce TLS, configured authority, route
-and method policy, cross-origin refusal, authentication, deadlines,
-connection/request counts and scheduling. Routes match the raw target;
-only validated endpoint components may be decoded, never used as arbitrary
-filesystem paths. It must authorize and admit
-body storage before sending 100 Continue, check decoder completion before
-publication, and close on framing failure. The current HTTPS runtime serves
-authenticated uploads, raw downloads and the Core API with these bounds;
-discovery remains pending EventSource activation. Device persistence and local
-administration are implemented under section 7. Framing tests
+The enclosing HTTPS driver must enforce TLS, configured authority, route and
+method policy, cross-origin refusal, authentication, deadlines,
+connection/request counts and scheduling. Routes match the raw target; only
+validated endpoint components may be decoded, never used as arbitrary
+filesystem paths. It must authorize and admit body storage before sending
+100 Continue, check decoder completion before publication, and close on
+framing failure. The current HTTPS runtime serves authenticated uploads, raw
+downloads, the Core API and EventSource with these bounds. Authenticated
+discovery advertises only the completed Core capability. Device persistence
+and local administration are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
 
-This initial profile deliberately refuses leading empty lines, absolute-form
-and asterisk-form targets, non-ASCII field values and Connection options
-other than close/keep-alive. It is not complete HTTP/1.1 conformance:
-absolute-form support required by RFC 9112 section 3.2.2 remains outstanding.
-Bracketed IPv6 Host values reject zone identifiers. Chunk extensions
-accept grammar-defined whitespace around semicolons and equals signs,
-but refuse standalone trailing whitespace before CRLF. Malformed request-line
-syntax is distinct from a well-formed unsupported HTTP version.
-No proxy, browser compatibility or JMAP conformance is claimed. These fixed
-parser caps are independent of the proposed slot partitions in RESOURCES
-and ADMISSION. The current HTTPS runtime uses the configured connection
-count and shared handshake cap; RESOURCES.md records its concrete buffers.
-Whole-service memory measurement remains section-5/M23 work; the existing
-Limits::plan arithmetic is unchanged.
+This profile accepts origin-form and absolute-form request targets; absolute
+URI authority controls routing even when Host differs, as RFC 9112 section
+3.2.2 requires. It refuses leading empty lines and asterisk-form targets,
+non-ASCII field values and Connection options other than close/keep-alive.
+No general-purpose proxy or complete HTTP/1.1 implementation is claimed.
+Bracketed IPv6 Host values reject zone identifiers. Chunk extensions accept
+grammar-defined whitespace around semicolons and equals signs, but refuse
+standalone trailing whitespace before CRLF. Malformed request-line syntax is
+distinct from a well-formed unsupported HTTP version. Browser compatibility
+and Mail capability conformance remain unclaimed. These fixed parser caps
+are independent of the proposed slot partitions in RESOURCES and ADMISSION.
+The current HTTPS runtime uses the configured connection count and shared
+handshake cap; RESOURCES.md records its concrete buffers. Whole-service
+memory measurement remains section-5/M23 work; the existing Limits::plan
+arithmetic is unchanged.
 
 `serve --mailbox-access` runs the existing receiver plus the IPv4 `https`
 driver. IPv6 listeners remain refused pending the audited socket adapter.
@@ -1844,8 +1846,8 @@ After responding it applies RESOURCES.md's bounded write-half closure.
 Refusals may drain bounded unread data; successful uploads already consumed
 their body and do not drain. Downloads also close without drain. Slots remain
 active until retired.
-This does not yet claim JMAP conformance: authenticated discovery gets 503
-until the complete Core contract is ready, and unknown targets get 404.
+Authenticated GET /.well-known/jmap returns Core Session metadata; unknown
+targets get 404. Mail and Submission capabilities remain unadvertised.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
 credentials receive the same 401 Basic challenge. No credential enters error
 output. A failed local credential publication
@@ -2178,5 +2180,8 @@ Implementation fixtures cite the additional extension RFCs they exercise.
 The mailbox-access Core API now runs on the bounded HTTPS body worker.
 ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
 owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
-is prepared for response sessionState but is not exposed by discovery until
-all required Core endpoints are active. Mail methods remain unavailable.
+is exposed by authenticated discovery now that its required endpoints are
+active. Mail methods remain unavailable. EventSource uses only authorized
+Core state: there are no account data types to announce yet. Pings and
+revocation still work; adding Mail requires passive state capture without
+blocking the network reactor or holding a store view across socket work.

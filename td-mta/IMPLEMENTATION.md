@@ -3821,3 +3821,13 @@ separate data/tmp/requests root. Real TLS fixtures exercise fixed/chunked calls,
 large echo output, ordered method errors, result references, createdIds,
 request problems and method/media/size refusal. EventSource and discovery
 activation remain next; mailbox and message APIs remain unavailable.
+
+Authenticated Core discovery and EventSource are active in mailbox-access.
+The network reactor owns bounded event slots, per-frame stall deadlines,
+revocation checks and close-delimited SSE output without database views.
+Core-only streams have no account state types and emit requested pings.
+Absolute-form HTTP requests now route by their URI authority, ignoring a
+conflicting Host for routing while still validating its syntax. TLS tests
+cover discovery, absolute origins, event/query/method limits, pings, silent
+streams, simultaneous Core requests, revocation and shutdown. Mail capability
+activation and a real td-mail read remain subsequent work.
