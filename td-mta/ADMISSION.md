@@ -776,6 +776,27 @@ checked file-base arithmetic, reads, retention of expanded results and shared
 work/deadline admission remain with the enclosing dispatcher. No endpoint
 uses this walker yet and it grants no file-read or publication authority.
 
+The inert `jmap_request::resolution::Resolution` now binds the walker to
+one exclusively borrowed `ResponseRetention`. Its caller supplies a source
+range from the earlier-response index; construction checks that the range
+lies wholly in the immutable published prefix and that no unpublished tail
+exists. The caller supplies a per-expansion output ceiling that excludes its
+mandatory response reserve; all delimiters and copied bytes count against it. Source reads, bounded CPU turns, copying, and final publication use
+that owner's original work meter and deadline. The dispatcher must still
+bind the index to this file and enforce its execution-phase deadline.
+
+Expansion appends a separate JSON value to the same private file, publishing
+only in freshly admitted finish, after complete selection succeeds. A bad
+later branch or copy failure
+rolls back only the unpublished tail, leaving earlier published values intact.
+Drop cancels incomplete output; explicit cancellation reports rollback faults,
+and any such fault remains sticky in the retention owner. Terminal work or
+deadline failure can prevent truncation; the tail stays unpublished until
+whole-file cleanup. Successful finish
+freshly checks admission before returning the passive range. HTTP encoding
+must frame indexed values, never transmit this mixed-content file wholesale.
+No method dispatcher or endpoint uses this adapter yet.
+
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument
 type is invalidArguments when the method validates it. Simultaneous normal and

@@ -194,6 +194,20 @@ encoded-header adapters or combined service RSS.
   scalar costs constant matching work and array tokens have a fixed bound; wildcard expansion also consumes the
   enclosing retained-output quota. Neither an empty wildcard nor a long path
   may reset the original work/deadline allowance.
+  The retained-file Resolution adds one fixed 4096-byte input buffer and
+  borrows caller copy scratch, using at most 4096 bytes per copy turn. It
+  keeps no selected-range list or response-sized tree. Each poll and finish
+  charges the existing retention foreground-record meter and checks its
+  original deadline, including CPU-only path validation. File reads and writes
+  additionally charge I/O/output work; expanded values share the same response
+  disk cap and a caller-supplied expansion ceiling preserving mandatory space.
+  Each scanner event costs a CPU record; a source refill adds a read record;
+  each copy turn spends CPU, read and append records, and each delimiter an
+  append record. Selected bytes are reread even if still buffered. Large
+  token/reference chains must fit the shared work budget before activation.
+  Cancellation attempts truncation of only the unpublished tail; terminal
+  failures leave it for whole-file cleanup. Neither path releases the owner's full-cap reservation. Combined runtime RSS qualification
+  and dispatcher execution-phase admission remain pending.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

@@ -376,7 +376,7 @@ pub(crate) mod tests {
     };
 
     pub(crate) struct Fixture {
-        pub(super) path: PathBuf,
+        pub(crate) path: PathBuf,
         directory: Directory,
         owner: u32,
     }

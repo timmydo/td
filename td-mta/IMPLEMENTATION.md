@@ -2906,6 +2906,14 @@ paths, beside fragmented, long-path, empty-wildcard and depth-limit fixtures.
 File custody, metered I/O, expanded-result retention and actual dispatcher
 integration remain required before any capability advertisement.
 
+The retained-file resolution adapter now composes that walker with exclusive
+response-file custody, metered reads/copies/CPU turns, and atomic publication
+of each expanded JSON value. Real-file tests cover chained expansion, late
+invalid branches, output-cap exhaustion, cancellation/drop, deadline expiry,
+invalid extents and truncated source I/O. Earlier published bytes survive
+failed expansion. The dispatcher still owns response-index/file binding,
+execution deadlines, method error mapping and final HTTP framing.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's

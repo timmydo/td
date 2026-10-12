@@ -176,6 +176,14 @@ impl<'s, 'sr, P> ResponseRetention<'_, 's, '_, 'sr, '_, P> {
             .map_err(|_| ports::Error::Capacity);
         self.record(result)
     }
+    /// Admit one bounded encoder/walker turn, including turns needing no I/O.
+    /// Charge the original foreground record budget and observe the original
+    /// outer deadline; callers additionally enforce execution-phase limits.
+    pub fn admit_work_turn(&mut self) -> Result<(), ports::Error> {
+        self.check()?;
+        self.charge(0, false)?;
+        self.check()
+    }
     /// One worker turn, at most 64 KiB. Cap refusal writes nothing and permits
     /// abandoning the unpublished tail; I/O/work/clock failure is terminal.
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ports::Error> {
@@ -657,6 +665,26 @@ mod tests {
             assert!(coordinator.admission_stopped());
             assert!(coordinator.retain_response(spool, deadline()).is_err());
             assert_eq!(coordinator.used(Kind::ResponseBytes).unwrap(), 72000);
+        });
+    }
+    #[test]
+    fn cpu_only_work_turns_share_the_original_record_budget() {
+        run(|coordinator, spool, _, _| {
+            let mut response = coordinator.retain_response(spool, deadline()).unwrap();
+            response.meter = Meter::new(
+                deadline(),
+                WorkCharge {
+                    io_bytes: 1000,
+                    records: 2,
+                    output_bytes: 1000,
+                    unlinks: 0,
+                },
+            );
+            response.admit_work_turn().unwrap();
+            response.admit_work_turn().unwrap();
+            assert_eq!(response.admit_work_turn(), Err(ports::Error::Capacity));
+            assert!(response.work_failure().is_some());
+            assert_eq!(response.admit_work_turn(), Err(ports::Error::Capacity));
         });
     }
 }
