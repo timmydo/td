@@ -124,4 +124,4 @@ const _: () = assert!(
 
 #[cfg(test)]
 #[path = "blob_part_json_tests.rs"]
-mod tests;
+pub(crate) mod tests;

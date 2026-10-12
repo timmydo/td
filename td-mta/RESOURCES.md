@@ -4529,3 +4529,21 @@ conservatively charged again. Numeric conversion sees only consumed bytes.
 Cached completion and explicit deadline checks add no positive charge.
 Output/unlink allowances are unchanged. No HeaderBudget, quota reset, source
 read or whole-job memory-admission claim is introduced.
+
+## Native selected metadata storage
+
+The native selected-metadata cursor, HeaderBudget and one 64-byte output
+window fit a compiled 1 KiB ceiling. It borrows the original generated fragment
+and candidate and retains the original traversal owners and scratch. The
+caller must admit retained fragments and candidates alongside the header arena,
+descriptors and response storage; the cursor does not perform whole-job backing
+admission. No heap allocation, body read or new quota occurs.
+
+The shared selector preserves resident charges: one record per index/output
+turn, one interpretation step per output turn or per indexed byte, and exact
+written output bytes. Interpretation steps additionally fund records through
+the retained stage Credit. Empty selection, empty output and cached completion
+add no positive charge. Fixed constructor checks compare retained scalar
+identity/range facts and freshly check the original deadlines. Partial
+selection indexes the original generated fragment in at most 64-byte turns;
+all-field selection copies the already-generated member sequence directly.

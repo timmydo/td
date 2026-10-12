@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+use crate::admission::work::Charge;
 use crate::mime_response::metadata::*;
 use crate::ports::{BlobReader, Clock, Error as PolicyError, Time};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +63,7 @@ fn drain(
     for _ in 0..10000 {
         let mut output = [0xa5; 128];
         let before = costs(cursor);
-        let credit = cursor.credit.remaining();
+        let credit = cursor.core.credit.remaining();
         let progress = cursor.poll(Tick(1), &mut output[..width])?;
         let after = costs(cursor);
         assert_eq!(before[0], after[0]);
@@ -218,7 +219,7 @@ fn empty_output_and_exact_final_byte_preserve_funded_progress() {
         assert_eq!(costs(&cursor), before);
         assert!(cursor.value().is_none());
         let bytes = drain(&mut cursor, 1).unwrap();
-        assert_eq!(cursor.position, bytes.len());
+        assert_eq!(cursor.core.position, bytes.len());
         assert_eq!(cursor.value(), Some(1));
     });
 }
@@ -303,7 +304,7 @@ fn quota_cutoffs_refuse_before_copying_and_hide_every_partial_value() {
                     Error::Original(crate::mime_response::bound::Error::Admission(expected))
                 );
                 assert_eq!(output, [0xa5; 64]);
-                assert_eq!(cursor.position, 0);
+                assert_eq!(cursor.core.position, 0);
                 assert!(cursor.value().is_none());
                 assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
                 assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
@@ -513,7 +514,7 @@ fn post_work_pin_deadline_overrides_original_quota_failure() {
             let error = Error::Parent(PolicyError::Deadline);
             assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
             assert_eq!(output, [0xa5; 64]);
-            assert_eq!(cursor.position, 0);
+            assert_eq!(cursor.core.position, 0);
             assert!(cursor.value().is_none());
             assert_eq!(cursor.failure, Some(error));
             assert_eq!(clock.samples.load(Ordering::SeqCst), samples + 3);
@@ -572,10 +573,98 @@ fn constructor_and_empty_output_freshly_check_both_deadline_domains() {
             };
             assert_eq!(error, expected);
             assert_eq!(costs(&cursor), before);
-            assert_eq!(cursor.position, 0);
+            assert_eq!(cursor.core.position, 0);
             assert!(cursor.value().is_none());
             assert_eq!(cursor.poll(Tick(1), &mut []), Err(error));
             assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
         });
+    }
+}
+
+#[test]
+fn native_and_resident_selected_members_match_bytes_and_all_five_costs() {
+    for (source, ordinal) in [(SIMPLE, 1), (MULTIPART, 1), (MULTIPART, 2)] {
+        for mask in [0, 1, 128, 511, 512, 1023] {
+            for width in [1, 7, 64, 128] {
+                let properties = crate::blob_selected_metadata::tests::properties(mask);
+                let mut native = None;
+                crate::blob_selected_metadata::tests::exercise(
+                    source,
+                    ordinal,
+                    |original, fragment, candidate, _| {
+                        let before = crate::blob_selected_metadata::tests::counters(&original);
+                        let mut cursor = crate::blob_selected_metadata::Cursor::new(
+                            original,
+                            fragment,
+                            candidate,
+                            properties,
+                            Tick(1),
+                        )
+                        .unwrap();
+                        let mut trace = vec![cursor.poll(Tick(1), &mut []).unwrap()];
+                        let mut bytes = Vec::new();
+                        loop {
+                            let mut output = [0; 128];
+                            let progress = cursor.poll(Tick(1), &mut output[..width]).unwrap();
+                            trace.push(progress);
+                            bytes.extend_from_slice(&output[..progress.written]);
+                            if progress.status == Status::Complete {
+                                break;
+                            }
+                        }
+                        trace.push(cursor.poll(Tick(1), &mut []).unwrap());
+                        trace.push(cursor.poll(Tick(1), &mut [0; 64]).unwrap());
+                        let result = cursor.finish(Tick(1)).unwrap();
+                        let after =
+                            crate::blob_selected_metadata::tests::counters(&result.original);
+                        let mut bytes = String::from_utf8(bytes).unwrap();
+                        if let Some(mut locator) = candidate.locator() {
+                            locator.parent = crate::ids::BlobId::from_bytes([0x44; 16]);
+                            let mut encoded = [0; crate::wire::PartLocator::WIRE_BYTES];
+                            locator.encode(&mut encoded).unwrap();
+                            bytes = bytes.replace(
+                                candidate.wire().unwrap(),
+                                std::str::from_utf8(&encoded).unwrap(),
+                            );
+                        }
+                        native = Some((
+                            bytes.into_bytes(),
+                            trace,
+                            std::array::from_fn::<_, 5, _>(|i| before[i] - after[i]),
+                        ));
+                    },
+                );
+                let clock = TestClock::new();
+                with_bound(source, 0, &clock, |bound| {
+                    let mut cursor =
+                        Cursor::with_properties(bound, ordinal, properties, Tick(1)).unwrap();
+                    let before = costs(&cursor);
+                    let mut trace = vec![cursor.poll(Tick(1), &mut []).unwrap()];
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut output = [0; 128];
+                        let progress = cursor.poll(Tick(1), &mut output[..width]).unwrap();
+                        trace.push(progress);
+                        bytes.extend_from_slice(&output[..progress.written]);
+                        if progress.status == Status::Complete {
+                            break;
+                        }
+                    }
+                    trace.push(cursor.poll(Tick(1), &mut []).unwrap());
+                    trace.push(cursor.poll(Tick(1), &mut [0; 64]).unwrap());
+                    let after = costs(&cursor);
+                    cursor.finish(Tick(1)).unwrap();
+                    assert_eq!(
+                        native,
+                        Some((
+                            bytes,
+                            trace,
+                            std::array::from_fn::<_, 5, _>(|i| before[i] - after[i])
+                        )),
+                        "ordinal={ordinal} mask={mask} width={width}"
+                    );
+                });
+            }
+        }
     }
 }

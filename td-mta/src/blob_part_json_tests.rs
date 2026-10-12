@@ -7,18 +7,18 @@ use crate::{
     ports::{Clock, Deadline, Error as PolicyError, Time},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-struct Timer {
+pub(crate) struct Timer {
     calls: AtomicU64,
     expires: AtomicU64,
 }
 impl Timer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calls: AtomicU64::new(0),
             expires: AtomicU64::new(u64::MAX),
         }
     }
-    fn after(&self, n: u64) {
+    pub(crate) fn after(&self, n: u64) {
         self.expires
             .store(self.calls.load(Ordering::Relaxed) + n, Ordering::Relaxed);
     }
@@ -82,7 +82,7 @@ fn meter() -> Meter {
     )
 }
 
-fn exercise_part(
+pub(crate) fn exercise_part(
     ordinal: u16,
     bytes: &[u8],
     timer: &Timer,
@@ -147,7 +147,7 @@ fn exercise(
 ) {
     exercise_part(1, bytes, timer, test);
 }
-const BYTES: &[u8] = concat!(
+pub(crate) const BYTES: &[u8] = concat!(
     "Content-Type: text/html;charset=UTF-8\r\n",
     "Content-Disposition: attachment;filename*=utf-8''caf%C3%A9.html\r\n",
     "Content-ID: <x@example.org>\r\nContent-Language: en, fr\r\n",

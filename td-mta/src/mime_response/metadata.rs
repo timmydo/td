@@ -1,6 +1,7 @@
 //! Source-bound part members; current access authorization and publication follow.
+use crate::mime_response::metadata_core::Core;
 use crate::mime_response::selected_metadata as selected;
-use crate::{admission::work::Charge, nfc::HeaderBudget, ports::Tick};
+use crate::{nfc::HeaderBudget, ports::Tick};
 pub use td_json::string::{Progress, Status};
 use {crate::mime_response::pinned::Bound, crate::mime_response::pinned::Error};
 
@@ -18,10 +19,7 @@ use {crate::mime_response::pinned::Bound, crate::mime_response::pinned::Error};
 pub struct Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
     pub(in crate::mime_response) source: Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
     ordinal: u16,
-    position: usize,
-    total: usize,
-    pub(in crate::mime_response) credit: crate::nfc::Credit,
-    pub(in crate::mime_response) selection: Option<crate::mime_response::selection_index::Index>,
+    pub(in crate::mime_response) core: Core,
     pub(in crate::mime_response) failure: Option<Error>,
 }
 impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> {
@@ -39,41 +37,23 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         now: Tick,
     ) -> Result<Self, Error> {
         source.check_deadline(now)?;
-        let mut cursor = Self {
+        let core = Core::new(Self::segments_from(&source, ordinal)?, properties)?;
+        Ok(Self {
             source,
             ordinal,
-            position: 0,
-            total: 0,
-            credit: crate::nfc::Credit::new(),
-            selection: None,
+            core,
             failure: None,
-        };
-        let total = cursor
-            .segments()?
-            .into_iter()
-            .try_fold(0usize, |total, bytes| {
-                total.checked_add(bytes.len()).ok_or(Error::InvalidState)
-            })?;
-        cursor.total = total;
-        let bits = properties.bits();
-        if bits == 0 {
-            cursor.position = cursor.total;
-        } else if bits != 1023 {
-            let fragment = cursor
-                .segments()?
-                .into_iter()
-                .next()
-                .ok_or(Error::InvalidState)?;
-            cursor.selection = Some(crate::mime_response::selection_index::Index::new(
-                bits, fragment,
-            )?);
-            cursor.total = 0;
-        }
-        Ok(cursor)
+        })
     }
     pub(in crate::mime_response) fn segments(&self) -> Result<[&[u8]; 5], Error> {
-        let index = usize::from(self.ordinal.checked_sub(1).ok_or(Error::InvalidState)?);
-        let original = self.source.value().ok_or(Error::InvalidState)?;
+        Self::segments_from(&self.source, self.ordinal)
+    }
+    fn segments_from<'s>(
+        source: &'s Bound<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k>,
+        ordinal: u16,
+    ) -> Result<[&'s [u8]; 5], Error> {
+        let index = usize::from(ordinal.checked_sub(1).ok_or(Error::InvalidState)?);
+        let original = source.value().ok_or(Error::InvalidState)?;
         let fragment = original
             .original
             .original
@@ -91,27 +71,14 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
             .copied()
             .ok_or(Error::InvalidState)?;
         let candidate = original.candidates.get(index).ok_or(Error::InvalidState)?;
-        if candidate.ordinal() != self.ordinal
-            || part.ordinal != self.ordinal
-            || fragment.end.part != part
-        {
+        if candidate.ordinal() != ordinal || part.ordinal != ordinal || fragment.end.part != part {
             return Err(Error::InvalidState);
         }
-        if part.media == crate::mime_structure::Media::Multipart {
-            if candidate.locator().is_some() {
-                return Err(Error::InvalidState);
-            }
-            return Ok([fragment.fragment, b",\"blobId\":", b"", b"null", b""]);
-        }
-        candidate.locator().ok_or(Error::InvalidState)?;
-        let wire = candidate.wire().ok_or(Error::InvalidState)?;
-        Ok([
+        crate::mime_response::metadata_core::segments(
             fragment.fragment,
-            b",\"blobId\":",
-            b"\"",
-            wire.as_bytes(),
-            b"\"",
-        ])
+            candidate,
+            part.media == crate::mime_structure::Media::Multipart,
+        )
     }
 
     pub(in crate::mime_response) fn outcome<T>(
@@ -124,10 +91,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         result
     }
     pub fn value(&self) -> Option<u16> {
-        if self.failure.is_some()
-            || self.position != self.total
-            || self.selection.as_ref().is_some_and(|index| !index.ready())
-        {
+        if self.failure.is_some() || !self.core.complete() {
             return None;
         }
         self.source.value()?;
@@ -167,51 +131,7 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
         self.outcome(result)
     }
     fn step(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
-        if self.selection.as_ref().is_some_and(|index| !index.ready()) {
-            return self.index_step(now);
-        }
-        let written = self
-            .total
-            .checked_sub(self.position)
-            .ok_or(Error::InvalidState)?
-            .min(output.len())
-            .min(64);
-        self.charge(now, 1, written)?;
-        let segments = self.segments()?;
-        let mut position = self.position;
-        if let Some(index) = self.selection.as_ref() {
-            for destination in output.get_mut(..written).ok_or(Error::InvalidState)? {
-                *destination = index.byte_at(position, segments)?;
-                position = position.checked_add(1).ok_or(Error::InvalidState)?;
-            }
-        } else {
-            for destination in output.get_mut(..written).ok_or(Error::InvalidState)? {
-                let mut offset = position;
-                let mut byte = None;
-                for segment in segments {
-                    if let Some(found) = segment.get(offset) {
-                        byte = Some(*found);
-                        break;
-                    }
-                    offset = offset
-                        .checked_sub(segment.len())
-                        .ok_or(Error::InvalidState)?;
-                }
-                *destination = byte.ok_or(Error::InvalidState)?;
-                position = position.checked_add(1).ok_or(Error::InvalidState)?;
-            }
-        }
-        self.position = position;
-        Ok(Progress {
-            written,
-            status: if self.position == self.total {
-                Status::Complete
-            } else {
-                Status::Yield
-            },
-        })
-    }
-    fn charge(&mut self, now: Tick, steps: u64, written: usize) -> Result<(), Error> {
+        let turn = self.core.plan(self.segments()?, output.len())?;
         let structure = &mut self
             .source
             .original
@@ -220,59 +140,11 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 'k> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l, 'p, 
             .source
             .projected
             .structure;
-        structure
-            .budget
-            .charge(structure.work, now, 0, steps, &mut self.credit)
-            .map_err(|error| {
-                Error::Original(crate::mime_response::bound::Error::Admission(error))
-            })?;
-        structure
-            .work
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    output_bytes: u64::try_from(written).map_err(|_| Error::InvalidState)?,
-                    ..Charge::default()
-                },
-            )
-            .map_err(|error| {
-                Error::Original(crate::mime_response::bound::Error::Admission(
-                    crate::nfc::Error::Work(error),
-                ))
-            })?;
-        Ok(())
-    }
-    fn index_step(&mut self, now: Tick) -> Result<Progress, Error> {
-        let index = self.selection.as_ref().ok_or(Error::InvalidState)?;
-        let fragment = self
-            .segments()?
-            .into_iter()
-            .next()
-            .ok_or(Error::InvalidState)?;
-        let count = index.remaining(fragment)?.min(64);
-        self.charge(
-            now,
-            u64::try_from(count).map_err(|_| Error::InvalidState)?,
-            0,
-        )?;
-        let mut index = self.selection.take().ok_or(Error::InvalidState)?;
-        let segments = self.segments()?;
-        let result = index.scan(segments, count).and_then(|()| {
-            if index.ready() {
-                Ok(Some(index.total(segments)?))
-            } else {
-                Ok(None)
-            }
-        });
-        self.selection = Some(index);
-        if let Some(total) = result? {
-            self.total = total;
-        }
-        Ok(Progress {
-            written: 0,
-            status: Status::Yield,
-        })
+        let charged = self
+            .core
+            .charge(turn, structure.work, structure.budget, now)?;
+        let segments = Self::segments_from(&self.source, self.ordinal)?;
+        self.core.emit(charged, segments, output)
     }
     pub fn finish(
         mut self,

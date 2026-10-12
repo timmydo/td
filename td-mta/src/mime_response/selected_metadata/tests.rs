@@ -51,13 +51,15 @@ fn drain(cursor: &mut Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_>, width: usize) 
         let before = costs(&cursor.inner);
         let scanning = cursor
             .inner
+            .core
             .selection
             .as_ref()
             .is_some_and(|index| !index.ready());
-        let credit = cursor.inner.credit.remaining();
+        let credit = cursor.inner.core.credit.remaining();
         let steps = if scanning {
             cursor
                 .inner
+                .core
                 .selection
                 .as_ref()
                 .unwrap()
@@ -409,7 +411,7 @@ fn interpretation_record_and_wire_refusals_precede_selected_copy() {
         with_bound(SIMPLE, 0, &clock, |bound| {
             let mut cursor = Cursor::new(bound, 1, properties(512), Tick(1)).unwrap();
             if kind == 2 {
-                while !cursor.inner.selection.as_ref().unwrap().ready() {
+                while !cursor.inner.core.selection.as_ref().unwrap().ready() {
                     cursor.poll(Tick(1), &mut [0; 64]).unwrap();
                 }
             }

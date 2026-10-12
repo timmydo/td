@@ -15,6 +15,7 @@ pub mod locators;
 pub mod metadata;
 #[path = "mime_response/metadata_collection.rs"]
 pub mod metadata_collection;
+pub(crate) mod metadata_core;
 #[path = "mime_response/metadata_json.rs"]
 pub mod metadata_json;
 #[path = "mime_response/metadata_json_window.rs"]
