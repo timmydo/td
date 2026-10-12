@@ -40,6 +40,12 @@ pub(crate) enum Notice {
     LoginKeys,
     /// The storage screen `S` opens (DESIGN.md, "Storage operations").
     DiskEncryption,
+    /// A protected machine's authorization choice for a login-key
+    /// operation (DESIGN.md, "Storage operations"): the disk proofs, and
+    /// for an addition or removal an enrolled key.
+    Authorize {
+        enrolled: bool,
+    },
     /// Removal digits: the enrolled key count and the chosen positions as
     /// bits, position 1 lowest.
     Removing {
@@ -79,8 +85,16 @@ pub(crate) enum Field {
 /// retries").
 const PIN_PROMPT: &str = "ENTER THE PIN FOR THIS KEY";
 const TOUCH_PROMPT: &str = "TOUCH YOUR KEY";
+/// The recovery-key profile's rows (td-compositor/DESIGN.md, "Storage
+/// operations").
+const RECOVERY_PROMPT: &str = "TYPE THE DISK RECOVERY KEY";
+const CHECKING_PROMPT: &str = "CHECKING THE RECOVERY KEY";
 /// The most masks the field shows: FIDO's longest PIN.
 const MASKS: usize = 63;
+/// The recovery-key profile's masks: its 48 digits, in groups of six one
+/// mask advance apart.
+const RECOVERY_MASKS: usize = 48;
+const RECOVERY_GROUP: usize = 6;
 /// A mask's side and advance in the prompt's font pixels, so that every
 /// mask fits one row inside the narrowest prompt's margins.
 const MASK_SIDE: usize = 3;
@@ -113,6 +127,8 @@ struct FieldRows {
     height: usize,
     pin: Vec<(usize, usize)>,
     touch: Vec<(usize, usize)>,
+    /// The recovery-key profile: its rows, and its masks grouped.
+    recovery: bool,
 }
 
 impl Prepared {
@@ -126,12 +142,35 @@ impl Prepared {
         Self::with_time(request, width, height, stride, None)
     }
 
+    /// At the doubled scale where the output allows it. A disk proof's
+    /// prompt (td-authd amendment 10) that cannot hold its rows and field
+    /// there falls back to the single scale, and only then; any other
+    /// prompt is refused as too tall.
     pub fn with_time(
         request: Request,
         width: usize,
         height: usize,
         stride: usize,
         remaining: Option<u64>,
+    ) -> Result<Self, String> {
+        let doubled = width >= 800 && height >= 600;
+        if !doubled || request.login_proof().is_none() {
+            let scale = if doubled { 2 } else { 1 };
+            return Self::at_scale(request, width, height, stride, remaining, scale);
+        }
+        match Self::at_scale(request.clone(), width, height, stride, remaining, 2) {
+            Ok(prepared) => Ok(prepared),
+            Err(_) => Self::at_scale(request, width, height, stride, remaining, 1),
+        }
+    }
+
+    fn at_scale(
+        request: Request,
+        width: usize,
+        height: usize,
+        stride: usize,
+        remaining: Option<u64>,
+        scale: usize,
     ) -> Result<Self, String> {
         let length = stride
             .checked_mul(height)
@@ -144,7 +183,6 @@ impl Prepared {
             return Err("output cannot hold a complete trusted prompt".into());
         }
         let font = crate::font::pinned()?;
-        let scale = if width >= 800 && height >= 600 { 2 } else { 1 };
         let cell_width = font
             .width()
             .checked_mul(scale)
@@ -234,10 +272,18 @@ impl Prepared {
             }
         }
         let field_rows = if request.login_step().is_some_and(|step| step.asks_pin()) {
+            let recovery =
+                request.login_step() == Some(crate::authority::consent::LoginStep::RecoveryKey);
+            let (pin, touch) = if recovery {
+                (RECOVERY_PROMPT, CHECKING_PROMPT)
+            } else {
+                (PIN_PROMPT, TOUCH_PROMPT)
+            };
             Some(FieldRows {
                 height: cell_height,
-                pin: ink(&font, PIN_PROMPT, scale)?,
-                touch: ink(&font, TOUCH_PROMPT, scale)?,
+                pin: ink(&font, pin, scale)?,
+                touch: ink(&font, touch, scale)?,
+                recovery,
             })
         } else {
             None
@@ -313,7 +359,8 @@ impl Prepared {
             Field::Pin(count) => (&rows.pin, usize::from(count)),
             Field::Touch => (&rows.touch, 0),
         };
-        if count > MASKS || !self.paint(frame, width, height, stride) {
+        let most = if rows.recovery { RECOVERY_MASKS } else { MASKS };
+        if count > most || !self.paint(frame, width, height, stride) {
             return false;
         }
         let white = [0xff, 0xff, 0xff, 0];
@@ -329,12 +376,18 @@ impl Prepared {
         }
         let side = MASK_SIDE * self.scale;
         for column in 0..count {
+            // A recovery key's masks skip one advance after each group.
+            let slot = if rows.recovery {
+                column + column / RECOVERY_GROUP
+            } else {
+                column
+            };
             ui::fill(
                 frame,
                 width,
                 height,
                 stride,
-                (24 + column * MASK_ADVANCE * self.scale, masks, side, side),
+                (24 + slot * MASK_ADVANCE * self.scale, masks, side, side),
                 white,
             );
         }
@@ -610,6 +663,7 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         Notice::LoginKeys => "LOGIN KEYS",
         Notice::StateUnknown => "LOGIN KEY STATE NOT KNOWN",
         Notice::DiskEncryption => "DISK ENCRYPTION",
+        Notice::Authorize { .. } => "AUTHORIZE WITH:",
         Notice::NotAvailable => "NOT AVAILABLE IN THIS BUILD",
         Notice::Uncertain(_) => "RESULT UNCERTAIN",
         Notice::Restarting => RESTARTING_NOTICE,
@@ -650,6 +704,14 @@ fn notice_rows(notice: Notice) -> Vec<String> {
         ],
         // One row per storage operation, in operation-byte order.
         Notice::DiskEncryption => &["U: UPDATE THE BOOT SELECTOR"],
+        Notice::Authorize { enrolled: true } => &[
+            "R: THE DISK RECOVERY KEY",
+            "S: A DISK SECURITY KEY",
+            "K: AN ENROLLED LOGIN KEY",
+        ],
+        Notice::Authorize { enrolled: false } => {
+            &["R: THE DISK RECOVERY KEY", "S: A DISK SECURITY KEY"]
+        }
         Notice::HostnameSaved => &["A RESTART COMPLETES THE CHANGE"],
         Notice::Uncertain(rows) => rows,
         _ => &[],
@@ -1242,6 +1304,8 @@ mod tests {
         Notice::LoginKeys,
         Notice::StateUnknown,
         Notice::DiskEncryption,
+        Notice::Authorize { enrolled: true },
+        Notice::Authorize { enrolled: false },
         Notice::NotAvailable,
         Notice::Removing {
             keys: 8,
@@ -1635,7 +1699,7 @@ mod tests {
             b"\x06tester",
             &[host],
             hostname.as_bytes(),
-            &[revocation, 0],
+            &[revocation, 0, 0],
         ]
         .concat();
         login.answer(&bytes).unwrap();
@@ -1891,9 +1955,13 @@ mod tests {
         let mut expected = prompt.pixels.clone();
         let white = [0xff, 0xff, 0xff, 0];
         let text = prompt.foot + 4 * scale;
-        let (line, count) = match field {
-            Field::Pin(count) => ("ENTER THE PIN FOR THIS KEY", usize::from(count)),
-            Field::Touch => ("TOUCH YOUR KEY", 0),
+        let recovery =
+            prompt.request.login_step() == Some(crate::authority::consent::LoginStep::RecoveryKey);
+        let (line, count) = match (field, recovery) {
+            (Field::Pin(count), false) => ("ENTER THE PIN FOR THIS KEY", usize::from(count)),
+            (Field::Touch, false) => ("TOUCH YOUR KEY", 0),
+            (Field::Pin(count), true) => ("TYPE THE DISK RECOVERY KEY", usize::from(count)),
+            (Field::Touch, true) => ("CHECKING THE RECOVERY KEY", 0),
         };
         for (column, character) in line.chars().enumerate() {
             let glyph = font.index(character);
@@ -1909,10 +1977,217 @@ mod tests {
         }
         let masks = text + font.height() * scale + 4 * scale;
         for column in 0..count {
-            let rect = (24 + column * 4 * scale, masks, 3 * scale, 3 * scale);
+            // Eight groups of six, one advance between groups.
+            let slot = if recovery {
+                column + column / 6
+            } else {
+                column
+            };
+            let rect = (24 + slot * 4 * scale, masks, 3 * scale, 3 * scale);
             ui::fill(&mut expected, width, height, stride, rect, white);
         }
         expected
+    }
+
+    /// The three disk-proof steps whose prompt and field a 768-row output
+    /// cannot hold at the doubled scale: a recovery-key or disk-key
+    /// one-key enrollment's first step, and a recovery-key removal leaving
+    /// one key.
+    fn tallest_proof_steps() -> Vec<Request> {
+        use crate::authority::consent::{ApprovalKey, LoginStep, Proof, Slot};
+        let approval = Some(ApprovalKey::new(*b"99").unwrap());
+        let enroll = |step, proof| Operation::LoginEnroll {
+            account: 65533,
+            before: 0,
+            after: 1,
+            key: 1,
+            step,
+            approval,
+            proof: Some(proof),
+        };
+        [
+            enroll(LoginStep::RecoveryKey, Proof::RecoveryKey),
+            enroll(LoginStep::DiskIdentify, Proof::DiskKey),
+            Operation::LoginRemove {
+                account: 65533,
+                before: 8,
+                after: 1,
+                removed: (1..=7)
+                    .map(|position| Slot {
+                        position,
+                        key: [0xff; 4],
+                    })
+                    .collect(),
+                step: LoginStep::RecoveryKey,
+                approval,
+                proof: Some(Proof::RecoveryKey),
+            },
+        ]
+        .into_iter()
+        .map(|operation| Request::new([1; 32], 65533, operation).unwrap())
+        .collect()
+    }
+
+    /// A disk proof's prompt that the doubled scale cannot hold with its
+    /// field falls back to the single scale, and only then: at 1024x768
+    /// and 1280x800 the three tallest are refused doubled and shown single
+    /// (the one-key recovery-key enrollment's at both, the others at 768
+    /// rows), every other proof step stays doubled, and no ordinary prompt
+    /// ever falls back. At the single scale the field still masks: its
+    /// row, one square per byte and no digit, the prompt untouched.
+    #[test]
+    fn only_a_disk_proof_prompt_falls_back_to_the_single_scale() {
+        for (width, height) in [(1024, 768), (1280, 800)] {
+            for (index, step) in tallest_proof_steps().iter().enumerate() {
+                let ceiling = step.login_ceiling().unwrap().as_secs();
+                let doubled =
+                    Prepared::at_scale(step.clone(), width, height, width * 4, Some(ceiling), 2);
+                let prompt = pin_prompt(step, width, height).unwrap();
+                // Only the recovery-key enrollment's is refused at 800 rows.
+                if height == 768 || index == 0 {
+                    assert!(doubled.is_err(), "{index} {width}x{height}");
+                    assert_eq!(prompt.scale, 1, "{index}");
+                } else {
+                    assert!(doubled.is_ok() && prompt.scale == 2, "{index}");
+                }
+                if prompt.field_rows.is_some() {
+                    let gap = 4 * prompt.scale;
+                    let rows = (prompt.foot + gap) * width * 4;
+                    for field in [Field::Pin(0), Field::Pin(48), Field::Touch] {
+                        let mut painted = vec![0; width * 4 * height];
+                        assert!(prompt.paint_field(&mut painted, width, height, width * 4, field));
+                        assert!(painted[..rows] == prompt.pixels[..rows]);
+                        assert!(painted == expected_field(&prompt, field), "{field:?}");
+                    }
+                }
+            }
+            for step in recovery_steps() {
+                let prompt = pin_prompt(&step, width, height).unwrap();
+                // None of these is the one-key enrollment.
+                let tall = height == 768 && tallest_proof_steps().contains(&step);
+                assert_eq!(prompt.scale == 1, tall, "{width}x{height}");
+            }
+            // Every ordinary PIN step is doubled where it is shown at all.
+            for step in pin_steps() {
+                if let Some(prompt) = pin_prompt(&step, width, height) {
+                    assert_eq!(prompt.scale, 2);
+                }
+            }
+        }
+        // An ordinary prompt too tall doubled is refused, not shrunk: at
+        // 800x600 a one-key enrollment's disclosure, which single scale
+        // would hold.
+        let enroll = Request::new(
+            [1; 32],
+            65533,
+            Operation::LoginEnroll {
+                account: 65533,
+                before: 0,
+                after: 1,
+                key: 1,
+                step: crate::authority::consent::LoginStep::Connect,
+                approval: Some(crate::authority::consent::ApprovalKey::new(*b"99").unwrap()),
+                proof: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pin_prompt(&enroll, 800, 600).map(|prompt| prompt.scale),
+            None
+        );
+        assert!(Prepared::at_scale(enroll, 800, 600, 3200, Some(240), 1).is_ok());
+    }
+
+    /// Every recovery-key step: an enrollment, addition or removal by the
+    /// recovery key, at its widest counts.
+    fn recovery_steps() -> Vec<Request> {
+        use crate::authority::consent::{LoginStep, Proof, Slot, LOGIN_KEYS};
+        let step = LoginStep::RecoveryKey;
+        let proof = Some(Proof::RecoveryKey);
+        let approval = Some(crate::authority::consent::ApprovalKey::new(*b"99").unwrap());
+        let removed: Vec<Slot> = (1..=LOGIN_KEYS)
+            .map(|position| Slot {
+                position,
+                key: [0xff; 4],
+            })
+            .collect();
+        [
+            Operation::LoginEnroll {
+                account: 65533,
+                before: 0,
+                after: 2,
+                key: 1,
+                step,
+                approval,
+                proof,
+            },
+            Operation::LoginAdd {
+                account: 65533,
+                before: 7,
+                after: 8,
+                step,
+                proof,
+            },
+            Operation::LoginRemove {
+                account: 65533,
+                before: 8,
+                after: 1,
+                removed: removed[..7].to_vec(),
+                step,
+                approval,
+                proof,
+            },
+            Operation::LoginRemove {
+                account: 65533,
+                before: 8,
+                after: 6,
+                removed: removed[..2].to_vec(),
+                step,
+                approval: None,
+                proof,
+            },
+        ]
+        .into_iter()
+        .map(|operation| Request::new([1; 32], 65533, operation).unwrap())
+        .collect()
+    }
+
+    /// The recovery-key profile (DESIGN.md, "Storage operations"): its row
+    /// names the recovery key, its 48 masks stand in eight groups of six,
+    /// 220 prompt pixels from 24 in, so the row fits from 320 wide, and its
+    /// touch row is the check's. The prompt above keeps its pixels, and a
+    /// 49th mask is refused.
+    #[test]
+    fn the_recovery_key_field_groups_its_48_masks_in_sixes() {
+        for (width, height) in [(320, 240), (1280, 800)] {
+            let prompts: Vec<Prepared> = recovery_steps()
+                .iter()
+                .filter_map(|step| pin_prompt(step, width, height))
+                .collect();
+            assert!(!prompts.is_empty());
+            if width == 1280 {
+                assert_eq!(prompts.len(), recovery_steps().len());
+            }
+            for prompt in &prompts {
+                assert!(prompt.holds_field());
+                for field in (0..=48).map(Field::Pin).chain([Field::Touch]) {
+                    let mut painted = vec![0; width * 4 * height];
+                    assert!(prompt.paint_field(&mut painted, width, height, width * 4, field));
+                    assert!(painted == expected_field(prompt, field), "{field:?}");
+                }
+                let mut painted = vec![0; width * 4 * height];
+                assert!(!prompt.paint_field(
+                    &mut painted,
+                    width,
+                    height,
+                    width * 4,
+                    Field::Pin(49)
+                ));
+                // The masks row ends 24 plus 219 advances' pixels in, inside
+                // the right margin.
+                assert!(24 + 219 * prompt.scale <= width - 24);
+            }
+        }
     }
 
     /// The field goes beneath the presented step's prompt and leaves it

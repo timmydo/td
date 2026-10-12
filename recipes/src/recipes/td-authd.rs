@@ -139,6 +139,14 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../../../td-authd/tests/storage.rs"),
     ),
     (
+        "src/proof.rs",
+        include_str!("../../../td-authd/src/proof.rs"),
+    ),
+    (
+        "tests/proof.rs",
+        include_str!("../../../td-authd/tests/proof.rs"),
+    ),
+    (
         "src/consent.rs",
         include_str!("../../../td-authd/src/consent.rs"),
     ),

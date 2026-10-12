@@ -324,6 +324,10 @@ struct KeyBindings {
     pointer_pending: BTreeSet<usize>,
     pointer_pressed: BTreeSet<(usize, u16)>,
     pointer_forwarded: BTreeSet<u16>,
+    /// Tests only: this build read as a production one, whose
+    /// `DISK_PROOFS` is false.
+    #[cfg(test)]
+    production: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -334,6 +338,10 @@ enum LoginScreen {
     Removing(crate::secret_client::Removal),
     /// The storage screen (DESIGN.md, "Storage operations").
     Storage,
+    /// A protected machine's authorization choice for the login-key
+    /// operation chosen (DESIGN.md, "Storage operations"), which is not
+    /// yet the lifetime's selection.
+    Authorize(crate::secret_client::LoginSelection),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -674,9 +682,31 @@ impl KeyBindings {
         {
             return;
         }
+        if let LoginScreen::Authorize(chosen) = &self.login_screen {
+            use crate::authority::consent::Proof;
+            let proof = match code {
+                KEY_R => Some(Proof::RecoveryKey),
+                KEY_S => Some(Proof::DiskKey),
+                // An enrolled key, the ordinary path, for an addition or
+                // removal: no first enrollment has one.
+                KEY_K if !matches!(chosen, LoginSelection::Enroll(_)) => {
+                    decision.secret = Some(Selection::Login(chosen.clone()));
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(proof) = proof {
+                decision.secret = Some(Selection::Login(LoginSelection::Proven(
+                    proof,
+                    Box::new(chosen.clone()),
+                )));
+            }
+            return;
+        }
         if let LoginScreen::Removing(removal) = &mut self.login_screen {
             if code == KEY_ENTER {
-                decision.secret = removal.selection().map(Selection::Login);
+                let chosen = removal.selection();
+                decision.secret = self.authorize(chosen, decision);
             } else if digit(code).is_some_and(|position| removal.toggle(position)) {
                 decision.notice = Some(removal.shown());
             }
@@ -691,9 +721,9 @@ impl KeyBindings {
         }
         if self.login_screen == LoginScreen::Menu {
             decision.secret = match code {
-                KEY_1 => Some(Selection::Login(LoginSelection::Enroll(1))),
-                KEY_2 => Some(Selection::Login(LoginSelection::Enroll(2))),
-                KEY_A => Some(Selection::Login(LoginSelection::Add)),
+                KEY_1 => self.authorize(Some(LoginSelection::Enroll(1)), decision),
+                KEY_2 => self.authorize(Some(LoginSelection::Enroll(2)), decision),
+                KEY_A => self.authorize(Some(LoginSelection::Add), decision),
                 KEY_D => {
                     use crate::authority::LoginState;
                     let state = self.login.state();
@@ -756,6 +786,44 @@ impl KeyBindings {
         };
     }
 
+    /// Whether this build sends a disk proof's `1b 0b`: td-authd decodes
+    /// one only where its `storage::OPERATIONS` is set, which
+    /// `DISK_PROOFS` equals.
+    fn disk_proofs(&self) -> bool {
+        #[cfg(test)]
+        if self.production {
+            return false;
+        }
+        crate::secret_client::DISK_PROOFS
+    }
+
+    /// A first enrollment, addition or removal chosen on the key-management
+    /// screen: selected at once, or while root's last `1a` answer's
+    /// protected byte reads `01` the authorization choice's screen, which
+    /// selects nothing yet (DESIGN.md, "Storage operations"). A build that
+    /// sends no disk proof ignores the byte, so its choices are as before.
+    fn authorize(
+        &mut self,
+        chosen: Option<crate::secret_client::LoginSelection>,
+        decision: &mut KeyDecision,
+    ) -> Option<crate::secret_client::Selection> {
+        use crate::secret_client::{LoginSelection, Selection};
+        let chosen = chosen?;
+        let protected = self
+            .login
+            .current()
+            .as_ref()
+            .is_some_and(crate::authority::Answer::protected);
+        if !protected || !self.disk_proofs() {
+            return Some(Selection::Login(chosen));
+        }
+        decision.notice = Some(crate::attention::Notice::Authorize {
+            enrolled: !matches!(chosen, LoginSelection::Enroll(_)),
+        });
+        self.login_screen = LoginScreen::Authorize(chosen);
+        None
+    }
+
     /// An approval-key digit for a fresh press from a device secure
     /// attention reads: a number-row 2 to 9, as its ASCII digit, with no
     /// Control, Alt or Super held on such a device. Shift is allowed, for
@@ -795,10 +863,12 @@ impl KeyBindings {
         {
             return None;
         }
-        match code {
-            KEY_ENTER | KEY_KPENTER => Some(FieldKey::Submit),
-            KEY_BACKSPACE => Some(FieldKey::Erase),
-            _ => pin_byte(code, held(KEY_LEFTSHIFT, KEY_RIGHTSHIFT)).map(FieldKey::Byte),
+        let byte = pin_byte(code, held(KEY_LEFTSHIFT, KEY_RIGHTSHIFT));
+        match (code, byte, recovery_digit(code)) {
+            (KEY_ENTER | KEY_KPENTER, ..) => Some(FieldKey::Submit),
+            (KEY_BACKSPACE, ..) => Some(FieldKey::Erase),
+            (_, Some(byte), Some(digit)) => Some(FieldKey::Digit { byte, digit }),
+            (_, byte, _) => byte.map(FieldKey::Byte),
         }
     }
 
@@ -2781,6 +2851,22 @@ fn digit(code: u16) -> Option<u8> {
         return None;
     }
     u8::try_from(code.checked_sub(KEY_1)?.checked_add(1)?).ok()
+}
+
+/// The digit a key names for the recovery-key profile: a number-row digit
+/// at either Shift level, or a keypad digit whatever NumLock says, as the
+/// PIN profile types the keypad. Attention reads no lock key, so a NumLock
+/// state from before it must not decide what the field takes.
+fn recovery_digit(code: u16) -> Option<u8> {
+    let digit = match code {
+        KEY_1..=KEY_9 => code - KEY_1 + 1,
+        KEY_0 | KEY_KP0 => 0,
+        KEY_KP1..=KEY_KP3 => code - KEY_KP1 + 1,
+        KEY_KP4..=KEY_KP6 => code - KEY_KP4 + 4,
+        KEY_KP7..=KEY_KP9 => code - KEY_KP7 + 7,
+        _ => return None,
+    };
+    u8::try_from(digit).ok().map(|digit| b'0' + digit)
 }
 
 /// The PIN field's byte for `code`, or none for a key that types nothing.
@@ -9999,13 +10085,199 @@ mod tests {
     fn login_answer(keys: &[[u8; 4]]) -> crate::authority::Login {
         let mut answer = vec![0x9a, 1, keys.len() as u8];
         answer.extend(keys.iter().flatten());
-        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00\x00");
+        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00\x00\x00");
         let login = crate::authority::Login::default();
         login.answer(&answer).unwrap();
         login
     }
 
     const ENROLLED: [[u8; 4]; 3] = [[0xa1; 4], [0xa2; 4], [0xa3; 4]];
+
+    /// `login_answer` with root's protected byte (amendment 10).
+    fn protected_answer(keys: &[[u8; 4]], protected: bool) -> crate::authority::Login {
+        let mut answer = vec![0x9a, 1, keys.len() as u8];
+        answer.extend(keys.iter().flatten());
+        answer.extend_from_slice(b"\x06tester\x09td-laptop\x00\x00");
+        answer.push(u8::from(protected));
+        let login = crate::authority::Login::default();
+        login.answer(&answer).unwrap();
+        login
+    }
+
+    /// On a protected machine a choice of `1`, `2`, `A` or a removal's
+    /// Enter selects nothing yet: the authorization screen offers `R` and
+    /// `S`, and `K` for an addition or removal, and only that choice is
+    /// the lifetime's one selection. Where the byte reads `00` the screen
+    /// is as before.
+    #[test]
+    fn a_protected_machine_chooses_how_to_authorize_a_login_operation() {
+        use crate::attention::Notice;
+        use crate::authority::consent::{Proof, Slot};
+        use crate::secret_client::{LoginSelection, Selection};
+        let remove = LoginSelection::Remove(
+            vec![Slot {
+                position: 2,
+                key: ENROLLED[1],
+            }],
+            2,
+        );
+        let proven = |proof, selection: &LoginSelection| {
+            Selection::Login(LoginSelection::Proven(proof, Box::new(selection.clone())))
+        };
+        for (keys, selection, choice, selected) in [
+            (
+                &[KEY_1][..],
+                LoginSelection::Enroll(1),
+                KEY_R,
+                Some(Proof::RecoveryKey),
+            ),
+            (
+                &[KEY_2],
+                LoginSelection::Enroll(2),
+                KEY_S,
+                Some(Proof::DiskKey),
+            ),
+            // A first enrollment has no enrolled key to choose.
+            (&[KEY_1], LoginSelection::Enroll(1), KEY_K, None),
+            (&[KEY_A], LoginSelection::Add, KEY_S, Some(Proof::DiskKey)),
+            (&[KEY_A], LoginSelection::Add, KEY_K, None),
+            (
+                &[KEY_D, KEY_2, KEY_ENTER],
+                remove.clone(),
+                KEY_R,
+                Some(Proof::RecoveryKey),
+            ),
+            (&[KEY_D, KEY_2, KEY_ENTER], remove.clone(), KEY_K, None),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = Mutex::new(KeyBindings {
+                attention_enabled: true,
+                login: protected_answer(&ENROLLED, true),
+                ..KeyBindings::default()
+            });
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_K], 20));
+            read_reports(&target, &bindings, 0, &presses(keys, 30));
+            let enrolled = !matches!(selection, LoginSelection::Enroll(_));
+            {
+                let target = target.lock().unwrap();
+                assert_eq!(
+                    target.notices.last(),
+                    Some(&Notice::Authorize { enrolled }),
+                    "{selection:?}"
+                );
+                assert!(target.secret_roles.is_empty(), "{selection:?}");
+            }
+            read_reports(&target, &bindings, 0, &presses(&[choice], 60));
+            // Nothing more selects in this lifetime.
+            read_reports(
+                &target,
+                &bindings,
+                0,
+                &presses(&[KEY_R, KEY_S, KEY_K, KEY_1, KEY_A], 70),
+            );
+            let target = target.lock().unwrap();
+            let expected: Vec<Selection> = match (selected, choice) {
+                (Some(proof), _) => vec![proven(proof, &selection)],
+                (None, KEY_K) if enrolled => vec![Selection::Login(selection.clone())],
+                // `K` offers nothing for an enrollment, so `R` then chooses.
+                _ => vec![proven(Proof::RecoveryKey, &selection)],
+            };
+            assert_eq!(target.secret_roles, expected, "{selection:?}");
+        }
+        // The byte reading `00`: the choices select at once.
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings {
+            attention_enabled: true,
+            login: protected_answer(&ENROLLED, false),
+            ..KeyBindings::default()
+        });
+        read_reports(&target, &bindings, 0, &chord_reports(10));
+        read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_A], 20));
+        let target = target.lock().unwrap();
+        assert_eq!(target.secret_roles, [Selection::Login(LoginSelection::Add)]);
+        assert_eq!(target.notices, [Notice::LoginKeys]);
+    }
+
+    /// A build whose `DISK_PROOFS` is false, as production is until
+    /// td-install/ENCRYPTION.md's item 9, ignores the protected byte: each
+    /// choice selects at once, as before the byte existed, and no disk
+    /// proof is ever sent.
+    #[test]
+    fn a_build_without_disk_proofs_ignores_the_protected_byte() {
+        use crate::attention::Notice;
+        use crate::authority::consent::Slot;
+        use crate::secret_client::{LoginSelection, Selection};
+        let remove = LoginSelection::Remove(
+            vec![Slot {
+                position: 2,
+                key: ENROLLED[1],
+            }],
+            2,
+        );
+        for (keys, selected) in [
+            (&[KEY_1][..], LoginSelection::Enroll(1)),
+            (&[KEY_2], LoginSelection::Enroll(2)),
+            (&[KEY_A], LoginSelection::Add),
+            (&[KEY_D, KEY_2, KEY_ENTER], remove),
+        ] {
+            let target = Mutex::new(RecordingTarget::default());
+            let bindings = Mutex::new(KeyBindings {
+                attention_enabled: true,
+                login: protected_answer(&ENROLLED, true),
+                production: true,
+                ..KeyBindings::default()
+            });
+            read_reports(&target, &bindings, 0, &chord_reports(10));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_K], 20));
+            read_reports(&target, &bindings, 0, &presses(keys, 30));
+            read_reports(&target, &bindings, 0, &presses(&[KEY_R, KEY_S, KEY_K], 60));
+            let target = target.lock().unwrap();
+            assert_eq!(target.secret_roles, [Selection::Login(selected.clone())]);
+            assert!(!target
+                .notices
+                .iter()
+                .any(|notice| matches!(notice, Notice::Authorize { .. })));
+        }
+    }
+
+    /// The recovery-key profile's keys: a number-row digit at either Shift
+    /// level, and a keypad digit whatever NumLock says; every other key is
+    /// the PIN profile's byte alone.
+    #[test]
+    fn a_digit_key_names_its_digit_for_the_recovery_key_profile() {
+        use crate::secret_client::FieldKey;
+        let digit = |byte, digit| Some(FieldKey::Digit { byte, digit });
+        let mut bindings = KeyBindings::default();
+        assert_eq!(bindings.field_key(KEY_1), digit(b'1', b'1'));
+        assert_eq!(bindings.field_key(KEY_9), digit(b'9', b'9'));
+        assert_eq!(bindings.field_key(KEY_0), digit(b'0', b'0'));
+        assert_eq!(bindings.field_key(KEY_MINUS), Some(FieldKey::Byte(b'-')));
+        assert_eq!(bindings.field_key(KEY_SPACE), Some(FieldKey::Byte(b' ')));
+        assert_eq!(bindings.field_key(KEY_A), Some(FieldKey::Byte(b'a')));
+        for num_lock in [false, true] {
+            bindings.num_lock = num_lock;
+            assert_eq!(bindings.field_key(KEY_KP5), digit(b'5', b'5'));
+        }
+        for (code, value) in [
+            (KEY_KP0, b'0'),
+            (KEY_KP1, b'1'),
+            (KEY_KP3, b'3'),
+            (KEY_KP4, b'4'),
+            (KEY_KP6, b'6'),
+            (KEY_KP7, b'7'),
+            (KEY_KP9, b'9'),
+        ] {
+            assert_eq!(bindings.field_key(code), digit(value, value));
+        }
+        assert_eq!(bindings.field_key(KEY_KPMINUS), Some(FieldKey::Byte(b'-')));
+        bindings.pressed.insert((0, KEY_LEFTSHIFT));
+        assert_eq!(bindings.field_key(KEY_1), digit(b'!', b'1'));
+        assert_eq!(bindings.field_key(KEY_0), digit(b')', b'0'));
+        assert_eq!(bindings.field_key(KEY_MINUS), Some(FieldKey::Byte(b'_')));
+        assert_eq!(bindings.field_key(KEY_ENTER), Some(FieldKey::Submit));
+        assert_eq!(bindings.field_key(KEY_BACKSPACE), Some(FieldKey::Erase));
+    }
 
     #[test]
     fn key_management_selects_one_login_operation_per_lifetime() {
@@ -10088,19 +10360,19 @@ mod tests {
             // Unenrolled, and each cause of the unavailable state, as root
             // answers them.
             (
-                Some(&b"\x9a\x00\x06tester\x09td-laptop\x00\x00"[..]),
+                Some(&b"\x9a\x00\x06tester\x09td-laptop\x00\x00\x00"[..]),
                 Notice::Login(&["NO LOGIN KEYS ENROLLED"]),
             ),
             (
-                Some(&b"\x9a\x02\x0a\x06tester\x00\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0a\x06tester\x00\x00\x00\x01"[..]),
                 Notice::Login(unavailable("directory")),
             ),
             (
-                Some(&b"\x9a\x02\x0b\x06tester\x00\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0b\x06tester\x00\x00\x00\x01"[..]),
                 Notice::Login(unavailable("record")),
             ),
             (
-                Some(&b"\x9a\x02\x0c\x06tester\x00\x00\x00"[..]),
+                Some(&b"\x9a\x02\x0c\x06tester\x00\x00\x00\x01"[..]),
                 Notice::Login(unavailable("unreadable")),
             ),
             // No answer: the direct profile, which has no authority.
@@ -10134,12 +10406,12 @@ mod tests {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = attention_bindings(None);
         let login = bindings.lock().unwrap().login.clone();
-        login.answer(b"\x9a\x00\x06tester\x00\x00\x00").unwrap();
+        login.answer(b"\x9a\x00\x06tester\x00\x00\x00\x00").unwrap();
         // A later answer, taken by the worker's handle, is the one `D` reads.
         let mut answer = vec![0x9a, 1, 2];
         answer.extend_from_slice(&[0xb1; 4]);
         answer.extend_from_slice(&[0xb2; 4]);
-        answer.extend_from_slice(b"\x06tester\x00\x00\x00");
+        answer.extend_from_slice(b"\x06tester\x00\x00\x00\x00");
         login.answer(&answer).unwrap();
         read_reports(&target, &bindings, 0, &chord_reports(10));
         read_reports(&target, &bindings, 0, &presses(&[KEY_K, KEY_D, KEY_2], 20));
@@ -10862,6 +11134,35 @@ mod tests {
             target.field.open();
         }
         (target, bindings)
+    }
+
+    /// Through the whole device dispatcher: attention entered with NumLock
+    /// off, a recovery-key field open, NumLock pressed there, which
+    /// attention does not read, and the keypad still types each digit, as
+    /// it does with NumLock never touched.
+    #[test]
+    fn keypad_digits_type_the_recovery_key_whatever_numlock_says() {
+        for numlock in [false, true] {
+            let (target, bindings) = pin_field(&[]);
+            assert!(!bindings.lock().unwrap().num_lock);
+            target.lock().unwrap().field.open_for(true);
+            if numlock {
+                read_reports(&target, &bindings, 0, &presses(&[KEY_NUMLOCK], 30));
+            }
+            read_reports(
+                &target,
+                &bindings,
+                0,
+                &presses(
+                    &[
+                        KEY_KP0, KEY_KP1, KEY_KP2, KEY_KP3, KEY_KP4, KEY_KP5, KEY_KP6, KEY_KP7,
+                        KEY_KP8, KEY_KP9, KEY_KPDOT, KEY_KPPLUS,
+                    ],
+                    40,
+                ),
+            );
+            assert_eq!(typed(&target), b"0123456789", "{numlock}");
+        }
     }
 
     fn typed(target: &Mutex<RecordingTarget>) -> Vec<u8> {
@@ -12082,7 +12383,7 @@ mod tests {
 
     /// Root's `9a` for `state`, with the names `login_answer` gives.
     fn root_answer(state: &[u8]) -> Vec<u8> {
-        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00"].concat()
+        [&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00\x00"].concat()
     }
 
     /// TOKEN-LOGIN.md's D13: on a lock surface whose state is unavailable
@@ -12225,9 +12526,8 @@ mod tests {
         for (state, locks) in STATES {
             let login = crate::authority::Login::default();
             let mut answer = root_answer(state);
-            if let Some(admission) = answer.last_mut() {
-                *admission = 1;
-            }
+            let at = answer.len() - 2;
+            answer[at] = 1;
             login.answer(&answer).unwrap();
             assert!(login.current().unwrap().admitted());
             let mut bindings = KeyBindings {

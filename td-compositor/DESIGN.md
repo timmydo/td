@@ -6070,10 +6070,13 @@ draining; every other login step's receipt still follows its
 presentation, and the step after a disclosure carries no key. A live
 boot's whole-disk installation keeps its fresh Enter.
 
-A disclosure prompt is taller than any other login prompt. With its
+A disclosure prompt is taller than any other login prompt authorized
+by an enrolled key. With its
 time line a one-key enrollment's is 18 rows and a removal of seven of
 eight keys 16, so at the prompt's doubled scale they are shown whole
-from 768 rows of output (1024x768 and 1366x768 among them) and, at the
+from 768 rows of output (1024x768 and 1366x768 among them; a disk
+proof's prompt may instead fall back to the single scale there, "Storage
+operations") and, at the
 single scale below 800x600, at 640x480; on an 800x600 output the
 one-key enrollment's refuses as any prompt that cannot hold its rows
 does, and the operation fails before any token I/O, while a two-key
@@ -6353,14 +6356,17 @@ nothing but cancelling.
 ### Storage operations
 
 Fixed by `td-install/ENCRYPTION.md` increment 8e's documentation
-commit before their code. The storage screen and the selector update
-are implemented (`LoginSelection::SelectorUpdate`, polled as a login
-operation is, with its own end table); the disk proofs and the
-recovery-key profile are not yet. td-authd/DESIGN.md
-amendment 10 gives the wire, and ENCRYPTION.md the operations. Until
-that document's item 9, root refuses every storage operation and every
-disk proof in a production build, so these screens end at `NOT
-AVAILABLE IN THIS BUILD` there.
+commit before their code, and implemented: the storage screen and the
+selector update (`LoginSelection::SelectorUpdate`, polled as a login
+operation is, with its own end table), the disk proofs
+(`LoginSelection::Proven`) and the recovery-key profile.
+td-authd/DESIGN.md amendment 10 gives the wire, and ENCRYPTION.md the
+operations. Until that document's item 9, root refuses every storage
+operation in a production build and decodes no disk proof there, so
+the storage screen ends at `NOT AVAILABLE IN THIS BUILD`, and the
+client sends no disk proof: `secret_client::DISK_PROOFS` is
+`cfg!(test)`, as td-authd's `storage::OPERATIONS` is, a source test
+pins the two to the same value, and item 9 lifts both together.
 
 **The storage screen.** The attention menu gains `S: DISK ENCRYPTION`
 below `H`'s row, so every row above keeps its place and only `ESC TO
@@ -6425,7 +6431,10 @@ own paint and read under the same rules. `R` and `S` send `1b 0b 01`
 or `1b 0b 02` and the operation's selection, and `K` the ordinary
 `1b`. The operation is the lifetime's one selection only once this
 choice is made; Escape before it cancels nothing at root, since nothing
-was sent. While the byte reads `00` the screen is as before, and a
+was sent. A build without `DISK_PROOFS` ignores the byte, so its
+choices select at once as before and the authorization screen never
+shows; root's byte reads `01` before item 9 only where reading the
+marker failed, which ends a first enrollment with `84` as before. While the byte reads `00` the screen is as before, and a
 first enrollment's `1b` meets root's `84` on a protected machine whose
 marker appeared since. The client checks a disk proof's descriptions
 as a login operation's ("Login-key operations"), through consent's
@@ -6434,13 +6443,33 @@ the chosen proof in every step, and no identify or authorize. A
 removal's commit follows its last proof step. Root's `86` shows `THIS
 MACHINE HAS NO DISK PROOF`, and the storage worker's ends the rows
 TOKEN-LOGIN.md's "Enrollment, addition and removal" adds to its
-"Failure texts". The ceilings are amendment 10's.
+"Failure texts". The ceilings are amendment 10's. Root's `86` and the
+volume's `21` come only before any description, `20` at any point, `25`
+only after a recovery-key step's description and `26` and `28` only
+after a description, `28` definite; a proof's enrollment never ends
+`84`. Any other end is a violation.
+
+A disk proof's prompt is taller than its operation's: it adds the
+proof's row, and a recovery-key enrollment or one-key removal discloses
+on the step that also opens the field. So a disk proof's prompt that
+cannot hold its rows and its field at the doubled scale is prepared at
+the single scale instead, and only then (`Prepared::with_time`); one
+the single scale cannot hold either is refused as too small, and no
+other prompt ever falls back. At 768 rows of output a one-key
+enrollment's first proof step, either proof, and a recovery-key removal
+leaving one key fall back; at 1280x800 the one-key recovery-key
+enrollment's still does, needing 875 rows doubled; every other proof
+step stays doubled. The prompt is the whole trusted screen at either
+scale: the field goes beneath it in the prompt's font, masks only, and
+a single-scale prompt's band and refusal are the PIN field's.
 
 **The recovery-key profile.** Root's `0c` for a recovery-key step opens
 the PIN field in its recovery-key profile; everything "The PIN field"
 says holds but the following. Its row is `TYPE THE DISK RECOVERY KEY`.
 It types only digits: a number-row digit, at either Shift level, and a
-keypad digit while NumLock types one; every other key, Space and a
+keypad digit whatever NumLock says, as the PIN profile types the keypad.
+Attention reads no lock key, so a NumLock state from before it cannot
+decide what the field takes. Every other key, Space and a
 hyphen included, is ignored rather than typed, so the field holds the
 48 passphrase digits td-protector's codec admits without separators
 (td-protector/DESIGN.md, "Recovery key"). Backspace erases one digit;
@@ -6457,13 +6486,17 @@ it as `26`. A disk authorize step opens the field in its ordinary PIN
 profile and then shows `TOUCH YOUR KEY`, as a login authorize step
 does.
 
-Host tests are to drive a selector update's whole status sequence to
-each form's success and every end in the table, a key typed before
+Host tests drive a selector update's whole status sequence to each
+form's success and every end in the table, a key typed before
 presentation and a wrong digit, the storage screen's choices and their
 refusal outside attention, before the screen is on glass and from a
 security key's own keyboard, the protected byte's choices and their
-absence, each disk proof's sequence for all three operations, the
-recovery-key profile's keys, bounds, masks and zeroing, and `86`.
+absence, `R` and `S` in a build without disk proofs, each disk proof's
+whole sequence for all three operations at 1024x768, its ends where
+root can and cannot send them, the recovery-key profile's keys, bounds,
+masks and zeroing, the single-scale fallback at 1024x768 and 1280x800
+with its masked field, and an ordinary prompt's refusal rather than
+fallback (verified red).
 
 ### The lock surface
 

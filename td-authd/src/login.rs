@@ -2,8 +2,8 @@
 //! login-operation` (td-login/TOKEN-LOGIN.md): root's side of its frames.
 
 use crate::consent::{
-    Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY,
-    LOGIN_KEYS, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+    Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Proof, Request, Slot, LOGIN_CEREMONY,
+    LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
 };
 use crate::login_status::login_state::Owner;
 use crate::unlock::{command, deadline_after, Event, Wire};
@@ -48,11 +48,13 @@ pub(crate) const ENROLLED: u8 = 0x82;
 /// A removal whose slots are not the record's.
 pub(crate) const SELECTION: u8 = 0x83;
 /// On a protected machine (td-login/TOKEN-LOGIN.md, "Enrollment, addition
-/// and removal"): a first enrollment, whose only authorization there is a
-/// disk proof, which this build does not offer.
+/// and removal"): a first enrollment without a disk proof, its only
+/// authorization there.
 pub(crate) const PROOF: u8 = 0x84;
 /// On a protected machine: a removal of every key.
 pub(crate) const LAST: u8 = 0x85;
+/// A disk proof on a machine that is not protected (amendment 10).
+pub(crate) const NO_PROOF: u8 = 0x86;
 
 /// The login operation the paired peer selects; root derives the rest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +66,11 @@ pub(crate) enum Selection {
     /// Positions in the record's canonical order, with the fingerprints the
     /// key-management screen showed for them.
     Remove(Vec<Slot>),
+    /// `1b 0b P`: a first enrollment, addition or removal authorized by a
+    /// disk proof (amendment 10). Decoded only where `storage::OPERATIONS`
+    /// is set, so until td-install/ENCRYPTION.md's item 9 a production
+    /// build reads one as a protocol violation.
+    Proven(Proof, Box<Selection>),
 }
 
 impl Selection {
@@ -74,6 +81,15 @@ impl Selection {
             [7] => Ok(Self::Unlock),
             [8, keys @ (1 | 2)] => Ok(Self::Enroll(*keys)),
             [9] => Ok(Self::Add),
+            [11, proof, rest @ ..] if crate::storage::OPERATIONS => {
+                let proof = Proof::from_byte(*proof).ok_or("invalid disk proof")?;
+                match Self::decode(rest)? {
+                    inner @ (Self::Enroll(_) | Self::Add | Self::Remove(_)) => {
+                        Ok(Self::Proven(proof, Box::new(inner)))
+                    }
+                    _ => Err("a disk proof authorizes no such operation".into()),
+                }
+            }
             [10, count, rest @ ..]
                 if (1..=LOGIN_KEYS).contains(count) && rest.len() == usize::from(*count) * 5 =>
             {
@@ -117,6 +133,16 @@ impl Selection {
             Self::Enroll(1) | Self::Remove(_) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
             Self::Add => LOGIN_TWO_CEREMONIES,
             Self::Enroll(_) => LOGIN_TWO_KEY_ENROLLMENT,
+            // The proof counts as one more ceremony.
+            Self::Proven(..) => LOGIN_LONGEST,
+        }
+    }
+
+    /// The disk proof that authorizes this selection, if any.
+    pub fn proof(&self) -> Option<Proof> {
+        match self {
+            Self::Proven(proof, _) => Some(*proof),
+            _ => None,
         }
     }
 
@@ -130,18 +156,30 @@ impl Selection {
         key: ApprovalKey,
         protected: bool,
     ) -> Result<Operation, u8> {
+        let (selection, proof) = match self {
+            Self::Proven(proof, inner) => (inner.as_ref(), Some(*proof)),
+            other => (other, None),
+        };
+        // A proof's first step replaces identify, and an enrollment's
+        // connect.
+        let first = |ordinary| match proof {
+            Some(Proof::RecoveryKey) => LoginStep::RecoveryKey,
+            Some(Proof::DiskKey) => LoginStep::DiskIdentify,
+            None => ordinary,
+        };
         let count = u8::try_from(baseline.len()).map_err(|_| INTERNAL)?;
-        let operation = match self {
+        let operation = match selection {
+            Self::Proven(..) => return Err(INTERNAL),
             Self::Enroll(_) if count != 0 => return Err(ENROLLED),
-            Self::Enroll(_) if protected => return Err(PROOF),
+            Self::Enroll(_) if protected && proof.is_none() => return Err(PROOF),
             Self::Enroll(after) => Operation::LoginEnroll {
                 account: owner,
                 before: 0,
                 after: *after,
                 key: 1,
-                step: LoginStep::Connect,
+                step: first(LoginStep::Connect),
                 approval: None,
-                proof: None,
+                proof,
             },
             _ if count == 0 => return Err(NO_RECORD),
             Self::Unlock => Operation::LoginUnlock {
@@ -156,8 +194,8 @@ impl Selection {
                 account: owner,
                 before: count,
                 after: count.checked_add(1).ok_or(INTERNAL)?,
-                step: LoginStep::Identify,
-                proof: None,
+                step: first(LoginStep::Identify),
+                proof,
             },
             Self::Remove(removed) if protected && removed.len() >= usize::from(count) => {
                 return Err(LAST)
@@ -170,9 +208,9 @@ impl Selection {
                     .and_then(|after| u8::try_from(after).ok())
                     .ok_or(SELECTION)?,
                 removed: removed.clone(),
-                step: LoginStep::Identify,
+                step: first(LoginStep::Identify),
                 approval: None,
-                proof: None,
+                proof,
             },
         };
         // A first enrollment's first step, and a removal's that leaves at
@@ -185,7 +223,7 @@ impl Selection {
 /// or this boot's `run/td-admit` exists there (td-install/ENCRYPTION.md,
 /// "Verified account handoff"). A directory or a name that cannot be read
 /// counts as protected, never as unprotected.
-fn protected(root: &Path, owner: Owner) -> bool {
+pub(crate) fn protected(root: &Path, owner: Owner) -> bool {
     use crate::login_status::login_state::{boot_protected, directory, Directory, PROTECTED};
     boot_protected(root)
         || Directory::open(&directory(root), owner)
@@ -199,6 +237,23 @@ fn approval_key(bytes: [u8; 2]) -> Result<ApprovalKey, String> {
     ApprovalKey::new(bytes.map(|byte| b'2' + byte % 8))
 }
 
+/// A login operation's nonce and the key its disclosure step carries,
+/// drawn together.
+pub(crate) fn draw() -> Result<([u8; 32], ApprovalKey), String> {
+    let mut nonce = [0; 32];
+    let mut key = [0; 2];
+    File::open("/dev/urandom")
+        .and_then(|mut random| {
+            random.read_exact(&mut nonce)?;
+            random.read_exact(&mut key)
+        })
+        .map_err(|_| "read login request randomness")?;
+    if nonce == [0; 32] {
+        return Err("zero login request nonce".into());
+    }
+    Ok((nonce, approval_key(key)?))
+}
+
 /// A PIN on its way to the worker, zeroed when dropped.
 #[derive(PartialEq, Eq)]
 pub(crate) struct Pin(Vec<u8>);
@@ -210,6 +265,11 @@ impl Pin {
             return Err("login PIN is outside its profile".into());
         }
         Ok(Self(bytes.to_vec()))
+    }
+
+    /// The bytes the worker's frame carries.
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -241,6 +301,9 @@ pub(crate) struct End {
 enum Phase {
     /// Waiting for the worker's baseline.
     Baseline,
+    /// A disk proof runs in the storage worker; the worker waits for its
+    /// first frame, the proof's last step, which `resume` sends.
+    Proving,
     /// Root's first step is queued; waiting for its invitation.
     Description,
     /// An invitation awaits its presentation acknowledgement.
@@ -279,6 +342,8 @@ pub(crate) struct Login {
     baseline: Vec<Fingerprint>,
     /// The current step's description, from root's first step on.
     request: Option<Request>,
+    /// A disk proof's first step, from the baseline until `resume`.
+    proven: Option<Request>,
     /// The credential the current key's ceremony created, from its prove step.
     created: Option<Fingerprint>,
     /// Whether the current step is the operation's final one.
@@ -324,33 +389,41 @@ fn failure(frame: &[u8]) -> Option<(u8, u8)> {
 impl Login {
     /// Call only after root startup and paired-session admission.
     pub fn start(owner: u32, selection: Selection) -> Result<Self, String> {
+        let (nonce, approval) = draw()?;
+        Self::begin_with(
+            owner,
+            nonce,
+            approval,
+            selection,
+            protected(Path::new("/"), Owner::ROOT),
+        )
+    }
+
+    /// `start` with its draw and its read of the protected marker made by
+    /// the caller, as a disk proof's (`proof::Proving`) are.
+    pub(crate) fn begin_with(
+        owner: u32,
+        nonce: [u8; 32],
+        approval: ApprovalKey,
+        selection: Selection,
+        protected: bool,
+    ) -> Result<Self, String> {
         if owner != 1000 {
             return Err("login supervisor requires the configured graphical session".into());
-        }
-        let mut nonce = [0; 32];
-        let mut key = [0; 2];
-        File::open("/dev/urandom")
-            .and_then(|mut random| {
-                random.read_exact(&mut nonce)?;
-                random.read_exact(&mut key)
-            })
-            .map_err(|_| "read login request randomness")?;
-        if nonce == [0; 32] {
-            return Err("zero login request nonce".into());
         }
         Self::spawn(
             owner,
             nonce,
-            approval_key(key)?,
+            approval,
             selection,
-            protected(Path::new("/"), Owner::ROOT),
+            protected,
             command("login-operation", owner),
         )
     }
 
     /// The deadline counts from before the worker starts, so it ends no
     /// later than the worker's, whose commit margin leaves the write room.
-    fn spawn(
+    pub(crate) fn spawn(
         owner: u32,
         nonce: [u8; 32],
         approval: ApprovalKey,
@@ -379,6 +452,7 @@ impl Login {
             phase: Phase::Baseline,
             baseline: Vec::new(),
             request: None,
+            proven: None,
             created: None,
             last: false,
             round: Vec::new(),
@@ -399,6 +473,52 @@ impl Login {
     /// None until the worker's baseline lets root derive its first step.
     pub fn request(&self) -> Option<&Request> {
         self.request.as_ref()
+    }
+
+    /// While a disk proof runs: its first step as the login record admits
+    /// it, the record's slot fingerprints, and root's operation deadline.
+    pub fn proving(&self) -> Option<(&Request, &[Fingerprint], Instant)> {
+        match (self.phase, &self.proven) {
+            (Phase::Proving, Some(first)) => Some((first, &self.baseline, self.deadline)),
+            _ => None,
+        }
+    }
+
+    /// The storage worker proved `proved`, the proof's last step, and
+    /// exited: the worker's first frame, which it admits by consent's
+    /// `begin_proven` as root does here. A removal's commit follows it;
+    /// otherwise the new key's connect.
+    pub fn resume(&mut self, proved: &Request) -> Result<(), String> {
+        // The proof's one step, or its successor: the same operation.
+        let admitted = match (self.phase, &self.proven) {
+            (Phase::Proving, Some(first))
+                if first == proved || first.login_successor(proved).is_ok() =>
+            {
+                Request::begin_proven(
+                    self.nonce,
+                    self.owner,
+                    proved.operation().clone(),
+                    &self.baseline,
+                )
+                .ok()
+                .filter(|(request, _)| request == proved)
+                .map(|(_, admitted)| admitted)
+            }
+            _ => None,
+        };
+        let Some(admitted) = admitted else {
+            self.stop(INTERNAL, 0)?;
+            return Err("disk proof resumed at another step".into());
+        };
+        self.wire
+            .as_mut()
+            .ok_or("missing login endpoint")?
+            .queue(&proved.encode())?;
+        self.proven = None;
+        self.last = admitted == Admitted::Last;
+        self.request = Some(proved.clone());
+        self.phase = Phase::Running;
+        Ok(())
     }
 
     /// A disclosure step's receipt follows its approval key, which the
@@ -620,17 +740,25 @@ impl Login {
     /// sees any description and so before any token I/O.
     fn begin(&mut self, frame: &[u8]) -> Result<Event, String> {
         let baseline = baseline(frame).ok_or("malformed login baseline")?;
+        let proof = self.selection.proof();
         let refused =
             match self
                 .selection
                 .operation(self.owner, &baseline, self.approval, self.protected)
             {
                 Err(kind) => Err(kind),
-                Ok(operation) => Request::begin_login(self.nonce, self.owner, operation, &baseline)
-                    .map_err(|_| match self.selection {
-                        Selection::Remove(_) => SELECTION,
-                        _ => INTERNAL,
-                    }),
+                Ok(operation) => if proof.is_some() {
+                    Request::begin_proof_shape(self.nonce, self.owner, operation, &baseline)
+                } else {
+                    Request::begin_login(self.nonce, self.owner, operation, &baseline)
+                }
+                .map_err(|_| match self.selection {
+                    Selection::Remove(_) => SELECTION,
+                    Selection::Proven(_, ref inner) if matches!(**inner, Selection::Remove(_)) => {
+                        SELECTION
+                    }
+                    _ => INTERNAL,
+                }),
             };
         let request = match refused {
             Ok(request) => request,
@@ -646,11 +774,17 @@ impl Login {
                 .checked_add(ceiling)
                 .ok_or("login deadline overflow")?,
         );
+        self.baseline = baseline;
+        // The storage worker presents a proof's steps; this worker waits.
+        if proof.is_some() {
+            self.proven = Some(request);
+            self.phase = Phase::Proving;
+            return Ok(Event::Waiting);
+        }
         self.wire
             .as_mut()
             .ok_or("missing login endpoint")?
             .queue(&request.encode())?;
-        self.baseline = baseline;
         self.request = Some(request);
         self.phase = Phase::Description;
         Ok(Event::Waiting)
@@ -723,6 +857,7 @@ impl Login {
         self.wire = None;
         self.round.clear();
         self.pin = None;
+        self.proven = None;
         self.acknowledgement_deadline = None;
         if let Some(child) = &mut self.child {
             child

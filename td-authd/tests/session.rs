@@ -1822,7 +1822,7 @@ fn root_login_supervision_meets_the_production_worker() {
             .position(|window| window == b"\x06tester")
             .unwrap();
         assert_eq!(
-            (answer[0], &answer[answer.len() - 2..]),
+            (answer[0], &answer[answer.len() - 3..answer.len() - 1]),
             (0x9a, &[0, 0][..])
         );
         answer[1..names].to_vec()
@@ -1926,7 +1926,7 @@ fn revoking(
 /// `revocation`.
 fn revoked(state: &[u8], revocation: u8) -> Vec<u8> {
     let mut answer = crate::login_status::tests::answer(state, "td-laptop");
-    let at = answer.len() - 2;
+    let at = answer.len() - 3;
     answer[at] = revocation;
     answer
 }
@@ -1936,7 +1936,7 @@ fn login_state_until(session: &mut Session, byte: u8) -> Vec<u8> {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let answer = session.answer(Request::LoginState).unwrap();
-        if answer[answer.len() - 2] == byte {
+        if answer[answer.len() - 3] == byte {
             return answer;
         }
         assert!(Instant::now() < until, "revocation byte never {byte}");
@@ -2245,7 +2245,7 @@ fn a_protected_boot_enforces_when_its_marker_cannot_be_made() {
         uptime: machine.paths.uptime.clone(),
     };
     std::fs::write(machine.paths.root.join("hostname"), b"td-laptop\n").unwrap();
-    let protected = answer(&[2, 0x0d], "td-laptop");
+    let protected = crate::login_status::tests::protected_answer(&[2, 0x0d], "td-laptop");
     for record in [Some(Method::TpmPin), Some(Method::None), None] {
         machine.reset();
         let mut session = quiet();
@@ -2295,7 +2295,8 @@ fn only_the_first_login_state_says_the_generation_is_admitted() {
     session.admit(&machine.paths);
     prepare(&mut session);
     let mut admitted = answer(&[0], "td-laptop");
-    *admitted.last_mut().unwrap() = 1;
+    let at = admitted.len() - 2;
+    admitted[at] = 1;
     assert_eq!(session.answer(Request::LoginState).unwrap(), admitted);
     for _ in 0..2 {
         assert_eq!(

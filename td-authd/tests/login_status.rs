@@ -114,7 +114,7 @@ pub(crate) fn never() -> Helper {
 }
 
 /// `9a`, the state's bytes, then this module's names, the settled
-/// revocation byte and the admission byte `00`.
+/// revocation byte, the admission byte `00` and the protected byte `00`.
 pub(crate) fn answer(state: &[u8], hostname: &str) -> Vec<u8> {
     let mut bytes = vec![0x9a];
     bytes.extend_from_slice(state);
@@ -122,7 +122,16 @@ pub(crate) fn answer(state: &[u8], hostname: &str) -> Vec<u8> {
     bytes.extend_from_slice(USER.as_bytes());
     bytes.push(hostname.len() as u8);
     bytes.extend_from_slice(hostname.as_bytes());
-    bytes.extend_from_slice(&[0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes
+}
+
+/// `answer` on a machine root reads as protected, or cannot read.
+pub(crate) fn protected_answer(state: &[u8], hostname: &str) -> Vec<u8> {
+    let mut bytes = answer(state, hostname);
+    if let Some(last) = bytes.last_mut() {
+        *last = 1;
+    }
     bytes
 }
 
@@ -142,7 +151,7 @@ fn an_unenrolled_machine_never_runs_the_helper() {
             b"tester",
             &[9],
             b"td-laptop",
-            &[0, 0][..]
+            &[0, 0, 0][..]
         ]
         .concat()
     );
@@ -164,13 +173,13 @@ fn a_damaged_directory_is_unavailable_without_the_helper() {
     fs::set_permissions(root.login(), Permissions::from_mode(0o750)).unwrap();
     assert_eq!(
         status.answer(false, 0, false).unwrap(),
-        answer(&DIRECTORY_DAMAGED, "td-laptop")
+        protected_answer(&DIRECTORY_DAMAGED, "td-laptop")
     );
     fs::remove_dir(root.login()).unwrap();
     status.operation_ended();
     assert_eq!(
         status.answer(false, 0, false).unwrap(),
-        answer(&DIRECTORY_DAMAGED, "td-laptop")
+        protected_answer(&DIRECTORY_DAMAGED, "td-laptop")
     );
 }
 
@@ -536,7 +545,7 @@ fn an_unenrolled_protected_machine_is_unavailable_with_cause_0d() {
     let mut status = root.status(never());
     assert_eq!(
         status.answer(false, 0, false).unwrap(),
-        answer(&[2, 0x0d], "td-laptop")
+        protected_answer(&[2, 0x0d], "td-laptop")
     );
     assert_eq!(status.cached, Some(State::Protected));
     assert_eq!(status.reduced(), Reduced::Enforced);
@@ -550,7 +559,7 @@ fn an_unenrolled_protected_machine_is_unavailable_with_cause_0d() {
     let (helper, runs) = counting(LOGIN_TWO);
     let mut status = root.status(helper);
     root.enroll();
-    let enrolled = answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
+    let enrolled = protected_answer(&[&[1, 2][..], &[0xa1; 4], &[0xa2; 4]].concat(), "td-laptop");
     assert_eq!(status.answer(false, 0, false).unwrap(), enrolled);
     assert_eq!(runs.get(), 1);
     root.unenroll();
@@ -558,15 +567,29 @@ fn an_unenrolled_protected_machine_is_unavailable_with_cause_0d() {
     assert_eq!(status.reduced(), Reduced::Unenrolled);
 }
 
-/// The admission byte follows the revocation byte, `01` only when asked.
+/// The admission byte follows the revocation byte, `01` only when asked,
+/// and the protected byte ends the answer (amendment 10): `01` while the
+/// marker or this boot's `run/td-admit` is present or cannot be read,
+/// and `00` on a live boot, which reads nothing.
 #[test]
-fn the_admission_byte_ends_the_answer() {
+fn the_admission_and_protected_bytes_end_the_answer() {
     let root = Root::new();
     let mut status = root.status(never());
     let mut admitted = answer(&[0], "td-laptop");
     assert_eq!(admitted.pop(), Some(0));
-    admitted.push(1);
+    assert_eq!(admitted.pop(), Some(0));
+    admitted.extend_from_slice(&[1, 0]);
     assert_eq!(status.answer(false, 0, true).unwrap(), admitted);
     let revoked = status.answer(false, 3, false).unwrap();
-    assert_eq!(revoked[revoked.len() - 2..], [3, 0]);
+    assert_eq!(revoked[revoked.len() - 3..], [3, 0, 0]);
+    fs::create_dir_all(root.path().join("run/td-admit")).unwrap();
+    assert_eq!(status.answer(false, 0, false).unwrap().last(), Some(&1));
+    assert_eq!(status.answer(true, 0, false).unwrap().last(), Some(&0));
+    fs::remove_dir(root.path().join("run/td-admit")).unwrap();
+    fs::write(root.login().join("protected"), b"").unwrap();
+    assert_eq!(status.answer(false, 0, false).unwrap().last(), Some(&1));
+    fs::remove_file(root.login().join("protected")).unwrap();
+    assert_eq!(status.answer(false, 0, false).unwrap().last(), Some(&0));
+    fs::set_permissions(root.login(), Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(status.answer(false, 0, false).unwrap().last(), Some(&1));
 }

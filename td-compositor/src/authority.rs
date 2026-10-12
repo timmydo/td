@@ -131,13 +131,18 @@ pub(crate) struct Answer {
     /// (td-install/ENCRYPTION.md, "Verified account handoff"). Only the
     /// generation's first answer may carry it.
     admitted: bool,
+    /// `01`: root read the protected marker for this answer, or could not
+    /// (td-authd/DESIGN.md, amendment 10). A display choice: it offers the
+    /// disk proofs and authorizes nothing.
+    protected: bool,
 }
 
 impl Answer {
     /// Exactly `9a`'s shape, or a protocol violation that ends the paired
     /// generation: a state, an enrolled list or a cause; a primary account
     /// name; an empty hostname or one under td-firstboot's rules; the
-    /// revocation byte, `00` to `03`; and the admission byte, `00` or `01`.
+    /// revocation byte, `00` to `03`; the admission byte, `00` or `01`;
+    /// and the protected byte, `00` or `01`.
     fn decode(answer: &[u8]) -> Result<Self, String> {
         let invalid = || "invalid login state answer".to_string();
         let [0x9a, state, rest @ ..] = answer else {
@@ -171,7 +176,7 @@ impl Answer {
             .ok_or_else(invalid)?;
         let username = std::str::from_utf8(username).map_err(|_| invalid())?;
         let host = std::str::from_utf8(host).map_err(|_| invalid())?;
-        let [revocation, admitted @ (0 | 1)] = rest else {
+        let [revocation, admitted @ (0 | 1), protected @ (0 | 1)] = rest else {
             return Err(invalid());
         };
         let revocation = Revocation::decode(*revocation).ok_or_else(invalid)?;
@@ -192,6 +197,7 @@ impl Answer {
             hostname,
             revocation,
             admitted: *admitted == 1,
+            protected: *protected == 1,
         })
     }
 
@@ -223,6 +229,11 @@ impl Answer {
     /// the session, whatever the state.
     pub(crate) fn admitted(&self) -> bool {
         self.admitted
+    }
+
+    /// Whether the key-management screen offers the disk proofs.
+    pub(crate) fn protected(&self) -> bool {
+        self.protected
     }
 }
 
@@ -855,7 +866,7 @@ mod tests {
             &[0x9a][..],
             state,
             b"\x06tester\x09td-laptop",
-            &[revocation, 0],
+            &[revocation, 0, 0],
         ]
         .concat()
     }
@@ -863,8 +874,16 @@ mod tests {
     /// `9a` for `state` with the admission byte `01`.
     fn admitting(state: &[u8]) -> Vec<u8> {
         let mut answer = login_state(state);
-        if let Some(admission) = answer.last_mut() {
-            *admission = 1;
+        let at = answer.len() - 2;
+        answer[at] = 1;
+        answer
+    }
+
+    /// `9a` for `state` with the protected byte `01`.
+    fn protecting(state: &[u8]) -> Vec<u8> {
+        let mut answer = login_state(state);
+        if let Some(protected) = answer.last_mut() {
+            *protected = 1;
         }
         answer
     }
@@ -901,10 +920,17 @@ mod tests {
             Ok(LoginState::Enrolled(vec![[7; 4], [7; 4]]))
         );
         // The longest names, and no hostname at all.
-        let longest = [&[0x9a, 0, 32][..], &[b'a'; 32], &[63], &[b'h'; 63], &[0, 0]].concat();
+        let longest = [
+            &[0x9a, 0, 32][..],
+            &[b'a'; 32],
+            &[63],
+            &[b'h'; 63],
+            &[0, 0, 0],
+        ]
+        .concat();
         assert_eq!(decode(&longest), Ok(LoginState::Unenrolled));
         assert_eq!(
-            decode(b"\x9a\x00\x01a\x00\x00\x00"),
+            decode(b"\x9a\x00\x01a\x00\x00\x00\x00"),
             Ok(LoginState::Unenrolled)
         );
         // The names are kept for the lock surface, as root sent them.
@@ -914,7 +940,7 @@ mod tests {
         assert_eq!(kept.username(), "a".repeat(32));
         assert_eq!(kept.hostname(), "h".repeat(63));
         assert_eq!(
-            Answer::decode(b"\x9a\x00\x01a\x00\x00\x00")
+            Answer::decode(b"\x9a\x00\x01a\x00\x00\x00\x00")
                 .unwrap()
                 .hostname(),
             ""
@@ -937,32 +963,36 @@ mod tests {
             login_state(&[0, 0]),
             // Usernames: empty, too long, not a primary name, not UTF-8.
             b"\x9a\x00\x00\x00\x00\x00".to_vec(),
-            [&[0x9a, 0, 33][..], &[b'a'; 33], &[0, 0, 0]].concat(),
-            b"\x9a\x00\x04Root\x00\x00\x00".to_vec(),
-            b"\x9a\x00\x041abc\x00\x00\x00".to_vec(),
-            b"\x9a\x00\x04a.bc\x00\x00\x00".to_vec(),
-            b"\x9a\x00\x02a\xff\x00\x00\x00".to_vec(),
+            [&[0x9a, 0, 33][..], &[b'a'; 33], &[0, 0, 0, 0]].concat(),
+            b"\x9a\x00\x04Root\x00\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x041abc\x00\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x04a.bc\x00\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x02a\xff\x00\x00\x00\x00".to_vec(),
             // Hostnames: too long, against firstboot's rules, not UTF-8.
-            [&[0x9a, 0, 1, b'a', 64][..], &[b'h'; 64], &[0, 0]].concat(),
-            b"\x9a\x00\x01a\x02TD\x00\x00".to_vec(),
-            b"\x9a\x00\x01a\x05host-\x00\x00".to_vec(),
-            b"\x9a\x00\x01a\x03a b\x00\x00".to_vec(),
-            b"\x9a\x00\x01a\x03td\n\x00\x00".to_vec(),
-            b"\x9a\x00\x01a\x02\xc3\xb6\x00\x00".to_vec(),
+            [&[0x9a, 0, 1, b'a', 64][..], &[b'h'; 64], &[0, 0, 0]].concat(),
+            b"\x9a\x00\x01a\x02TD\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x05host-\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x03a b\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x03td\n\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x01a\x02\xc3\xb6\x00\x00\x00".to_vec(),
             // Lengths that overrun the answer.
             b"\x9a\x00\x07tester".to_vec(),
             b"\x9a\x00\x06tester\x09td".to_vec(),
             // The revocation byte: missing, past `03`, or followed by more
-            // than the admission byte.
+            // than the admission and protected bytes.
             b"\x9a\x00\x06tester\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x04\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\xff\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x00\x00\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x02\x01\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x04\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\xff\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x02\x01\x00\x00".to_vec(),
             // The admission byte: missing, or past `01`.
             b"\x9a\x00\x06tester\x00\x00".to_vec(),
-            b"\x9a\x00\x06tester\x00\x00\x02".to_vec(),
-            b"\x9a\x00\x06tester\x00\x00\xff".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x02\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\xff\x00".to_vec(),
+            // The protected byte (amendment 10): missing, or past `01`.
+            b"\x9a\x00\x06tester\x00\x00\x00".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x00\x02".to_vec(),
+            b"\x9a\x00\x06tester\x00\x00\x01\xff".to_vec(),
         ];
         for answer in refused {
             assert!(decode(&answer).is_err(), "{answer:02x?}");
@@ -1020,9 +1050,25 @@ mod tests {
             assert_eq!(admitted.state(), plain.state());
             assert_eq!(admitted.locks(), plain.locks());
         }
-        assert!(Answer::decode(b"\x9a\x00\x06tester\x00\x02\x01")
+        assert!(Answer::decode(b"\x9a\x00\x06tester\x00\x02\x01\x00")
             .unwrap()
             .admitted());
+    }
+
+    /// The protected byte is kept beside the state and the admission, and
+    /// changes neither: a display choice.
+    #[test]
+    fn the_protected_byte_is_kept_beside_the_state() {
+        for state in [&[0][..], &keys(2), &[2, 0x0d], &[2, UNREADABLE]] {
+            let plain = Answer::decode(&login_state(state)).unwrap();
+            let protected = Answer::decode(&protecting(state)).unwrap();
+            assert!(!plain.protected() && protected.protected());
+            assert!(!protected.admitted());
+            assert_eq!(protected.state(), plain.state());
+            assert_eq!(protected.locks(), plain.locks());
+        }
+        let both = Answer::decode(b"\x9a\x00\x06tester\x00\x00\x01\x01").unwrap();
+        assert!(both.admitted() && both.protected());
     }
 
     /// Only the generation's first answer may admit: a later one that says

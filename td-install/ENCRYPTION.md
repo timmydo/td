@@ -1901,9 +1901,11 @@ storage-operation`, the running system's one keyslot-test surface
 (DESIGN.md "Storage operation worker"). 8e's documentation commit
 fixes its consent steps, `1b` selection, PIN-field profile and
 compositor screen (td-authd/DESIGN.md amendment 10), and 8e's last
-commit implements them over the storage-operation wire; until then a
-protected machine refuses every login-key operation only a disk proof
-can authorize. Upgrade's first
+commit implements them over the storage-operation wire, decoded and
+offered only in test builds; until item 9's activation lifts td-authd's
+`storage::OPERATIONS` and the compositor's `DISK_PROOFS` together, a
+production build's protected machine refuses every login-key operation
+only a disk proof can authorize. Upgrade's first
 phase requires an enrolled login state, and the
 last login key cannot be removed on a protected machine, so a recovery
 boot never finds an unlocked session.
@@ -2517,8 +2519,10 @@ commit.
      commit; and last, once the storage-operation wire exists,
      TOKEN-LOGIN.md's disk proof for login-key operations, whose keyslot
      test runs through `storage-operation`, with the compositor's
-     authorization choice and recovery-key profile, lifting 8d's
-     interim refusal.
+     authorization choice and recovery-key profile, which lifts 8d's
+     interim refusal in test builds only; its exit is item 9's
+     activation, which sets `storage::OPERATIONS` and `DISK_PROOFS`
+     in production.
    - **8f, re-encrypting upgrade.** td-protector's upgrade planner over
      the states U0 to U5 and the runner's `reencrypt` (initialization in
      both resilience modes and `--resume-only`) and `token import`

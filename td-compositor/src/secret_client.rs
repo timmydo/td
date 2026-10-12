@@ -2,8 +2,8 @@
 
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
-    Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery,
-    Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING,
+    Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Proof,
+    Recovery, Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING,
     LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT, SELECTOR_UPDATE_CEILING,
 };
 use crate::authority::Exchange;
@@ -35,6 +35,16 @@ const PIN_SHORTEST: usize = 4;
 const PIN_LONGEST: usize = 63;
 /// The PIN field's fixed buffer.
 const PIN_CAPACITY: usize = 64;
+/// The recovery-key profile: the 48 passphrase digits td-protector's
+/// codec admits, without separators.
+const RECOVERY_DIGITS: usize = 48;
+
+/// Whether this build offers the disk proofs, `R` and `S` on the
+/// authorization screen: td-authd's `storage::OPERATIONS`, which decodes
+/// `1b 0b`. Until td-install/ENCRYPTION.md's item 9 a production build
+/// shows `NOT AVAILABLE IN THIS BUILD` for each and sends nothing; a
+/// source test pins the two to one value.
+pub(crate) const DISK_PROOFS: bool = cfg!(test);
 /// `1c` as written: its tag, the length byte, the longest description that
 /// byte counts, and the longest PIN.
 const PIN_REQUEST: usize = 2 + 255 + PIN_LONGEST;
@@ -50,6 +60,13 @@ const UNPROTECTED: &[&str] = &["PIN ENTRY NEEDS NO SWAP AND NO CORE DUMPS"];
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum FieldKey {
     Byte(u8),
+    /// A key that names a digit for the recovery-key profile: a number-row
+    /// digit at either Shift level, or a keypad digit while NumLock types
+    /// one; `byte` is what it types for a PIN.
+    Digit {
+        byte: u8,
+        digit: u8,
+    },
     Erase,
     Submit,
 }
@@ -58,6 +75,7 @@ impl std::fmt::Debug for FieldKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Byte(_) => "Byte(..)",
+            Self::Digit { .. } => "Digit(..)",
             Self::Erase => "Erase",
             Self::Submit => "Submit",
         })
@@ -126,6 +144,8 @@ impl Drop for PinBuffer {
 pub(crate) struct PinField {
     open: bool,
     submitted: bool,
+    /// The recovery-key profile: digits only, exactly 48.
+    recovery: bool,
     /// When the field's own paint was seen on glass: only a press made
     /// after it may type.
     shown: Option<u128>,
@@ -133,10 +153,18 @@ pub(crate) struct PinField {
 }
 
 impl PinField {
+    #[cfg(test)]
     pub fn open(&mut self) {
+        self.open_for(false);
+    }
+
+    /// Opens the field in the PIN profile, or for a recovery-key step in
+    /// the recovery-key profile.
+    pub fn open_for(&mut self, recovery: bool) {
         self.pin.clear();
         self.open = true;
         self.submitted = false;
+        self.recovery = recovery;
         self.shown = None;
     }
 
@@ -144,6 +172,7 @@ impl PinField {
         self.pin.clear();
         self.open = false;
         self.submitted = false;
+        self.recovery = false;
         self.shown = None;
     }
 
@@ -154,16 +183,27 @@ impl PinField {
     /// One key while the field is open and not yet submitted: the masked
     /// length to show when the bytes changed. A byte outside printable
     /// ASCII, a 64th byte, Backspace on nothing and an Enter before four
-    /// bytes change nothing.
+    /// bytes change nothing. In the recovery-key profile only a digit
+    /// types, a 49th refused, and Enter submits only at exactly 48.
     pub fn key(&mut self, key: FieldKey) -> Option<usize> {
         if !self.open || self.submitted {
             return None;
         }
-        let changed = match key {
-            FieldKey::Byte(byte) => (0x20..=0x7e).contains(&byte) && self.pin.push(byte),
-            FieldKey::Erase => self.pin.pop(),
-            FieldKey::Submit => {
-                self.submitted = self.pin.length >= PIN_SHORTEST;
+        let changed = match (self.recovery, key) {
+            (false, FieldKey::Byte(byte) | FieldKey::Digit { byte, .. }) => {
+                (0x20..=0x7e).contains(&byte) && self.pin.push(byte)
+            }
+            (true, FieldKey::Digit { digit, .. }) => {
+                digit.is_ascii_digit() && self.pin.length < RECOVERY_DIGITS && self.pin.push(digit)
+            }
+            (true, FieldKey::Byte(_)) => false,
+            (_, FieldKey::Erase) => self.pin.pop(),
+            (recovery, FieldKey::Submit) => {
+                self.submitted = if recovery {
+                    self.pin.length == RECOVERY_DIGITS
+                } else {
+                    self.pin.length >= PIN_SHORTEST
+                };
                 false
             }
         };
@@ -395,12 +435,21 @@ pub(crate) enum LoginSelection {
     /// `20 01`, polled as a login operation is: one step, confirmed by its
     /// approval key, then its commit.
     SelectorUpdate,
+    /// A first enrollment, addition or removal authorized by a disk proof,
+    /// root's `1b 0b P` (amendment 10); offered only where `DISK_PROOFS`.
+    Proven(Proof, Box<LoginSelection>),
 }
 
 impl LoginSelection {
     /// The bytes td-authd's `login::Selection::decode` reads, after `1b`.
     fn request(&self) -> Result<Vec<u8>, String> {
         Ok(match self {
+            Self::Proven(proof, inner) => match (inner.as_ref(), inner.request()?.as_slice()) {
+                (Self::Enroll(_) | Self::Add | Self::Remove(..), [0x1b, rest @ ..]) => {
+                    [&[0x1b, 0x0b, proof.byte()][..], rest].concat()
+                }
+                _ => return Err("a disk proof authorizes no such operation".into()),
+            },
             Self::SelectorUpdate => vec![0x20, 1],
             Self::Unlock => vec![0x1b, 7],
             Self::Enroll(keys @ (1 | 2)) => vec![0x1b, 8, *keys],
@@ -441,6 +490,21 @@ impl LoginSelection {
             Self::Add => LOGIN_TWO_CEREMONIES,
             Self::Enroll(_) => LOGIN_TWO_KEY_ENROLLMENT,
             Self::SelectorUpdate => SELECTOR_UPDATE_CEILING,
+            // The proof replaces an addition's or removal's authorizing
+            // key, and adds a ceremony to an enrollment.
+            Self::Proven(_, inner) => match inner.as_ref() {
+                Self::Enroll(_) => inner.ceiling().saturating_add(LOGIN_CEREMONY),
+                other => other.ceiling(),
+            },
+        }
+    }
+
+    /// The operation a disk proof authorizes, and the proof; any other
+    /// selection is its own.
+    fn authorized(&self) -> (&Self, Option<Proof>) {
+        match self {
+            Self::Proven(proof, inner) => (inner.as_ref(), Some(*proof)),
+            other => (other, None),
         }
     }
 
@@ -456,10 +520,10 @@ impl LoginSelection {
 
     /// The rows an end of this operation shows.
     fn failure(&self, kind: u8, detail: u8) -> Option<&'static [&'static str]> {
-        if *self == Self::SelectorUpdate {
-            storage_failure(kind, detail)
-        } else {
-            login_failure(kind, detail)
+        match self {
+            Self::SelectorUpdate => storage_failure(kind, detail),
+            Self::Proven(..) => proof_failure(kind, detail),
+            _ => login_failure(kind, detail),
         }
     }
 
@@ -468,17 +532,18 @@ impl LoginSelection {
         *self != Self::Unlock
     }
 
-    /// Whether `request` describes this operation for the configured human.
-    /// No selection here is a disk proof's, so a description carrying one
-    /// (consent tags 13 to 15) never selects, whatever its ceiling.
+    /// Whether `request` describes this operation for the configured human,
+    /// authorized as it was chosen: by the chosen disk proof (consent tags
+    /// 13 to 15), or by an enrolled key, whose descriptions carry none.
     fn selects(&self, request: &Request) -> bool {
         if *self == Self::SelectorUpdate {
             return request.owner() == 1000 && request.selector_update().is_some();
         }
+        let (selection, proof) = self.authorized();
         request.owner() == 1000
-            && request.login_proof().is_none()
+            && request.login_proof() == proof
             && request.login_ceiling() == Some(self.ceiling())
-            && match (self, request.operation()) {
+            && match (selection, request.operation()) {
                 (Self::Unlock, Operation::LoginUnlock { account, .. })
                 | (Self::Add, Operation::LoginAdd { account, .. }) => *account == 1000,
                 (Self::Enroll(keys), Operation::LoginEnroll { account, after, .. }) => {
@@ -505,6 +570,7 @@ impl LoginSelection {
             Self::Enroll(_) => &["LOGIN KEYS ENROLLED"],
             Self::Add => &["LOGIN KEY ADDED"],
             Self::Remove(..) => &["LOGIN KEYS REMOVED"],
+            Self::Proven(_, inner) => inner.success(request),
             Self::SelectorUpdate => match request.and_then(Request::selector_update) {
                 Some((_, SelectorForm::Staged, _)) => &[
                     "BOOT SELECTOR UPDATED",
@@ -646,6 +712,21 @@ pub(crate) fn login_failure(kind: u8, detail: u8) -> Option<&'static [&'static s
     })
 }
 
+/// A disk proof's end (td-login/TOKEN-LOGIN.md, "Enrollment, addition and
+/// removal"): root's `86`, the storage worker's own kinds, and otherwise a
+/// login operation's.
+pub(crate) fn proof_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
+    Some(match (kind, detail) {
+        (0x86, 0) => &["THIS MACHINE HAS NO DISK PROOF"],
+        (0x20, 0) => &["NO ENCRYPTED TD VOLUME"],
+        (0x21, 0) => &["THE DISK CANNOT DO THIS NOW"],
+        (0x25, 0) => &["RECOVERY KEY MISTYPED"],
+        (0x26, 0) => &["WRONG KEY FOR THIS DISK"],
+        (0x28, 0) => &["THE DISK CHANGED; NOTHING WRITTEN"],
+        _ => return login_failure(kind, detail),
+    })
+}
+
 /// DESIGN.md's "Storage operations" text for a selector update's end, or
 /// none for a pair root never sends one.
 pub(crate) fn storage_failure(kind: u8, detail: u8) -> Option<&'static [&'static str]> {
@@ -776,7 +857,7 @@ impl Attempt {
                 field.close();
                 return Err("physical attention was cancelled".into());
             }
-            field.open();
+            field.open_for(step.login_step() == Some(LoginStep::RecoveryKey));
             let shown = self
                 .runtime
                 .lock()
@@ -1858,17 +1939,34 @@ impl LoginPending {
                 _ => false,
             };
         }
+        let (selection, proof) = self.selection.authorized();
+        // A disk proof's own (amendment 10): root's `86` and the volume's
+        // `21` before any description; the storage worker's `20` from its
+        // baseline or its re-read, `25` and `26` from its keyslot test, and
+        // `28`, which precedes any write, before the commit. With a proof
+        // a first enrollment is never `84`.
+        if let Some(proof) = proof {
+            match (kind, detail) {
+                (0x86 | 0x21, 0) => return !described,
+                (0x20, 0) => return true,
+                (0x25, 0) => return described && proof == Proof::RecoveryKey,
+                (0x26, 0) => return described,
+                (0x28, 0) => return described && !uncertain && !self.committed,
+                (0x84, 0) => return false,
+                _ => {}
+            }
+        }
         match (kind, detail) {
             (0x01, _) | (0x06, 1..=6) | (0x02..=0x05 | 0x07..=0x0d | 0x0f..=0x12, 0) => true,
             (0x0e, 1..=5) => uncertain,
             (0x80, 0) => self.cancelled,
-            (0x81, 0) => !described && self.selection == LoginSelection::Add,
-            (0x82, 0) => !described && matches!(self.selection, LoginSelection::Enroll(_)),
-            (0x83, 0) => !described && matches!(self.selection, LoginSelection::Remove(..)),
+            (0x81, 0) => !described && *selection == LoginSelection::Add,
+            (0x82, 0) => !described && matches!(selection, LoginSelection::Enroll(_)),
+            (0x83, 0) => !described && matches!(selection, LoginSelection::Remove(..)),
             // A protected machine's refusals (td-login/TOKEN-LOGIN.md,
             // "Enrollment, addition and removal").
-            (0x84, 0) => !described && matches!(self.selection, LoginSelection::Enroll(_)),
-            (0x85, 0) => !described && matches!(self.selection, LoginSelection::Remove(..)),
+            (0x84, 0) => !described && matches!(selection, LoginSelection::Enroll(_)),
+            (0x85, 0) => !described && matches!(selection, LoginSelection::Remove(..)),
             _ => false,
         }
     }
@@ -1893,6 +1991,13 @@ impl LoginPending {
                 self.last = true;
             } else {
                 description.login_start()?;
+                // A removal's recovery key is its proof's one step and the
+                // operation's last; every other first step has successors.
+                self.last = matches!(
+                    &self.selection,
+                    LoginSelection::Proven(Proof::RecoveryKey, inner)
+                        if matches!(inner.as_ref(), LoginSelection::Remove(..))
+                );
             }
             self.request = Some(description.clone());
             return Ok(());
@@ -1948,11 +2053,56 @@ fn cancel(wire: &mut impl Exchange, nonce: &[u8; 32]) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
-    use crate::authority::consent::Proof;
+
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
+
+    /// The recovery-key profile (DESIGN.md, "Storage operations"): only a
+    /// key that names a digit types, as that digit whatever its Shift
+    /// level; a 49th is refused; Enter submits only at exactly 48; and the
+    /// field's take zeroes it as a PIN's. The PIN profile types the same
+    /// keys' bytes.
+    #[test]
+    fn the_recovery_key_profile_takes_exactly_48_digits() {
+        let digit = |n: usize| FieldKey::Digit {
+            byte: b"!@#$%^&*()"[n % 10],
+            digit: b'0' + (n % 10) as u8,
+        };
+        let mut field = PinField::default();
+        field.open_for(true);
+        for ignored in *b"1- a" {
+            assert_eq!(field.key(FieldKey::Byte(ignored)), None);
+        }
+        for n in 0..47 {
+            assert_eq!(field.key(digit(n)), Some(n + 1));
+        }
+        assert_eq!(field.key(FieldKey::Submit), None);
+        assert!(!field.submitted());
+        assert_eq!(field.key(digit(47)), Some(48));
+        assert_eq!(field.key(digit(48)), None);
+        assert_eq!(field.key(FieldKey::Erase), Some(47));
+        assert_eq!(field.key(digit(47)), Some(48));
+        let expected: Vec<u8> = (0..48).map(|n| b'0' + (n % 10) as u8).collect();
+        assert_eq!(field.typed(), expected);
+        field.key(FieldKey::Submit);
+        assert!(field.submitted());
+        let mut into = [0; PIN_CAPACITY];
+        assert_eq!(field.take(&mut into), Some(48));
+        assert_eq!(&into[..48], expected);
+        assert!(field.raw().iter().all(|byte| *byte == 0));
+        assert!(!field.is_open());
+        // Closed, the next field is a PIN's: the same key types its byte,
+        // and four bytes submit.
+        field.open_for(false);
+        for n in 0..4 {
+            assert_eq!(field.key(digit(n)), Some(n + 1));
+        }
+        assert_eq!(field.typed(), b"!@#$");
+        field.key(FieldKey::Submit);
+        assert!(field.submitted());
+    }
 
     thread_local! {
         /// Each PIN buffer and `1c` request as it was dropped, after its
@@ -2074,12 +2224,15 @@ mod tests {
             WIRE.with(|wire| wire.borrow_mut().push(WireEvent::Received));
             let reply = self.replies.pop_front().ok_or("uncertain delivery")?;
             if let Some(attempt) = &self.typist {
-                let empty = {
+                let (empty, recovery) = {
                     let field = attempt.field.lock().unwrap();
-                    field.is_open() && field.typed().is_empty() && !field.submitted()
+                    (
+                        field.is_open() && field.typed().is_empty() && !field.submitted(),
+                        field.recovery,
+                    )
                 };
                 if empty {
-                    type_pin(attempt, PIN);
+                    type_pin(attempt, if recovery { RECOVERY } else { PIN });
                 }
                 // A login disclosure on glass: they type its key.
                 if matches!(attempt.selection, Selection::Login(_)) {
@@ -2091,6 +2244,8 @@ mod tests {
     }
     /// The PIN the tests' person types.
     const PIN: &[u8] = b"1234";
+    /// The recovery key they type at a recovery-key step: 48 digits.
+    const RECOVERY: &[u8] = b"012345678901234567890123456789012345678901234567";
     /// A press's evdev time: just after its field was on glass, or before
     /// any field was.
     fn pressed(attempt: &Attempt) -> u128 {
@@ -2123,12 +2278,17 @@ mod tests {
     /// `pin`'s keys, then Enter, as the evdev adapter offers them.
     fn type_pin(attempt: &Attempt, pin: &[u8]) {
         for byte in pin {
+            // A digit's key names its digit, as the number row's does.
+            let key = if byte.is_ascii_digit() {
+                FieldKey::Digit {
+                    byte: *byte,
+                    digit: *byte,
+                }
+            } else {
+                FieldKey::Byte(*byte)
+            };
             attempt
-                .field_key(
-                    &crate::input::test_origin(),
-                    FieldKey::Byte(*byte),
-                    pressed(attempt),
-                )
+                .field_key(&crate::input::test_origin(), key, pressed(attempt))
                 .unwrap();
         }
         attempt
@@ -3756,7 +3916,68 @@ mod tests {
                 }),
             ],
             LoginSelection::SelectorUpdate => panic!("storage tests drive their own"),
+            LoginSelection::Proven(proof, inner) => {
+                let firsts = match proof {
+                    Proof::RecoveryKey => vec![LoginStep::RecoveryKey],
+                    Proof::DiskKey => vec![
+                        LoginStep::DiskIdentify,
+                        LoginStep::DiskAuthorize {
+                            key: DISK,
+                            retries: 8,
+                        },
+                    ],
+                };
+                let enroll = |after, key, step| {
+                    proven(
+                        Operation::LoginEnroll {
+                            account: 1000,
+                            before: 0,
+                            after,
+                            key,
+                            step,
+                            approval: None,
+                            proof: None,
+                        },
+                        *proof,
+                    )
+                };
+                match inner.as_ref() {
+                    LoginSelection::Add => firsts
+                        .into_iter()
+                        .chain(new_key(NEW))
+                        .map(|step| proven(add_op(step), *proof))
+                        .collect(),
+                    LoginSelection::Remove(..) => firsts
+                        .into_iter()
+                        .map(|step| proven(remove_op(step), *proof))
+                        .collect(),
+                    LoginSelection::Enroll(after) => firsts
+                        .into_iter()
+                        .map(|step| enroll(*after, 1, step))
+                        .chain((1..=*after).flat_map(|key| {
+                            new_key(if key == 1 { NEW } else { BACKUP })
+                                .map(|step| enroll(*after, key, step))
+                        }))
+                        .collect(),
+                    _ => panic!("a disk proof authorizes no {inner:?}"),
+                }
+            }
         }
+    }
+    /// A header fido2 token's fingerprint, which a disk authorize step
+    /// names.
+    const DISK: Fingerprint = [0xd1; 4];
+    /// Each disk proof of each operation it authorizes.
+    fn proven_selections() -> Vec<LoginSelection> {
+        let remove = || Box::new(LoginSelection::Remove(removal(), 1));
+        vec![
+            LoginSelection::Proven(Proof::RecoveryKey, Box::new(LoginSelection::Enroll(1))),
+            LoginSelection::Proven(Proof::DiskKey, Box::new(LoginSelection::Enroll(2))),
+            LoginSelection::Proven(Proof::RecoveryKey, Box::new(LoginSelection::Add)),
+            LoginSelection::Proven(Proof::DiskKey, Box::new(LoginSelection::Add)),
+            LoginSelection::Proven(Proof::RecoveryKey, remove()),
+            LoginSelection::Proven(Proof::DiskKey, remove()),
+        ]
     }
     fn selections() -> Vec<LoginSelection> {
         vec![
@@ -3815,7 +4036,12 @@ mod tests {
             calls.extend([vec![0x11], description(&[0x13], step)]);
             if asks_pin(step) {
                 replies.extend([status(0x0c, step), status(0x0c, step), vec![0x9c, 0]]);
-                calls.extend([vec![0x11], vec![0x11], pin_request(step, PIN)]);
+                let secret = if step.login_step() == Some(LoginStep::RecoveryKey) {
+                    RECOVERY
+                } else {
+                    PIN
+                };
+                calls.extend([vec![0x11], vec![0x11], pin_request(step, secret)]);
             }
             replies.push(status(3, step));
             calls.push(vec![0x11]);
@@ -3873,6 +4099,180 @@ mod tests {
             assert_eq!(sent(&wire, 0x1c), pins, "{selection:?}");
             assert_eq!(screen.shown(), Some(Notice::Login(selection.success(None))));
             assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    /// Each disk proof's whole status sequence (DESIGN.md, "Storage
+    /// operations"): `1b 0b P` and the operation; the proof's steps, the
+    /// recovery key typed as its 48 digits and sent as `1c`'s secret, a
+    /// disk authorize step's PIN; then, once root's description is the
+    /// login worker's, the new keys' steps, or for a removal the commit
+    /// over the proof's last step.
+    #[test]
+    fn every_disk_proof_runs_its_whole_status_sequence() {
+        for selection in proven_selections() {
+            let screen = Screen::login(selection.clone());
+            let steps = steps(&selection);
+            let last = steps.last().unwrap();
+            let (mut replies, mut calls) = presented(&selection, steps.len());
+            let LoginSelection::Proven(proof, _) = &selection else {
+                panic!("{selection:?}");
+            };
+            assert_eq!(calls[0][..3], [0x1b, 0x0b, proof.byte()]);
+            replies.extend([
+                status(5, last),
+                vec![0x94],
+                status(3, last),
+                status(6, last),
+            ]);
+            calls.extend([
+                vec![0x11],
+                description(&[0x14], last),
+                vec![0x11],
+                vec![0x11],
+            ]);
+            let (mut client, wire, result) = drive(&screen, replies);
+            assert_eq!(result, Ok(()), "{selection:?}");
+            assert!(client.login.is_none());
+            assert!(client.take_login_end());
+            assert_eq!(wire.calls, calls, "{selection:?}");
+            let recovery = steps
+                .iter()
+                .filter(|step| step.login_step() == Some(LoginStep::RecoveryKey))
+                .count();
+            assert_eq!(
+                wire.calls
+                    .iter()
+                    .filter(|call| call.ends_with(RECOVERY))
+                    .count(),
+                recovery
+            );
+            assert_eq!(screen.shown(), Some(Notice::Login(selection.success(None))));
+            assert_eq!(screen.attempt.field_raw(), [0; PIN_CAPACITY]);
+        }
+    }
+
+    /// A disk proof's ends: root's `86` and the volume's `21` before any
+    /// description; the storage worker's `20` at either point, `25` only
+    /// for the recovery key and `26` only after a description, and its
+    /// `28` definite. A proof's enrollment never ends `84`, and an end
+    /// root cannot send ends the generation.
+    #[test]
+    fn a_disk_proofs_ends_show_their_rows_where_root_can_send_them() {
+        let add = |proof| LoginSelection::Proven(proof, Box::new(LoginSelection::Add));
+        let enroll =
+            LoginSelection::Proven(Proof::RecoveryKey, Box::new(LoginSelection::Enroll(1)));
+        let first = |selection: &LoginSelection| steps(selection)[0].clone();
+        for (selection, described, kind, rows) in [
+            (
+                add(Proof::RecoveryKey),
+                false,
+                0x86,
+                Some(&["THIS MACHINE HAS NO DISK PROOF"][..]),
+            ),
+            (
+                add(Proof::DiskKey),
+                false,
+                0x21,
+                Some(&["THE DISK CANNOT DO THIS NOW"][..]),
+            ),
+            (
+                add(Proof::DiskKey),
+                false,
+                0x20,
+                Some(&["NO ENCRYPTED TD VOLUME"][..]),
+            ),
+            (
+                add(Proof::RecoveryKey),
+                true,
+                0x20,
+                Some(&["NO ENCRYPTED TD VOLUME"][..]),
+            ),
+            (
+                add(Proof::RecoveryKey),
+                true,
+                0x25,
+                Some(&["RECOVERY KEY MISTYPED"][..]),
+            ),
+            (
+                add(Proof::RecoveryKey),
+                true,
+                0x26,
+                Some(&["WRONG KEY FOR THIS DISK"][..]),
+            ),
+            (
+                add(Proof::DiskKey),
+                true,
+                0x26,
+                Some(&["WRONG KEY FOR THIS DISK"][..]),
+            ),
+            (
+                add(Proof::DiskKey),
+                true,
+                0x28,
+                Some(&["THE DISK CHANGED; NOTHING WRITTEN"][..]),
+            ),
+            (
+                add(Proof::DiskKey),
+                true,
+                0x04,
+                Some(&["THIS KEY IS NOT ENROLLED HERE"][..]),
+            ),
+            (add(Proof::RecoveryKey), true, 0x86, None),
+            (add(Proof::RecoveryKey), true, 0x21, None),
+            (add(Proof::DiskKey), true, 0x25, None),
+            (add(Proof::RecoveryKey), false, 0x25, None),
+            (add(Proof::RecoveryKey), false, 0x26, None),
+            (enroll.clone(), false, 0x84, None),
+            (
+                enroll,
+                false,
+                0x82,
+                Some(&["LOGIN KEYS ALREADY ENROLLED"][..]),
+            ),
+        ] {
+            let screen = Screen::login(selection.clone());
+            let mut replies = vec![started(), vec![0x91, 0x0b]];
+            let mut end = ended(0x0d, kind, 0);
+            if described {
+                end.extend_from_slice(&first(&selection).encode());
+            }
+            replies.push(end);
+            let (client, _, result) = drive(&screen, replies);
+            match rows {
+                Some(rows) => {
+                    assert_eq!(result, Ok(()), "{selection:?} {kind:02x}");
+                    assert!(client.login.is_none());
+                    assert_eq!(screen.shown(), Some(Notice::Login(rows)), "{kind:02x}");
+                }
+                None => assert!(result.is_err(), "{selection:?} {kind:02x} {described}"),
+            }
+        }
+    }
+
+    /// A description that carries another proof than the one chosen, or
+    /// none, never selects a disk proof, and a proof's never selects an
+    /// enrolled key's operation.
+    #[test]
+    fn a_disk_proof_selects_only_its_own_proofs_descriptions() {
+        let rk = LoginSelection::Proven(Proof::RecoveryKey, Box::new(LoginSelection::Add));
+        let dk = LoginSelection::Proven(Proof::DiskKey, Box::new(LoginSelection::Add));
+        let first = steps(&rk)[0].clone();
+        assert!(rk.selects(&first));
+        assert!(!dk.selects(&first));
+        assert!(!LoginSelection::Add.selects(&first));
+        assert!(!rk.selects(&steps(&LoginSelection::Add)[0]));
+        assert_eq!(rk.request().unwrap(), [0x1b, 0x0b, 0x01, 0x09],);
+        assert_eq!(
+            LoginSelection::Proven(Proof::DiskKey, Box::new(LoginSelection::Enroll(2)))
+                .request()
+                .unwrap(),
+            [0x1b, 0x0b, 0x02, 0x08, 0x02],
+        );
+        for inner in [LoginSelection::Unlock, LoginSelection::SelectorUpdate] {
+            assert!(LoginSelection::Proven(Proof::RecoveryKey, Box::new(inner))
+                .request()
+                .is_err());
         }
     }
 
@@ -4686,14 +5086,17 @@ mod tests {
                 LoginSelection::Enroll(_) => (0x82, 0),
                 LoginSelection::Add => (0x81, 0),
                 LoginSelection::Remove(..) => (0x83, 0),
-                LoginSelection::SelectorUpdate => panic!("storage tests drive their own"),
+                LoginSelection::SelectorUpdate | LoginSelection::Proven(..) => {
+                    panic!("storage and disk proof tests drive their own")
+                }
             });
             match selection {
                 LoginSelection::Enroll(_) => ends.insert((0x84, 0)),
                 LoginSelection::Remove(..) => ends.insert((0x85, 0)),
-                LoginSelection::Unlock | LoginSelection::Add | LoginSelection::SelectorUpdate => {
-                    false
-                }
+                LoginSelection::Unlock
+                | LoginSelection::Add
+                | LoginSelection::SelectorUpdate
+                | LoginSelection::Proven(..) => false,
             };
         }
         ends

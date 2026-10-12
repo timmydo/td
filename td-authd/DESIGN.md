@@ -2630,8 +2630,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
    `/run/td-admit` present root and the worker apply TOKEN-LOGIN.md's
    protected-volume rule
    ("Enrollment, addition and removal"): the last key's removal is
-   refused (`85`), and, until 8e's disk proof lands, so is every
-   operation only that proof can authorize, a first enrollment (`84`).
+   refused (`85`), and so is a first enrollment without a disk proof
+   (`84`), the operation only that proof can authorize; until
+   ENCRYPTION.md's item 9 no production build decodes the proof
+   (amendment 10), so there every first enrollment is.
    The disk proof's keyslot test runs through amendment 10's
    `storage-operation`, never in the login worker. Both peers ship the
    byte atomically, still `TDLA003`, as request `1a` did.
@@ -2657,7 +2659,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     implemented (`storage.rs`, `20 01`); like the login worker's writes
     it starts no worker outside test builds (`OPERATIONS`) until
     ENCRYPTION.md's item 9, so a production build answers every `20`
-    `a0 00`. The disk proofs and every later operation are not yet
+    `a0 00`. The disk proofs are implemented too (`proof.rs`, `1b 0b`)
+    and decoded only where `OPERATIONS` is set, so a production build
+    reads `1b 0b` as a malformed selection, a protocol violation, until
+    item 9 lifts both together. Every later operation is not yet
     implemented.
     One fixed root `/bin/td-install storage-operation --uid 1000` child
     per operation, the storage worker (`td-install/DESIGN.md`, "Storage
@@ -2726,8 +2731,18 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     next step is a new key's connect or, for a removal, the commit round
     over that proof step. The login worker's first-frame wait is
     therefore bounded by its operation deadline rather than a frame
-    time. A failure, cancellation or deadline at any point kills and
-    reaps both children before the end is reported. Root admits each
+    time. A failure, cancellation or deadline at any point stops and
+    reaps both children before the end is reported: the login worker is
+    killed, and the storage worker's channel is closed first, which its
+    keyslot test's child reads as cancellation, then the worker is given
+    up to one second (`GRACE`) to remove its header copy and exit
+    before it is killed; teardown and drop do the same. Root reads the
+    volume from the storage worker's baseline: no encrypted td volume,
+    or one the worker refused, ends the operation `20`, an upgrading
+    one, or one whose baseline does not offer the chosen proof (no
+    `recovery-key` marker, or no fido2 token), `21`. `proof.rs` holds
+    the two workers in order: the login worker until its baseline, the
+    storage worker through the proof, then the login worker resumed. Root admits each
     step the storage worker presents against both baselines: a disk
     key's fingerprint must name a fido2 token of the volume's baseline
     and no key of the login baseline, and its retries be one nonzero
@@ -2740,11 +2755,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     ceremony: a removal by disk proof 120 seconds, an addition 240, a
     first enrollment 240 for one key and 360 for two, each plus the
     reading allowance where it discloses, so `LOGIN_LONGEST` becomes
-    480. Until 8e's disk-proof commit no build decodes a disk-proof
-    selection, so one is a protocol violation, and 8d's interim refusals
-    stand; that commit lifts them in test builds, where a first
-    enrollment on a protected machine without a proof still ends with
-    `84`.
+    480. Only a build with `storage::OPERATIONS`, a test build until
+    ENCRYPTION.md's item 9, decodes a disk-proof selection; elsewhere
+    one is a protocol violation, and 8d's interim refusals stand. In a
+    test build a first enrollment on a protected machine without a proof
+    still ends with `84`.
 
     **Consent tags.** Tags 13, 14 and 15 are a first enrollment, an
     addition and a removal authorized by a disk proof: each is tag 8's,
@@ -2832,8 +2847,10 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     answer, or could not read it, and `00` when it is absent. The
     compositor offers the disk-proof choices only while the last answer
     reads `01`; root decides from its own read at the operation's start,
-    so the byte is a display choice and authorizes nothing. Both peers
-    ship it atomically, still `TDLA003`, with 8e's disk-proof commit.
+    so the byte is a display choice and authorizes nothing. A live boot
+    answers `00`, having no installed volume, and a compositor built
+    without disk proofs ignores the byte. Both peers shipped it
+    atomically, still `TDLA003`, with 8e's disk-proof commit.
 
     Until ENCRYPTION.md's item 9 a production build answers every `20`
     with `a0 00` before starting anything (`storage::OPERATIONS`, false
@@ -2857,7 +2874,7 @@ argument. The paired requests are:
 
 | Request | Response |
 | --- | --- |
-| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds, or `0d`, an unenrolled protected machine; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, the revocation byte, `00` to `03`, and the admission byte, `00` or `01` (amendments 1, 7 and 9) |
+| `1a` | `9a`, then the state: `00` unenrolled; `01`, a slot count of 1 to 8 and that many four-byte fingerprints in canonical slot order; or `02` and the cause `0a`, `0b` or `0c`, TOKEN-LOGIN.md's failure kinds, or `0d`, an unenrolled protected machine; then a length byte of 1 to 32 and the primary username, a length byte of 0 to 63 and the hostname, the revocation byte, `00` to `03`, the admission byte, `00` or `01`, and the protected byte, `00` or `01` (amendments 1, 7, 9 and 10) |
 | `1b 07` unlock; `1b 08 01` or `1b 08 02` one- or two-key first enrollment; `1b 09` addition; `1b 0a N` and N slots, each a position and a four-byte fingerprint, positions strictly increasing within 1 to 8 | `9b 01` and the 32-byte nonce: started |
 | `1c`, one length byte, the current step's canonical description, then the PIN (4 to 63 printable ASCII bytes) | `9c 00` PIN queued; `9c 01` the operation had already ended, or root's deadline has passed, which ends it as TIMEOUT: the PIN is dropped |
 

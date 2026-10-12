@@ -1590,7 +1590,8 @@ Fixed by [ENCRYPTION.md](ENCRYPTION.md) increment 8e's documentation
 commit before its code. `storage_operation.rs` implements the selector
 update and the disk proof's keyslot test; td-authd refuses every
 storage operation in a production build until that document's item 9,
-and starts no disk proof's worker before 8e's last commit. The worker
+and starts a disk proof's worker only in builds that decode the proof,
+test builds until then. The worker
 compiles td-secret's endpoint (`frames.rs`, whose shared secret frame
 `16` it reads into clearing storage) and memory rules (`memory.rs`) and
 td-authd's consent descriptions by `#[path]`, admits and writes the
@@ -1725,10 +1726,10 @@ consent time holds no I/O.
   child runs through the runner's `run_bounded`: it is killed and
   reaped at the operation's deadline (`08`) or as soon as root's end of
   the socket closes, which a second handle on it reads for every 10 ms,
-  so a cancellation, which closes root's end, ends it. Root's side, a
-  proof's storage worker given a bounded grace after its channel
-  closes before it is killed, arrives with 8e's last commit, the first
-  to start one; until then no root starts this path.
+  so a cancellation, which closes root's end, ends it. Root gives a
+  proof's storage worker one second after closing its channel before
+  it kills it (td-authd/DESIGN.md amendment 10), so the copy is
+  removed; until item 9 only a test build's root starts this path.
 
   Success sends `14` with no commit round, and
   the worker exits; the secret, output and passphrase are zeroed first.

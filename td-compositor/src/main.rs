@@ -1105,7 +1105,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const SCM: &str = include_str!("../../td-secret/src/scm.rs");
     const DRM: &str = include_str!("drm.rs");
-    const AUTHORITY_FINGERPRINT: u64 = 0x332a3f1255acc21a;
+    const AUTHORITY_FINGERPRINT: u64 = 0x74a2b927784edf10;
     const AUTH_SYS_FINGERPRINT: u64 = 0x42363c39df98214d;
     const AUTH_CHANNEL_FINGERPRINT: u64 = 0xdf20e4130b2d96e2;
     const AUTHORITY: &str = include_str!("authority.rs");
@@ -1217,6 +1217,32 @@ mod confinement {
         assert!(app.contains(&app_id), "td-term no longer spells {app_id}");
     }
 
+    /// The build constant that offers the disk proofs is td-authd's that
+    /// decodes them: one value, so neither can drift (td-authd/DESIGN.md
+    /// amendment 10). Item 9 lifts both together.
+    #[test]
+    fn disk_proofs_are_offered_exactly_where_root_decodes_them() {
+        let storage = include_str!("../../td-authd/src/storage.rs");
+        let login = include_str!("../../td-authd/src/login.rs");
+        let client = include_str!("secret_client.rs");
+        let input = include_str!("input.rs");
+        let once = |source: &str, line: &str| source.matches(line).count() == 1;
+        assert!(once(
+            storage,
+            "pub(crate) const OPERATIONS: bool = cfg!(test);"
+        ));
+        assert!(once(
+            login,
+            "[11, proof, rest @ ..] if crate::storage::OPERATIONS =>"
+        ));
+        assert!(once(
+            client,
+            "pub(crate) const DISK_PROOFS: bool = cfg!(test);"
+        ));
+        assert!(once(input, "crate::secret_client::DISK_PROOFS"));
+        assert!(once(input, "if !protected || !self.disk_proofs() {"));
+    }
+
     #[test]
     fn private_authority_startup_and_shared_transport_have_one_owner() {
         let fingerprint = |source: &str| {
@@ -1226,7 +1252,7 @@ mod confinement {
         };
         assert_eq!(
             fingerprint(include_str!("../../td-authd/src/consent.rs")),
-            0xe1ac06eb9a6963b3,
+            0x2c3581318e578908,
             "shared consent changed: reconcile td-secret/src/lib.rs, td-authd/tests/confinement.rs and this pin"
         );
         assert_eq!(fingerprint(AUTHORITY), AUTHORITY_FINGERPRINT);

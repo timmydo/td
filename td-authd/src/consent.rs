@@ -1030,6 +1030,24 @@ impl Request {
         Ok(request)
     }
 
+    /// The login side of a disk proof's first description, before any
+    /// storage baseline exists: `begin_login`'s rules against the login
+    /// record, a proof, and the proof's first step. It checks the shape
+    /// only, not the volume's offer; `begin_proof` against the storage
+    /// worker's baseline checks that before anything is presented.
+    pub fn begin_proof_shape(
+        nonce: [u8; 32],
+        owner: u32,
+        operation: Operation,
+        baseline: &[Fingerprint],
+    ) -> Result<Self, String> {
+        let request = Self::begun(nonce, owner, operation, baseline)?;
+        if request.start()?.proof.is_none() {
+            return Err("not a disk proof".into());
+        }
+        Ok(request)
+    }
+
     /// The shape of a disk proof's first description without the login
     /// record, as the storage worker checks root's: `login_start`, a
     /// proof, and its first step one the worker's own baseline `disk`
@@ -5500,6 +5518,28 @@ mod tests {
             proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey),
             &[A],
             both
+        )
+        .is_err());
+        // Root's login side, before any storage baseline, checks the shape
+        // and the record alone: the volume's offer is not yet known.
+        let shape = |operation, baseline: &[Fingerprint]| {
+            Request::begin_proof_shape([9; 32], 1000, operation, baseline)
+        };
+        assert_eq!(shape(recovery.clone(), &baseline), begin(recovery, both));
+        assert_eq!(shape(identify.clone(), &baseline), begin(identify, both));
+        assert!(shape(add(LoginStep::Identify), &baseline).is_err());
+        assert!(shape(proven(add(LoginStep::Connect), Proof::DiskKey), &baseline).is_err());
+        assert!(shape(
+            proven(
+                add(LoginStep::DiskAuthorize { key: N, retries: 8 }),
+                Proof::DiskKey
+            ),
+            &baseline
+        )
+        .is_err());
+        assert!(shape(
+            proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey),
+            &[A]
         )
         .is_err());
     }

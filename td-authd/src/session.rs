@@ -3,6 +3,7 @@
 use crate::consent::{Recovery, Request as Description, Role};
 use crate::inspection::{Event as InspectionEvent, Inspection};
 use crate::login::{Login, Pin, Selection};
+use crate::proof::Proving;
 use crate::rollback::{Refusal, Rollback};
 use crate::set_hostname::Change;
 use crate::storage::Storage;
@@ -120,6 +121,9 @@ enum Active {
     DiskInstall(Box<crate::disk_install::Installation>),
     /// A login-key worker shares the one operation slot.
     Login(Box<Login>),
+    /// So does a login operation a disk proof authorizes, with its two
+    /// workers in turn.
+    Proof(Box<Proving>),
     /// So does a storage worker.
     Storage(Box<Storage>),
     Rollback(Box<Rollback>),
@@ -133,6 +137,7 @@ impl Active {
             Self::Install(op) => Some(op.request()),
             Self::DiskInstall(op) => Some(op.request()),
             Self::Login(op) => op.request(),
+            Self::Proof(op) => op.request(),
             Self::Storage(op) => op.request(),
             Self::Rollback(op) => Some(op.request()),
             Self::Hostname(op) => Some(op.request()),
@@ -144,6 +149,7 @@ impl Active {
             Self::Install(op) => op.request().nonce(),
             Self::DiskInstall(op) => op.request().nonce(),
             Self::Login(op) => op.nonce(),
+            Self::Proof(op) => op.nonce(),
             Self::Storage(op) => op.nonce(),
             Self::Rollback(op) => op.request().nonce(),
             Self::Hostname(op) => op.request().nonce(),
@@ -155,6 +161,7 @@ impl Active {
             Self::Install(op) => op.presented(request),
             Self::DiskInstall(op) => op.presented(request),
             Self::Login(op) => op.presented(request),
+            Self::Proof(op) => op.presented(request),
             Self::Storage(op) => op.presented(request),
             Self::Rollback(op) => op.presented(request),
             Self::Hostname(op) => op.presented(request),
@@ -166,6 +173,7 @@ impl Active {
             Self::Install(op) => op.commit(request),
             Self::DiskInstall(op) => op.commit(request),
             Self::Login(op) => op.commit(request),
+            Self::Proof(op) => op.commit(request),
             Self::Storage(op) => op.commit(request),
             Self::Rollback(op) => op.commit(request),
             Self::Hostname(op) => op.commit(request),
@@ -178,6 +186,7 @@ impl Active {
             Self::DiskInstall(op) => op.cancel(reason),
             // Every login cancellation is the person's: kill, reap, no relock.
             Self::Login(op) => op.cancel(),
+            Self::Proof(op) => op.cancel(),
             Self::Storage(op) => op.cancel(),
             Self::Rollback(op) => op.cancel(),
             Self::Hostname(op) => op.cancel(),
@@ -189,6 +198,7 @@ impl Active {
             Self::Install(op) => op.poll(),
             Self::DiskInstall(op) => op.poll(),
             Self::Login(op) => op.poll(),
+            Self::Proof(op) => op.poll(),
             Self::Storage(op) => op.poll(),
             Self::Rollback(op) => op.poll(),
             Self::Hostname(op) => op.poll(),
@@ -201,6 +211,7 @@ impl Active {
             // The setup intake owns the service and stops it at teardown.
             Self::DiskInstall(_) => Ok(()),
             Self::Login(op) => op.reap_for_teardown(),
+            Self::Proof(op) => op.reap_for_teardown(),
             Self::Storage(op) => op.reap_for_teardown(),
             Self::Rollback(op) => op.reap_for_teardown(),
             // Root saved the name itself: there is no child.
@@ -447,15 +458,20 @@ impl Session {
             Request::LoginState => Err("login state before session preparation".into()),
             Request::Begin(role) => self.begin(Start::Unlock(role), begin),
             Request::Enroll(recovery) => self.begin(Start::Enroll(recovery), begin),
+            Request::Login(selection) if selection.proof().is_some() => {
+                self.begin_proof(selection, Proving::start)
+            }
             Request::Login(selection) => self.begin_login(selection, Login::start),
             Request::Storage(selection) => {
                 self.begin_storage(selection, crate::storage::OPERATIONS, Storage::start)
             }
             Request::Pin(description, pin) => {
-                let Some(Active::Login(operation)) = &mut self.operation else {
-                    return Err("no login operation takes a PIN".into());
+                let queued = match &mut self.operation {
+                    Some(Active::Login(operation)) => operation.pin(&description, pin)?,
+                    Some(Active::Proof(operation)) => operation.pin(&description, pin)?,
+                    _ => return Err("no login operation takes a PIN".into()),
                 };
-                if !operation.pin(&description, pin)? {
+                if !queued {
                     return Ok(vec![0x9c, 1]);
                 }
                 self.event = Some(Event::Waiting);
@@ -798,6 +814,29 @@ impl Session {
         Ok(answer)
     }
 
+    /// A login operation a disk proof authorizes (amendment 10), which only
+    /// a build whose `storage::OPERATIONS` is set decodes: as
+    /// `begin_login`, its two workers then started in turn.
+    fn begin_proof(
+        &mut self,
+        selection: Selection,
+        start: impl FnOnce(u32, Selection) -> Result<Proving, String>,
+    ) -> Result<Vec<u8>, String> {
+        if !self.prepared
+            || self.cleanup.is_some()
+            || self.operation.is_some()
+            || self.inspection.is_some()
+        {
+            return Err("secret session is not ready for a login operation".into());
+        }
+        let operation = start(self.owner, selection)?;
+        let mut answer = vec![0x9b, 1];
+        answer.extend_from_slice(operation.nonce());
+        self.operation = Some(Active::Proof(Box::new(operation)));
+        self.event = Some(Event::Waiting);
+        Ok(answer)
+    }
+
     /// A storage operation from the worker's baseline on. Until item 9 a
     /// production build refuses every one (`active` false), and every
     /// build the operations its increments have not fixed, before any
@@ -987,7 +1026,7 @@ impl Session {
             }
             // However it ended, the next `1a` reads the login state afresh,
             // and the revocation check begins before this status is sent.
-            let login = matches!(operation, Active::Login(_));
+            let login = matches!(operation, Active::Login(_) | Active::Proof(_));
             self.operation = None;
             self.event = None;
             if login {

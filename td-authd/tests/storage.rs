@@ -260,6 +260,7 @@ fn scripted_worker() {
             w.send(&frame);
             w.hold();
         }
+        proof if proof.starts_with("proof-") => proof_script(w, proof),
         _ => panic!("unknown storage script {script}"),
     }
 }
@@ -440,4 +441,134 @@ fn only_operation_byte_one_is_a_selection_this_build_runs() {
         assert!(Selection::decode(bad).is_err(), "{bad:?}");
     }
     assert!(Storage::start(1001, Selection::SelectorUpdate).is_err());
+}
+
+/// A disk proof's baseline: the volume byte, the recovery-key marker and
+/// the fido2 tokens.
+fn proof_baseline(volume: u8, recovery: bool, tokens: &[(u8, [u8; 4])]) -> Vec<u8> {
+    let mut frame = baseline_frame(volume, tokens, true);
+    frame[2] = u8::from(recovery);
+    frame
+}
+
+/// The storage worker's side of `crate::proof::tests`.
+fn proof_script(w: &mut Worker, script: &str) {
+    use crate::consent::{LoginStep, Proof};
+    use crate::proof::tests::{add_by, described, remove_by, A, RECOVERY, T};
+    let recovery = described(add_by(Proof::RecoveryKey, LoginStep::RecoveryKey));
+    let identify = described(remove_by(Proof::DiskKey, LoginStep::DiskIdentify));
+    let authorize = |key| {
+        described(remove_by(
+            Proof::DiskKey,
+            LoginStep::DiskAuthorize { key, retries: 8 },
+        ))
+    };
+    let first = |w: &mut Worker, frame: Vec<u8>, expected: &Request| {
+        w.send(&frame);
+        assert_eq!(&Request::decode(&w.read()).unwrap(), expected);
+    };
+    let recovered = |w: &mut Worker| {
+        first(w, proof_baseline(3, true, &[(1, T)]), &recovery);
+        w.invite(0x10, &recovery);
+        assert_eq!(w.read(), [&[0x16][..], &RECOVERY[..]].concat());
+    };
+    let identified = |w: &mut Worker, token| {
+        first(w, proof_baseline(4, false, &[(1, token)]), &identify);
+        w.invite(0x10, &identify);
+    };
+    match script {
+        "proof-recovery" => {
+            recovered(w);
+            w.send(&[0x14]);
+        }
+        "proof-changed" => {
+            recovered(w);
+            w.send(&[0x15, 0x28]);
+        }
+        fail if fail.starts_with("proof-fail:") => {
+            recovered(w);
+            let kind = u8::from_str_radix(fail.trim_start_matches("proof-fail:"), 16).unwrap();
+            w.send(&[0x15, kind]);
+            std::process::exit(1);
+        }
+        "proof-disk-remove" => {
+            identified(w, T);
+            w.invite(0x10, &authorize(T));
+            assert_eq!(w.read(), b"\x161234");
+            w.send(&[0x14]);
+        }
+        "proof-wrong-pin" => {
+            identified(w, T);
+            w.invite(0x10, &authorize(T));
+            assert_eq!(w.read(), b"\x161234");
+            w.send(&[0x15, 0x01, 7]);
+            std::process::exit(1);
+        }
+        // A disk security key that names a login key, and one the header
+        // does not hold.
+        "proof-login-key" | "proof-stranger" => {
+            let (token, key) = if script == "proof-login-key" {
+                (A, A)
+            } else {
+                (T, [0x99; 4])
+            };
+            identified(w, token);
+            let frame = w.frame(0x10, &authorize(key));
+            w.send(&frame);
+            w.hold();
+        }
+        // Success before any secret: the identify step proves nothing.
+        "proof-identify-success" => {
+            identified(w, T);
+            w.send(&[0x14]);
+            w.hold();
+        }
+        "proof-hold" => {
+            w.send(&proof_baseline(3, true, &[(1, T)]));
+            w.hold();
+        }
+        "proof-disk-hold" => {
+            w.send(&proof_baseline(4, false, &[(1, T)]));
+            w.hold();
+        }
+        "proof-no-recovery" => {
+            w.send(&proof_baseline(3, false, &[(1, T)]));
+            w.hold();
+        }
+        "proof-no-tokens" => {
+            w.send(&proof_baseline(3, true, &[]));
+            w.hold();
+        }
+        volume if volume.starts_with("proof-volume:") => {
+            let volume = volume.trim_start_matches("proof-volume:").parse().unwrap();
+            w.send(&proof_baseline(volume, true, &[(1, T)]));
+            w.hold();
+        }
+        // Presents the recovery-key step, then reads until root closes the
+        // channel, which it reports before it exits on its own.
+        witness if witness.starts_with("proof-close-witness:") => {
+            first(w, proof_baseline(3, true, &[(1, T)]), &recovery);
+            let frame = w.frame(0x10, &recovery);
+            w.send(&frame);
+            w.stream.set_read_timeout(None).unwrap();
+            let mut byte = [0];
+            while matches!(w.stream.read(&mut byte), Ok(1)) {}
+            let path = witness.trim_start_matches("proof-close-witness:");
+            std::fs::write(format!("{path}.tmp"), b"closed").unwrap();
+            std::fs::rename(format!("{path}.tmp"), path).unwrap();
+        }
+        "proof-ignore" => {
+            recovered_until_pin(w, &recovery);
+            w.hold();
+        }
+        _ => panic!("unknown proof script {script}"),
+    }
+}
+
+/// Through the recovery-key step's acknowledgement, without its secret.
+fn recovered_until_pin(w: &mut Worker, recovery: &Request) {
+    use crate::proof::tests::T;
+    w.send(&proof_baseline(3, true, &[(1, T)]));
+    assert_eq!(&Request::decode(&w.read()).unwrap(), recovery);
+    w.invite(0x10, recovery);
 }

@@ -165,9 +165,12 @@ impl Status {
         }
     }
 
-    /// The `9a` answer, ending in `revocation`'s byte and the admission
-    /// byte, `01` only when `admitted` (amendment 9). A live boot is
-    /// unenrolled without any read, so the live medium never locks.
+    /// The `9a` answer, ending in `revocation`'s byte, the admission
+    /// byte, `01` only when `admitted` (amendment 9), and the protected
+    /// byte, `01` when the protected marker or this boot's `run/td-admit`
+    /// is present or cannot be read (amendment 10), the display choice
+    /// that offers a disk proof. A live boot is unenrolled and unprotected
+    /// without any read, so the live medium never locks.
     pub fn answer(
         &mut self,
         live: bool,
@@ -189,6 +192,9 @@ impl Status {
         answer.extend_from_slice(hostname.as_bytes());
         answer.push(revocation);
         answer.push(u8::from(admitted));
+        answer.push(u8::from(
+            !live && crate::login::protected(&self.root, self.directory_owner),
+        ));
         Ok(answer)
     }
 

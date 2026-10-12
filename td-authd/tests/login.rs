@@ -475,6 +475,51 @@ fn scripted_worker() {
         }
         "silent" => w.hold(),
         "brief" => thread::sleep(Duration::from_secs(2)),
+        // A login operation a disk proof authorized: the worker's first
+        // frame is the proof's last step (crate::proof::tests).
+        "proven-add" => {
+            use crate::consent::Proof;
+            use crate::proof::tests::add_by;
+            let step = |step| add_by(Proof::RecoveryKey, step);
+            w.baseline(&[A]);
+            w.description(step(LoginStep::RecoveryKey));
+            w.present(step(LoginStep::Connect));
+            w.pin_step(step(LoginStep::Create { retries: 7 }));
+            w.pin_step(step(LoginStep::Prove { key: N, retries: 7 }));
+            w.pin_step(step(LoginStep::Repeat { key: N, retries: 7 }));
+            w.present(step(LoginStep::Probe { key: N }));
+            w.invite(0x12, &request(step(LoginStep::Probe { key: N })));
+            w.send(&[0x14]);
+        }
+        "proven-remove" => {
+            use crate::consent::Proof;
+            use crate::proof::tests::{remove_by, T};
+            let last = remove_by(
+                Proof::DiskKey,
+                LoginStep::DiskAuthorize { key: T, retries: 8 },
+            );
+            w.baseline(&[A, B]);
+            w.description(last.clone());
+            w.invite(0x12, &request(last));
+            w.send(&[0x14]);
+        }
+        "proven-hold" => {
+            w.baseline(&[A]);
+            w.hold();
+        }
+        "proven-hold-two" => {
+            w.baseline(&[A, B]);
+            w.hold();
+        }
+        // A frame while the storage worker runs the proof.
+        "proven-early" => {
+            use crate::consent::Proof;
+            use crate::proof::tests::remove_by;
+            w.baseline(&[A, B]);
+            thread::sleep(Duration::from_millis(200));
+            w.present(remove_by(Proof::DiskKey, LoginStep::DiskIdentify));
+            w.hold();
+        }
         _ => panic!("unknown login script {script}"),
     }
 }

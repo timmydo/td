@@ -16061,7 +16061,7 @@ mod tests {
     fn login(state: &[u8]) -> crate::authority::Login {
         let login = crate::authority::Login::default();
         login
-            .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00"].concat())
+            .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x00\x00"].concat())
             .unwrap();
         login
     }
@@ -16150,7 +16150,7 @@ mod tests {
         ] {
             let login = crate::authority::Login::default();
             login
-                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x01"].concat())
+                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop\x00\x01\x00"].concat())
                 .unwrap();
             let answer = login.current().unwrap();
             assert!(answer.admitted());
@@ -16229,7 +16229,15 @@ mod tests {
         let revoked = |state: &[u8], byte: u8| {
             let login = crate::authority::Login::default();
             login
-                .answer(&[&[0x9a][..], state, b"\x06tester\x09td-laptop", &[byte, 0]].concat())
+                .answer(
+                    &[
+                        &[0x9a][..],
+                        state,
+                        b"\x06tester\x09td-laptop",
+                        &[byte, 0, 0],
+                    ]
+                    .concat(),
+                )
                 .unwrap();
             login.current().unwrap()
         };
@@ -16296,7 +16304,7 @@ mod tests {
         let handle = login(&[2, 0x0c]);
         let connected = handle.current().unwrap();
         handle
-            .answer(&[&[0x9a, 0][..], b"\x06tester\x09td-laptop\x00\x00"].concat())
+            .answer(&[&[0x9a, 0][..], b"\x06tester\x09td-laptop\x00\x00\x00"].concat())
             .unwrap();
         let latest = handle.current().unwrap();
         assert!(!latest.locks());
@@ -16337,7 +16345,7 @@ mod tests {
             .answer(
                 &[
                     &[0x9a, 1, 1, 7, 7, 7, 7][..],
-                    b"\x06tester\x09td-laptop\x00\x00",
+                    b"\x06tester\x09td-laptop\x00\x00\x00",
                 ]
                 .concat(),
             )
@@ -16354,7 +16362,7 @@ mod tests {
         // An answer stored after the read reaches the watcher after the
         // paint, and repaints the rows.
         handle
-            .answer(&[&[0x9a, 2, 0x0b][..], b"\x06tester\x09td-laptop\x00\x00"].concat())
+            .answer(&[&[0x9a, 2, 0x0b][..], b"\x06tester\x09td-laptop\x00\x00\x00"].concat())
             .unwrap();
         let damaged = handle.current().unwrap();
         assert!(*frames.lock().unwrap().last().unwrap() == lock_surface(Some(&damaged)));

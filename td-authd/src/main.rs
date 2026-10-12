@@ -44,6 +44,7 @@ mod login_tier;
 mod mount_sys;
 mod portal_files;
 mod primary_account;
+mod proof;
 mod revocation;
 mod rollback;
 // The saved hostname's bounded read and synced write, and the synced write

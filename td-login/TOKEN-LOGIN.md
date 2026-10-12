@@ -1048,8 +1048,9 @@ reads only a private copy of the header area the worker verified
 writes the disk, and its child is killed at the operation's deadline or
 cancellation (`td-install/DESIGN.md`, "Storage operation worker").
 ENCRYPTION.md increment 8e's documentation commit fixes the rest, and
-its last commit implements it after the storage-operation wire exists
-(td-authd/DESIGN.md amendment 10):
+its last commit implements it over the storage-operation wire
+(td-authd/DESIGN.md amendment 10), live in test builds and lifted in
+production with item 9's activation:
 
 - **Selection.** On the key-management screen, while the last `1a`
   answer's protected byte reads `01`, choosing `1`, `2`, `A` or a
@@ -1078,13 +1079,14 @@ its last commit implements it after the storage-operation wire exists
   nothing; a disk key's PIN, presence and device kinds show the rows
   above.
 
-Until that commit a protected machine refuses every login-key operation
-that only a disk proof can authorize: a first enrollment, which has no
-enrolled key to assert, is refused from the worker's baseline with
-`84`, and the worker refuses a description of it as INTERNAL; after
-it, a first enrollment without a proof still is. An addition and a
-removal that leaves a key are authorized by an enrolled key's
-assertion, as anywhere, or by a disk proof once it lands.
+Until item 9, outside test builds, a protected machine refuses every
+login-key operation that only a disk proof can authorize: a first
+enrollment, which has no enrolled key to assert, is refused from the
+worker's baseline with `84`, and the worker refuses a description of
+it as INTERNAL; where the proof is decoded, a first enrollment without
+one still is. An addition and a removal that leaves a key are
+authorized by an enrolled key's assertion, as anywhere, or by a disk
+proof where it is decoded.
 
 The recovery key is not hardware-backed, and is acceptable here because
 its holder already has equal power offline: from the live medium it

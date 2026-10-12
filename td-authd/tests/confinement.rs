@@ -45,6 +45,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
             "mount_sys.rs",
             "portal_files.rs",
             "primary_account.rs",
+            "proof.rs",
             "revocation.rs",
             "rollback.rs",
             "secret_intake.rs",
@@ -90,6 +91,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
         ("mount_sys.rs", 4),
         ("portal_files.rs", 0),
         ("primary_account.rs", 0),
+        ("proof.rs", 0),
         ("revocation.rs", 0),
         ("storage.rs", 0),
     ] {
@@ -138,7 +140,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0xe1ac06eb9a6963b3,
+        0x2c3581318e578908,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -189,7 +191,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0x99f08c22313e3bf1,
+        0xfdd35efbd98912ad,
         "login worker supervisor changed"
     );
     assert_eq!(
@@ -229,7 +231,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert!(storage.contains(".args([\"storage-operation\", \"--uid\", &owner.to_string()])"));
     assert_eq!(
         fingerprint(storage),
-        0x3e4eb8fba71b0efa,
+        0x917534debaa70e1e,
         "storage worker supervisor changed"
     );
     assert_eq!(
@@ -237,6 +239,58 @@ fn the_production_source_and_raw_boundary_are_closed() {
             .matches("Request::Login(selection) => self.begin_login(selection, Login::start),")
             .count(),
         1
+    );
+    // Amendment 10's disk proof: only a build whose `storage::OPERATIONS`
+    // is set decodes `1b 0b`, so until td-install/ENCRYPTION.md's item 9
+    // a production build reads one as a protocol violation, and the
+    // storage worker it starts is the same fixed verb under the same
+    // gate. Its two workers start only through `proof::Proving`.
+    assert_eq!(
+        login
+            .matches("[11, proof, rest @ ..] if crate::storage::OPERATIONS =>")
+            .count(),
+        1
+    );
+    assert_eq!(login.matches("[11").count(), 1);
+    assert_eq!(storage.matches("if !OPERATIONS {").count(), 1);
+    assert_eq!(
+        storage
+            .matches("Self::spawn_proof(owner, nonce, first, login, deadline, command(owner))")
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .matches("self.begin_proof(selection, Proving::start)")
+            .count(),
+        1
+    );
+    let proof = include_str!("../src/proof.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert_eq!(
+        proof
+            .matches("Login::begin_with(owner, nonce, approval, selection, true)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        proof
+            .matches(".map(|proving| proving.storage_with(Box::new(Storage::start_proof)))")
+            .count(),
+        1
+    );
+    assert_eq!(
+        proof
+            .matches("login::protected(Path::new(\"/\"), Owner::ROOT)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fingerprint(proof),
+        0x4f704b3fa38bb7e8,
+        "disk proof orchestrator changed"
     );
     // Amendment 9: only an installed boot's Prepare consumes the admission
     // record, with the production paths, and only the generation's first
@@ -1101,13 +1155,13 @@ fn fingerprint(source: &str) -> u64 {
     })
 }
 
-const LOGIN_STATE_FINGERPRINT: u64 = 0xfffb5ba28cf59137;
+const LOGIN_STATE_FINGERPRINT: u64 = 0x10b1af1d87d02b94;
 const SHARED_LOGIN_STATE_FINGERPRINT: u64 = 0x36b736e5dda17cc6;
 const SHARED_HOSTNAME_FINGERPRINT: u64 = 0x49026f28c1db76ec;
 
 const LAUNCH_FINGERPRINT: u64 = 0xe4f8992811d62954;
-const MAIN_FINGERPRINT: u64 = 0x95f472e5e6b26243;
-const SESSION_FINGERPRINT: u64 = 0x8cd7530b40b227bf;
+const MAIN_FINGERPRINT: u64 = 0xd03c9fa382ca5d9a;
+const SESSION_FINGERPRINT: u64 = 0x4cf72cc41aabc397;
 
 const INTAKE_RAW_FINGERPRINT: u64 = 0x320c8b6ddbfe29af;
 const INTAKE_FINGERPRINT: u64 = 0xe2f50441f71b4c76;
