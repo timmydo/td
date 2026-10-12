@@ -107,3 +107,21 @@ zero-cost admission for defaults. One turn compares at most 31 source bytes;
 each comparison byte spends one source visit and one interpretation step.
 Values remain passive; the enclosing owner retains source custody and makes
 any refusal terminal for its operation.
+
+The shared entity-header interpreter selects metadata, classifies it and
+retains at most 70 boundary bytes under the original Meter/HeaderBudget.
+Resident structure traversal uses the same core. Input may be a retained
+prefix with a definitive header boundary; incomplete prefixes refuse. The
+interpreter never reads a MIME body or grants complete-tree authority. It
+rejects encoded multipart entities and absent/invalid selected boundaries,
+preserving the resident traversal's policy. Each active public turn funds
+one record, and every retained boundary octet funds one output byte.
+Public cached-completion polls and consuming finish freshly check admission.
+The value accessor is a passive peek; a recorded failure hides it permanently.
+Unspent local interpretation credit is prepaid and forfeited at public finish;
+separate entity cursors can spend more records than one resident traversal,
+which preserves its original cross-entity credit. No credit is renewed. The resident
+traversal keeps its existing outer admission and passive completion policy.
+The public interpreter has a compiled 2 KiB owner ceiling, with input backing
+reserved separately. Resident traversal still fits its existing 16 KiB
+cursor-plus-header-budget ceiling; no heap indirection stores phase state.

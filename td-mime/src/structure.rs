@@ -11,6 +11,8 @@ use crate::{
 };
 #[path = "structure/classify.rs"]
 pub mod classify;
+#[path = "structure/entity.rs"]
+pub mod entity;
 pub const MAX_DEPTH: usize = 64;
 /// Parsing ceilings, independent of any service configuration or account.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,9 +162,8 @@ struct Frame<'a> {
     closed: bool,
     digest: bool,
 }
-enum Phase<'a> {
-    Headers(metadata::Cursor<'a>),
-    Boundary(protocol::Reader<'a>),
+enum Phase {
+    Entity,
     FirstOpening,
     NextDelimiter,
     Leaf,
@@ -199,10 +200,8 @@ pub struct Cursor<'a, 'w> {
     frames: [Option<Frame<'a>>; MAX_DEPTH],
     depth: usize,
     current: Part,
-    phase: Phase<'a>,
-    boundary: [u8; 70],
-    boundary_len: usize,
-    digest: bool,
+    phase: Phase,
+    entity: Option<entity::Core<'a>>,
     decoder: Option<Decode>,
     decoded: [u8; 32],
     failure: Option<Error>,
@@ -232,14 +231,13 @@ impl<'a, 'w> Cursor<'a, 'w> {
             .checked_add(u64::try_from(source.len()).map_err(|_| Error::InvalidRange)?)
             .ok_or(Error::InvalidRange)?;
         let max_headers = u64::try_from(limits.header_bytes).map_err(|_| Error::InvalidLimits)?;
-        let metadata = metadata::Cursor::new(
+        let entity = entity::Core::new(entity::Input {
             source,
             base,
-            max_headers,
-            metadata::Context::Normal,
-            SourceEnd::Eof,
-        )
-        .map_err(Self::metadata_error)?;
+            header_limit: max_headers,
+            context: metadata::Context::Normal,
+            source_end: SourceEnd::Eof,
+        })?;
         Ok(Self {
             source,
             base,
@@ -260,31 +258,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
                 depth: 1,
                 ..Part::default()
             },
-            phase: Phase::Headers(metadata),
-            boundary: [0; 70],
-            boundary_len: 0,
-            digest: false,
+            phase: Phase::Entity,
+            entity: Some(entity),
             decoder: None,
             decoded: [0; 32],
             failure: None,
         })
-    }
-    fn metadata_error(error: metadata::Error) -> Error {
-        match error {
-            metadata::Error::Work(stop) => Error::Work(stop),
-            metadata::Error::InterpretationLimit => Error::InterpretationLimit,
-            metadata::Error::Headers(crate::headers::Error::HeaderLimit) => Error::HeaderLimit,
-            error => Error::Metadata(error),
-        }
-    }
-    fn parameter_error(error: protocol::Error) -> Error {
-        match error {
-            protocol::Error::Parameter(crate::parameter::Error::Work(stop)) => Error::Work(stop),
-            protocol::Error::Parameter(crate::parameter::Error::InterpretationLimit) => {
-                Error::InterpretationLimit
-            }
-            error => Error::Parameter(error),
-        }
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
@@ -380,44 +359,44 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.used += 1;
         Ok(ordinal)
     }
-    fn finish_headers(&mut self, now: Tick, selected: metadata::Selection) -> Result<(), Error> {
+    fn finish_entity(&mut self, now: Tick, value: entity::Value) -> Result<(), Error> {
         self.headers = self
             .headers
-            .checked_add(selected.end.header_bytes)
+            .checked_add(value.selection.end.header_bytes)
             .ok_or(Error::HeaderLimit)?;
         if self.headers > self.max_headers {
             return Err(Error::HeaderLimit);
         }
-        self.current.body_start = selected.end.body_start;
+        self.current.body_start = value.selection.end.body_start;
         self.current.size = self
             .current
             .entity_end
             .checked_sub(self.current.body_start)
             .ok_or(Error::InvalidRange)?;
-        let classified = classify::local(
-            classify::Input {
-                source: self.source,
-                base: self.base,
-                selected,
-            },
-            now,
-            self.work,
-            self.budget,
-            &mut self.credit,
-        )?;
+        let classified = value.classified;
         self.current.media = classified.media;
         self.current.encoding = classified.encoding;
         self.current.type_start = classified.type_start;
         self.current.type_end = classified.type_end;
         self.current.diagnostics |= classified.diagnostics;
-        self.digest = classified.digest;
         if self.current.media == Media::Multipart {
-            if self.current.encoding != Encoding::Identity {
-                return Err(Error::NotParsable);
-            }
-            let raw = self.range(self.current.type_start, self.current.type_end)?;
-            self.boundary_len = 0;
-            self.phase = Phase::Boundary(protocol::Reader::new(raw, protocol::Purpose::Boundary));
+            let boundary = value.boundary().ok_or(Error::InvalidState)?;
+            let body = self.range(self.current.body_start, self.current.entity_end)?;
+            let scanner = delimiter::Core::new(body, self.current.body_start, boundary.len())
+                .map_err(Error::Delimiter)?;
+            let ordinal = self.append(now)?;
+            let frame = Frame {
+                scanner,
+                boundary: value.boundary,
+                length: value.boundary_len,
+                ordinal,
+                next_start: None,
+                closed: false,
+                digest: classified.digest,
+            };
+            *self.frames.get_mut(self.depth).ok_or(Error::DepthLimit)? = Some(frame);
+            self.depth += 1;
+            self.phase = Phase::FirstOpening;
         } else {
             self.decoder = match self.current.encoding {
                 Encoding::Identity => None,
@@ -481,8 +460,13 @@ impl<'a, 'w> Cursor<'a, 'w> {
         } else {
             metadata::Context::Normal
         };
-        let metadata = metadata::Cursor::new(source, start, remaining, context, SourceEnd::Eof)
-            .map_err(Self::metadata_error)?;
+        let entity = entity::Core::new(entity::Input {
+            source,
+            base: start,
+            header_limit: remaining,
+            context,
+            source_end: SourceEnd::Eof,
+        })?;
         self.current = Part {
             entity_start: start,
             entity_end: end,
@@ -491,7 +475,8 @@ impl<'a, 'w> Cursor<'a, 'w> {
             depth: u8::try_from(depth).map_err(|_| Error::DepthLimit)?,
             ..Part::default()
         };
-        self.phase = Phase::Headers(metadata);
+        self.entity = Some(entity);
+        self.phase = Phase::Entity;
         Ok(())
     }
     fn delimiter(&mut self, now: Tick) -> Result<delimiter::Status, Error> {
@@ -524,74 +509,12 @@ impl<'a, 'w> Cursor<'a, 'w> {
             )
             .map_err(Error::Work)?;
         match &mut self.phase {
-            Phase::Headers(metadata) => {
-                if metadata
-                    .poll_in_context(now, self.work, self.budget, &mut self.credit)
-                    .map_err(Self::metadata_error)?
-                    == metadata::Status::Complete
-                {
-                    let selected = metadata
-                        .selection()
-                        .map_err(Self::metadata_error)?
-                        .ok_or(Error::InvalidState)?;
-                    self.finish_headers(now, selected)?;
-                }
-            }
-            Phase::Boundary(reader) => {
-                match reader
-                    .poll(
-                        now,
-                        &mut decode_work::Parsing::new(self.work, self.budget, &mut self.credit),
-                    )
-                    .map_err(Self::parameter_error)?
-                {
-                    protocol::Read::Yield => {}
-                    protocol::Read::Octet(byte) => {
-                        let target = self
-                            .boundary
-                            .get_mut(self.boundary_len)
-                            .ok_or(Error::InvalidState)?;
-                        self.work
-                            .charge(
-                                now,
-                                Charge {
-                                    output_bytes: 1,
-                                    ..Charge::default()
-                                },
-                            )
-                            .map_err(Error::Work)?;
-                        *target = byte;
-                        self.boundary_len += 1;
-                    }
-                    protocol::Read::Complete(end) => {
-                        if end.value != protocol::Value::Present {
-                            return Err(Error::NotParsable);
-                        }
-                        if end.bytes != self.boundary_len {
-                            return Err(Error::InvalidState);
-                        }
-                        if end.unsupported_qualifier || end.selection.invalid_extended {
-                            self.current.diagnostics |= PARAMETER_PROBLEM;
-                        }
-                        let body = self.range(self.current.body_start, self.current.entity_end)?;
-                        let scanner =
-                            delimiter::Core::new(body, self.current.body_start, self.boundary_len)
-                                .map_err(Error::Delimiter)?;
-                        let ordinal = self.append(now)?;
-                        let frame = Frame {
-                            scanner,
-                            boundary: self.boundary,
-                            length: u8::try_from(self.boundary_len)
-                                .map_err(|_| Error::InvalidState)?,
-                            ordinal,
-                            next_start: None,
-                            closed: false,
-                            digest: self.digest,
-                        };
-                        *self.frames.get_mut(self.depth).ok_or(Error::DepthLimit)? = Some(frame);
-                        self.depth += 1;
-                        self.phase = Phase::FirstOpening;
-                    }
+            Phase::Entity => {
+                let entity = self.entity.as_mut().ok_or(Error::InvalidState)?;
+                if entity.poll(now, self.work, self.budget, &mut self.credit)? == Status::Complete {
+                    let value = entity.value().ok_or(Error::InvalidState)?;
+                    self.finish_entity(now, value)?;
+                    self.entity = None;
                 }
             }
             Phase::FirstOpening => match self.delimiter(now)? {
