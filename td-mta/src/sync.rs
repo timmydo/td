@@ -5,6 +5,11 @@ use crate::{
     wire::{hex, unhex, Error},
 };
 
+const DATA_PREFIX: &[u8; 3] = b"d1_";
+
+mod query;
+pub use query::{QueryState, QueryType, QUERY_INTERPRETATION_VERSION};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DataType {
     Mailbox,
@@ -46,7 +51,7 @@ impl DataState {
             .get_mut(..Self::WIRE_BYTES)
             .ok_or(Error::OutputFull)?;
         let (prefix, rest) = output.split_at_mut_checked(3).ok_or(Error::OutputFull)?;
-        prefix.copy_from_slice(b"d1_");
+        prefix.copy_from_slice(DATA_PREFIX);
         let (kind, rest) = rest.split_at_mut_checked(2).ok_or(Error::OutputFull)?;
         hex(&[self.kind.object_type().tag()], kind)?;
         let (account, rest) = rest.split_at_mut_checked(32).ok_or(Error::OutputFull)?;
@@ -61,7 +66,7 @@ impl DataState {
             return Err(Error::Syntax);
         }
         let (prefix, rest) = value.as_bytes().split_at_checked(3).ok_or(Error::Syntax)?;
-        if prefix != b"d1_" {
+        if prefix != DATA_PREFIX {
             return Err(Error::Syntax);
         }
         let (kind, rest) = rest.split_at_checked(2).ok_or(Error::Syntax)?;

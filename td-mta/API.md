@@ -7332,3 +7332,30 @@ Email thread membership has evidence that it commits matching Thread
 history atomically. This dispatcher does not enforce that pairing at the
 generic storage boundary. Delivery has its own history tests; future
 import, set and purge paths must supply their own evidence before admission.
+
+## Passive query-state tokens
+
+sync::QueryState encodes and decodes POLICY.md section 4.2's query-state
+syntax. QueryType admits only Mailbox, Email and Submission. current captures
+ViewIdentity metadata and the compiled QUERY_INTERPRETATION_VERSION; it
+retains no read view and provides no authorization. Callers keep and freshly
+check the original view before publishing a query result.
+
+Decoding validates canonical syntax but preserves any u32 interpretation
+version, including unknown versions. Recognition is not permission to reuse
+an old result under current semantics. Token equality promises stable results
+only for identical query arguments under the same interpretation policy;
+arguments are not hashed into this token. The utility neither evaluates
+queries nor activates methods or capabilities. POLICY.md owns versioning,
+immutable Email projection constraints and queryChanges refusal behavior.
+
+A future consumer comparing an old token must test account, epoch, query
+type, interpretation version and sequence against its trusted current view;
+comparing only sequences is invalid. matches_current compares all fields
+with current trusted metadata and the compiled interpretation version, but
+still does not compare query arguments or establish authority. Consumer
+admission tests must cover each
+mismatch before that consumer is enabled. No queryChanges consumer is added
+here: the policy continues to require refusal. Query inputs must obey the
+stable-result and interpretation-version contract in POLICY.md section 4.2;
+this token cannot enforce visibility, index or time-dependent semantics.
