@@ -207,3 +207,7 @@ pub use structure as mime_structure;
 #[path = "root_headers.rs"]
 #[allow(unused)] // The library remains the lint authority for the collector.
 pub mod root_headers;
+
+#[path = "property_selection.rs"]
+#[allow(unused)] // Match the production selector used by measured body properties.
+pub mod property_selection;

@@ -7879,3 +7879,37 @@ UnsupportedGrammar, although property recognition admits them. This is an
 existing Mail conformance blocker, including absent fields; resolve it in
 the shared parser before advertising Mail. This owner preserves the typed
 refusal and retires the whole input instead of bypassing that parser.
+
+## Aggregate Email property selection
+
+email_properties::Cursor validates already-decoded immutable Email/get keys
+into caller-reserved header cells and a fixed field bitset. Explicit empty
+selection includes id; DEFAULT names exactly the RFC 8621 section 4.2 omitted
+or null properties list, excluding headers and bodyStructure. The caller
+chooses DEFAULT only for omitted/null input, never for an explicit empty
+array, and retains the decoded request bytes for the entire selection.
+
+The shared property_selection engine now owns the existing body-part
+selector's header retention, exact requested-key deduplication, 64-byte
+comparison turns and refusal state. Body and Email classifiers retain their
+separate property grammars and fixed-field sets. Body selection's public
+aliases, defaults, costs and caller storage contracts are unchanged; error
+diagnostic prefixes now describe generic property selection. No
+second key-deduplication implementation is maintained.
+
+Duplicate fixed fields collapse in the bitset. Header keys deduplicate only
+when their complete requested spellings match; differently cased requested
+keys and aliases remain distinct response keys, in first-requested order.
+Every key is recognized before it can contribute to a complete result;
+unknown/forbidden properties and cell exhaustion hide the whole selection.
+Errors are sticky. Cached completion and View are passive, so the enclosing
+request must retain and freshly check its original meter and authorization.
+This supplies selection, not JSON decoding, IDs validation or Email/get
+method dispatch. It changes no capability advertisement.
+
+Domain is sealed to the built-in classifiers, and retention state and View
+fields stay private. Only complete selection or the internal body-default
+constructor can create a View. The latter is specialized to body Fields,
+sets its own defaults and keeps the original header-cell loan; Email has
+no default shortcut. DEFAULT_HEADER_CELLS states the eleven
+header cells required by Email defaults; one fewer refuses the selection.

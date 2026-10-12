@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
+use crate::body_properties::Fields;
 use crate::{
     admission::work::{Charge, Meter, Stop},
     ports::Deadline,
@@ -412,7 +413,7 @@ pub fn probe(mut snapshot: impl FnMut()) {
         );
         if trial >= 6 {
             loop {
-                if matches!(&cursor.phase,Some(Phase::Selection(selection)) if trial==7 || (selection.used==1 && matches!(selection.phase,super::super::Phase::Header{..})))
+                if matches!(&cursor.phase,Some(Phase::Selection(selection)) if trial == 7 || crate::property_selection::body_tests::comparing_second_header(selection))
                 {
                     break;
                 }

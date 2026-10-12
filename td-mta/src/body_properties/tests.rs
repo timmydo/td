@@ -1,6 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 use super::*;
-use crate::ports::Deadline;
+use crate::{
+    body_properties::{Cursor, Fields, Metadata},
+    body_property,
+    ports::Deadline,
+};
 const NAMES: &[&str] = &[
     "partId",
     "blobId",
@@ -611,4 +615,8 @@ fn different_lengths_and_insertions_pay_exact_records_without_byte_visits() {
     assert_eq!(header_turns, 5);
     let view = cursor.finish().unwrap();
     assert_eq!(view.headers().len(), 2);
+}
+
+pub(crate) fn comparing_second_header(cursor: &Cursor<'_, '_, '_>) -> bool {
+    cursor.used == 1 && matches!(cursor.phase, Phase::Header { .. })
 }

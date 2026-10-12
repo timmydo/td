@@ -1,5 +1,5 @@
 //! Decode and validate one admitted bodyProperties argument without copying keys.
-use super::{json, Cell, Fields, View};
+use super::{json, Cell, View};
 use crate::{admission::work::Meter, ports::Tick};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -71,10 +71,7 @@ impl<'i, 'c, 'k, 'm, 'h> Cursor<'i, 'c, 'k, 'm, 'h> {
             return None;
         }
         match self.phase.as_ref()? {
-            Phase::Default => Some(View {
-                fields: Fields::DEFAULT,
-                headers: self.headers.as_ref()?.get(..0)?,
-            }),
+            Phase::Default => View::body_default(self.headers.as_ref()?),
             Phase::Selection(cursor) => cursor.value(),
             Phase::Json(_) => None,
         }
@@ -84,14 +81,8 @@ impl<'i, 'c, 'k, 'm, 'h> Cursor<'i, 'c, 'k, 'm, 'h> {
             return Err(error);
         }
         match self.phase.ok_or(Error::InvalidState)? {
-            Phase::Default => Ok(View {
-                fields: Fields::DEFAULT,
-                headers: self
-                    .headers
-                    .ok_or(Error::InvalidState)?
-                    .get(..0)
-                    .ok_or(Error::InvalidState)?,
-            }),
+            Phase::Default => View::body_default(self.headers.ok_or(Error::InvalidState)?)
+                .ok_or(Error::InvalidState),
             Phase::Selection(cursor) => match cursor.finish() {
                 Ok(view) => Ok(view),
                 Err(super::Error::InvalidState) => Err(Error::InvalidState),
