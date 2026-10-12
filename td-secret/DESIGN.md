@@ -2415,14 +2415,19 @@ step it derives later carries no key.
    exit.
 
 **Disk proofs.** Fixed by ENCRYPTION.md increment 8e's documentation
-commit, implemented by its last: a first enrollment, an addition or a
-removal authorized by a disk proof (td-authd/DESIGN.md amendment 10,
-consent tags 13 to 15). The proof runs in td-install's storage worker,
-never here: this worker never tests a keyslot, reads the volume or
-holds a disk secret. Its baseline is sent as above, and its wait for
-root's first frame is bounded by the operation deadline, not a frame
-time, since root runs the proof meanwhile. For these tags root's first
-frame is the description of the proof's last step (recovery key, or
+commit; this worker's part is implemented by its third code commit,
+and root starts it for one only from its last: a first enrollment, an
+addition or a removal authorized by a disk proof (td-authd/DESIGN.md
+amendment 10, consent tags 13 to 15). The proof runs in td-install's
+storage worker, never here: this worker never tests a keyslot, reads
+the volume or holds a disk secret. Its baseline is sent as above, and
+its wait for root's first frame is bounded by the operation deadline,
+not a frame time, since root runs the proof meanwhile; the same wait
+serves every first frame, which root sends at once otherwise. Root
+offers a disk proof only on a protected machine (`86` otherwise), and
+the worker refuses one on any other as INTERNAL before any token. For
+these tags root's first frame is the description of the proof's last
+step (recovery key, or
 disk authorize), sent only once the storage worker proved it; the
 worker admits it through consent's start rule for a proven proof and
 against its own baseline, presents nothing for it, and reads the

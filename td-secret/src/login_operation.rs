@@ -2,7 +2,9 @@
 //! first enrollment, key addition and key removal, each started by
 //! td-authd on the compositor's physical selection.
 
-use crate::consent::{Admitted, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_LONGEST};
+use crate::consent::{
+    Admitted, Fingerprint, LoginStep, Operation, Proof, Request, Slot, LOGIN_LONGEST,
+};
 use crate::fido_ctap;
 use crate::fido_device::{self, Interruption};
 use crate::fido_p256::PublicKey;
@@ -312,7 +314,10 @@ fn perform<D: Devices>(
         }
     }
     wire.send(&frame).map_err(|_| framing(wire))?;
-    let frame = wire.receive_cleared().map_err(|_| framing(wire))?;
+    // Root may run a disk proof's storage worker before it sends this, so
+    // the wait is the operation's, not a frame time (td-authd/DESIGN.md,
+    // amendment 10).
+    let frame = wire.receive_awaited().map_err(|_| framing(wire))?;
     let request = Request::decode(frame.bytes()).map_err(|_| Failure::Internal)?;
     drop(frame);
     if request.owner() != context.uid {
@@ -333,19 +338,39 @@ fn perform<D: Devices>(
         return Err(Failure::NoRecord);
     }
     // TOKEN-LOGIN.md's protected-volume rule, which root applies before
-    // it describes anything: there a first enrollment needs a disk proof
-    // this build does not offer, and the last key stays.
-    if refused_when_protected(&operation) && protected(context) {
+    // it describes anything: there a first enrollment needs a disk proof,
+    // and the last key stays.
+    if refused_when_protected(&operation, request.login_proof()) && protected(context) {
         return Err(Failure::Internal);
     }
-    let begun = Request::begin_login(
-        *request.nonce(),
-        request.owner(),
-        operation.clone(),
-        &fingerprints,
-    )
-    .map_err(|_| Failure::Internal)?;
-    if begun != request {
+    // Root offers a disk proof only on a protected machine (`86`
+    // otherwise); the worker refuses one anywhere else as well.
+    if request.login_proof().is_some() && !protected(context) {
+        return Err(Failure::Internal);
+    }
+    // A disk proof's first frame is its last step, which the storage
+    // worker presented and proved; an enrolled key's is root's first step.
+    let (begun, proven) = match request.login_proof() {
+        None => (
+            Request::begin_login(
+                *request.nonce(),
+                request.owner(),
+                operation.clone(),
+                &fingerprints,
+            ),
+            None,
+        ),
+        Some(_) => match Request::begin_proven(
+            *request.nonce(),
+            request.owner(),
+            operation.clone(),
+            &fingerprints,
+        ) {
+            Ok((begun, admitted)) => (Ok(begun), Some(admitted)),
+            Err(error) => (Err(error), None),
+        },
+    };
+    if begun.map_err(|_| Failure::Internal)? != request {
         return Err(Failure::Internal);
     }
     let ceremony = Ceremony {
@@ -353,7 +378,8 @@ fn perform<D: Devices>(
         presented,
         fingerprints: &fingerprints,
         current: request,
-        last: false,
+        last: proven == Some(Admitted::Last),
+        proven: proven.is_some(),
     };
     match (operation, record) {
         (Operation::LoginUnlock { .. }, Some(record)) => {
@@ -380,12 +406,14 @@ fn perform<D: Devices>(
     }
 }
 
-/// A first enrollment, or a removal of every key.
-fn refused_when_protected(operation: &Operation) -> bool {
-    matches!(
-        operation,
-        Operation::LoginEnroll { .. } | Operation::LoginRemove { after: 0, .. }
-    )
+/// A first enrollment no disk proof authorizes, or a removal of every key
+/// however authorized.
+fn refused_when_protected(operation: &Operation, proof: Option<Proof>) -> bool {
+    match operation {
+        Operation::LoginEnroll { .. } => proof.is_none(),
+        Operation::LoginRemove { after: 0, .. } => true,
+        _ => false,
+    }
 }
 
 /// Whether the protected marker is in the login directory or the boot's
@@ -450,6 +478,9 @@ struct Ceremony<'a> {
     /// Whether that step was the operation's final one, after which only
     /// its commit round may follow.
     last: bool,
+    /// Whether a disk proof authorized the operation: root's first frame
+    /// was its proven last step, which this worker never presents.
+    proven: bool,
 }
 
 impl Ceremony<'_> {
@@ -467,7 +498,8 @@ impl Ceremony<'_> {
         wire.send(&[0x14]).map_err(|_| framing(wire))
     }
 
-    /// Each new key in turn, then the record they make.
+    /// Each new key in turn, then the record they make. After a disk
+    /// proof, the first key's connect is this worker's to present.
     fn enroll<D: Devices>(
         mut self,
         wire: &mut Wire,
@@ -480,8 +512,9 @@ impl Ceremony<'_> {
         let mut made: Vec<EnrolledCredential> = Vec::with_capacity(usize::from(after));
         let mut previous = None;
         for ordinal in 1..=after {
-            // Root's own first step is the first key's connect.
-            if ordinal > 1 {
+            // Root's own first step is the first key's connect, unless a
+            // disk proof came first.
+            if ordinal > 1 || self.proven {
                 let connect = Step {
                     ordinal,
                     ..Step::of(LoginStep::Connect, Admitted::Next)
@@ -513,7 +546,9 @@ impl Ceremony<'_> {
         self.commit(wire, Some(&record), entropy)
     }
 
-    /// Authorized by an enrolled key, then one new key.
+    /// Authorized by an enrolled key or a disk proof, then one new key.
+    /// After a proof no device authorized it, so any one connected key may
+    /// be the new one.
     fn add<D: Devices>(
         mut self,
         wire: &mut Wire,
@@ -523,9 +558,13 @@ impl Ceremony<'_> {
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<(), Failure> {
         self.begin(wire)?;
-        let authorizing = self.enrolled(wire, &record, devices, entropy, Admitted::Next)?;
+        let authorizing = if self.proven {
+            None
+        } else {
+            Some(self.enrolled(wire, &record, devices, entropy, Admitted::Next)?)
+        };
         self.present(wire, Step::of(LoginStep::Connect, Admitted::Next))?;
-        let node = connected(devices, Some(authorizing), wire)?;
+        let node = connected(devices, authorizing, wire)?;
         let excluded: Vec<&[u8]> = record
             .slots()
             .iter()
@@ -546,7 +585,8 @@ impl Ceremony<'_> {
         self.commit(wire, Some(&record), entropy)
     }
 
-    /// Authorized by an enrolled key, which may be among those removed.
+    /// Authorized by an enrolled key, which may be among those removed, or
+    /// by a disk proof, whose last step is the operation's.
     fn remove<D: Devices>(
         mut self,
         wire: &mut Wire,
@@ -557,7 +597,9 @@ impl Ceremony<'_> {
         entropy: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
     ) -> Result<(), Failure> {
         self.begin(wire)?;
-        self.enrolled(wire, &record, devices, entropy, Admitted::Last)?;
+        if !self.proven {
+            self.enrolled(wire, &record, devices, entropy, Admitted::Last)?;
+        }
         let Some(version) = version else {
             return self.commit(wire, None, entropy);
         };
@@ -581,8 +623,13 @@ impl Ceremony<'_> {
 
     /// Presents root's own first step, then requires the record unchanged
     /// before any token I/O. Only that step can carry a disclosure, whose
-    /// acknowledgement waits for the person to type its approval key.
+    /// acknowledgement waits for the person to type its approval key. A
+    /// disk proof's step was presented and proved before root sent it, so
+    /// only the record is read.
     fn begin(&mut self, wire: &mut Wire) -> Result<(), Failure> {
+        if self.proven {
+            return self.unchanged();
+        }
         let acknowledged = if self.current.login_approval().is_some() {
             wire.acknowledge_typed(0x10, 0x11, &self.current)
         } else {
@@ -988,6 +1035,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             account,
             before,
             after,
+            proof,
             ..
         } => Operation::LoginEnroll {
             account,
@@ -996,25 +1044,27 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             key: ordinal,
             step,
             approval: None,
-            proof: None,
+            proof,
         },
         Operation::LoginAdd {
             account,
             before,
             after,
+            proof,
             ..
         } => Operation::LoginAdd {
             account,
             before,
             after,
             step,
-            proof: None,
+            proof,
         },
         Operation::LoginRemove {
             account,
             before,
             after,
             removed,
+            proof,
             ..
         } => Operation::LoginRemove {
             account,
@@ -1023,7 +1073,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             removed,
             step,
             approval: None,
-            proof: None,
+            proof,
         },
         _ => return Err(Failure::Internal),
     })
@@ -1628,6 +1678,9 @@ mod tests {
         /// a person reading a disclosure and typing its key does, sending
         /// it only if the worker has not ended the operation by then.
         typing: Option<Duration>,
+        /// Holds root's first description this long, as root does while a
+        /// disk proof's storage worker runs.
+        late: Option<Duration>,
     }
 
     type OnStep = std::sync::Arc<dyn Fn(&Request) + Send + Sync>;
@@ -1743,13 +1796,24 @@ mod tests {
             step: LoginStep::Identify,
         });
         let mut current = Request::new(NONCE, UID, operation.clone()).unwrap();
-        if let Ok(begun) = Request::begin_login(NONCE, UID, operation, &keys) {
+        if let Ok(begun) = Request::begin_login(NONCE, UID, operation.clone(), &keys) {
             assert_eq!(begun, current);
         }
+        // A proven operation resumes after its proof's last step, which
+        // may be its final one.
+        let mut last = match Request::begin_proven(NONCE, UID, operation, &keys) {
+            Ok((begun, admitted)) => {
+                assert_eq!(begun, current);
+                admitted == Admitted::Last
+            }
+            Err(_) => false,
+        };
         let description = plan.description.clone().unwrap_or(current.encode());
+        if let Some(late) = plan.late {
+            std::thread::sleep(late);
+        }
         write_frame(&mut stream, &description);
         let mut rounds: Vec<Vec<u8>> = Vec::new();
-        let mut last = false;
         let mut created = None;
         let mut invitations = 0;
         while let Some(mut frame) = read_frame(&mut stream) {
@@ -1908,6 +1972,68 @@ mod tests {
             proof: None,
         }
         .disclosed(disclosure())
+    }
+
+    /// `operation` authorized by `proof`, with root's key where its first
+    /// step discloses.
+    fn proving(operation: Operation, proof: Proof) -> Operation {
+        match operation {
+            Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                ..
+            } => Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                ..
+            } => Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                proof: Some(proof),
+            },
+            Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                ..
+            } => Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            other => other,
+        }
+        .disclosed(disclosure())
+    }
+
+    /// A disk authorize step for a header token, which no login slot names.
+    fn disk_authorize(retries: u8) -> LoginStep {
+        LoginStep::DiskAuthorize {
+            key: [0xd1, 0x5c, 0, 1],
+            retries,
+        }
     }
 
     fn baseline(keys: &[Fingerprint]) -> Vec<u8> {
@@ -2608,13 +2734,30 @@ mod tests {
         assert!(matches!(boot.state(), State::Unenrolled));
         // Without the marker the same enrollment would begin: the refusal
         // is the marker's.
-        assert!(!refused_when_protected(&adding(1, LoginStep::Identify)));
-        assert!(!refused_when_protected(&removing(
-            2,
-            &[slot],
-            LoginStep::Identify
-        )));
-        assert!(refused_when_protected(&enrolling(2, 1, LoginStep::Connect)));
+        assert!(!refused_when_protected(
+            &adding(1, LoginStep::Identify),
+            None
+        ));
+        assert!(!refused_when_protected(
+            &removing(2, &[slot], LoginStep::Identify),
+            None
+        ));
+        assert!(refused_when_protected(
+            &enrolling(2, 1, LoginStep::Connect),
+            None
+        ));
+        // A disk proof admits a first enrollment there, never a removal
+        // of every key.
+        for proof in [Proof::RecoveryKey, Proof::DiskKey] {
+            assert!(!refused_when_protected(
+                &enrolling(2, 1, LoginStep::Connect),
+                Some(proof)
+            ));
+            assert!(refused_when_protected(
+                &removing(1, &[slot], LoginStep::Identify),
+                Some(proof)
+            ));
+        }
     }
 
     #[test]
@@ -2917,7 +3060,10 @@ mod tests {
         let production = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
         let worker = production(include_str!("login_operation.rs"));
         assert!(!worker.contains(".receive()"));
-        assert_eq!(worker.matches(".receive_cleared()").count(), 1);
+        // Root's first frame, awaited for the operation, is the one read
+        // outside an exchange.
+        assert_eq!(worker.matches(".receive_cleared()").count(), 0);
+        assert_eq!(worker.matches(".receive_awaited()").count(), 1);
         let exchange = production(include_str!("frames.rs"))
             .split("    pub(crate) fn exchange(")
             .nth(1)
@@ -3503,6 +3649,7 @@ mod tests {
             fingerprints: &order,
             current: login(removal),
             last: true,
+            proven: false,
         };
         let (worker, mut parent) = UnixStream::pair().unwrap();
         // The acknowledgement comes after 3 seconds, within a frame's time,
@@ -4273,5 +4420,260 @@ mod tests {
     /// The qemu-secret login guests, which share this module's root and keys.
     mod vm {
         include!("login_vm.rs");
+    }
+
+    /// An addition a disk proof authorized: root's first frame is the
+    /// proof's last step, which the worker never presents; it presents the
+    /// new key's connect at once, and no enrolled key asserts anything.
+    #[test]
+    fn a_proven_addition_resumes_at_a_connect_with_no_authorizing_key() {
+        let first = Key::new(50);
+        for proof in [Proof::RecoveryKey, Proof::DiskKey] {
+            let fixture = Fixture::new();
+            fixture.seed(&record(&[&first], None, None));
+            fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+            let order = fixture.fingerprints();
+            let proved = match proof {
+                Proof::RecoveryKey => LoginStep::RecoveryKey,
+                Proof::DiskKey => disk_authorize(3),
+            };
+            let new = blank(&format!("proof-add-{}", proof.byte()));
+            let start = first.device.transcript().len();
+            let mut keys = Keys::all(&[&new]);
+            let (result, seen) = operation(
+                &fixture,
+                &mut keys,
+                begins(proving(adding(1, proved), proof)),
+            );
+            assert_eq!(result, Ok(()), "{proof:?}");
+            let id = newest(&new);
+            let make = |step| proving(adding(1, step), proof);
+            let mut frames = vec![
+                baseline(&order),
+                invitation(0x10, &login(make(LoginStep::Connect))),
+            ];
+            frames.extend(ceremony(make, fingerprint(&id)));
+            assert_eq!(
+                seen,
+                committed(
+                    frames,
+                    make(LoginStep::Probe {
+                        key: fingerprint(&id)
+                    })
+                )
+            );
+            assert_eq!(keys.opened, 4);
+            assert_eq!(first.device.transcript().len(), start);
+            let mut both = vec![first.id.clone(), id];
+            both.sort();
+            assert_eq!(fixture.stored(), Some(both));
+            assert_eq!(unlock(&fixture, &[&new], pin(PIN)).0, Ok(()));
+        }
+        // Any one connected key may be the new one, an enrolled key
+        // excluded as anywhere.
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&first], None, None));
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let (result, _) = unlock(
+            &fixture,
+            &[&first.device],
+            begins(proving(
+                adding(1, LoginStep::RecoveryKey),
+                Proof::RecoveryKey,
+            )),
+        );
+        assert_eq!(result, Err(Failure::Excluded));
+        assert_eq!(fixture.stored(), Some(vec![first.id.clone()]));
+    }
+
+    /// Root offers a disk proof only on a protected machine; the worker
+    /// refuses one elsewhere before any token.
+    #[test]
+    fn an_unprotected_machine_refuses_a_disk_proof() {
+        let first = Key::new(57);
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&first], None, None));
+        let order = fixture.fingerprints();
+        let new = blank("proof-unprotected");
+        let start = (first.device.transcript().len(), new.transcript().len());
+        for operation_ in [
+            proving(adding(1, LoginStep::RecoveryKey), Proof::RecoveryKey),
+            proving(
+                removing(1, &slots(&order, &[1]), disk_authorize(3)),
+                Proof::DiskKey,
+            ),
+        ] {
+            let (result, seen) = operation(
+                &fixture,
+                &mut Keys::all(&[&new, &first.device]),
+                begins(operation_),
+            );
+            assert_eq!(result, Err(Failure::Internal));
+            assert_eq!(seen, [baseline(&order), Failure::Internal.frame()]);
+        }
+        assert_eq!(
+            (first.device.transcript().len(), new.transcript().len()),
+            start
+        );
+        assert_eq!(fixture.stored(), Some(vec![first.id.clone()]));
+    }
+
+    /// A removal's proof step is its last: the commit round follows it
+    /// directly, and no key is touched.
+    #[test]
+    fn a_proven_removal_commits_over_its_proof_step() {
+        let keys = [Key::new(51), Key::new(52)];
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&keys[0], &keys[1]], None, None));
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let order = fixture.fingerprints();
+        let removed = slots(&order, &[1]);
+        let operation_ = proving(removing(2, &removed, disk_authorize(8)), Proof::DiskKey);
+        let mut none = Keys::all(&[]);
+        let (result, seen) = operation(&fixture, &mut none, begins(operation_.clone()));
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, committed(vec![baseline(&order)], operation_));
+        assert_eq!(none.opened, 0);
+        let left: Vec<Vec<u8>> = keys
+            .iter()
+            .filter(|key| fingerprint(&key.id) != order[0])
+            .map(|key| key.id.clone())
+            .collect();
+        assert_eq!(fixture.stored(), Some(left));
+    }
+
+    /// A first enrollment under tag 13 is the one a protected machine
+    /// admits; a removal of every key stays refused however authorized.
+    #[test]
+    fn a_protected_machine_admits_a_proven_first_enrollment_only() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let new = blank("proof-enroll");
+        let make = |key, step| proving(enrolling(1, key, step), Proof::RecoveryKey);
+        let mut keys = Keys::all(&[&new]);
+        let (result, seen) =
+            operation(&fixture, &mut keys, begins(make(1, LoginStep::RecoveryKey)));
+        assert_eq!(result, Ok(()));
+        let id = newest(&new);
+        // The proof's step carried the disclosure; the connect does not.
+        assert!(login(make(1, LoginStep::RecoveryKey))
+            .login_approval()
+            .is_some());
+        let mut frames = vec![
+            vec![0x18, 0],
+            invitation(0x10, &login(make(1, LoginStep::Connect))),
+        ];
+        frames.extend(ceremony(|step| make(1, step), fingerprint(&id)));
+        assert_eq!(
+            seen,
+            committed(
+                frames,
+                make(
+                    1,
+                    LoginStep::Probe {
+                        key: fingerprint(&id)
+                    }
+                )
+            )
+        );
+        assert_eq!(fixture.stored(), Some(vec![id]));
+        let order = fixture.fingerprints();
+        let start = new.transcript().len();
+        let (result, seen) = unlock(
+            &fixture,
+            &[&new],
+            begins(proving(
+                removing(1, &slots(&order, &[1]), LoginStep::RecoveryKey),
+                Proof::RecoveryKey,
+            )),
+        );
+        assert_eq!(result, Err(Failure::Internal));
+        assert_eq!(seen, [baseline(&order), Failure::Internal.frame()]);
+        assert_eq!(new.transcript().len(), start);
+        assert_eq!(fixture.fingerprints(), order);
+    }
+
+    /// For tags 13 to 15 only the proof's last step, at its first key,
+    /// with retries, against this record, resumes; anything else is
+    /// INTERNAL before any token, as is a record changed since the
+    /// baseline RECORD CHANGED.
+    #[test]
+    fn a_proven_operation_resumes_only_at_its_proofs_last_step() {
+        let first = Key::new(53);
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&first], None, None));
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let order = fixture.fingerprints();
+        let other = Key::new(54);
+        let stranger = slots(&canonical(&[&other]), &[1]);
+        let start = first.device.transcript().len();
+        for operation_ in [
+            proving(adding(1, LoginStep::DiskIdentify), Proof::DiskKey),
+            proving(adding(1, disk_authorize(0)), Proof::DiskKey),
+            proving(adding(1, LoginStep::RecoveryKey), Proof::DiskKey),
+            proving(adding(1, LoginStep::Connect), Proof::RecoveryKey),
+            proving(adding(1, disk_authorize(3)), Proof::RecoveryKey),
+            proving(adding(2, LoginStep::RecoveryKey), Proof::RecoveryKey),
+            proving(
+                removing(2, &[stranger[0], slots(&order, &[1])[0]], disk_authorize(3)),
+                Proof::DiskKey,
+            ),
+        ] {
+            let Ok(request) = Request::new(NONCE, UID, operation_.clone()) else {
+                continue;
+            };
+            let (result, seen) = operation(
+                &fixture,
+                &mut Keys::all(&[&first.device]),
+                Plan {
+                    description: Some(request.encode()),
+                    ..begins(operation_)
+                },
+            );
+            assert_eq!(result, Err(Failure::Internal));
+            assert_eq!(seen, [baseline(&order), Failure::Internal.frame()]);
+        }
+        assert_eq!(first.device.transcript().len(), start);
+        // The record changed while root ran the proof.
+        let changed = record(&[&first, &other], None, None);
+        let (result, seen) = unlock(
+            &fixture,
+            &[&first.device],
+            Plan {
+                change: Some((fixture.dir.clone(), Some(changed), At::Baseline)),
+                ..begins(proving(
+                    adding(1, LoginStep::RecoveryKey),
+                    Proof::RecoveryKey,
+                ))
+            },
+        );
+        assert_eq!(result, Err(Failure::Changed));
+        assert_eq!(seen, [baseline(&order), Failure::Changed.frame()]);
+        assert_eq!(first.device.transcript().len(), start);
+    }
+
+    /// Root sends the first frame only after the proof, so the worker
+    /// waits for it past the frame time, within the operation.
+    #[test]
+    fn the_first_frame_waits_past_the_frame_time_for_a_proof() {
+        let keys = [Key::new(55), Key::new(56)];
+        let fixture = Fixture::new();
+        fixture.seed(&record(&[&keys[0], &keys[1]], None, None));
+        fs::create_dir(fixture.dir.join(crate::login_state::PROTECTED)).unwrap();
+        let order = fixture.fingerprints();
+        let operation_ = proving(
+            removing(2, &slots(&order, &[2]), LoginStep::RecoveryKey),
+            Proof::RecoveryKey,
+        );
+        let (result, seen) = operation(
+            &fixture,
+            &mut Keys::all(&[]),
+            Plan {
+                late: Some(crate::frames::FRAME_TIME + Duration::from_secs(1)),
+                ..begins(operation_.clone())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(seen, committed(vec![baseline(&order)], operation_));
     }
 }

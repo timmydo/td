@@ -127,6 +127,15 @@ impl Wire {
         self.receive_cleared_by(None)
     }
 
+    /// `receive_cleared`, its header waiting for the operation deadline,
+    /// or an open session's, rather than a frame time: a frame root sends
+    /// only after work of its own, as a login worker's first description
+    /// after a disk proof.
+    pub(crate) fn receive_awaited(&mut self) -> Result<Cleared, String> {
+        let bound = self.bound();
+        self.receive_cleared_by(Some(bound))
+    }
+
     /// `receive_cleared`, whose header waits until `header` when given,
     /// the rest then having one frame time.
     fn receive_cleared_by(&mut self, header: Option<Instant>) -> Result<Cleared, String> {
