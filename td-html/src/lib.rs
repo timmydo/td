@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Bounded extraction; see `td-html/DESIGN.md` for its text heuristic.
+pub mod extract;
 /// Bounded references; see `td-html/DESIGN.md` for the streaming contract.
 pub mod reference;
 
