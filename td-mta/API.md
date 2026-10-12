@@ -8641,3 +8641,27 @@ is bracketed before the generic child's passive ownership handoff; no new
 clock sample can escape the native fence during release. Failure is terminal
 and hides passive completion. MIME selection, full Email/get worker/aggregate
 admission and Mail advertisement remain separate obligations.
+## Native preview source selection
+
+`blob_preview_selection::Cursor` consumes the original native body-list
+handoff and preserves its source, job/header budgets, traversal, retained
+headers, classifications and lists. Classifications and membership must have
+been derived from those original headers; passive facts do not authenticate
+fabricated metadata. It selects according to POLICY.md's preview source rule.
+Choice contains a one-based ordinal and expected Plain/Html format. The
+consumer must interpret that original part and confirm its actual content
+type before native preview decoding. Selection never opens another snapshot.
+
+One charged turn checks one descriptor/node correspondence or one body-list
+entry. Both complete lists are checked in increasing ordinal order, including
+suffixes after a choice, before selection succeeds. Out-of-range, duplicate,
+backward or non-body-class entries refuse. Every check/poll/finish has fresh
+native and original job/header admission. Failures are terminal and hide the
+choice; cached completion remains fresh without spending positive work.
+
+`value` is passive: None means incomplete or refused, Some(None) means no
+textual body entry, and Some(Some(choice)) identifies the selected part. A
+healthy finish returns all original owners and the choice. This component
+emits no JSON; an enclosing response admits an empty preview for no choice
+or drives the selected native part's decoder. Whole Email/get admission and
+Mail advertisement remain separate.

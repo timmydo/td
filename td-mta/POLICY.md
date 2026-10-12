@@ -572,10 +572,17 @@ For alternative > mixed > [plain, image], outer fallback puts both leaves in
 both body lists, so final attachments is empty. The suggested script's
 provisional image append is not retained after that fallback.
 
-Preview is the first 256 Unicode scalars of display text, preferring
-textBody, falling back to HTML extraction below, collapsing ASCII whitespace
-to one SP and trimming edges. It has no HTML markup or attachment metadata
-appended.
+Preview uses the first textual entry in textBody, falling back to the first
+textual entry in htmlBody when textBody has none. Inline media is skipped.
+The selected entry's actual text/plain or text/html type determines whether
+HTML extraction is needed; textBody can contain HTML through alternative
+fallback. Preserve each list's order rather than preferring a later plain
+part over an earlier HTML part in the same displayed sequence. Selection
+is metadata-only: an empty chosen part yields an empty preview, and later
+parts are not concatenated or tried after a decoding/admission refusal.
+If neither list has text, the preview is empty. It contains the first 256
+Unicode scalars of the chosen display text under the projection rules below,
+with no attachment metadata appended.
 
 For structured creation, generate missing Message-ID and Date once before
 publication. Message-ID is <td-mta.HEX@HOST>, with 32 lowercase entropy hex
@@ -677,8 +684,9 @@ next word, omit that separator and the remaining suffix rather than end with
 a generated space. Continue consuming the chosen source after the display cap
 so later decoding or admission refusal cannot become successful preview data.
 HTML sources first use the extraction policy below; literal markup is never
-fed directly to this plaintext projection. Source selection and native response
-composition remain separate implementation work.
+fed directly to this plaintext projection. Selection follows the body-list
+rule above; native decoding and enclosing response admission retain the
+original source and budget owners.
 
 HTML extraction uses the shared bounded tokenizer specified by
 [td-html/DESIGN.md](../td-html/DESIGN.md), not a renderer or sanitizer.

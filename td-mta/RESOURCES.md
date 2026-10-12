@@ -4703,3 +4703,18 @@ check. Progress retains the generic preview's per-stage record and output
 charges and at most six copied JSON bytes per poll; native freshness checks
 add no replacement work allowance. The enclosing worker must account for all
 retained backing and response staging separately.
+
+## Native preview source selection storage
+
+The selector fits 512 bytes, retains only original body-list/traversal
+references, one choice and fixed cursor/credit state, and allocates nothing.
+It needs no output backing. Each uncached turn charges one original job record
+and one header interpretation step before checking a descriptor or list entry;
+phase transitions have the same fixed charge. For P parts and T/H body-list
+entries, healthy completion takes N = P + T + H + 3 charged turns and N
+header interpretation steps. The selector's fresh header Credit prepays one
+additional original Meter record per group of 16 steps, so total Meter
+records are N + ceil(N / 16). No I/O or output bytes are charged. Ordinal bounds and strict increasing list checks bound
+malformed lists as well as healthy ones; positive progress cannot exceed the
+u16 part space per list. Empty and cached freshness operations spend no new
+positive allowance. Enclosing admission owns all borrowed backing costs.
