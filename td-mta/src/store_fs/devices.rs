@@ -263,6 +263,15 @@ impl<'r> DeviceStore<'r> {
         self.available()?;
         Ok(self.records.iter().map(|record| record.id))
     }
+    /// Activity check for an already authenticated device, never authentication.
+    pub(crate) fn active(&self, account: AccountId, id: DeviceId) -> Result<bool, DeviceError> {
+        self.available()?;
+        Ok(self.account == account
+            && self
+                .records
+                .iter()
+                .any(|record| record.id == id && record.revoked.is_none()))
+    }
     pub fn revoke(&mut self, id: DeviceId, now: u64) -> Result<(), DeviceError> {
         self.available()?;
         let record = self

@@ -995,3 +995,30 @@ on a ping. Clock regressions and account substitution refuse. Authentication,
 revocation, connection limits, snapshot acquisition, socket scheduling and
 stall/total deadlines remain runtime responsibilities. These helpers activate
 no HTTP endpoint and do not advertise Core early.
+
+### Device upload publication guard
+
+`http_auth::DevicePolicy` implements UploadAuthorization for the live private
+device registry. The caller supplies a device ID established by successful
+HTTPS authentication; knowing or passing an ID is not authentication. The
+policy checks the registry's account, healthy state and current revocation
+state under its mutex. A successful guard retains that mutex through the
+coordinator's commit, excluding create/revoke publication until it drops.
+The guard contains only fixed Access metadata and the registry lock, never
+a password. The existing coordinator checks its account/device/generation
+and reacquires the guard before a prepared upload can commit or replan.
+
+Admission checks the real clock before and after lookup, refuses expiration
+or regression, and uses try_lock so contention returns Busy rather than
+waiting past a deadline. Poison or retired registry state refuses as
+WriterStopped. The configuration generation is immutable for this policy's
+lifetime; future configuration replacement must share the same publication
+exclusion. This adapter is not yet wired into HTTPS upload serving and does
+not activate a route or expand mail credentials into OS authority.
+
+The mutex serializes all registry access, including other upload guards and
+HTTPS authentication, for the bounded publication interval. Runtime callers
+must retry Busy within their original deadlines or return a transient refusal;
+they must never replace admission with an unbounded mutex wait. A panic while
+publication holds the guard poisons the shared registry and deliberately
+requires service restart, even if the registry itself was only read.

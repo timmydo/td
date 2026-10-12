@@ -3770,3 +3770,8 @@ required before the EventSource endpoint can activate.
 
 Mail capability activation additionally requires EmailDelivery state and
 push support; the current fixed EventSource roster does not provide it.
+
+The device registry now supplies current account/device activity to a guarded
+UploadAuthorization adapter. Admission is deadline-bounded and nonblocking;
+a live guard excludes revocation through storage publication. HTTPS worker
+and upload route integration remain separate.

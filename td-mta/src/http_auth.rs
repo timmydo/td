@@ -1,10 +1,14 @@
 //! HTTPS request authentication and bounded attempt admission.
 use crate::{
     config::endpoint::Origin,
-    ids::DeviceId,
+    ids::{AccountId, DeviceId},
+    ports::{Access, Clock, Deadline, Error, Principal},
     store_fs::{DeviceError, DeviceStore},
 };
-use std::net::IpAddr;
+use std::{
+    net::IpAddr,
+    sync::{Mutex, MutexGuard, TryLockError},
+};
 
 const DECODED: usize = 254 + 1 + 97;
 struct Credentials([u8; DECODED]);
@@ -43,6 +47,80 @@ pub fn basic(
     }
     store.authenticate(decoded.get(colon + 1..).ok_or(DeviceError::Invalid)?)
 }
+
+/// Binds upload commit admission to the live device registry. Callers may
+/// supply only the device ID obtained by successful HTTPS authentication.
+/// The fixed configuration generation is retained for the service lifetime;
+/// a future reload must replace policy under the same publication exclusion.
+pub struct DevicePolicy<'a, 'r> {
+    devices: &'a Mutex<DeviceStore<'r>>,
+    clock: &'a dyn Clock,
+    generation: u64,
+}
+impl<'a, 'r> DevicePolicy<'a, 'r> {
+    pub fn new(devices: &'a Mutex<DeviceStore<'r>>, clock: &'a dyn Clock, generation: u64) -> Self {
+        Self {
+            devices,
+            clock,
+            generation,
+        }
+    }
+}
+/// Holding this guard excludes device create/revoke until publication ends.
+/// It never retains a password or allows callers to modify the registry.
+pub struct DeviceGuard<'a, 'r> {
+    _store: MutexGuard<'a, DeviceStore<'r>>,
+    access: Access,
+}
+impl crate::store_fs::UploadGuard for DeviceGuard<'_, '_> {
+    fn access(&self) -> Access {
+        self.access
+    }
+}
+impl<'r> crate::store_fs::UploadAuthorization for DevicePolicy<'_, 'r> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        let before = self.clock.sample()?.monotonic;
+        if deadline.expired(before) {
+            return Err(Error::Deadline);
+        }
+        let store = match self.devices.try_lock() {
+            Ok(store) => store,
+            Err(TryLockError::WouldBlock) => return Err(Error::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::WriterStopped),
+        };
+        let active = store
+            .active(account, device)
+            .map_err(|_| Error::WriterStopped)?;
+        let after = self.clock.sample()?.monotonic;
+        if after.0 < before.0 {
+            return Err(Error::Invalid);
+        }
+        if deadline.expired(after) {
+            return Err(Error::Deadline);
+        }
+        if !active {
+            return Err(Error::Forbidden);
+        }
+        Ok(DeviceGuard {
+            _store: store,
+            access: Access {
+                account,
+                principal: Principal::Device(device),
+                config_generation: self.generation,
+            },
+        })
+    }
+}
+
 fn sextet(byte: u8) -> Option<u32> {
     Some(u32::from(match byte {
         b'A'..=b'Z' => byte - b'A',

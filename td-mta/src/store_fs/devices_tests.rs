@@ -181,3 +181,136 @@ fn canonical_tokens_and_checksummed_structural_corruption_are_refused() {
     assert_eq!(bytes.len(), 58170);
     assert_eq!(decode(&bytes, ACCOUNT).unwrap().len(), DEVICE_CAPACITY);
 }
+
+#[test]
+fn upload_policy_guard_excludes_revocation_and_rechecks_current_device() {
+    use crate::{
+        http_auth::DevicePolicy,
+        ports::{Access, Deadline, Error, Principal, Tick},
+        store_fs::{UploadAuthorization, UploadGuard},
+    };
+    use std::sync::Mutex;
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let mut store = DeviceStore::open_or_create(&mut root, ACCOUNT).unwrap();
+    let (id, password) = store.create("upload", 1, &mut Random(0)).unwrap();
+    assert_eq!(store.authenticate(password.expose()).unwrap(), Some(id));
+    let devices = Mutex::new(store);
+    let clock = PolicyClock::new(&[1, 2, 3, 4, 5, 6]);
+    let policy = DevicePolicy::new(&devices, &clock, 42);
+    let deadline = Deadline::after(Tick(0), 100).unwrap();
+    let guard = policy.authorize(ACCOUNT, id, deadline).unwrap();
+    assert_eq!(
+        guard.access(),
+        Access {
+            account: ACCOUNT,
+            principal: Principal::Device(id),
+            config_generation: 42
+        }
+    );
+    assert!(matches!(
+        devices.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    drop(guard);
+    assert_eq!(
+        policy
+            .authorize(AccountId::from_bytes([8; 16]), id, deadline)
+            .err(),
+        Some(Error::Forbidden)
+    );
+    devices.lock().unwrap().revoke(id, 2).unwrap();
+    assert_eq!(
+        policy.authorize(ACCOUNT, id, deadline).err(),
+        Some(Error::Forbidden)
+    );
+}
+struct PolicyClock(std::sync::Mutex<std::collections::VecDeque<u64>>);
+impl PolicyClock {
+    fn new(values: &[u64]) -> Self {
+        Self(std::sync::Mutex::new(values.iter().copied().collect()))
+    }
+}
+impl crate::ports::Clock for PolicyClock {
+    fn sample(&self) -> Result<crate::ports::Time, crate::ports::Error> {
+        let value = self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(crate::ports::Error::Invalid)?;
+        Ok(crate::ports::Time {
+            utc_ms: 0,
+            monotonic: crate::ports::Tick(value),
+        })
+    }
+}
+#[test]
+#[allow(clippy::panic)]
+fn upload_policy_deadlines_busy_retirement_and_poison_fail_closed() {
+    use crate::{
+        http_auth::DevicePolicy,
+        ports::{Deadline, Error, Tick},
+        store_fs::UploadAuthorization,
+    };
+    use std::sync::Mutex;
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let mut store = DeviceStore::open_or_create(&mut root, ACCOUNT).unwrap();
+    let (id, _) = store.create("upload", 1, &mut Random(0)).unwrap();
+    let devices = Mutex::new(store);
+    let deadline = Deadline::after(Tick(0), 10).unwrap();
+    for (times, error) in [
+        (vec![10], Error::Deadline),
+        (vec![1, 10], Error::Deadline),
+        (vec![2, 1], Error::Invalid),
+        (vec![], Error::Invalid),
+        (vec![1], Error::Invalid),
+    ] {
+        let clock = PolicyClock::new(&times);
+        assert_eq!(
+            DevicePolicy::new(&devices, &clock, 1)
+                .authorize(ACCOUNT, id, deadline)
+                .err(),
+            Some(error)
+        );
+    }
+    let held = devices.lock().unwrap();
+    let clock = PolicyClock::new(&[1]);
+    assert_eq!(
+        DevicePolicy::new(&devices, &clock, 1)
+            .authorize(ACCOUNT, id, deadline)
+            .err(),
+        Some(Error::Busy)
+    );
+    drop(held);
+    devices.lock().unwrap().healthy = false;
+    let clock = PolicyClock::new(&[1]);
+    assert_eq!(
+        DevicePolicy::new(&devices, &clock, 1)
+            .authorize(ACCOUNT, id, deadline)
+            .err(),
+        Some(Error::WriterStopped)
+    );
+    devices.lock().unwrap().healthy = true;
+    let clock = PolicyClock::new(&[1, 2]);
+    drop(
+        DevicePolicy::new(&devices, &clock, 1)
+            .authorize(ACCOUNT, id, deadline)
+            .unwrap(),
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let _guard = devices.lock().unwrap();
+            panic!("intentional policy poison");
+        });
+        assert!(worker.join().is_err());
+    });
+    let clock = PolicyClock::new(&[1, 2]);
+    assert_eq!(
+        DevicePolicy::new(&devices, &clock, 1)
+            .authorize(ACCOUNT, id, deadline)
+            .err(),
+        Some(Error::WriterStopped)
+    );
+}
