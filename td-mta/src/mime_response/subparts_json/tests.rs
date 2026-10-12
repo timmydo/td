@@ -460,3 +460,68 @@ fn nested_tree_omission_stops_at_root_while_selected_children_recurse() {
         });
     }
 }
+
+#[test]
+fn native_composition_matches_resident_bytes_and_costs_plus_correspondence() {
+    for source in [SIMPLE, SOURCE] {
+        for empty in [false, true] {
+            for bits in [0, 1, 8, 16, 31] {
+                for sub_parts in [false, true] {
+                    for width in [1, 64] {
+                        let selected = selection(bits, sub_parts);
+                        let mut native = None;
+                        let mut count = 0;
+                        crate::blob_body_json::tests::exercise(
+                            source,
+                            empty,
+                            |original, fragments, _| {
+                                count = fragments.len() as u64;
+                                let before = crate::blob_body_json::tests::counters(&original);
+                                let mut cursor = crate::blob_body_json::Cursor::new(
+                                    original,
+                                    fragments,
+                                    selected,
+                                    Tick(1),
+                                )
+                                .unwrap();
+                                let bytes = crate::blob_body_json::tests::drain(&mut cursor, width)
+                                    .unwrap();
+                                let completed = cursor.finish(Tick(1)).unwrap();
+                                let after =
+                                    crate::blob_body_json::tests::counters(&completed.original);
+                                native = Some((
+                                    bytes,
+                                    std::array::from_fn::<_, 5, _>(|i| before[i] - after[i]),
+                                ));
+                            },
+                        );
+                        let clock = TestClock::new();
+                        with_collection(
+                            source,
+                            0,
+                            if empty { 0 } else { 1 },
+                            &clock,
+                            |serialized| {
+                                let before = serialized.inner.costs();
+                                let mut cursor =
+                                    Cursor::new(serialized, selected, Tick(1)).unwrap();
+                                let bytes = drain(&mut cursor, width);
+                                let (serialized, _) =
+                                    cursor.finish(Tick(1)).unwrap().finish(Tick(1)).unwrap();
+                                let after = serialized.inner.costs();
+                                let mut costs =
+                                    std::array::from_fn::<_, 5, _>(|i| before[i] - after[i]);
+                                costs[3] += count;
+                                assert_eq!(
+                                    native,
+                                    Some((bytes, costs)),
+                                    "empty={empty} bits={bits} sub_parts={sub_parts} width={width}"
+                                );
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

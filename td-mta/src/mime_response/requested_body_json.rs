@@ -30,7 +30,7 @@ impl Properties {
         attachments: true,
         has_attachment: true,
     };
-    pub(in crate::mime_response) const fn bits(self) -> u8 {
+    pub(crate) const fn bits(self) -> u8 {
         self.text_body as u8
             | ((self.html_body as u8) << 1)
             | ((self.attachments as u8) << 2)

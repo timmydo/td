@@ -7,18 +7,18 @@ use crate::{
     ports::{Clock, Deadline, Error as PolicyError, Time},
 };
 use std::sync::atomic::{AtomicU64, Ordering};
-struct Timer {
+pub(crate) struct Timer {
     calls: AtomicU64,
     expires: AtomicU64,
 }
 impl Timer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calls: AtomicU64::new(0),
             expires: AtomicU64::new(u64::MAX),
         }
     }
-    fn after(&self, n: u64) {
+    pub(crate) fn after(&self, n: u64) {
         self.expires
             .store(self.calls.load(Ordering::Relaxed) + n, Ordering::Relaxed);
     }
@@ -36,7 +36,7 @@ impl Clock for Timer {
         })
     }
 }
-struct Storage {
+pub(crate) struct Storage {
     heads: [u8; 256],
     charset: [u8; 256],
     filename: [u8; 256],
@@ -45,7 +45,7 @@ struct Storage {
     location: [u8; 256],
 }
 impl Storage {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             heads: [0; 256],
             charset: [0; 256],
@@ -55,7 +55,7 @@ impl Storage {
             location: [0; 256],
         }
     }
-    fn backing(&mut self) -> label_json::Backing<'_> {
+    pub(crate) fn backing(&mut self) -> label_json::Backing<'_> {
         label_json::Backing {
             headers: mime_part_headers::Backing {
                 heads: &mut self.heads,
@@ -82,14 +82,14 @@ fn meter() -> Meter {
     )
 }
 
-fn limits() -> Limits {
+pub(crate) fn limits() -> Limits {
     Limits {
         header_bytes: 1024,
         mime_depth: 8,
         mime_parts: 8,
     }
 }
-fn exercise(
+pub(crate) fn exercise(
     bytes: &[u8],
     test: impl FnOnce(blob_structure::Retained<'_, '_, '_, '_, '_, '_>, &[Node], &Timer),
 ) {
@@ -151,14 +151,14 @@ fn exercise(
         test(retained, &nodes[..count], &timer);
     });
 }
-struct Lists {
+pub(crate) struct Lists {
     text: [u16; 8],
     html: [u16; 8],
     attachments: [u16; 8],
     membership: [u8; 8],
 }
 impl Lists {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             text: [0; 8],
             html: [0; 8],
@@ -166,7 +166,7 @@ impl Lists {
             membership: [0; 8],
         }
     }
-    fn backing(&mut self) -> Backing<'_> {
+    pub(crate) fn backing(&mut self) -> Backing<'_> {
         Backing {
             text: &mut self.text,
             html: &mut self.html,
@@ -201,7 +201,7 @@ fn own(view: View<'_>) -> (Vec<u16>, Vec<u16>, Vec<u16>, bool) {
         view.has_attachment,
     )
 }
-const MIXED: &[u8] = concat!(
+pub(crate) const MIXED: &[u8] = concat!(
     "Content-Type: multipart/mixed;boundary=x\r\n\r\n",
     "--x\r\nContent-Type: multipart/alternative;boundary=y\r\n\r\n",
     "--y\r\n\r\nplain\r\n",

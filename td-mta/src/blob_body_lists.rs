@@ -218,4 +218,4 @@ const _: () = assert!(
 
 #[cfg(test)]
 #[path = "blob_body_lists_tests.rs"]
-mod tests;
+pub(crate) mod tests;
