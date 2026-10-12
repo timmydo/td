@@ -12621,6 +12621,166 @@ mod tests {
         fs::remove_file(framebuffer_path).unwrap();
     }
 
+    /// The selection is MIME-neutral: a picture copied by one client is
+    /// pasted whole by another. Every type the source offers reaches the
+    /// destination in order, the second of them is asked for, and a binary
+    /// payload far past a socket buffer, NULs and all, arrives byte for byte
+    /// through the forwarded descriptor.
+    #[test]
+    fn a_pictures_every_type_is_offered_and_its_bytes_cross_whole() {
+        const TYPES: &[&str] = &["text/html", "image/png", "image/jpeg"];
+        let stem = format!(
+            "td-data-device-picture-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (source_client, destination_client) = (403, 404);
+        let focus = |client: u64, object: u32| {
+            runtime
+                .lock()
+                .unwrap()
+                .commit(
+                    SurfaceKey { client, object },
+                    Surface::from_shm_pixels(1, 1, vec![1, 2, 3, 0], SHM_XRGB8888).unwrap(),
+                )
+                .unwrap();
+        };
+        focus(source_client, 90);
+
+        let (source_server, mut source_peer) = UnixStream::pair().unwrap();
+        let (destination_server, mut destination_peer) = UnixStream::pair().unwrap();
+        for peer in [&source_peer, &destination_peer] {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        let workers = [
+            (source_server, source_client),
+            (destination_server, destination_client),
+        ]
+        .map(|(server, client)| {
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || serve_client(server, client, runtime, test_keymap()))
+        });
+
+        bind_data_device_stack(&mut source_peer, 10, 11, 12, true);
+        bind_data_device_stack(&mut destination_peer, 10, 11, 12, false);
+
+        let mut create_source = wire::Builder::new();
+        create_source.u32(13);
+        send(&mut source_peer, 11, 0, create_source);
+        for mime in TYPES {
+            let mut offer = wire::Builder::new();
+            offer.string(mime).unwrap();
+            send(&mut source_peer, 13, 0, offer);
+        }
+        let mut set_selection = wire::Builder::new();
+        set_selection.u32(13);
+        set_selection.u32(77);
+        send(&mut source_peer, 12, 1, set_selection);
+        // The owner is focused, so it sees its own selection offered.
+        receive_messages(&mut source_peer, 2 + TYPES.len());
+
+        focus(destination_client, 91);
+        let advertised = receive_messages(&mut destination_peer, 2 + TYPES.len());
+        let introduced = advertised.first().unwrap();
+        assert_eq!(
+            (introduced.object, introduced.opcode),
+            (12, WL_DATA_DEVICE_DATA_OFFER)
+        );
+        let mut payload = wire::Cursor::new(&introduced.payload);
+        let offer = payload.u32().unwrap();
+        payload.finish().unwrap();
+        assert!(offer >= WL_SERVER_ID_START);
+        let offered: Vec<String> = advertised
+            .get(1..=TYPES.len())
+            .unwrap()
+            .iter()
+            .map(|message| {
+                assert_eq!(
+                    (message.object, message.opcode),
+                    (offer, WL_DATA_OFFER_OFFER)
+                );
+                let mut payload = wire::Cursor::new(&message.payload);
+                let mime = payload.string().unwrap().to_string();
+                payload.finish().unwrap();
+                mime
+            })
+            .collect();
+        assert_eq!(offered, TYPES);
+        let selection = advertised.last().unwrap();
+        assert_eq!(
+            (selection.object, selection.opcode),
+            (12, WL_DATA_DEVICE_SELECTION)
+        );
+        let mut payload = wire::Cursor::new(&selection.payload);
+        assert_eq!(payload.u32().unwrap(), offer);
+        payload.finish().unwrap();
+
+        let (transfer, mut observer) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut receive = wire::Builder::new();
+        receive.string("image/png").unwrap();
+        let receive = receive.message(offer, 1).unwrap();
+        sys::send_with_fd(&destination_peer, &receive, transfer.as_raw_fd()).unwrap();
+        drop(transfer);
+
+        let mut received_bytes = Vec::new();
+        let mut descriptors = Vec::new();
+        let sent = loop {
+            let mut scratch = [0u8; 4096];
+            let received = sys::recv_with_fds(&source_peer, &mut scratch).unwrap();
+            // End of stream returns at once, past any read timeout.
+            assert!(received.count > 0, "the source's connection closed");
+            received_bytes.extend_from_slice(scratch.get(..received.count).unwrap());
+            descriptors.extend(received.fds);
+            if let Some(message) = wire::take(&mut received_bytes).unwrap() {
+                break message;
+            }
+        };
+        assert!(received_bytes.is_empty());
+        assert_eq!((sent.object, sent.opcode), (13, WL_DATA_SOURCE_SEND));
+        let mut payload = wire::Cursor::new(&sent.payload);
+        assert_eq!(payload.string().unwrap(), "image/png");
+        payload.finish().unwrap();
+        assert_eq!(descriptors.len(), 1);
+        let mut source_endpoint = sys::ReceivedFd::adopt(descriptors.remove(0))
+            .unwrap()
+            .into_file();
+
+        // A megabyte of every byte value, PNG's signature first: far past
+        // what a socket buffers, so the source writes while it is read.
+        let picture: Vec<u8> = b"\x89PNG\r\n\x1a\n"
+            .iter()
+            .copied()
+            .chain((0..1 << 20).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 24) as u8))
+            .collect();
+        let written = picture.clone();
+        let writer = thread::spawn(move || {
+            source_endpoint.write_all(&written).unwrap();
+        });
+        let mut transferred = Vec::new();
+        observer.read_to_end(&mut transferred).unwrap();
+        writer.join().unwrap();
+        assert_eq!(transferred.len(), picture.len());
+        // The first byte that differs, not a megabyte of both.
+        assert_eq!(
+            transferred.iter().zip(&picture).position(|(a, b)| a != b),
+            None
+        );
+
+        drop(source_peer);
+        drop(destination_peer);
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
     #[test]
     fn selection_precedes_enter_and_owner_departure_sends_null_to_focused_peer() {
         let stem = format!(

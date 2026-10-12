@@ -1550,7 +1550,10 @@ destroys it. Server-created ids are never acknowledged with
 `wl_display.delete_id`, which is only for client-created ids. Selection offers
 accept `accept` as feedback, transfer only a MIME type they advertised, and
 reject the DnD-only `finish` and `set_actions` requests with the data-offer
-errors defined for those cases.
+errors defined for those cases. Within those bounds the data device is
+MIME-neutral: it offers every type a source advertised, in its order, filters
+and interprets none, and never reads the transferred bytes, so a picture
+crosses as text does.
 
 `wl_data_offer.receive` adopts exactly one descriptor as the endpoint the
 source writes, preserving its original open-file description, offset and
@@ -4586,10 +4589,12 @@ The landing must prove:
   aggregate MIME ceilings, server-created id and retained-offer ceilings,
   source reuse and versioned action errors, deferred DnD, focus-loss
   invalidation, device release, source destruction and departure, stale-race
-  EOF, cross-client source replacement, generation-safe id reuse, and a real
+  EOF, cross-client source replacement, generation-safe id reuse, a real
   descriptor forwarded from
   `wl_data_offer.receive` to `wl_data_source.send` and written through by the
-  source;
+  source, and MIME neutrality: a picture's `text/html`, `image/png` and
+  `image/jpeg` offered in order, the second asked for, and a megabyte of
+  binary, far past a socket buffer, crossing byte for byte;
 - xdg-foreign tests pin fixed-width handle delivery, unknown and
   oversized-handle destruction, inert-object requests, exact invalid-surface
   and invalid-parent error objects, mapped cross-client placement and focus,
