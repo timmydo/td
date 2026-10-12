@@ -182,7 +182,24 @@ impl<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> Cursor<'r, 'b, 'w, 'c, S> {
         clock: &'c dyn Clock,
         last: Tick,
     ) -> Result<Self, Error> {
-        let mut cursor = Self {
+        let mut cursor = Self::prepare(input, buffer, checkpoints, format, work, clock, last)?;
+        cursor.check()?;
+        Ok(cursor)
+    }
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        self.source.reader.source_mut()
+    }
+    // No I/O or clock work; native callers must check before exposure.
+    pub(crate) fn prepare(
+        input: InputSource<'r, S>,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+        format: Format,
+        work: &'w mut Meter,
+        clock: &'c dyn Clock,
+        last: Tick,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             source: Text {
                 reader: Reader::new_typed(input, buffer, checkpoints)?,
                 preview: Core::new(),
@@ -197,9 +214,7 @@ impl<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> Cursor<'r, 'b, 'w, 'c, S> {
             frame: string::Frame::new(),
             complete: false,
             failure: None,
-        };
-        cursor.check()?;
-        Ok(cursor)
+        })
     }
     fn outcome<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         if let Err(error) = result {
@@ -235,6 +250,10 @@ impl<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> Cursor<'r, 'b, 'w, 'c, S> {
     }
     pub fn finish(mut self) -> Result<Retained<'r, 'b, 'w, S>, Error> {
         self.check()?;
+        self.finish_retained()
+    }
+    // Native callers fence the final check before this passive handoff.
+    pub(crate) fn finish_retained(self) -> Result<Retained<'r, 'b, 'w, S>, Error> {
         let diagnostics = self.value().ok_or(Error::State)?;
         let input = self.source.reader.release()?;
         Ok(Retained {

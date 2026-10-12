@@ -4688,3 +4688,18 @@ charges, plus all emitted extraction UTF-8 bytes for HTML, plus at most
 and a conservative six bytes per projected scalar). Reader source visits
 and records retain their separate bounds, including charset prescanning.
 The 256-scalar result cap does not bound the first two terms.
+
+## Native preview custody storage
+
+The native preview cursor fits 2 KiB, including its generic JSON child and
+original traversal/metadata references. Its external input ring and
+checkpoints keep the existing 6 KiB ceiling. The original header/MIME storage
+is borrowed through completion; this wrapper allocates no source, metadata
+or preview collection and does not add a second native reader or snapshot.
+
+Shared text eligibility examines one retained descriptor and its bounded
+content-type evidence. Preparation preserves the original header-budget
+check. Progress retains the generic preview's per-stage record and output
+charges and at most six copied JSON bytes per poll; native freshness checks
+add no replacement work allowance. The enclosing worker must account for all
+retained backing and response staging separately.

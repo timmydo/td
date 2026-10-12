@@ -13,6 +13,7 @@ pub mod blob_entity;
 pub mod blob_part;
 pub mod blob_part_json;
 pub mod blob_part_locators;
+pub mod blob_preview;
 pub mod blob_selected_metadata;
 pub mod blob_structure;
 pub mod blob_value_parts;

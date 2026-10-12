@@ -8614,3 +8614,30 @@ sides of the operation; failures remain terminal. Passive value exposes only
 completed diagnostics. A healthy finish returns the exact original source,
 input ring, checkpoints and Meter, preserving their exclusive ownership for
 the next stage. No source or work budget is reconstructed by this adapter.
+
+
+## Native preview from one interpreted text part
+
+`blob_preview::Cursor` consumes an original `blob_part::Retained` and
+caller-owned text input ring/checkpoints. It validates ordinal, descriptor,
+body start, text content type and source extent against that retained
+traversal. Body-value and preview adapters share this eligibility check.
+Text/html selects shared HTML extraction; other eligible text subtypes use
+plaintext projection. Source selection among body-list entries remains the
+enclosing operation's responsibility.
+
+The adapter retains the exact original native pin, job Meter, header budget,
+metadata, scratch, parts, retained headers and remaining backing. It creates
+no replacement snapshot, source copy or budget. Transfer/charset decoding,
+full-source validation, preview projection and JSON framing use the generic
+preview cursor under the original checked clock seeded by the supplied Tick.
+Every native check, poll and healthy finish fences the operation with fresh
+snapshot admission, including empty buffers, cached completion and errors.
+Any exposed bytes are provisional until the whole response is admitted.
+
+A healthy finish returns the original interpreted-part handoff together with
+its reusable input ring/checkpoints and diagnostics. The final clock check
+is bracketed before the generic child's passive ownership handoff; no new
+clock sample can escape the native fence during release. Failure is terminal
+and hides passive completion. MIME selection, full Email/get worker/aggregate
+admission and Mail advertisement remain separate obligations.

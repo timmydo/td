@@ -1,17 +1,15 @@
 //! Decode one original native text part without replacing its pin or work owner.
 use crate::{
     blob_part, blob_structure,
-    body_charset::Plan,
     body_value::json,
     mime_input::Checkpoints,
     mime_response::bound::{self, ClassifiedView},
-    mime_structure::{Encoding, Media, Part},
+    mime_structure::Part,
     mime_text::InputSource as Input,
     nfc::{Credit, HeaderBudget, Scratch},
-    ports::{BlobReader, Clock, Error as PolicyError, Tick},
+    ports::{Clock, Error as PolicyError, Tick},
     root_headers,
     store_fs::PinnedBlob,
-    wire::TransferEncoding,
 };
 pub use json::{Diagnostics, Progress, Status};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,62 +66,30 @@ impl<'p, 'v, 'c, 'b, 'o, 'w, 'i, 't> Cursor<'p, 'v, 'c, 'b, 'o, 'w, 'i, 't> {
                     crate::mime_text::Error::Input(crate::mime_input::Error::InvalidBacking),
                 )));
             }
-            let part = original.metadata.part;
-            let index = usize::from(part.ordinal)
-                .checked_sub(1)
-                .ok_or(Error::Metadata(bound::Error::InvalidState))?;
-            let content_type = original.metadata.metadata.headers.content_type;
-            if original.structure.parts.get(index) != Some(&part)
-                || matches!(part.media, Media::Multipart | Media::MessageRfc822)
-                || original.metadata.metadata.headers.body_start != part.body_start
-                || !content_type
-                    .get(..5)
-                    .is_some_and(|p| p.eq_ignore_ascii_case(b"text/"))
-            {
-                return Err(Error::Metadata(bound::Error::InvalidState));
-            }
-            let length = part
-                .entity_end
-                .checked_sub(part.body_start)
-                .ok_or(Error::Metadata(bound::Error::InvalidState))?;
-            if part.entity_end > original.structure.source.len() {
-                return Err(Error::Metadata(bound::Error::InvalidState));
-            }
-            let encoding = match part.encoding {
-                Encoding::Identity => TransferEncoding::Identity,
-                Encoding::Base64 => TransferEncoding::Base64,
-                Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
-            };
-            Ok((
-                part.body_start,
-                length,
-                encoding,
-                Plan::from_label(original.metadata.metadata.headers.charset),
-                content_type.eq_ignore_ascii_case(b"text/html") && max_bytes != 0,
-            ))
+            original.text_spec().map_err(Error::Metadata)
         })();
         original
             .structure
             .source
             .check_deadline()
             .map_err(Error::Policy)?;
-        let (offset, length, encoding, charset, html) = prepared?;
+        let spec = prepared?;
         // The checks above cover every fallible prepare input: backing and
         // extent. Preparation performs no I/O; check brackets its success.
         let child = json::Cursor::prepare(
             Input {
                 source: original.structure.source,
-                offset,
-                length,
-                encoding,
-                charset,
+                offset: spec.offset,
+                length: spec.length,
+                encoding: spec.encoding,
+                charset: spec.charset,
             },
             buffer,
             checkpoints,
             max_bytes,
             original.structure.work,
             clock,
-            html,
+            spec.html && max_bytes != 0,
         )
         .map_err(Error::Json)?;
         let mut cursor = Self {

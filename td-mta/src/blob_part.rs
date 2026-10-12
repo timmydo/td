@@ -1,13 +1,15 @@
 //! Interpret one retained entity header while preserving native traversal custody.
 use crate::{
     blob_structure,
+    body_charset::Plan,
     mime_part_headers::{self, label_json},
     mime_response::bound::{self, ClassifiedView, PartView},
-    mime_structure::Part,
+    mime_structure::{Encoding, Media, Part},
     nfc::{HeaderBudget, Scratch},
-    ports::{Error as PolicyError, Tick},
+    ports::{BlobReader, Error as PolicyError, Tick},
     root_headers,
     store_fs::PinnedBlob,
+    wire::TransferEncoding,
 };
 pub use mime_part_headers::Status;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +48,51 @@ pub struct Retained<'p, 'v, 'c, 'b, 'o, 'w> {
     pub structure: blob_structure::Retained<'p, 'v, 'c, 'b, 'o, 'w>,
     pub metadata: ClassifiedView<'w>,
     pub scratch: &'w mut Scratch,
+}
+pub(crate) struct TextSpec {
+    pub offset: u64,
+    pub length: u64,
+    pub encoding: TransferEncoding,
+    pub charset: Plan,
+    pub html: bool,
+}
+impl Retained<'_, '_, '_, '_, '_, '_> {
+    /// Validate passive metadata against this retained traversal and source.
+    /// Callers bracket this preparation with native freshness checks.
+    pub(crate) fn text_spec(&self) -> Result<TextSpec, bound::Error> {
+        let part = self.metadata.part;
+        let index = usize::from(part.ordinal)
+            .checked_sub(1)
+            .ok_or(bound::Error::InvalidState)?;
+        let content_type = self.metadata.metadata.headers.content_type;
+        if self.structure.parts.get(index) != Some(&part)
+            || matches!(part.media, Media::Multipart | Media::MessageRfc822)
+            || self.metadata.metadata.headers.body_start != part.body_start
+            || !content_type
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"text/"))
+        {
+            return Err(bound::Error::InvalidState);
+        }
+        let length = part
+            .entity_end
+            .checked_sub(part.body_start)
+            .ok_or(bound::Error::InvalidState)?;
+        if part.entity_end > self.structure.source.len() {
+            return Err(bound::Error::InvalidState);
+        }
+        Ok(TextSpec {
+            offset: part.body_start,
+            length,
+            encoding: match part.encoding {
+                Encoding::Identity => TransferEncoding::Identity,
+                Encoding::Base64 => TransferEncoding::Base64,
+                Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
+            },
+            charset: Plan::from_label(self.metadata.metadata.headers.charset),
+            html: content_type.eq_ignore_ascii_case(b"text/html"),
+        })
+    }
 }
 /// This cursor reads only retained headers, never the native body or another pin.
 /// Each fresh poll fences metadata progress with the original native deadline.

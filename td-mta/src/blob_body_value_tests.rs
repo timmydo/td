@@ -2,6 +2,7 @@
 use super::*;
 use crate::blob_part_json::tests::{exercise_part, Timer};
 use crate::ports::Time;
+use crate::{body_charset::Plan, mime_structure::Media, ports::BlobReader, wire::TransferEncoding};
 struct GoodClock;
 impl Clock for GoodClock {
     fn sample(&self) -> Result<Time, PolicyError> {
