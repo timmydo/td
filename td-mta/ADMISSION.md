@@ -1208,3 +1208,58 @@ Do not reserve a second SortBytes charge for the same files in a future job
 owner. An uncertain cleanup of a file holding the entire sort cap can block
 all further sort admission until quiescent cold recovery; the conservative
 full-cap charge is intentional.
+
+## Native sort-job custody
+
+StoreCoordinator::sort_job couples two SortBytes reservations with one
+coordinator-wide resident workspace permit. A workspace admits at most 256
+records of at most 2048 bytes and eight merge heads, within the existing
+1 MiB sort-buffer reservation. It frees both vectors before releasing the
+permit. A contending workspace receives Busy; dropping the workspace does
+not release file reservations, which remain with NativeSortJob. The service
+uses its one shared coordinator; creating separate coordinators is not a
+way to multiply the service reservation.
+
+Each file cap is positive and at most half the configured aggregate sort
+capacity, so the pair's requested reservation fits before contention is
+considered. Both reservations remain held across every reset and merge pass.
+If creation of either file fails, all acquired file/workspace custody unwinds;
+uncertain file cleanup still follows the existing conservative SortBytes
+settlement. File cleanup does not require the execution deadline to remain
+open.
+
+NativeSortJob retains one original foreground work meter and deadline for
+all engine polls, both files, resets, output reads and source callbacks.
+It conservatively charges poll admission and native operations separately;
+source/comparator lookups additionally charge through SortWork. No file or
+pass replaces this meter. Every charge checks time before and after work.
+A source callback that ignores a failed charge still fails its enclosing
+operation; all source, I/O, budget and clock failures are sticky for the job.
+Each source callback must yield within the existing coordinator-turn bounds.
+The adapter contract is trusted, not a sandbox for arbitrary callbacks.
+
+The source retains its authenticated account/view binding and must freshly
+validate it before response publication. Sorted-file completion and bounded
+output reads do not establish that permission. This boundary activates no
+query method and does not claim final client-read conformance.
+
+This is a per-job meter created at construction, not the already consumed
+request/argument-admission meter. Construction charges one control record.
+Query activation must create at most one job for that method and propagate
+exhaustion without constructing a replacement job. Filtering/decoding during
+sorting must use the supplied meter, rather than a newly created one. This
+boundary alone does not establish an aggregate budget for arbitrary chains
+of independent jobs or other query stages.
+
+SortWork enforces cumulative declared source-callback charges of at most
+64 KiB and 256 records, resetting those two step counters for each callback
+without resetting the job meter. Byte-only charges are valid; a wholly empty
+charge is invalid. Unmetered callback CPU remains a trusted-code obligation.
+An already admitted job also checks writer-stop state before work. Invalid
+output indices are terminal caller errors, not end-of-stream markers; callers
+iterate only within the returned count. Busy propagates as temporary pressure;
+there is no internal retry queue or replacement job after execution failure.
+A forgotten workspace fails closed by retaining its permit. The generic
+algorithm's raw slices remain a trusted primitive; production callers use this
+native admission path. A compile-time bound pins maximum workspace buffers
+and fixed swap/metadata allowance below the existing 1 MiB reservation.

@@ -26,7 +26,9 @@ pub use td_mta::{mailbox_sweep, reference_sweep};
 #[path = "../src/account_checks.rs"]
 #[allow(unused)] // Match the source-recompiled filesystem report types.
 mod account_checks;
-use td_mta::{bounded, config, format, ids, limits, ownership, ports, store_paths, wire};
+use td_mta::{
+    bounded, config, external_sort, format, ids, limits, ownership, ports, store_paths, wire,
+};
 #[path = "../src/admission.rs"]
 #[allow(unused)] // Keep quota/work helpers in this measured source compilation.
 mod admission;

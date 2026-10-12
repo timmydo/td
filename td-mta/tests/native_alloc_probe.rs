@@ -581,8 +581,8 @@ mod account_checks;
 mod admission;
 #[cfg(td_native_alloc_probe)]
 use td_mta::{
-    bounded, config, format, ids, limits, mailbox_parents, ownership, ports, row_references,
-    store_paths,
+    bounded, config, external_sort, format, ids, limits, mailbox_parents, ownership, ports,
+    row_references, store_paths,
 };
 #[cfg(td_native_alloc_probe)]
 #[path = "../src/recipient_sweep.rs"]

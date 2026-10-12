@@ -81,6 +81,7 @@ pub struct StoreCoordinator<'r, 'a, P> {
     work: crate::admission::WorkLimits,
     response_bytes: u64,
     sort_bytes: u64,
+    sort_workspace: std::sync::atomic::AtomicBool,
 }
 struct AdmissionState<'a> {
     ledger: Leases<'a>,
@@ -116,6 +117,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             work: *plan.work(),
             response_bytes: plan.disk().response_bytes,
             sort_bytes: plan.sort_bytes(),
+            sort_workspace: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub fn admission_stopped(&self) -> bool {
@@ -800,3 +802,7 @@ pub use response_retention::{ResponseError, ResponseRetention, SortError, SortRe
 #[path = "blob_access.rs"]
 mod blob_access;
 pub use blob_access::{BlobAuthorization, BlobReadRequest};
+
+#[path = "sort_job.rs"]
+mod sort_job;
+pub use sort_job::{NativeSortJob, SortSource, SortWork, SortWorkspace};

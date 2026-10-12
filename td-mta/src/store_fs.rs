@@ -18,11 +18,12 @@ pub use index::{
     BlobReadRequest, BlobSource, CommitCompletion, CommitError, CommitFileUsage, CommitRequest,
     Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
     DeliveryPeer, DeliveryRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
-    LedgerInitError, LogicalUsage, MailboxCounts, ResponseError, ResponseRetention, SortError,
-    SortRetention, StoreCoordinator, StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails,
-    Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError,
-    UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
-    MAX_MAILBOX_COUNTS, MAX_THREAD_EMAILS,
+    LedgerInitError, LogicalUsage, MailboxCounts, NativeSortJob, ResponseError, ResponseRetention,
+    SortError, SortRetention, SortSource, SortWork, SortWorkspace, StoreCoordinator,
+    StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails, Upload, UploadAttempt,
+    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
+    UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence, MAX_MAILBOX_COUNTS,
+    MAX_THREAD_EMAILS,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

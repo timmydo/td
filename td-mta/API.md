@@ -7523,3 +7523,36 @@ never record contents. The engine charges fixed-record bytes for actual
 scratch reads/writes and one potential source record before each source step
 (including its end/skip result); additional source I/O is adapter-owned.
 Control-only transitions charge work but no scratch I/O bytes.
+
+## Native sort adapter
+
+StoreCoordinator::sort_job returns a SortWorkspace and NativeSortJob for a
+trusted SortSource. Borrow the workspace's run/head slices into Sorter, then
+poll with the native job. The workspace cannot be resized, and its resident
+permit stays held while a sorter borrows its buffers. SortSource::next may
+yield Skipped after one excluded candidate; the source and comparator charge
+additional work through the original SortWork object. NativeSortJob keeps
+source errors, ignored charge errors and storage/deadline failures sticky.
+
+The caller passes only its own completed sorter output to read_output, which
+returns bounded records from the exact sealed
+result while retaining the original job budget. source_mut permits the
+caller's final retained-view validation; it must never replace the source's
+view, account or authority. Dropping the native job cleans both files, while
+dropping the workspace frees buffers before admitting another workspace.
+ADMISSION.md owns the single-workspace and cumulative-meter policy. No query
+method or discovery capability is enabled by this adapter.
+
+read_output validates scratch bounds and sealed length, not completion
+provenance. Because Output is public metadata, trusted callers must not forge
+it, use another job's coordinates or substitute a sealed intermediate run.
+The query activation tests must enforce that final-completion call sequence.
+
+Drop the sorter and its workspace on completion or failure, before streaming
+output, to release resident admission promptly. The single workspace imposes
+service-wide contention; there is no fairness or waiting guarantee. Every
+work charge also tries coordinator state without blocking. Contention returns
+terminal Busy even within an admitted job; callers propagate it rather than
+retrying with a renewed budget. Engine admission is per fixed record, never
+for an entire resident run. On any read_output error, discard its destination
+buffer: an I/O or post-read freshness failure may follow buffer mutation.

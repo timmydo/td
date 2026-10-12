@@ -1153,4 +1153,359 @@ mod tests {
             assert_eq!(spool.status().occupied_slots, 0);
         });
     }
+    struct SortInput {
+        remaining: u64,
+        ignore_bad_charge: bool,
+    }
+    impl<const N: usize> SortSource<N> for SortInput {
+        fn next(
+            &mut self,
+            output: &mut [u8; N],
+            work: &mut dyn SortWork,
+        ) -> Result<crate::external_sort::Next, ports::Error> {
+            if self.ignore_bad_charge {
+                let _ = work.charge(0, 0);
+            } else {
+                work.charge(N as u64, 1)?;
+            }
+            if self.remaining == 0 {
+                return Ok(crate::external_sort::Next::Complete);
+            }
+            self.remaining -= 1;
+            output.fill(0);
+            output
+                .get_mut(..8)
+                .ok_or(ports::Error::Invalid)?
+                .copy_from_slice(&self.remaining.to_be_bytes());
+            Ok(crate::external_sort::Next::Record)
+        }
+        fn compare(
+            &mut self,
+            a: &[u8; N],
+            b: &[u8; N],
+            work: &mut dyn SortWork,
+        ) -> Result<std::cmp::Ordering, ports::Error> {
+            work.charge(0, 1)?;
+            Ok(a.cmp(b))
+        }
+    }
+    fn input(count: u64) -> SortInput {
+        SortInput {
+            remaining: count,
+            ignore_bad_charge: false,
+        }
+    }
+    #[test]
+    fn native_sort_uses_two_reserved_files_and_one_resident_workspace() {
+        use crate::external_sort::{Progress, Sorter};
+        run(|coordinator, spool, _, _| {
+            let (mut buffers, mut job) = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(19))
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(400)
+            );
+            let first = coordinator.retain_sort(spool, 200, deadline()).unwrap();
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                1
+            );
+            drop(first);
+            assert_eq!(coordinator.used(Kind::SortBytes), Ok(0));
+            assert!(matches!(
+                coordinator.sort_job::<8, _>(spool, 2, 200, deadline(), input(1)),
+                Err(SortError::Store(ports::Error::Busy))
+            ));
+            let output = {
+                let (run, heads) = buffers.buffers();
+                let mut sorter = Sorter::new(run, heads).unwrap();
+                loop {
+                    match sorter.poll(&mut job).unwrap() {
+                        Progress::Pending => {}
+                        Progress::Complete(output) => break output,
+                    }
+                }
+            };
+            assert_eq!(output.records, 19);
+            for id in 0..19u64 {
+                let mut record = [0; 8];
+                job.read_output(output, id, &mut record).unwrap();
+                assert_eq!(u64::from_be_bytes(record), id);
+            }
+            assert_eq!(job.source_mut().remaining, 0);
+            drop(buffers);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(400)
+            );
+            drop(job);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+            assert_eq!(coordinator.used(Kind::SortBytes), Ok(0));
+            let pair = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(1))
+                .unwrap();
+            drop(pair);
+        });
+    }
+    #[test]
+    fn native_sort_failure_unwinds_reservations_and_workspace_admission() {
+        run_with_cells(3, |coordinator, spool, _, _| {
+            let response = coordinator.retain_response(spool, deadline()).unwrap();
+            assert_eq!(
+                coordinator.state.lock().unwrap().ledger.available_cells(),
+                2
+            );
+            assert!(matches!(
+                coordinator.sort_job::<8, _>(spool, 2, 200, deadline(), input(1)),
+                Err(SortError::Ledger(logical::Error::Full))
+            ));
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+            assert!(!coordinator.sort_workspace.load(Ordering::Acquire));
+            drop(response);
+            let pair = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(1))
+                .unwrap();
+            drop(pair);
+        });
+    }
+    #[test]
+    fn native_sort_original_job_meter_cannot_be_renewed_by_reset_or_file_switch() {
+        use crate::external_sort::{File, Job};
+        run(|coordinator, spool, _, _| {
+            let (buffers, mut job) = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(1))
+                .unwrap();
+            assert_eq!(
+                job.test_remaining_records(),
+                coordinator.work.foreground_records - 1
+            );
+            job.test_record_budget(4);
+            Job::<8>::admit(&mut job, 0).unwrap();
+            Job::<8>::reset(&mut job, File::A).unwrap();
+            Job::<8>::reset(&mut job, File::B).unwrap();
+            Job::<8>::reset(&mut job, File::A).unwrap();
+            assert_eq!(
+                Job::<8>::reset(&mut job, File::B),
+                Err(ports::Error::Capacity)
+            );
+            assert_eq!(job.failure(), Some(ports::Error::Capacity));
+            assert_eq!(Job::<8>::admit(&mut job, 0), Err(ports::Error::Capacity));
+            drop(job);
+            drop(buffers);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+        });
+    }
+    #[test]
+    fn native_sort_deadline_and_ignored_source_budget_failure_stay_terminal() {
+        use crate::external_sort::Job;
+        run(|coordinator, spool, _, timer| {
+            let (buffers, mut job) = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(1))
+                .unwrap();
+            timer.0.store(100, Ordering::SeqCst);
+            assert_eq!(
+                Job::<8>::next(&mut job, &mut [0; 8]),
+                Err(ports::Error::Deadline)
+            );
+            assert_eq!(job.source_mut().remaining, 1);
+            drop(job);
+            drop(buffers);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+        });
+        run(|coordinator, spool, _, _| {
+            let source = SortInput {
+                remaining: 1,
+                ignore_bad_charge: true,
+            };
+            let (buffers, mut job) = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), source)
+                .unwrap();
+            assert_eq!(
+                Job::<8>::next(&mut job, &mut [0; 8]),
+                Err(ports::Error::Invalid)
+            );
+            assert_eq!(job.failure(), Some(ports::Error::Invalid));
+            assert_eq!(Job::<8>::admit(&mut job, 0), Err(ports::Error::Invalid));
+            drop(job);
+            drop(buffers);
+        });
+    }
+    #[test]
+    fn native_sort_deterministic_caps_refuse_before_workspace_or_file_effects() {
+        run(|coordinator, spool, _, _| {
+            for (rows, bytes) in [
+                (0, 8),
+                (crate::external_sort::MAX_RUN_RECORDS + 1, 8),
+                (1, 0),
+            ] {
+                assert!(matches!(
+                    coordinator.sort_job::<8, _>(spool, rows, bytes, deadline(), input(1)),
+                    Err(SortError::Store(ports::Error::Invalid))
+                ));
+            }
+            assert!(matches!(
+                coordinator.sort_job::<8, _>(
+                    spool,
+                    1,
+                    coordinator.sort_bytes / 2 + 1,
+                    deadline(),
+                    input(1)
+                ),
+                Err(SortError::Store(ports::Error::Capacity))
+            ));
+            assert!(!coordinator.sort_workspace.load(Ordering::Acquire));
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+        });
+    }
+    #[test]
+    fn native_sort_full_width_runs_and_output_bound_refusal() {
+        use crate::external_sort::{Progress, Sorter};
+        run(|coordinator, spool, _, _| {
+            let (mut buffers, mut job) = coordinator
+                .sort_job::<2048, _>(spool, 256, 600_000, deadline(), input(257))
+                .unwrap();
+            let (run, heads) = buffers.buffers();
+            let mut sorter = Sorter::new(run, heads).unwrap();
+            let output = loop {
+                if let Progress::Complete(output) = sorter.poll(&mut job).unwrap() {
+                    break output;
+                }
+            };
+            let mut record = [0; 2048];
+            for id in 0..257 {
+                job.read_output(output, id, &mut record).unwrap();
+                assert_eq!(u64::from_be_bytes(record[..8].try_into().unwrap()), id);
+                assert!(record[8..].iter().all(|byte| *byte == 0));
+            }
+            assert_eq!(
+                job.read_output(output, 257, &mut record),
+                Err(ports::Error::Invalid)
+            );
+            assert_eq!(
+                job.read_output(output, 0, &mut record),
+                Err(ports::Error::Invalid)
+            );
+        });
+    }
+    #[test]
+    fn native_sort_callback_totals_and_writer_stop_are_enforced() {
+        use crate::external_sort::{Job, Next};
+        struct Many {
+            bytes: bool,
+        }
+        impl SortSource<8> for Many {
+            fn next(
+                &mut self,
+                _: &mut [u8; 8],
+                work: &mut dyn SortWork,
+            ) -> Result<Next, ports::Error> {
+                if self.bytes {
+                    assert_eq!(work.charge(32768, 0), Ok(()));
+                    assert_eq!(work.charge(32768, 0), Ok(()));
+                    assert_eq!(work.charge(1, 0), Err(ports::Error::Capacity));
+                } else {
+                    assert_eq!(work.charge(0, 128), Ok(()));
+                    assert_eq!(work.charge(0, 128), Ok(()));
+                    assert_eq!(work.charge(0, 1), Err(ports::Error::Capacity));
+                }
+                Ok(Next::Complete)
+            }
+            fn compare(
+                &mut self,
+                _: &[u8; 8],
+                _: &[u8; 8],
+                work: &mut dyn SortWork,
+            ) -> Result<std::cmp::Ordering, ports::Error> {
+                self.next(&mut [0; 8], work)?;
+                Ok(std::cmp::Ordering::Equal)
+            }
+        }
+        for (bytes, compare) in [(false, false), (true, false), (false, true), (true, true)] {
+            run(|coordinator, spool, _, _| {
+                let (_buffers, mut job) = coordinator
+                    .sort_job::<8, _>(spool, 2, 200, deadline(), Many { bytes })
+                    .unwrap();
+                let result = if compare {
+                    Job::<8>::compare(&mut job, &[0; 8], &[0; 8]).map(|_| ())
+                } else {
+                    Job::<8>::next(&mut job, &mut [0; 8]).map(|_| ())
+                };
+                assert_eq!(result, Err(ports::Error::Capacity));
+                assert_eq!(job.failure(), Some(ports::Error::Capacity));
+            });
+        }
+        run(|coordinator, spool, _, _| {
+            let (_buffers, mut job) = coordinator
+                .sort_job::<8, _>(spool, 2, 200, deadline(), input(1))
+                .unwrap();
+            coordinator.state.lock().unwrap().stopped = true;
+            assert_eq!(
+                Job::<8>::next(&mut job, &mut [0; 8]),
+                Err(ports::Error::WriterStopped)
+            );
+            assert_eq!(job.source_mut().remaining, 1);
+            drop(job);
+            assert_eq!(coordinator.used(Kind::SortBytes), Ok(0));
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::SortBytes),
+                Ok(0)
+            );
+        });
+    }
 }

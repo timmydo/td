@@ -2717,3 +2717,23 @@ under the same cumulative native VM budget and original deadline.
 This trades repeated indexed reads for fixed memory; no maximum-thread
 throughput claim is made. read_snapshot plus a final native check withhold
 results after failure. API.md owns the passive result/caller contract.
+
+## Native external-sort jobs
+
+NativeSortJob implements external_sort::Job over two SortRetention files and
+one cumulative original foreground work/deadline meter. A separate borrowed
+SortWorkspace owns the bounded run/head vectors and the coordinator-wide
+resident permit; the sorter borrows its slices. Both file caps are reserved
+before a job escapes the constructor, and failed construction unwinds all
+acquired custody. ADMISSION.md defines workspace contention, pair bounds and
+conservative work charges.
+
+SortSource supplies one bounded input step or comparator on the retained
+read view. It receives the same SortWork meter for additional decoding and
+lookup costs. The native owner freshly checks the original deadline after
+callbacks and file operations and retains even ignored charge failures.
+read_output checks record bounds, checked byte offsets and the exact sealed
+length before reading one fixed record. Output coordinates are internal
+scratch metadata, not authorization or evidence of a fresh read view.
+
+API.md owns the trusted output-coordinate and error-buffer contract.

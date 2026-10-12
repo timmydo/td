@@ -184,8 +184,8 @@ mod account_checks;
 #[allow(unused)] // Keep private ledger transitions with the recompiled storage core.
 mod admission;
 use td_mta::{
-    bounded, config, format, ids, limits, mailbox_parents, ownership, ports, row_references,
-    store_paths,
+    bounded, config, external_sort, format, ids, limits, mailbox_parents, ownership, ports,
+    row_references, store_paths,
 };
 #[path = "../src/recipient_sweep.rs"]
 #[allow(dead_code)]
