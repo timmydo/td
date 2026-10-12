@@ -4491,3 +4491,23 @@ prepaid steps are discarded at finish, with no refund or new allowance.
 Native clock fences
 and zero charges are fresh even after mapping is complete. Original source
 bytes and I/O budgets are unchanged; no body read occurs.
+
+## Native body-list selection storage
+
+The native list cursor and HeaderBudget fit a compiled 3 KiB ceiling; the
+cursor also fits the shared selector plus 256 bytes. Fixed inline state holds
+both optional phase slots, with at most one occupied, without heap allocation. The
+caller must reserve and admit nodes, text/HTML/attachment ordinal spans and
+membership bytes alongside retained headers and descriptors. Output windows
+share the admission-owner lifetime and stay borrowed through the handoff.
+
+Correspondence checking costs one original work record per node. The shared
+selector retains its existing interpretation, record and output charges and
+bounded turns. Deadline checks and cached completion add no positive charge.
+No source byte or native I/O debit occurs because selection reads only the
+retained classifications. This adapter does not implement whole-job memory
+admission or authorize Mail capability advertisement.
+
+After N correspondence turns, one constant-size handoff turn constructs the
+shared selector and yields without a positive charge. Selection starts on the
+following turn; this single transition does not scale with message size.

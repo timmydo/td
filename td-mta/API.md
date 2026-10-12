@@ -8328,3 +8328,27 @@ returns all candidates beside the original traversal owners. These candidates
 are not part-ID authorization or permission to publish/download; the enclosing
 worker must preserve its account/snapshot authorization and response admission.
 No body bytes are read or transfer-decoded by this mapping.
+
+## Native body-list selection
+
+`blob_body_lists::Cursor` consumes the native traversal handoff, immutable
+caller-retained classifications from those original parts, and admitted list
+backing. It checks one node's ordinal/parent/depth correspondence per turn,
+then runs the shared body-list selector for textBody, htmlBody, attachments
+and hasAttachment. The caller must supply original classification facts;
+coordinate checks do not authenticate fabricated classes. No MIME header
+reparse, body read or transfer decoding occurs in this selector.
+
+The shared selector validates selection limits when correspondence checking
+has finished. A short list window, inconsistent preorder, exhausted original
+budget or expired native/job deadline refuses the consuming operation.
+Native checks bracket construction, every validation/selection turn (including
+cached completion), explicit checks and finish; late native expiry wins over
+provisional progress. Passive value does not sample time or authorize response
+publication. All output remains provisional and must be discarded on refusal.
+Successful finish returns the original traversal owners, node slice and lists.
+
+A failed constructor or consuming finish terminates this traversal handoff;
+no retry handoff is returned. The underlying borrowed owners remain owned by
+the caller, but provisional traversal/list results cannot be reused as a
+successful completion.
