@@ -680,23 +680,12 @@ HTML sources first use the extraction policy below; literal markup is never
 fed directly to this plaintext projection. Source selection and native response
 composition remain separate implementation work.
 
-HTML extraction is a bounded tokenizer, not a renderer or sanitizer. Ignore
-tags, comments, declarations and contents of head/script/style; include text
-and decoded alt/title attribute values, with SP on either side of each
-attribute value. Tag/attribute names use ASCII case insensitivity,
-quoted/unquoted attributes and raw-text closing rules. Insert SP at
-address/article/aside/blockquote/br/div/dl/dt/dd/fieldset/figcaption/figure/
-footer/form/h1-h6/header/hr/li/main/nav/ol/p/pre/section/table/td/th/tr/ul
-start/end tags only; inline/unknown tags add no separator. Treat U+00A0 as SP
-for search/preview. In particular, <span>Hel</span>lo becomes Hello. Never
-insert a space solely because an inline tag ended; never match tag names, URLs
-or ordinary attribute names. Decode numeric character references and
-amp/lt/gt/quot/apos/nbsp; unknown named references remain literal. Invalid
-numeric scalars become U+FFFD. Malformed/unterminated markup consumes its
-remaining bounded context, with a diagnostic; it never launches a browser,
-fetches content or interprets CSS/JS. This is the declared v1 extraction
-heuristic. BodyValues preserves the original decoded HTML instead. HTML,
-Unicode and token work all count against the enclosing scan budget.
+HTML extraction uses the shared bounded tokenizer specified by
+[td-html/DESIGN.md](../td-html/DESIGN.md), not a renderer or sanitizer.
+That document owns its tag/attribute, suppressed-context, separator, Basic
+reference, malformed-input and diagnostic rules. Search and preview use the
+same projection; BodyValues preserves original decoded HTML. HTML, Unicode
+and token work all count against the enclosing scan budget.
 
 SearchSnippet/get uses the same token matches, HTML-escapes &, < and >, and
 adds only generated balanced mark tags. Subject is the full escaped subject

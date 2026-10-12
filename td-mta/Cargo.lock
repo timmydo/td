@@ -253,6 +253,10 @@ name = "td-header"
 version = "0.1.0"
 
 [[package]]
+name = "td-html"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
 version = "0.1.0"
 
@@ -273,6 +277,7 @@ dependencies = [
  "td-civil",
  "td-crypto",
  "td-header",
+ "td-html",
  "td-json",
  "td-mime",
  "td-nfc",

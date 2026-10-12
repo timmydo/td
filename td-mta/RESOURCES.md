@@ -4639,3 +4639,26 @@ Work remains linear in the entire chosen decoded source, even after the cap.
 A large source may exhaust the enclosing job and refuse preview rather than
 publish its prefix. Source selection and worker admission must account for
 that availability tradeoff; this cursor claims no constant-time whole preview.
+
+## Charged HTML extraction storage
+
+The html_text cursor fits 384 bytes, including the shared fixed-state parser
+and checked-clock observer, and retains no source/output buffer or heap state.
+Each uncached poll spends one original work record, including input-gap polls,
+reference resolution, suppressed source text and EOF draining. Each emitted
+scalar additionally spends its UTF-8 byte length before exposure. Cached
+completion and explicit freshness operations add no positive charge. The
+original Meter is never copied, replaced or reset. The shared parser consumes
+at most one source scalar and emits at most one scalar per turn, with bounded
+name storage and reference table work. Total work remains linear in the chosen
+source plus fixed overhead per reference; a refused budget never publishes a
+successful partial result. This is component accounting, not whole-worker or
+pinned-musl memory qualification.
+
+The Meter's output_bytes covers intermediate transformations as well as wire
+serialization. Extraction therefore charges the entire projected source,
+including text later omitted by the preview cap; subsequent preview and JSON
+stages charge their own output. It is not solely the advertised response-size
+ceiling. The composing job must admit all stages; a large source may exhaust
+this work allowance and refuse a small preview. No stage silently replaces or
+increases that original allowance.

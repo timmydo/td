@@ -51,6 +51,7 @@ pub use td_mime::header_select;
 pub use td_mime::header_text;
 pub use td_mime::header_urls;
 pub use td_mime::header_value;
+pub mod html_text;
 pub mod http_auth;
 pub mod http_request;
 pub mod https;

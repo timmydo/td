@@ -16,6 +16,7 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", 
 td-civil = { path = "../td-civil" }
 td-crypto = { path = "../td-crypto" }
 td-header = { path = "../td-header" }
+td-html = { path = "../td-html" }
 td-json = { path = "../td-json" }
 td-mime = { path = "../td-mime" }
 td-nfc = { path = "../td-nfc" }

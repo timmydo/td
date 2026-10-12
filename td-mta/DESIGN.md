@@ -180,7 +180,8 @@ of an operator file and its protected inputs, foreground
 stopped-database `backup`, and verified fresh-epoch `restore` to a fresh
 destination. STORAGE.md owns their scope and machine-readable results. Other commands arrive with their implementations.
 Its direct
-dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-json`, `td-mime`
+dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
+`td-json`, `td-mime`
 and `td-nfc` crates, plus the approved private rusqlite dependency with
 bundled SQLite. Application protocols, configuration and scheduling use std
 plus the local libraries; store_fs/index.rs alone owns native SQL. There is

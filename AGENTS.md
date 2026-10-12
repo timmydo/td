@@ -18,6 +18,7 @@ needs them:
 - For login or credentials, read `td-login/THREAT-MODEL.md`.
 - For mail serving, storage, or submission, read `td-mta/DESIGN.md`.
 - For shared MIME parsing or decoding, read `td-mime/DESIGN.md`.
+- For shared HTML rendering or text extraction, read `td-html/DESIGN.md`.
 - For td-crypto or its consumer boundary, read `td-crypto/DESIGN.md`.
 - For the shared FIDO2 client or SHA-256, HMAC and HKDF, read
   `td-fido/DESIGN.md`.
@@ -385,13 +386,13 @@ message.
   exception is `td-crypto`'s private Rustls/AWS-LC closure: exact manifests,
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
   `td-mta` depends directly on local `td-crypto` and std-only `td-civil`, `td-header`
-  plus `td-json`, `td-mime` and `td-nfc`, and the approved private
+  plus `td-html`, `td-json`, `td-mime` and `td-nfc`, and the approved private
   `rusqlite` 0.40.2 closure with source-built bundled SQLite 3.53.2. Its
   exact manifest, lock and active features are pinned in the same policy.
-  Its lock includes these closures. All seven
+  Its lock includes these closures. All eight
   local manifests and locks are pinned. No other roster crate may depend
   on `td-crypto` or `td-mta`, directly or transitively; `td-header`,
-  `td-civil`, `td-json`, `td-mime` and `td-nfc` remain
+  `td-civil`, `td-html`, `td-json`, `td-mime` and `td-nfc` remain
   ordinary std-only shared crates.
   `td-crypto/DESIGN.md` owns offline preparation and crypto confinement;
   `td-mta/STORAGE.md` owns the private SQLite boundary. No other roster

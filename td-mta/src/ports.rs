@@ -590,6 +590,7 @@ mod crypto_boundary_tests {
                 r#"td-civil = { path = "../td-civil" }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,
                 r#"td-header = { path = "../td-header" }"#,
+                r#"td-html = { path = "../td-html" }"#,
                 r#"td-json = { path = "../td-json" }"#,
                 r#"td-mime = { path = "../td-mime" }"#,
                 r#"td-nfc = { path = "../td-nfc" }"#

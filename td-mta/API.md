@@ -8561,3 +8561,29 @@ summary values and later calls return the same error without additional work.
 The value accessor is passive; only check and finish freshly admit its counts.
 Healthy consuming finish returns the exact original Meter and scalar/byte
 counts. This does not implement a native Email preview or advertise Mail.
+
+## Charged HTML text extraction
+
+`html_text::Cursor` uses the shared td-html bounded extraction heuristic
+under the original borrowed job Meter and Clock. Construction seeds the checked
+clock from the caller's prior job Tick. Supply charset-decoded scalars, retain
+unconsumed input/last pairs, and drain with None after consumed-last input until
+Complete. A final scalar can accompany Complete and must be handled first.
+This cursor removes markup and suppressed contexts, emits visible text and
+alt/title values, and decodes the shared Names::Basic reference set according to POLICY.md and
+`td-html/DESIGN.md`. It neither collapses whitespace nor caps preview length.
+
+Construction, polling, explicit check and consuming finish sample fresh time.
+Each uncached poll charges one work record before parser progress, including
+input gaps, because pending reference output can drain without new input.
+Every emitted scalar charges its UTF-8 length before exposure. A postcheck
+fences each turn's provisional output. Cached completion/check/finish add no
+positive debit. Failures latch, hide completion diagnostics and refuse later
+operations without additional work. Healthy finish returns the exact original
+Meter and malformed-markup diagnostic; value observes those diagnostics
+passively. Incomplete finish refuses rather than silently truncating extraction.
+
+Native pin custody, source transfer/charset decoding, preview projection and
+whole-response admission remain the composing caller's responsibility. Emitted
+text is provisional until those owners finish successfully. This standalone
+adapter does not advertise Mail or activate an Email/get worker.
