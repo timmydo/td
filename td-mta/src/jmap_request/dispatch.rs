@@ -187,6 +187,16 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     optional_end: u64,
     account: AccountId,
 }
+impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
+    fn check(&mut self) -> Result<(), Error> {
+        Worker::check(self)
+    }
+    fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), Error> {
+        self.retention
+            .read_at(offset, output)
+            .map_err(Error::Storage)
+    }
+}
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
         if !self

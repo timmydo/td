@@ -7584,3 +7584,31 @@ create/move methods must enforce it for the whole affected subtree before
 activation. API.md does not claim those currently disabled writers enforce it.
 Walk errors, including Busy, are terminal; do not renew its deadline or resume
 a failed walk. Completed advances still validate the supplied view identity.
+
+## Incremental retained argument children
+
+The crate-private jmap_request::children module supplies the shared direct-child walker used by method
+decoders. Source owns the original retention, work accounting and deadline.
+Each poll checks admission, performs at most one 4096-byte read and one
+scanner turn consuming at most 4096 bytes, then freshly checks before exposing
+an Item or completion. Pending never means the container ended. The cursor
+retains fixed storage only, including a 256-byte decoded direct-child key;
+subtrees remain retained byte ranges, not resident trees. next is the existing
+looping convenience for consumers whose Source schedules/checks each turn.
+
+Inputs must already be producer-validated unique I-JSON. This walker checks
+structural corruption but is not whole-request admission and does not withhold
+earlier items until a later malformed tail is found. Any source, shape, key
+capacity or scanner failure is sticky; even a check failing after an item was
+formed withholds it permanently. Re-polling Complete checks admission without
+reading. Only object and array roots are accepted. No Mail query or capability
+is activated by this shared traversal change.
+
+Checks occur before and after every scanner turn, including Pending, and
+consume the original retention work meter. This intentionally increases
+control-record charges relative to the former single-check convenience; it
+does not renew or enlarge the deadline or budget. Retention read_at separately
+charges actual I/O bytes. Recursive consumers must also account for rereading
+subtree ranges at each depth; bounded polls do not imply linear whole-filter
+work. Impossible scanner no-progress or simultaneous item/completion states
+fail internally instead of spinning or discarding an item.
