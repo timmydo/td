@@ -2936,6 +2936,16 @@ output, exact Content-Length, escaped IDs/state, file truncation between
 execution and transmission, invalid phase transitions and fresh deadline
 checks before output and after completion. HTTP activation remains pending.
 
+The retained dispatcher now handles credential-scoped PushSubscription/get
+and /set under the no-external-registration policy. Argument normalization
+shares echo emission and result-reference expansion; a bounded retained-file
+child walker checks method argument types without reparsing a large expansion
+into the request arena. Get returns actual empty registration results and
+absent generic IDs, with mandatory sensitive-property refusal. Set reports
+per-object creation policy refusal and absent update/destroy errors. The
+validated request retains its configured object limit for both methods.
+HTTP authentication/discovery activation remains separate.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's
@@ -3723,7 +3733,6 @@ have evidence, the exact binaries/fixtures tested, and what remains unavailable.
 Avoid dates or completion marks copied ahead of implementation. The final v1
 report must link the conformance table, memory measurements, crash results,
 real td-mail integration evidence and tested migration/restore procedure.
-
 
 ### Foreground direct receiving activation
 

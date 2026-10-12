@@ -3,6 +3,8 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "push.rs"]
+mod push;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -12,6 +14,8 @@ pub enum Error {
     InvalidArguments,
     InvalidResultReference,
     UnknownMethod,
+    Forbidden,
+    RequestTooLarge,
     ResponseCapacity,
 }
 impl std::fmt::Display for Error {
@@ -60,7 +64,7 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
 /// invocation. All methods here are side-effect free; errors never stop later
 /// calls. Terminal original work/I/O/outer-deadline failure aborts the batch.
 /// Refusal drops the request arenas; allocation recycling is not promised.
-/// PushSubscription and HTTP activation remain separate.
+/// HTTP activation remains separate.
 pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -100,7 +104,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core);
         let (name, range) = match result {
-            Ok(range) => ("Core/echo", range),
+            Ok(result) => result,
             Err(error) => {
                 if let Some(error) = worker.retention.failure() {
                     return Err(Error::Storage(error));
@@ -109,6 +113,8 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     Error::InvalidArguments => br#"{"type":"invalidArguments"}"#,
                     Error::InvalidResultReference => br#"{"type":"invalidResultReference"}"#,
                     Error::UnknownMethod => br#"{"type":"unknownMethod"}"#,
+                    Error::Forbidden => br#"{"type":"forbidden"}"#,
+                    Error::RequestTooLarge => br#"{"type":"requestTooLarge"}"#,
                     Error::ExecutionDeadline => {
                         br#"{"type":"serverUnavailable","description":"executionDeadline"}"#
                     }
@@ -210,7 +216,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         ordinal: usize,
         token: usize,
         core: bool,
-    ) -> Result<Range<u64>, Error> {
+    ) -> Result<(&'static str, Range<u64>), Error> {
         self.check()?;
         let document = responses
             .request()
@@ -238,14 +244,28 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 range,
             });
         }
-        if call.name != b"Core/echo" || !core {
+        if !core {
             return Err(Error::UnknownMethod);
         }
+        let name = match call.name {
+            b"Core/echo" => "Core/echo",
+            b"PushSubscription/get" => "PushSubscription/get",
+            b"PushSubscription/set" => "PushSubscription/set",
+            _ => return Err(Error::UnknownMethod),
+        };
         let start = self.retention.len();
         self.arguments(responses, call, &resolved)?;
         self.check()?;
         let end = self.retention.publish().map_err(Error::Storage)?;
-        Ok(start..end)
+        if name == "Core/echo" {
+            return Ok((name, start..end));
+        }
+        let result = self.push_method(
+            name,
+            start..end,
+            responses.request().envelope.maximum_objects,
+        )?;
+        Ok((name, result))
     }
     fn reference(
         &mut self,
@@ -432,7 +452,9 @@ pub(super) mod tests {
         ports::{Deadline, Tick},
     };
     pub(crate) fn request(input: &str) -> OwnedRequest {
-        let limits = Limits::default();
+        request_with_limits(input, Limits::default())
+    }
+    fn request_with_limits(input: &str, limits: Limits) -> OwnedRequest {
         let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
         let tokens = vec![arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
@@ -464,13 +486,26 @@ pub(super) mod tests {
         advance: Option<u64>,
         records: Option<u64>,
     ) -> Result<Vec<Reply>, Error> {
+        execute_with_limits(input, phase, advance, records, Limits::default())
+    }
+    fn execute_with_limits(
+        input: &str,
+        phase: u64,
+        advance: Option<u64>,
+        records: Option<u64>,
+        limits: Limits,
+    ) -> Result<Vec<Reply>, Error> {
         let mut replies = Vec::new();
         let mut failure = None;
         resolution::tests::run(|coordinator, spool, _, clock| {
             let deadline = Deadline::after(Tick(0), 100).unwrap();
             let mut retention = coordinator.retain_response(spool, deadline).unwrap();
-            let mut plan =
-                response::Preflight::new(request(input), "session-1", retention.maximum()).unwrap();
+            let mut plan = response::Preflight::new(
+                request_with_limits(input, limits),
+                "session-1",
+                retention.maximum(),
+            )
+            .unwrap();
             while !plan.step(&mut [0; 4096]).unwrap() {}
             if let Some(target) = advance {
                 clock.advance_until(target);
@@ -700,5 +735,211 @@ pub(super) mod tests {
                 Err(Error::Storage(ports::Error::Invalid))
             );
         }
+    }
+    #[test]
+    fn push_get_defaults_projection_and_absent_generic_ids() {
+        let replies = execute(
+            &batch(
+                r#"[["PushSubscription/get",{},"a"],["PushSubscription/get",{"ids":["foreign","A_9-","foreign"],"properties":["id","types"]},"b"],["PushSubscription/get",{"ids":null,"properties":null},"c"]]"#,
+            ),
+            90,
+        );
+        assert_eq!(replies[0].0, "PushSubscription/get");
+        assert_eq!(replies[0].1, br#"{"list":[],"notFound":[]}"#);
+        assert_eq!(
+            replies[1].1,
+            br#"{"list":[],"notFound":["foreign","A_9-"]}"#
+        );
+        assert_eq!(replies[2].1, replies[0].1);
+    }
+    #[test]
+    fn push_sensitive_projection_is_forbidden_even_with_no_ids() {
+        for property in ["url", "keys"] {
+            let calls = format!(
+                r#"[["PushSubscription/get",{{"ids":[],"properties":["{property}"]}},"a"],["Core/echo",{{}},"b"]]"#
+            );
+            let replies = execute(&batch(&calls), 90);
+            assert_eq!(replies[0].0, "error");
+            assert_eq!(replies[0].1, br#"{"type":"forbidden"}"#);
+            assert_eq!(replies[1].0, "Core/echo");
+        }
+    }
+    #[test]
+    fn push_set_refuses_creation_and_reports_absent_updates_and_destroys() {
+        let replies = execute(
+            &batch(
+                r#"[["PushSubscription/set",{"create":{"c":{"url":"https://never-contact.invalid/","deviceClientId":"d"}},"update":{"foreign":{"expires":null}},"destroy":["gone","gone"]},"a"],["PushSubscription/set",{},"b"],["PushSubscription/set",{"create":{},"update":{},"destroy":[]},"c"]]"#,
+            ),
+            90,
+        );
+        assert_eq!(replies[0].0, "PushSubscription/set");
+        assert_eq!(replies[0].1, br#"{"created":null,"updated":null,"destroyed":null,"notCreated":{"c":{"type":"forbidden"}},"notUpdated":{"foreign":{"type":"notFound"}},"notDestroyed":{"gone":{"type":"notFound"}}}"#);
+        assert_eq!(replies[1].1, br#"{"created":null,"updated":null,"destroyed":null,"notCreated":null,"notUpdated":null,"notDestroyed":null}"#);
+        assert_eq!(replies[1].1, replies[2].1);
+    }
+    #[test]
+    fn push_argument_shapes_account_state_and_unknown_properties_are_invalid() {
+        for (method, arguments) in [
+            ("get", r#"{"accountId":"a"}"#),
+            ("get", r#"{"ids":{}}"#),
+            ("get", r#"{"ids":[""]}"#),
+            ("get", r#"{"ids":["bad.id"]}"#),
+            ("get", r#"{"properties":[true]}"#),
+            ("get", r#"{"properties":["unknown"]}"#),
+            ("set", r#"{"ifInState":null}"#),
+            ("set", r#"{"accountId":"a"}"#),
+            ("set", r#"{"create":{"a":false}}"#),
+            ("set", r#"{"update":[]}"#),
+            ("set", r#"{"destroy":{}}"#),
+        ] {
+            let calls = format!(
+                r#"[["PushSubscription/{method}",{arguments},"a"],["Core/echo",{{}},"b"]]"#
+            );
+            let replies = execute(&batch(&calls), 90);
+            assert_eq!(
+                replies[0].1, br#"{"type":"invalidArguments"}"#,
+                "{method}: {arguments}"
+            );
+            assert_eq!(replies[1].0, "Core/echo");
+        }
+    }
+    #[test]
+    fn push_resolves_arguments_before_validation_and_enforces_object_count() {
+        let replies = execute(
+            &batch(
+                r##"[["Core/echo",{"ids":["a","b"],"sensitive":["keys"],"create":{"c":{}}},"seed"],["PushSubscription/get",{"#ids":{"resultOf":"seed","name":"Core/echo","path":"/ids"}},"get"],["PushSubscription/get",{"#properties":{"resultOf":"seed","name":"Core/echo","path":"/sensitive"}},"deny"],["PushSubscription/set",{"#create":{"resultOf":"seed","name":"Core/echo","path":"/create"}},"set"]]"##,
+            ),
+            90,
+        );
+        assert_eq!(replies[1].1, br#"{"list":[],"notFound":["a","b"]}"#);
+        assert_eq!(replies[2].1, br#"{"type":"forbidden"}"#);
+        assert_eq!(replies[3].0, "PushSubscription/set");
+        assert_eq!(replies[3].1, br#"{"created":null,"updated":null,"destroyed":null,"notCreated":{"c":{"type":"forbidden"}},"notUpdated":null,"notDestroyed":null}"#);
+        for count in [256, 257] {
+            let ids = std::iter::repeat_n("\"a\"", count)
+                .collect::<Vec<_>>()
+                .join(",");
+            let calls = format!(r#"[["PushSubscription/get",{{"ids":[{ids}]}},"a"]]"#);
+            let replies = execute(&batch(&calls), 90);
+            assert_eq!(
+                replies[0].0,
+                if count == 256 {
+                    "PushSubscription/get"
+                } else {
+                    "error"
+                }
+            );
+            if count == 257 {
+                assert_eq!(replies[0].1, br#"{"type":"requestTooLarge"}"#);
+            }
+        }
+    }
+    #[test]
+    fn push_object_limits_follow_the_admitted_configuration_and_sum_set_actions() {
+        let limits = Limits {
+            objects_per_method: 1,
+            ..Limits::default()
+        };
+        for call in [
+            r#"["PushSubscription/get",{"ids":["a","b"]},"a"]"#,
+            r#"["PushSubscription/set",{"create":{"c":{}},"destroy":["a"]},"a"]"#,
+            r#"["PushSubscription/set",{"update":{"a":{}},"destroy":["b"]},"a"]"#,
+        ] {
+            let replies =
+                execute_with_limits(&batch(&format!("[{call}]")), 90, None, None, limits).unwrap();
+            assert_eq!(replies[0].1, br#"{"type":"requestTooLarge"}"#);
+        }
+    }
+    #[test]
+    fn push_accepts_resolved_arguments_larger_than_the_request_arena() {
+        let calls = format!(
+            r##"[["Core/echo",{{"c":{{"url":"{}"}}}},"s"],["Core/echo",{{"#a":{{"resultOf":"s","name":"Core/echo","path":"/c"}},"#b":{{"resultOf":"s","name":"Core/echo","path":"/c"}},"#c":{{"resultOf":"s","name":"Core/echo","path":"/c"}},"#d":{{"resultOf":"s","name":"Core/echo","path":"/c"}}}},"wide"],["PushSubscription/set",{{"#create":{{"resultOf":"wide","name":"Core/echo","path":""}}}},"p"]]"##,
+            "x".repeat(300)
+        );
+        let input = batch(&calls);
+        assert!(input.len() < 1024);
+        let replies = execute_with_limits(
+            &input,
+            90,
+            None,
+            None,
+            Limits {
+                json_bytes: 1024,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert!(replies[1].1.len() > 1024);
+        assert_eq!(replies[2].0, "PushSubscription/set");
+        assert_eq!(replies[2].1, br#"{"created":null,"updated":null,"destroyed":null,"notCreated":{"a":{"type":"forbidden"},"b":{"type":"forbidden"},"c":{"type":"forbidden"},"d":{"type":"forbidden"}},"notUpdated":null,"notDestroyed":null}"#);
+    }
+    #[test]
+    fn push_scans_deep_reference_chains_and_split_utf8_without_retaining_subtrees() {
+        let mut value = "{}".to_string();
+        for _ in 0..56 {
+            value = format!(r#"{{"nested":{value}}}"#);
+        }
+        let mut calls = vec![format!(r#"["Core/echo",{{"c":{value}}},"s0"]"#)];
+        for n in 1..15 {
+            calls.push(format!(r##"["Core/echo",{{"#c":{{"resultOf":"s{}","name":"Core/echo","path":""}}}},"s{n}"]"##, n-1));
+        }
+        calls.push(r##"["PushSubscription/set",{"#create":{"resultOf":"s14","name":"Core/echo","path":""}},"push"]"##.into());
+        let replies = execute_with_limits(
+            &batch(&format!("[{}]", calls.join(","))),
+            90,
+            None,
+            None,
+            Limits {
+                json_depth: 64,
+                json_methods: 16,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(replies.len(), 16);
+        assert_eq!(replies[15].0, "PushSubscription/set");
+        assert!(std::str::from_utf8(&replies[15].1)
+            .unwrap()
+            .contains(r#""c":{"type":"forbidden"}"#));
+        for padding in 4050..4100 {
+            let call = format!(
+                r#"[["PushSubscription/set",{{"create":{{"c":{{"{}é":"é"}}}}}},"p"]]"#,
+                "x".repeat(padding)
+            );
+            let replies = execute(&batch(&call), 90);
+            assert_eq!(replies[0].0, "PushSubscription/set");
+        }
+    }
+    #[test]
+    fn push_set_accepts_the_exact_aggregate_limit() {
+        let calls = r#"[["PushSubscription/set",{"create":{"c":{}},"update":{"u":{}},"destroy":["d"]},"p"]]"#;
+        let replies = execute_with_limits(
+            &batch(calls),
+            90,
+            None,
+            None,
+            Limits {
+                objects_per_method: 3,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(replies[0].0, "PushSubscription/set");
+    }
+    #[test]
+    fn push_output_capacity_rolls_back_provisional_results_and_runs_later_calls() {
+        let ids = (0..165)
+            .map(|n| format!("\"{n:06}{}\"", "x".repeat(194)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = batch(&format!(
+            r#"[["PushSubscription/get",{{"ids":[{ids}]}},"p"],["Core/echo",{{"ok":true}},"after"]]"#
+        ));
+        let replies = execute(&input, 90);
+        assert_eq!(
+            replies[0].1,
+            br#"{"type":"serverFail","description":"responseCapacity"}"#
+        );
+        assert_eq!(replies[1].1, br#"{"ok":true}"#);
     }
 }

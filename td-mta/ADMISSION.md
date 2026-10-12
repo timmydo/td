@@ -838,9 +838,31 @@ or completed stream. Before output, dropping an encoder leaves the same owned
 file and budget. Dropping Completed cleans up that file. Into-request recovery releases retention and returns the
 original arenas. Only side-effect-free handlers currently run: any future
 creating method must first supply the final creation-ID overlay to framing.
-PushSubscription handlers, HTTP worker handoff and
-authenticated discovery remain unimplemented.
+HTTP worker handoff and authenticated discovery remain unimplemented.
 No Core capability or API endpoint is advertised by this adapter.
+
+The worker also implements the empty-registration PushSubscription policy.
+Both methods require Core in using and run after result-reference resolution.
+Get accepts nullable ids/properties, defaults to the nonsensitive properties,
+returns no accountId/state, deduplicates requested absent generic IDs, and
+refuses explicit url/keys with forbidden. Set accepts only create/update/
+destroy, has no accountId/ifInState or response state fields, rejects every
+creation with forbidden, and reports absent updates/destroys as notFound.
+No URL is contacted and no credential registration or creation-ID entry is
+created. Generic IDs exclude unresolved creation-reference spellings.
+Multiple simultaneous invalid arguments have no promised error precedence.
+Invalid argument shapes and unknown properties remain method errors.
+The objects-per-method limit travels in the validated request's envelope:
+get counts all requested IDs and set counts the sum of create/update/destroy.
+
+Push arguments are normalized into a published, private JSON value after
+reference resolution, then inspected with the shared structural scanner.
+Only direct-child descriptors and bounded decoded names are retained;
+nested create/update values are scanned without materializing their trees.
+A resolved argument need not fit the original request arena. Normalized
+arguments, reference expansions and final results all consume the same
+optional retained-byte ceiling. A late validation failure leaves previously
+published private arguments charged and rolls back only provisional output.
 
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument

@@ -238,6 +238,20 @@ encoded-header adapters or combined service RSS.
   may coalesce successful fragments before transport. Exhaustion after headers
   requires aborting the exchange. Runtime peak RSS and largest accepted
   chain qualification remain pending.
+  Each Push policy walker holds a 4096-byte input window, fixed scanner
+  state and one 256-byte decoded direct-child key. Up to two walkers and
+  five saved direct-child descriptors may coexist. Individual ID/property strings use
+  at most 1538 raw bytes and one shared arena token; accepted IDs are ASCII
+  and at most 255 bytes. Requested absent IDs retain at most the configured
+  object count of names (256 bytes plus one usize each) for deduplication,
+  with one fallible reservation before scanning the list. Each name comparison is
+  charged; the bounded linear duplicate scan may use quadratic record work.
+  The normal configured method object limit, not source JSON size, bounds
+  this metadata. Scanning large nested create/update bodies retains no tree.
+  A normalized argument object is another charged private file extent, so
+  Push can retain expansions, normalized inputs and final policy output
+  simultaneously. This adds no disk allowance or response reservation.
+
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.
