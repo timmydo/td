@@ -7713,3 +7713,28 @@ how tree-query semantics are bound to state, since the standard queryChanges
 arguments do not carry the tree flags; the current tokens claim no such delta
 reconstruction. Refusal allocates the fixed query workspace and bounded filter
 frames, not a result array sized to query_page or json_tokens.
+
+## Passive Email property recognition
+
+email_property::Cursor recognizes one immutable decoded Email property key.
+The existing shared header-property cursor owns all convenience aliases,
+parameterized header grammar, field/form restrictions and requested spelling.
+The Email wrapper adds the fifteen standard fixed fields, distinguishing
+unknown names from malformed or forbidden header forms. It allocates no
+storage and borrows any recognized header spelling from the original key.
+
+Header recognition yields under its existing per-turn bounds; one subsequent
+fixed-table turn charges at most 256 candidate bytes and 32 records before
+comparisons (currently 125 bytes and 15 records). The caller must supply one
+original meter across all turns; this passive cursor does not bind its identity.
+Failure is sticky even
+if supplied another meter. Completed recognition is passive cached metadata,
+not a fresh deadline, authorization or projection proof. Request defaults,
+property aggregation, Email/get dispatch and actual values remain separate;
+this recognizer activates no Mail capability or partial Email/get method.
+
+The consumer must keep decoded keys in separate immutable request-owned storage
+that outlives borrowed cursors and returned header properties. It must not
+rebuild a cursor to renew exhausted work. Unknown names and malformed/forbidden
+header forms map to invalidArguments at Email/get admission; work refusal keeps
+its resource classification and must never become invalidArguments.

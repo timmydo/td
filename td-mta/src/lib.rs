@@ -10,6 +10,7 @@ pub mod body_value;
 pub mod bounded;
 pub mod clock;
 pub mod config;
+pub mod email_property;
 pub use td_mime::encoded_word;
 pub mod external_sort;
 pub mod filter_logic;
