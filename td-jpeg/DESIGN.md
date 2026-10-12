@@ -1,11 +1,12 @@
 # td-jpeg
 
 A bounded baseline JPEG decoder, std only, held to an independent
-oracle's hashes rather than a tolerance. td-photo decodes its camera's
-embedded previews with it (`td-photo/DESIGN.md`, "Embedded previews"),
-and its export encoder shares the decoder's basis and zigzag order. It
-is a crate of its own so td-agent can show the images a conversation
-holds. Nothing here reads a file, the environment or a clock.
+oracle's hashes rather than a tolerance, and the baseline encoder that
+shares its basis and zigzag order. td-photo decodes its camera's
+embedded previews with it (`td-photo/DESIGN.md`, "Embedded previews")
+and exports through the encoder; td-agent shows the pictures a
+conversation holds with the decoder. Nothing here reads a file, the
+environment or a clock, or starts a thread.
 
 ## Public surface
 
@@ -22,8 +23,10 @@ holds. Nothing here reads a file, the environment or a clock.
 - `Error`, each refusal by name.
 - The bounds: `MAX_AXIS` (16384), `MAX_IMAGE_PIXELS` (64 Mi),
   `MAX_PREVIEW_SAMPLES` (128 Mi) and `MAX_TABLE_DEFINITIONS` (32).
-- `T8` and `ZIGZAG`, the 8-point basis and the zigzag order, for an
-  encoder that must share the decoder's transform exactly.
+- `Encoder` (`new(width, height, quality)`, `encode_rows(rows, runner)`,
+  `take`, `finish(runner)`) and `EncodeError`, each refusal by name.
+- `Runner`, what runs the encoder's independent pieces, and `InOrder`,
+  which runs them in turn on the caller's thread.
 
 ## The decoder
 
@@ -68,6 +71,34 @@ common on the web, are refused by name rather than decoded; CMYK and
 YCCK (four components) are refused; application segments are skipped,
 so an EXIF orientation is not applied and an Adobe transform not read.
 
+## The encoder
+
+`Encoder` is baseline: JFIF, YCbCr 4:4:4 (one block per component per
+MCU, so a band of eight rows is a row of MCUs and the right edge and
+bottom pad by replicating the last column and row), the T.81 Annex K
+quantisation tables scaled at the caller's quality the way every encoder
+since IJG scales them (`5000 / q` below 50, `200 - 2q` from 50 up,
+entries held to 1..=255) and the Annex K.3 Huffman tables, written into
+the stream, no restart intervals. The colour transform is the JFIF one
+the decoder inverts; the forward transform is the decoder's basis
+transposed, in `f32`, rows then columns; coefficients are held to the
+categories the tables carry (the DC to -1024..=1023, each AC to
+-1023..=1023), and a symbol no table carries would be refused rather
+than coded as a bare run of bits; the last byte is padded with ones. It
+is fed rows in any number at a time and drained of bytes as they are
+made, so a frame of any size is coded a band at a time; the transform
+and quantisation of a band run as a `Runner`'s pieces (`InOrder` on the
+caller's thread, or a pool the caller owns: td-jpeg starts no thread),
+the entropy coding is sequential, and the bytes are the same whatever
+the band or thread count. The decoder is its oracle: a ramp at quality
+92 round-trips within 12 of every 8-bit value and noise at quality 100
+within the colour transform's rounding, a grey frame stays exactly grey,
+a black frame at quality 100 (the largest DC category through coder and
+decoder) exactly black, and the standard tables are pinned complete
+(every baseline DC category and AC run/size once) with no code of all
+ones, which is what the decoder refuses; the clamp is pinned by a unit
+test over `forward`.
+
 ## Test contract
 
 `tests/decode.rs` carries a synthetic baseline JPEG writer (fixed
@@ -89,12 +120,22 @@ out-of-sequence restart marker and an unread byte before one, a code no
 table holds, a reserved AC symbol, a predictor past 16 bits, a run or a
 ZRL past the block, and anything but EOI after the scan).
 
+`tests/encode.rs` holds the encoder to the decoder: the round trips
+above over sizes from 1x1 to ones that are no multiple of a block, a
+smooth frame a small fraction of its raw bytes, the stream fed in bands
+of any size and run on one thread or a pool of up to sixteen equal to
+the stream fed whole in order, each refusal by name (an axis of zero or
+past `MAX_AXIS`, rows not the width, rows past the height, a finish
+short of it), and the segments before the scan by their bytes. Its unit
+tests pin the standard tables complete and prefix-free, the quality
+scaling at its ends, the clamp, and the magnitude coding.
+
 `tests/buffer.rs` holds `Rgb8` to its bounds: no zero axis, none past
 `MAX_AXIS`, no frame past `MAX_IMAGE_PIXELS` (`MAX_AXIS` squared is
 refused), and `is_consistent` and `pixel` refusing a buffer whose public
 fields disagree, overflow or are out of range.
 
-`tests/confinement.rs` pins one pure source file that opens nothing, a
-manifest of no dependencies, the bounds above, and the fixture (its
-length and markers) and the hashes its README records, and the oracle's
-contract stated in `src/lib.rs`.
+`tests/confinement.rs` pins one pure source file that opens nothing and
+names no thread, a manifest of no dependencies, the bounds above, and
+the fixture (its length and markers) and the hashes its README records,
+and the oracle's contract stated in `src/lib.rs`.

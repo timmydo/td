@@ -46,10 +46,16 @@ fn one_pure_source_file_that_opens_nothing() {
     ] {
         assert!(!text.contains(word), "lib.rs names {word}");
     }
-    let tests: BTreeSet<String> = ["buffer.rs", "confinement.rs", "decode.rs", "fixtures"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let tests: BTreeSet<String> = [
+        "buffer.rs",
+        "confinement.rs",
+        "decode.rs",
+        "encode.rs",
+        "fixtures",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     assert_eq!(names("tests"), tests);
     let fixtures: BTreeSet<String> = ["README.md", "jpeg_ref.py", "z8-thumb.jpg"]
         .iter()

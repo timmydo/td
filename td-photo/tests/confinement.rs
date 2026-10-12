@@ -419,7 +419,8 @@ fn budgets_are_the_documented_values() {
     assert_eq!(main.matches("fn export(path: &Path").count(), 1);
     assert_eq!(main.matches("fn export_file(").count(), 1);
     assert!(main.contains("develop::export_band("));
-    assert!(main.contains("jpeg::Encoder::new("));
+    assert!(main.contains("td_jpeg::Encoder::new("));
+    assert!(main.contains("jpeg::Bands(threads)"));
     // The window's export is the verb's runner on a pool thread, queued by
     // the session and handed over each turn; no decode on the turn thread.
     assert!(window.contains("crate::export_file("));

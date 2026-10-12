@@ -4,7 +4,8 @@
 //! container, `nef` the Nikon layout and codec over it, `camera` is the table
 //! of supported bodies, `color` the linear colour math and transfer, `develop`
 //! the demosaic, resampler and pipeline, `jpeg` the thumbnail rule over
-//! td-jpeg's preview decoder and the export encoder, `image` the PPM reader
+//! td-jpeg's preview decoder and the pool td-jpeg's encoder runs on for
+//! export, `image` the PPM reader
 //! and writer and the shrinker over td-jpeg's RGB buffer,
 //! `library` the sidecar grammar, roll rules and dating rule, `look` the look
 //! format with its built-in set, `auto` the auto exposure and contrast rule,

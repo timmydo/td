@@ -3,7 +3,7 @@
 //! specification (version 1.0.0 with errata) reads it back, so any
 //! decoder reconstructs exactly the picture the encoder reconstructs for
 //! itself. The stream is a sequence header OBU and a frame OBU; `avif`
-//! wraps them. Fed rows like `jpeg::Encoder`, a superblock row at a time.
+//! wraps them. Fed rows like `td_jpeg::Encoder`, a superblock row at a time.
 //!
 //! What the encoder uses of AV1: 64x64 superblocks coded whole or split down to
 //! square blocks of 32, 16, 8 and 4 pixels and the halves of a 32, a 16 or an 8

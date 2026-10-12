@@ -23,7 +23,7 @@ pub const FULL: &str = "full";
 /// The file an export is written as.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Format {
-    /// Baseline JPEG, `jpeg::Encoder`.
+    /// Baseline JPEG, `td_jpeg::Encoder`.
     #[default]
     Jpeg,
     /// AVIF, `av1::Encoder` in `avif`'s container.

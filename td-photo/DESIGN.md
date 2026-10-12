@@ -31,7 +31,8 @@ superpixel demosaic, area resampler and headless development pipeline
 with the look in it, and the full-resolution bilinear demosaic export
 runs in row bands (`develop`), the PPM writer and reader over td-jpeg's
 RGB buffer (`image`), the thumbnail rule over td-jpeg's preview decoder
-and the baseline encoder export writes through (`jpeg`), the AV1
+and the pool td-jpeg's baseline encoder spreads its transform over as
+export writes through it (`jpeg`), the AV1
 still-picture encoder (`av1` over `transform`, `cdf`, `deblock` and
 `cdef`) and the AVIF container (`avif`) export writes through instead
 when asked, the thumbnail rule and the thumbnail cache, the library's
@@ -92,8 +93,8 @@ unbounded read.
 Production code has no `unwrap`, `expect`, panics or panicking indexing;
 the crate root forbids `unsafe`, and its confinement tests pin that
 td-ui, td-civil (the calendar the EXIF date is checked against) and
-td-jpeg (the preview decoder) are its only dependencies and which files
-name which of td-ui's modules.
+td-jpeg (the preview decoder and the export encoder) are its only
+dependencies and which files name which of td-ui's modules.
 
 ## Workflow
 
@@ -1104,9 +1105,9 @@ camera pins them.
 
 The previews decode through td-jpeg (`td-jpeg/DESIGN.md`), a baseline
 decoder with reduced-transform scaling held to an independent oracle's
-hashes; td-photo's `jpeg` module holds the thumbnail rule over it and
-the export encoder, which shares the decoder's basis and zigzag order
-(`td_jpeg::T8`, `td_jpeg::ZIGZAG`).
+hashes; td-photo's `jpeg` module holds the thumbnail rule over it, the
+export quality, and the pool its baseline encoder, td-jpeg's too, runs
+on.
 
 The thumbnail rule: for a long edge N, take the smallest preview whose
 long edge covers N (else the largest), decode it at the coarsest covering
@@ -1344,30 +1345,14 @@ scaled like `superpixel`, a level 1 at full resolution, and a region of it
 is that window of the whole, read at the sensor's CFA phase, not the
 crop's. A better full-resolution demosaic is a later increment.
 
-The encoder (`jpeg::Encoder`) is baseline: JFIF, YCbCr 4:4:4 (one block
-per component per MCU, so a band of eight rows is a row of MCUs and the
-right edge and bottom pad by replicating the last column and row), the
-T.81 Annex K quantisation tables scaled at the settings' quality
-(`QUALITY`, 92, at first) the way every encoder since IJG scales them
-(`5000 / q` below 50, `200 - 2q` from 50 up, entries held to 1..=255)
-and the Annex K.3 Huffman tables, written into the stream, no restart
-intervals. The colour transform is the JFIF one the
-decoder inverts; the forward transform is the decoder's `T8` basis
-transposed, in `f32`, rows then columns; coefficients are held to the
-categories the tables carry (the DC to -1024..=1023, each AC to
--1023..=1023), and a symbol no table carries would be refused rather than
-coded as a bare run of bits; the last byte is padded with ones. It is fed
-rows in any number at a time and drained of bytes as they are made, so the
-stream is written as the frame is developed; the transform and
-quantisation of a band run across the pool through `develop::bands`, the
-entropy coding is sequential, and the bytes are the same whatever the band
-or thread count. The decoder is its oracle: a ramp at `QUALITY` round-trips
-within 12 of every 8-bit value and noise at quality 100 within the colour
-transform's rounding, a grey frame stays exactly grey, a black frame at
-quality 100 (the largest DC category through coder and decoder) exactly
-black, and the standard tables are pinned complete (every baseline DC
-category and AC run/size once) with no code of all ones, which is what the
-decoder refuses; the clamp is pinned by a unit test over `forward`.
+The encoder is td-jpeg's (`td_jpeg::Encoder`, `td-jpeg/DESIGN.md`, "The
+encoder"), at the settings' quality (`jpeg::QUALITY`, 92, at first). It
+is fed the developed rows as they come and drained of bytes as they are
+made, so the stream is written as the frame is developed; its transform
+and quantisation of a band run across the pool as `jpeg::Bands`, a
+`td_jpeg::Runner` over `develop::bands`, and the bytes are the same
+whatever the band or thread count, which `tests/jpeg.rs` pins against
+the encoder run on the caller's thread alone.
 
 The AVIF export codes the frame with the crate's own AV1 encoder
 (`av1::Encoder`, over `transform`, `cdf`, `deblock` and `cdef`), pure
@@ -2093,15 +2078,11 @@ and cropped, the same choice again no step, undone step by step, and a sidecar
 the reader refuses refusing the measure with the file kept.
 
 `tests/jpeg.rs` pins the thumbnail rule by value over td-jpeg's Z 8
-thumbnail fixture, and the encoder against the decoder (Export, above):
-ramps of every partial-block shape at `QUALITY` and noise at quality 100
-round-tripping within their tolerances, a grey frame staying grey, the
-stream compressing, the bytes identical however the rows are fed and on
-any thread count, the axes and rows refused by name, and the headers
-held to their literal bytes (the frame and scan segments whole, each
-table's counts, the luma quantiser's first zigzag entries and the
-chroma's last at `QUALITY`); the standard tables' completeness is an
-inline unit test in `jpeg`.
+thumbnail fixture, the PPM format, and the export's pool: td-jpeg's
+encoder over `Bands` gives the bytes it codes on the caller's thread
+alone (`td_jpeg::InOrder`), however the rows are fed and on any thread
+count. The encoder's own contract is td-jpeg's (`td-jpeg/DESIGN.md`,
+"Test contract").
 
 `tests/av1.rs` pins the AV1 encoder: the geometry by value (the mode-info
 and superblock grids, the tile columns the width needs and the rows
@@ -2625,7 +2606,8 @@ preflight. A td-photo, td-ui or td-compositor edit selects this check in
    press off the names, or on a surface too small for the box, picks nothing.
    Landed. The live scaled preview under the marquee remains a later slice.
 6. Export, in landings. (a) The banded full-resolution bilinear demosaic
-   and the export geometry in `develop`, the JPEG encoder in `jpeg`, the
+   and the export geometry in `develop`, the JPEG encoder in `jpeg`
+   (since moved to td-jpeg), the
    `exported/` naming, and `td-photo export FILE` headless. Landed. (b) The
    `export` action in the window: the `Export` pool job over the raw cache,
    running the verb's runner off the turn thread, its outcome the status

@@ -378,18 +378,17 @@ fn preview_develop_zooms_the_box_to_the_centre_at_100() {
 }
 
 /// A flat baseline JPEG of one colour, `width` by `height`, through the
-/// crate's own encoder.
+/// encoder td-photo exports with, td-jpeg's.
 fn flat_jpeg(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
-    let mut encoder =
-        td_photo::jpeg::Encoder::new(width, height, td_photo::jpeg::QUALITY, 1).unwrap();
+    let mut encoder = td_jpeg::Encoder::new(width, height, td_photo::jpeg::QUALITY).unwrap();
     let rows: Vec<u8> = rgb
         .iter()
         .copied()
         .cycle()
         .take(width * height * 3)
         .collect();
-    encoder.encode_rows(&rows).unwrap();
-    encoder.finish().unwrap()
+    encoder.encode_rows(&rows, &td_jpeg::InOrder).unwrap();
+    encoder.finish(&td_jpeg::InOrder).unwrap()
 }
 
 #[test]

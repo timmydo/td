@@ -647,12 +647,11 @@ fn bench() {
     }
 }
 
-/// AVIF against the crate's JPEG encoder over the camera thumbnail
+/// AVIF against the JPEG encoder export uses, td-jpeg's, over the camera thumbnail
 /// fixture, at matched qualities: bytes and luma PSNR.
 #[test]
 #[ignore]
 fn compare_with_jpeg() {
-    use td_photo::jpeg;
     let data = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../td-jpeg/tests/fixtures/z8-thumb.jpg"
@@ -667,9 +666,9 @@ fn compare_with_jpeg() {
         encoder.encode_rows(&source.data).unwrap();
         let (obus, reconstruction) = encoder.finish_with().unwrap();
         let avif_psnr = luma_psnr(&source.data, &reconstruction.unwrap());
-        let mut je = jpeg::Encoder::new(w, h, quality, 1).unwrap();
-        je.encode_rows(&source.data).unwrap();
-        let jpg = je.finish().unwrap();
+        let mut je = td_jpeg::Encoder::new(w, h, quality).unwrap();
+        je.encode_rows(&source.data, &td_jpeg::InOrder).unwrap();
+        let jpg = je.finish(&td_jpeg::InOrder).unwrap();
         let back = td_jpeg::decode(&jpg, td_jpeg::Scale::Full).unwrap();
         let mut sse = 0f64;
         for (a, b) in source

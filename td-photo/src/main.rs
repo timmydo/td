@@ -1225,7 +1225,7 @@ fn export_settings(rest: &[OsString]) -> Result<Settings, String> {
 /// nothing until the end, since its container names the stream's
 /// length), and closed for the tail.
 enum Output {
-    Jpeg(Box<jpeg::Encoder>),
+    Jpeg(Box<td_jpeg::Encoder>, jpeg::Bands),
     Avif(Box<av1::Encoder>),
 }
 
@@ -1237,10 +1237,13 @@ impl Output {
         threads: usize,
     ) -> Result<Output, String> {
         Ok(match settings.format {
-            Format::Jpeg => Output::Jpeg(Box::new(
-                jpeg::Encoder::new(width, height, settings.quality, threads)
-                    .map_err(|e| e.to_string())?,
-            )),
+            Format::Jpeg => Output::Jpeg(
+                Box::new(
+                    td_jpeg::Encoder::new(width, height, settings.quality)
+                        .map_err(|e| e.to_string())?,
+                ),
+                jpeg::Bands(threads),
+            ),
             Format::Avif => Output::Avif(Box::new(
                 av1::Encoder::new(width, height, settings.quality, threads)
                     .map_err(|e| e.to_string())?,
@@ -1250,21 +1253,23 @@ impl Output {
 
     fn encode_rows(&mut self, rows: &[u8]) -> Result<(), String> {
         match self {
-            Output::Jpeg(encoder) => encoder.encode_rows(rows).map_err(|e| e.to_string()),
+            Output::Jpeg(encoder, bands) => {
+                encoder.encode_rows(rows, bands).map_err(|e| e.to_string())
+            }
             Output::Avif(encoder) => encoder.encode_rows(rows).map_err(|e| e.to_string()),
         }
     }
 
     fn take(&mut self) -> Vec<u8> {
         match self {
-            Output::Jpeg(encoder) => encoder.take(),
+            Output::Jpeg(encoder, _) => encoder.take(),
             Output::Avif(_) => Vec::new(),
         }
     }
 
     fn finish(self) -> Result<Vec<u8>, String> {
         match self {
-            Output::Jpeg(encoder) => encoder.finish().map_err(|e| e.to_string()),
+            Output::Jpeg(encoder, bands) => encoder.finish(&bands).map_err(|e| e.to_string()),
             Output::Avif(encoder) => {
                 let geometry = encoder.geometry().clone();
                 let obus = encoder.finish().map_err(|e| e.to_string())?;
