@@ -8130,3 +8130,40 @@ meter, never renewed admission. Both owners fit 160 bytes by compile-time
 bounds. No source identity, part descriptor or publication authority follows
 from delimiter offsets. Native reads, short-source refusal and complete
 streaming tree traversal remain separate service composition.
+
+## Native blob delimiter reads
+
+mime_delimiter::Scanner is the shared composable form with an owned
+boundary and an original-Meter owner label. new(base, length, boundary,
+now, work) checks the range/length bound, checks admission and acquires
+the owner label before funding one bounded boundary copy: one record and
+boundary.len() I/O bytes, at most 70. The first poll
+still performs charged grammar validation. poll(input, now, work),
+check_deadline and consuming finish reject replacement meters, even with
+matching limits or after Complete, and retain sticky refusal. Moving the
+original Meter preserves its identity. Scanner has a 192-byte compiled
+ceiling; it provides no native-source or account authority.
+
+blob_delimiters::Cursor retains one verified PinnedBlob, the original
+Meter, that scanner and caller-provided reusable input backing. new takes
+an already-authorized raw extent within the pinned blob, a selected boundary,
+backing and real current Tick. Nonempty extents require nonempty backing;
+empty extents need none. The boundary is copied under original admission.
+Each poll does one native read of at most 4096 bytes or one shared scanner
+turn of at most 128 body bytes. It never combines a read with scanning.
+Read turns fund the requested I/O bytes and one record before native I/O;
+short reads advance only by actual bytes, and zero/oversized reads refuse.
+Scanner turns retain the existing two-visit-per-body-byte cost. No source
+bytes outside the extent are read, and consumed input backing is reused.
+
+Every poll freshly checks the retained native snapshot/clock and original
+work before and after the operation, including cached Complete. Post-turn
+admission failure takes precedence, withholds that turn's event and retires
+the cursor. All prior events remain provisional. finish freshly checks both
+domains and requires complete extent scanning; it grants no descriptor or
+publication authority. Callers supply the actual current Tick and retain
+the original snapshot through enclosing traversal/publication. Adjacent
+child extents still need the delimiter preceding_end clamp. The inline
+native owner fits 512 bytes; its caller backing and native connection remain
+separate reservations. Complete MIME traversal and Email/get integration
+remain separate; this path adds no whole-body buffering.

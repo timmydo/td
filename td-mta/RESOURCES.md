@@ -1216,6 +1216,17 @@ including bytes past the extent, exact I/O and record cuts, CR handling
 and original-meter handoff. Worker/source buffers need separate
 reservations; this is not native stack or RSS qualification.
 
+The composable delimiter Scanner fits 192 bytes and copies at most 70
+selected-boundary bytes under one funded record and one visit per byte.
+Its owner label binds later turns to the original Meter across moves.
+The native blob_delimiters owner fits 512 bytes, including that scanner;
+caller input backing and the retained native snapshot are separate. Each
+native turn reads at most 4096 bytes or scans at most 128 body bytes, never
+both. Reads charge their requested bytes and one record; scanner turns
+charge their existing costs. No heap allocation occurs in the adapters by
+inspection; this is not a native-allocation, stack or RSS measurement.
+The existing resident traversal's layout and reservations are unchanged.
+
 M06ce's private protocol Reader, delimiter Core and metadata context poll
 replace their former inline mechanisms. Public cursor bounds and original
 per-turn charging are unchanged. Detached shared delimiter State fits eight

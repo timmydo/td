@@ -85,3 +85,14 @@ ordering, native reads and EOF/truncation detection belong to the caller.
 Delimiter preceding_end excludes the previous line ending and can precede
 an empty child's start when delimiters are adjacent. Child owners clamp
 that offset to their own start before constructing a child extent.
+
+The composable delimiter Scanner owns its bounded boundary bytes and binds
+to the original Meter's move-stable owner label. Construction funds the
+boundary copy (one record and one I/O visit per byte); normal validation
+and scanning retain their existing costs. Every poll, deadline check and
+finish verifies the same meter, including after Complete. A replacement
+meter retires the scanner before debiting its counters; owner-label
+exhaustion refuses construction. This owner binding does not authenticate
+source bytes: the caller retains source identity, extent and fragment order.
+The borrowed Stream and resident Cursor keep their existing costs and
+passive cached-completion behavior.

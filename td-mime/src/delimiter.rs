@@ -1,7 +1,7 @@
 //! Bounded raw-line delimiter scanning; entity/source authority is external.
 use crate::{
     time::Tick,
-    work::{Charge, Meter, Stop},
+    work::{Charge, Meter, Owner, Stop},
 };
 use td_header::{
     mime_boundary::{State, MAX_BOUNDARY_BYTES},
@@ -27,6 +27,7 @@ pub enum Error {
     InvalidBoundary,
     InvalidRange,
     InvalidState,
+    InvalidOwner,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +36,7 @@ impl std::fmt::Display for Error {
             Self::InvalidBoundary => "invalid MIME boundary",
             Self::InvalidRange => "invalid MIME delimiter source range",
             Self::InvalidState => "invalid MIME delimiter state",
+            Self::InvalidOwner => "MIME delimiter work owner mismatch",
         })
     }
 }
@@ -141,6 +143,85 @@ impl<'a, 'w> Stream<'a, 'w> {
         Ok(self.work)
     }
 }
+
+/// Composable scanner with an owned boundary and a move-stable work binding.
+/// Caller retains the original meter, immutable source and contiguous fragments.
+/// No copied progress, boundary replacement or fresh meter can renew admission.
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::delimiter::Scanner>();
+/// ```
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::delimiter::Scanner>();
+/// ```
+pub struct Scanner {
+    state: Scan,
+    length: u64,
+    boundary: [u8; MAX_BOUNDARY_BYTES],
+    boundary_len: usize,
+    owner: Owner,
+}
+impl Scanner {
+    pub fn new(
+        base: u64,
+        length: u64,
+        boundary: &[u8],
+        now: Tick,
+        work: &mut Meter,
+    ) -> Result<Self, Error> {
+        let state = Scan::new(base, length, boundary.len())?;
+        work.charge(now, Charge::default()).map_err(Error::Work)?;
+        let owner = work.owner().ok_or(Error::InvalidOwner)?;
+        work.charge(
+            now,
+            Charge {
+                io_bytes: boundary.len() as u64,
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(Error::Work)?;
+        let mut retained = [0; MAX_BOUNDARY_BYTES];
+        retained
+            .get_mut(..boundary.len())
+            .ok_or(Error::InvalidBoundary)?
+            .copy_from_slice(boundary);
+        Ok(Self {
+            state,
+            length,
+            boundary: retained,
+            boundary_len: boundary.len(),
+            owner,
+        })
+    }
+    pub fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+        if let Some(error) = self.state.failure {
+            return Err(error);
+        }
+        if work.owner() != Some(self.owner) {
+            return self.state.outcome(Err(Error::InvalidOwner));
+        }
+        self.state.check_deadline(now, work)
+    }
+    pub fn poll(&mut self, input: &[u8], now: Tick, work: &mut Meter) -> Result<Progress, Error> {
+        self.check_deadline(now, work)?;
+        let result = (|| {
+            let boundary = self
+                .boundary
+                .get(..self.boundary_len)
+                .ok_or(Error::InvalidState)?;
+            self.state.poll(input, self.length, now, work, boundary)
+        })();
+        self.state.outcome(result)
+    }
+    pub fn finish(mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+        self.check_deadline(now, work)?;
+        if !self.state.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok(())
+    }
+}
+const _: () = assert!(std::mem::size_of::<Scanner>() <= 192);
 
 /// Private resident adapter; source and original admission stay with its owner.
 pub(crate) struct Core<'a> {
@@ -863,5 +944,127 @@ mod tests {
         let mut stream = Stream::new(0, 0, b"bad ", &mut work).unwrap();
         assert_eq!(stream.poll(&[], Tick(1)), Err(Error::InvalidBoundary));
         assert_eq!(stream.poll(&[], Tick(1)), Err(Error::InvalidBoundary));
+    }
+    #[test]
+    fn owned_scanner_keeps_boundary_and_original_meter_across_moves() {
+        let mut work = meter();
+        let before = work.remaining();
+        let mut boundary = *b"b";
+        let mut scanner = Scanner::new(7, 9, &boundary, Tick(1), &mut work).unwrap();
+        boundary.fill(b'x');
+        assert_eq!(before.io_bytes - work.remaining().io_bytes, 1);
+        assert_eq!(before.records - work.remaining().records, 1);
+        let mut moved = work;
+        let source = b"--b\n--b--";
+        let mut position = 0;
+        let mut events = Vec::new();
+        loop {
+            let end = source.len().min(position + 1);
+            let step = scanner
+                .poll(source.get(position..end).unwrap(), Tick(1), &mut moved)
+                .unwrap();
+            position += step.consumed;
+            match step.status {
+                StreamStatus::Delimiter(value) => events.push(value),
+                StreamStatus::Complete => break,
+                _ => {}
+            }
+        }
+        assert_eq!(events, reference(source, 7, b"b"));
+        scanner.finish(Tick(1), &mut moved).unwrap();
+        assert_eq!(
+            before.io_bytes - moved.remaining().io_bytes,
+            2 + 2 * source.len() as u64
+        );
+    }
+    #[test]
+    fn owned_scanner_rejects_replacement_work_even_after_complete() {
+        for complete in [false, true] {
+            let mut original = meter();
+            let mut scanner = Scanner::new(0, 0, b"b", Tick(1), &mut original).unwrap();
+            if complete {
+                assert_eq!(
+                    scanner.poll(b"", Tick(1), &mut original).unwrap().status,
+                    StreamStatus::Yield
+                );
+                assert_eq!(
+                    scanner.poll(b"", Tick(1), &mut original).unwrap().status,
+                    StreamStatus::Complete
+                );
+            }
+            let before = original.remaining();
+            let mut replacement = meter();
+            let replacement_before = replacement.remaining();
+            assert_eq!(
+                scanner.poll(b"", Tick(1), &mut replacement),
+                Err(Error::InvalidOwner)
+            );
+            assert_eq!(replacement.remaining(), replacement_before);
+            assert_eq!(original.remaining(), before);
+            assert_eq!(
+                scanner.poll(b"", Tick(1), &mut original),
+                Err(Error::InvalidOwner)
+            );
+            assert_eq!(
+                scanner.finish(Tick(1), &mut original),
+                Err(Error::InvalidOwner)
+            );
+        }
+        for finish in [false, true] {
+            let mut work = meter();
+            let mut scanner = Scanner::new(0, 0, b"b", Tick(1), &mut work).unwrap();
+            scanner.poll(b"", Tick(1), &mut work).unwrap();
+            scanner.poll(b"", Tick(1), &mut work).unwrap();
+            let error = Error::Work(Stop::Deadline);
+            if !finish {
+                assert_eq!(scanner.poll(b"", Tick(100), &mut work), Err(error));
+            }
+            assert_eq!(scanner.finish(Tick(100), &mut work), Err(error));
+        }
+    }
+    #[test]
+    fn owned_boundary_copy_is_funded_before_retention() {
+        for records in [false, true] {
+            let mut work = Meter::new(
+                Deadline::after(Tick(0), 100).unwrap(),
+                Charge {
+                    io_bytes: if records { 100 } else { 0 },
+                    records: if records { 0 } else { 100 },
+                    ..Charge::default()
+                },
+            );
+            let stop = if records {
+                Stop::Records
+            } else {
+                Stop::IoBytes
+            };
+            assert!(
+                matches!(Scanner::new(0, 0, b"b", Tick(1), &mut work), Err(Error::Work(value)) if value == stop)
+            );
+            assert_eq!(work.stopped(), Some(stop));
+        }
+    }
+    #[test]
+    fn owned_boundary_capacity_refuses_before_debit() {
+        let mut work = meter();
+        let before = work.remaining();
+        assert!(matches!(
+            Scanner::new(0, 0, &[b'b'; 71], Tick(1), &mut work),
+            Err(Error::InvalidBoundary)
+        ));
+        assert_eq!(work.remaining(), before);
+        let mut scanner = Scanner::new(0, 0, &[b'b'; 70], Tick(1), &mut work).unwrap();
+        assert_eq!(before.io_bytes - work.remaining().io_bytes, 70);
+        assert_eq!(before.records - work.remaining().records, 1);
+        assert_eq!(
+            scanner.poll(b"", Tick(1), &mut work).unwrap().status,
+            StreamStatus::Yield
+        );
+        assert_eq!(before.io_bytes - work.remaining().io_bytes, 140);
+        assert_eq!(
+            scanner.poll(b"", Tick(1), &mut work).unwrap().status,
+            StreamStatus::Complete
+        );
+        scanner.finish(Tick(1), &mut work).unwrap();
     }
 }
