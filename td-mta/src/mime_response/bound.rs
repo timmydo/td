@@ -379,23 +379,7 @@ impl<'w> PartCursor<'_, 'w> {
         Error,
     > {
         let (metadata, work, budget, scratch) = self.finish_metadata(now)?;
-        let result = (|| {
-            let class = Class::from_headers(metadata.headers, now, work, budget)
-                .map_err(Error::Classification)?;
-            work.charge(
-                now,
-                crate::admission::work::Charge {
-                    output_bytes: NODE_EXTRA_OUTPUT,
-                    ..crate::admission::work::Charge::default()
-                },
-            )
-            .map_err(|error| Error::Classification(mime_body_lists::Error::Work(error)))?;
-            Ok(Node {
-                parent: self.part.parent,
-                depth: self.part.depth,
-                class,
-            })
-        })();
+        let result = classify(self.part, metadata.headers, now, work, budget);
         let node = self.outcome(result)?;
         *self.parent_failure = None;
         Ok((
@@ -409,6 +393,29 @@ impl<'w> PartCursor<'_, 'w> {
             scratch,
         ))
     }
+}
+/// Shared retained-node charge and classification for resident and native owners.
+pub(crate) fn classify(
+    part: Part,
+    headers: mime_part_headers::View<'_>,
+    now: Tick,
+    work: &mut Meter,
+    budget: &mut HeaderBudget,
+) -> Result<Node, Error> {
+    let class = Class::from_headers(headers, now, work, budget).map_err(Error::Classification)?;
+    work.charge(
+        now,
+        crate::admission::work::Charge {
+            output_bytes: NODE_EXTRA_OUTPUT,
+            ..crate::admission::work::Charge::default()
+        },
+    )
+    .map_err(|error| Error::Classification(mime_body_lists::Error::Work(error)))?;
+    Ok(Node {
+        parent: part.parent,
+        depth: part.depth,
+        class,
+    })
 }
 const _: () = assert!(
     std::mem::size_of::<Cursor<'_, '_>>() + std::mem::size_of::<HeaderBudget>() <= 16 * 1024

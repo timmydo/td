@@ -4447,3 +4447,20 @@ from recognized header bytes alone guarantees successful witness retention.
 A checked product of maximum part count and total source extent length is a
 conservative backing bound, but can be impractical; the enclosing job instead
 admits a fixed arena ceiling and explicitly refuses when it is insufficient.
+
+## Native retained part metadata
+
+The native part cursor and HeaderBudget fit a compiled 8 KiB ceiling, including
+the shared part-header/label/location cursor. All output windows, original
+header prefixes and normalization scratch remain caller-reserved. Parser turns
+retain their shared bounds; final classification is a fixed set of media and
+disposition comparisons and charges the same Class/Node bytes as resident
+classification. No body buffer, read, allocation or new quota is introduced.
+
+The current consuming metadata handoff ties output-window borrows to its live
+work/header/scratch lifetime. A chain of N parts therefore retains all N sets
+of six output windows; it does not permit a single window set to be recycled
+between these handoffs. N is bounded by mime_parts. The enclosing job must
+check and admit the sum of all chosen window capacities, plus cumulative
+header backing and the fixed cursor/scratch reservations. The 8 KiB owner
+ceiling is not a bound on that aggregate message storage.

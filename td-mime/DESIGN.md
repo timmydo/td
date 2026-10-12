@@ -168,3 +168,9 @@ be overwritten immediately after each turn. A complete supplied entity must
 carry Eof; a shorter definitive header prefix must carry Prefix. Header or body
 range overruns refuse as InvalidRange; inconsistent EOF labels refuse as
 IncompleteSource. These passive labels do not authenticate the source.
+
+Part-header metadata and its label/location JSON composition accept retained
+header prefixes only when selection proves the entire header section. They
+preserve the caller's Prefix/Eof label through all header replays; incomplete
+prefixes refuse during polling. No body bytes are needed for filenames, charset, content IDs,
+language or location. Whole-entity authorization remains external.

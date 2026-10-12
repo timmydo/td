@@ -8257,3 +8257,28 @@ Retained fields are passive and intentionally accessible for subsequent owner
 composition. The presence/pairing guarantee describes successful finish, not
 arbitrarily reconstructed structs. Consumers must validate supplied ordinal,
 view and descriptor correspondence and retain live source/work custody.
+
+## Native retained MIME-part metadata
+
+`blob_part::Cursor` consumes a healthy native traversal handoff and an ordinal,
+selects only that descriptor's retained immutable header view, and runs the
+shared part-header/label/location interpreter with the original Meter and
+HeaderBudget. It preserves the header prefix's truthful EOF label and uses
+its recognized header byte count as the replay ceiling. Caller-reserved windows
+hold all resulting metadata; no native body read or whole-body copy occurs.
+
+Fresh native checks bracket construction, every parser turn, cached completion
+and consuming finish. Metadata/body-start disagreement refuses, and any poll
+or explicit-check failure permanently hides passive values. Finish classifies
+the part using the same retained-node helper as the resident response owner,
+then checks the native deadline before returning metadata, the unchanged
+traversal handoff and original scratch/budget/source owners. Output and scratch
+backing remain borrowed through that handoff. The descriptors and generated
+metadata grant neither part IDs nor publication authority; subsequent workers
+must retain the live snapshot and original admission owners.
+
+Constructor rejection consumes and retires the traversal handoff for this
+interpretation operation, even for an invalid ordinal. No partially successful
+metadata or recoverable handoff is returned; the caller-owned snapshot itself
+is not destroyed. A trailing native check covers constructor validation errors
+as well as successful setup, so late native expiry takes precedence.

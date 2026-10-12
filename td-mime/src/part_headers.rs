@@ -115,6 +115,7 @@ pub struct Cursor<'a, 'w> {
     source: &'a [u8],
     base: u64,
     header_limit: u64,
+    source_end: SourceEnd,
     selector: Option<metadata::Cursor<'a>>,
     owner: Owner<'a, 'w>,
     phase: Phase,
@@ -185,13 +186,11 @@ impl<'a, 'w> Cursor<'a, 'w> {
             header_limit,
             context,
         } = entity;
-        if source_end != SourceEnd::Eof {
-            return Err(Error::Metadata(metadata::Error::Truncated));
-        }
         Ok(Self {
             source,
             base,
             header_limit,
+            source_end,
             selector: Some(
                 metadata::Cursor::new(source, base, header_limit, context, source_end)
                     .map_err(Self::metadata_error)?,
@@ -544,7 +543,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
                             label_fields::Input {
                                 source: self.source,
                                 base: self.base,
-                                source_end: SourceEnd::Eof,
+                                source_end: self.source_end,
                                 header_limit: self.header_limit,
                             },
                             work,
@@ -1009,20 +1008,26 @@ mod tests {
         let mut h = [0; 32];
         let mut c = [0; 16];
         let mut n = [0; 8];
+        let mut prefix = Cursor::new(
+            Entity {
+                source: b"Content-Type: text/plain",
+                base: 0,
+                source_end: SourceEnd::Prefix,
+                header_limit: 1024,
+                context: metadata::Context::Normal,
+            },
+            backing(&mut h, &mut c, &mut n),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            drain(&mut prefix),
+            Err(Error::Metadata(metadata::Error::Truncated))
+        );
         assert!(matches!(
-            Cursor::new(
-                Entity {
-                    source,
-                    base: 0,
-                    source_end: SourceEnd::Prefix,
-                    header_limit: 1024,
-                    context: metadata::Context::Normal
-                },
-                backing(&mut h, &mut c, &mut n),
-                &mut work,
-                &mut budget,
-                &mut scratch
-            ),
+            prefix.finish(Tick(1)),
             Err(Error::Metadata(metadata::Error::Truncated))
         ));
         let nested = format!(

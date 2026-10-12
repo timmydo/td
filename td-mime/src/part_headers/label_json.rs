@@ -1206,4 +1206,57 @@ mod tests {
         assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
         assert_eq!(work.stopped(), None);
     }
+    #[test]
+    fn retained_header_prefix_requires_definitive_boundary_and_keeps_metadata() {
+        let end = SOURCE.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let mut work = meter();
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        let mut storage = Storage::new();
+        let mut full = Cursor::new(
+            entity(SOURCE, 123),
+            storage.backing(256, 256),
+            &mut work,
+            &mut budget,
+            &mut scratch,
+        )
+        .unwrap();
+        drain(&mut full).unwrap();
+        let expected = full.finish(Tick(1)).unwrap().0;
+        for cut in 0..=SOURCE.len() {
+            let mut work = meter();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = Scratch::new();
+            let mut storage = Storage::new();
+            let mut input = entity(&SOURCE[..cut], 123);
+            input.source_end = SourceEnd::Prefix;
+            let mut cursor = Cursor::new(
+                input,
+                storage.backing(256, 256),
+                &mut work,
+                &mut budget,
+                &mut scratch,
+            )
+            .unwrap();
+            if cut < end {
+                let error = Error::Headers(super::super::Error::Metadata(
+                    crate::metadata::Error::Truncated,
+                ));
+                assert_eq!(drain(&mut cursor), Err(error));
+                assert!(cursor.value().is_none());
+                assert_eq!(cursor.poll(Tick(1)), Err(error));
+                assert_eq!(cursor.finish(Tick(1)).err(), Some(error));
+            } else {
+                drain(&mut cursor).unwrap();
+                let view = cursor.finish(Tick(1)).unwrap().0;
+                assert_eq!(view.headers, expected.headers);
+                assert_eq!(view.labels.content_id, expected.labels.content_id);
+                assert_eq!(
+                    view.labels.content_language,
+                    expected.labels.content_language
+                );
+                assert_eq!(view.location.value, expected.location.value);
+            }
+        }
+    }
 }
