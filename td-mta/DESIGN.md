@@ -1910,6 +1910,12 @@ by explicit policy using the standard method error; v1 never POSTs to a
 client-supplied callback URL. The conformance table must pin that refusal
 and the associated get/set behavior rather than silently omit Core methods.
 
+The passive Mailbox projection reads typed rows and emits every standard
+object property or a validated selection, with caller-supplied account rights
+and same-view batch counts. API.md owns its snapshot, provisional-output and
+fixed-buffer contract. It does not activate Mailbox/get or advertise Mail;
+method argument handling and retained response integration are separate.
+
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:
 

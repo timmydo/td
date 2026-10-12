@@ -7098,3 +7098,42 @@ artifacts, error semantics and the separation from SQLite authority. Existing
 ports::BlobWriter::finish still returns passive StagedBlob and requires the
 future coordinator to retain the concrete prepared owner; IngressSpool does
 not falsely implement that contract by returning metadata without its file.
+
+## Bounded Mailbox object projection
+
+`mailbox_response::encode` reads one Mailbox row from a retained
+IndexReadView and emits its selected object properties into caller storage.
+Projection::all selects all eleven standard properties; id_only selects
+just id. include accepts only exact standard property names, makes duplicate
+selection idempotent, and rejects unknown names without changing the
+selection. id is always emitted. The method argument parser will choose
+all for omitted/null properties and id_only before adding an explicit list.
+This object boundary does not parse a method, dispatch Mailbox/get, authorize
+access, or advertise Mail.
+
+The caller supplies rights from trusted account policy. All nine booleans
+are emitted when myRights is selected; this passive value confers no
+permissions. If count properties are selected for a present mailbox, the
+caller must supply counts obtained from mailbox_counts or
+mailbox_counts_many on the same retained view. The complete ViewIdentity
+and MailboxId must match, including
+account, epoch, endpoint and history floor. These public scalar counts are
+not unforgeable provenance; the trusted caller remains responsible for
+obtaining them from the storage reader. An absent mailbox returns None.
+When no count property is selected, counts need not be computed.
+
+The typed row reader checks the mailbox. Check the original snapshot again
+after bounded JSON formatting, before returning the complete output length.
+Expired or lost snapshots, mismatched counts, insufficient scratch/output,
+and selected counts outside the JMAP UnsignedInt range return errors without
+a successful length. All written bytes are provisional until success.
+The caller must discard failed output rather than publish its prefix.
+Nullable parent/role, exact sort order/subscription, JSON string escaping and
+rights values are preserved. Text uses the shared td-json string encoder.
+
+The projection allocates no growing object graph: callers provide
+format::MAX_VALUE_BYTES row scratch and up to MAX_OBJECT_BYTES (8192) output
+bytes, sufficient for every valid stored mailbox including worst-case
+escaping. Counts and rights are passive scalar metadata. This component
+adds no running worker, admission reservation or response-file publication;
+method envelopes and retained response ownership remain separate.

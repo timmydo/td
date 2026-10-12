@@ -1522,6 +1522,9 @@ pub struct IndexReadView<'s, 'r> {
     identity: ViewIdentity,
 }
 impl IndexReadView<'_, '_> {
+    pub(crate) fn check_snapshot(&mut self) -> Result<(), ports::Error> {
+        self.read_snapshot(|native| native.check())
+    }
     fn native(&self) -> Result<&Native, ports::Error> {
         self.native.as_ref().ok_or(ports::Error::WriterStopped)
     }

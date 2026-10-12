@@ -46,6 +46,7 @@ pub mod jmap_request;
 pub mod jmap_session;
 pub mod limits;
 pub mod mailbox_parents;
+pub mod mailbox_response;
 pub mod mailbox_sweep;
 pub mod metadata_sweep;
 pub use td_mime::attribute as mime_attribute;
