@@ -600,6 +600,7 @@ mod tests {
         event(
             seq,
             Kind::User {
+                pictures: Vec::new(),
                 delivery: "d".into(),
                 text: text.into(),
             },

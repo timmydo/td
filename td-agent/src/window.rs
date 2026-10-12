@@ -379,7 +379,7 @@ struct Removal {
     archive: bool,
     title: String,
     repositories: crate::workspace::Repositories,
-    held: Vec<(String, String)>,
+    held: Vec<crate::supervisor::Pending>,
     survey: Option<Receiver<Vec<crate::removal::Found>>>,
 }
 
@@ -404,19 +404,26 @@ impl Session {
                     Ok(said) => self.app.template_saved(said),
                     Err(why) => self.app.template_refused(why),
                 },
-                Request::Send(text) => self.send_message(text),
+                Request::Send(text, pictures) => self.send_message(text, pictures),
                 Request::OpenLink(url) => match td_ui::open::url(&url, None) {
                     Ok(_) => self.app.note(format!("opened {url} in the browser")),
                     Err(why) => self.app.note(format!("could not open the link: {why}")),
                 },
-                Request::Command { name, args, typed } => {
+                Request::Command {
+                    name,
+                    args,
+                    typed,
+                    pictures,
+                } => {
                     let expanded = match &self.commands {
                         Some(dir) => crate::commands::expand(dir, &name, &args, crate::protocol::MAX_TEXT),
                         None => Ok(None),
                     };
+                    // The pictures the typed command named go with what
+                    // it expands to.
                     match expanded {
-                        Ok(text) => self.send_message(text.unwrap_or(typed)),
-                        Err(why) => self.app.restore(&typed, why),
+                        Ok(text) => self.send_message(text.unwrap_or(typed), pictures),
+                        Err(why) => self.app.give_back(&typed, pictures, why),
                     }
                 }
                 Request::Commands => match self.commands.as_deref().map(crate::commands::list) {
@@ -1240,18 +1247,65 @@ impl Session {
                 }
                 _ => {}
             }
-            if self.supervisor.open_id() == Some(&id) {
+            let open = self.supervisor.open_id() == Some(&id);
+            if let (
+                true,
+                Update::Refused {
+                    text: Some(text),
+                    pictures,
+                    reason,
+                },
+            ) = (open, &update)
+            {
+                // Back in the composer with its pictures, read back from
+                // where they were staged or kept.
+                let back = crate::picture::unstage_all(&self.state, &id, pictures, |digest| {
+                    self.supervisor.stages(&id, digest)
+                });
+                self.app.give_back(text, back, format!("refused: {reason}"));
+            } else if open {
                 self.app.update(update, store::now_ms());
-            } else if let Update::Refused { text, reason } = &update {
-                // No composer of its own to go back to: said, and kept
-                // whole on standard error.
+            } else if let Update::Refused {
+                text,
+                pictures,
+                reason,
+            } = &update
+            {
+                // No composer of its own to go back to: said, its text
+                // kept whole on standard error and its pictures where
+                // they were staged.
                 let note = match text {
                     Some(text) => {
                         eprintln!(
                             "td-agent: conversation {id} refused a message ({reason}):\n{text}"
                         );
+                        let kept = if pictures.is_empty() {
+                            String::new()
+                        } else {
+                            let dir = crate::picture::staging(&self.state, &id);
+                            // One the conversation took before refusing
+                            // is where it keeps its own.
+                            let kept = crate::picture::kept(&self.state.conversation(&id));
+                            for picture in pictures {
+                                let staged = dir.join(&picture.digest);
+                                let at = if staged.exists() {
+                                    staged
+                                } else {
+                                    kept.join(&picture.digest)
+                                };
+                                eprintln!(
+                                    "td-agent: its picture {} is kept as {}",
+                                    picture.stand_in(),
+                                    at.display()
+                                );
+                            }
+                            format!(
+                                ", its {} picture(s) where standard error says",
+                                pictures.len()
+                            )
+                        };
                         format!(
-                            "conversation {id} refused a message: {reason}; its text is on standard error"
+                            "conversation {id} refused a message: {reason}; its text is on standard error{kept}"
                         )
                     }
                     None => format!("conversation {id} refused: {reason}"),
@@ -1775,9 +1829,34 @@ impl Session {
 
     /// The person's message, to the open conversation, put back in the
     /// composer when it cannot go.
-    fn send_message(&mut self, text: String) {
-        if let Err(e) = self.supervisor.send(text.clone()) {
-            self.app.restore(&text, e);
+    fn send_message(
+        &mut self,
+        text: String,
+        pictures: Vec<(crate::picture::Reference, std::sync::Arc<[u8]>)>,
+    ) {
+        let references: Vec<_> = pictures.iter().map(|(r, _)| r.clone()).collect();
+        // Each picture staged before the message goes, so its process
+        // finds them (DESIGN.md §6, Pictures).
+        let sent = match self.supervisor.open_id().cloned() {
+            None => Err("no conversation is open".to_string()),
+            Some(id) => pictures
+                .iter()
+                .try_for_each(|(reference, bytes)| {
+                    crate::picture::stage(&self.state, &id, reference, bytes)
+                })
+                .map_err(|e| format!("a picture could not be staged: {e}"))
+                .and_then(|()| self.supervisor.send(text.clone(), references.clone()))
+                .inspect_err(|_| {
+                    // A picture another pending message names stays.
+                    for reference in &references {
+                        if !self.supervisor.stages(&id, &reference.digest) {
+                            crate::picture::unstage(&self.state, &id, reference);
+                        }
+                    }
+                }),
+        };
+        if let Err(e) = sent {
+            self.app.give_back(&text, pictures, e);
         }
         self.app.set_queued(self.supervisor.queued());
     }
@@ -1938,7 +2017,12 @@ impl Session {
     /// Deletes conversation `id`, its processes stopped and `held` the
     /// human's messages they had not taken, opening the next when
     /// `was_open`; whether it is deleted.
-    fn delete_now(&mut self, id: &Id, was_open: bool, held: Vec<(String, String)>) -> bool {
+    fn delete_now(
+        &mut self,
+        id: &Id,
+        was_open: bool,
+        held: Vec<crate::supervisor::Pending>,
+    ) -> bool {
         // The workspace's own rules go with it, a directory's staying,
         // it being the human's and others able to work in it; and its
         // crossings.
@@ -2194,7 +2278,7 @@ impl Session {
         archived: bool,
         removed: bool,
         was_open: bool,
-        held: Vec<(String, String)>,
+        held: Vec<crate::supervisor::Pending>,
     ) -> bool {
         let done = if archived { "archived" } else { "unarchived" };
         let mut trouble = None;
@@ -2464,8 +2548,9 @@ impl Handler for Session {
         if surface != self.app.surface() {
             self.app.resize(surface);
         }
-        self.app
-            .emit(surface.bounds(), &mut |draw| raster.draw(draw));
+        raster
+            .paint(&self.app, surface.bounds())
+            .map_err(|e| e.to_string())?;
         self.app.painted();
         Ok(())
     }
@@ -2571,6 +2656,7 @@ pub fn run(
     let stream = td_ui::wayland::connect(endpoint)?;
     let surface = Surface::new(1280, 800, Scale::default()).map_err(|e| e.to_string())?;
     let mut app = App::new(surface, state.load_share(), config.mode)?;
+    app.set_state(state.clone());
     app.set_without_jev(!config.client.jev_required);
     for note in &config.notes {
         eprintln!("td-agent: configuration: {note}");

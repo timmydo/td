@@ -64,6 +64,7 @@ pub mod notes;
 pub mod output;
 pub mod patch;
 pub mod picker;
+pub mod picture;
 pub mod post;
 pub mod prompt;
 pub mod protocol;

@@ -56,8 +56,14 @@ pub enum Down {
         key: Result<Secret, String>,
         client: Box<Client>,
     },
-    /// The human's message, with an id the conversation logs once.
-    User { delivery: String, text: String },
+    /// The human's message, with an id the conversation logs once, and
+    /// the pictures it carries, staged for the conversation to take
+    /// (DESIGN.md §6, Pictures): referred to, never sent in the frame.
+    User {
+        delivery: String,
+        text: String,
+        pictures: Vec<crate::picture::Reference>,
+    },
     /// The answer to a `Reserve` of the same id: granted, or why not.
     Reservation { id: u64, refusal: Option<String> },
     /// Ask again for the last turn, which failed in a way that may pass.
@@ -724,13 +730,23 @@ impl Down {
                 };
                 typed("setup", vec![key, ("client".into(), client.to_json())])
             }
-            Self::User { delivery, text } => typed(
-                "user",
-                vec![
+            Self::User {
+                delivery,
+                text,
+                pictures,
+            } => {
+                let mut fields = vec![
                     ("delivery".into(), Json::Str(delivery.clone())),
                     ("text".into(), Json::Str(text.clone())),
-                ],
-            ),
+                ];
+                if !pictures.is_empty() {
+                    fields.push((
+                        "pictures".into(),
+                        Json::Arr(pictures.iter().map(|p| p.to_json()).collect()),
+                    ));
+                }
+                typed("user", fields)
+            }
             Self::Reservation { id, refusal } => typed(
                 "reservation",
                 vec![
@@ -1126,9 +1142,22 @@ impl Down {
                 if !delivery_ok(&delivery) {
                     return Err("a malformed delivery id".into());
                 }
+                let pictures = match value.get("pictures") {
+                    None => Vec::new(),
+                    Some(list) => {
+                        let list = list.as_arr().ok_or("pictures is not a list")?;
+                        if list.len() > crate::picture::MAX_PICTURES {
+                            return Err("too many pictures".into());
+                        }
+                        list.iter()
+                            .map(crate::picture::Reference::from_json)
+                            .collect::<Result<_, _>>()?
+                    }
+                };
                 Ok(Self::User {
                     delivery,
                     text: string(&value, "text")?,
+                    pictures,
                 })
             }
             Some("resumed") => Ok(Self::Resumed {
@@ -1939,13 +1968,31 @@ mod tests {
     #[test]
     fn every_message_round_trips_within_the_frame_bound() {
         let delivery = "0123456789abcdef0123456789abcdef".to_string();
+        // The longest text, and every picture a message carries, each
+        // with the longest label.
+        let picture = crate::picture::Reference {
+            digest: "e".repeat(64),
+            mime: crate::picture::JPEG,
+            width: crate::picture::MAX_PICTURE_AXIS,
+            height: crate::picture::MAX_PICTURE_AXIS,
+            bytes: crate::picture::MAX_PICTURE_BYTES,
+            label: "i".repeat(crate::picture::MAX_LABEL),
+        };
         let down = Down::User {
+            pictures: vec![picture.clone(); crate::picture::MAX_PICTURES],
             delivery: delivery.clone(),
             text: "\u{1}".repeat(MAX_TEXT),
         };
         let bytes = down.encode();
         assert!(bytes.len() <= crate::frame::MAX_FRAME, "{}", bytes.len());
         assert_eq!(Down::decode(&bytes).unwrap(), down);
+        // One picture more is refused.
+        let over = Down::User {
+            pictures: vec![picture; crate::picture::MAX_PICTURES + 1],
+            delivery: delivery.clone(),
+            text: "x".into(),
+        };
+        assert!(Down::decode(&over.encode()).is_err());
         for up in [
             Up::Resume {
                 turn: 3,
@@ -2064,6 +2111,7 @@ mod tests {
                 seq: 1,
                 time: 2,
                 kind: Kind::User {
+                    pictures: Vec::new(),
                     delivery: delivery.clone(),
                     text: "hi".into(),
                 },

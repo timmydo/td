@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use td_ui::chrome::ROW;
@@ -53,6 +54,7 @@ use crate::key::Secret;
 use crate::keydialog::{KeyDialog, Reply};
 use crate::menu;
 use crate::picker::{Offer, Picker};
+use crate::picture::Reference;
 use crate::post::Entry;
 use crate::protocol::{Up, MAX_TEXT};
 use crate::store::{Event, Held, Id, Kind, Purpose, Role, Status, TaskStart, TodoItem};
@@ -60,6 +62,13 @@ use crate::supervisor::Update;
 use crate::templatedialog::{Reply as TemplateReply, TemplateDialog};
 use crate::tools;
 use crate::workspace::Workspace;
+
+/// A pasted picture held for the composer: what it is, and its bytes.
+pub type Attached = (Reference, Arc<[u8]>);
+
+/// The longest side a picture is decoded at for the transcript, which
+/// shows none wider (DESIGN.md §4).
+const SHOWN_AXIS: usize = 1024;
 
 /// Why a hello came without the prefix (DESIGN.md §4).
 const LONG_PREFIX: &str = "the conversation's prefix file is longer than the window is sent";
@@ -458,7 +467,9 @@ pub enum Request {
     /// confirmed in its dialog.
     RemoveTemplate(String),
     /// Send the human's message to the open conversation.
-    Send(String),
+    /// The composer's text and the pictures it names, in the order it
+    /// names them.
+    Send(String, Vec<Attached>),
     /// Ask the open conversation's failed turn again.
     Retry,
     /// Interrupt the open conversation's turn.
@@ -482,6 +493,7 @@ pub enum Request {
         name: String,
         args: String,
         typed: String,
+        pictures: Vec<Attached>,
     },
     /// List the person's commands.
     Commands,
@@ -806,6 +818,12 @@ pub struct App {
     surface: Surface,
     rows: Vec<Row>,
     active: Option<Id>,
+    /// The pictures pasted into the composer and not yet sent, each named
+    /// in its text by its label (DESIGN.md §4, Pictures).
+    attached: Vec<Attached>,
+    /// Where the open conversation's pictures are kept, for showing them;
+    /// none for an app without a store, whose pictures show as text.
+    state: Option<crate::store::StateDir>,
     list: tree_table::Controller<usize>,
     split: split::Controller,
     transcript: messages::Controller,
@@ -1052,6 +1070,8 @@ impl App {
         .map_err(|e| e.to_string())?;
         let model = Model::new(&[], COLUMNS).map_err(|e| e.to_string())?;
         let mut app = Self {
+            attached: Vec::new(),
+            state: None,
             surface,
             rows: Vec::new(),
             active: None,
@@ -2417,10 +2437,12 @@ impl App {
             Update::Refused {
                 text: Some(text),
                 reason,
+                ..
             } => self.restore(&text, format!("refused: {reason}")),
-            Update::Refused { text: None, reason } | Update::Up(Up::Refused { reason, .. }) => {
-                self.note(format!("refused: {reason}"))
+            Update::Refused {
+                text: None, reason, ..
             }
+            | Update::Up(Up::Refused { reason, .. }) => self.note(format!("refused: {reason}")),
             // The window's ledger and post answer these; nothing shows.
             Update::Up(
                 Up::Reserve { .. }
@@ -2490,11 +2512,12 @@ impl App {
                 .map(|m| m.1)
         };
         match event.kind {
-            Kind::User { text, .. } => {
+            Kind::User { text, pictures, .. } => {
                 let pushed = Message::new(YOU)
                     .map(|m| m.side(Side::Right))
                     .and_then(|m| self.stamped(m, event.time))
                     .and_then(|m| m.text(&text))
+                    .and_then(|m| self.show_pictures(m, &pictures))
                     .map_err(|e| e.to_string())
                     .and_then(|m| self.push_message(m));
                 match pushed {
@@ -4246,12 +4269,22 @@ impl App {
             ));
             return;
         }
+        let pictures = self.pictures_named(&text);
+        if pictures.len() > crate::picture::MAX_PICTURES {
+            self.note(format!(
+                "a message carries at most {} pictures; this one names {}",
+                crate::picture::MAX_PICTURES,
+                pictures.len()
+            ));
+            return;
+        }
         // The schedule commands are the human's, not messages (§3), and
         // the window's, whatever the open conversation's process is.
         if let Some(command) = crate::schedule::command(&text) {
             match command {
                 Ok(command) => {
                     self.composer.fresh();
+                    self.attached.clear();
                     self.apply_focus();
                     self.requests.push(Request::Schedule(command));
                     self.touch();
@@ -4274,6 +4307,7 @@ impl App {
                     _ => Request::Commands,
                 };
                 self.composer.fresh();
+                self.attached.clear();
                 self.apply_focus();
                 self.requests.push(request);
                 self.touch();
@@ -4304,6 +4338,7 @@ impl App {
                 return;
             }
             self.composer.fresh();
+            self.attached.clear();
             self.apply_focus();
             self.compact(focus);
             return;
@@ -4322,6 +4357,7 @@ impl App {
                 return;
             }
             self.composer.fresh();
+            self.attached.clear();
             self.apply_focus();
             self.requests.push(Request::Review(revision.clone()));
             self.note(format!("reviewing {revision}"));
@@ -4329,15 +4365,18 @@ impl App {
             return;
         }
         self.composer.fresh();
+        self.attached.clear();
         self.apply_focus();
-        self.requests.push(match command {
+        let request = match command {
             Some(Ok(crate::commands::Typed::Run { name, args })) => Request::Command {
                 name,
                 args,
                 typed: text,
+                pictures,
             },
-            _ => Request::Send(text),
-        });
+            _ => Request::Send(text, pictures),
+        };
+        self.requests.push(request);
         self.touch();
     }
 
@@ -4387,6 +4426,9 @@ impl App {
         }
         if let Input::Paste(text) = input {
             return self.pasted(text);
+        }
+        if let Input::PasteImage { bytes, .. } = input {
+            return self.pasted_picture(bytes);
         }
         // The dialog's paste that the clipboard gave up on (a focus loss,
         // a failed transfer, the device going away) never comes; td-ui hands a paste over only
@@ -4518,6 +4560,139 @@ impl App {
                 Err(e) => self.note(e),
             }
         }
+    }
+
+    /// The clipboard's picture, which only the composer asks for: checked,
+    /// named in the composer's text by a label of its own, `[image 1]`,
+    /// and held until the message goes. Deleting the label from the text
+    /// leaves the picture out.
+    fn pasted_picture(&mut self, bytes: &[u8]) {
+        if self.modal() || self.focus != Focus::Composer {
+            return self.note("a picture that came while the composer was not focused is dropped");
+        }
+        // Those whose labels the draft no longer names are let go first.
+        self.attached = self.pictures_named(self.composer.text());
+        if self.attached.len() >= crate::picture::MAX_PICTURES {
+            return self.note(format!(
+                "a message carries at most {} pictures",
+                crate::picture::MAX_PICTURES
+            ));
+        }
+        let label = format!("image {}", self.next_picture());
+        let reference = match crate::picture::check(bytes, &label) {
+            Ok(reference) => reference,
+            Err(why) => return self.note(format!("the picture is not taken: {why}")),
+        };
+        match self.composer.insert(&reference.stand_in()) {
+            Ok(true) => {
+                self.note(format!(
+                    "pasted {}: {}x{} {}, {:.1} MB",
+                    reference.stand_in(),
+                    reference.width,
+                    reference.height,
+                    if reference.mime == crate::picture::PNG {
+                        "PNG"
+                    } else {
+                        "JPEG"
+                    },
+                    reference.bytes as f64 / 1e6
+                ));
+                self.attached.push((reference, Arc::from(bytes)));
+                self.touch();
+            }
+            Ok(false) => self.note("the composer took no picture"),
+            Err(e) => self.note(e),
+        }
+    }
+
+    /// The number the next pasted picture's label takes: one past the
+    /// highest held.
+    fn next_picture(&self) -> u32 {
+        self.attached
+            .iter()
+            .filter_map(|(r, _)| r.label.strip_prefix("image ")?.parse::<u32>().ok())
+            .max()
+            .map_or(1, |n| n.saturating_add(1))
+    }
+
+    /// The held pictures `text` names, in the order it names them.
+    fn pictures_named(&self, text: &str) -> Vec<Attached> {
+        let mut named: Vec<(usize, &Attached)> = self
+            .attached
+            .iter()
+            .filter_map(|held| Some((text.find(&held.0.stand_in())?, held)))
+            .collect();
+        named.sort_by_key(|(at, _)| *at);
+        named.into_iter().map(|(_, held)| held.clone()).collect()
+    }
+
+    /// A message that did not go, back in the composer with the pictures
+    /// it carried, as `restore` puts its text back. A returned picture
+    /// whose label one the draft holds already has is labelled anew, past
+    /// every label held or returned, and the returned text says the new
+    /// label, so neither picture stands for the other.
+    pub fn give_back(&mut self, text: &str, pictures: Vec<Attached>, why: String) {
+        self.attached = self.pictures_named(self.composer.text());
+        let number = |r: &Reference| {
+            r.label
+                .strip_prefix("image ")
+                .and_then(|n| n.parse::<u32>().ok())
+        };
+        let mut next = pictures
+            .iter()
+            .filter_map(|(r, _)| number(r))
+            .max()
+            .map_or(1, |n| n.saturating_add(1))
+            .max(self.next_picture());
+        let mut text = text.to_string();
+        for (mut reference, bytes) in pictures {
+            if self
+                .attached
+                .iter()
+                .any(|(r, _)| r.label == reference.label)
+            {
+                let label = format!("image {next}");
+                next = next.saturating_add(1);
+                text = text.replace(&reference.stand_in(), &format!("[{label}]"));
+                reference.label = label;
+            }
+            self.attached.push((reference, bytes));
+        }
+        self.restore(&text, why);
+    }
+
+    /// Where the open conversation's pictures are kept.
+    pub fn set_state(&mut self, state: crate::store::StateDir) {
+        self.state = Some(state);
+    }
+
+    /// A message's pictures as the transcript shows them: each decoded
+    /// from where its conversation keeps it, or a line saying why not.
+    fn show_pictures(
+        &self,
+        mut message: Message,
+        pictures: &[Reference],
+    ) -> Result<Message, messages::Error> {
+        for reference in pictures {
+            match self.load_picture(reference) {
+                Ok(picture) => message = message.picture(picture, &reference.stand_in())?,
+                Err(why) => {
+                    message =
+                        message.text(&format!("{} is not shown: {why}", reference.stand_in()))?
+                }
+            }
+        }
+        Ok(message)
+    }
+
+    fn load_picture(&self, reference: &Reference) -> Result<td_ui::picture::Picture, String> {
+        let (Some(state), Some(id)) = (&self.state, &self.active) else {
+            return Err("no store to read it from".into());
+        };
+        let bytes = crate::picture::read(&state.conversation(id), reference)?;
+        // A JPEG decoded at the scale that shows it at most this wide.
+        let (width, height, rgba) = crate::picture::decode(reference.mime, &bytes, SHOWN_AXIS)?;
+        td_ui::picture::Picture::new(width, height, rgba).map_err(|e| e.to_string())
     }
 
     fn cancel_pointer(&mut self) {
@@ -6294,7 +6469,15 @@ impl App {
                     }
                 }
                 "C-v" | "S-Insert" if !repeat => {
-                    if let Err(why) = clipboard.paste() {
+                    // A picture the selection offers comes before its
+                    // text: a screenshot tool offers the picture alone, a
+                    // browser's copied image the picture and a link.
+                    let asked = if clipboard.has_image() {
+                        clipboard.paste_image()
+                    } else {
+                        clipboard.paste()
+                    };
+                    if let Err(why) = asked {
                         self.note(format!("paste: {why}"));
                     }
                 }
@@ -6631,6 +6814,10 @@ impl Composition for App {
         self.emit_modals(damage, sink);
         self.emit_tip(regions.transcript, damage, sink);
     }
+
+    fn picture(&self, id: u64, with: &mut dyn FnMut(&td_ui::picture::Fitted)) {
+        self.transcript.picture(id, with)
+    }
 }
 
 impl App {
@@ -6750,6 +6937,7 @@ pub mod tests {
             seq,
             time: 0,
             kind: Kind::User {
+                pictures: Vec::new(),
                 delivery: String::new(),
                 text: text.into(),
             },
@@ -6919,6 +7107,7 @@ pub mod tests {
         assert_eq!(
             app.take_requests(),
             [Request::Command {
+                pictures: vec![],
                 name: "compacting".into(),
                 args: String::new(),
                 typed: "/compacting".into(),
@@ -7014,6 +7203,7 @@ pub mod tests {
         assert_eq!(
             app.take_requests(),
             [Request::Command {
+                pictures: vec![],
                 name: "triage".into(),
                 args: "PR 12".into(),
                 typed: "/triage PR 12".into(),
@@ -7024,7 +7214,7 @@ pub mod tests {
         key(&mut app, "Return");
         assert_eq!(
             app.take_requests(),
-            [Request::Send("/usr/bin is gone".into())]
+            [Request::Send("/usr/bin is gone".into(), vec![])]
         );
         assert!(app.composer.insert("/commands").unwrap());
         key(&mut app, "Return");
@@ -7090,6 +7280,182 @@ pub mod tests {
         }
     }
 
+    /// A clipboard offering a picture: `C-v` asks for it, not the text.
+    struct PictureClipboard {
+        asked: Vec<&'static str>,
+    }
+
+    impl Clipboard for PictureClipboard {
+        fn available(&self) -> bool {
+            true
+        }
+        fn has_text(&self) -> bool {
+            true
+        }
+        fn pasting(&self) -> bool {
+            false
+        }
+        fn copy(&mut self, _: Arc<str>) -> Result<(), td_ui::window::Refusal> {
+            Ok(())
+        }
+        fn paste(&mut self) -> Result<(), td_ui::window::Refusal> {
+            self.asked.push("text");
+            Ok(())
+        }
+        fn has_image(&self) -> bool {
+            true
+        }
+        fn paste_image(&mut self) -> Result<(), td_ui::window::Refusal> {
+            self.asked.push("picture");
+            Ok(())
+        }
+    }
+
+    /// A pasted picture is named in the composer's text and goes with
+    /// the message that still names it; one whose label was deleted, or
+    /// that is not a picture, does not.
+    #[test]
+    fn a_pasted_picture_goes_with_the_message_that_names_it() {
+        let mut app = app();
+        let mut clipboard = PictureClipboard { asked: Vec::new() };
+        app.key("C-v", false, &mut clipboard);
+        assert_eq!(clipboard.asked, ["picture"]);
+        let bytes = crate::picture::tests::png(2, 2, [1, 2, 3]);
+        let pasted = |app: &mut App, bytes: &[u8]| {
+            app.input(
+                Input::PasteImage {
+                    mime: "image/png",
+                    bytes,
+                },
+                &mut NoClipboard,
+            )
+        };
+        for chord in ["s", "e", "e", " "] {
+            key(&mut app, chord);
+        }
+        pasted(&mut app, &bytes);
+        assert_eq!(app.composed(), "see [image 1]");
+        pasted(&mut app, &crate::picture::tests::png(1, 1, [0; 3]));
+        assert_eq!(app.composed(), "see [image 1][image 2]");
+        // The second's label deleted: it is left out.
+        for _ in 0.."[image 2]".len() {
+            key(&mut app, "Backspace");
+        }
+        key(&mut app, "Return");
+        let mut requests = app.take_requests();
+        assert_eq!(requests.len(), 1);
+        let Some(Request::Send(text, pictures)) = requests.pop() else {
+            panic!("not sent")
+        };
+        assert_eq!(text, "see [image 1]");
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(
+            pictures[0].0,
+            crate::picture::check(&bytes, "image 1").unwrap()
+        );
+        assert_eq!(&*pictures[0].1, &bytes[..]);
+        // Bytes that are no picture are said and not taken; the next
+        // message carries nothing held before.
+        pasted(&mut app, b"not a picture");
+        assert_eq!(app.composed(), "");
+        key(&mut app, "x");
+        key(&mut app, "Return");
+        assert_eq!(app.take_requests(), [Request::Send("x".into(), vec![])]);
+    }
+
+    fn paste_picture(app: &mut App, rgb: [u8; 3]) -> Vec<u8> {
+        let bytes = crate::picture::tests::png(1, 1, rgb);
+        app.input(
+            Input::PasteImage {
+                mime: "image/png",
+                bytes: &bytes,
+            },
+            &mut NoClipboard,
+        );
+        bytes
+    }
+
+    /// A refused message comes back with its pictures; one whose label a
+    /// picture pasted since holds is labelled anew, in the returned text
+    /// too, so each label still stands for its own picture.
+    #[test]
+    fn a_returned_picture_whose_label_is_taken_is_labelled_anew() {
+        let mut app = app();
+        let first = paste_picture(&mut app, [1, 1, 1]);
+        key(&mut app, "Return");
+        let mut requests = app.take_requests();
+        let Some(Request::Send(text, sent)) = requests.pop() else {
+            panic!("not sent")
+        };
+        assert_eq!(text, "[image 1]");
+        // Pasted while the first waits: `image 1` again.
+        let second = paste_picture(&mut app, [2, 2, 2]);
+        assert_eq!(app.composed(), "[image 1]");
+        app.give_back(&format!("see {text}"), sent, "refused: busy".into());
+        assert_eq!(app.composed(), "[image 1]\nsee [image 2]\n");
+        key(&mut app, "Return");
+        let mut requests = app.take_requests();
+        let Some(Request::Send(_, pictures)) = requests.pop() else {
+            panic!("not sent")
+        };
+        let held: Vec<(&str, &[u8])> = pictures
+            .iter()
+            .map(|(r, b)| (r.label.as_str(), &**b))
+            .collect();
+        assert_eq!(held, [("image 1", &second[..]), ("image 2", &first[..])]);
+    }
+
+    /// A message names at most eight pictures, said before anything
+    /// leaves the composer; a deleted label's picture no longer counts
+    /// against the next paste; and a command typed with pictures carries
+    /// them to what it expands to.
+    #[test]
+    fn a_messages_pictures_are_bounded_and_follow_its_text() {
+        let mut app = app();
+        // Pasted and deleted, nine times: each frees its place.
+        for _ in 0..9 {
+            paste_picture(&mut app, [3, 3, 3]);
+            assert_eq!(app.composed(), "[image 1]");
+            for _ in 0.."[image 1]".len() {
+                key(&mut app, "Backspace");
+            }
+        }
+        for n in 0..8u8 {
+            paste_picture(&mut app, [n; 3]);
+        }
+        assert_eq!(app.composed().matches("[image ").count(), 8);
+        paste_picture(&mut app, [9; 3]);
+        assert_eq!(app.composed().matches("[image ").count(), 8);
+        // A ninth, given back with a message, is refused at sending.
+        let ninth =
+            crate::picture::check(&crate::picture::tests::png(1, 1, [9; 3]), "image 1").unwrap();
+        let bytes = crate::picture::tests::png(1, 1, [9; 3]);
+        app.give_back(
+            "[image 1]",
+            vec![(ninth, Arc::from(&bytes[..]))],
+            "refused".into(),
+        );
+        let draft = app.composed().to_string();
+        assert!(draft.ends_with("[image 9]\n"), "{draft}");
+        key(&mut app, "Return");
+        assert!(app.take_requests().is_empty());
+        assert_eq!(app.composed(), draft);
+        // A command with one picture carries it.
+        for _ in 0..draft.len() {
+            key(&mut app, "Backspace");
+        }
+        assert!(app.composer.insert("/describe ").unwrap());
+        let one = paste_picture(&mut app, [4; 3]);
+        key(&mut app, "Return");
+        let mut requests = app.take_requests();
+        let Some(Request::Command { name, pictures, .. }) = requests.pop() else {
+            panic!("no command")
+        };
+        assert_eq!(name, "describe");
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(&*pictures[0].1, &one[..]);
+    }
+
     #[test]
     fn return_sends_and_empties_the_composer_and_s_return_is_a_newline() {
         let mut app = app();
@@ -7099,12 +7465,15 @@ pub mod tests {
         assert_eq!(app.composed(), "hi\nthere");
         assert!(app.take_requests().is_empty(), "S-Return sends nothing");
         key(&mut app, "Return");
-        assert_eq!(app.take_requests(), [Request::Send("hi\nthere".into())]);
+        assert_eq!(
+            app.take_requests(),
+            [Request::Send("hi\nthere".into(), vec![])]
+        );
         assert_eq!(app.composed(), "");
         // C-Return sends too; a held Return sends once and types nothing.
         key(&mut app, "x");
         key(&mut app, "C-Return");
-        assert_eq!(app.take_requests(), [Request::Send("x".into())]);
+        assert_eq!(app.take_requests(), [Request::Send("x".into(), vec![])]);
         key(&mut app, "y");
         app.key("Return", true, &mut NoClipboard);
         assert!(app.take_requests().is_empty());
@@ -7383,6 +7752,7 @@ pub mod tests {
         let mut app = app();
         app.update(
             Update::Refused {
+                pictures: Vec::new(),
                 text: Some("long ago".into()),
                 reason: "the conversation's log is full".into(),
             },
@@ -7452,6 +7822,7 @@ pub mod tests {
             at(
                 user,
                 Kind::User {
+                    pictures: Vec::new(),
                     delivery: String::new(),
                     text: text.into(),
                 },
@@ -8048,6 +8419,7 @@ pub mod tests {
         let mut app = app();
         let stamped = |seq, time, kind| Update::Up(Up::Event(Event { seq, time, kind }));
         let user = Kind::User {
+            pictures: Vec::new(),
             delivery: String::new(),
             text: "hello".into(),
         };
@@ -8685,6 +9057,7 @@ pub mod tests {
                 event(
                     1,
                     Kind::User {
+                        pictures: Vec::new(),
                         delivery: String::new(),
                         text: "hello".into(),
                     },
@@ -8753,6 +9126,7 @@ pub mod tests {
                     seq: 8,
                     time: 0,
                     kind: Kind::User {
+                        pictures: Vec::new(),
                         delivery: String::new(),
                         text: "from the log".into(),
                     },
@@ -8774,6 +9148,7 @@ pub mod tests {
             at(
                 8,
                 Kind::User {
+                    pictures: Vec::new(),
                     delivery: String::new(),
                     text: "from the log".into(),
                 },
@@ -9709,6 +10084,7 @@ pub mod tests {
             seq: 1,
             time: 0,
             kind: Kind::User {
+                pictures: Vec::new(),
                 delivery: "d1".into(),
                 text: "look".into(),
             },
@@ -9719,6 +10095,7 @@ pub mod tests {
             seq,
             time: 0,
             kind: Kind::User {
+                pictures: Vec::new(),
                 delivery: format!("d{seq}"),
                 text: "later\nlater\nlater".into(),
             },

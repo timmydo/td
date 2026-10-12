@@ -533,6 +533,7 @@ mod tests {
                 "td-open",
                 "td-pass",
                 "td-photo",
+                "td-png",
                 "td-portal",
                 "td-protector",
                 "td-regex",

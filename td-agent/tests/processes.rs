@@ -97,7 +97,7 @@ fn a_killed_conversation_process_is_restarted_from_its_log() {
         .open(id.clone(), Some(Role::Orchestrator))
         .unwrap();
     let mut heard = Vec::new();
-    supervisor.send("first".into()).unwrap();
+    supervisor.send("first".into(), Vec::new()).unwrap();
     until(&mut supervisor, &mut heard, |h| {
         delivered(h) == 1 && events(h).len() == 3
     });
@@ -117,7 +117,7 @@ fn a_killed_conversation_process_is_restarted_from_its_log() {
     assert_ne!(supervisor.pid(), Some(first_pid));
     // The restarted process goes on from where the log ends.
     heard.clear();
-    supervisor.send("second".into()).unwrap();
+    supervisor.send("second".into(), Vec::new()).unwrap();
     until(&mut supervisor, &mut heard, |h| events(h).len() == 3);
     assert_eq!(events(&heard), [4, 5, 6]);
     drop(supervisor);
@@ -145,7 +145,7 @@ fn a_message_sent_just_before_moving_away_is_delivered_on_reopening() {
         .unwrap();
     // Sent while A's process is still starting, then away at once: the
     // process may go before it reads the message.
-    supervisor.send("kept".into()).unwrap();
+    supervisor.send("kept".into(), Vec::new()).unwrap();
     // Queued, the window shows, until the process takes it: B's own
     // queue is its, empty.
     assert_eq!(supervisor.queued(), ["kept"]);
@@ -345,7 +345,7 @@ fn a_repository_conversations_first_turn_waits_for_its_stores() {
             .iter()
             .any(|u| matches!(u, Update::Up(Up::Fetch { .. })))
     });
-    supervisor.send("hello".into()).unwrap();
+    supervisor.send("hello".into(), Vec::new()).unwrap();
     let finished = |heard: &[Update]| {
         heard.iter().any(
             |u| matches!(u, Update::Up(Up::Event(e)) if matches!(e.kind, Kind::Finished { .. })),
@@ -451,7 +451,7 @@ fn a_conversation_whose_workspace_went_with_its_archive_prepares_nothing() {
             .iter()
             .any(|u| matches!(u, Update::Up(Up::Prepared { .. })))
     });
-    supervisor.send("hello".into()).unwrap();
+    supervisor.send("hello".into(), Vec::new()).unwrap();
     until(&mut supervisor, &mut heard, |heard| {
         heard.iter().any(|u| {
             matches!(u, Update::Up(Up::Event(e))
@@ -652,11 +652,11 @@ fn an_interrupt_ends_a_turn_waiting_for_its_stores() {
             .count()
     };
     // Sent with the message, the interrupt is queued behind it.
-    supervisor.send("hello".into()).unwrap();
+    supervisor.send("hello".into(), Vec::new()).unwrap();
     supervisor.interrupt().unwrap();
     until(&mut supervisor, &mut heard, |heard| ended(heard) == 1);
     // Sent while it waits.
-    supervisor.send("again".into()).unwrap();
+    supervisor.send("again".into(), Vec::new()).unwrap();
     until(&mut supervisor, &mut heard, |heard| delivered(heard) == 2);
     std::thread::sleep(Duration::from_millis(200));
     supervisor.interrupt().unwrap();
@@ -682,7 +682,7 @@ fn a_conversation_that_keeps_failing_is_left_failed() {
         .filter(|u| matches!(u, Update::Restarting { .. }))
         .count();
     assert_eq!(restarts, MAX_RESTARTS as usize, "{heard:#?}");
-    assert!(supervisor.send("x".into()).is_err());
+    assert!(supervisor.send("x".into(), Vec::new()).is_err());
     assert!(supervisor.poll().is_empty(), "no restart after failing");
 }
 
@@ -815,7 +815,7 @@ fn a_message_sent_just_before_switching_away_runs_its_turn() {
     supervisor
         .open(a.clone(), Some(Role::Conversation))
         .unwrap();
-    supervisor.send("hello".into()).unwrap();
+    supervisor.send("hello".into(), Vec::new()).unwrap();
     // Away before the window has heard a word of the turn.
     supervisor
         .open(b.clone(), Some(Role::Conversation))
@@ -873,7 +873,7 @@ fn a_compaction_asked_during_a_turn_runs_after_a_switch() {
     supervisor
         .open(a.clone(), Some(Role::Conversation))
         .unwrap();
-    supervisor.send("hello".into()).unwrap();
+    supervisor.send("hello".into(), Vec::new()).unwrap();
     supervisor.compact(None).unwrap();
     supervisor
         .open(b.clone(), Some(Role::Conversation))
@@ -923,7 +923,7 @@ fn a_deleted_conversation_loses_its_process_and_its_directory() {
         .open(id.clone(), Some(Role::Conversation))
         .unwrap();
     let mut heard = Vec::new();
-    supervisor.send("before".into()).unwrap();
+    supervisor.send("before".into(), Vec::new()).unwrap();
     until(&mut supervisor, &mut heard, |h| delivered(h) == 1);
     let pid = supervisor.pid().unwrap();
     // While its process holds the lock, the store refuses.

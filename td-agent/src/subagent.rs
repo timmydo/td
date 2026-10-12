@@ -304,7 +304,9 @@ impl Session {
                 })?
                 .seq;
             self.sync()?;
-            let failure = match self.stream(request, &client, &key, body) {
+            // A sub-agent's view is its task's, which holds none of the
+            // person's pictures.
+            let failure = match self.stream(request, &client, &key, body, false) {
                 Streamed::Replied(completion) => {
                     let cost = charge(completion.usage, pricing, reserved);
                     let outcome = self.reply(request, &completion, cost)?;

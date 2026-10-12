@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::frame;
 use crate::key::Secret;
+use crate::picture::Reference;
 use crate::protocol::{Down, Up};
 use crate::store::{random_hex, Effect, Id, Kind, Role};
 use crate::workspace::Workspace;
@@ -37,15 +38,35 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a closing window waits for a child to exit on its own.
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
+/// A human's message sent to a conversation and not yet acknowledged:
+/// sent again to its next process, or handed back when refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pending {
+    pub delivery: String,
+    pub text: String,
+    pub pictures: Vec<Reference>,
+}
+
+impl Pending {
+    fn down(&self) -> Down {
+        Down::User {
+            delivery: self.delivery.clone(),
+            text: self.text.clone(),
+            pictures: self.pictures.clone(),
+        }
+    }
+}
+
 /// What the window hears about a conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Update {
     /// A child's message, in order. A `Hello` starts the transcript over.
     Up(Up),
     /// The child refused a message: its text, when the window still had
-    /// it, and why.
+    /// it, the pictures it carried, still staged, and why.
     Refused {
         text: Option<String>,
+        pictures: Vec<Reference>,
         reason: String,
     },
     /// The child failed and is being started again from its log.
@@ -80,7 +101,7 @@ struct Running {
     writer: UnixStream,
     incoming: Receiver<Incoming>,
     /// The human's messages sent and not yet acknowledged, in order.
-    pending: Vec<(String, String)>,
+    pending: Vec<Pending>,
     /// Messages from other conversations handed to this child and not yet
     /// acknowledged, in order: each a `Down::Message`, by delivery id.
     deliveries: Vec<(String, Down)>,
@@ -152,7 +173,7 @@ pub struct Supervisor {
     retiring: Vec<(Id, Child, Instant)>,
     /// Messages a closed conversation had not acknowledged, sent again
     /// when it is opened again; its process logs each delivery id once.
-    parked: Vec<(Id, Vec<(String, String)>)>,
+    parked: Vec<(Id, Vec<Pending>)>,
     /// Variables set in each child's environment besides what it inherits.
     env: Vec<(OsString, OsString)>,
 }
@@ -374,13 +395,7 @@ impl Supervisor {
             .as_ref()
             .and_then(|id| self.at(id))
             .and_then(|at| self.children.get(at))
-            .map(|running| {
-                running
-                    .pending
-                    .iter()
-                    .map(|(_, text)| text.clone())
-                    .collect()
-            })
+            .map(|running| running.pending.iter().map(|p| p.text.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -537,17 +552,19 @@ impl Supervisor {
 
     /// Sends the human's message to the open conversation, keeping it
     /// until the conversation acknowledges it.
-    pub fn send(&mut self, text: String) -> Result<(), String> {
+    pub fn send(&mut self, text: String, pictures: Vec<Reference>) -> Result<(), String> {
         let running = self.opened().ok_or("no conversation is open")?;
         if running.failed {
             return Err("the conversation's process failed; open it again to restart it".into());
         }
         let delivery = random_hex(16)?;
-        let down = Down::User {
-            delivery: delivery.clone(),
-            text: text.clone(),
+        let pending = Pending {
+            delivery,
+            text,
+            pictures,
         };
-        running.pending.push((delivery, text));
+        let down = pending.down();
+        running.pending.push(pending);
         if frame::write(&mut running.writer, &down.encode()).is_err() {
             // The message is pending: the reader sees the child go, and
             // the restart resends it, or the failure is reported then.
@@ -743,7 +760,7 @@ impl Supervisor {
     /// §4, deleting a conversation). The human's messages it had not
     /// acknowledged are handed back, oldest first, to be parked again
     /// should the deletion fail.
-    pub fn remove(&mut self, id: &Id) -> Vec<(String, String)> {
+    pub fn remove(&mut self, id: &Id) -> Vec<Pending> {
         if self.open.as_ref() == Some(id) {
             self.open = None;
         }
@@ -765,9 +782,28 @@ impl Supervisor {
         held
     }
 
+    /// Whether a message to `id` not yet acknowledged, sent or parked,
+    /// carries the picture `digest`, whose staged copy it still needs.
+    pub fn stages(&self, id: &Id, digest: &str) -> bool {
+        let names = |pending: &[Pending]| {
+            pending
+                .iter()
+                .any(|p| p.pictures.iter().any(|r| r.digest == digest))
+        };
+        self.children
+            .iter()
+            .filter(|running| running.id == *id)
+            .any(|running| names(&running.pending))
+            || self
+                .parked
+                .iter()
+                .filter(|(parked, _)| parked == id)
+                .any(|(_, pending)| names(pending))
+    }
+
     /// Keeps the human's messages `id` had not acknowledged for its next
     /// process.
-    pub fn park(&mut self, id: Id, pending: Vec<(String, String)>) {
+    pub fn park(&mut self, id: Id, pending: Vec<Pending>) {
         if pending.is_empty() {
             return;
         }
@@ -807,17 +843,28 @@ fn drain(running: &mut Running, updates: &mut Vec<(Id, Update)>) -> Option<Strin
                     if running.busy == Some(0) {
                         running.busy = None;
                     }
-                    let text = running
+                    let refused = running
                         .pending
                         .iter()
-                        .position(|(d, _)| *d == delivery)
-                        .map(|at| running.pending.remove(at).1);
-                    updates.push((running.id.clone(), Update::Refused { text, reason }));
+                        .position(|p| p.delivery == delivery)
+                        .map(|at| running.pending.remove(at));
+                    let (text, pictures) = match refused {
+                        Some(p) => (Some(p.text), p.pictures),
+                        None => (None, Vec::new()),
+                    };
+                    updates.push((
+                        running.id.clone(),
+                        Update::Refused {
+                            text,
+                            pictures,
+                            reason,
+                        },
+                    ));
                 }
                 Ok(up) => {
                     match &up {
                         Up::Delivered { delivery } => {
-                            running.pending.retain(|(d, _)| d != delivery);
+                            running.pending.retain(|p| p.delivery != *delivery);
                             running.deliveries.retain(|(d, _)| d != delivery);
                             running.restarts = 0;
                         }
@@ -889,7 +936,7 @@ impl Drop for Supervisor {
         // Nothing keeps these past the window: each is said, whole, so
         // what was typed is not lost without a word.
         for (id, pending) in &self.parked {
-            for (_, text) in pending {
+            for Pending { text, .. } in pending {
                 eprintln!("td-agent: a message to conversation {id} was not delivered:\n{text}");
             }
         }
@@ -939,18 +986,12 @@ fn greet(
     writer: &mut UnixStream,
     setup: &Down,
     policy: &Down,
-    pending: &[(String, String)],
+    pending: &[Pending],
     deliveries: &[(String, Down)],
 ) {
     let downs = std::iter::once(setup.encode())
         .chain(std::iter::once(policy.encode()))
-        .chain(pending.iter().map(|(delivery, text)| {
-            Down::User {
-                delivery: delivery.clone(),
-                text: text.clone(),
-            }
-            .encode()
-        }))
+        .chain(pending.iter().map(|p| p.down().encode()))
         .chain(deliveries.iter().map(|(_, down)| down.encode()));
     for bytes in downs {
         if frame::write(writer, &bytes).is_err() {

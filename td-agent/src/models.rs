@@ -93,6 +93,9 @@ pub struct Model {
     /// negative one, which marks a router whose price is not fixed.
     pub pricing: Option<Pricing>,
     pub supported_parameters: Vec<String>,
+    /// What it reads, as its `architecture.input_modalities` says:
+    /// `text`, `image` and the like; empty where the list says nothing.
+    pub input_modalities: Vec<String>,
     /// The list's price strings as given, kept so the cache says what the
     /// provider said.
     prices: Vec<(String, String)>,
@@ -101,6 +104,13 @@ pub struct Model {
 impl Model {
     pub fn supports(&self, parameter: &str) -> bool {
         self.supported_parameters.iter().any(|p| p == parameter)
+    }
+
+    /// Whether a person's pictures go to it: its list entry says it reads
+    /// images, or says nothing of what it reads (a cache written before
+    /// td-agent kept it, an endpoints listing), as for a model not listed.
+    pub fn takes_pictures(&self) -> bool {
+        self.input_modalities.is_empty() || self.input_modalities.iter().any(|m| m == "image")
     }
 }
 
@@ -158,6 +168,7 @@ impl Model {
         max_completion_tokens: Option<u64>,
         prices: Vec<(String, String)>,
         supported_parameters: Vec<String>,
+        input_modalities: Vec<String>,
     ) -> Self {
         Self {
             pricing: pricing(&prices),
@@ -165,8 +176,18 @@ impl Model {
             context_length,
             max_completion_tokens,
             supported_parameters,
+            input_modalities,
             prices,
         }
+    }
+
+    /// An entry's `architecture.input_modalities`.
+    fn modalities_of(entry: &Json) -> Vec<String> {
+        Self::parameters_of(
+            entry
+                .get("architecture")
+                .and_then(|a| a.get("input_modalities")),
+        )
     }
 
     fn prices_of(value: Option<&Json>) -> Vec<(String, String)> {
@@ -222,6 +243,15 @@ impl Model {
                         .collect(),
                 ),
             ),
+            (
+                "input_modalities".into(),
+                Json::Arr(
+                    self.input_modalities
+                        .iter()
+                        .map(|m| Json::Str(m.clone()))
+                        .collect(),
+                ),
+            ),
         ])
     }
 }
@@ -247,6 +277,7 @@ impl Models {
                 number(top.and_then(|t| t.get("max_completion_tokens"))),
                 Model::prices_of(entry.get("pricing")),
                 Model::parameters_of(entry.get("supported_parameters")),
+                Model::modalities_of(entry),
             ));
         }
         Ok(Self { models })
@@ -318,6 +349,7 @@ impl Models {
             completion,
             prices,
             parameters.unwrap_or_default(),
+            Model::modalities_of(data),
         ))
     }
 
@@ -341,6 +373,7 @@ impl Models {
                 number(entry.get("max_completion_tokens")),
                 Model::prices_of(entry.get("pricing")),
                 Model::parameters_of(entry.get("supported_parameters")),
+                Model::parameters_of(entry.get("input_modalities")),
             ));
         }
         Ok(Self { models })
@@ -422,6 +455,8 @@ mod tests {
         assert_eq!(pricing.completion, 0);
         assert_eq!(Some(pricing.prompt), cost::parse("0.000000042", true));
         assert_eq!(jev.context_length, Some(32000));
+        assert_eq!(jev.input_modalities, ["text"]);
+        assert!(!jev.takes_pictures());
         let cached = Models {
             models: vec![jev.clone()],
         };
@@ -502,6 +537,7 @@ mod tests {
 
     const LIST: &str = r#"{"data":[
         {"id":"anthropic/claude-sonnet-5.5","name":"Claude","context_length":1000000,
+         "architecture":{"modality":"text+image->text","input_modalities":["text","image"]},
          "pricing":{"prompt":"0.000003","completion":"0.000015","request":"0","image":"0.0048",
                     "input_cache_read":"0.0000003","input_cache_write":"0.00000375"},
          "top_provider":{"context_length":1000000,"max_completion_tokens":64000,"is_moderated":false},
@@ -522,6 +558,10 @@ mod tests {
         assert_eq!(sonnet.context_length, Some(1_000_000));
         assert_eq!(sonnet.max_completion_tokens, Some(64_000));
         assert!(sonnet.supports("reasoning") && !sonnet.supports("web_search"));
+        // Pictures go to a model whose entry says it reads them, or says
+        // nothing of what it reads.
+        assert!(sonnet.takes_pictures());
+        assert!(models.find("free/model").unwrap().takes_pictures());
         assert_eq!(
             sonnet.pricing,
             Some(Pricing {

@@ -49,14 +49,18 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
 # td's own crates, by the one sibling-dependency spelling the lock guard
 # admits (AGENTS.md 'Rust code'): the civil calendar, the fetch service's
-# client, HTML as text, JSON, Markdown, TOML and the shared UI toolkit.
+# client, HTML as text, JSON, Markdown, TOML, the shared UI toolkit, and
+# for pictures base64, JPEG and PNG.
 [dependencies]
 td-civil = { path = "../td-civil" }
+td-encoding = { path = "../td-encoding" }
 td-fetch-client = { path = "../td-fetch-client" }
 td-fs = { path = "../td-fs" }
 td-html = { path = "../td-html" }
+td-jpeg = { path = "../td-jpeg" }
 td-json = { path = "../td-json" }
 td-markdown = { path = "../td-markdown" }
+td-png = { path = "../td-png" }
 td-toml = { path = "../td-toml" }
 td-ui = { path = "../td-ui" }
 

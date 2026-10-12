@@ -26,6 +26,28 @@ const TOOLS: &str = "{tools}";
 /// The system text of a title request (DESIGN.md §13).
 pub const TITLE: &str = include_str!("../prompt/title.txt");
 
+/// One message's JSON text, whose content is its text, then each
+/// picture after its label: placeholder parts that `picture::inline`
+/// fills as the request is sent (DESIGN.md §6, Pictures).
+pub fn message_parts(role: &str, content: &str, pictures: &[crate::picture::Reference]) -> String {
+    let text = |text: String| {
+        Json::Obj(vec![
+            ("type".into(), Json::Str("text".into())),
+            ("text".into(), Json::Str(text)),
+        ])
+    };
+    let mut parts = vec![text(content.to_string())];
+    for picture in pictures {
+        parts.push(text(picture.stand_in()));
+        parts.push(picture.part());
+    }
+    Json::Obj(vec![
+        ("role".into(), Json::Str(role.into())),
+        ("content".into(), Json::Arr(parts)),
+    ])
+    .to_string()
+}
+
 /// One message's JSON text.
 pub fn message(role: &str, content: &str) -> String {
     Json::Obj(vec![

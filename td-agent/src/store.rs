@@ -245,6 +245,8 @@ impl StateDir {
         let lock = lock_conversation(&dir, Duration::from_secs(2))?;
         let gone = self.conversations().join(format!("{DELETING}{id}"));
         std::fs::rename(&dir, &gone).map_err(|e| format!("{}: {e}", dir.display()))?;
+        // Pictures staged for it and never taken go with it.
+        let _ = std::fs::remove_dir_all(crate::picture::staging(self, id));
         let removed = File::open(self.conversations())
             .and_then(|d| d.sync_all())
             .and_then(|()| match std::fs::remove_dir_all(&gone) {
@@ -1432,8 +1434,13 @@ pub fn mcp_listing<'a>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Kind {
     /// The human's message, with the window's delivery id, which a
-    /// receiver logs once (DESIGN.md §6, Recovery).
-    User { delivery: String, text: String },
+    /// receiver logs once (DESIGN.md §6, Recovery), and the pictures it
+    /// carries, kept under `pictures/` (DESIGN.md §6, Pictures).
+    User {
+        delivery: String,
+        text: String,
+        pictures: Vec<crate::picture::Reference>,
+    },
     /// An effect logged and synced before it runs, for the event `of`.
     Started { effect: Effect, of: u64 },
     /// The effect started at `started` finished; `retry` when the human
@@ -1488,8 +1495,9 @@ pub enum Kind {
     /// A model request, logged and synced before it is sent: the turn it
     /// belongs to, what it is for, the prefix it begins with (0 for the
     /// file, else the `Prefix` event's sequence number), the exact text of
-    /// its body's other members (`head`), its body's length, and the
-    /// credits reserved for it. The body is a pure function of these and
+    /// its body's other members (`head`), its body's length as §14's
+    /// estimate counts it (each picture as the tokens it costs,
+    /// `picture::weighted`), and the credits reserved for it. The body is a pure function of these and
     /// the log before it (`request::body`).
     Request {
         turn: u64,
@@ -1663,10 +1671,20 @@ impl Event {
         ];
         let mut put = |key: &str, value: Json| pairs.push((key.into(), value));
         match &self.kind {
-            Kind::User { delivery, text } => {
+            Kind::User {
+                delivery,
+                text,
+                pictures,
+            } => {
                 put("kind", Json::Str("user".into()));
                 put("delivery", Json::Str(delivery.clone()));
                 put("text", Json::Str(text.clone()));
+                if !pictures.is_empty() {
+                    put(
+                        "pictures",
+                        Json::Arr(pictures.iter().map(|p| p.to_json()).collect()),
+                    );
+                }
             }
             Kind::Started { effect, of } => {
                 put("kind", Json::Str("started".into()));
@@ -2059,6 +2077,18 @@ impl Event {
             Some("user") => Kind::User {
                 delivery: string("delivery")?,
                 text: string("text")?,
+                pictures: match value.get("pictures") {
+                    None => Vec::new(),
+                    Some(list) => {
+                        let list = list.as_arr().ok_or("pictures is not a list")?;
+                        if list.len() > crate::picture::MAX_PICTURES {
+                            return Err("too many pictures".into());
+                        }
+                        list.iter()
+                            .map(crate::picture::Reference::from_json)
+                            .collect::<Result<_, _>>()?
+                    }
+                },
             },
             Some("started") => Kind::Started {
                 effect: value
@@ -2620,6 +2650,17 @@ impl Conversation {
         &self.prefix
     }
 
+    /// The picture bytes its messages carry in all.
+    pub fn picture_bytes(&self) -> u64 {
+        self.events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::User { pictures, .. } => Some(pictures.iter().map(|p| p.bytes).sum::<u64>()),
+                _ => None,
+            })
+            .sum()
+    }
+
     /// Whether the log has room for `bytes` more of records and the
     /// `LOG_RESERVE` after them: a reply is taken only while it would fit.
     pub fn has_room_for(&self, bytes: u64) -> bool {
@@ -3167,6 +3208,7 @@ pub mod tests {
 
     fn user(text: &str) -> Kind {
         Kind::User {
+            pictures: Vec::new(),
             delivery: random_hex(8).unwrap(),
             text: text.into(),
         }
@@ -4583,6 +4625,7 @@ pub mod tests {
         assert!(!conversation.delivered("d1"));
         conversation
             .append(Kind::User {
+                pictures: Vec::new(),
                 delivery: "d1".into(),
                 text: "x".into(),
             })
@@ -4674,6 +4717,7 @@ pub mod tests {
                 Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
             conversation
                 .append(Kind::User {
+                    pictures: Vec::new(),
                     delivery: "d1".into(),
                     text: r#"{"kind":"task","call":1}"#.into(),
                 })

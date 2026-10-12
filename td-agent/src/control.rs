@@ -430,7 +430,10 @@ mod tests {
         }
         assert!(remote.state().unwrap().contains("composer=2"));
         driven::request(&mut remote, b"1\t20\taction\tsend");
-        assert_eq!(remote.app.take_requests(), [Request::Send("ok".into())]);
+        assert_eq!(
+            remote.app.take_requests(),
+            [Request::Send("ok".into(), vec![])]
+        );
         assert!(driven::request(&mut remote, b"1\t21\taction\tnope").contains("protocol"));
         assert!(driven::request(&mut remote, b"1\t22\taction\tnew\tx").contains("protocol"));
         let text = driven::request(&mut remote, b"1\t23\ttext");

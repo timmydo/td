@@ -470,6 +470,14 @@ fn descend(dir: &Path, name: &str, depth: usize, never: &Never, walk: &mut Walk)
                         named,
                         "the workspaces' jail directories hold the human's work".into(),
                     ));
+                } else if (depth == 0 && file == crate::picture::PASTED)
+                    || (depth == 2
+                        && file == crate::picture::KEPT
+                        && name.starts_with("state/conversations/"))
+                {
+                    // Screenshots may show anything; the log names each.
+                    walk.left_out
+                        .push((named, "the person's pasted pictures".into()));
                 } else if depth == 2
                     && file == crate::wire::DIR
                     && name.starts_with("state/conversations/")
@@ -812,6 +820,13 @@ mod tests {
         std::fs::write(conversation.join(crate::wire::DIR).join("2"), "POST u\n").unwrap();
         std::fs::write(conversation.join("log"), "{\"seq\":1}\n").unwrap();
         std::fs::write(conversation.join("meta"), "{}").unwrap();
+        // The person's pictures, kept and staged, are theirs.
+        let kept = conversation.join(crate::picture::KEPT);
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("e".repeat(64)), "a screenshot").unwrap();
+        let staged = state.join(crate::picture::PASTED).join(&id);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("f".repeat(64)), "another").unwrap();
         let outbox = state.join("outbox").join(&id);
         std::fs::create_dir_all(&outbox).unwrap();
         // Past ustar's 100-byte name, split into its prefix.
@@ -890,6 +905,12 @@ mod tests {
             manifest.contains("state/leaky: it holds the API key"),
             "{manifest}"
         );
+        for pictures in [
+            format!("state/conversations/{id}/pictures: the person's pasted pictures"),
+            "state/pasted: the person's pasted pictures".into(),
+        ] {
+            assert!(manifest.contains(&pictures), "{manifest}");
+        }
         assert!(
             manifest.contains("a prefix event in its log replaces it"),
             "{manifest}"
@@ -913,7 +934,7 @@ mod tests {
             members.iter().all(|(name, _)| !name.contains("/jail/")),
             "{members:?}"
         );
-        assert_eq!((exported.files, exported.left_out), (5, 4));
+        assert_eq!((exported.files, exported.left_out), (5, 6));
         // No part is left, and a second export in the same second takes
         // a name of its own.
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);

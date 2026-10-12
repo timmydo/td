@@ -316,10 +316,17 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
     for event in events {
         match &event.kind {
             Kind::Request { purpose, .. } => purposes.push((event.seq, *purpose)),
-            Kind::User { text, .. } => out.push((
-                event.seq,
-                crate::prompt::message("user", &format!("{}{text}", at(event.time))),
-            )),
+            Kind::User { text, pictures, .. } => {
+                let text = format!("{}{text}", at(event.time));
+                out.push((
+                    event.seq,
+                    if pictures.is_empty() {
+                        crate::prompt::message("user", &text)
+                    } else {
+                        crate::prompt::message_parts("user", &text, pictures)
+                    },
+                ))
+            }
             Kind::Notification { text, mcp } => out.push((
                 event.seq,
                 crate::prompt::message(
@@ -1328,6 +1335,7 @@ mod tests {
             event(
                 1,
                 Kind::User {
+                    pictures: Vec::new(),
                     delivery: "d".into(),
                     text: "hi \"you\"".into(),
                 },
@@ -1384,6 +1392,7 @@ mod tests {
             event(
                 7,
                 Kind::User {
+                    pictures: Vec::new(),
                     delivery: "e".into(),
                     text: "again".into(),
                 },

@@ -7,11 +7,14 @@ name = "td-agent"
 version = "0.1.0"
 dependencies = [
  "td-civil",
+ "td-encoding",
  "td-fetch-client",
  "td-fs",
  "td-html",
+ "td-jpeg",
  "td-json",
  "td-markdown",
+ "td-png",
  "td-test-compositor",
  "td-toml",
  "td-ui",
@@ -19,6 +22,10 @@ dependencies = [
 
 [[package]]
 name = "td-civil"
+version = "0.1.0"
+
+[[package]]
+name = "td-encoding"
 version = "0.1.0"
 
 [[package]]
@@ -34,11 +41,19 @@ name = "td-html"
 version = "0.1.0"
 
 [[package]]
+name = "td-jpeg"
+version = "0.1.0"
+
+[[package]]
 name = "td-json"
 version = "0.1.0"
 
 [[package]]
 name = "td-markdown"
+version = "0.1.0"
+
+[[package]]
+name = "td-png"
 version = "0.1.0"
 
 [[package]]

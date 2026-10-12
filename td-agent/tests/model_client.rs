@@ -177,6 +177,7 @@ impl Harness {
     fn say(&mut self, text: &str) {
         let delivery = td_agent::store::random_hex(16).unwrap();
         self.down(&Down::User {
+            pictures: Vec::new(),
             delivery,
             text: text.into(),
         });
@@ -945,6 +946,72 @@ fn the_next_request_replays_the_log_and_the_reasoning_byte_for_byte() {
         )
     );
     assert_eq!(usage(&events), [(2_150_000_000, Basis::Reported)]);
+}
+
+/// A two-by-two PNG of one colour.
+const PICTURE: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd, 0xd4, 0x9a,
+    0x73, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x10, 0x50, 0x30, 0x00,
+    0x22, 0x06, 0x08, 0x05, 0x00, 0x0a, 0x0e, 0x01, 0x81, 0x56, 0x33, 0xee, 0xf3, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// A message's picture goes to the provider as its data URL, after its
+/// label; the log keeps its placeholder, and the request is logged with
+/// the size §14's estimate counts, the picture weighed as its tokens,
+/// so the next request's estimate does not count it twice.
+#[test]
+fn a_pasted_picture_is_sent_as_its_data_url_and_weighed_once() {
+    let mut h = Harness::new(
+        "picture",
+        Role::Orchestrator,
+        vec![Reply::sse("stream-sonnet.sse")],
+    );
+    h.setup(Client::default());
+    let picture = td_agent::picture::check(PICTURE, "image 1").unwrap();
+    td_agent::picture::stage(&h.state, &h.id, &picture, PICTURE).unwrap();
+    h.down(&Down::User {
+        delivery: td_agent::store::random_hex(16).unwrap(),
+        text: "What colour is [image 1]?".into(),
+        pictures: vec![picture.clone()],
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let sent = h.mock.requests()[0].text();
+    let url = format!("data:image/png;base64,{}", td_encoding::base64(PICTURE));
+    assert!(
+        sent.contains(&format!(
+            "{{\"type\":\"text\",\"text\":\"[image 1]\"}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{url}\"}}}}"
+        )),
+        "{sent}"
+    );
+    assert!(!sent.contains("td-picture:"), "{sent}");
+    let index = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e.kind,
+                Kind::Request {
+                    purpose: Purpose::Turn,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let Kind::Request { bytes, .. } = &events[index].kind else {
+        panic!("not a request")
+    };
+    let prefix = td_agent::store::read_prefix(&h.state, &h.id).unwrap();
+    let rebuilt = td_agent::client::body(&events, index, &prefix).unwrap();
+    assert!(rebuilt.contains("td-picture:image/png;2x2;"), "{rebuilt}");
+    let placeholder = picture.part().to_string().len() as u64;
+    // 2x2/750 + 1 = one token: four bytes in the placeholder's place.
+    assert_eq!(*bytes, rebuilt.len() as u64 - placeholder + 4);
+    assert_eq!(
+        *bytes,
+        td_agent::picture::weighted(&rebuilt, &td_agent::picture::known(&events))
+    );
 }
 
 /// A conversation begun when the prefix carried `tool_choice` and
@@ -5439,6 +5506,7 @@ fn a_call_started_and_not_finished_is_answered_as_interrupted_after_a_restart() 
         };
         let user = c
             .append(Kind::User {
+                pictures: Vec::new(),
                 delivery: "0".repeat(32),
                 text: "Plan it.".into(),
             })
@@ -5604,7 +5672,7 @@ fn a_message_between_two_conversations_wakes_the_receiver() {
     assert!(problems.is_empty(), "{problems:?}");
     let mut post = Post::new(outbox);
     supervisor
-        .send("Ask the conversation to summarise.".into())
+        .send("Ask the conversation to summarise.".into(), Vec::new())
         .unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let mut finished: Vec<Id> = Vec::new();
@@ -6170,6 +6238,7 @@ fn the_classifier_decides_a_crossing_in_auto_mode() {
     .unwrap();
     conversation
         .append(Kind::User {
+            pictures: Vec::new(),
             delivery: "d".repeat(32),
             text: "the plan for the other work".into(),
         })
@@ -6394,6 +6463,7 @@ fn a_deny_taken_while_the_classifier_is_asked_refuses_the_crossing() {
     .unwrap();
     conversation
         .append(Kind::User {
+            pictures: Vec::new(),
             delivery: "d".repeat(32),
             text: "the plan for the other work".into(),
         })
@@ -7129,6 +7199,7 @@ fn a_crossing_answered_for_good_holds_one_way_only() {
     .unwrap();
     conversation
         .append(Kind::User {
+            pictures: Vec::new(),
             delivery: "d".repeat(32),
             text: "the plan for the other work".into(),
         })
@@ -7275,6 +7346,7 @@ fn a_read_of_another_log_asks_the_person_first() {
         .unwrap();
         conversation
             .append(Kind::User {
+                pictures: Vec::new(),
                 delivery: "d".repeat(32),
                 text: "the plan for the other work".into(),
             })
@@ -7625,6 +7697,7 @@ fn calibrate_puts_each_case_to_both_stages_and_counts_them() {
 fn read_two(conversation: &mut Conversation, old: usize, recent: usize) -> u64 {
     let user = conversation
         .append(Kind::User {
+            pictures: Vec::new(),
             delivery: "1".repeat(32),
             text: "Read both.".into(),
         })

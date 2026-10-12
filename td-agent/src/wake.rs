@@ -162,6 +162,7 @@ mod tests {
             u,
             120,
             Kind::User {
+                pictures: Vec::new(),
                 delivery: "d".into(),
                 text: "go on".into(),
             },

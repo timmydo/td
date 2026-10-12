@@ -261,7 +261,7 @@ pub fn render(event: &Event) -> String {
             bytes,
             ..
         } => format!(
-            "a {} request of {bytes} bytes, in the turn begun at #{turn}",
+            "a {} request of {bytes} bytes, each picture counted as its tokens, in the turn begun at #{turn}",
             purpose.word()
         ),
         Kind::Assistant {
@@ -711,6 +711,7 @@ mod tests {
         event(
             seq,
             Kind::User {
+                pictures: Vec::new(),
                 delivery: "d".into(),
                 text: text.into(),
             },

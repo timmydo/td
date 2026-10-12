@@ -102,10 +102,13 @@ measured effect of edit formats and tool ergonomics. td-agent
 reimplements none of them and inherits none of their compatibility claims.
 
 td-agent is its own crate, `td-agent/`, and its own static binary, built by
-td's source-built stage2 toolchain. Its manifest declares eight
-dependencies, all td crates by path: `td-civil`, `td-fetch-client`,
-`td-fs`, `td-html`, `td-json`, `td-markdown`, `td-toml` and `td-ui`, and
-its lock lists exactly those and td-agent. It
+td's source-built stage2 toolchain. Its manifest declares eleven
+dependencies, all td crates by path: `td-civil`, `td-encoding`,
+`td-fetch-client`, `td-fs`, `td-html`, `td-jpeg`, `td-json`,
+`td-markdown`, `td-png`, `td-toml` and `td-ui`, and its lock lists
+exactly those and td-agent. The person's pictures are read by td-png and
+td-jpeg, the decoders td-ui's other programs share, and sent in base64
+by td-encoding's (§6, Pictures). It
 carries no TLS, resolves no names and opens no network
 connection itself: every request to a model provider goes through the td
 fetch service (APPLICATIONS.md §W.8) by td-fetch-client, as td-news and
@@ -120,8 +123,10 @@ plugin host, and not a client of any td-run server (principle 5).
 Out of scope for the first increments, each a later reviewed addition: an
 MCP client (planned, §12, MCP servers: servers are commands in the jail,
 never loaded into td-agent), web search, a provider dialect other than
-OpenAI Chat Completions, images, plugins, and any socket listening
-outside a jail's own loopback.
+OpenAI Chat Completions, pictures other than the person's pasted PNG
+and JPEG (§6, Pictures: a tool's or a reply's pictures are a later
+increment), plugins, and any socket listening outside a jail's own
+loopback.
 
 ## 2. Processes and trust
 
@@ -1109,8 +1114,28 @@ says.
   action buttons and wrapped text block, never transcript text.
 - a question the model asks (§12), above the composer until answered.
 - the todo list (§12), collapsed to its item in progress until opened.
-- the composer, an editable pane. `Return` sends, as `C-Return` does from
-  outside a dialog; `S-Return` is a newline.
+- the composer, an editable pane. `Return` sends, as `C-Return` does
+  from outside a dialog; `S-Return` is a newline. `C-v` and `S-Insert`
+  ask the clipboard for its picture when the selection offers PNG or
+  JPEG (td-ui DESIGN.md, Widget window), and for its text otherwise, so
+  a screenshot tool's or a browser's copied image comes as the picture.
+  A pasted picture is checked as §6's Pictures says, held by the window,
+  and named in the composer's text by a label of its own, `[image 1]`,
+  numbered past the highest held; a note says its size. A picture whose
+  label the text no longer names is let go when another is pasted, so
+  at most 8 are held. A message, or a command of the person's (§15),
+  carries the held pictures its text names, in the order it names them,
+  and every held picture is let go when it is sent; deleting the label
+  leaves its picture out. One naming more than 8 is not sent, and says
+  so. A message the window cannot hand on, or the child refuses, comes
+  back to the composer with its pictures; one whose label a picture
+  pasted since holds is labelled anew, in the returned text too. A
+  message carrying pictures does not answer a question the model asked
+  (§12), which wants words; it is refused with why. The transcript shows
+  the person's pictures below their text, read from where the
+  conversation keeps them and decoded within 1024 pixels a side, a JPEG
+  at the DCT scale that brings it within and a PNG halved until it is;
+  one that cannot be read shows as a line saying why.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
   whether the workspace is unconfined, context used against the model's
   length, the resource limits (`no limits` until §8's land), the count
@@ -1784,8 +1809,10 @@ keeps that bears on what it did, and never the key file.
   §15 reads it), a file that is not regular (each is opened without
   waiting and checked by its descriptor, so a FIFO swapped in never
   blocks the export), one past the log's 256 MiB bound, one deeper than
-  four directories, and anything past 1 GiB in all; the walk considers
-  at most 100,000 names, and the manifest counts the rest.
+  four directories, the person's pictures (`pasted/` and each
+  conversation's `pictures/`, §6, which may show anything and which the
+  log names by reference), and anything past 1 GiB in all; the walk
+  considers at most 100,000 names, and the manifest counts the rest.
 - **The archive** is ustar, written by td-agent itself, members mode
   0600 with uid and gid 0, a name past ustar's 100 bytes split into its
   prefix field. A file that cannot be written into it ends the export,
@@ -2100,22 +2127,26 @@ it fits a log line. `http-referer` is `https://github.com/timmydo/td`.
   thread of the window's, under a 16 MiB bound. It is cached as the
   state directory's `models`, and only `id`, `context_length` (or the
   top provider's), `top_provider.max_completion_tokens`, the pricing
-  above and `supported_parameters` are kept. A model the configuration
-  names (`model`, `title_model`, `classifier_model`,
+  above, `supported_parameters` and `architecture.input_modalities` are
+  kept. A model whose `input_modalities` names `image`, or that the list
+  leaves out or whose entry names no modality, is sent the person's
+  pictures; one whose list names others alone is sent a line in each
+  one's place saying it was left out (§6, Pictures). A model the
+  configuration names (`model`, `title_model`, `classifier_model`,
   `classifier_fast_model`) that the list leaves out is looked for in
   `GET /models/{id}/endpoints`, the one listing OpenRouter gives Jev,
   its id taken only when it stands in a path as it is, and kept priced
   at its dearest endpoint for each price (an endpoint without a
   cache-read price counted at its prompt price), or unpriced when any
-  endpoint is, with the least context and completion and the
-  parameters every endpoint supports; one not found there stays out,
-  why said on standard error, and is refused where it is used. The list
-  is cached and shown before any lookup, and again with what the
-  lookups found, so a slow lookup holds back no listed model; until it
-  returns, the cache lacks a looked-up model, and a crossing that wants
-  Jev in that time goes to the human while `jev_required`. `review`
-  and `calibrate` look up the models they use the same way. Conversation
-  processes read that cache.
+  endpoint is, with the least context and completion and the parameters
+  every endpoint supports; one not found there stays out, why said on
+  standard error, and is refused where it is used. The list is cached
+  and shown before any lookup, and again with what the lookups found, so
+  a slow lookup holds back no listed model; until it returns, the cache
+  lacks a looked-up model, and a crossing that wants Jev in that time
+  goes to the human while `jev_required`. `review` and `calibrate` look
+  up the models they use the same way. Conversation processes read that
+  cache.
 - **Credit** is `GET /key` with the key and no redirect followed, at
   start and after a turn ends, at most every 20 s. The row shows
   `limit_remaining` (a negative remainder as zero), or what the key has
@@ -2300,6 +2331,8 @@ removal whose lock nobody holds), holding:
 - `meta`: title, workspace, model, mode, parent conversation when forked,
   creation time, whether it is archived, and a `role` kept only as data
   (§3).
+- `pictures/`: the person's pictures its messages carry, each named by
+  its SHA-256 and written once (Pictures, below).
 - `prefix`: the exact bytes of the request prefix (§13), written once at
   creation and never rewritten. A later td-agent whose prompt or tool
   definitions differ appends a new prefix as a log event instead, which
@@ -2341,8 +2374,53 @@ on load, and dropping it is reported. The log doubles as the audit
 trail: no jail instance can write it, and the classifier's and the
 human's verdicts are in it. A conversation can be forked at any
 message, which copies its prefix and log up to there into a new
-conversation, and exported to a local file; nothing is shared through
-any service.
+conversation, with the pictures those messages carry, and exported to a
+local file; nothing is shared through any service.
+
+**Pictures.** A picture the person pastes (§4) is a PNG or a JPEG by its
+first bytes, whatever the clipboard named it, at most 5 MB (the least of
+the providers' bounds) and 1 to 8000 pixels a side, read from its header
+before it is decoded whole, its pixels then dropped, so a picture is
+never taken that td-agent cannot show. A message carries at most 8, and
+a conversation's messages at most 20 MB in all, so a request carrying
+every one in base64 stays inside the fetch service's 32 MiB. The window
+writes each picture of a message it sends under the state directory's
+`pasted/<conversation>/<digest>`, owner-only, before the message goes;
+the message names each by reference: its digest, type, size and label.
+The child, the conversation's one writer, refuses the message over
+either bound, and otherwise takes each picture into its own `pictures/`
+before it logs the message: read whole under the bound, checked against
+the reference's length, digest and type, written once and durably under
+its digest, and the staged copy removed. A picture already kept, a
+message resent after a restart, is checked where it is. A message
+refused comes back to the window with its references. For the open
+conversation the window reads each picture back, staged or already kept,
+for the composer; a staged copy is removed unless another message still
+waiting names the same picture. For another conversation its pictures
+stay where they are, which standard error says. Deleting a conversation
+removes its staging directory, once the conversation is renamed away; a
+picture staged for a message never taken stays there until then, as one
+taken for a message refused after it stays in `pictures/`.
+
+The log names a picture by reference only, and a request's messages
+carry each as a placeholder part, `td-picture:<type>;<w>x<h>;<digest>`,
+after a text part holding its label, so every request is still a pure
+function of `prefix` and `log` and the log's lines stay small; the Debug
+view (§4), rebuilding a body from the log, shows the placeholder. As the
+request is sent, each placeholder of a picture the person's messages
+carry, at most as often as they carry it, becomes the picture's `data:`
+URL, read from `pictures/` and checked against its reference; any other
+text that spells a placeholder out (a provider's reasoning details, an
+MCP server's schema) is left as it is, so such text cannot send more
+than the conversation's own pictures, and only a party that knows a
+picture's digest and size, which the provider alone is sent, can spell
+out one that matches. For a model whose list says it reads no images
+(§5), or for a picture that cannot be read, the placeholder becomes a
+text part saying the picture was left out and why; the request still
+goes. The §14 estimate, compaction's included, counts each picture as
+its pixels over 750 tokens, at most 1600, as providers scale and count
+them, rather than its placeholder's bytes, and a request is logged with
+its size counted so.
 
 **Wire records.** Beside the log, `http/<request>` in the conversation's
 directory keeps what each request to the provider (a turn's step, a
@@ -6631,7 +6709,8 @@ event as any change is.
 The model's context is the prefix (§13) plus a view of the log; the log
 itself keeps everything (§6). The budget is the model's `context_length`
 from §5. The prompt is estimated as the last response's reported prompt
-tokens plus a bytes-over-four estimate of what has been appended since.
+tokens plus a bytes-over-four estimate of what has been appended since,
+each picture counted as §6's Pictures says.
 As built (increment 7), the last response is the last one answered
 whole, its report counting its prompt and completion: a failed or
 incomplete reply's report is left out, since its completion is never

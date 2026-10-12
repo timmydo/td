@@ -1184,7 +1184,11 @@ impl Session {
                     rules,
                     mode,
                 } => self.policy(version, rules, mode),
-                Down::User { delivery, text } => self.user(delivery, text)?,
+                Down::User {
+                    delivery,
+                    text,
+                    pictures,
+                } => self.user(delivery, text, pictures)?,
                 Down::Message {
                     delivery,
                     from,
@@ -1237,14 +1241,19 @@ impl Session {
         Ok(())
     }
 
-    fn user(&mut self, delivery: String, text: String) -> Result<(), String> {
+    fn user(
+        &mut self,
+        delivery: String,
+        text: String,
+        pictures: Vec<crate::picture::Reference>,
+    ) -> Result<(), String> {
         if self.conversation.delivered(&delivery) {
             // A message the window sent again after a restart: logged
             // once, acknowledged each time.
             self.send(&Up::Delivered { delivery });
             return Ok(());
         }
-        if let Some(reason) = self.refusal(&text) {
+        if let Some(reason) = self.admit(&text, &pictures) {
             self.send(&Up::Refused { delivery, reason });
             return Ok(());
         }
@@ -1257,6 +1266,7 @@ impl Session {
         let user = self.conversation.append(Kind::User {
             delivery: delivery.clone(),
             text: text.clone(),
+            pictures,
         })?;
         let of = user.seq;
         let user = user.clone();
@@ -1281,16 +1291,50 @@ impl Session {
     }
 
     /// Why a message from the person is not taken, if it is not.
-    fn refusal(&self, text: &str) -> Option<String> {
+    fn refusal(&self, text: &str, pictures: &[crate::picture::Reference]) -> Option<String> {
+        use crate::picture::{MAX_CONVERSATION_PICTURE_BYTES, MAX_PICTURES};
+        let carried: u64 = pictures.iter().map(|p| p.bytes).sum();
         if text.len() > MAX_TEXT {
             Some(format!("a message is at most {MAX_TEXT} bytes"))
-        } else if text.trim().is_empty() {
+        } else if text.trim().is_empty() && pictures.is_empty() {
             Some("an empty message".to_string())
-        } else if !self.conversation.has_room(text.len()) {
+        } else if pictures.len() > MAX_PICTURES {
+            Some(format!("a message carries at most {MAX_PICTURES} pictures"))
+        } else if self.conversation.picture_bytes().saturating_add(carried)
+            > MAX_CONVERSATION_PICTURE_BYTES
+        {
+            Some(format!(
+                "a conversation's pictures are at most {} MB in all, which this one's would pass; start another conversation for more",
+                MAX_CONVERSATION_PICTURE_BYTES / 1_000_000
+            ))
+        } else if !self.conversation.has_room(
+            text.len()
+                .saturating_add(pictures.len().saturating_mul(512)),
+        ) {
             Some("the conversation's log is full; start another conversation".to_string())
         } else {
             None
         }
+    }
+
+    /// `refusal`, and then each picture taken from where the window
+    /// staged it into the conversation's own (DESIGN.md §6, Pictures),
+    /// before the message that names them is logged.
+    fn admit(&self, text: &str, pictures: &[crate::picture::Reference]) -> Option<String> {
+        if let Some(reason) = self.refusal(text, pictures) {
+            return Some(reason);
+        }
+        let state = StateDir::at(self.state.clone());
+        let id = &self.conversation.meta().id;
+        let dir = state.conversation(id);
+        // One that fails leaves those taken before it kept, unnamed by the
+        // log: a resend finds them there.
+        for picture in pictures {
+            if let Err(e) = crate::picture::adopt(&state, id, &dir, picture) {
+                return Some(format!("a picture could not be taken: {e}"));
+            }
+        }
+        None
     }
 
     /// The person's messages that came while the turn ran, ahead of any
@@ -1309,7 +1353,11 @@ impl Session {
                 .iter()
                 .take_while(|down| !matches!(down, Down::Pause { .. }))
                 .position(|down| matches!(down, Down::User { .. }));
-            let Some(Down::User { delivery, text }) = next.and_then(|at| self.queue.remove(at))
+            let Some(Down::User {
+                delivery,
+                text,
+                pictures,
+            }) = next.and_then(|at| self.queue.remove(at))
             else {
                 return Ok(());
             };
@@ -1317,7 +1365,7 @@ impl Session {
                 self.send(&Up::Delivered { delivery });
                 continue;
             }
-            if let Some(reason) = self.refusal(&text) {
+            if let Some(reason) = self.admit(&text, &pictures) {
                 self.send(&Up::Refused { delivery, reason });
                 continue;
             }
@@ -1326,6 +1374,7 @@ impl Session {
                 .append(Kind::User {
                     delivery: delivery.clone(),
                     text,
+                    pictures,
                 })?
                 .clone();
             self.sync()?;
@@ -1890,7 +1939,14 @@ impl Session {
                 .as_ref()
                 .filter(|_| !noticed)
                 .map_or(0, |n| n.len() as u64 + 256);
-            let estimate = client::estimate(events, (body.len() as u64).saturating_add(unlogged));
+            // A picture is counted as the tokens it costs, not its
+            // placeholder's bytes (DESIGN.md §6, Pictures), here and in
+            // the size the request is logged with.
+            let known = crate::picture::known(events);
+            let estimate = client::estimate(
+                events,
+                crate::picture::weighted(&body, &known).saturating_add(unlogged),
+            );
             // Resuming cold asks first, once a turn (DESIGN.md §14); a
             // turn's last request comes after a step that did.
             if wrap.is_none() && !cold_asked && stage == Stage::Whole {
@@ -2042,13 +2098,17 @@ impl Session {
                 purpose: Purpose::Turn,
                 prefix,
                 head,
-                bytes: body.len() as u64,
+                bytes: crate::picture::weighted(
+                    &body,
+                    &crate::picture::known(self.conversation.events()),
+                ),
                 reserved,
             })?;
             // Logged as started and synced before it is sent: a restart
             // that finds it unfinished never sends it again.
             self.sync()?;
-            let failure = match self.stream(request.seq, &client, &key, body) {
+            let pictures = model.as_ref().is_none_or(Model::takes_pictures);
+            let failure = match self.stream(request.seq, &client, &key, body, pictures) {
                 Streamed::Replied(completion) => {
                     let cost = charge(completion.usage, pricing, reserved);
                     let outcome = self.reply(request.seq, &completion, cost)?;
@@ -2188,11 +2248,14 @@ impl Session {
             .filter(|(_, (_, m))| !m.starts_with("{\"role\":\"tool\""))
             .map(|(i, _)| i)
             .collect();
+        // Each picture counted as the tokens it costs (DESIGN.md §6,
+        // Pictures).
+        let known = crate::picture::known(events);
         let tokens = |from: usize| -> u64 {
             view.get(from..)
                 .unwrap_or_default()
                 .iter()
-                .map(|(_, m)| m.len() as u64)
+                .map(|(_, m)| crate::picture::weighted(m, &known))
                 .sum::<u64>()
                 .div_ceil(4)
         };
@@ -2248,7 +2311,12 @@ impl Session {
             model
                 .as_ref()
                 .and_then(|m| m.context_length)
-                .is_none_or(|c| (body.len() as u64).div_ceil(4).saturating_add(bound) <= c)
+                .is_none_or(|c| {
+                    crate::picture::weighted(body, &known)
+                        .div_ceil(4)
+                        .saturating_add(bound)
+                        <= c
+                })
         };
         // Left out from the oldest step on, an earlier summary's message
         // kept before what is left.
@@ -2279,7 +2347,9 @@ impl Session {
             return not(format!("not even its last step fits {name}'s context"));
         };
         let pricing = model.as_ref().and_then(|m| m.pricing);
-        let reserved = pricing.map_or(0, |p| p.reserve((body.len() as u64).div_ceil(4), bound));
+        let reserved = pricing.map_or(0, |p| {
+            p.reserve(crate::picture::weighted(&body, &known).div_ceil(4), bound)
+        });
         let within = cost::within(
             "max_cost_per_turn",
             client.limits.turn,
@@ -2321,13 +2391,14 @@ impl Session {
             purpose: Purpose::Compact,
             prefix,
             head,
-            bytes: body.len() as u64,
+            bytes: crate::picture::weighted(&body, &known),
             reserved,
         })?;
         self.sync()?;
         // Streamed as a turn's is, within its budget and interruptible;
         // the window does not draw it as it comes.
-        let failed = match self.stream(request.seq, client, key, body) {
+        let pictures = model.as_ref().is_none_or(Model::takes_pictures);
+        let failed = match self.stream(request.seq, client, key, body, pictures) {
             Streamed::Replied(completion) => {
                 let cost = charge(completion.usage, pricing, reserved);
                 let text = completion.content.clone().unwrap_or_default();
@@ -5870,12 +5941,23 @@ impl Session {
                 }
                 Some(Ok(at)) => {
                     let taken = match self.queue.get(at) {
-                        Some(Down::User { delivery, text }) => {
+                        Some(Down::User {
+                            delivery,
+                            text,
+                            pictures,
+                        }) => {
                             if self.conversation.delivered(delivery) {
                                 Err(Up::Delivered {
                                     delivery: delivery.clone(),
                                 })
-                            } else if let Some(reason) = self.refusal(text) {
+                            } else if !pictures.is_empty() {
+                                // An answer is words; a picture would be
+                                // dropped from it unseen.
+                                Err(Up::Refused {
+                                    delivery: delivery.clone(),
+                                    reason: "a message with pictures does not answer a question; answer in words, then send the pictures".into(),
+                                })
+                            } else if let Some(reason) = self.refusal(text, &[]) {
                                 Err(Up::Refused {
                                     delivery: delivery.clone(),
                                     reason,
@@ -6665,14 +6747,26 @@ impl Session {
     /// Sends turn request `request` as a stream and reads its reply as it
     /// comes, drawing what each frame brings in the window, until the
     /// reply ends or fails or the window interrupts it. A window that
-    /// closes meanwhile leaves the reply to be read and logged whole.
-    fn stream(&mut self, request: u64, client: &Client, key: &Secret, body: String) -> Streamed {
+    /// closes meanwhile leaves the reply to be read and logged whole. Its
+    /// pictures go as the body's placeholders are filled, or as stand-ins
+    /// where the model takes no `pictures`.
+    fn stream(
+        &mut self,
+        request: u64,
+        client: &Client,
+        key: &Secret,
+        body: String,
+        pictures: bool,
+    ) -> Streamed {
         self.live.store(request, Ordering::SeqCst);
         let url = format!("{}/chat/completions", client.base_url);
         let headers = client::headers(key.expose());
         // What the exchange carries, for the window's Debug view, its
         // credentials never among it (DESIGN.md §6).
         let mut record = crate::wire::Record::new("POST", &url, &headers);
+        let dir = StateDir::at(self.state.clone()).conversation(&self.conversation.meta().id);
+        let known = crate::picture::known(self.conversation.events());
+        let body = crate::picture::inline(&body, &dir, pictures, &known);
         let (send, live) = (self.sender.clone(), self.live.clone());
         let spawned = std::thread::Builder::new()
             .name("td-agent-stream".into())
@@ -8307,6 +8401,7 @@ mod tests {
 
     fn say(stream: &mut UnixStream, delivery: &str, text: &str) {
         let down = Down::User {
+            pictures: Vec::new(),
             delivery: delivery.into(),
             text: text.into(),
         };
@@ -8400,6 +8495,62 @@ mod tests {
         assert_eq!(conversation.events().len(), 3);
     }
 
+    /// A message's pictures, staged by the window, are taken into the
+    /// conversation's own and logged by reference; a picture alone is a
+    /// message; one never staged refuses the message that names it.
+    #[test]
+    fn a_messages_pictures_are_taken_and_logged_by_reference() {
+        let scratch = Scratch::new("pictures");
+        let state = scratch.state();
+        let id = Id::random().unwrap();
+        let (mut window, theirs) = UnixStream::pair().unwrap();
+        let served = {
+            let (state, id) = (state.clone(), id.clone());
+            std::thread::spawn(move || serve(theirs, &state, &id, Some(Role::Conversation)))
+        };
+        assert!(matches!(next(&mut window), Up::Hello { .. }));
+        keyless(&mut window);
+        let bytes = crate::picture::tests::png(2, 2, [7, 8, 9]);
+        let picture = crate::picture::check(&bytes, "image 1").unwrap();
+        crate::picture::stage(&state, &id, &picture, &bytes).unwrap();
+        let down = Down::User {
+            delivery: D1.into(),
+            text: String::new(),
+            pictures: vec![picture.clone()],
+        };
+        frame::write(&mut window, &down.encode()).unwrap();
+        let Up::Event(user) = next(&mut window) else {
+            panic!("no user event")
+        };
+        assert!(
+            matches!(user.kind, Kind::User { ref pictures, .. } if *pictures == [picture.clone()])
+        );
+        let dir = state.conversation(&id);
+        assert_eq!(crate::picture::read(&dir, &picture).unwrap(), bytes);
+        loop {
+            if finished(&next(&mut window)).is_some() {
+                break;
+            }
+        }
+        // Named, never staged: refused, nothing logged.
+        let other =
+            crate::picture::check(&crate::picture::tests::png(1, 1, [0; 3]), "image 1").unwrap();
+        let down = Down::User {
+            delivery: D2.into(),
+            text: "look [image 1]".into(),
+            pictures: vec![other],
+        };
+        frame::write(&mut window, &down.encode()).unwrap();
+        let Up::Refused { reason, .. } = next(&mut window) else {
+            panic!("not refused")
+        };
+        assert!(reason.contains("could not be taken"), "{reason}");
+        drop(window);
+        served.join().unwrap().unwrap();
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert_eq!(conversation.picture_bytes(), bytes.len() as u64);
+    }
+
     /// A later `Setup`, the key the human stored from the window's dialog,
     /// replaces the first between turns: the next turn has the key.
     #[test]
@@ -8479,6 +8630,7 @@ mod tests {
         assert_eq!(take(&mut queue), None);
         // The human's own message keeps its place ahead of a pause.
         let user = Down::User {
+            pictures: Vec::new(),
             delivery: D2.into(),
             text: "mine".into(),
         };
@@ -8642,6 +8794,7 @@ mod tests {
                 Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
             conversation
                 .append(Kind::User {
+                    pictures: Vec::new(),
                     delivery: D1.into(),
                     text: "lost title".into(),
                 })
@@ -8803,6 +8956,7 @@ mod tests {
             event(
                 3,
                 Kind::User {
+                    pictures: Vec::new(),
                     delivery: "typed".into(),
                     text: "go on".into(),
                 },
@@ -8842,6 +8996,7 @@ mod tests {
                 seq: 2,
                 time: 0,
                 kind: Kind::User {
+                    pictures: Vec::new(),
                     delivery: "typed".into(),
                     text: "again".into(),
                 },
