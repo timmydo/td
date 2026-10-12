@@ -14,7 +14,7 @@ use crate::{
 use std::ops::Range;
 use td_json::scan;
 
-fn storage(error: ports::Error) -> Error {
+pub(super) fn storage(error: ports::Error) -> Error {
     match error {
         ports::Error::Deadline => Error::ExecutionDeadline,
         ports::Error::Capacity => Error::StorageCapacity,
@@ -258,4 +258,4 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
 
 #[cfg(test)]
 #[path = "mailbox_get_tests.rs"]
-mod tests;
+pub(super) mod tests;

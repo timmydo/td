@@ -7221,3 +7221,30 @@ Complete and incomplete polls check the retained snapshot; failures stick.
 finish requires completion and checks the snapshot again before returning
 passive page metadata. A method encoder must keep its own view alive, treat
 output as provisional, and check that view before publishing the response.
+
+## Retained Mailbox/changes dispatch
+
+The retained dispatcher executes Mailbox/changes only when the admitted
+request opts into Mail. Live HTTPS and Session remain Core-only until the
+complete Mail conformance gate. Validate accountId, required string
+sinceState, optional nullable maxChanges, and reject unknown arguments.
+Malformed or unavailable state strings return cannotCalculateChanges;
+non-string state arguments return invalidArguments. Validate argument
+shapes before account availability and state interpretation.
+
+maxChanges is an exact JSON UnsignedInt in 0..=2^53-1, with zero rejected.
+Integer-valued decimal/exponent spellings are accepted without floating
+rounding. Null/omitted limits default to the configured object limit;
+positive UnsignedInt values above that limit are clamped to it and then to
+the retained cursor ceiling defined above. Values outside UnsignedInt are
+rejected. Numeric scanning uses a fixed
+256-byte buffer under the original work and execution checks.
+
+One retained view drives the complete cursor and remains alive through
+response encoding. Charge every cursor poll against the enclosing request
+budget. Publish accountId, oldState, newState, hasMoreChanges and separate
+created/updated/destroyed ID arrays only after a final view check.
+updatedProperties is always null: the current history records do not prove
+which mailbox fields changed. Common result-reference substitution applies
+to arguments and results. Existing method rollback preserves other replies;
+outer retention failures remain terminal.

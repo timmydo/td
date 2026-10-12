@@ -1918,6 +1918,13 @@ including result references, bounded enumeration and same-view counts. The
 live HTTPS capability preflight remains Core-only until the complete Mail
 surface satisfies the conformance gate.
 
+The retained Mailbox/changes dispatcher validates scoped state and exact
+UnsignedInt limits, consumes one retained change-page cursor and encodes
+transaction-aligned changes under the original request work and deadline.
+It keeps the read view through final publication and emits null
+updatedProperties because history does not track per-field changes.
+This method remains behind admitted Mail opt-in; live admission is Core-only.
+
 The retained change-page cursor coalesces typed object history into bounded
 transaction-aligned pages. API.md owns its token scope, limit, snapshot and
 completion contract. Wire argument handling and changes-method dispatch are

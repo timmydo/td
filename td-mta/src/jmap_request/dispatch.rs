@@ -3,6 +3,8 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "mailbox_changes.rs"]
+mod mailbox_changes;
 #[path = "mailbox_get.rs"]
 mod mailbox_get;
 #[path = "push.rs"]
@@ -16,6 +18,7 @@ pub enum Error {
     ExecutionDeadline,
     InvalidArguments,
     AccountNotFound,
+    CannotCalculateChanges,
     FromAccountNotFound,
     InvalidResultReference,
     UnknownMethod,
@@ -123,6 +126,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     return Err(Error::Storage(error));
                 }
                 let body: &[u8] = match error {
+                    Error::CannotCalculateChanges => br#"{"type":"cannotCalculateChanges"}"#,
                     Error::AccountNotFound => br#"{"type":"accountNotFound"}"#,
                     Error::FromAccountNotFound => br#"{"type":"fromAccountNotFound"}"#,
                     Error::InvalidArguments => br#"{"type":"invalidArguments"}"#,
@@ -273,6 +277,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"PushSubscription/get" if core => "PushSubscription/get",
             b"PushSubscription/set" if core => "PushSubscription/set",
             b"Mailbox/get" if mail => "Mailbox/get",
+            b"Mailbox/changes" if mail => "Mailbox/changes",
             _ => return Err(Error::UnknownMethod),
         };
         let start = self.retention.len();
@@ -284,6 +289,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let result = if name == "Blob/copy" {
             self.blob_copy(start..end)
+        } else if name == "Mailbox/changes" {
+            self.mailbox_changes(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Mailbox/get" {
             self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
         } else {

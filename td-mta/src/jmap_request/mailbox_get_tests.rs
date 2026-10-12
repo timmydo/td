@@ -38,25 +38,25 @@ impl Clock for Timer {
         })
     }
 }
-fn deadline() -> Deadline {
+pub(crate) fn deadline() -> Deadline {
     Deadline::after(Tick(0), 100).unwrap()
 }
-fn mailbox(n: u16) -> MailboxId {
+pub(crate) fn mailbox(n: u16) -> MailboxId {
     let mut bytes = [0; 16];
     bytes[..2].copy_from_slice(&n.to_be_bytes());
     MailboxId::from_bytes(bytes)
 }
-fn id(n: u16) -> String {
+pub(crate) fn id(n: u16) -> String {
     wire::encode_id(mailbox(n), &mut [0; wire::IdKind::WIRE_BYTES])
         .unwrap()
         .to_owned()
 }
-fn account() -> String {
+pub(crate) fn account() -> String {
     wire::encode_id(ACCOUNT, &mut [0; wire::IdKind::WIRE_BYTES])
         .unwrap()
         .to_owned()
 }
-fn batch(calls: &str) -> String {
+pub(crate) fn batch(calls: &str) -> String {
     format!(
         r#"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":{calls}}}"#
     )
@@ -74,6 +74,17 @@ fn run_cutoff(
     phase: u64,
     busy: bool,
     cutoff: Option<u64>,
+) -> td_json::Json {
+    run_setup(input, count, maximum, phase, busy, cutoff, |_| {})
+}
+pub(crate) fn run_setup(
+    input: &str,
+    count: u16,
+    maximum: usize,
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+    setup: impl FnOnce(&IndexStore<'_>),
 ) -> td_json::Json {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
@@ -152,6 +163,7 @@ fn run_cutoff(
     if count >= 257 {
         seed_window_counts(&store);
     }
+    setup(&store);
     let mut states = [const { SlotState::EMPTY }; 4];
     let mut cells = [const { LeaseCell::EMPTY }; 4];
     let coordinator = StoreCoordinator::new(
