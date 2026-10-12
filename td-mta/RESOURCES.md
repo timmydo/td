@@ -162,6 +162,18 @@ encoded-header adapters or combined service RSS.
   the request allocations. Cancellation or step refusal can return the same
   arenas through into_request instead; this is distinct from the earlier
   validation owners' recoverable consuming refusals.
+  The inert result index owns the same request arenas and 128 fixed response
+  entries; a size test checks ADMISSION.md's 8 KiB response-index planning estimate. Append visits
+  at most 64 call tuples without traversing argument trees or string bytes.
+  Lookup compares one primary ID, at most 256 call-ID bytes plus a 64-byte
+  server name per turn, and may skip one implicit entry by token identity.
+  Across R references, worst-case comparison work scales with R times the
+  sum of earlier call-ID lengths; identical long prefixes can exhaust the
+  original runtime work budget, which must report a resource failure. Reference strings and the immutable index
+  stay borrowed until lookup ends; no string copies or response tree are
+  allocated. This is not file custody or an authorization to read a Span.
+  Runtime must bind the index to retention and charge work/deadline checks;
+  combined-owner memory and actual disk traversal still need qualification.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

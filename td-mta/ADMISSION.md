@@ -721,6 +721,33 @@ Implement RFC 8620 section 3.7 against immutable retained response bytes:
 3. Apply JSON Pointer to its arguments, including ~0/~1 escaping, array-index
    rules and the RFC's array-only wildcard mapping/order/flattening behavior.
 
+The inert `jmap_request::result_index::Responses` implements the first two
+steps. It owns the immutable admitted request and holds at most 128 entries,
+two per admitted call, in wire order without skipped calls. The selected
+Core/Mail/Submission methods each require one reply plus at most one implicit
+reply; an extension with another response cardinality needs new planning before
+it can be advertised. This is not a universal extension-method constraint.
+Each entry stores
+a server-literal name of at most 64 ASCII letters/digits, slash or underscore,
+a request-bound call-ID token and checked nonoverlapping arguments offsets.
+Append checks each complete-object span against the supplied published prefix;
+this is passive metadata, not proof of file identity or valid retained JSON.
+The dispatcher must publish through the matching ResponseRetention first and
+preflight index capacity before effects. No disk read is authorized by a Span.
+Lookup requires every earlier call indexed and none from the current or later
+calls; a behind/ahead index is State, not invalidResultReference. It borrows
+and freezes the index and reference strings, compares at most one primary ID
+and 256 ID bytes per step, then compares the bounded name. A mismatching
+primary skips its implicit reply by token identity without rescanning bytes.
+The first earlier ID match is final, even if its name differs. Empty and
+repeated opaque IDs are preserved. Cancellation through into_request returns
+the original request arenas; dropping the index releases them. Debug never
+includes IDs or reference strings.
+Runtime still charges original work/time between steps. This does not parse
+reference objects, apply JSON Pointer, resolve creation IDs, bind the actual
+retention owner or activate dispatch. Internal index-state errors remain
+separate from invalidResultReference.
+
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument
 type is invalidArguments when the method validates it. Simultaneous normal and

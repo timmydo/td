@@ -2877,10 +2877,18 @@ writer counts and emits exact framing, escaped call IDs and the optional
 initial creation map. Its plan also covers the seed-map copy and bounded
 method-error type/diagnostic space. An all-call serverFail fallback preserves
 call order and duplicate IDs; it is restricted to deterministic refusal before
-any method effects. This implements no method execution, response index,
-creation-map lookup or HTTP activation. Binding the plan to actual retained
+any method effects. The preflight itself does not execute methods, index
+responses, look up creation IDs or activate HTTP. Binding the plan to actual retained
 capacity, charging live work/time and reserving each method's additional
 outcomes remain dispatcher responsibilities.
+
+The inert response index now retains bounded metadata in wire order, with
+call-ID tokens bound to the original owned request. Resumable lookup selects
+the first earlier matching ID before checking the response name, including
+implicit replies and duplicate input IDs. Tests cover long-ID yielding,
+missing/self/forward references, checked spans and all 128 entries. Its spans
+are passive metadata: actual retention binding, disk JSON Pointer evaluation,
+creation-map lookup and method dispatch remain required before activation.
 
 **Private response retention.**
 
