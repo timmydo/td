@@ -1,4 +1,4 @@
-//! Plain body-value scalars; HTML truncation and JSON serialization are separate.
+//! Body-value scalar normalization, HTML cutoff planning and plain JSON.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     ports::Tick,
@@ -434,3 +434,7 @@ mod tests {
 /// Streaming non-HTML body-value JSON; source authorization remains external.
 #[path = "body_value/json.rs"]
 pub mod json;
+
+/// Bounded first-pass HTML cutoff planning over decoded scalars.
+#[path = "body_value/html.rs"]
+pub mod html;

@@ -535,14 +535,22 @@ not change it under those locator versions:
   whitespace run. All extra reads/steps are charged.
 
 Blob downloads apply only transfer decoding, never charset conversion, NFC,
-NUL removal or line-ending conversion. Body values additionally apply charset
-decoding and CRLF-to-LF conversion, with true isEncodingProblem for unknown or
-malformed transfer/charset data. maxBodyValueBytes=0 means unlimited by that
-argument; disk/work caps still apply. A positive cap stops at a UTF-8 scalar
-boundary and sets isTruncated only if text remains. For HTML, back up to the
-last position outside a tag when a cap lands inside one, using a bounded
-streaming tag/quote state; no valid/balanced HTML guarantee. Continue bounded
-validation/counting as needed to establish flags and sizes before success.
+NUL removal or line-ending conversion. Body values additionally apply
+charset decoding and CRLF-to-LF conversion, with true isEncodingProblem for
+unknown or malformed transfer/charset data. maxBodyValueBytes=0 means
+unlimited by that argument; disk/work caps still apply. A positive cap stops
+at a UTF-8 scalar boundary and sets isTruncated only if text remains. For
+HTML, back up to the last position outside a tag when a cap lands inside
+one, using a bounded streaming tag/quote state. Every literal < outside a
+tag opens one; an unquoted > closes it. Within a tag, matching single/double
+quotes delimit quoted spans; backslash has no escape meaning. Quotes open
+anywhere inside a tag, including malformed attribute names or unquoted
+values. This lexical rule can disagree with an HTML tokenizer; it has no
+special comment, raw-text or entity interpretation and offers no
+valid/balanced HTML guarantee. An incomplete tag is preserved if the entire
+value fits: backing up applies only when text actually exceeds the cap.
+Continue bounded validation/counting as needed to establish flags and sizes
+before success.
 
 Use RFC 8621 section 4.1.4's suggested parseStructure algorithm for the
 initial textBody/htmlBody lists, implemented iteratively. Pin its fallback

@@ -8000,3 +8000,40 @@ retain its authorized native view/lease, and enclosing publication must check
 native custody and account/request authorization afresh. This cursor neither
 opens nor authorizes a part, creates a pin, or activates Email/get. HTML body
 values, bodyValues map selection and enclosing method composition are separate.
+
+## HTML body-value cutoff planning
+
+body_value::html::Cursor retains original work and clock while consuming
+decoded scalars through Plain's CRLF conversion and noncharacter replacement.
+It scans the entire value, even after exceeding max_bytes, and returns an
+exact projected UTF-8 prefix length. When the full value exceeds a positive
+cap, the prefix ends at the last scalar boundary outside a tag at or below
+the cap, using POLICY.md's lexical tag/quote rules. Otherwise it keeps
+the whole value, including an incomplete final tag. Input max_bytes=0 means
+unlimited; Cutoff.prefix instead distinguishes Prefix::Empty from
+Prefix::Bytes(NonZeroU64). Replay must handle Empty explicitly, never pass
+zero to Plain::new or the plain JSON cursor as an unlimited cap.
+
+One poll performs one Plain operation or one retained-scalar tag operation.
+Callers retain every unconsumed input/last pair, including across pending
+scalar turns, and signal actual EOF. Plain charges its existing input records
+and all normalized UTF-8 bytes; each tag operation additionally charges one
+record. No bytes are emitted or buffered per tag. The inline owner is at most
+256 bytes and uses no heap by inspection, not a measured allocation scenario.
+
+All polls (including cached Complete), check and consuming finish freshly
+check original clock/work; post-turn failures take precedence and latch,
+hiding the provisional plan. value is an unchecked passive read of cached
+metadata, not admission: callers must check or finish before handing it off.
+The plan's encoding diagnostic covers only Plain; transfer/charset diagnostics
+come from the original reader. The caller retains the authorized immutable
+source and must validate its custody through planning, bounded replay and
+publication. A Cutoff is passive metadata, not a source binding or admission
+authority. Replay must use that same source and normalization, the remaining
+original budget and deadline, and emit exactly the typed prefix. Reader
+composition, HTML JSON replay and bodyValues selection remain separate.
+
+The retained clock reference is wrapped in a cursor-local monotonic watermark
+starting at construction. The enclosing clock must retain any earlier
+watermark across this handoff; the planner cannot infer an earlier sample
+from Meter alone. No original-clock history is manufactured by this wrapper.
