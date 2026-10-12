@@ -41,6 +41,7 @@ mod https_exchange;
 pub mod https_upload;
 pub mod ids;
 pub use td_mime::json_string;
+pub mod jmap_changes;
 pub mod jmap_events;
 pub mod jmap_request;
 pub mod jmap_session;

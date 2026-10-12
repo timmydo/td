@@ -7172,3 +7172,52 @@ per-object planning estimate; this is not an allocation or RSS proof. Row scratc
 8192-byte object buffer are independent of account size. The retained request
 file supplies unknown-ID spellings for duplicate checks and notFound output.
 All scans and repeated comparisons retain the enclosing work/time checks.
+
+## Retained change-page cursor
+
+jmap_changes::Cursor folds history for one explicitly selected data type
+from an existing IndexReadView. The supplied DataState must match account,
+epoch and requested type, be at or above the retained history floor, and
+not exceed the captured endpoint. Invalid scope/history and an atomic first
+transaction too large for the requested page return CannotCalculateChanges.
+The internal page limit must be 1..=MAX_CHANGES (1024). A method caller
+chooses an omitted client limit and clamps larger positive client limits
+before construction; internal Invalid is not a client argument error.
+This passive cursor does not dispatch any
+changes method or activate a capability.
+
+One poll consumes at most one native change record under the original
+snapshot's cumulative work and deadline; the caller must charge every poll
+against its service job budget. Repeated updates across transactions coalesce. Created then
+updated stays created; updated then destroyed becomes destroyed; created
+then destroyed disappears when both fall within the same page. Contradictory
+transitions for an ID still retained in the page refuse as corrupt. Canceled
+create/delete pairs leave no tombstone: this bounded cursor is not an audit
+of permanent ID nonreuse. A later creation of a canceled ID is represented
+as created relative to the original state. Object allocation must enforce
+its own identity lifetime contract. Records are held in ID order.
+
+A page ends only at a complete committed transaction. If adding the next
+transaction exceeds the requested number of IDs, restore the preceding
+accepted transaction's changes and return its state with has_more true.
+The returned state is the last accepted whole sequence, including an
+Advanced step if the reader supplies one; canceled changes can leave an
+empty page with has_more true. The current native reader supplies only
+Record and Complete, skipping other-type history in its indexed query.
+An oversized first transaction refuses rather than inventing a partial
+transaction state; this conservative boundary does not scan ahead seeking
+later cancellations. A transaction with more than MAX_CHANGES distinct
+surviving changes therefore forces cache invalidation even at the maximum
+page size; this cursor does not constrain writers to smaller transactions.
+Exhausted history returns the captured endpoint and
+has_more false, including an empty result. Concurrent later commits remain
+outside this view and page.
+
+Memory is bounded by one page plus MAX_TRANSACTION_OPERATIONS operations,
+and a page-sized checkpoint. The cursor allocates these vectors once. Each poll may shift that bounded
+vector and copy at most MAX_CHANGES checkpoint entries; service work units
+must allow this cost. Returned Page retains the tentative vector capacity.
+Complete and incomplete polls check the retained snapshot; failures stick.
+finish requires completion and checks the snapshot again before returning
+passive page metadata. A method encoder must keep its own view alive, treat
+output as provisional, and check that view before publishing the response.
