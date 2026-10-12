@@ -199,8 +199,8 @@ fn freshness_incomplete_finish_and_overflow_are_terminal() {
     }
     let mut work = budget(100, 100);
     let mut cursor = Cursor::new(1, &mut work, &clock).unwrap();
-    cursor.total = u64::MAX;
-    cursor.pending = Some('a');
+    cursor.core.total = u64::MAX;
+    cursor.core.pending = Some('a');
     assert_eq!(cursor.poll(None, true), Err(Error::SizeOverflow));
     assert_eq!(cursor.finish(), Err(Error::SizeOverflow));
 }

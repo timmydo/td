@@ -84,13 +84,7 @@ enum Tag {
 pub struct Cursor<'w, 'c> {
     work: &'w mut Meter,
     clock: CheckedClock<'c>,
-    filter: Plain,
-    cap: u64,
-    total: u64,
-    safe: u64,
-    tag: Tag,
-    pending: Option<char>,
-    complete: bool,
+    core: Core,
     failure: Option<Error>,
 }
 impl<'w, 'c> Cursor<'w, 'c> {
@@ -98,13 +92,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
         let mut cursor = Self {
             work,
             clock: CheckedClock::new(clock, Tick(0)),
-            filter: Plain::new(0),
-            cap: max_bytes,
-            total: 0,
-            safe: 0,
-            tag: Tag::Outside,
-            pending: None,
-            complete: false,
+            core: Core::new(max_bytes),
             failure: None,
         };
         cursor.check()?;
@@ -112,16 +100,13 @@ impl<'w, 'c> Cursor<'w, 'c> {
     }
     /// Passive cached metadata; call check or finish for fresh admission.
     pub fn value(&self) -> Option<Cutoff> {
-        if self.failure.is_some() || !self.complete {
-            return None;
+        if self.failure.is_some() {
+            None
+        } else {
+            self.core.value()
         }
-        let truncated = self.cap != 0 && self.total > self.cap;
-        Some(Cutoff {
-            prefix: Prefix::new(if truncated { self.safe } else { self.total }),
-            is_truncated: truncated,
-            is_encoding_problem: self.filter.is_encoding_problem(),
-        })
     }
+
     pub fn check(&mut self) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
@@ -162,6 +147,57 @@ impl<'w, 'c> Cursor<'w, 'c> {
         result
     }
     fn step(&mut self, input: Option<char>, last: bool) -> Result<Progress, Error> {
+        if self.core.complete {
+            return Ok(Progress {
+                consumed: false,
+                status: Status::Complete,
+            });
+        }
+        let now = self.admit(0)?;
+        self.core.step(input, last, now, self.work)
+    }
+}
+
+// Detached progress only; every composing owner retains admission and source.
+pub(super) struct Core {
+    filter: Plain,
+    cap: u64,
+    total: u64,
+    safe: u64,
+    tag: Tag,
+    pending: Option<char>,
+    complete: bool,
+}
+impl Core {
+    pub(super) fn new(max_bytes: u64) -> Self {
+        Self {
+            filter: Plain::new(0),
+            cap: max_bytes,
+            total: 0,
+            safe: 0,
+            tag: Tag::Outside,
+            pending: None,
+            complete: false,
+        }
+    }
+    pub(super) fn value(&self) -> Option<Cutoff> {
+        if !self.complete {
+            return None;
+        }
+        let truncated = self.cap != 0 && self.total > self.cap;
+        Some(Cutoff {
+            prefix: Prefix::new(if truncated { self.safe } else { self.total }),
+            is_truncated: truncated,
+            is_encoding_problem: self.filter.is_encoding_problem(),
+        })
+    }
+    pub(super) fn step(
+        &mut self,
+        input: Option<char>,
+        last: bool,
+        now: Tick,
+        work: &mut Meter,
+    ) -> Result<Progress, Error> {
         if self.complete {
             return Ok(Progress {
                 consumed: false,
@@ -169,7 +205,14 @@ impl<'w, 'c> Cursor<'w, 'c> {
             });
         }
         if let Some(value) = self.pending {
-            self.admit(1)?;
+            work.charge(
+                now,
+                Charge {
+                    records: 1,
+                    ..Charge::default()
+                },
+            )
+            .map_err(Error::Work)?;
             self.total = self
                 .total
                 .checked_add(value.len_utf8() as u64)
@@ -191,8 +234,7 @@ impl<'w, 'c> Cursor<'w, 'c> {
                 status: Status::Yield,
             });
         }
-        let now = self.admit(0)?;
-        let progress = self.filter.poll(input, last, now, self.work)?;
+        let progress = self.filter.poll(input, last, now, work)?;
         let status = match progress.status {
             PlainStatus::Scalar(value) => {
                 self.pending = Some(value);

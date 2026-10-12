@@ -431,7 +431,7 @@ mod tests {
     }
 }
 
-/// Streaming non-HTML body-value JSON; source authorization remains external.
+/// Streaming body-value JSON; source authorization remains external.
 #[path = "body_value/json.rs"]
 pub mod json;
 

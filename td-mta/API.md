@@ -7960,7 +7960,7 @@ inspection; the retained allocation probe exercises the body-policy alias.
 
 ## Plain body-value JSON
 
-body_value::json::Cursor composes an admitted non-HTML mime_text::Input,
+body_value::json::Cursor::new composes an admitted non-HTML mime_text::Input,
 caller-owned input ring/checkpoints, body_value::Plain and td-json string
 framing into one provisional EmailBodyValue object. It writes value,
 isEncodingProblem and isTruncated in that order. Its exclusive original
@@ -7998,8 +7998,9 @@ caller-backed input/checkpoints and the source itself. All emitted bytes stay
 unpublished until complete enclosing-method success. The source owner must
 retain its authorized native view/lease, and enclosing publication must check
 native custody and account/request authorization afresh. This cursor neither
-opens nor authorizes a part, creates a pin, or activates Email/get. HTML body
-values, bodyValues map selection and enclosing method composition are separate.
+opens nor authorizes a part, creates a pin, or activates Email/get. The HTML
+entry point is specified below; bodyValues map selection and enclosing method
+composition remain separate.
 
 ## HTML body-value cutoff planning
 
@@ -8031,7 +8032,8 @@ source and must validate its custody through planning, bounded replay and
 publication. A Cutoff is passive metadata, not a source binding or admission
 authority. Replay must use that same source and normalization, the remaining
 original budget and deadline, and emit exactly the typed prefix. Reader
-composition, HTML JSON replay and bodyValues selection remain separate.
+composition is provided by the HTML JSON entry point below; bodyValues
+selection remains separate.
 
 The retained clock reference is wrapped in a cursor-local monotonic watermark
 starting at construction. The enclosing clock must retain any earlier
@@ -8044,8 +8046,10 @@ mime_text::Reader::new_replayable configures its initial poll to save the
 original transfer position in caller-owned private checkpoint slots before
 scanning/decoding. Ordinary new keeps
 its existing operation and cost sequence. After a replayable reader reaches
-actual Complete, restart restores that same source position and resets scalar-decoder progress, pending-byte/EOF state and the decode phase, retaining selected charset, accumulated encoding
-diagnostics, source/buffer/checkpoint borrows and the monotonic watermark.
+actual Complete, restart restores that same source position and resets
+scalar-decoder progress, pending-byte/EOF state and the decode phase,
+retaining selected charset, accumulated encoding diagnostics,
+source/buffer/checkpoint borrows and the monotonic watermark.
 Each restart spends the transfer checkpoint's one record and performs fresh
 clock/work checks before and after it. No source I/O happens in that turn;
 later polls fund every replay read, decoded byte and scalar operation. A
@@ -8057,6 +8061,46 @@ and retires even a restored checkpoint. Invalid-state invocations also
 perform this post-check, whose failure takes precedence over InvalidState.
 The caller must keep the original
 Meter/Clock and retain immutable native source custody throughout every pass;
-this helper cannot supply or replace source authorization. This is bounded
-replay support for callers such as HTML cutoff projection, not HTML JSON
-integration or a new publication boundary.
+this helper cannot supply or replace source authorization. This bounded
+replay helper supplies no new publication boundary; the HTML JSON owner
+below composes it with projection.
+
+## HTML body-value JSON
+
+For a positive cap, body_value::json::Cursor::new_html retains the same
+admitted Input, original Meter/Clock and caller input/checkpoint backing
+through cutoff planning and complete replay. A zero (unlimited) cap uses
+the ordinary single-pass JSON path and its costs, since no tag cutoff is
+needed. It shares the planner's private Core with the public HTML
+scalar cursor; that core is detached progress with no admission authority.
+The original checked clock covers all nested reads, planning, checkpoint
+restoration, replay and framing. Each source turn performs one reader,
+planner, checkpoint-restoration or Plain-filter operation. Empty output
+still checks admission without progressing either pass.
+
+The first pass fully decodes and normalizes before selecting the typed
+Empty/Bytes prefix. A separately admitted turn restarts the same reader;
+charset selection and all earlier diagnostics survive. The second pass uses
+the same Plain normalization and emits exactly the planned UTF-8 prefix,
+including explicitly empty prefixes. It still reads/validates the entire
+tail. Short replay, an impossible scalar boundary, or unexpected extra text
+for an untruncated plan refuses with ReplayMismatch. A truncated plan also
+requires replay text beyond the prefix. These checks do not detect every
+content change (including equal-length changes or moved tags); the native
+immutable-source owner remains responsible for exact identity across passes. Diagnostics OR
+both normalization passes and the retained transfer/charset reader state.
+No tag-sized buffer, body-sized allocation or copied source handle is added.
+The composed inline owner remains at most 1024 bytes, by compile-time bound;
+heap absence for this path is by inspection only.
+
+Both full transfer passes fund every decoded byte; both full Plain passes
+fund every normalized UTF-8 byte. Charset prescan, when needed, additionally
+funds its own transfer pass. Planning spends one tag record per normalized
+scalar; checkpoint save/restart spend their existing records. JSON framing
+funds wire bytes. The requested cap limits only returned value bytes; even
+an empty prefix still funds all validation/replay work. Every byte, including
+the opening object/string prefix before planning, remains provisional until
+fresh consuming finish and enclosing-method publication admission. Any late
+source, work, clock or framing refusal hides diagnostics and permanently
+retires the cursor. This composes a single part's value, not bodyValues map
+selection, part authorization, native view retention or Email/get dispatch.
