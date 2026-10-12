@@ -13801,6 +13801,7 @@ mod tests {
                 key: 1,
                 step: crate::authority::consent::LoginStep::Connect,
                 approval: Some(crate::authority::consent::ApprovalKey::new(*b"44").unwrap()),
+                proof: None,
             },
         )
         .unwrap()
@@ -13993,6 +13994,7 @@ mod tests {
                 }],
                 step,
                 approval: None,
+                proof: None,
             },
         )
         .unwrap()

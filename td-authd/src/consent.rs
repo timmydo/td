@@ -55,9 +55,12 @@ pub const LOGIN_TWO_CEREMONIES: Duration = Duration::from_secs(240);
 /// reads it and types its approval key before any token I/O, and that
 /// time does not come out of a ceremony's.
 pub const LOGIN_READING: Duration = Duration::from_secs(120);
-/// The longest login ceiling, a two-key enrollment's: the worker's bound
-/// until a description names its operation.
-pub const LOGIN_LONGEST: Duration = Duration::from_secs(360);
+/// A two-key first enrollment's ceiling: two ceremonies and the reading.
+pub const LOGIN_TWO_KEY_ENROLLMENT: Duration = Duration::from_secs(360);
+/// The longest login ceiling, a two-key first enrollment authorized by a
+/// disk proof, which counts as one more ceremony: the worker's bound until
+/// a description names its operation (td-authd/DESIGN.md, amendment 10).
+pub const LOGIN_LONGEST: Duration = Duration::from_secs(480);
 
 /// How a disk installation stores its volume, as its plan names it
 /// (td-install/INSTALLER.md "Storage choice").
@@ -69,6 +72,51 @@ pub enum Storage {
 
 /// The first four bytes of a credential ID's SHA-256, shown as hex.
 pub type Fingerprint = [u8; 4];
+
+/// The disk proof that authorizes a login operation in place of an
+/// enrolled key, consent tags 13 to 15 (td-login/TOKEN-LOGIN.md,
+/// "Enrollment, addition and removal"): its proof byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Proof {
+    /// The volume's recovery key, `1`.
+    RecoveryKey,
+    /// An authorize-phase assertion from a disk security key, `2`.
+    DiskKey,
+}
+
+impl Proof {
+    pub fn byte(self) -> u8 {
+        match self {
+            Self::RecoveryKey => 1,
+            Self::DiskKey => 2,
+        }
+    }
+
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::RecoveryKey),
+            2 => Some(Self::DiskKey),
+            _ => None,
+        }
+    }
+
+    /// The proof's step bytes, in their only order.
+    fn steps(self) -> &'static [u8] {
+        match self {
+            Self::RecoveryKey => &[9],
+            Self::DiskKey => &[10, 11],
+        }
+    }
+}
+
+/// What the storage worker's baseline offers a disk proof: whether a
+/// `recovery-key` marker names a keyslot, and the fingerprints of the
+/// header's fido2 tokens, whatever their role.
+#[derive(Clone, Copy, Debug)]
+pub struct DiskProofs<'a> {
+    pub recovery_key: bool,
+    pub tokens: &'a [Fingerprint],
+}
 
 /// How a selector update writes the pair, tag 16's form byte, which root
 /// derives from the volume's state (td-install/ENCRYPTION.md, "Selector
@@ -200,6 +248,18 @@ pub enum LoginStep {
     },
     /// The person connects the next new key alone.
     Connect,
+    /// A disk proof's one step: the person types the volume's recovery
+    /// key, which the storage worker tests.
+    RecoveryKey,
+    /// Silent selection of the connected disk security key among the
+    /// header's fido2 tokens.
+    DiskIdentify,
+    /// The disk security key's PIN and assertion; `key` names a header
+    /// fido2 token, never a login slot.
+    DiskAuthorize {
+        key: Fingerprint,
+        retries: u8,
+    },
 }
 
 impl LoginStep {
@@ -213,12 +273,25 @@ impl LoginStep {
             Self::Probe { .. } => 6,
             Self::Unlock { .. } => 7,
             Self::Connect => 8,
+            Self::RecoveryKey => 9,
+            Self::DiskIdentify => 10,
+            Self::DiskAuthorize { .. } => 11,
         }
     }
 
-    /// Whether the step asks for the key's PIN.
+    /// Whether the step asks for a secret through the PIN field: a key's
+    /// PIN, or the recovery-key step's recovery key.
     pub fn asks_pin(self) -> bool {
-        self.retries().is_some()
+        self.retries().is_some() || self == Self::RecoveryKey
+    }
+
+    /// Whether the step is a disk proof's, which the storage worker
+    /// presents.
+    pub fn proves(self) -> bool {
+        matches!(
+            self,
+            Self::RecoveryKey | Self::DiskIdentify | Self::DiskAuthorize { .. }
+        )
     }
 
     fn key(self) -> Option<Fingerprint> {
@@ -227,20 +300,30 @@ impl LoginStep {
             | Self::Prove { key, .. }
             | Self::Repeat { key, .. }
             | Self::Probe { key }
-            | Self::Unlock { key, .. } => Some(key),
-            Self::Identify | Self::Create { .. } | Self::Connect => None,
+            | Self::Unlock { key, .. }
+            | Self::DiskAuthorize { key, .. } => Some(key),
+            Self::Identify
+            | Self::Create { .. }
+            | Self::Connect
+            | Self::RecoveryKey
+            | Self::DiskIdentify => None,
         }
     }
 
-    /// Present exactly on the steps that ask for a PIN.
+    /// Present exactly on the steps that ask for a key's PIN.
     fn retries(self) -> Option<u8> {
         match self {
             Self::Authorize { retries, .. }
             | Self::Create { retries }
             | Self::Prove { retries, .. }
             | Self::Repeat { retries, .. }
-            | Self::Unlock { retries, .. } => Some(retries),
-            Self::Identify | Self::Probe { .. } | Self::Connect => None,
+            | Self::Unlock { retries, .. }
+            | Self::DiskAuthorize { retries, .. } => Some(retries),
+            Self::Identify
+            | Self::Probe { .. }
+            | Self::Connect
+            | Self::RecoveryKey
+            | Self::DiskIdentify => None,
         }
     }
 }
@@ -254,22 +337,36 @@ enum LoginKind {
 }
 
 impl LoginKind {
-    fn tag(self) -> u8 {
-        match self {
+    /// Tags 7 to 10, or 13 to 15 for a disk proof's enrollment, addition
+    /// and removal.
+    fn tag(self, proof: Option<Proof>) -> u8 {
+        let tag = match self {
             Self::Unlock => 7,
             Self::Enroll => 8,
             Self::Add => 9,
             Self::Remove => 10,
+        };
+        if proof.is_some() {
+            tag + 5
+        } else {
+            tag
         }
     }
 
-    /// Step bytes in their only order; enrollment repeats its list per key.
-    fn steps(self) -> &'static [u8] {
-        match self {
-            Self::Unlock => &[1, 7],
-            Self::Enroll => &[8, 3, 4, 5, 6],
-            Self::Add => &[1, 2, 8, 3, 4, 5, 6],
-            Self::Remove => &[1, 2],
+    /// Step bytes in their only order; enrollment repeats its key steps,
+    /// from connect, per key. A disk proof's steps replace identify and
+    /// authorize, and come first in an enrollment.
+    fn steps(self, proof: Option<Proof>) -> &'static [u8] {
+        match (self, proof) {
+            (Self::Unlock, _) => &[1, 7],
+            (Self::Enroll, None) => &[8, 3, 4, 5, 6],
+            (Self::Enroll, Some(Proof::RecoveryKey)) => &[9, 8, 3, 4, 5, 6],
+            (Self::Enroll, Some(Proof::DiskKey)) => &[10, 11, 8, 3, 4, 5, 6],
+            (Self::Add, None) => &[1, 2, 8, 3, 4, 5, 6],
+            (Self::Add, Some(Proof::RecoveryKey)) => &[9, 8, 3, 4, 5, 6],
+            (Self::Add, Some(Proof::DiskKey)) => &[10, 11, 8, 3, 4, 5, 6],
+            (Self::Remove, None) => &[1, 2],
+            (Self::Remove, Some(proof)) => proof.steps(),
         }
     }
 }
@@ -286,6 +383,8 @@ struct Login<'a> {
     step: LoginStep,
     /// A disclosure step's approval key, on no other step.
     approval: Option<ApprovalKey>,
+    /// The disk proof authorizing it, in every step of tags 13 to 15.
+    proof: Option<Proof>,
 }
 
 impl Login<'_> {
@@ -320,22 +419,25 @@ impl Login<'_> {
         };
         self.account == owner
             && counts
-            && self.kind.steps().contains(&self.step.byte())
+            && self.steps().contains(&self.step.byte())
+            // A proof is made once, before an enrollment's first key.
+            && (!self.step.proves() || self.key == 1)
             && self.approval.is_some() == self.discloses()
     }
 
+    fn steps(&self) -> &'static [u8] {
+        self.kind.steps(self.proof)
+    }
+
     /// Whether this step carries a disclosure (td-login/TOKEN-LOGIN.md,
-    /// "Enrollment, addition and removal"), and so the approval key: a
-    /// first enrollment's first step, its first key's connect, and the
-    /// first step, identify, of a removal that leaves at most one key. Each
-    /// comes before any token I/O and discloses for the whole operation,
-    /// so no later step carries one.
+    /// "Enrollment, addition and removal"), and so the approval key: the
+    /// operation's first step, of a first enrollment's first key (connect,
+    /// or its disk proof's first step) and of a removal that leaves at most
+    /// one key (identify, or its disk proof's first step). Each comes
+    /// before any token I/O and discloses for the whole operation, so no
+    /// later step carries one.
     fn discloses(&self) -> bool {
-        self.reads()
-            && match self.kind {
-                LoginKind::Enroll => self.step == LoginStep::Connect && self.key == 1,
-                _ => self.step == LoginStep::Identify,
-            }
+        self.reads() && self.key == 1 && self.steps().first() == Some(&self.step.byte())
     }
 
     /// Whether the operation shows a disclosure, at its first step.
@@ -364,12 +466,20 @@ impl Login<'_> {
     }
 
     /// Root's ceiling, which is the worker's and the compositor's
-    /// attempt's: one ceremony per key the person handles in turn, and the
-    /// reading allowance when the operation discloses.
+    /// attempt's: one ceremony per key the person handles in turn, a disk
+    /// proof counting as one, and the reading allowance when the operation
+    /// discloses.
     fn ceiling(&self) -> Duration {
-        let ceremonies = match (self.kind, self.after) {
-            (LoginKind::Unlock | LoginKind::Remove, _) | (LoginKind::Enroll, 1) => LOGIN_CEREMONY,
-            (LoginKind::Enroll | LoginKind::Add, _) => LOGIN_TWO_CEREMONIES,
+        // A proof replaces an addition's or removal's authorizing key, but
+        // adds a ceremony to an enrollment, which has none.
+        let ceremonies = match (self.kind, self.after, self.proof) {
+            (LoginKind::Unlock | LoginKind::Remove, _, _) | (LoginKind::Enroll, 1, None) => {
+                LOGIN_CEREMONY
+            }
+            (LoginKind::Add, _, _)
+            | (LoginKind::Enroll, 1, Some(_))
+            | (LoginKind::Enroll, _, None) => LOGIN_TWO_CEREMONIES,
+            (LoginKind::Enroll, _, Some(_)) => LOGIN_TWO_CEREMONIES.saturating_add(LOGIN_CEREMONY),
         };
         if self.reads() {
             ceremonies.saturating_add(LOGIN_READING)
@@ -381,12 +491,13 @@ impl Login<'_> {
     /// The step that must follow this one, with its new-key ordinal, or none
     /// after the operation's final step.
     fn following(&self) -> Option<(u8, u8)> {
-        let steps = self.kind.steps();
+        let steps = self.steps();
         let index = steps.iter().position(|byte| *byte == self.step.byte())?;
         match steps.get(index.saturating_add(1)) {
             Some(step) => Some((*step, self.key)),
+            // The next key starts at its connect; a proof is made once.
             None if self.kind == LoginKind::Enroll && self.key < self.after => {
-                Some((*steps.first()?, self.key.saturating_add(1)))
+                Some((LoginStep::Connect.byte(), self.key.saturating_add(1)))
             }
             None => None,
         }
@@ -537,7 +648,8 @@ pub enum Operation {
         step: LoginStep,
     },
     /// First enrollment of `after` keys; `key` is the one this step creates.
-    /// `approval` is the disclosure's key, on the first key's connect only.
+    /// `approval` is the disclosure's key, on the operation's first step
+    /// only. `proof`, in every step, is the disk proof authorizing it.
     LoginEnroll {
         account: u32,
         before: u8,
@@ -545,16 +657,18 @@ pub enum Operation {
         key: u8,
         step: LoginStep,
         approval: Option<ApprovalKey>,
+        proof: Option<Proof>,
     },
     LoginAdd {
         account: u32,
         before: u8,
         after: u8,
         step: LoginStep,
+        proof: Option<Proof>,
     },
     /// `removed` is in strictly increasing slot position. `approval` is the
-    /// disclosure's key, on the identify step of a removal that leaves at
-    /// most one key only.
+    /// disclosure's key, on the first step of a removal that leaves at most
+    /// one key only.
     LoginRemove {
         account: u32,
         before: u8,
@@ -562,6 +676,7 @@ pub enum Operation {
         removed: Vec<Slot>,
         step: LoginStep,
         approval: Option<ApprovalKey>,
+        proof: Option<Proof>,
     },
     /// `deploy-rollback`: move `current` back to `previous`, the pair the
     /// two boot selectors name.
@@ -589,22 +704,25 @@ pub enum Operation {
 
 impl Operation {
     fn login(&self) -> Option<Login<'_>> {
-        let (kind, account, before, after, key, removed, step, approval) = match self {
+        let login =
+            |kind, account: &u32, before: &u8, after: &u8, key, removed, step: &LoginStep| Login {
+                kind,
+                account: *account,
+                before: *before,
+                after: *after,
+                key,
+                removed,
+                step: *step,
+                approval: None,
+                proof: None,
+            };
+        Some(match self {
             Self::LoginUnlock {
                 account,
                 before,
                 after,
                 step,
-            } => (
-                LoginKind::Unlock,
-                account,
-                before,
-                after,
-                1,
-                &[][..],
-                step,
-                None,
-            ),
+            } => login(LoginKind::Unlock, account, before, after, 1, &[][..], step),
             Self::LoginEnroll {
                 account,
                 before,
@@ -612,31 +730,30 @@ impl Operation {
                 key,
                 step,
                 approval,
-            } => (
-                LoginKind::Enroll,
-                account,
-                before,
-                after,
-                *key,
-                &[][..],
-                step,
-                *approval,
-            ),
+                proof,
+            } => Login {
+                approval: *approval,
+                proof: *proof,
+                ..login(
+                    LoginKind::Enroll,
+                    account,
+                    before,
+                    after,
+                    *key,
+                    &[][..],
+                    step,
+                )
+            },
             Self::LoginAdd {
                 account,
                 before,
                 after,
                 step,
-            } => (
-                LoginKind::Add,
-                account,
-                before,
-                after,
-                1,
-                &[][..],
-                step,
-                None,
-            ),
+                proof,
+            } => Login {
+                proof: *proof,
+                ..login(LoginKind::Add, account, before, after, 1, &[][..], step)
+            },
             Self::LoginRemove {
                 account,
                 before,
@@ -644,27 +761,21 @@ impl Operation {
                 removed,
                 step,
                 approval,
-            } => (
-                LoginKind::Remove,
-                account,
-                before,
-                after,
-                1,
-                removed.as_slice(),
-                step,
-                *approval,
-            ),
+                proof,
+            } => Login {
+                approval: *approval,
+                proof: *proof,
+                ..login(
+                    LoginKind::Remove,
+                    account,
+                    before,
+                    after,
+                    1,
+                    removed.as_slice(),
+                    step,
+                )
+            },
             _ => return None,
-        };
-        Some(Login {
-            kind,
-            account: *account,
-            before: *before,
-            after: *after,
-            key,
-            removed,
-            step: *step,
-            approval,
         })
     }
 
@@ -683,6 +794,7 @@ impl Operation {
                 key: ordinal,
                 step,
                 approval: _,
+                proof,
             } => Self::LoginEnroll {
                 account,
                 before,
@@ -690,6 +802,7 @@ impl Operation {
                 key: ordinal,
                 step,
                 approval: Some(key),
+                proof,
             },
             Self::LoginRemove {
                 account,
@@ -698,6 +811,7 @@ impl Operation {
                 removed,
                 step,
                 approval: _,
+                proof,
             } => Self::LoginRemove {
                 account,
                 before,
@@ -705,6 +819,7 @@ impl Operation {
                 removed,
                 step,
                 approval: Some(key),
+                proof,
             },
             other => other,
         }
@@ -888,16 +1003,95 @@ impl Request {
 
     fn start(&self) -> Result<Login<'_>, String> {
         let login = self.operation.login().ok_or("not a login operation step")?;
-        if login.kind.steps().first() != Some(&login.step.byte()) || login.key != 1 {
+        if login.steps().first() != Some(&login.step.byte()) || login.key != 1 {
             return Err("a login operation begins at its first step".into());
         }
         Ok(login)
     }
 
-    /// Root's first presentation of a login operation: `login_start`, then
-    /// `baseline`, the presented record's slot fingerprints in its canonical
-    /// order, which the counts and any removal set must match.
+    /// The disk proof a login description carries, in every step of tags
+    /// 13 to 15; none on every other description.
+    pub fn login_proof(&self) -> Option<Proof> {
+        self.operation.login().and_then(|login| login.proof)
+    }
+
+    /// Root's first presentation of a login operation authorized by a disk
+    /// proof: `begin_login`'s rules, a proof, and its first step one the
+    /// storage worker's baseline `disk` offers.
+    pub fn begin_proof(
+        nonce: [u8; 32],
+        owner: u32,
+        operation: Operation,
+        baseline: &[Fingerprint],
+        disk: DiskProofs<'_>,
+    ) -> Result<Self, String> {
+        let request = Self::begun(nonce, owner, operation, baseline)?;
+        request.proof_start(disk)?;
+        Ok(request)
+    }
+
+    /// The shape of a disk proof's first description without the login
+    /// record, as the storage worker checks root's: `login_start`, a
+    /// proof, and its first step one the worker's own baseline `disk`
+    /// offers.
+    pub fn proof_start(&self, disk: DiskProofs<'_>) -> Result<(), String> {
+        let login = self.start()?;
+        if login.proof.is_none() || !offered(login.step, disk) {
+            return Err("disk proof the volume does not offer".into());
+        }
+        Ok(())
+    }
+
+    /// The login worker's first frame of an operation a disk proof
+    /// authorized, which root sends only once the storage worker proved
+    /// it: the proof's last step (recovery key, or disk authorize with
+    /// retries that are not zero) of the operation's first key, against
+    /// the worker's own baseline. `Last` means only the commit follows, as
+    /// for a removal; otherwise `login_successor` admits what does.
+    pub fn begin_proven(
+        nonce: [u8; 32],
+        owner: u32,
+        operation: Operation,
+        baseline: &[Fingerprint],
+    ) -> Result<(Self, Admitted), String> {
+        let request = Self::new(nonce, owner, operation)?;
+        let login = request
+            .operation
+            .login()
+            .ok_or("not a login operation step")?;
+        let last = login.proof.and_then(|proof| proof.steps().last().copied());
+        if last != Some(login.step.byte())
+            || login.key != 1
+            || login.step.retries() == Some(0)
+            || !login.matches(baseline)
+        {
+            return Err("a proven login operation resumes at its proof's last step".into());
+        }
+        let admitted = match login.following() {
+            Some(_) => Admitted::Next,
+            None => Admitted::Last,
+        };
+        Ok((request, admitted))
+    }
+
+    /// Root's first presentation of a login operation an enrolled key
+    /// authorizes: `login_start`, then `baseline`, the presented record's
+    /// slot fingerprints in its canonical order, which the counts and any
+    /// removal set must match. A disk proof's begins at `begin_proof`.
     pub fn begin_login(
+        nonce: [u8; 32],
+        owner: u32,
+        operation: Operation,
+        baseline: &[Fingerprint],
+    ) -> Result<Self, String> {
+        let request = Self::begun(nonce, owner, operation, baseline)?;
+        if request.login_proof().is_some() {
+            return Err("a disk proof begins as one".into());
+        }
+        Ok(request)
+    }
+
+    fn begun(
         nonce: [u8; 32],
         owner: u32,
         operation: Operation,
@@ -936,6 +1130,7 @@ impl Request {
             || following.before != current.before
             || following.after != current.after
             || following.removed != current.removed
+            || following.proof != current.proof
         {
             return Err("login step changed its operation".into());
         }
@@ -994,9 +1189,39 @@ impl Request {
             LoginStep::Prove { key, .. }
             | LoginStep::Repeat { key, .. }
             | LoginStep::Probe { key } => created_is(key),
+            // The storage worker's, admitted by `admit_proof_step`.
+            LoginStep::RecoveryKey | LoginStep::DiskIdentify | LoginStep::DiskAuthorize { .. } => {
+                false
+            }
         };
         if !named {
             return Err("login step names a key root did not admit".into());
+        }
+        Ok(admitted)
+    }
+
+    /// Admits `invitation`, the storage worker's next step of a disk
+    /// proof: `login_successor`, the login baseline as `admit_login_step`
+    /// holds it, and a proof step the storage worker's baseline `disk`
+    /// offers, a disk authorize step's key naming one of its fido2 tokens
+    /// and no login key, even by a four-byte collision.
+    pub fn admit_proof_step(
+        &self,
+        invitation: &Self,
+        baseline: &[Fingerprint],
+        disk: DiskProofs<'_>,
+    ) -> Result<Admitted, String> {
+        let (admitted, current, next) = self.successor(invitation)?;
+        if !current.matches(baseline) {
+            return Err("login step does not match its baseline record".into());
+        }
+        if !offered(next.step, disk) {
+            return Err("disk proof step the volume does not offer".into());
+        }
+        if let LoginStep::DiskAuthorize { key, .. } = next.step {
+            if baseline.contains(&key) {
+                return Err("disk security key names a login key".into());
+            }
         }
         Ok(admitted)
     }
@@ -1095,8 +1320,11 @@ impl Request {
             | Operation::LoginAdd { .. }
             | Operation::LoginRemove { .. } => {
                 if let Some(login) = self.operation.login() {
-                    bytes.push(login.kind.tag());
+                    bytes.push(login.kind.tag(login.proof));
                     bytes.extend_from_slice(&login.account.to_be_bytes());
+                    if let Some(proof) = login.proof {
+                        bytes.push(proof.byte());
+                    }
                     bytes.push(login.before);
                     bytes.push(login.after);
                     match login.kind {
@@ -1252,8 +1480,16 @@ impl Request {
                     requester,
                 }
             }
-            tag @ 7..=10 => {
+            tag @ (7..=10 | 13..=15) => {
                 let account = input.number()?;
+                // Tags 13 to 15 are 8 to 10 with the proof after the account.
+                let (tag, proof) = if tag >= 13 {
+                    let proof =
+                        Proof::from_byte(input.byte()?).ok_or("invalid consent disk proof")?;
+                    (tag - 5, Some(proof))
+                } else {
+                    (tag, None)
+                };
                 let before = input.byte()?;
                 let after = input.byte()?;
                 let operation = match tag {
@@ -1272,6 +1508,7 @@ impl Request {
                             key,
                             step: input.login_step()?,
                             approval: None,
+                            proof,
                         }
                     }
                     9 => Operation::LoginAdd {
@@ -1279,6 +1516,7 @@ impl Request {
                         before,
                         after,
                         step: input.login_step()?,
+                        proof,
                     },
                     _ => {
                         let count = input.byte()?;
@@ -1300,6 +1538,7 @@ impl Request {
                             removed,
                             step: input.login_step()?,
                             approval: None,
+                            proof,
                         }
                     }
                 };
@@ -1562,6 +1801,19 @@ fn label_line(field: &str, label: Option<&Label>) -> String {
     }
 }
 
+/// Whether the storage worker's baseline offers this disk proof step: the
+/// recovery-key step a `recovery-key` marker, disk identify a fido2 token,
+/// and disk authorize the token its fingerprint names. No other step is a
+/// proof's.
+fn offered(step: LoginStep, disk: DiskProofs<'_>) -> bool {
+    match step {
+        LoginStep::RecoveryKey => disk.recovery_key,
+        LoginStep::DiskIdentify => !disk.tokens.is_empty(),
+        LoginStep::DiskAuthorize { key, .. } => disk.tokens.contains(&key),
+        _ => false,
+    }
+}
+
 /// A login operation's rows. The unlock prompt, shown on the lock surface,
 /// omits the key count, which unlocking does not change.
 fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
@@ -1597,6 +1849,11 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
     if login.kind == LoginKind::Remove && login.after == 0 && login.approval.is_none() {
         lines.push(NO_KEY.into());
     }
+    match login.proof {
+        Some(Proof::RecoveryKey) => lines.push("AUTHORIZED BY DISK RECOVERY KEY".into()),
+        Some(Proof::DiskKey) => lines.push("AUTHORIZED BY A DISK SECURITY KEY".into()),
+        None => {}
+    }
     match login.step {
         LoginStep::Identify => lines.push("CONNECT ONLY ONE ENROLLED KEY".into()),
         LoginStep::Connect => {
@@ -1619,6 +1876,11 @@ fn login_lines(lines: &mut Vec<String>, login: &Login<'_>) {
         LoginStep::Probe { key } => {
             lines.push(format!("CHECKING NEW KEY {}", hex(&key)));
             lines.push("KEEP IT CONNECTED AND TOUCH IT".into());
+        }
+        LoginStep::RecoveryKey => lines.push("TYPE THE DISK RECOVERY KEY".into()),
+        LoginStep::DiskIdentify => lines.push("CONNECT ONE DISK SECURITY KEY ONLY".into()),
+        LoginStep::DiskAuthorize { key, .. } => {
+            lines.push(format!("DISK SECURITY KEY {}", hex(&key)));
         }
     }
     if let Some(retries) = login.step.retries() {
@@ -1807,6 +2069,15 @@ impl<'a> Input<'a> {
                 }
             }
             8 => LoginStep::Connect,
+            9 => LoginStep::RecoveryKey,
+            10 => LoginStep::DiskIdentify,
+            11 => {
+                let key = self.fingerprint()?;
+                LoginStep::DiskAuthorize {
+                    key,
+                    retries: self.byte()?,
+                }
+            }
             _ => return Err("invalid consent login step".into()),
         })
     }
@@ -2950,6 +3221,7 @@ mod tests {
                     before,
                     after: before.saturating_add(1),
                     step,
+                    proof: None,
                 });
                 for removed in &sets {
                     if let Some(after) = before.checked_sub(removed.len() as u8) {
@@ -2960,6 +3232,7 @@ mod tests {
                             removed: removed.clone(),
                             step,
                             approval: None,
+                            proof: None,
                         });
                     }
                 }
@@ -2973,6 +3246,7 @@ mod tests {
                         key,
                         step,
                         approval: None,
+                        proof: None,
                     });
                 }
             }
@@ -3008,6 +3282,7 @@ mod tests {
             before: 2,
             after: 3,
             step,
+            proof: None,
         }
     }
 
@@ -3020,6 +3295,7 @@ mod tests {
             key,
             step,
             approval: None,
+            proof: None,
         }
         .disclosed(disclosure())
     }
@@ -3034,6 +3310,7 @@ mod tests {
             removed,
             step,
             approval: None,
+            proof: None,
         }
         .disclosed(disclosure())
     }
@@ -3104,6 +3381,7 @@ mod tests {
                     removed: vec![slot(1, A)],
                     step: LoginStep::Authorize { key: A, retries: 0 },
                     approval: None,
+                    proof: None,
                 },
                 10,
                 vec![
@@ -3157,6 +3435,7 @@ mod tests {
             key: 1,
             step: LoginStep::Connect,
             approval: key,
+            proof: None,
         };
         let remove = |before, removed: Vec<Slot>| Operation::LoginRemove {
             account: 1000,
@@ -3165,6 +3444,7 @@ mod tests {
             removed,
             step: LoginStep::Identify,
             approval: key,
+            proof: None,
         };
         let rows = |head: &[&'static str], tail: &[&[&'static str]]| {
             let mut rows = header.to_vec();
@@ -3257,6 +3537,7 @@ mod tests {
                 key,
                 step,
                 approval: _,
+                proof,
             } => Operation::LoginEnroll {
                 account,
                 before,
@@ -3264,6 +3545,7 @@ mod tests {
                 key,
                 step,
                 approval,
+                proof,
             },
             Operation::LoginRemove {
                 account,
@@ -3272,6 +3554,7 @@ mod tests {
                 removed,
                 step,
                 approval: _,
+                proof,
             } => Operation::LoginRemove {
                 account,
                 before,
@@ -3279,6 +3562,7 @@ mod tests {
                 removed,
                 step,
                 approval,
+                proof,
             },
             other => other,
         }
@@ -3363,6 +3647,7 @@ mod tests {
                 removed: vec![slot(1, A)],
                 step: LoginStep::Authorize { key: A, retries: 8 },
                 approval: None,
+                proof: None,
             },
             add(LoginStep::Identify),
             add(LoginStep::Connect),
@@ -3439,7 +3724,8 @@ mod tests {
         let mut identify = header(7);
         identify.extend([2, 2, 1]);
         assert!(Request::decode(&identify).is_ok());
-        for tag in [0, 3, 13, 255] {
+        // 13 to 15 are the disk proofs', 17 to 25 reserved.
+        for tag in [0, 3, 17, 25, 255] {
             let mut bad = identify.clone();
             bad[44] = tag;
             assert_eq!(
@@ -3448,7 +3734,7 @@ mod tests {
                 "{tag}"
             );
         }
-        for byte in [0, 9, 255] {
+        for byte in [0, 12, 255] {
             let mut bad = identify.clone();
             bad[51] = byte;
             assert_eq!(
@@ -3536,6 +3822,7 @@ mod tests {
                 key: 1,
                 step: LoginStep::Connect,
                 approval: None,
+                proof: None,
             },
             enroll(3, 1, LoginStep::Connect),
             enroll(0, 0, LoginStep::Connect),
@@ -3547,18 +3834,21 @@ mod tests {
                 before: 0,
                 after: 1,
                 step: LoginStep::Identify,
+                proof: None,
             },
             Operation::LoginAdd {
                 account: 1000,
                 before: 8,
                 after: 9,
                 step: LoginStep::Identify,
+                proof: None,
             },
             Operation::LoginAdd {
                 account: 1000,
                 before: 2,
                 after: 2,
                 step: LoginStep::Identify,
+                proof: None,
             },
             add(LoginStep::Unlock { key: A, retries: 1 }),
             remove(vec![slot(1, A)], LoginStep::Connect),
@@ -3569,6 +3859,7 @@ mod tests {
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
                 approval: None,
+                proof: None,
             },
             Operation::LoginRemove {
                 account: 1000,
@@ -3577,6 +3868,7 @@ mod tests {
                 removed: vec![slot(1, A), slot(1, A)],
                 step: LoginStep::Identify,
                 approval: None,
+                proof: None,
             },
             Operation::LoginRemove {
                 account: 1000,
@@ -3585,6 +3877,7 @@ mod tests {
                 removed: vec![slot(1, A)],
                 step: LoginStep::Identify,
                 approval: None,
+                proof: None,
             },
         ];
         for operation in refused {
@@ -3612,6 +3905,7 @@ mod tests {
                 retries: 255,
             },
             approval: None,
+            proof: None,
         });
         // Header 45, account and counts 6, the set 1 + 8 * 5, the step 1 + 4 + 1.
         assert_eq!(request.encode().len(), 98);
@@ -3634,6 +3928,7 @@ mod tests {
                     .collect(),
                 step: LoginStep::Identify,
                 approval: None,
+                proof: None,
             }
             .disclosed(disclosure()),
         );
@@ -3889,6 +4184,7 @@ mod tests {
             before: 3,
             after: 4,
             step: LoginStep::Authorize { key: A, retries: 8 },
+            proof: None,
         };
         assert!(admit(&identify, three, &[B, A, N], None).is_err());
         let first = enroll(1, 1, LoginStep::Connect);
@@ -3924,6 +4220,7 @@ mod tests {
                 before: 2,
                 after: 3,
                 step: LoginStep::Authorize { key: A, retries: 8 },
+                proof: None,
             },
         )
         .unwrap();
@@ -4004,6 +4301,9 @@ mod tests {
             LoginStep::Probe { .. } => "probe",
             LoginStep::Unlock { .. } => "unlock",
             LoginStep::Connect => "connect",
+            LoginStep::RecoveryKey => "recovery key",
+            LoginStep::DiskIdentify => "disk identify",
+            LoginStep::DiskAuthorize { .. } => "disk authorize",
         };
         (name, key)
     }
@@ -4018,13 +4318,17 @@ mod tests {
             _ => return (None, None),
         };
         match step {
-            LoginStep::Identify | LoginStep::Connect => (None, None),
+            LoginStep::Identify
+            | LoginStep::Connect
+            | LoginStep::RecoveryKey
+            | LoginStep::DiskIdentify => (None, None),
             LoginStep::Create { retries } => (None, Some(retries)),
             LoginStep::Probe { key } => (Some(key), None),
             LoginStep::Authorize { key, retries }
             | LoginStep::Prove { key, retries }
             | LoginStep::Repeat { key, retries }
-            | LoginStep::Unlock { key, retries } => (Some(key), Some(retries)),
+            | LoginStep::Unlock { key, retries }
+            | LoginStep::DiskAuthorize { key, retries } => (Some(key), Some(retries)),
         }
     }
 
@@ -4228,6 +4532,7 @@ mod tests {
             before,
             after,
             step: LoginStep::Authorize { key: N, retries: 8 },
+            proof: None,
         };
         assert_eq!(
             identify.login_successor(&login(authorize(1000, 2, 3))),
@@ -4252,6 +4557,7 @@ mod tests {
                     removed: Vec::new(),
                     step: LoginStep::Authorize { key: N, retries: 8 },
                     approval: None,
+                    proof: None,
                 },
             ),
         ] {
@@ -4271,6 +4577,7 @@ mod tests {
                     removed,
                     step: LoginStep::Authorize { key: B, retries: 8 },
                     approval: None,
+                    proof: None,
                 },
             )
         };
@@ -4496,13 +4803,36 @@ mod tests {
             (LoginStep::Probe { key: A }, false),
             (LoginStep::Unlock { key: A, retries: 1 }, true),
             (LoginStep::Connect, false),
+            // The recovery key is the secret the PIN field takes there.
+            (LoginStep::RecoveryKey, true),
+            (LoginStep::DiskIdentify, false),
+            (LoginStep::DiskAuthorize { key: A, retries: 1 }, true),
         ] {
             assert_eq!(step.asks_pin(), pin, "{step:?}");
+            assert_eq!(
+                step.proves(),
+                matches!(
+                    step,
+                    LoginStep::RecoveryKey
+                        | LoginStep::DiskIdentify
+                        | LoginStep::DiskAuthorize { .. }
+                ),
+                "{step:?}"
+            );
         }
         assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
         assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
         assert_eq!(LOGIN_READING, Duration::from_secs(120));
-        assert_eq!(LOGIN_LONGEST, LOGIN_TWO_CEREMONIES + LOGIN_READING);
+        assert_eq!(
+            LOGIN_TWO_KEY_ENROLLMENT,
+            LOGIN_TWO_CEREMONIES + LOGIN_READING
+        );
+        // A two-key enrollment by disk proof: three ceremonies and reading.
+        assert_eq!(
+            LOGIN_LONGEST,
+            LOGIN_TWO_CEREMONIES + LOGIN_CEREMONY + LOGIN_READING
+        );
+        assert_eq!(LOGIN_LONGEST, Duration::from_secs(480));
         let ceremony = Some(Duration::from_secs(120));
         let two = Some(Duration::from_secs(240));
         // A disclosing operation's ceiling adds the reading allowance to
@@ -4678,6 +5008,7 @@ mod tests {
                     retries: 2
                 },
                 approval: None,
+                proof: None,
             })[2..],
             [
                 "REMOVE 8 LOGIN KEYS (8 -> 0 KEYS)",
@@ -4693,5 +5024,719 @@ mod tests {
                 "ESC TO CANCEL",
             ]
         );
+    }
+
+    /// A disk proof's operation: `operation` with `proof` set, then the
+    /// test disclosure key where its step discloses.
+    fn proven(operation: Operation, proof: Proof) -> Operation {
+        match operation {
+            Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                ..
+            } => Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                ..
+            } => Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                proof: Some(proof),
+            },
+            Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                ..
+            } => Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            other => other,
+        }
+        .disclosed(disclosure())
+    }
+
+    const PROOFS: &[Proof] = &[Proof::RecoveryKey, Proof::DiskKey];
+
+    fn proof_steps(key: Fingerprint) -> [LoginStep; 3] {
+        [
+            LoginStep::RecoveryKey,
+            LoginStep::DiskIdentify,
+            LoginStep::DiskAuthorize { key, retries: 8 },
+        ]
+    }
+
+    /// Every proof, count, key ordinal, removal set and step a disk proof's
+    /// operation may carry: tags 13 to 15 over every step.
+    fn every_proven_operation() -> Vec<Operation> {
+        let mut operations = Vec::new();
+        for operation in every_login_operation() {
+            for proof in PROOFS {
+                for step in every_step(A).into_iter().chain(proof_steps(A)) {
+                    let with = match operation.clone() {
+                        Operation::LoginEnroll { .. }
+                        | Operation::LoginAdd { .. }
+                        | Operation::LoginRemove { .. } => proven(operation.clone(), *proof),
+                        _ => continue,
+                    };
+                    let stepped = match with {
+                        Operation::LoginEnroll {
+                            account,
+                            before,
+                            after,
+                            key,
+                            proof,
+                            ..
+                        } => Operation::LoginEnroll {
+                            account,
+                            before,
+                            after,
+                            key,
+                            step,
+                            approval: None,
+                            proof,
+                        },
+                        Operation::LoginAdd {
+                            account,
+                            before,
+                            after,
+                            proof,
+                            ..
+                        } => Operation::LoginAdd {
+                            account,
+                            before,
+                            after,
+                            step,
+                            proof,
+                        },
+                        Operation::LoginRemove {
+                            account,
+                            before,
+                            after,
+                            removed,
+                            proof,
+                            ..
+                        } => Operation::LoginRemove {
+                            account,
+                            before,
+                            after,
+                            removed,
+                            step,
+                            approval: None,
+                            proof,
+                        },
+                        other => other,
+                    };
+                    operations.push(stepped.disclosed(disclosure()));
+                }
+            }
+        }
+        operations.retain(|operation| Request::new([1; 32], 1000, operation.clone()).is_ok());
+        operations.sort_by_key(|operation| format!("{operation:?}"));
+        operations.dedup();
+        operations
+    }
+
+    #[test]
+    fn each_disk_proof_has_an_independent_literal_encoding_and_rows() {
+        // Account 1000, the proof byte, the counts, the operation's own
+        // field, the step, and a disclosure step's key.
+        let cases: Vec<(Operation, u8, Vec<u8>, &[&str])> = vec![
+            (
+                proven(enroll(2, 1, LoginStep::RecoveryKey), Proof::RecoveryKey),
+                13,
+                vec![1, 0, 2, 1, 9, b'3', b'6'],
+                &[
+                    "ENROLL LOGIN KEYS (0 -> 2 KEYS)",
+                    "NEW KEY 1 OF 2",
+                    "ACCOUNT UID 1000",
+                    "AUTHORIZED BY DISK RECOVERY KEY",
+                    "TYPE THE DISK RECOVERY KEY",
+                    "BOOT AND LOCK NEED A KEY AND PIN",
+                    "CONSOLE AND SSH SESSIONS END NOW",
+                    "SSH ONLY FOR THE PRIMARY ACCOUNT",
+                    "ADMINISTRATION NEEDS A LOGIN",
+                    "PIN SET ON ANOTHER LAYOUT MAY FAIL",
+                    "APPROVE: TYPE 3 THEN 6",
+                    "ESC: CANCEL",
+                ],
+            ),
+            (
+                proven(enroll(1, 1, LoginStep::Connect), Proof::DiskKey),
+                13,
+                vec![2, 0, 1, 1, 8],
+                &[
+                    "ENROLL LOGIN KEYS (0 -> 1 KEY)",
+                    "NEW KEY 1 OF 1",
+                    "ACCOUNT UID 1000",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "CONNECT ONLY THE NEW KEY",
+                    "ESC TO CANCEL",
+                ],
+            ),
+            (
+                proven(add(LoginStep::DiskIdentify), Proof::DiskKey),
+                14,
+                vec![2, 2, 3, 10],
+                &[
+                    "ADD A LOGIN KEY (2 -> 3 KEYS)",
+                    "ACCOUNT UID 1000",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "CONNECT ONE DISK SECURITY KEY ONLY",
+                    "ESC TO CANCEL",
+                ],
+            ),
+            (
+                proven(
+                    add(LoginStep::DiskAuthorize { key: A, retries: 8 }),
+                    Proof::DiskKey,
+                ),
+                14,
+                vec![2, 2, 3, 11, 0x3f, 0xa2, 0xc1, 0xd0, 8],
+                &[
+                    "ADD A LOGIN KEY (2 -> 3 KEYS)",
+                    "ACCOUNT UID 1000",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "DISK SECURITY KEY 3fa2c1d0",
+                    "8 PIN ATTEMPTS LEFT ON THIS KEY",
+                    "ENTER ITS PIN, THEN TOUCH THE KEY",
+                    "ESC TO CANCEL",
+                ],
+            ),
+            (
+                proven(
+                    remove(vec![slot(2, A)], LoginStep::RecoveryKey),
+                    Proof::RecoveryKey,
+                ),
+                15,
+                vec![1, 3, 2, 1, 2, 0x3f, 0xa2, 0xc1, 0xd0, 9],
+                &[
+                    "REMOVE A LOGIN KEY (3 -> 2 KEYS)",
+                    "ACCOUNT UID 1000",
+                    "REMOVE: 2:3fa2c1d0",
+                    "AUTHORIZED BY DISK RECOVERY KEY",
+                    "TYPE THE DISK RECOVERY KEY",
+                    "ESC TO CANCEL",
+                ],
+            ),
+            (
+                proven(
+                    remove(vec![slot(1, B), slot(3, A)], LoginStep::DiskIdentify),
+                    Proof::DiskKey,
+                ),
+                15,
+                vec![
+                    2, 3, 1, 2, 1, 1, 2, 3, 4, 3, 0x3f, 0xa2, 0xc1, 0xd0, 10, b'3', b'6',
+                ],
+                &[
+                    "REMOVE 2 LOGIN KEYS (3 -> 1 KEY)",
+                    "ACCOUNT UID 1000",
+                    "REMOVE: 1:01020304 3:3fa2c1d0",
+                    "AUTHORIZED BY A DISK SECURITY KEY",
+                    "CONNECT ONE DISK SECURITY KEY ONLY",
+                    "LOST KEY OR BLOCKED PIN: NO LOGIN",
+                    "RECOVERY NEEDS BOOTING OTHER CODE",
+                    "HERE, WHICH ALSO BYPASSES THE LOCK",
+                    "A BACKUP KEY CAN BE ADDED LATER",
+                    "APPROVE: TYPE 3 THEN 6",
+                    "ESC: CANCEL",
+                ],
+            ),
+        ];
+        for (operation, tag, tail, rows) in cases {
+            let request = login(operation);
+            let mut literal = header(tag);
+            literal.extend(&tail);
+            assert_eq!(request.encode(), literal, "{request:?}");
+            assert_eq!(Request::decode(&literal).unwrap(), request);
+            let lines = request.lines();
+            assert_eq!(lines[..2], ["TD SECURE ATTENTION", "SESSION USER 1000"]);
+            assert_eq!(lines[2..], *rows, "{request:?}");
+        }
+    }
+
+    #[test]
+    fn a_disk_proof_keeps_its_own_tags_steps_and_proof_byte() {
+        let decode = |tag, tail: &[u8]| {
+            let mut bytes = header(tag);
+            bytes.extend(tail);
+            Request::decode(&bytes)
+        };
+        assert!(decode(14, &[1, 2, 3, 9]).is_ok());
+        assert!(decode(14, &[2, 2, 3, 10]).is_ok());
+        for proof in [0, 3, 255] {
+            assert_eq!(
+                decode(14, &[proof, 2, 3, 9]).err().unwrap(),
+                "invalid consent disk proof"
+            );
+        }
+        // Tags 8 to 10 never carry a proof step, 13 to 15 never identify,
+        // authorize or another proof's step, and an unlock has no proof.
+        for (tag, tail) in [
+            (9, &[2, 3, 9][..]),
+            (9, &[2, 3, 10]),
+            (9, &[2, 3, 11, 1, 2, 3, 4, 8]),
+            (8, &[0, 1, 1, 9, b'3', b'6']),
+            (10, &[3, 2, 1, 2, 1, 2, 3, 4, 10]),
+            (7, &[2, 2, 9]),
+            (14, &[1, 2, 3, 1]),
+            (14, &[1, 2, 3, 2, 1, 2, 3, 4, 8]),
+            (14, &[1, 2, 3, 10]),
+            (14, &[2, 2, 3, 9]),
+            (13, &[2, 0, 1, 1, 1, b'3', b'6']),
+            (15, &[1, 3, 2, 1, 2, 1, 2, 3, 4, 1]),
+            (15, &[2, 3, 2, 1, 2, 1, 2, 3, 4, 2, 1, 2, 3, 4, 8]),
+            // A proof is made once, at the first key.
+            (13, &[1, 0, 2, 2, 9]),
+            (13, &[2, 0, 2, 2, 10]),
+        ] {
+            assert!(decode(tag, tail).is_err(), "{tag} {tail:?}");
+        }
+    }
+
+    #[test]
+    fn disk_proofs_roundtrip_and_refuse_every_cut_and_trailing_byte() {
+        let operations = every_proven_operation();
+        // Each proof's enrollment: 6 or 7 steps at each two-key count's
+        // first key, connect to probe at the second; addition's 6 or 7 at
+        // 7 counts; removal's 1 or 2 over each set's valid counts.
+        assert_eq!(
+            operations.len(),
+            (6 + 6 + 5) + (7 + 7 + 5) + 6 * 7 + 7 * 7 + (8 + 7 + 6 + 1) * 3
+        );
+        for operation in operations {
+            let request = Request::new([1; 32], 1000, operation).unwrap();
+            assert!(request.login_proof().is_some());
+            let mut bytes = request.encode();
+            assert_eq!(Request::decode(&bytes).unwrap(), request);
+            for end in 0..bytes.len() {
+                assert!(Request::decode(&bytes[..end]).is_err(), "{request:?} {end}");
+            }
+            bytes.push(0);
+            assert!(Request::decode(&bytes).is_err());
+        }
+    }
+
+    /// The widest disk proof, a removal of eight keys at its disk authorize
+    /// step, is 99 bytes, and no row of any proof wraps.
+    #[test]
+    fn disk_proofs_fit_the_request_bound_and_the_narrowest_prompt() {
+        let widest = every_proven_operation()
+            .into_iter()
+            .map(|operation| login(operation).encode().len())
+            .max();
+        assert_eq!(widest, Some(99));
+        let eight = login(proven(
+            Operation::LoginRemove {
+                account: 1000,
+                before: LOGIN_KEYS,
+                after: 0,
+                removed: (1..=LOGIN_KEYS)
+                    .map(|position| slot(position, [0xff; 4]))
+                    .collect(),
+                step: LoginStep::DiskAuthorize {
+                    key: [0xff; 4],
+                    retries: 255,
+                },
+                approval: None,
+                proof: None,
+            },
+            Proof::DiskKey,
+        ));
+        // Header 45, account, proof and counts 7, the set 1 + 8 * 5, the
+        // step 1 + 4 + 1.
+        assert_eq!(eight.encode().len(), 99);
+        assert!(eight.encode().len() <= MAX_BYTES);
+        for operation in every_proven_operation() {
+            let mut operation = operation;
+            if let Operation::LoginEnroll { account, .. }
+            | Operation::LoginAdd { account, .. }
+            | Operation::LoginRemove { account, .. } = &mut operation
+            {
+                *account = 65533;
+            }
+            let request = Request::new([1; 32], 65533, operation).unwrap();
+            for line in request.lines() {
+                assert!(line.len() <= PROMPT_COLUMNS, "{line:?}");
+            }
+        }
+    }
+
+    /// The proof's first step discloses where the operation does; no other
+    /// step of it, a connect included, carries the key.
+    #[test]
+    fn a_disk_proof_discloses_on_its_first_step_only() {
+        for operation in every_proven_operation() {
+            let request = login(operation.clone());
+            let start = request.login_start().is_ok();
+            let reads = match &operation {
+                Operation::LoginEnroll { .. } => true,
+                Operation::LoginRemove { after, .. } => *after <= 1,
+                _ => false,
+            };
+            assert_eq!(
+                request.login_approval().is_some(),
+                start && reads,
+                "{operation:?}"
+            );
+            if start {
+                assert!(request.login_step().is_some_and(LoginStep::proves));
+            }
+        }
+    }
+
+    #[test]
+    fn a_disk_proofs_ceiling_counts_the_proof_as_one_ceremony() {
+        let seconds = |operation| {
+            login(operation)
+                .login_ceiling()
+                .map(|ceiling| ceiling.as_secs())
+        };
+        for proof in PROOFS {
+            let first = proof_steps(A)[if *proof == Proof::RecoveryKey { 0 } else { 1 }];
+            assert_eq!(seconds(proven(enroll(1, 1, first), *proof)), Some(360));
+            assert_eq!(seconds(proven(enroll(2, 1, first), *proof)), Some(480));
+            assert_eq!(seconds(proven(add(first), *proof)), Some(240));
+            assert_eq!(
+                seconds(proven(remove(vec![slot(2, A)], first), *proof)),
+                Some(120)
+            );
+            assert_eq!(
+                seconds(proven(remove(vec![slot(1, B), slot(2, A)], first), *proof)),
+                Some(240)
+            );
+        }
+        let longest = every_proven_operation()
+            .into_iter()
+            .chain(every_login_operation())
+            .filter_map(|operation| login(operation).login_ceiling())
+            .max();
+        assert_eq!(longest, Some(LOGIN_LONGEST));
+    }
+
+    #[test]
+    fn root_begins_a_disk_proof_only_where_the_volume_offers_it() {
+        let baseline = [B, A];
+        let both = DiskProofs {
+            recovery_key: true,
+            tokens: &[N, M],
+        };
+        let begin =
+            |operation, disk| Request::begin_proof([9; 32], 1000, operation, &baseline, disk);
+        let recovery = proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey);
+        let identify = proven(add(LoginStep::DiskIdentify), Proof::DiskKey);
+        assert!(begin(recovery.clone(), both).is_ok());
+        assert!(begin(identify.clone(), both).is_ok());
+        let none = DiskProofs {
+            recovery_key: false,
+            tokens: &[],
+        };
+        assert!(begin(recovery.clone(), none).is_err());
+        assert!(begin(identify.clone(), none).is_err());
+        assert!(begin(
+            recovery.clone(),
+            DiskProofs {
+                recovery_key: false,
+                tokens: &[N],
+            }
+        )
+        .is_err());
+        assert!(begin(
+            identify.clone(),
+            DiskProofs {
+                recovery_key: true,
+                tokens: &[],
+            }
+        )
+        .is_err());
+        // An ordinary operation is not a proof, and a proof does not begin
+        // as an ordinary one or past its first step.
+        assert!(begin(add(LoginStep::Identify), both).is_err());
+        assert!(Request::begin_login([9; 32], 1000, recovery.clone(), &baseline).is_err());
+        assert!(Request::begin_login([9; 32], 1000, identify.clone(), &baseline).is_err());
+        assert!(begin(
+            proven(
+                add(LoginStep::DiskAuthorize { key: N, retries: 8 }),
+                Proof::DiskKey
+            ),
+            both
+        )
+        .is_err());
+        // The storage worker, without the record, checks the same shape.
+        assert!(login(identify.clone()).proof_start(both).is_ok());
+        assert!(login(recovery.clone()).proof_start(none).is_err());
+        assert!(login(add(LoginStep::Identify)).proof_start(both).is_err());
+        assert!(login(proven(add(LoginStep::Connect), Proof::DiskKey))
+            .proof_start(both)
+            .is_err());
+        // The login baseline still fixes the counts.
+        assert!(Request::begin_proof(
+            [9; 32],
+            1000,
+            proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey),
+            &[A],
+            both
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn root_admits_a_disk_authorize_step_naming_a_header_token() {
+        let baseline = [B, A];
+        let disk = DiskProofs {
+            recovery_key: false,
+            tokens: &[N],
+        };
+        let identify = Request::begin_proof(
+            [9; 32],
+            1000,
+            proven(add(LoginStep::DiskIdentify), Proof::DiskKey),
+            &baseline,
+            disk,
+        )
+        .unwrap();
+        let authorize = |key, retries| {
+            login(proven(
+                add(LoginStep::DiskAuthorize { key, retries }),
+                Proof::DiskKey,
+            ))
+        };
+        assert_eq!(
+            identify.admit_proof_step(&authorize(N, 8), &baseline, disk),
+            Ok(Admitted::Next)
+        );
+        // A login key's fingerprint, an unknown one, or a blocked key.
+        for (key, retries) in [(A, 8), (M, 8), (N, 0)] {
+            assert!(identify
+                .admit_proof_step(&authorize(key, retries), &baseline, disk)
+                .is_err());
+        }
+        // Never the login worker's to present, nor the storage worker's
+        // to present anything but its proof.
+        assert!(identify
+            .admit_login_step(&authorize(N, 8), &baseline, None)
+            .is_err());
+        let proved = authorize(N, 8);
+        assert!(proved
+            .admit_proof_step(
+                &login(proven(add(LoginStep::Connect), Proof::DiskKey)),
+                &baseline,
+                disk
+            )
+            .is_err());
+        assert!(identify
+            .admit_proof_step(&authorize(N, 8), &[A], disk)
+            .is_err());
+        // A header token whose fingerprint a login key shares.
+        let colliding = DiskProofs {
+            recovery_key: false,
+            tokens: &[N, A],
+        };
+        let identify = Request::begin_proof(
+            [9; 32],
+            1000,
+            proven(add(LoginStep::DiskIdentify), Proof::DiskKey),
+            &baseline,
+            colliding,
+        )
+        .unwrap();
+        assert_eq!(
+            identify.admit_proof_step(&authorize(N, 8), &baseline, colliding),
+            Ok(Admitted::Next)
+        );
+        assert_eq!(
+            identify.admit_proof_step(&authorize(A, 8), &baseline, colliding),
+            Err("disk security key names a login key".into())
+        );
+    }
+
+    /// The whole sequence of each proof and operation: root's first step,
+    /// the storage worker's proof steps, the login worker's first frame at
+    /// the proof's last step, then its own steps to the last.
+    #[test]
+    fn each_disk_proof_walks_from_the_storage_worker_to_the_login_worker() {
+        let disk = DiskProofs {
+            recovery_key: true,
+            tokens: &[M, N],
+        };
+        let ceremony = |make: &dyn Fn(LoginStep) -> Operation, new| {
+            vec![
+                (make(LoginStep::Connect), None),
+                (make(LoginStep::Create { retries: 8 }), None),
+                (
+                    make(LoginStep::Prove {
+                        key: new,
+                        retries: 8,
+                    }),
+                    Some(new),
+                ),
+                (
+                    make(LoginStep::Repeat {
+                        key: new,
+                        retries: 8,
+                    }),
+                    Some(new),
+                ),
+                (make(LoginStep::Probe { key: new }), Some(new)),
+            ]
+        };
+        for proof in PROOFS {
+            let first = match proof {
+                Proof::RecoveryKey => LoginStep::RecoveryKey,
+                Proof::DiskKey => LoginStep::DiskIdentify,
+            };
+            let last = match proof {
+                Proof::RecoveryKey => LoginStep::RecoveryKey,
+                Proof::DiskKey => LoginStep::DiskAuthorize { key: M, retries: 3 },
+            };
+            let adding = |step| proven(add(step), *proof);
+            let removing = |step| proven(remove(vec![slot(1, B)], step), *proof);
+            let enrolling = |key, step| proven(enroll(2, key, step), *proof);
+            let first_key = |step| enrolling(1, step);
+            let mut two = ceremony(&first_key, A);
+            two.extend(ceremony(&|step| enrolling(2, step), B));
+            /// A step builder, its login baseline and the login worker's steps.
+            type Case<'a> = (
+                &'a dyn Fn(LoginStep) -> Operation,
+                &'a [Fingerprint],
+                Vec<(Operation, Option<Fingerprint>)>,
+            );
+            let cases: Vec<Case> = vec![
+                (&adding, &[B, A], ceremony(&adding, N)),
+                (&removing, &[B, A, A], vec![]),
+                (&first_key, &[], two),
+            ];
+            for (make, baseline, rest) in cases {
+                let mut current =
+                    Request::begin_proof([9; 32], 1000, make(first), baseline, disk).unwrap();
+                // A removal's last proof step is its last step.
+                let proved = if rest.is_empty() {
+                    Admitted::Last
+                } else {
+                    Admitted::Next
+                };
+                if first != last {
+                    let next = login(make(last));
+                    assert_eq!(current.admit_proof_step(&next, baseline, disk), Ok(proved));
+                    current = next;
+                }
+                // The login worker starts at exactly the step the storage
+                // worker proved.
+                let (resumed, admitted) =
+                    Request::begin_proven([9; 32], 1000, make(last), baseline).unwrap();
+                assert_eq!(resumed, current);
+                assert_eq!(admitted, proved);
+                for (index, (operation, created)) in rest.iter().enumerate() {
+                    let next = login(operation.clone());
+                    let expected = if index + 1 == rest.len() {
+                        Admitted::Last
+                    } else {
+                        Admitted::Next
+                    };
+                    assert_eq!(
+                        current.admit_login_step(&next, baseline, *created),
+                        Ok(expected),
+                        "{operation:?}"
+                    );
+                    current = next;
+                }
+            }
+        }
+    }
+
+    /// The chosen proof is in every step: a successor that drops or
+    /// changes it is another operation.
+    #[test]
+    fn a_disk_proofs_successor_keeps_its_proof() {
+        let proved = login(proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey));
+        assert_eq!(
+            proved.admit_login_step(
+                &login(proven(add(LoginStep::Connect), Proof::RecoveryKey)),
+                &[B, A],
+                None
+            ),
+            Ok(Admitted::Next)
+        );
+        for next in [
+            add(LoginStep::Connect),
+            proven(add(LoginStep::Connect), Proof::DiskKey),
+        ] {
+            assert_eq!(
+                proved.login_successor(&login(next)).err().unwrap(),
+                "login step changed its operation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_worker_resumes_only_at_a_proven_proofs_last_step() {
+        let begin = |operation, baseline: &[Fingerprint]| {
+            Request::begin_proven([9; 32], 1000, operation, baseline).map(|(request, _)| request)
+        };
+        assert!(begin(
+            proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey),
+            &[B, A]
+        )
+        .is_ok());
+        assert!(begin(
+            proven(
+                add(LoginStep::DiskAuthorize { key: N, retries: 1 }),
+                Proof::DiskKey
+            ),
+            &[B, A]
+        )
+        .is_ok());
+        for (operation, baseline) in [
+            // The proof's first step, a blocked key, a step after it, an
+            // ordinary operation, and a baseline the counts do not match.
+            (
+                proven(add(LoginStep::DiskIdentify), Proof::DiskKey),
+                &[B, A][..],
+            ),
+            (
+                proven(
+                    add(LoginStep::DiskAuthorize { key: N, retries: 0 }),
+                    Proof::DiskKey,
+                ),
+                &[B, A],
+            ),
+            (proven(add(LoginStep::Connect), Proof::DiskKey), &[B, A]),
+            (add(LoginStep::Authorize { key: A, retries: 1 }), &[B, A]),
+            (add(LoginStep::Connect), &[B, A]),
+            (
+                proven(add(LoginStep::RecoveryKey), Proof::RecoveryKey),
+                &[A],
+            ),
+            (
+                proven(enroll(1, 1, LoginStep::RecoveryKey), Proof::RecoveryKey),
+                &[A],
+            ),
+        ] {
+            assert!(begin(operation.clone(), baseline).is_err(), "{operation:?}");
+        }
     }
 }

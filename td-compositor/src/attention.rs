@@ -858,6 +858,7 @@ mod tests {
                 key: 1,
                 step: LoginStep::Connect,
                 approval: Some(key),
+                proof: None,
             };
             let remove = |removed: u8| Operation::LoginRemove {
                 account: 65533,
@@ -871,6 +872,7 @@ mod tests {
                     .collect(),
                 step: LoginStep::Identify,
                 approval: Some(key),
+                proof: None,
             };
             [
                 enroll(1),
@@ -929,6 +931,7 @@ mod tests {
                     retries: 255,
                 },
                 approval: None,
+                proof: None,
             },
         )
         .unwrap();
@@ -958,6 +961,7 @@ mod tests {
                 before: 1,
                 after: 2,
                 step: LoginStep::Identify,
+                proof: None,
             },
         )
         .unwrap();
@@ -1832,6 +1836,7 @@ mod tests {
                         before,
                         after,
                         step,
+                        proof: None,
                     });
                     for created in 1..=2 {
                         operations.push(Operation::LoginEnroll {
@@ -1841,6 +1846,7 @@ mod tests {
                             key: created,
                             step,
                             approval: None,
+                            proof: None,
                         });
                     }
                     for removed in 1..=before {
@@ -1853,6 +1859,7 @@ mod tests {
                                 .collect(),
                             step,
                             approval: None,
+                            proof: None,
                         });
                     }
                 }

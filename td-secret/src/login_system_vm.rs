@@ -979,6 +979,7 @@ fn enroll(host: &mut Host, keyboard: &mut Keyboard, keys: &[&Virtual]) -> Plugge
         key,
         step,
         approval: None,
+        proof: None,
     };
     held(keys);
     let mut plugged = Plugged::insert(keys[0], NAME);
@@ -1008,6 +1009,7 @@ fn add(host: &mut Host, keyboard: &mut Keyboard, by: &Virtual, new: &Virtual, be
         before,
         after: before + 1,
         step,
+        proof: None,
     };
     held(&[by, new]);
     let plugged = Plugged::insert(by, NAME);
@@ -1078,6 +1080,7 @@ fn remove(
         removed: removed.to_vec(),
         step,
         approval: None,
+        proof: None,
     };
     approve(host, keyboard, removing(LoginStep::Identify));
     let authorize = LoginStep::Authorize {

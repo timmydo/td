@@ -3,7 +3,7 @@
 
 use crate::consent::{
     Admitted, ApprovalKey, Fingerprint, LoginStep, Operation, Request, Slot, LOGIN_CEREMONY,
-    LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING, LOGIN_TWO_CEREMONIES,
+    LOGIN_KEYS, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
 };
 use crate::login_status::login_state::Owner;
 use crate::unlock::{command, deadline_after, Event, Wire};
@@ -116,7 +116,7 @@ impl Selection {
             Self::Unlock => LOGIN_CEREMONY,
             Self::Enroll(1) | Self::Remove(_) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
             Self::Add => LOGIN_TWO_CEREMONIES,
-            Self::Enroll(_) => LOGIN_LONGEST,
+            Self::Enroll(_) => LOGIN_TWO_KEY_ENROLLMENT,
         }
     }
 
@@ -141,6 +141,7 @@ impl Selection {
                 key: 1,
                 step: LoginStep::Connect,
                 approval: None,
+                proof: None,
             },
             _ if count == 0 => return Err(NO_RECORD),
             Self::Unlock => Operation::LoginUnlock {
@@ -156,6 +157,7 @@ impl Selection {
                 before: count,
                 after: count.checked_add(1).ok_or(INTERNAL)?,
                 step: LoginStep::Identify,
+                proof: None,
             },
             Self::Remove(removed) if protected && removed.len() >= usize::from(count) => {
                 return Err(LAST)
@@ -170,6 +172,7 @@ impl Selection {
                 removed: removed.clone(),
                 step: LoginStep::Identify,
                 approval: None,
+                proof: None,
             },
         };
         // A first enrollment's first step, and a removal's that leaves at

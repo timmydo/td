@@ -138,7 +138,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     }
     assert_eq!(
         fingerprint(include_str!("../src/consent.rs")),
-        0x4ce795e608fe4cc6,
+        0xe1ac06eb9a6963b3,
         "shared consent changed: reconcile td-secret/src/lib.rs, compositor confinement and this pin"
     );
     assert_eq!(
@@ -189,7 +189,7 @@ fn the_production_source_and_raw_boundary_are_closed() {
     assert_eq!(login.matches("Instant::now()").count(), 5);
     assert_eq!(
         fingerprint(login),
-        0x2a7b03cb2ec47e43,
+        0x99f08c22313e3bf1,
         "login worker supervisor changed"
     );
     assert_eq!(

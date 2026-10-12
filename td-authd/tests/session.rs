@@ -1359,6 +1359,7 @@ fn login_ends_are_typed_and_a_cancel_relocks_nothing() {
             before: 1,
             after: 2,
             step: LoginStep::Probe { key: [0x4e; 4] },
+            proof: None,
         },
     )
     .unwrap();
@@ -1859,6 +1860,7 @@ fn root_login_supervision_meets_the_production_worker() {
             key: 1,
             step: crate::consent::LoginStep::Connect,
             approval: Some(_),
+            proof: None,
         }
     ));
     assert_eq!(state(&mut session), [0]);

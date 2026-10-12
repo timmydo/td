@@ -3,8 +3,8 @@
 use crate::attention::{Field, Notice};
 use crate::authority::consent::{
     Admitted, ApprovalKey, Enrollment, Fingerprint, LoginStep, Operation, Platform, Recovery,
-    Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_LONGEST, LOGIN_READING,
-    LOGIN_TWO_CEREMONIES, SELECTOR_UPDATE_CEILING,
+    Request, Role, SelectorForm, Slot, LOGIN_CEREMONY, LOGIN_KEYS, LOGIN_READING,
+    LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT, SELECTOR_UPDATE_CEILING,
 };
 use crate::authority::Exchange;
 use crate::input::EvdevOrigin;
@@ -439,7 +439,7 @@ impl LoginSelection {
             Self::Remove(_, after) if *after > 1 => LOGIN_CEREMONY,
             Self::Remove(..) | Self::Enroll(1) => LOGIN_CEREMONY.saturating_add(LOGIN_READING),
             Self::Add => LOGIN_TWO_CEREMONIES,
-            Self::Enroll(_) => LOGIN_LONGEST,
+            Self::Enroll(_) => LOGIN_TWO_KEY_ENROLLMENT,
             Self::SelectorUpdate => SELECTOR_UPDATE_CEILING,
         }
     }
@@ -469,11 +469,14 @@ impl LoginSelection {
     }
 
     /// Whether `request` describes this operation for the configured human.
+    /// No selection here is a disk proof's, so a description carrying one
+    /// (consent tags 13 to 15) never selects, whatever its ceiling.
     fn selects(&self, request: &Request) -> bool {
         if *self == Self::SelectorUpdate {
             return request.owner() == 1000 && request.selector_update().is_some();
         }
         request.owner() == 1000
+            && request.login_proof().is_none()
             && request.login_ceiling() == Some(self.ceiling())
             && match (self, request.operation()) {
                 (Self::Unlock, Operation::LoginUnlock { account, .. })
@@ -1945,6 +1948,7 @@ fn cancel(wire: &mut impl Exchange, nonce: &[u8; 32]) -> Result<(), String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
+    use crate::authority::consent::Proof;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -3583,6 +3587,7 @@ mod tests {
                 key,
                 step,
                 approval: None,
+                proof: None,
             }
             .disclosed(disclosure()),
         )
@@ -3593,7 +3598,92 @@ mod tests {
             before: 3,
             after: 4,
             step,
+            proof: None,
         })
+    }
+    fn enroll_op(after: u8, step: LoginStep) -> Operation {
+        Operation::LoginEnroll {
+            account: 1000,
+            before: 0,
+            after,
+            key: 1,
+            step,
+            approval: None,
+            proof: None,
+        }
+    }
+    fn add_op(step: LoginStep) -> Operation {
+        Operation::LoginAdd {
+            account: 1000,
+            before: 3,
+            after: 4,
+            step,
+            proof: None,
+        }
+    }
+    fn remove_op(step: LoginStep) -> Operation {
+        Operation::LoginRemove {
+            account: 1000,
+            before: 3,
+            after: 1,
+            removed: removal(),
+            step,
+            approval: None,
+            proof: None,
+        }
+    }
+    /// `operation` authorized by `proof`, its first step disclosing where
+    /// the proof's does.
+    fn proven(operation: Operation, proof: Proof) -> Request {
+        let operation = match operation {
+            Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                ..
+            } => Operation::LoginEnroll {
+                account,
+                before,
+                after,
+                key,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                ..
+            } => Operation::LoginAdd {
+                account,
+                before,
+                after,
+                step,
+                proof: Some(proof),
+            },
+            Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                ..
+            } => Operation::LoginRemove {
+                account,
+                before,
+                after,
+                removed,
+                step,
+                approval: None,
+                proof: Some(proof),
+            },
+            other => other,
+        };
+        login(operation.disclosed(disclosure()))
     }
     fn removal() -> Vec<Slot> {
         vec![
@@ -3617,6 +3707,7 @@ mod tests {
                 removed: removal(),
                 step,
                 approval: None,
+                proof: None,
             }
             .disclosed(disclosure()),
         )
@@ -4128,6 +4219,7 @@ mod tests {
                     before: 3,
                     after: 4,
                     step: LoginStep::Identify,
+                    proof: None,
                 },
             )
             .unwrap()
@@ -4164,6 +4256,32 @@ mod tests {
             (
                 LoginSelection::Enroll(2),
                 enroll_step(2, 2, LoginStep::Connect),
+            ),
+            // The same operation authorized by a disk proof, tags 13 to 15,
+            // whose addition and removal keep the ordinary ceilings.
+            (
+                LoginSelection::Enroll(1),
+                proven(enroll_op(1, LoginStep::RecoveryKey), Proof::RecoveryKey),
+            ),
+            (
+                LoginSelection::Enroll(2),
+                proven(enroll_op(2, LoginStep::DiskIdentify), Proof::DiskKey),
+            ),
+            (
+                LoginSelection::Add,
+                proven(add_op(LoginStep::RecoveryKey), Proof::RecoveryKey),
+            ),
+            (
+                LoginSelection::Add,
+                proven(add_op(LoginStep::DiskIdentify), Proof::DiskKey),
+            ),
+            (
+                LoginSelection::Remove(removal(), 1),
+                proven(remove_op(LoginStep::RecoveryKey), Proof::RecoveryKey),
+            ),
+            (
+                LoginSelection::Remove(removal(), 1),
+                proven(remove_op(LoginStep::DiskIdentify), Proof::DiskKey),
             ),
         ] {
             for code in [3, 4, 0x0d] {
@@ -4989,7 +5107,7 @@ mod tests {
     #[test]
     fn a_login_attempt_lives_its_operations_ceiling_and_no_longer() {
         assert_eq!(LOGIN_READING, Duration::from_secs(120));
-        assert_eq!(LOGIN_LONGEST, Duration::from_secs(360));
+        assert_eq!(LOGIN_TWO_KEY_ENROLLMENT, Duration::from_secs(360));
         for (selection, seconds) in [
             (LoginSelection::Unlock, 120),
             (LoginSelection::Enroll(1), 240),
@@ -5631,6 +5749,7 @@ mod tests {
                         .collect(),
                     step,
                     approval: None,
+                    proof: None,
                 }
                 .disclosed(disclosure()),
             )

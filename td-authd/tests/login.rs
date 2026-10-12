@@ -46,6 +46,7 @@ fn adding(before: u8, step: LoginStep) -> Operation {
         before,
         after: before + 1,
         step,
+        proof: None,
     }
 }
 
@@ -63,6 +64,7 @@ fn enrolling(after: u8, key: u8, step: LoginStep) -> Operation {
         key,
         step,
         approval: None,
+        proof: None,
     }
     .disclosed(approval())
 }
@@ -76,6 +78,7 @@ fn removing(before: u8, removed: &[Slot], step: LoginStep) -> Operation {
         removed: removed.to_vec(),
         step,
         approval: None,
+        proof: None,
     }
     .disclosed(approval())
 }

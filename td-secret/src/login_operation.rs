@@ -996,6 +996,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             key: ordinal,
             step,
             approval: None,
+            proof: None,
         },
         Operation::LoginAdd {
             account,
@@ -1007,6 +1008,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             before,
             after,
             step,
+            proof: None,
         },
         Operation::LoginRemove {
             account,
@@ -1021,6 +1023,7 @@ fn stepped(operation: &Operation, step: LoginStep, ordinal: u8) -> Result<Operat
             removed,
             step,
             approval: None,
+            proof: None,
         },
         _ => return Err(Failure::Internal),
     })
@@ -1164,7 +1167,9 @@ fn token(error: LoginError, reported: Option<u8>, wire: &Wire) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consent::{ApprovalKey, LOGIN_CEREMONY, LOGIN_READING, LOGIN_TWO_CEREMONIES};
+    use crate::consent::{
+        ApprovalKey, LOGIN_CEREMONY, LOGIN_READING, LOGIN_TWO_CEREMONIES, LOGIN_TWO_KEY_ENROLLMENT,
+    };
     use crate::crypto;
     use crate::fido_cbor::{self as cbor, Value};
     use crate::fido_ctap::fingerprint;
@@ -1876,6 +1881,7 @@ mod tests {
             key,
             step,
             approval: None,
+            proof: None,
         }
         .disclosed(disclosure())
     }
@@ -1886,6 +1892,7 @@ mod tests {
             before,
             after: before + 1,
             step,
+            proof: None,
         }
     }
 
@@ -1898,6 +1905,7 @@ mod tests {
             removed: removed.to_vec(),
             step,
             approval: None,
+            proof: None,
         }
         .disclosed(disclosure())
     }
@@ -2117,7 +2125,9 @@ mod tests {
         assert_eq!(LOGIN_CEREMONY, Duration::from_secs(120));
         assert_eq!(LOGIN_TWO_CEREMONIES, Duration::from_secs(240));
         assert_eq!(LOGIN_READING, Duration::from_secs(120));
-        assert_eq!(LOGIN_LONGEST, Duration::from_secs(360));
+        // The bound until a description names the operation: a two-key
+        // enrollment by disk proof's (td-authd/DESIGN.md, amendment 10).
+        assert_eq!(LOGIN_LONGEST, Duration::from_secs(480));
         assert!(LOGIN_CEREMONY <= fido_device::MAX_LIFETIME);
         let slot = |position| Slot {
             position,
@@ -2143,7 +2153,10 @@ mod tests {
                 enrolling(1, 1, LoginStep::Connect),
                 LOGIN_CEREMONY + LOGIN_READING,
             ),
-            (enrolling(2, 1, LoginStep::Connect), LOGIN_LONGEST),
+            (
+                enrolling(2, 1, LoginStep::Connect),
+                LOGIN_TWO_KEY_ENROLLMENT,
+            ),
             (adding(1, LoginStep::Identify), LOGIN_TWO_CEREMONIES),
         ] {
             assert_eq!(login(operation).login_ceiling(), Some(ceiling));

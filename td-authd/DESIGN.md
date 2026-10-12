@@ -1138,10 +1138,28 @@ presenting it. `LoginStep::asks_pin` names the PIN steps,
 `Request::login_ceiling` is the operation's deadline, amendment 6:
 `LOGIN_CEREMONY` (120 seconds) per key ceremony, `LOGIN_TWO_CEREMONIES`
 (240) for two, plus `LOGIN_READING` (120) for an operation that
-discloses; `LOGIN_LONGEST` (360) is the largest. Root bounds its
+discloses; `LOGIN_TWO_KEY_ENROLLMENT` (360) is an ordinary two-key
+enrollment's, and `LOGIN_LONGEST` (480), a two-key enrollment by disk
+proof (amendment 10), the largest. Root bounds its
 operation by these constants until its first step, then by that step's
 `login_ceiling`, which the worker takes too, and reads a step and
 whether it asks for a PIN through these accessors.
+
+A disk proof's descriptions (amendment 10, tags 13 to 15) carry
+`Operation`'s `proof` in every step, `Request::login_proof` reads it, and
+three entries admit them. `begin_login` refuses a proof, so root begins
+one with `Request::begin_proof`: `begin_login`'s rules, then the proof's
+first step one the storage worker's baseline offers (`DiskProofs`: a
+`recovery-key` marker for the recovery-key step, a fido2 token for disk
+identify). `Request::admit_proof_step` admits the storage worker's next
+step as `admit_login_step` does, but against that baseline: a disk
+authorize step's key names one of the header's fido2 tokens, never a
+login slot, and `admit_login_step` refuses every proof step.
+`Request::begin_proven` is the login worker's start rule: the proof's
+last step of the first key, its retries not zero, against the worker's
+own record, answering `Last` for a removal, whose commit follows it, and
+`Next` otherwise. A proof step's key ordinal is always 1, since the
+proof is made once, before an enrollment's first key.
 
 The human UID is 1000 through 65533; the external application UID is 65536
 through 2147483647. A write's requester must equal its human owner. Names are
@@ -2711,8 +2729,9 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     time. A failure, cancellation or deadline at any point kills and
     reaps both children before the end is reported. Root admits each
     step the storage worker presents against both baselines: a disk
-    key's fingerprint must name a fido2 token of the volume's baseline,
-    and its retries be one nonzero byte, as an authorize step's are; the
+    key's fingerprint must name a fido2 token of the volume's baseline
+    and no key of the login baseline, and its retries be one nonzero
+    byte, as an authorize step's are; the
     recovery-key step needs a `recovery-key` marker in that baseline. A
     `1c` for the recovery-key step must hold exactly 48 ASCII digits,
     which root forwards unparsed; anything else is a protocol violation
@@ -2746,10 +2765,11 @@ contracts above as follows; increment numbers are TOKEN-LOGIN.md's.
     never identify or authorize. Recovery key and disk authorize ask for
     a secret (`asks_pin`), the first the recovery key, the second the
     disk key's PIN. The rows name the operation as tags 8 to 10 do, then
-    `AUTHORIZED BY THE DISK RECOVERY KEY` or `AUTHORIZED BY A DISK
-    SECURITY KEY`; the recovery-key step shows `TYPE THE DISK RECOVERY
-    KEY`, disk identify `CONNECT ONE DISK SECURITY KEY ONLY`, and disk
-    authorize `DISK SECURITY KEY` with its fingerprint, then a PIN
+    `AUTHORIZED BY DISK RECOVERY KEY` or `AUTHORIZED BY A DISK SECURITY
+    KEY`, each within `PROMPT_COLUMNS`; the recovery-key step shows
+    `TYPE THE DISK RECOVERY KEY`, disk identify `CONNECT ONE DISK
+    SECURITY KEY ONLY`, and disk authorize `DISK SECURITY KEY` with its
+    fingerprint, then a PIN
     step's two rows. The widest such value, a removal of eight keys at
     its disk authorize step, is 99 bytes.
 
