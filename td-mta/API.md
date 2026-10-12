@@ -7248,3 +7248,27 @@ updatedProperties is always null: the current history records do not prove
 which mailbox fields changed. Common result-reference substitution applies
 to arguments and results. Existing method rollback preserves other replies;
 outer retention failures remain terminal.
+
+## Retained thread member windows
+
+IndexReadView::thread_emails returns an optional ThreadEmails window for a
+typed Thread ID in the original account snapshot. An absent thread returns
+None; an existing empty thread returns an empty window. This is a storage
+row-existence distinction, not a claim that an empty thread is a visible
+JMAP Thread. A method encoder must apply its object lifecycle contract.
+Thread row values are empty, so the scratch slice may be empty.
+
+The internal window limit is 1..=MAX_THREAD_EMAILS. Zero returns Invalid;
+a larger limit returns Capacity, consistent with other bounded readers.
+These argument refusals do not themselves exhaust the view. ThreadEmail
+coordinates order members by signed received_at, then Email ID, ascending.
+An optional coordinate excludes itself and everything before it; it need
+not name a current member. has_more reports additional matching members.
+The result includes the captured view identity and Thread ID. Coordinates
+and windows are passive metadata, not authorization or view pins.
+
+The same view must remain alive across windows and be checked before
+response publication. Allocation refusal and expired/lost views never
+become empty successful windows. STORAGE.md owns the selection algorithm
+and cumulative work cost. This surface does not dispatch Thread/get or
+advertise Mail.

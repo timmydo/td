@@ -19,9 +19,10 @@ pub use index::{
     Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
     DeliveryPeer, DeliveryRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
     LedgerInitError, LogicalUsage, MailboxCounts, ResponseError, ResponseRetention,
-    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt,
-    UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
+    StoreCoordinator, StoreFileUsage, StoreLogicalUsage, ThreadEmail, ThreadEmails, Upload,
+    UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
     UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence, MAX_MAILBOX_COUNTS,
+    MAX_THREAD_EMAILS,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;

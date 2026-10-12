@@ -52,6 +52,9 @@ use operations::Operations;
 mod history;
 #[path = "index/mailbox_counts.rs"]
 mod mailbox_counts;
+#[path = "index/thread_emails.rs"]
+mod thread_emails;
+pub use thread_emails::{ThreadEmail, ThreadEmails, MAX_THREAD_EMAILS};
 #[path = "index/threading.rs"]
 mod threading;
 pub use history::{HistoryPruneRequest, HistoryPruned};

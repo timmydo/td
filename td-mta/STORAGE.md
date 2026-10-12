@@ -2700,3 +2700,20 @@ Mail database backup and restore do not copy credential state. Preserve the
 credential directory separately; restoring an older credential snapshot can
 undo revocations. The store lock and stable trusted namespace assumptions
 apply here as to the database. There is no public HTTP administration route.
+
+## Thread member read windows
+
+The thread_emails reader searches emails_thread by account and thread and
+walks ID order. It validates every member's changed sequence against the
+original snapshot. A bounded Rust BinaryHeap selects up to MAX_THREAD_EMAILS entries in
+(received_at, Email ID) order, then consumes it into an ascending Vec.
+The heap is reserved once at the requested capacity and never grows beyond
+it. The pinned query-plan test excludes SQL temporary sorts and account
+scans. No schema or index migration is introduced.
+
+Pagination is a strict coordinate filter over the retained snapshot. Each
+window scans the whole thread again, including rows before the coordinate,
+under the same cumulative native VM budget and original deadline.
+This trades repeated indexed reads for fixed memory; no maximum-thread
+throughput claim is made. read_snapshot plus a final native check withhold
+results after failure. API.md owns the passive result/caller contract.

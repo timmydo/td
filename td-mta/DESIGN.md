@@ -1930,6 +1930,11 @@ transaction-aligned pages. API.md owns its token scope, limit, snapshot and
 completion contract. Wire argument handling and changes-method dispatch are
 separate from this passive cursor.
 
+The passive thread member reader returns bounded received-date windows
+from one retained snapshot without an SQL sort or account-sized collection.
+API.md and STORAGE.md own the fixed-memory and repeated-scan tradeoff.
+Thread/get dispatch and Mail advertisement remain separate.
+
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:
 
