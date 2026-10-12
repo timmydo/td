@@ -56,7 +56,7 @@ impl<'w, 'o> Cursor<'w, 'o> {
         self.framing.check_deadline(now)
     }
     pub fn poll(&mut self, now: Tick) -> Result<Status, Error> {
-        if let Some(error) = self.framing.failure {
+        if let Some(error) = self.framing.failure() {
             return Err(error);
         }
         if self.framing.value().is_some() {

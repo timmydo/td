@@ -83,14 +83,7 @@ fn costs(cursor: &Cursor<'_, '_>) -> [u64; 5] {
     framing_costs(&cursor.framing)
 }
 fn framing_costs(framing: &crate::mime_response::part_json::Cursor<'_>) -> [u64; 5] {
-    let remaining = framing.scalars.work.remaining();
-    [
-        framing.scalars.budget.source_bytes_remaining(),
-        framing.scalars.budget.steps_remaining(),
-        remaining.io_bytes,
-        remaining.records,
-        remaining.output_bytes,
-    ]
+    crate::mime_response::part_json::tests::snapshot(framing)
 }
 fn bare(source: &[u8], base: u64, ordinal: usize) -> (Vec<u8>, [u64; 5]) {
     exercise(source, base, ordinal, 1024, |cursor, original| {
@@ -131,9 +124,9 @@ fn exact_retention_preserves_original_fragment_costs_identity_and_owner_release(
                 let (expected, charged) =
                     exercise(source, base, ordinal, 1024, |mut cursor, _original| {
                         let pointers = (
-                            std::ptr::from_mut(cursor.framing.scalars.work),
-                            std::ptr::from_mut(cursor.framing.scalars.budget),
-                            std::ptr::from_mut(cursor.framing.scratch),
+                            std::ptr::from_mut(cursor.framing.core().scalars.work),
+                            std::ptr::from_mut(cursor.framing.core().scalars.budget),
+                            std::ptr::from_mut(cursor.framing.core().scratch),
                         );
                         assert_eq!(pointers, _original);
                         let before = costs(&cursor);
@@ -262,9 +255,10 @@ fn every_retention_prefix_requires_fresh_completion_and_forgetting_retires_paren
 #[test]
 fn original_output_refusal_remains_sticky() {
     exercise(SOURCE, 0, 2, 1024, |mut cursor, _original| {
-        let left = cursor.framing.scalars.work.remaining().output_bytes;
+        let left = cursor.framing.core().scalars.work.remaining().output_bytes;
         cursor
             .framing
+            .core()
             .scalars
             .work
             .charge(

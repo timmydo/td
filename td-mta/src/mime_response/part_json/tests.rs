@@ -11,7 +11,7 @@ use {
 fn forget<T>(value: T) {
     std::mem::forget(value);
 }
-fn exercise<T>(
+pub(crate) fn exercise<T>(
     source: &[u8],
     base: u64,
     ordinal: usize,
@@ -77,11 +77,11 @@ fn drain(cursor: &mut Cursor<'_>, width: usize) -> Result<(Vec<u8>, usize), Erro
     }
     panic!("JSON did not finish")
 }
-fn snapshot(cursor: &Cursor<'_>) -> [u64; 5] {
-    let left = cursor.scalars.work.remaining();
+pub(crate) fn snapshot(cursor: &Cursor<'_>) -> [u64; 5] {
+    let left = cursor.core.scalars.work.remaining();
     [
-        cursor.scalars.budget.source_bytes_remaining(),
-        cursor.scalars.budget.steps_remaining(),
+        cursor.core.scalars.budget.source_bytes_remaining(),
+        cursor.core.scalars.budget.steps_remaining(),
         left.io_bytes,
         left.records,
         left.output_bytes,
@@ -99,11 +99,11 @@ fn original_fields_short_drains_and_exact_new_wire_costs() {
             for base in [0, 17, u64::MAX - source.len() as u64] {
                 for width in 1..=8 {
                     let emitted = exercise(source, base, ordinal, |mut cursor| {
-                        let end = cursor.end;
+                        let end = cursor.core.end;
                         let pointers = (
-                            std::ptr::from_mut(cursor.scalars.work),
-                            std::ptr::from_mut(cursor.scalars.budget),
-                            std::ptr::from_mut(cursor.scratch),
+                            std::ptr::from_mut(cursor.core.scalars.work),
+                            std::ptr::from_mut(cursor.core.scalars.budget),
+                            std::ptr::from_mut(cursor.core.scratch),
                         );
                         let before = snapshot(&cursor);
                         for _ in 0..3 {
@@ -145,7 +145,7 @@ fn original_fields_short_drains_and_exact_new_wire_costs() {
                         assert_eq!(
                             parsed.get("type"),
                             Some(&td_json::Json::Str(
-                                std::str::from_utf8(cursor.metadata.headers.content_type)
+                                std::str::from_utf8(cursor.core.metadata.headers.content_type)
                                     .unwrap()
                                     .to_owned()
                             ))
@@ -190,10 +190,10 @@ fn selected_filename_escaping_charset_and_nulls_match_literal_fragment() {
     let expected = "\"partId\":\"1\",\"size\":3,\"type\":\"text/plain\",\"charset\":\"UTF-8\",\"name\":\"é例🐈\\\"\\\\x\",\"disposition\":\"attachment\",\"cid\":\"i@a\",\"language\":[\"en\",\"fr\"],\"location\":\"../x\"";
     for width in [1, 2, 6, 128] {
         exercise(source, 37, 1, |mut cursor| {
-            let expected_source = cursor.metadata.headers.content_type.len()
-                + cursor.metadata.headers.charset.unwrap().len()
-                + cursor.metadata.headers.filename.unwrap().len()
-                + cursor.metadata.headers.disposition.unwrap().len();
+            let expected_source = cursor.core.metadata.headers.content_type.len()
+                + cursor.core.metadata.headers.charset.unwrap().len()
+                + cursor.core.metadata.headers.filename.unwrap().len()
+                + cursor.core.metadata.headers.disposition.unwrap().len();
             let before = snapshot(&cursor);
             let (bytes, _) = drain(&mut cursor, width).unwrap();
             let used = delta(before, snapshot(&cursor));
@@ -284,6 +284,7 @@ fn original_output_and_interpretation_cutoffs_are_sticky_without_replacement_own
                 if kind < 2 {
                     let left = snapshot(&cursor);
                     cursor
+                        .core
                         .scalars
                         .budget
                         .charge(
@@ -295,8 +296,9 @@ fn original_output_and_interpretation_cutoffs_are_sticky_without_replacement_own
                         )
                         .unwrap();
                 } else {
-                    let left = cursor.scalars.work.remaining();
+                    let left = cursor.core.scalars.work.remaining();
                     cursor
+                        .core
                         .scalars
                         .work
                         .charge(
@@ -427,14 +429,15 @@ fn long_location_copy_obeys_64_byte_turns_with_wide_output() {
     let source = format!("Content-Location: ../{suffix}\r\n\r\nabc");
     exercise(source.as_bytes(), 17, 1, |mut cursor| {
         let before = snapshot(&cursor);
-        let prepaid = cursor.metadata.location.value.unwrap().len();
+        let prepaid = cursor.core.metadata.location.value.unwrap().len();
         assert_eq!(prepaid, 165);
         let mut bytes = Vec::new();
         let mut raw_turns = Vec::new();
         let mut done = false;
         for _ in 0..10000 {
-            let raw = cursor.field == Field::Location && matches!(cursor.phase, Phase::Raw);
-            let remaining = cursor.scalars.work.remaining().output_bytes;
+            let raw =
+                cursor.core.field == Field::Location && matches!(cursor.core.phase, Phase::Raw);
+            let remaining = cursor.core.scalars.work.remaining().output_bytes;
             let mut output = [0xa5; 128];
             let progress = cursor.poll(Tick(1), &mut output).unwrap();
             assert!(progress.written <= 64);
@@ -443,7 +446,7 @@ fn long_location_copy_obeys_64_byte_turns_with_wide_output() {
             if raw {
                 raw_turns.push(progress.written);
                 assert_eq!(
-                    remaining - cursor.scalars.work.remaining().output_bytes,
+                    remaining - cursor.core.scalars.work.remaining().output_bytes,
                     progress.written as u64
                 );
             }
@@ -519,7 +522,7 @@ fn final_charset_mapping_preserves_selected_labels_defaults_and_nontext_nulls() 
 fn unsigned_size_property_refuses_out_of_range_original_evidence() {
     for size in [0, 9_007_199_254_740_991, 9_007_199_254_740_992, u64::MAX] {
         exercise(b"\r\nx", 17, 1, |mut cursor| {
-            cursor.end.part.size = size;
+            cursor.core.end.part.size = size;
             let result = drain(&mut cursor, 128);
             if size <= 9_007_199_254_740_991 {
                 let (bytes, _) = result.unwrap();

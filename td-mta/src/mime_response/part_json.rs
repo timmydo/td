@@ -160,28 +160,91 @@ impl Field {
 /// fn substitute(view: ClassifiedView<'_>) { let _ = Cursor::new(view, Tick(1)); }
 /// ```
 pub struct Cursor<'w> {
+    core: Core<'w>,
+    parent_failure: &'w mut Option<Error>,
+    next: &'w mut usize,
+    following: u16,
+}
+impl<'w> Cursor<'w> {
+    #[cfg(test)]
+    pub(in crate::mime_response) fn core(&mut self) -> &mut Core<'w> {
+        &mut self.core
+    }
+    pub fn new(mut part: Part<'_, 'w>, now: Tick) -> Result<Self, Error> {
+        let end = End {
+            part: part.child.part,
+            node: part.node,
+        };
+        // Keep the parent's Abandoned latch through serialization.
+        let (metadata, work, budget, scratch) = part.child.finish_metadata(now)?;
+        Ok(Self {
+            core: Core::new(metadata, end, work, budget, scratch),
+            parent_failure: part.child.parent_failure,
+            next: part.next,
+            following: part.following,
+        })
+    }
+    pub(in crate::mime_response) fn failure(&self) -> Option<Error> {
+        self.core.failure
+    }
+    pub(in crate::mime_response) fn outcome<T>(
+        &mut self,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
+        if let Err(error) = result {
+            *self.parent_failure = Some(error);
+        }
+        self.core.outcome(result)
+    }
+    pub fn value(&self) -> Option<End> {
+        self.core.value()
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        let result = self.core.check_deadline(now);
+        self.outcome(result)
+    }
+    pub fn poll(&mut self, now: Tick, output: &mut [u8]) -> Result<Progress, Error> {
+        let result = self.core.poll(now, output);
+        self.outcome(result)
+    }
+    pub fn finish(
+        self,
+        now: Tick,
+    ) -> Result<(End, &'w mut Meter, &'w mut HeaderBudget, &'w mut Scratch), Error> {
+        let result = self.core.finish(now);
+        match result {
+            Ok(value) => {
+                *self.parent_failure = None;
+                *self.next = usize::from(self.following);
+                Ok(value)
+            }
+            Err(error) => {
+                *self.parent_failure = Some(error);
+                Err(error)
+            }
+        }
+    }
+}
+pub(crate) struct Core<'w> {
     metadata: label_json::View<'w>,
     end: End,
     pub(in crate::mime_response) scalars: Scalars<'w>,
     pub(in crate::mime_response) scratch: &'w mut Scratch,
-    parent_failure: &'w mut Option<Error>,
-    next: &'w mut usize,
-    following: u16,
     field: Field,
     position: usize,
     phase: Phase,
     frame: Frame<nfc::Error>,
     pub(in crate::mime_response) failure: Option<Error>,
 }
-impl<'w> Cursor<'w> {
-    pub fn new(mut part: Part<'_, 'w>, now: Tick) -> Result<Self, Error> {
-        let end = End {
-            part: part.child.part,
-            node: part.node,
-        };
-        // Keep the parent's Abandoned latch through serialization, not just metadata.
-        let (metadata, work, budget, scratch) = part.child.finish_metadata(now)?;
-        Ok(Self {
+impl<'w> Core<'w> {
+    pub(crate) fn new(
+        metadata: label_json::View<'w>,
+        end: End,
+        work: &'w mut Meter,
+        budget: &'w mut HeaderBudget,
+        scratch: &'w mut Scratch,
+    ) -> Self {
+        Self {
             metadata,
             end,
             scalars: Scalars {
@@ -194,15 +257,12 @@ impl<'w> Cursor<'w> {
                 credit: crate::nfc::Credit::new(),
             },
             scratch,
-            parent_failure: part.child.parent_failure,
-            next: part.next,
-            following: part.following,
             field: Field::PartId,
             position: 0,
             phase: Phase::Prefix,
             frame: Frame::new(),
             failure: None,
-        })
+        }
     }
     pub(in crate::mime_response) fn outcome<T>(
         &mut self,
@@ -210,7 +270,6 @@ impl<'w> Cursor<'w> {
     ) -> Result<T, Error> {
         if let Err(error) = result {
             self.failure = Some(error);
-            *self.parent_failure = Some(error);
         }
         result
     }
@@ -392,8 +451,6 @@ impl<'w> Cursor<'w> {
         if !matches!(self.phase, Phase::Complete) {
             return self.outcome(Err(Error::InvalidState));
         }
-        *self.parent_failure = None;
-        *self.next = usize::from(self.following);
         Ok((
             self.end,
             self.scalars.work,
@@ -406,4 +463,4 @@ const _: () =
     assert!(std::mem::size_of::<Cursor<'_>>() + std::mem::size_of::<HeaderBudget>() <= 1024);
 #[cfg(test)]
 #[path = "part_json/tests.rs"]
-pub(in crate::mime_response) mod tests;
+pub(crate) mod tests;

@@ -8282,3 +8282,24 @@ interpretation operation, even for an invalid ordinal. No partially successful
 metadata or recoverable handoff is returned; the caller-owned snapshot itself
 is not destroyed. A trailing native check covers constructor validation errors
 as well as successful setup, so late native expiry takes precedence.
+
+## Native MIME-part member JSON
+
+`blob_part_json::Cursor` consumes retained native part metadata and keeps its
+original snapshot, Meter, HeaderBudget and scratch throughout member encoding.
+The resident part cursor and native cursor use one encoder for partId, size,
+type, charset, name, disposition, cid, language and location. Their field
+ordering, defaults, escaping, pre-escaped label/location copying and charges
+are identical. Multipart partId remains null. Braces, blob locators,
+requested-field filtering, subparts and response publication remain external.
+
+Native checks bracket construction, every output turn (including cached
+completion), explicit `check_deadline`, and consuming finish. Passive `value()`
+does not sample time or grant publication authority. An error retires the
+whole native cursor and hides passive
+completion; already written bytes are provisional and may not be published.
+A short output span supports bounded progress and an empty span requests
+output. Successful finish freshly returns the original native traversal
+handoff and scratch with passive part/class evidence. It cannot create another
+source or request allowance. Resident parent abandonment and preorder progress
+are still cleared/advanced only by its own successful whole-fragment finish.

@@ -4464,3 +4464,12 @@ between these handoffs. N is bounded by mime_parts. The enclosing job must
 check and admit the sum of all chosen window capacities, plus cumulative
 header backing and the fixed cursor/scratch reservations. The 8 KiB owner
 ceiling is not a bound on that aggregate message storage.
+
+## Native part member JSON
+
+The native member encoder plus HeaderBudget fits a compiled 2 KiB ceiling.
+Its shared scalar/frame implementation emits at most 64 bytes per turn into
+caller-owned output and retains the existing interpretation and output charges.
+The resident wrapper stays within its existing 1 KiB ceiling and owns only
+its original parent failure/progress references around that same encoder.
+No buffer, scratch window, source read, allocation or resource limit is added.
