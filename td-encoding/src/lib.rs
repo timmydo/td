@@ -1,6 +1,6 @@
 //! Byte encodings td's crates each kept a copy of: lowercase hexadecimal
 //! both ways, and base64 (RFC 4648 §4, the standard alphabet with `=`
-//! padding) for encoding.
+//! padding) both ways.
 //!
 //! One file and `std` alone, so a crate built by a direct rustc can include
 //! it as a module by `#[path]`, as td-txt does td-regex. Decoders that
@@ -69,6 +69,47 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// The bytes the standard padded base64 `text` spells, or `None` for any
+/// other spelling: a length not a multiple of four, padding missing,
+/// misplaced or past two, a symbol outside the standard alphabet
+/// (whitespace and the URL-safe `-_` included), or bits the padding drops
+/// that are not zero, so one value has one spelling.
+pub fn from_base64(text: &str) -> Option<Vec<u8>> {
+    let (quads, rest) = text.as_bytes().as_chunks::<4>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(quads.len().saturating_mul(3));
+    for (index, quad) in quads.iter().enumerate() {
+        let pad = quad.iter().rev().take_while(|&&byte| byte == b'=').count();
+        if pad > 2 || (pad > 0 && index + 1 != quads.len()) {
+            return None;
+        }
+        let mut value = 0u32;
+        for (at, &byte) in quad.iter().enumerate() {
+            let sextet = if at < 4 - pad { sextet(byte)? } else { 0 };
+            value = (value << 6) | u32::from(sextet);
+        }
+        // Padding stands for bytes not there; the bits it covers are zero.
+        if value & ((1u32 << (8 * pad)) - 1) != 0 {
+            return None;
+        }
+        out.extend_from_slice(value.to_be_bytes().get(1..4 - pad)?);
+    }
+    Some(out)
+}
+
+fn sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
 /// The alphabet symbol for a masked value; out of range would be a bug,
 /// answered with `?` rather than a panic.
 fn digit(alphabet: &[u8], value: u8) -> char {
@@ -128,5 +169,49 @@ mod tests {
         assert_eq!(encoded.len(), 344);
         assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
         assert!(encoded.ends_with("+fr7/P3+/w=="));
+    }
+
+    #[test]
+    fn base64_decodes_rfc_4648_vectors_and_every_byte() {
+        for (expected, input) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(from_base64(input).unwrap(), expected.as_bytes(), "{input}");
+        }
+        for length in 0..=256 {
+            let bytes: Vec<u8> = (0..length).map(|i| (i * 7 + 3) as u8).collect();
+            assert_eq!(from_base64(&base64(&bytes)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn base64_decoding_refuses_every_other_spelling() {
+        for bad in [
+            "Zg",
+            "Zg=",
+            "Zm9",
+            "Z===",
+            "====",
+            "=Zg=",
+            "Zg==Zg==",
+            "Zm9v=",
+            "Zh==",
+            "Zm9=",
+            "Zm 9v",
+            " Zm9v",
+            "Zm9v\n",
+            "-_-_",
+            "Zm9v\0\0\0\0",
+            "Zé=",
+            "Zg=a",
+        ] {
+            assert_eq!(from_base64(bad), None, "{bad:?}");
+        }
     }
 }
