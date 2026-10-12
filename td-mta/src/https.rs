@@ -1,4 +1,4 @@
-//! Bounded HTTPS admission. JMAP routing is attached in the next increment.
+//! Bounded HTTPS admission and authenticated mailbox-access routing.
 use crate::{
     admission::timers::{self, TimeoutPlan},
     config::{
@@ -25,7 +25,7 @@ use crate::{
 use std::{
     net::{IpAddr, TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex, TryLockError,
     },
     time::Duration,
@@ -69,6 +69,7 @@ enum Phase {
     Authorize,
     Upload,
     Download,
+    Api,
     Response,
     Close,
     Drain,
@@ -88,7 +89,7 @@ struct Client {
     sent: usize,
     attempt_admitted: bool,
     device: Option<DeviceId>,
-    upload_slot: bool,
+    body_slot: bool,
     stop_after_response: bool,
     absolute: Deadline,
     phase_deadline: Deadline,
@@ -137,7 +138,7 @@ impl Https<'_, '_> {
             .map_err(|_| Error::Capacity)?;
         slots.extend((0..count).map(|_| Mutex::new(None)));
         let done = AtomicBool::new(false);
-        let upload_active = AtomicBool::new(false);
+        let body_active = AtomicU8::new(0);
         std::thread::scope(|scope| {
             let worker = std::thread::Builder::new()
                 .name("https-tls".into())
@@ -182,14 +183,15 @@ impl Https<'_, '_> {
                                     return;
                                 }
                             };
-                            let Some(client) = slot
-                                .as_mut()
-                                .filter(|c| matches!(c.phase, Phase::Upload | Phase::Download))
-                            else {
+                            let Some(client) = slot.as_mut().filter(|c| {
+                                matches!(c.phase, Phase::Upload | Phase::Download | Phase::Api)
+                            }) else {
                                 continue;
                             };
                             let result = if client.phase == Phase::Download {
                                 self.download(client, control)
+                            } else if client.phase == Phase::Api {
+                                self.api(client, control)
                             } else {
                                 self.upload(client, control)
                             };
@@ -198,7 +200,7 @@ impl Https<'_, '_> {
                                     control.fail();
                                 }
                                 *slot = None;
-                                upload_active.store(false, Ordering::Release);
+                                body_active.store(0, Ordering::Release);
                             }
                         }
                         std::thread::park_timeout(SCAN);
@@ -215,7 +217,7 @@ impl Https<'_, '_> {
                 done: &done,
                 worker: uploader.thread(),
             };
-            let result = self.network(&slots, &worker, &uploader, &upload_active, control);
+            let result = self.network(&slots, &worker, &uploader, &body_active, control);
             if result.is_err() {
                 control.fail();
             }
@@ -317,7 +319,7 @@ impl Https<'_, '_> {
         slots: &[Mutex<Option<Client>>],
         worker: &std::thread::ScopedJoinHandle<'_, ()>,
         uploader: &std::thread::ScopedJoinHandle<'_, ()>,
-        upload_active: &AtomicBool,
+        body_active: &AtomicU8,
         control: &Control,
     ) -> Result<(), Error> {
         for listener in self.listeners {
@@ -359,21 +361,24 @@ impl Https<'_, '_> {
                     *peers.get_mut(index).ok_or(Error::Invalid)? = None;
                     continue;
                 };
-                if matches!(client.phase, Phase::Tls | Phase::Upload | Phase::Download) {
+                if matches!(
+                    client.phase,
+                    Phase::Tls | Phase::Upload | Phase::Download | Phase::Api
+                ) {
                     continue;
                 }
-                let mut wake_upload = false;
-                match self.step(client, &mut attempts, upload_active) {
+                let mut wake_body = false;
+                match self.step(client, &mut attempts, body_active) {
                     Ok(true) => {
-                        if matches!(client.phase, Phase::Upload | Phase::Download) {
-                            wake_upload = true;
+                        if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
+                            wake_body = true;
                         }
                         if client.phase == Phase::Close
-                            && client.upload_slot
+                            && client.body_slot
                             && !client.stop_after_response
                         {
-                            client.upload_slot = false;
-                            upload_active.store(false, Ordering::Release);
+                            client.body_slot = false;
+                            body_active.store(0, Ordering::Release);
                         }
                     }
                     Err(Error::WriterStopped) => return Err(Error::WriterStopped),
@@ -381,14 +386,14 @@ impl Https<'_, '_> {
                         if client.stop_after_response {
                             return Err(Error::WriterStopped);
                         }
-                        if client.upload_slot {
-                            upload_active.store(false, Ordering::Release);
+                        if client.body_slot {
+                            body_active.store(0, Ordering::Release);
                         }
                         *slot = None;
                     }
                 }
                 drop(slot);
-                if wake_upload {
+                if wake_body {
                     uploader.thread().unpark();
                 }
             }
@@ -477,7 +482,7 @@ impl Https<'_, '_> {
                     sent: 0,
                     attempt_admitted: false,
                     device: None,
-                    upload_slot: false,
+                    body_slot: false,
                     stop_after_response: false,
                     absolute,
                     phase_deadline,
@@ -496,7 +501,7 @@ impl Https<'_, '_> {
         &self,
         client: &mut Client,
         attempts: &mut Attempts,
-        upload_active: &AtomicBool,
+        body_active: &AtomicU8,
     ) -> Result<bool, Error> {
         let time = self.clock.sample()?;
         if client.absolute.expired(time.monotonic)
@@ -577,18 +582,19 @@ impl Https<'_, '_> {
                                         != Some(backend.account())
                                     {
                                         404
-                                    } else if upload_active
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_err()
-                                    {
-                                        429
+                                    } else if let Err(active) = body_active.compare_exchange(
+                                        0,
+                                        1,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    ) {
+                                        if active == 2 {
+                                            503
+                                        } else {
+                                            429
+                                        }
                                     } else {
-                                        client.upload_slot = true;
+                                        client.body_slot = true;
                                         client.device = Some(device);
                                         client.phase = Phase::Upload;
                                         return Ok(true);
@@ -600,20 +606,48 @@ impl Https<'_, '_> {
                                         || head.expect_continue
                                     {
                                         400
-                                    } else if upload_active
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_err()
-                                    {
-                                        429
+                                    } else if let Err(active) = body_active.compare_exchange(
+                                        0,
+                                        1,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    ) {
+                                        if active == 2 {
+                                            503
+                                        } else {
+                                            429
+                                        }
                                     } else {
-                                        client.upload_slot = true;
+                                        client.body_slot = true;
                                         client.device = Some(device);
                                         client.phase = Phase::Download;
+                                        return Ok(true);
+                                    }
+                                } else if head.target == "/jmap/api" {
+                                    if head.method != "POST" {
+                                        405
+                                    } else if !head.content_type.is_some_and(|media| {
+                                        media.split(';').next().is_some_and(|kind| {
+                                            kind.trim().eq_ignore_ascii_case("application/json")
+                                        })
+                                    }) {
+                                        415
+                                    } else if let Err(active) = body_active.compare_exchange(
+                                        0,
+                                        2,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    ) {
+                                        drop(devices);
+                                        if active == 2 {
+                                            return self.respond_body(client, 429, time.utc_ms,
+                                                br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
+                                        }
+                                        503
+                                    } else {
+                                        client.body_slot = true;
+                                        client.device = Some(device);
+                                        client.phase = Phase::Api;
                                         return Ok(true);
                                     }
                                 } else if head.target == "/.well-known/jmap" {
@@ -674,7 +708,9 @@ impl Https<'_, '_> {
                     &mut client.drain_left,
                 );
             }
-            Phase::Tls | Phase::Upload | Phase::Download => return Err(Error::Invalid),
+            Phase::Tls | Phase::Upload | Phase::Download | Phase::Api => {
+                return Err(Error::Invalid)
+            }
         }
         Ok(true)
     }
@@ -728,6 +764,54 @@ impl Https<'_, '_> {
             Err(Failure::Before(error)) => {
                 let status = match error {
                     Error::NotFound | Error::Forbidden => 404,
+                    _ => 503,
+                };
+                self.respond(client, status, self.clock.sample()?.utc_ms)
+            }
+        }
+    }
+    fn api(&self, client: &mut Client, control: &Control) -> Result<(), Error> {
+        use crate::https_download::Failure;
+        let backend = self.uploads.ok_or(Error::Invalid)?;
+        let head = client.head.head().map_err(|_| Error::Invalid)?;
+        let framing = head.framing;
+        let expect_continue = head.expect_continue;
+        client.head = HeadReader::new(Vec::new().into_boxed_slice());
+        let result = backend.api(
+            crate::https_api::Request {
+                device: client.device.ok_or(Error::Invalid)?,
+                framing,
+                expect_continue,
+                prefix: client
+                    .input
+                    .get(..client.input_used)
+                    .ok_or(Error::Invalid)?,
+                deadline: client.absolute,
+            },
+            client.connection.as_mut().ok_or(Error::Invalid)?,
+            control,
+        );
+        client.input.fill(0);
+        client.input_used = 0;
+        client.drain_left = 0;
+        match result {
+            Ok(()) => {
+                client.phase = Phase::Close;
+                client.phase_deadline =
+                    deadline(self.clock.sample()?.monotonic, DRAIN_SECONDS)?.min(client.absolute);
+                client.idle = client.phase_deadline;
+                Ok(())
+            }
+            Err(Failure::Before(Error::WriterStopped) | Failure::Started(Error::WriterStopped)) => {
+                control.fail();
+                Err(Error::WriterStopped)
+            }
+            Err(Failure::Started(error)) => Err(error),
+            Err(Failure::Before(error)) => {
+                let status = match error {
+                    Error::NotFound => 404,
+                    Error::Forbidden => 403,
+                    Error::Invalid => 400,
                     _ => 503,
                 };
                 self.respond(client, status, self.clock.sample()?.utc_ms)
@@ -848,6 +932,7 @@ impl Https<'_, '_> {
             421 => "Misdirected Request",
             429 => "Too Many Requests",
             431 => "Request Header Fields Too Large",
+            415 => "Unsupported Media Type",
             _ => "Service Unavailable",
         };
         write!(&mut client.response, "HTTP/1.1 {status} {reason}\r\nDate: {}\r\nConnection: close\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n", http_date(utc_ms)?, body.len())?;
@@ -860,9 +945,11 @@ impl Https<'_, '_> {
             client.response.extend_from_slice(b"Retry-After: 1\r\n");
         }
         if !body.is_empty() {
-            client
-                .response
-                .extend_from_slice(b"Content-Type: application/json\r\n");
+            client.response.extend_from_slice(if status == 429 {
+                b"Content-Type: application/problem+json\r\n"
+            } else {
+                b"Content-Type: application/json\r\n"
+            });
         }
         if status == 405 {
             let download = client

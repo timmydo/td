@@ -3,13 +3,13 @@ use crate::{
     admission::timers::{self, TimeoutPlan},
     bounded::TextBuffer,
     http_request::{decode_uri_component, QUANTUM},
+    https_exchange::Sender,
     ids::{AccountId, BlobId, DeviceId},
-    ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Tick, Transport},
+    ports::{Clock, Deadline, Error, Transport},
     smtp_receiving::Control,
     store_fs::{BlobAuthorization, BlobReadRequest, StoreCoordinator},
     wire,
 };
-use std::time::Duration;
 
 pub struct Target {
     account: AccountId,
@@ -159,82 +159,12 @@ pub(crate) fn send<P: BlobAuthorization>(
         }
     })
 }
-struct Sender<'a> {
-    transport: &'a mut dyn Transport,
-    control: &'a Control,
-    clock: &'a dyn Clock,
-    timeouts: &'a TimeoutPlan,
-    deadline: Deadline,
-    idle: Deadline,
-    last: Tick,
-    started: bool,
-}
-impl<'a> Sender<'a> {
-    fn new(
-        transport: &'a mut dyn Transport,
-        control: &'a Control,
-        clock: &'a dyn Clock,
-        timeouts: &'a TimeoutPlan,
-        deadline: Deadline,
-    ) -> Result<Self, Error> {
-        let last = clock.sample()?.monotonic;
-        let idle = deadline;
-        Ok(Self {
-            transport,
-            control,
-            clock,
-            timeouts,
-            deadline,
-            idle,
-            last,
-            started: false,
-        })
-    }
-    fn check(&mut self) -> Result<(), Error> {
-        let now = self.clock.sample()?.monotonic;
-        if now < self.last {
-            return Err(Error::WriterStopped);
-        }
-        self.last = now;
-        if self.control.stop_requested() || self.deadline.expired(now) || self.idle.expired(now) {
-            return Err(Error::Deadline);
-        }
-        Ok(())
-    }
-    fn write(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
-        while !bytes.is_empty() {
-            self.check()?;
-            self.started = true;
-            match self.transport.write(bytes)? {
-                IoProgress::Bytes(n) if n > 0 && n <= bytes.len() => {
-                    self.check()?;
-                    bytes = bytes.get(n..).ok_or(Error::Invalid)?;
-                    self.idle =
-                        timers::deadline(self.last, self.timeouts.limits().response_idle_seconds)
-                            .map_err(|_| Error::Invalid)?
-                            .min(self.deadline);
-                }
-                IoProgress::Pending => std::thread::sleep(Duration::from_millis(5)),
-                _ => return Err(Error::Invalid),
-            }
-        }
-        Ok(())
-    }
-    fn flush(&mut self) -> Result<(), Error> {
-        loop {
-            self.check()?;
-            if self.transport.flush()? == FlushProgress::Complete {
-                return self.check();
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::ports::{FlushProgress, IoProgress, Tick};
     use std::sync::atomic::{AtomicU64, Ordering};
     fn url(name: &str, media: &str) -> String {
         format!(

@@ -484,6 +484,35 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
         clock: clock.as_ref(),
         timeouts: &timeouts,
     };
+    let response_fixture = Fixture::new();
+    let mut response_root = response_fixture.locked();
+    let request_spool =
+        crate::store_fs::RequestSpool::open(&mut response_root, clock.clone(), until).unwrap();
+    let session = crate::jmap_session::Session::core(
+        Origin::parse(&origin_text).unwrap(),
+        crate::config::identities::AccountView {
+            id: account,
+            username: "private-user",
+            name: "Private",
+        },
+        &resource,
+        crate::jmap_session::Concurrency {
+            uploads: 1,
+            requests: 1,
+        },
+    )
+    .unwrap();
+    let api = crate::https_api::Service {
+        transfers: &uploads,
+        coordinator: &coordinator,
+        spool: &request_spool,
+        policy: DevicePolicy::new(&devices, clock.as_ref(), 1),
+        resources: &resource,
+        session: &session,
+        response_maximum: admission.disk().response_bytes,
+        clock: clock.as_ref(),
+        timeouts: &timeouts,
+    };
     let handshakes = HandshakePool::new(2).unwrap();
     let ready = AtomicBool::new(false);
     let control = Control::default();
@@ -500,7 +529,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 .unwrap();
             let listeners = [BoundListener::new(socket, row, &lease).unwrap()];
             let server = Https {
-                uploads: Some(&uploads),
+                uploads: Some(&api),
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
@@ -516,6 +545,9 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 let worker = scope.spawn(|| server.run(&control));
                 let stop = Stop(&control);
                 wait(|| ready.load(Ordering::Acquire));
+                api_cases(address, &lease, clock.clone(), &authorization, account_wire, session.state().unwrap(), &resource, &devices);
+                assert_eq!(request_spool.status().occupied_slots, 0);
+                assert_eq!(coordinator.used(crate::admission::quota::Kind::ResponseBytes).unwrap(), 0);
                 let large = "x".repeat(65537);
                 for (framing, body, expected) in [
                     ("Content-Length: 65537", large.as_str(), large.as_str()),
@@ -670,6 +702,15 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 send(&mut blocked, format!("GET /jmap/download/{account_wire}/absent/a?type=text%2Fplain HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
                 assert_eq!(upload_reply(&mut blocked).0, 429);
                 blocked.abort();
+                std::thread::sleep(Duration::from_millis(30));
+                let mut api_blocked = client(address, &lease, clock.clone());
+                send(&mut api_blocked, format!(
+                    "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\n\
+                     Authorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+                    address.port()
+                ).as_bytes());
+                assert_eq!(upload_reply(&mut api_blocked).0, 503);
+                api_blocked.abort();
                 devices.lock().unwrap().revoke(device, 2).unwrap();
                 send(&mut wire, b"lost");
                 assert_eq!(upload_reply(&mut wire).0, 403);
@@ -1087,4 +1128,227 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
             });
         })
         .unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn api_cases(
+    address: std::net::SocketAddr,
+    lease: &GenerationLease<TlsPolicies>,
+    clock: Arc<Now>,
+    authorization: &str,
+    account: &str,
+    state: &str,
+    resources: &crate::limits::ResourcePlan,
+    devices: &Mutex<DeviceStore<'_>>,
+) {
+    let calls = format!(
+        r##"{{"using":["urn:ietf:params:jmap:core"],"createdIds":{{"seed":"seed-id"}},"methodCalls":[
+        ["Core/echo",{{"x":"hello"}},"a"],
+        ["Core/echo",{{"#x":{{"resultOf":"a","name":"Core/echo","path":"/x"}}}},"b"],
+        ["PushSubscription/get",{{}},"c"],
+        ["PushSubscription/set",{{"create":{{"new":{{}}}}}},"d"],
+        ["Blob/copy",{{"fromAccountId":"{account}","accountId":"{account}","blobIds":[]}},"e"],
+        ["No/method",{{}},"f"]]}}"##
+    );
+    let long = format!(
+        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Core/echo",{{"long":"{}"}},"a"]]}}"#,
+        "x".repeat(65537)
+    );
+    let too_many = format!(
+        r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":[{}]}}"#,
+        vec![r#"["Core/echo",{},"a"]"#; resources.limits().json_methods + 1].join(",")
+    );
+    for (body, chunked, status, problem_type) in [
+        (calls.as_str(), false, 200, ""),
+        (calls.as_str(), true, 200, ""),
+        (long.as_str(), false, 200, ""),
+        ("{", false, 400, "notJSON"),
+        ("[]", false, 400, "notRequest"),
+        (
+            r#"{"using":["urn:unknown"],"methodCalls":[]}"#,
+            false,
+            400,
+            "unknownCapability",
+        ),
+        (too_many.as_str(), false, 400, "limit"),
+    ] {
+        clock.1.fetch_add(2000, Ordering::Relaxed);
+        let mut wire = client(address, lease, clock.clone());
+        let framing = if chunked {
+            "Transfer-Encoding: chunked".to_owned()
+        } else {
+            format!("Content-Length: {}", body.len())
+        };
+        let interim = if chunked {
+            "Expect: 100-continue\r\n"
+        } else {
+            ""
+        };
+        let head = format!("POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json; charset=utf-8\r\n{framing}\r\n{interim}\r\n", address.port());
+        let body_wire = if chunked {
+            format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
+        } else {
+            body.to_owned()
+        };
+        if chunked {
+            assert!(request(&mut wire, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
+            send(&mut wire, body_wire.as_bytes());
+        } else {
+            send(&mut wire, format!("{head}{body_wire}").as_bytes());
+        }
+        let (actual, headers, reply) = full_reply(&mut wire);
+        assert_eq!(actual, status, "{reply}");
+        assert!(headers.contains("X-Content-Type-Options: nosniff"));
+        let json = td_json::parse(&reply).unwrap();
+        if status == 200 {
+            assert_eq!(json["sessionState"].as_str(), Some(state));
+            if body == long {
+                assert_eq!(
+                    json["methodResponses"][0][1]["long"].as_str(),
+                    Some("x".repeat(65537).as_str())
+                );
+            } else {
+                assert_eq!(json["methodResponses"][1][1]["x"].as_str(), Some("hello"));
+                assert_eq!(
+                    json["methodResponses"][2][1]["list"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                assert_eq!(
+                    json["methodResponses"][3][1]["notCreated"]["new"]["type"].as_str(),
+                    Some("forbidden")
+                );
+                assert_eq!(
+                    json["methodResponses"][4][1]["type"].as_str(),
+                    Some("invalidArguments")
+                );
+                assert_eq!(
+                    json["methodResponses"][5][1]["type"].as_str(),
+                    Some("unknownMethod")
+                );
+                assert_eq!(json["createdIds"]["seed"].as_str(), Some("seed-id"));
+            }
+        } else {
+            assert!(headers.contains("Content-Type: application/problem+json"));
+            assert_eq!(
+                json["type"].as_str(),
+                Some(format!("urn:ietf:params:jmap:error:{problem_type}").as_str())
+            );
+            if problem_type == "limit" {
+                assert_eq!(json["limit"].as_str(), Some("maxCallsInRequest"));
+            }
+        }
+        finish_api(&mut wire);
+    }
+    for (method, media, length, status) in [
+        ("GET", "application/json", 0, 405),
+        ("POST", "text/plain", 0, 415),
+        (
+            "POST",
+            "application/json",
+            resources.limits().json_bytes + 1,
+            400,
+        ),
+    ] {
+        clock.1.fetch_add(2000, Ordering::Relaxed);
+        let mut wire = client(address, lease, clock.clone());
+        let head = format!("{method} /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: {media}\r\nContent-Length: {length}\r\nExpect: 100-continue\r\n\r\n", address.port());
+        send(&mut wire, head.as_bytes());
+        let (actual, _, body) = full_reply(&mut wire);
+        assert_eq!(actual, status);
+        if status == 400 {
+            assert_eq!(
+                td_json::parse(&body).unwrap()["limit"].as_str(),
+                Some("maxSizeRequest")
+            );
+        }
+        finish_api(&mut wire);
+    }
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let head = format!(
+        "POST /jmap/api HTTP/1.1\r\nHost: localhost:{}\r\n\
+         Authorization: Basic {authorization}\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nExpect: 100-continue\r\n\r\n",
+        address.port()
+    );
+    let mut held = client(address, lease, clock.clone());
+    assert!(request(&mut held, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
+    let mut busy = client(address, lease, clock.clone());
+    send(&mut busy, head.as_bytes());
+    let (status, headers, body) = full_reply(&mut busy);
+    assert_eq!(status, 429);
+    assert!(headers.contains("application/problem+json"));
+    assert_eq!(
+        td_json::parse(&body).unwrap()["limit"].as_str(),
+        Some("maxConcurrentRequests")
+    );
+    finish_api(&mut busy);
+    let mut binary = client(address, lease, clock.clone());
+    send(&mut binary, format!("POST /jmap/upload/{account} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n", address.port()).as_bytes());
+    assert_eq!(full_reply(&mut binary).0, 503);
+    finish_api(&mut binary);
+    send(&mut held, b"{}");
+    assert_eq!(upload_reply(&mut held).0, 400);
+    finish_api(&mut held);
+
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let mut oversized = client(address, lease, clock.clone());
+    assert!(request(
+        &mut oversized,
+        head.replace("Content-Length: 2", "Transfer-Encoding: chunked")
+            .as_bytes()
+    )
+    .starts_with("HTTP/1.1 100 Continue"));
+    send(
+        &mut oversized,
+        format!("{:x}\r\n", resources.limits().json_bytes + 1).as_bytes(),
+    );
+    let (status, _, body) = full_reply(&mut oversized);
+    assert_eq!(status, 400);
+    assert_eq!(
+        td_json::parse(&body).unwrap()["limit"].as_str(),
+        Some("maxSizeRequest")
+    );
+    finish_api(&mut oversized);
+
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let (device, password) = devices
+        .lock()
+        .unwrap()
+        .create(
+            "api-revoke",
+            1,
+            &mut td_crypto::SystemEntropy::try_new().unwrap(),
+        )
+        .unwrap();
+    let temporary = base64(&[b"private-user:".as_slice(), password.expose()].concat());
+    let mut revoked = client(address, lease, clock.clone());
+    assert!(request(
+        &mut revoked,
+        head.replace(authorization, &temporary).as_bytes()
+    )
+    .starts_with("HTTP/1.1 100 Continue"));
+    devices.lock().unwrap().revoke(device, 2).unwrap();
+    send(&mut revoked, b"{}");
+    assert_eq!(upload_reply(&mut revoked).0, 403);
+    finish_api(&mut revoked);
+
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let mut idle = client(address, lease, clock.clone());
+    assert!(request(&mut idle, head.as_bytes()).starts_with("HTTP/1.1 100 Continue"));
+    clock.1.fetch_add(16000, Ordering::Relaxed);
+    assert_eq!(upload_reply(&mut idle).0, 503);
+    finish_api(&mut idle);
+}
+
+fn finish_api(wire: &mut impl Transport) {
+    let mut bytes = [0; 1024];
+    wait(|| match wire.read(&mut bytes) {
+        Ok(IoProgress::Pending) => false,
+        Ok(IoProgress::Closed) | Err(_) => true,
+        other => panic!("unexpected bytes after complete API response: {other:?}"),
+    });
+    wire.abort();
 }

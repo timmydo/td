@@ -20,7 +20,7 @@ use td_mta::{
     ownership::SlotState,
     ports::{self, Clock},
     smtp_receiving::{BoundListener, Control, Receiving},
-    store_fs::{AuxiliaryUsage, IngressSpool, LedgerInitError, StoreCoordinator},
+    store_fs::{AuxiliaryUsage, IngressSpool, LedgerInitError, RequestSpool, StoreCoordinator},
     store_fs::{DeviceStore, IndexStore, PrivateRoot},
     tls_admission::HandshakePool,
 };
@@ -118,6 +118,30 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                 )),
                 None => None,
             };
+            // Recover a previous mailbox run even when this run is SMTP-only.
+            let request_path = format!("{data}/tmp/requests");
+            let request_exists = std::path::Path::new(&request_path)
+                .try_exists()
+                .map_err(|_| config_failure("request-root", "unavailable"))?;
+            if mailbox_access {
+                td_mta::jmap_request::Request::validate_resources(resources)
+                    .map_err(|_| config_failure("request-limits", "invalid"))?;
+            }
+            let mut request_root = if mailbox_access || request_exists {
+                Some(lock_root(
+                    same_owner_root(&request_path, owner, "request-root")?,
+                    "request-lock",
+                )?)
+            } else {
+                None
+            };
+            let request_spool = match request_root.as_mut() {
+                Some(root) => Some(
+                    RequestSpool::open(root, Arc::clone(&clock), deadline)
+                        .map_err(|error| adapter("request-spool", error))?,
+                ),
+                None => None,
+            };
             let store = IndexStore::open(
                 &mut root,
                 Arc::clone(&clock),
@@ -134,7 +158,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
             let spool =
                 IngressSpool::open(&mut spool_root, resources, Arc::clone(&clock), deadline)
                     .map_err(|error| adapter("spool-open", error))?;
-            // SMTP deliveries, one optional upload and the serial publication ticket.
+            // SMTP deliveries, one HTTPS body job and the serial publication ticket.
             let count = limits.smtp_sessions + 1 + usize::from(mailbox_access);
             let mut states = Vec::new();
             let mut cells = Vec::new();
@@ -150,7 +174,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                 store,
                 plans.admission(),
                 AuxiliaryUsage {
-                    // No sort/cache/response/log/cold owners are active in this profile.
+                    // Any existing request spool was cold-recovered before zero usage.
                     sort_bytes: 0,
                     response_bytes: 0,
                     cache_bytes: 0,
@@ -212,6 +236,46 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                 clock: clock.as_ref(),
                 timeouts: plans.timeouts(),
             };
+            let session = if mailbox_access {
+                Some(
+                    td_mta::jmap_session::Session::core(
+                        view.origin()
+                            .map_err(|_| config_failure("configuration", "invariant"))?,
+                        candidate
+                            .identities()
+                            .map_err(|_| config_failure("configuration", "invariant"))?
+                            .account()
+                            .map_err(|_| config_failure("configuration", "invariant"))?,
+                        resources,
+                        td_mta::jmap_session::Concurrency {
+                            uploads: 1,
+                            requests: 1,
+                        },
+                    )
+                    .map_err(|error| adapter("session", error))?,
+                )
+            } else {
+                None
+            };
+            let api_service = match (devices.as_ref(), request_spool.as_ref(), session.as_ref()) {
+                (Some(devices), Some(spool), Some(session)) => Some(td_mta::https_api::Service {
+                    transfers: &upload_service,
+                    coordinator: &coordinator,
+                    spool,
+                    policy: td_mta::http_auth::DevicePolicy::new(
+                        devices,
+                        clock.as_ref(),
+                        policies.id().get(),
+                    ),
+                    resources,
+                    session,
+                    response_maximum: plans.admission().disk().response_bytes,
+                    clock: clock.as_ref(),
+                    timeouts: plans.timeouts(),
+                }),
+                (None, _, None) => None,
+                _ => return Err(config_failure("https", "invariant")),
+            };
             let https_ready = AtomicBool::new(false);
             let https = if let Some(devices) = devices.as_ref() {
                 Some(td_mta::https::Https {
@@ -231,7 +295,11 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                     resources,
                     timeouts: plans.timeouts(),
                     clock: Arc::clone(&clock),
-                    uploads: Some(&upload_service),
+                    uploads: Some(
+                        api_service
+                            .as_ref()
+                            .ok_or_else(|| config_failure("https", "invariant"))?,
+                    ),
                     ready: &https_ready,
                 })
             } else {

@@ -55,6 +55,15 @@ pub trait Backend: Sync {
         transport: &mut dyn Transport,
         control: &Control,
     ) -> Result<Response, Error>;
+    fn api(
+        &self,
+        _request: crate::https_api::Request<'_>,
+        _transport: &mut dyn Transport,
+        _control: &Control,
+    ) -> Result<(), crate::https_download::Failure> {
+        Err(crate::https_download::Failure::Before(Error::NotFound))
+    }
+
     fn download(
         &self,
         _request: crate::https_download::Request<'_>,

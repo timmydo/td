@@ -3811,3 +3811,13 @@ precedence, same-account refusal, references, capability opt-in, deadline
 expiry and later-call continuation. Successful cross-account copying is
 unreachable in the personal-account profile. Discovery, API and EventSource
 runtime activation remain pending.
+
+The authenticated Core HTTP API now joins body framing, owned I-JSON request
+arenas, whole-envelope admission, result-reference dispatch and exact retained
+response transmission. It runs on the shared body worker, distinguishes API
+concurrency refusal from binary-transfer pressure, and rechecks current device
+authority before dispatch. Mailbox-access startup owns and cold-cleans the
+separate data/tmp/requests root. Real TLS fixtures exercise fixed/chunked calls,
+large echo output, ordered method errors, result references, createdIds,
+request problems and method/media/size refusal. EventSource and discovery
+activation remain next; mailbox and message APIs remain unavailable.

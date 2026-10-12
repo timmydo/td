@@ -658,11 +658,10 @@ failure path, not fabricated results.
 
 ### Private response-file custody
 
-The inert RequestSpool and StoreCoordinator::retain_response boundary
-implement file custody and quota reservation; no HTTP dispatcher invokes
-them yet. Activation requires the supervisor to supply a separate private
-tmp/requests root
-and hold its LOCK. Cold opening validates the complete closed namespace
+RequestSpool and StoreCoordinator::retain_response implement file custody
+and quota reservation for the authenticated Core API worker. Mailbox-access
+startup opens the separately provisioned private data/tmp/requests root and
+holds its LOCK. Cold opening validates the complete closed namespace
 before deleting abandoned responses: at most 32 server-named request
 subdirectories, each containing only its optional response file. Directory
 owner read/search permissions filtered by umask may be repaired to permit
@@ -1110,3 +1109,37 @@ Before output, inaccessible blobs return 404; storage failures, including
 verification corruption, return 503 without exposing provisional bytes. After output begins, errors close the connection without a
 second HTTP response. Shutdown cancels streaming and joins bounded storage
 work already running. Successful downloads close without unread-data drain.
+
+Authenticated POST /jmap/api uses the same fixed body worker as upload and
+raw download. Its sole API permit is distinguishable from a binary transfer:
+a competing API gets the maxConcurrentRequests problem with HTTP 429, while
+a binary transfer occupying the worker gives temporary HTTP 503. Conversely,
+a binary request refused behind an API receives 503, not an upload-limit
+refusal. The permit lasts through response flush, including error output.
+The prepared
+Session records one API request and one upload; discovery remains disabled
+until EventSource is active. Content-Type must name application/json.
+
+Before 100 Continue or method execution, the API reserves the complete response
+cap and allocates the resource plan's byte/token arenas. It decodes bounded
+Content-Length or chunked framing into the byte arena, then performs incremental
+I-JSON parsing, whole-envelope validation and mandatory-response preflight.
+Each preparation turn checks cancellation, the original exchange deadline and
+the retention work meter; preparation also has the execution phase deadline.
+Device authority is fresh after body receipt and again before dispatch.
+Revocation at these checks returns 403, as for uploads; initial invalid
+credentials still receive 401. Core
+methods are currently side-effect free; future mutators need their own guarded
+publication boundary. The account always comes from trusted configuration.
+
+The complete response is retained before final headers. The existing wire
+encoder counts the exact envelope, then streams it with Content-Length through
+fixed scratch under the original exchange and response-idle bounds. All
+response files and charges remain owned through transmission and cleanup.
+Uncertain ledger settlement retires admission, including after known output;
+no cleanup failure fabricates a fresh response. A failure after a write attempt
+closes the connection. A fully flushed 100 Continue permits one final response.
+Request syntax/envelope/capability and advertised size/call-limit failures use
+RFC 8620 problem details; internal parser/work/storage ceilings remain resource
+failures rather than being misreported as invalid JSON. Shutdown cancels reads
+and output and joins already bounded storage/dispatch work.

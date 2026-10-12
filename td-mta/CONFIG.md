@@ -1939,8 +1939,9 @@ status ok and the operation's data; failures carry fixed stage/error codes.
 
 The ready announcement and status report profile mailbox-access. Readiness
 waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS/body workers. This reports transport readiness, not available JMAP
-methods. Stop, SIGTERM and SIGINT use the same shared stop flag. HTTPS closes
+network/TLS/body workers. Core API methods are available; discovery still
+waits for EventSource activation. Stop, SIGTERM and SIGINT use the same
+shared stop flag. HTTPS closes
 its exchanges and joins its TLS and body workers; an upload publication
 already underway settles before shutdown returns. SMTP preserves its normal
 drain and known committed replies. Outbound delivery, reload and ACME
@@ -1948,21 +1949,34 @@ remain inactive in both profiles.
 
 ### Response retention admission
 
-The inert response owner reserves the entire configured response_bytes cap
+The Core API response owner reserves the entire configured response_bytes cap
 before file creation. Thus floor(response_total_bytes / response_bytes)
 bounds concurrent retained requests: two at defaults, possibly one for a
 valid smaller aggregate. This deliberately conservative policy does not
-promise one retained request per HTTPS connection. Future JMAP admission
-and advertised concurrency must also respect HTTPS workers, the 32 response
-file slots and ledger availability. Refuse transient pressure before method
+promise one retained request per HTTPS connection. The fixed HTTPS body
+worker admits one API request and respects the 32 response-file slots and
+ledger availability. Refuse transient pressure before method
 effects. An uncertain cleanup charges the full cap as used until cold
 recovery, so it may exhaust response admission. Coordinator used-byte
 accounting and RequestSpool status (occupied and retired slot counts)
-expose that state; runtime status and dispatch wiring remain pending.
+expose that state; a public per-bucket runtime status report remains pending.
 
 The authenticated download route is
 `/jmap/download/{accountId}/{blobId}/{name}?type={type}`. GET streams an
 accessible raw blob; other methods receive 405 with Allow: GET. GET bodies
 and Expect are rejected. The name and media type are template values, not
-stored blob metadata. Downloads and uploads share one body-transfer slot.
-This activates raw downloads; discovery and other Core routes remain pending.
+stored blob metadata. Downloads, uploads and API requests share one body
+worker. The independent advertised maxima are upper bounds; cross-kind
+contention receives 503. Same-kind contention receives 429.
+This activates raw downloads; discovery remains pending EventSource activation.
+
+Authenticated POST `/jmap/api` now executes Core/echo, PushSubscription/get,
+PushSubscription/set and the single-account Blob/copy contract. Provision
+`data/tmp` and `data/tmp/requests` mode 0700 under the service owner before
+starting mailbox-access. Startup locks and cleans this separate disposable
+root before accepting requests. SMTP-only also cleans an existing request
+root from a previous mailbox run, but does not require one. The API accepts
+application/json with fixed or chunked bodies and returns ordered retained
+responses, result references, createdIds and the prepared Session state.
+Malformed requests and advertised limits receive standard JMAP problem details.
+Discovery still returns 503; no incomplete Core capability is advertised.

@@ -1806,8 +1806,8 @@ only validated endpoint components may be decoded, never used as arbitrary
 filesystem paths. It must authorize and admit
 body storage before sending 100 Continue, check decoder completion before
 publication, and close on framing failure. The current HTTPS runtime serves
-authenticated uploads and raw downloads with these bounds; discovery and
-JMAP method activation remain pending. Device persistence and local
+authenticated uploads, raw downloads and the Core API with these bounds;
+discovery remains pending EventSource activation. Device persistence and local
 administration are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
@@ -2174,3 +2174,9 @@ V1 is ready only with reproducible evidence for all of the following:
 
 Migadu settings are documentation-derived, not tested against its live server.
 Implementation fixtures cite the additional extension RFCs they exercise.
+
+The mailbox-access Core API now runs on the bounded HTTPS body worker.
+ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
+owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
+is prepared for response sessionState but is not exposed by discovery until
+all required Core endpoints are active. Mail methods remain unavailable.

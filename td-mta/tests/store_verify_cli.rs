@@ -1955,7 +1955,7 @@ fn mailbox_profile_runs_live_device_commands_and_stops_cleanly() {
     let fixture = ConfigFixture::new();
     let runtime = Fixture::new();
     let logs = Fixture::new();
-    for name in ["ingress", "devices"] {
+    for name in ["ingress", "devices", "tmp", "tmp/requests"] {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(fixture.data.0.join(name))
@@ -2079,6 +2079,29 @@ fn mailbox_profile_runs_live_device_commands_and_stops_cleanly() {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(status) = process.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(std::time::Instant::now() < until);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let abandoned = fixture.data.0.join("tmp/requests/request-00/response");
+    fs::write(&abandoned, b"abandoned response").unwrap();
+    fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut smtp_recovery = ReceivingProcess::profile(&fixture, "smtp-only");
+    assert!(!abandoned.exists());
+    report_command(
+        &Command::new(mail_binary())
+            .args(["stop", "--runtime"])
+            .arg(&runtime.0)
+            .output()
+            .unwrap(),
+        0,
+        "stop",
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = smtp_recovery.child.try_wait().unwrap() {
             assert!(status.success());
             break;
         }
