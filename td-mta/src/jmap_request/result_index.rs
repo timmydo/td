@@ -45,6 +45,7 @@ impl Span {
 pub struct Response<'a> {
     pub name: &'static str,
     pub call_id: &'a [u8],
+    pub(super) id_token: usize,
     pub arguments: Span,
 }
 #[derive(Clone, Copy)]
@@ -99,6 +100,7 @@ impl Responses {
         Ok(Some(Response {
             name: entry.name,
             call_id,
+            id_token: entry.id_token,
             arguments: entry.arguments,
         }))
     }

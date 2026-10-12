@@ -818,11 +818,28 @@ per-method capacity refusal. The shorter execution deadline uses the same
 clock and meter and must precede the outer deadline; expiry retains
 serverUnavailable with executionDeadline while outer time/capacity remain.
 Collision validation precedes all reference resolution. A refused run drops
-its request arenas; recycling is not part of this interface.
+its request arenas and cleans up its owned retention file; recycling is not
+part of this interface.
 
-The returned index and Session state are passive completion data. Final
-Response framing/transmission, initial-map serialization, PushSubscription
-handlers, HTTP worker handoff and authenticated discovery remain unimplemented.
+Completed now owns the response index and exact retention file, and borrows
+the captured Session state. Its encoder borrows all three together, preventing file/index
+substitution. It first counts the final Response envelope, then freshly admits
+output, returns the Content-Length and emits exactly that many bytes. Counting shares framing and
+arena emission with output but adds published argument-span lengths without
+reading the file. Output reads those spans in bounded chunks and preserves
+response order, escaped call IDs, Session state and initial createdIds
+presence (including an empty map). Count scratch remains private.
+
+Counting, output and final completion all use the original retention budget
+and deadline. Only successful output polls expose eligible body fragments;
+an output-time failure aborts the exchange rather than replacing its body.
+After output starts, Completed refuses any new encoder, even after a failed
+or completed stream. Before output, dropping an encoder leaves the same owned
+file and budget. Dropping Completed cleans up that file. Into-request recovery releases retention and returns the
+original arenas. Only side-effect-free handlers currently run: any future
+creating method must first supply the final creation-ID overlay to framing.
+PushSubscription handlers, HTTP worker handoff and
+authenticated discovery remain unimplemented.
 No Core capability or API endpoint is advertised by this adapter.
 
 A missing target, wrong response name or failed pointer traversal is

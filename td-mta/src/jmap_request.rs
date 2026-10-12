@@ -8,6 +8,7 @@ pub mod pointer;
 pub mod resolution;
 pub mod response;
 pub mod result_index;
+pub mod wire;
 
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 

@@ -21,22 +21,37 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-/// Indexed complete arguments in the exclusively borrowed retention file.
+/// Indexed complete arguments and their exclusively owned retention file.
 /// Initial createdIds and the captured Session state remain available for the
 /// final envelope writer. No API/Session or Core capability is activated here.
-pub struct Completed<'s> {
+pub struct Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
     responses: result_index::Responses,
-    state: &'s str,
+    state: &'state str,
+    output_started: bool,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
 }
-impl<'s> Completed<'s> {
+impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
     pub fn responses(&self) -> &result_index::Responses {
         &self.responses
     }
-    pub fn session_state(&self) -> &'s str {
+    pub fn session_state(&self) -> &'state str {
         self.state
     }
-    pub fn into_responses(self) -> result_index::Responses {
-        self.responses
+    pub fn into_request(self) -> super::OwnedRequest {
+        self.responses.into_request()
+    }
+    pub fn encoder(
+        &mut self,
+    ) -> Result<super::wire::Encoder<'_, 'state, 'c, 's, 'r, 'sr, 'a, P>, super::wire::Error> {
+        if self.output_started {
+            return Err(super::wire::Error::State);
+        }
+        Ok(super::wire::Encoder::new(
+            &self.responses,
+            self.state,
+            &mut self.retention,
+            &mut self.output_started,
+        ))
     }
 }
 
@@ -45,12 +60,12 @@ impl<'s> Completed<'s> {
 /// invocation. All methods here are side-effect free; errors never stop later
 /// calls. Terminal original work/I/O/outer-deadline failure aborts the batch.
 /// Refusal drops the request arenas; allocation recycling is not promised.
-/// PushSubscription, final wire framing and HTTP activation remain separate.
-pub fn run<'state, P>(
+/// PushSubscription and HTTP activation remain separate.
+pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
-    retention: &mut ResponseRetention<'_, '_, '_, '_, '_, P>,
+    mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
-) -> Result<Completed<'state>, Error> {
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
     }
@@ -78,7 +93,7 @@ pub fn run<'state, P>(
         calls.push(call.token_index());
     }
     let mut worker = Worker {
-        retention,
+        retention: &mut retention,
         execution,
         optional_end,
     };
@@ -120,7 +135,12 @@ pub fn run<'state, P>(
             .map_err(|_| Error::State)?;
     }
     worker.retention.admit_work_turn().map_err(Error::Storage)?;
-    Ok(Completed { responses, state })
+    Ok(Completed {
+        responses,
+        state,
+        output_started: false,
+        retention,
+    })
 }
 struct Resolved {
     value: usize,
@@ -404,14 +424,14 @@ fn resolution_error(error: resolution::Error) -> Error {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         jmap_request::{OwnedRequest, OwnedValidation},
         limits::Limits,
         ports::{Deadline, Tick},
     };
-    fn request(input: &str) -> OwnedRequest {
+    pub(crate) fn request(input: &str) -> OwnedRequest {
         let limits = Limits::default();
         let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
@@ -458,9 +478,9 @@ mod tests {
             if let Some(records) = records {
                 retention.test_record_budget(records);
             }
-            let complete = match run(
+            let mut complete = match run(
                 plan.finish().unwrap(),
-                &mut retention,
+                retention,
                 Deadline::after(Tick(0), phase).unwrap(),
             ) {
                 Ok(complete) => complete,
@@ -471,9 +491,10 @@ mod tests {
             };
             assert_eq!(complete.session_state(), "session-1");
             for i in 0..complete.responses().len() {
-                let reply = complete.responses().get(i).unwrap().unwrap();
+                let reply = complete.responses.get(i).unwrap().unwrap();
                 let mut arguments = vec![0; reply.arguments.length() as usize];
-                retention
+                complete
+                    .retention
                     .read_at(reply.arguments.offset(), &mut arguments)
                     .unwrap();
                 replies.push((reply.name.into(), arguments, reply.call_id.to_vec()));
@@ -483,7 +504,7 @@ mod tests {
                 .get(complete.responses().len())
                 .unwrap()
                 .is_none());
-            assert_eq!(retention.len(), retention.published_len());
+            assert_eq!(complete.retention.len(), complete.retention.published_len());
         });
         match failure {
             Some(error) => Err(error),

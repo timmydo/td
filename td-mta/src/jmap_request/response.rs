@@ -466,11 +466,11 @@ fn emission_error(error: arena_emit::Error) -> Error {
     }
 }
 
-struct StateSource<'a, 's> {
-    value: &'s str,
-    offset: &'a mut usize,
-    charged: &'a mut u64,
-    limit: u64,
+pub(super) struct StateSource<'a, 's> {
+    pub(super) value: &'s str,
+    pub(super) offset: &'a mut usize,
+    pub(super) charged: &'a mut u64,
+    pub(super) limit: u64,
 }
 impl string::Source for StateSource<'_, '_> {
     type Context = ();

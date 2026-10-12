@@ -225,7 +225,19 @@ encoded-header adapters or combined service RSS.
   charged even when a later reference or method fails. Optional output leaves the entire
   mandatory preflight amount unavailable. The execution-phase check uses the
   retention clock without replacing its enclosing deadline or work budget.
-  Runtime peak RSS and largest accepted chain qualification remain pending.
+  The final Response encoder borrows the completed index, arenas and owned
+  file. Its state holds one borrowed arena emitter and one string frame, with
+  no full-response buffer. Count and output share framing; count uses stored
+  argument lengths without I/O, and output reads at most 4096 bytes per turn.
+  Session escaping yields after at most 256 string-frame steps. Every turn
+  charges the original meter and deadline before and after work; output does
+  not acquire a replacement allowance. Counting proves wire length, not
+  sufficient remaining work for transmission: argument reads and small output
+  windows can require more turns, and even empty polls consume a record.
+  Each phase yields separately, including short literal fragments; callers
+  may coalesce successful fragments before transport. Exhaustion after headers
+  requires aborting the exchange. Runtime peak RSS and largest accepted
+  chain qualification remain pending.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

@@ -2927,6 +2927,15 @@ while copying selected values without per-value trees. This is a worker
 adapter, not advertised Core: final Response framing, PushSubscription,
 Session/discovery and HTTPS dispatch remain integration work.
 
+Final Response framing now counts and streams from a completion owner that
+keeps its index, original request and exact retention file together. It
+preserves ordered method tuples, Session-state escaping and absent/empty/
+populated initial createdIds. Counting skips argument reads; transmission
+reads their published spans under the original budget. Tests cover fragmented
+output, exact Content-Length, escaped IDs/state, file truncation between
+execution and transmission, invalid phase transitions and fresh deadline
+checks before output and after completion. HTTP activation remains pending.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's
