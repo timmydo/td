@@ -7,9 +7,11 @@ ambient clock. Cold corpus verification uses the engine SHA-256 source;
 that verifier is outside the runtime library and adds no Cargo dependency.
 
 The library parses immutable resident bytes and emits bounded cursor turns
-into caller-owned storage. Raw bytes remain authoritative. Malformed
-content reports parser diagnostics; resource refusal is distinct from
-malformed content and never publishes a partial successful property.
+into caller-owned storage. The delimiter scanner also accepts contiguous
+fragments of a caller-pinned immutable extent without retaining input. Raw
+bytes remain authoritative. Malformed content reports parser diagnostics;
+resource refusal is distinct from malformed content and never publishes
+a partial successful property.
 
 Callers supply monotonic ticks, the original live work Meter and, where
 needed, a shared aggregate HeaderBudget. Copying a source checkpoint never
@@ -67,3 +69,19 @@ validation error is deferred. In :all mode a provisional match can refuse
 before a later scan failure; last-instance selection scans the whole section
 first. This error ordering follows streaming selection and grants no partial
 success or publication authority.
+
+Fragmented delimiter scanning shares the resident scanner's line state,
+CRLF/LF/bare-CR policy and offset calculation. The declared extent length
+is exact; empty fragments request more input until that length is consumed,
+and bytes after it remain unconsumed. Each poll reports its consumed prefix,
+at most 128 body bytes, so callers retain the remainder. Initial boundary
+validation is a separate turn. Every active turn spends one record;
+boundary validation spends one I/O visit per byte and body scanning spends
+two per byte. Events remain provisional through complete extent validation
+and fresh consuming finish. Cached Complete is passive; explicit deadline
+checks and finish use the original live meter. Source custody, fragment
+ordering, native reads and EOF/truncation detection belong to the caller.
+
+Delimiter preceding_end excludes the previous line ending and can precede
+an empty child's start when delimiters are adjacent. Child owners clamp
+that offset to their own start before constructing a child extent.

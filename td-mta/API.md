@@ -8104,3 +8104,29 @@ fresh consuming finish and enclosing-method publication admission. Any late
 source, work, clock or framing refusal hides diagnostics and permanently
 retires the cursor. This composes a single part's value, not bodyValues map
 selection, part authorization, native view retention or Email/get dispatch.
+
+## Fragmented MIME delimiters
+
+td-mta re-exports td_mime::delimiter as mime_delimiter. Its Stream shares
+the resident Cursor's scanner over one exact immutable body extent. new takes its checked absolute base and length, the
+selected boundary and original Meter. poll(input, now) consumes at most 128
+body bytes and reports consumed plus Yield, NeedInput, Delimiter or Complete.
+Retain any unconsumed input and provide contiguous source bytes; the scanner
+retains no input fragment. A boundary-validation turn consumes zero bytes.
+An empty fragment before the declared end returns NeedInput, never EOF.
+Bytes beyond the extent remain unconsumed. A final unterminated delimiter
+can be emitted before Complete. CR state survives fragment boundaries.
+
+Events use the same absolute offsets, preceding-ending exclusion, closing
+and ignored-suffix diagnostics as resident scanning. For adjacent delimiters,
+preceding_end can precede the child start; child owners must clamp it to
+that start before constructing the child extent. One active poll funds
+one record, initial validation funds one visit per boundary byte (at most
+70), and scanning funds two visits per body byte (at most 256 per turn).
+Empty-input polls still fund their active turn. Refusals stay terminal.
+Cached Complete is passive; check_deadline and consuming finish freshly
+check the original Meter. finish requires Complete and returns that same
+meter, never renewed admission. Both owners fit 160 bytes by compile-time
+bounds. No source identity, part descriptor or publication authority follows
+from delimiter offsets. Native reads, short-source refusal and complete
+streaming tree traversal remain separate service composition.

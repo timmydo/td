@@ -1207,6 +1207,15 @@ qualifies resident scanner state/work only, not DFS composition,
 complete worker/native stack or RSS. Child extent clipping and
 body/descriptor reservations remain those of the later traversal owner.
 
+Fragmented delimiter scanning shares the resident core and keeps its exact
+extent length in the fragmented owner. The resident core derives length
+from its retained source slice, preserving the traversal layout below.
+Both public owners retain the existing 160-byte ceiling. No source buffer
+is retained by the fragmented owner. The shared suite tests fragments
+including bytes past the extent, exact I/O and record cuts, CR handling
+and original-meter handoff. Worker/source buffers need separate
+reservations; this is not native stack or RSS qualification.
+
 M06ce's private protocol Reader, delimiter Core and metadata context poll
 replace their former inline mechanisms. Public cursor bounds and original
 per-turn charging are unchanged. Detached shared delimiter State fits eight

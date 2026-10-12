@@ -1,4 +1,4 @@
-//! Resident raw-line delimiter scanning; entity/source authority is external.
+//! Bounded raw-line delimiter scanning; entity/source authority is external.
 use crate::{
     time::Tick,
     work::{Charge, Meter, Stop},
@@ -72,7 +72,7 @@ impl<'a, 'w> Cursor<'a, 'w> {
     }
     pub fn finish(mut self, now: Tick) -> Result<&'w mut Meter, Error> {
         self.check_deadline(now)?;
-        if !self.core.complete {
+        if !self.core.state.complete {
             return Err(Error::InvalidState);
         }
         Ok(self.work)
@@ -81,15 +81,114 @@ impl<'a, 'w> Cursor<'a, 'w> {
         self.core.poll(now, self.work, self.boundary)
     }
 }
-/// Private progress; its owner pins the immutable pattern and original meter.
-/// No live admission reference is retained across calls.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    Yield,
+    NeedInput,
+    Delimiter(Delimiter),
+    Complete,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Progress {
+    /// Input bytes consumed this turn, at most 128; retain the remainder.
+    pub consumed: usize,
+    pub status: StreamStatus,
+}
+/// Same grammar over contiguous fragments of one immutable, admitted extent.
+/// Length is the exact entity-body extent, not the available captured prefix.
+/// Caller supplies every byte in order and retains source identity/custody.
+/// No fragment or complete body is retained. Cached Complete is passive;
+/// check_deadline and consuming finish freshly admit under the original meter.
+/// ```compile_fail,E0277
+/// fn copied<T: Copy>() {} copied::<td_mime::delimiter::Stream<'_, '_>>();
+/// ```
+/// ```compile_fail,E0277
+/// fn cloned<T: Clone>() {} cloned::<td_mime::delimiter::Stream<'_, '_>>();
+/// ```
+pub struct Stream<'a, 'w> {
+    state: Scan,
+    length: u64,
+    boundary: &'a [u8],
+    work: &'w mut Meter,
+}
+impl<'a, 'w> Stream<'a, 'w> {
+    pub fn new(
+        base: u64,
+        length: u64,
+        boundary: &'a [u8],
+        work: &'w mut Meter,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            state: Scan::new(base, length, boundary.len())?,
+            length,
+            boundary,
+            work,
+        })
+    }
+    pub fn poll(&mut self, input: &[u8], now: Tick) -> Result<Progress, Error> {
+        self.state
+            .poll(input, self.length, now, self.work, self.boundary)
+    }
+    pub fn check_deadline(&mut self, now: Tick) -> Result<(), Error> {
+        self.state.check_deadline(now, self.work)
+    }
+    pub fn finish(mut self, now: Tick) -> Result<&'w mut Meter, Error> {
+        self.check_deadline(now)?;
+        if !self.state.complete {
+            return Err(Error::InvalidState);
+        }
+        Ok(self.work)
+    }
+}
+
+/// Private resident adapter; source and original admission stay with its owner.
 pub(crate) struct Core<'a> {
     source: &'a [u8],
+    state: Scan,
+}
+impl<'a> Core<'a> {
+    pub(crate) fn new(source: &'a [u8], base: u64, boundary_len: usize) -> Result<Self, Error> {
+        let length = u64::try_from(source.len()).map_err(|_| Error::InvalidRange)?;
+        Ok(Self {
+            source,
+            state: Scan::new(base, length, boundary_len)?,
+        })
+    }
+    pub(crate) fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+        self.state.check_deadline(now, work)
+    }
+    pub(crate) fn poll(
+        &mut self,
+        now: Tick,
+        work: &mut Meter,
+        boundary: &[u8],
+    ) -> Result<Status, Error> {
+        let result = (|| {
+            let position = usize::try_from(self.state.position).map_err(|_| Error::InvalidRange)?;
+            let input = self.source.get(position..).ok_or(Error::InvalidState)?;
+            Ok(
+                match self
+                    .state
+                    .poll(input, self.source.len() as u64, now, work, boundary)?
+                    .status
+                {
+                    StreamStatus::Yield => Status::Yield,
+                    StreamStatus::Delimiter(found) => Status::Delimiter(found),
+                    StreamStatus::Complete => Status::Complete,
+                    StreamStatus::NeedInput => return Err(Error::InvalidState),
+                },
+            )
+        })();
+        self.state.outcome(result)
+    }
+}
+struct Scan {
     line: State,
     base: u64,
-    position: usize,
-    line_start: usize,
-    preceding_ending: usize,
+    position: u64,
+    line_start: u64,
+    preceding_ending: u64,
     pending_cr: bool,
     validation: usize,
     validator: Validator,
@@ -97,12 +196,10 @@ pub(crate) struct Core<'a> {
     complete: bool,
     failure: Option<Error>,
 }
-impl<'a> Core<'a> {
-    pub(crate) fn new(source: &'a [u8], base: u64, boundary_len: usize) -> Result<Self, Error> {
-        base.checked_add(u64::try_from(source.len()).map_err(|_| Error::InvalidRange)?)
-            .ok_or(Error::InvalidRange)?;
+impl Scan {
+    fn new(base: u64, length: u64, boundary_len: usize) -> Result<Self, Error> {
+        base.checked_add(length).ok_or(Error::InvalidRange)?;
         Ok(Self {
-            source,
             line: State::new(boundary_len).ok_or(Error::InvalidBoundary)?,
             base,
             position: 0,
@@ -123,43 +220,46 @@ impl<'a> Core<'a> {
         }
         result
     }
-    pub(crate) fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
+    fn check_deadline(&mut self, now: Tick, work: &mut Meter) -> Result<(), Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         let result = work.charge(now, Charge::default()).map_err(Error::Work);
         self.outcome(result)
     }
-    pub(crate) fn poll(
+    fn poll(
         &mut self,
+        input: &[u8],
+        length: u64,
         now: Tick,
         work: &mut Meter,
         boundary: &[u8],
-    ) -> Result<Status, Error> {
+    ) -> Result<Progress, Error> {
         if let Some(error) = self.failure {
             return Err(error);
         }
         if self.complete {
-            return Ok(Status::Complete);
+            return Ok(Progress {
+                consumed: 0,
+                status: StreamStatus::Complete,
+            });
         }
         let result = if boundary.len() != self.line.boundary_len() {
             Err(Error::InvalidState)
         } else {
-            self.step(now, work, boundary)
+            self.step(input, length, now, work, boundary)
         };
         self.outcome(result)
     }
-    fn offset(&self, position: usize) -> Result<u64, Error> {
-        self.base
-            .checked_add(u64::try_from(position).map_err(|_| Error::InvalidRange)?)
-            .ok_or(Error::InvalidRange)
+    fn offset(&self, position: u64) -> Result<u64, Error> {
+        self.base.checked_add(position).ok_or(Error::InvalidRange)
     }
-    fn end_line(&mut self, ending: usize) -> Result<Option<Delimiter>, Error> {
+    fn end_line(&mut self, ending: u64) -> Result<Option<Delimiter>, Error> {
         let result = if let Some(found) = self.line.finish() {
             Some(Delimiter {
                 line_start: self.offset(self.line_start)?,
                 after_line: self.offset(self.position)?,
-                // The child owner clamps this delimiter-leading ending at its start.
+                // The child owner clamps this ending at its own start.
                 preceding_end: self.offset(
                     self.line_start
                         .checked_sub(self.preceding_ending)
@@ -177,7 +277,14 @@ impl<'a> Core<'a> {
         self.line.reset();
         Ok(result)
     }
-    fn step(&mut self, now: Tick, work: &mut Meter, boundary: &[u8]) -> Result<Status, Error> {
+    fn step(
+        &mut self,
+        input: &[u8],
+        length: u64,
+        now: Tick,
+        work: &mut Meter,
+        boundary: &[u8],
+    ) -> Result<Progress, Error> {
         work.charge(
             now,
             Charge {
@@ -210,25 +317,44 @@ impl<'a> Core<'a> {
                 return Err(Error::InvalidBoundary);
             }
             self.validated = true;
-            return Ok(Status::Yield);
+            return Ok(Progress {
+                consumed: 0,
+                status: StreamStatus::Yield,
+            });
         }
+        let mut consumed = 0;
         for _ in 0..BODY_BYTES_PER_TURN {
-            if self.position == self.source.len() {
+            if self.position == length {
                 if self.line_start == self.position && !self.pending_cr {
                     self.complete = true;
-                    return Ok(Status::Complete);
+                    return Ok(Progress {
+                        consumed,
+                        status: StreamStatus::Complete,
+                    });
                 }
                 if self.pending_cr {
                     self.line.feed(b'\r', boundary);
                     self.pending_cr = false;
                 }
                 if let Some(found) = self.end_line(0)? {
-                    return Ok(Status::Delimiter(found));
+                    return Ok(Progress {
+                        consumed,
+                        status: StreamStatus::Delimiter(found),
+                    });
                 }
                 self.complete = true;
-                return Ok(Status::Complete);
+                return Ok(Progress {
+                    consumed,
+                    status: StreamStatus::Complete,
+                });
             }
-            // One source read plus at most one trusted boundary comparison.
+            if consumed == input.len() {
+                return Ok(Progress {
+                    consumed,
+                    status: StreamStatus::NeedInput,
+                });
+            }
+            // One source visit plus at most one selected-boundary comparison.
             work.charge(
                 now,
                 Charge {
@@ -237,12 +363,16 @@ impl<'a> Core<'a> {
                 },
             )
             .map_err(Error::Work)?;
-            let byte = *self.source.get(self.position).ok_or(Error::InvalidState)?;
-            self.position += 1;
+            let byte = *input.get(consumed).ok_or(Error::InvalidState)?;
+            self.position = self.position.checked_add(1).ok_or(Error::InvalidRange)?;
+            consumed += 1;
             if byte == b'\n' {
                 let ending = if self.pending_cr { 2 } else { 1 };
                 if let Some(found) = self.end_line(ending)? {
-                    return Ok(Status::Delimiter(found));
+                    return Ok(Progress {
+                        consumed,
+                        status: StreamStatus::Delimiter(found),
+                    });
                 }
             } else {
                 if self.pending_cr {
@@ -256,10 +386,14 @@ impl<'a> Core<'a> {
                 }
             }
         }
-        Ok(Status::Yield)
+        Ok(Progress {
+            consumed,
+            status: StreamStatus::Yield,
+        })
     }
 }
-
+const _: () = assert!(std::mem::size_of::<Cursor<'_, '_>>() <= 160);
+const _: () = assert!(std::mem::size_of::<Stream<'_, '_>>() <= 160);
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -421,7 +555,7 @@ mod tests {
                 let mut cursor = Cursor::new(&source, 0, &boundary, &mut work).unwrap();
                 let before = cursor.work.remaining();
                 assert_eq!(cursor.poll(Tick(1)), Ok(Status::Yield));
-                assert!(cursor.core.validated);
+                assert!(cursor.core.state.validated);
                 assert_eq!(before.records - cursor.work.remaining().records, 1);
                 assert_eq!(before.io_bytes - cursor.work.remaining().io_bytes, 70);
                 assert_eq!(
@@ -476,7 +610,7 @@ mod tests {
                     break;
                 }
             }
-            assert!(cursor.core.complete);
+            assert!(cursor.core.state.complete);
         }
         for (total, stop) in [
             (initial.io_bytes - work.remaining().io_bytes, Stop::IoBytes),
@@ -534,5 +668,200 @@ mod tests {
         ));
         let cursor = Cursor::new(source, 0, b"b", &mut work).unwrap();
         assert!(matches!(cursor.finish(Tick(1)), Err(Error::InvalidState)));
+    }
+    fn stream_events(source: &[u8], boundary: &[u8], split: usize) -> (Vec<Delimiter>, Charge) {
+        let mut work = meter();
+        let before = work.remaining();
+        let identity = std::ptr::from_ref(&work);
+        let mut stream = Stream::new(17, source.len() as u64, boundary, &mut work).unwrap();
+        let mut position = 0;
+        let mut supplied = source.to_vec();
+        supplied.extend_from_slice(b"\n--b--\r\ntail");
+        let mut events = Vec::new();
+        for _ in 0..source.len() * 3 + 20 {
+            let end = supplied.len().min(position + split);
+            let step = stream
+                .poll(supplied.get(position..end).unwrap(), Tick(1))
+                .unwrap();
+            assert!(step.consumed <= 128 && step.consumed <= end - position);
+            position += step.consumed;
+            assert!(position <= source.len());
+            match step.status {
+                StreamStatus::Delimiter(found) => events.push(found),
+                StreamStatus::Complete => {
+                    assert_eq!(position, source.len());
+                    let cached = stream.work.remaining();
+                    assert_eq!(
+                        stream.poll(b"ignored", Tick(100)).unwrap(),
+                        Progress {
+                            consumed: 0,
+                            status: StreamStatus::Complete,
+                        }
+                    );
+                    assert_eq!(stream.work.remaining(), cached);
+                    let work = stream.finish(Tick(1)).unwrap();
+                    assert_eq!(std::ptr::from_ref(work), identity);
+                    return (
+                        events,
+                        Charge {
+                            io_bytes: before.io_bytes - work.remaining().io_bytes,
+                            records: before.records - work.remaining().records,
+                            ..Charge::default()
+                        },
+                    );
+                }
+                StreamStatus::NeedInput => assert_eq!(position, end),
+                StreamStatus::Yield => {}
+            }
+        }
+        panic!("fragmented delimiter scan did not finish");
+    }
+    #[test]
+    fn fragments_preserve_every_line_boundary_and_exact_source_visit_cost() {
+        for source in [
+            b"".as_slice(),
+            b"--b",
+            b"--b\r",
+            b"--b\r\n--b--\r\n",
+            b"\r\n\n--b\r\n\r\n--b--",
+            b"\n\r\n--b\n\r\n--b--\r\n",
+            b"a\r--b\n--b---tail\n--b \t\r\nepilogue",
+            b"preamble\r\n--b\r\nA: B\r\n\r\nbody\r\n--b--\r\nepilogue",
+            b" --b\n--boops\r\n--b \t\n--b-- \t\n",
+        ] {
+            for width in 1..=source.len() + 2 {
+                let (events, charge) = stream_events(source, b"b", width);
+                assert_eq!(events, reference(source, 17, b"b"));
+                assert_eq!(charge.io_bytes, 1 + 2 * source.len() as u64);
+            }
+        }
+        let boundary = [b'x'; 70];
+        for prefix in 0..=260 {
+            let mut source = vec![b'a'; prefix];
+            source.extend_from_slice(b"\r\n--");
+            source.extend_from_slice(&boundary);
+            source.extend_from_slice(b"-- \t\r\n");
+            for width in [1, 2, 3, 127, 128, 129, 4096] {
+                let (events, charge) = stream_events(&source, &boundary, width);
+                assert_eq!(events, reference(&source, 17, &boundary));
+                assert_eq!(charge.io_bytes, 70 + 2 * source.len() as u64);
+            }
+        }
+    }
+    #[test]
+    fn empty_fragments_are_not_eof_and_extent_end_does_not_consume_following_bytes() {
+        let mut work = meter();
+        let mut stream = Stream::new(9, 3, b"b", &mut work).unwrap();
+        assert_eq!(
+            stream.poll(&[], Tick(1)).unwrap().status,
+            StreamStatus::Yield
+        );
+        let before = stream.work.remaining();
+        assert_eq!(
+            stream.poll(&[], Tick(1)).unwrap(),
+            Progress {
+                consumed: 0,
+                status: StreamStatus::NeedInput,
+            }
+        );
+        assert_eq!(stream.work.remaining().records, before.records - 1);
+        assert_eq!(stream.work.remaining().io_bytes, before.io_bytes);
+        assert_eq!(
+            stream.poll(b"--", Tick(1)).unwrap(),
+            Progress {
+                consumed: 2,
+                status: StreamStatus::NeedInput,
+            }
+        );
+        assert_eq!(
+            stream.poll(b"bignored", Tick(1)).unwrap(),
+            Progress {
+                consumed: 1,
+                status: StreamStatus::Delimiter(Delimiter {
+                    line_start: 9,
+                    after_line: 12,
+                    preceding_end: 9,
+                    closing: false,
+                    ignored_suffix: false,
+                }),
+            }
+        );
+        assert_eq!(
+            stream.poll(b"ignored", Tick(1)).unwrap(),
+            Progress {
+                consumed: 0,
+                status: StreamStatus::Complete,
+            }
+        );
+        stream.finish(Tick(1)).unwrap();
+        let stream = Stream::new(0, 1, b"b", &mut work).unwrap();
+        assert!(matches!(stream.finish(Tick(1)), Err(Error::InvalidState)));
+    }
+    #[test]
+    fn fragmented_original_work_and_completion_expiry_refuse_stickily() {
+        let source = b"a\r\n--b\r\nz\n--b--";
+        let (_, cost) = stream_events(source, b"b", 1);
+        for (total, stop) in [
+            (cost.io_bytes, Stop::IoBytes),
+            (cost.records, Stop::Records),
+        ] {
+            for allowance in 0..total {
+                let mut capacity = meter().remaining();
+                if stop == Stop::IoBytes {
+                    capacity.io_bytes = allowance;
+                } else {
+                    capacity.records = allowance;
+                }
+                let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+                let mut stream = Stream::new(17, source.len() as u64, b"b", &mut work).unwrap();
+                let mut position = 0;
+                let error = loop {
+                    let end = source.len().min(position + 1);
+                    match stream.poll(source.get(position..end).unwrap(), Tick(1)) {
+                        Err(error) => break error,
+                        Ok(step) => {
+                            assert_ne!(step.status, StreamStatus::Complete);
+                            position += step.consumed;
+                        }
+                    }
+                };
+                assert_eq!(error, Error::Work(stop));
+                let left = stream.work.remaining();
+                assert_eq!(stream.poll(b"", Tick(1)), Err(error));
+                assert_eq!(stream.check_deadline(Tick(1)), Err(error));
+                assert_eq!(stream.work.remaining(), left);
+                assert!(matches!(stream.finish(Tick(1)), Err(value) if value == error));
+            }
+        }
+        for complete in [false, true] {
+            let mut work = meter();
+            let mut stream = Stream::new(0, 0, b"b", &mut work).unwrap();
+            if complete {
+                assert_eq!(
+                    stream.poll(&[], Tick(1)).unwrap().status,
+                    StreamStatus::Yield
+                );
+                assert_eq!(
+                    stream.poll(&[], Tick(1)).unwrap().status,
+                    StreamStatus::Complete
+                );
+            }
+            assert!(matches!(
+                stream.finish(Tick(100)),
+                Err(Error::Work(Stop::Deadline))
+            ));
+        }
+        let mut work = meter();
+        assert!(matches!(
+            Stream::new(u64::MAX, 1, b"b", &mut work),
+            Err(Error::InvalidRange)
+        ));
+        assert!(matches!(
+            Stream::new(0, 0, b"", &mut work),
+            Err(Error::InvalidBoundary)
+        ));
+        let mut stream = Stream::new(0, 0, b"bad ", &mut work).unwrap();
+        assert_eq!(stream.poll(&[], Tick(1)), Err(Error::InvalidBoundary));
+        assert_eq!(stream.poll(&[], Tick(1)), Err(Error::InvalidBoundary));
     }
 }
