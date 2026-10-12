@@ -8303,3 +8303,28 @@ output. Successful finish freshly returns the original native traversal
 handoff and scratch with passive part/class evidence. It cannot create another
 source or request allowance. Resident parent abandonment and preorder progress
 are still cleared/advanced only by its own successful whole-fragment finish.
+
+## Native direct-leaf locator candidates
+
+`blob_part_locators::Cursor` consumes the original native traversal handoff
+and exactly one caller-reserved candidate cell per descriptor. It maps one
+part per turn through the resident locator policy and original work budgets.
+Multipart descriptors produce no locator; other parts retain their transfer
+encoding and exact encoded body range. Parent IDs come from the held
+PinnedBlob, and offsets remain absolute within that blob even for traversal
+of a clipped nonzero extent. Every range must fit the original blob length and the root descriptor's
+clipped entity extent; body starts cannot precede their own entity. These
+checks detect inconsistent passive descriptors, not fabricated replacement
+traversals. The caller must supply the original traversal handoff.
+
+Construction, explicit checks, every poll (including cached completion), and
+consuming finish freshly check the native and job deadlines. Native expiry
+wins over provisional mapping; any refusal retires the consuming handoff and
+hides completion through the cursor. After refusal, caller-owned cells may
+still contain provisional locators and must be discarded; the cursor does
+not perform an unbounded clearing pass. `value()` does not sample time.
+Successful finish
+returns all candidates beside the original traversal owners. These candidates
+are not part-ID authorization or permission to publish/download; the enclosing
+worker must preserve its account/snapshot authorization and response admission.
+No body bytes are read or transfer-decoded by this mapping.

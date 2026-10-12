@@ -4473,3 +4473,21 @@ caller-owned output and retains the existing interpretation and output charges.
 The resident wrapper stays within its existing 1 KiB ceiling and owns only
 its original parent failure/progress references around that same encoder.
 No buffer, scratch window, source read, allocation or resource limit is added.
+
+### Native direct-leaf locator candidate storage
+
+The native locator cursor retains one original traversal handoff and one
+borrowed candidate span. Its compiled ceiling, including HeaderBudget and one
+Candidate, is 1 KiB. The enclosing job must reserve exactly N candidate cells,
+where N is the bounded native descriptor count, and must admit the checked sum
+alongside the retained headers and descriptors. Candidate remains at most
+128 bytes. No message-sized copy, heap allocation or new allowance occurs.
+Each turn funds one shared mapping: one explicit record, one interpretation
+step for multipart or the fixed wire length in interpretation steps and output
+bytes for a leaf. Interpretation steps also fund records through the shared
+Credit policy; those records are additional to the explicit mapping record.
+Each mapper starts empty Credit and retains it across its parts; unused
+prepaid steps are discarded at finish, with no refund or new allowance.
+Native clock fences
+and zero charges are fresh even after mapping is complete. Original source
+bytes and I/O budgets are unchanged; no body read occurs.

@@ -8,6 +8,7 @@ pub mod blob_delimiters;
 pub mod blob_entity;
 pub mod blob_part;
 pub mod blob_part_json;
+pub mod blob_part_locators;
 pub mod blob_structure;
 pub mod body_properties;
 pub mod body_property;

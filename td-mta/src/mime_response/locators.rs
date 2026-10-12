@@ -134,72 +134,19 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l> {
             .checked_add(1)
             .and_then(|n| u16::try_from(n).ok())
             .ok_or(Error::InvalidState)?;
-        if part.ordinal != ordinal {
-            return Err(Error::InvalidState);
-        }
-        let leaf = part.media != Media::Multipart;
-        structure
-            .budget
-            .charge(
-                structure.work,
-                now,
-                0,
-                if leaf {
-                    PartLocator::WIRE_BYTES as u64
-                } else {
-                    1
-                },
-                &mut self.credit,
-            )
-            .map_err(Error::Admission)?;
-        structure
-            .work
-            .charge(
-                now,
-                Charge {
-                    records: 1,
-                    output_bytes: if leaf {
-                        PartLocator::WIRE_BYTES as u64
-                    } else {
-                        0
-                    },
-                    ..Charge::default()
-                },
-            )
-            .map_err(|error| Error::Admission(crate::nfc::Error::Work(error)))?;
-        let mut candidate = Candidate {
+        let candidate = candidate(
+            part,
             ordinal,
-            ..Candidate::default()
-        };
-        if leaf {
-            let offset = part
-                .body_start
-                .checked_sub(structure.base)
-                .ok_or(Error::InvalidRange)?;
-            let length = part
-                .entity_end
-                .checked_sub(part.body_start)
-                .ok_or(Error::InvalidRange)?;
-            let parent_length =
-                u64::try_from(structure.source.len()).map_err(|_| Error::InvalidRange)?;
-            let locator = PartLocator {
-                parent: self.parent,
-                offset,
-                length,
-                encoding: match part.encoding {
-                    Encoding::Identity => TransferEncoding::Identity,
-                    Encoding::Base64 => TransferEncoding::Base64,
-                    Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
-                },
-            };
-            locator
-                .checked_end(parent_length)
-                .map_err(|_| Error::InvalidRange)?;
-            locator
-                .encode(&mut candidate.wire)
-                .map_err(|_| Error::InvalidState)?;
-            candidate.locator = Some(locator);
-        }
+            Parent {
+                id: self.parent,
+                base: structure.base,
+                length: u64::try_from(structure.source.len()).map_err(|_| Error::InvalidRange)?,
+            },
+            structure.work,
+            structure.budget,
+            &mut self.credit,
+            now,
+        )?;
         *self
             .candidates
             .get_mut(self.next)
@@ -222,6 +169,85 @@ impl<'a, 'w, 'n, 'c, 'o, 'r, 'l> Cursor<'a, 'w, 'n, 'c, 'o, 'r, 'l> {
             candidates: self.candidates,
         })
     }
+}
+/// Passive source coordinates; this does not authenticate a parent blob.
+pub(crate) struct Parent {
+    pub id: BlobId,
+    pub base: u64,
+    pub length: u64,
+}
+/// One shared direct-leaf mapping and charge path for resident/native owners.
+pub(crate) fn candidate(
+    part: crate::mime_structure::Part,
+    ordinal: u16,
+    parent: Parent,
+    work: &mut crate::admission::work::Meter,
+    budget: &mut crate::nfc::HeaderBudget,
+    credit: &mut crate::nfc::Credit,
+    now: Tick,
+) -> Result<Candidate, Error> {
+    if part.ordinal != ordinal {
+        return Err(Error::InvalidState);
+    }
+    let leaf = part.media != Media::Multipart;
+    budget
+        .charge(
+            work,
+            now,
+            0,
+            if leaf {
+                PartLocator::WIRE_BYTES as u64
+            } else {
+                1
+            },
+            credit,
+        )
+        .map_err(Error::Admission)?;
+    work.charge(
+        now,
+        Charge {
+            records: 1,
+            output_bytes: if leaf {
+                PartLocator::WIRE_BYTES as u64
+            } else {
+                0
+            },
+            ..Charge::default()
+        },
+    )
+    .map_err(|error| Error::Admission(crate::nfc::Error::Work(error)))?;
+    let mut candidate = Candidate {
+        ordinal,
+        ..Candidate::default()
+    };
+    if leaf {
+        let offset = part
+            .body_start
+            .checked_sub(parent.base)
+            .ok_or(Error::InvalidRange)?;
+        let length = part
+            .entity_end
+            .checked_sub(part.body_start)
+            .ok_or(Error::InvalidRange)?;
+        let locator = PartLocator {
+            parent: parent.id,
+            offset,
+            length,
+            encoding: match part.encoding {
+                Encoding::Identity => TransferEncoding::Identity,
+                Encoding::Base64 => TransferEncoding::Base64,
+                Encoding::QuotedPrintable => TransferEncoding::QuotedPrintable,
+            },
+        };
+        locator
+            .checked_end(parent.length)
+            .map_err(|_| Error::InvalidRange)?;
+        locator
+            .encode(&mut candidate.wire)
+            .map_err(|_| Error::InvalidState)?;
+        candidate.locator = Some(locator);
+    }
+    Ok(candidate)
 }
 /// Complete original candidate mapping; still not parent authorization.
 /// ```compile_fail,E0277
@@ -266,3 +292,86 @@ const _: () = assert!(std::mem::size_of::<Mapped<'_, '_, '_, '_, '_, '_, '_>>() 
 #[cfg(test)]
 #[path = "locators/tests.rs"]
 pub(in crate::mime_response) mod tests;
+
+#[cfg(test)]
+mod native_parity {
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+    use super::*;
+    fn costs(work: &crate::admission::work::Meter, budget: &crate::nfc::HeaderBudget) -> [u64; 5] {
+        let left = work.remaining();
+        [
+            budget.source_bytes_remaining(),
+            budget.steps_remaining(),
+            left.io_bytes,
+            left.records,
+            left.output_bytes,
+        ]
+    }
+    #[test]
+    fn native_and_resident_candidates_and_five_costs_match() {
+        for bytes in [
+            b"\n".as_slice(),
+            b"Content-Type: message/rfc822\r\n\r\n\r\nplain",
+            crate::blob_part_locators::tests::SOURCE,
+        ] {
+            let (resident, cost) = tests::exercise(bytes, 17, |mut cursor| {
+                let structure = &cursor.source.original.source.projected.structure;
+                let before = costs(structure.work, structure.budget);
+                for _ in 0..100 {
+                    if cursor.poll(Tick(1)).unwrap()
+                        == crate::mime_response::body_window::Status::Complete
+                    {
+                        break;
+                    }
+                }
+                let structure = &cursor.source.original.source.projected.structure;
+                let after = costs(structure.work, structure.budget);
+                let candidates = cursor.value().unwrap().candidates.to_vec();
+                cursor.finish(Tick(1)).unwrap();
+                (
+                    candidates,
+                    std::array::from_fn::<_, 5, _>(|i| before[i] - after[i]),
+                )
+            });
+            crate::blob_part_locators::tests::exercise(
+                bytes,
+                0..bytes.len() as u64,
+                |retained, _| {
+                    let parent = retained.source.id();
+                    let before = costs(retained.work, retained.budget);
+                    let mut cells = vec![Candidate::default(); retained.parts.len()];
+                    let mut cursor =
+                        crate::blob_part_locators::Cursor::new(retained, &mut cells, Tick(1))
+                            .unwrap();
+                    for _ in 0..100 {
+                        if cursor.poll(Tick(1)).unwrap()
+                            == crate::blob_part_locators::Status::Complete
+                        {
+                            break;
+                        }
+                    }
+                    let result = cursor.finish(Tick(1)).unwrap();
+                    let after = costs(result.structure.work, result.structure.budget);
+                    assert_eq!(
+                        std::array::from_fn::<_, 5, _>(|i| before[i] - after[i]),
+                        cost
+                    );
+                    assert_eq!(result.candidates.len(), resident.len());
+                    for (native, resident) in result.candidates.iter().zip(&resident) {
+                        assert_eq!(native.ordinal(), resident.ordinal());
+                        if let Some(mut locator) = resident.locator() {
+                            locator.parent = parent;
+                            assert_eq!(native.locator(), Some(locator));
+                            let mut wire = [0; PartLocator::WIRE_BYTES];
+                            locator.encode(&mut wire).unwrap();
+                            assert_eq!(native.wire().unwrap().as_bytes(), wire);
+                        } else {
+                            assert!(native.locator().is_none());
+                            assert!(native.wire().is_none());
+                        }
+                    }
+                },
+            );
+        }
+    }
+}
