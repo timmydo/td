@@ -7612,3 +7612,57 @@ charges actual I/O bytes. Recursive consumers must also account for rereading
 subtree ranges at each depth; bounded polls do not imply linear whole-filter
 work. Impossible scanner no-progress or simultaneous item/completion states
 fail internally instead of spinning or discarding an item.
+
+## Retained Mailbox/query dispatch
+
+The opt-in Mail dispatcher evaluates Mailbox/query against one native account
+snapshot. It accepts the standard parent/name/role/role-presence/subscription
+conditions and all AND/OR/NOT forms, validates every branch before scanning
+mailboxes, and implements the POLICY.md sort, tree, anchor and paging rules.
+Unsupported properties/operators/collations or compiled filter complexity
+return unsupportedFilter/unsupportedSort; wrong JSON types return
+invalidArguments. Text-operand admission compares decoded strings exactly,
+so repeated operands do not consume distinct-operand slots. Null filtering
+matches all rows. Empty Boolean operands retain their specified truth values.
+
+One native sort job owns the original deadline, cumulative work meter and
+both whole-file reservations. Its source yields between retained JSON scanner
+turns, distinct-text comparisons, account scans, parent lookups and predicate
+steps. A single filter frame allocation is reused across candidate and ancestor
+evaluation. During validation at most 64 distinct bounded decoded text operands and
+one pending operand are retained; these are dropped before account scanning. Nested ranges are reread
+under the same charged job, never under renewed per-filter budgets.
+
+Each scratch record holds a bounded root-to-self ID chain. Flat queries use
+one ID; tree queries validate paths before sorting. Comparisons inspect at most
+32 ID pairs and fetch at most two sibling rows; the original comparator policy
+supplies field ordering and final ID ties. Ancestors remain first regardless
+of direction. filterAsTree evaluates the whole predicate for the candidate and
+every ancestor. Counts and paging follow complete filtering and sorting, with
+no account-sized resident ID vector or SQL sort temporary.
+
+Output coordinates come only from this job's successful Sorter completion.
+Drop filter frames and sort run/head buffers before reading the sealed output;
+keep file reservations and the native view through anchor search and page
+serialization. Missing anchors fail even for limit=0. Include the selected
+limit when omitted/null or clamped; calculateTotal counts the whole result,
+including with a zero requested limit. The query state captures the original
+view and current interpretation version; canCalculateChanges is false.
+Fresh native snapshot and execution checks precede response publication;
+the existing HTTPS response boundary retains final credential authorization.
+No Mail discovery advertisement or td-mail interoperability claim is added.
+
+Filter validation follows native view and workspace admission. Temporary
+pressure can therefore precede a filter-shape error; there is no uncharged
+validation allocation or internal retry. The source retains its bounded row,
+arguments and one scratch record while reading output. A failed job drops its
+source/filter before the workspace binding releases its permit.
+
+The original request retention meter remains authoritative across methods.
+If that meter or its outer deadline fails, the entire batch terminates without
+publishing a response; it is never replenished to encode later calls. A query
+job's separate work refusal can return storageWorkLimit and allow later calls
+while request custody is still healthy. No precedence between those cumulative
+meters is promised. An anchor sum outside JMAP's safe integer range produces
+an empty page positioned at the result end, keeping the response integer
+representable without refusing an otherwise valid out-of-range query.

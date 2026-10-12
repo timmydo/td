@@ -202,7 +202,13 @@ impl<'a, 'c> Validation<'a, 'c> {
             parser: Some(parser),
             document: None,
             capabilities,
-            envelope: Envelope::new(limits.json_methods, limits.objects_per_method),
+            envelope: Envelope::new(
+                limits.json_methods,
+                limits.objects_per_method,
+                limits.query_page,
+                limits.json_depth,
+                limits.json_tokens,
+            ),
         })
     }
     /// One parser step, up to 256 scalar/comparison transitions, or sixteen
@@ -284,7 +290,13 @@ impl<'c> OwnedValidation<'c> {
             Ok(()) => Ok(Self {
                 document,
                 capabilities,
-                envelope: Envelope::new(limits.json_methods, limits.objects_per_method),
+                envelope: Envelope::new(
+                    limits.json_methods,
+                    limits.objects_per_method,
+                    limits.query_page,
+                    limits.json_depth,
+                    limits.json_tokens,
+                ),
             }),
             Err(error) => Err(ValidationRefusal { error, document }),
         }
@@ -448,6 +460,9 @@ impl Walk {
 struct Envelope {
     maximum_calls: usize,
     maximum_objects: usize,
+    query_page: usize,
+    query_depth: usize,
+    query_nodes: usize,
     stage: Stage,
     raw_using: Option<usize>,
     raw_calls: Option<usize>,
@@ -459,10 +474,19 @@ struct Envelope {
     failed: Option<Error>,
 }
 impl Envelope {
-    fn new(maximum_calls: usize, maximum_objects: usize) -> Self {
+    fn new(
+        maximum_calls: usize,
+        maximum_objects: usize,
+        query_page: usize,
+        query_depth: usize,
+        query_nodes: usize,
+    ) -> Self {
         Self {
             maximum_calls,
             maximum_objects,
+            query_page,
+            query_depth,
+            query_nodes,
             stage: Stage::Strings {
                 token: 0,
                 offset: 0,

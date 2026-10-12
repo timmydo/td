@@ -214,7 +214,10 @@ pub(crate) struct Temporary<'s, 'r> {
     identity: Option<Metadata>,
     cleaned: Option<Result<(), ports::Error>>,
 }
-impl Temporary<'_, '_> {
+impl<'s, 'r> Temporary<'s, 'r> {
+    pub(crate) fn spool(&self) -> &'s RequestSpool<'r> {
+        self.spool
+    }
     pub(crate) fn create(&mut self) -> Result<(), ports::Error> {
         let mut path = [0; MAX_PATH_BYTES];
         let file = OpenOptions::new()

@@ -177,6 +177,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         Ok(state)
     }
     fn changes_uint(&mut self, item: &Item) -> Result<u64, Error> {
+        u64::try_from(self.query_integer(item)?).map_err(|_| Error::InvalidArguments)
+    }
+    pub(super) fn query_integer(&mut self, item: &Item) -> Result<i64, Error> {
         if item.kind != scan::Kind::Number {
             return Err(Error::InvalidArguments);
         }
@@ -196,7 +199,15 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             position += length as u64;
         }
         self.check()?;
-        number.finish().ok_or(Error::InvalidArguments)
+        let negative = number.negative;
+        number.negative = false;
+        let value = i64::try_from(number.finish().ok_or(Error::InvalidArguments)?)
+            .map_err(|_| Error::InvalidArguments)?;
+        if negative {
+            value.checked_neg().ok_or(Error::InvalidArguments)
+        } else {
+            Ok(value)
+        }
     }
 }
 // The retained scanner already checked JSON number syntax. Keep exact decimal

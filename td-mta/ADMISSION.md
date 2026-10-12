@@ -1263,3 +1263,21 @@ A forgotten workspace fails closed by retaining its permit. The generic
 algorithm's raw slices remain a trusted primitive; production callers use this
 native admission path. A compile-time bound pins maximum workspace buffers
 and fixed swap/metadata allowance below the existing 1 MiB reservation.
+
+Mailbox/query uses the native single-workspace permit for both sorting and
+its bounded filter workspace. A compile-time bound combines 256 resident
+513-byte records, eight merge heads, 64 maximum filter frames, 64 decoded
+4096-byte distinct operands, one pending operand and fixed decoding/row/stack allowance below the existing
+1 MiB reservation. Frame storage is reused across rows; decoded distinct
+operands exist only during pre-scan validation. Completion drops the filter
+storage before releasing the sort workspace, so output streaming cannot
+retain uncharged filter memory after a later query acquires the permit.
+
+Every query uses one sort job, with no reconstruction after failure. Source
+steps conservatively precharge retained scanner reads, bounded decoded-text
+work and native lookups; actual retained reads also debit the original request
+retention meter. Sorting control and backend operations retain the adapter's
+conservative double charges. A disk cap is not a promise that every query can
+fill it before its CPU/I/O/deadline ceiling. Deterministic job work exhaustion
+is storageWorkLimit; elapsed deadline and shared workspace/file/view pressure
+are temporary serverUnavailable. Neither publishes partial IDs or totals.

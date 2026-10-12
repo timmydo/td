@@ -7,6 +7,12 @@ use td_json::{arena, arena_emit::BorrowedEmitter};
 mod get_ids;
 #[path = "mailbox_get.rs"]
 mod mailbox_get;
+#[path = "mailbox_query.rs"]
+mod mailbox_query;
+#[path = "mailbox_query_args.rs"]
+mod mailbox_query_args;
+#[path = "mailbox_query_filter.rs"]
+mod mailbox_query_filter;
 #[path = "object_changes.rs"]
 mod object_changes;
 #[path = "push.rs"]
@@ -23,6 +29,9 @@ pub enum Error {
     InvalidArguments,
     AccountNotFound,
     CannotCalculateChanges,
+    UnsupportedFilter,
+    UnsupportedSort,
+    AnchorNotFound,
     FromAccountNotFound,
     InvalidResultReference,
     UnknownMethod,
@@ -130,6 +139,9 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     return Err(Error::Storage(error));
                 }
                 let body: &[u8] = match error {
+                    Error::UnsupportedFilter => br#"{"type":"unsupportedFilter"}"#,
+                    Error::UnsupportedSort => br#"{"type":"unsupportedSort"}"#,
+                    Error::AnchorNotFound => br#"{"type":"anchorNotFound"}"#,
                     Error::CannotCalculateChanges => br#"{"type":"cannotCalculateChanges"}"#,
                     Error::AccountNotFound => br#"{"type":"accountNotFound"}"#,
                     Error::FromAccountNotFound => br#"{"type":"fromAccountNotFound"}"#,
@@ -290,6 +302,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"Blob/copy" if core => "Blob/copy",
             b"PushSubscription/get" if core => "PushSubscription/get",
             b"PushSubscription/set" if core => "PushSubscription/set",
+            b"Mailbox/query" if mail => "Mailbox/query",
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
             b"Thread/changes" if mail => "Thread/changes",
@@ -319,6 +332,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             )
         } else if name == "Thread/get" {
             self.thread_get(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Mailbox/query" {
+            let limits = &responses.request().envelope;
+            self.mailbox_query(
+                start..end,
+                limits.query_page,
+                limits.query_depth,
+                limits.query_nodes,
+            )
         } else if name == "Mailbox/get" {
             self.mailbox_get(start..end, responses.request().envelope.maximum_objects)
         } else {

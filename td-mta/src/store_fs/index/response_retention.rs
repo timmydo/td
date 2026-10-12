@@ -163,7 +163,27 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         Ok(response)
     }
 }
-impl<'c, 's, 'r, 'sr, P> ResponseRetention<'c, 's, 'r, 'sr, '_, P> {
+impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
+    pub(crate) fn method_sort_context(
+        &mut self,
+        phase: Deadline,
+    ) -> Result<(&'c StoreCoordinator<'r, 'a, P>, &'s RequestSpool<'sr>, u64), ports::Error> {
+        if !self.admit_before(phase)? {
+            return Err(ports::Error::Deadline);
+        }
+        let cap = self.coordinator.sort_bytes / 2;
+        if cap == 0 {
+            return Err(ports::Error::Capacity);
+        }
+        Ok((
+            self.coordinator,
+            self.temporary
+                .as_ref()
+                .ok_or(ports::Error::Invalid)?
+                .spool(),
+            cap,
+        ))
+    }
     pub(crate) fn method_view(
         &mut self,
         account: AccountId,

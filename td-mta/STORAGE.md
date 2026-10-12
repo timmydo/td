@@ -2737,3 +2737,13 @@ length before reading one fixed record. Output coordinates are internal
 scratch metadata, not authorization or evidence of a fresh read view.
 
 API.md owns the trusted output-coordinate and error-buffer contract.
+
+The retained Mailbox/query worker obtains its coordinator/spool context from
+its existing ResponseRetention after checking the method phase. The borrowed
+context does not expose paths or descriptors and cannot renew a job budget.
+One native view supplies the account scan, parent validation, sibling-key
+lookups and final snapshot check. Raw query records store only bounded ID
+paths, never row values whose buffers could outlive a lookup. All output reads
+use the same job's actual completed sorter coordinates; failed output reads
+withhold the destination bytes. API.md owns query semantics and publication;
+ADMISSION.md owns the combined resident workspace and accounting policy.

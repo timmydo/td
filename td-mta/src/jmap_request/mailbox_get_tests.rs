@@ -86,16 +86,34 @@ pub(crate) fn run_setup(
     cutoff: Option<u64>,
     setup: impl FnOnce(&IndexStore<'_>),
 ) -> td_json::Json {
+    run_configured(
+        input,
+        count,
+        Limits {
+            objects_per_method: maximum,
+            ..Limits::default()
+        },
+        phase,
+        busy,
+        cutoff,
+        setup,
+    )
+}
+pub(crate) fn run_configured(
+    input: &str,
+    count: u16,
+    limits: Limits,
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+    setup: impl FnOnce(&IndexStore<'_>),
+) -> td_json::Json {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let files = Fixture::new();
     let mut file_root = files.locked();
     let clock = Arc::new(Timer(AtomicU64::new(0), AtomicU64::new(u64::MAX)));
     let spool = RequestSpool::open(&mut file_root, clock.clone(), deadline()).unwrap();
-    let limits = Limits {
-        objects_per_method: maximum,
-        ..Limits::default()
-    };
     let resources = Limits {
         json_bytes: 64,
         json_methods: 1,

@@ -276,3 +276,14 @@ last-event-ID replay avoidance and closeafter=state. Core exposes no stateful
 account data type, so a Core-only runtime stream produces pings, not mail
 StateChange events. Live mail-state integration belongs with Mail activation.
 This is not a td-mail interoperability result; that remains the next milestone.
+
+## Mailbox/query worker evidence
+
+The opt-in retained dispatcher now exercises native Mailbox/query filtering,
+external sorting, tree rules, anchor adjustment, configured paging, totals,
+query state and result references into Mailbox/get. Its fixture includes a
+300-row merge, empty accounts, full filter validation before scans, distinct
+text limits, account/view pressure and execution expiry. This is worker-level
+evidence only: live discovery still advertises Core alone, and no td-mail
+interoperability result is claimed. Mail activation still requires the rest
+of this document's capability obligations.
