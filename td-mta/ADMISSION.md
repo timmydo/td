@@ -756,6 +756,26 @@ the source, checks span arithmetic, charges reads/work/deadlines, discards
 provisional selections on error and applies the reference's Pointer rules.
 The scanner alone does not read a file, select a value or activate dispatch.
 
+The inert `jmap_request::pointer::Walker` now applies JSON Pointer plus the
+RFC 8620 array wildcard to that stream. It borrows the decoded path, validates
+its escapes in bounded turns, matches decoded object keys lazily without
+retaining or prescanning whole segments, and accepts only canonical
+nonnegative array indexes after at most 21 token bytes. A star is an
+ordinary object key; only an array interprets it as a wildcard. Wildcards map
+the remaining tokens over each element in order and flatten each resulting
+array one level. Missing branches invalidate the entire provisional selection;
+an empty wildcard returns an empty array without evaluating its remaining
+tokens (their syntax is still validated). Path depth is not capped by response depth for that reason.
+The walker emits passive relative byte ranges and generated array delimiters,
+not copied value trees. Its complete success is required before using the
+resolution; a later failure discards earlier pieces. Scanner/source-limit
+errors that are detected remain distinct from invalidResultReference. The
+first error wins: bad references may stop before a corrupt tail, so retained
+producer integrity remains a prerequisite. Actual file identity,
+checked file-base arithmetic, reads, retention of expanded results and shared
+work/deadline admission remain with the enclosing dispatcher. No endpoint
+uses this walker yet and it grants no file-read or publication authority.
+
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument
 type is invalidArguments when the method validates it. Simultaneous normal and

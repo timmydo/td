@@ -181,6 +181,19 @@ encoded-header adapters or combined service RSS.
   event per poll, preserving lexical progress across arbitrary read splits.
   Source custody, reads, work/time admission and JSON Pointer selection stay
   with the future enclosing retained-response walker.
+  The inert Pointer Walker composes that scanner with 160 selection frames
+  and a borrowed path. A turn checks at most 256 path bytes or polls the
+  scanner once and handles its single event. Object segments compare lazily
+  against decoded key scalars; array-token validation inspects at most 21
+  bytes, so long segments are not rescanned up front for each branch.
+  No key, value tree or selected-range list is allocated. A state-size test
+  bounds the combined scanner/selection owner at 16 KiB; this is a measured
+  component ceiling, not combined qualification with the emitter and file
+  read/output buffers. Integration must account for those simultaneous owners.
+  Work scales with retained bytes plus initial path validation; each key
+  scalar costs constant matching work and array tokens have a fixed bound; wildcard expansion also consumes the
+  enclosing retained-output quota. Neither an empty wildcard nor a long path
+  may reset the original work/deadline allowance.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

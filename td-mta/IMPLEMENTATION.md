@@ -2897,6 +2897,15 @@ fragmented escapes and numbers, exact limits, malformed tails and long-scalar
 yielding. Retained producers still prove unique keys and I-JSON policy;
 actual source custody and Pointer/wildcard selection remain integration work.
 
+The inert Pointer walker now selects retained spans with escaped/Unicode
+object keys, canonical array indexes and RFC 8620 wildcard ordering and
+one-level flattening. It rejects a missing wildcard branch after provisional
+output and preserves source failures as distinct from bad client references.
+An independent recursive oracle matches 200 generated trees across twelve
+paths, beside fragmented, long-path, empty-wildcard and depth-limit fixtures.
+File custody, metered I/O, expanded-result retention and actual dispatcher
+integration remain required before any capability advertisement.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's
