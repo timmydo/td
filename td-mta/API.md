@@ -7738,3 +7738,30 @@ that outlives borrowed cursors and returned header properties. It must not
 rebuild a cursor to renew exhausted work. Unknown names and malformed/forbidden
 header forms map to invalidArguments at Email/get admission; work refusal keeps
 its resource classification and must never become invalidArguments.
+
+## Stored timestamps as JMAP UTCDate
+
+jmap_date::write_utc_ms appends an unquoted UTCDate from signed Unix
+milliseconds using the existing td-civil checked calendar conversion. It
+accepts only four-digit years 0000 through 9999, refuses out-of-range
+values instead of clamping, uses uppercase T and Z, and omits a zero
+fraction. A nonzero fraction always retains three millisecond digits.
+Euclidean division preserves the date and fraction before the Unix epoch.
+This follows RFC 8620 section 1.4 and RFC 3339 section 5.6; leap seconds
+are not representable in the stored Unix-millisecond format.
+
+The operation allocates nothing, performs fixed work and writes at most
+24 bytes into caller-owned TextBuffer storage. Range and capacity failures
+leave its visible output unchanged; a failed format may overwrite the
+invisible tail, as TextBuffer already specifies. Callers budget formatting
+and response retention under the original operation meter, add JSON quotes,
+and obtain fresh snapshot/authorization checks before publication. The
+formatter grants no storage, deadline or response-publication authority and
+does not activate Email/get or advertise Mail.
+
+Year 0000 deliberately follows RFC 3339's four-digit proleptic Gregorian
+representation; narrower client library ranges do not redefine this wire
+formatter. A stored receivedAt outside this range cannot become null or a
+fabricated date: the Email projection must return a storage-corruption/server
+failure, never invalidArguments for a read request. Validation of incoming
+import/set values belongs to their method admission before storage.
