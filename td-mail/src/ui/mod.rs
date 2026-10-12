@@ -1821,7 +1821,12 @@ mod frame_tests {
     use super::*;
     use crate::config::PasswordSource;
     use crate::jmap::types::Mailbox;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use td_ui::window::{NoClipboard, PointerPhase};
+
+    /// How many `setup`s this process has made: parallel tests can read
+    /// one clock tick, so the time alone does not keep their state apart.
+    static SETUPS: AtomicU64 = AtomicU64::new(0);
 
     fn account() -> AccountConfig {
         AccountConfig {
@@ -1858,12 +1863,13 @@ mod frame_tests {
             draft_dir: Some(
                 std::env::temp_dir()
                     .join(format!(
-                        "td-mail-state-{}-{}",
+                        "td-mail-state-{}-{}-{}",
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
-                            .as_nanos()
+                            .as_nanos(),
+                        SETUPS.fetch_add(1, Ordering::Relaxed)
                     ))
                     .join("drafts"),
             ),
