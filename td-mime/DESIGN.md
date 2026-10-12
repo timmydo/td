@@ -55,3 +55,15 @@ owner can retain an identifier's bracketed extent at Begin/End. The extent
 is passive and provisional until the complete field validates. Replaying a
 selected extent still uses the original source and live work meter; no copy
 of parser progress duplicates source custody or admission.
+
+Header value grammar classification precedes selection, but an unsupported
+grammar refuses only when a matching field exists. Complete selection can
+prove absence without interpreting a value and returns null or an empty
+array. Source, budget and deadline refusals are never absence. Output remains
+provisional, including an opening array bracket before a grammar refusal.
+Only Text currently reports UnsupportedGrammar from classification. The shared
+core defers that typed refusal for any projection that reports it; no other
+validation error is deferred. In :all mode a provisional match can refuse
+before a later scan failure; last-instance selection scans the whole section
+first. This error ordering follows streaming selection and grants no partial
+success or publication authority.

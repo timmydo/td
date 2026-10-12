@@ -299,6 +299,7 @@ struct Core<'a, 'w, P: Projection<'a, 'w>> {
     position: usize,
     all: bool,
     seen: bool,
+    unsupported_grammar: bool,
     problem: bool,
     unverified_leap: bool,
     end: Option<End>,
@@ -334,6 +335,7 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
             position: 0,
             all: input.property.occurrence() == Occurrence::All,
             seen: false,
+            unsupported_grammar: false,
             problem: false,
             unverified_leap: false,
             end: None,
@@ -432,7 +434,12 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
                 let Owner::Budgets(work, budget, workspace) = &mut self.owner else {
                     return Err(Error::InvalidState);
                 };
-                P::validate(self.name, now, work, budget, workspace)?;
+                match P::validate(self.name, now, work, budget, workspace) {
+                    Ok(()) => {}
+                    // Absence needs no value grammar; selection must prove it.
+                    Err(Error::UnsupportedGrammar) => self.unsupported_grammar = true,
+                    Err(error) => return Err(error),
+                }
                 if self.all {
                     self.stage(now, b"[", Phase::Select)?;
                 } else {
@@ -450,6 +457,9 @@ impl<'a, 'w, P: Projection<'a, 'w>> Core<'a, 'w, P> {
                 {
                     header_select::Status::Yield => {}
                     header_select::Status::Match(field) => {
+                        if self.unsupported_grammar {
+                            return Err(Error::UnsupportedGrammar);
+                        }
                         if !self.all && self.seen {
                             return Err(Error::InvalidState);
                         }

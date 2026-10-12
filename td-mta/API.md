@@ -2482,7 +2482,8 @@ Scratch and the same exclusive job/email budget borrows. Input holds resident
 bytes, base offset, header limit, parsed property and Prefix/EOF meaning. Only
 Text-form properties are admitted. The first active poll additionally admits
 Subject, Comments and Content-Description, plus user-defined X- fields,
-case-insensitively, before staging any JSON. M06bj extends the unstructured
+case-insensitively, before staging any JSON for supported names. M06bj
+extends the unstructured
 path using RFC 2045 section 8 and RFC 2047 section 5's field rules.
 Parentheses and quotes in these fields are text, not structured comments or
 quoted strings. M06bm also admits Keywords and List-Id with original
@@ -2491,7 +2492,16 @@ comments and punctuation remain Text data, while List-Id identifier bytes
 never admit words. M06bn admits Content-Type and Content-Disposition with
 comment-only word placement, preserving parameter spelling as Text data.
 RFC 2231 decoding and filename compatibility remain derived-metadata work.
-Other MIME fields and unknown non-X- fields still return UnsupportedGrammar.
+For other MIME fields and unknown non-X- fields, name classification retains
+an unsupported-grammar marker. The selector still runs under the same budgets.
+A matching field returns UnsupportedGrammar before interpreting any value;
+provisional :all output may contain only its opening bracket. Proven absence
+returns null or [] as required by RFC 8621 section 4.1.3. Resource and source
+failures remain terminal and cannot become an absence result. Error order
+follows streaming selection: :all may refuse at its first provisional match,
+whereas last-instance selection scans the complete section before its match.
+A later source failure may therefore precede grammar refusal only in the
+last-instance mode. Neither error authorizes publication.
 This is an implementation limit, not an invalid-property or invalidArguments
 claim; Text-form authorization alone cannot authorize encoded words in
 structured syntax. Last/all, absence, provisional output, backpressure and
@@ -7874,11 +7884,11 @@ an open or failed projection; dropping Input is not successful
 completion. No Email/get dispatch or Mail capability advertisement is
 added.
 
-The shared Text projector currently refuses unknown non-X- fields with
-UnsupportedGrammar, although property recognition admits them. This is an
-existing Mail conformance blocker, including absent fields; resolve it in
-the shared parser before advertising Mail. This owner preserves the typed
-refusal and retires the whole input instead of bypassing that parser.
+The shared Text projector currently refuses present unknown non-X- fields
+with UnsupportedGrammar, although property recognition admits them. This
+remaining Mail conformance blocker must be resolved before advertising Mail.
+Absent fields return null or [] after complete selection. This owner preserves
+source/work failures and typed grammar refusals and retires the whole input.
 
 ## Aggregate Email property selection
 

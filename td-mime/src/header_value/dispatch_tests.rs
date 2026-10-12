@@ -225,10 +225,21 @@ fn diagnostics_and_unsupported_grammar_remain_selected_value_policy() {
     )
     .unwrap();
     let mut output = [0xa5; 8];
-    assert_eq!(
-        cursor.poll(Tick(1), &mut output),
-        Err(Error::UnsupportedGrammar)
-    );
+    let mut refused = false;
+    for _ in 0..1000 {
+        match cursor.poll(Tick(1), &mut output) {
+            Ok(progress) => {
+                assert_eq!(progress.written, 0);
+                assert!(!matches!(progress.status, Status::Complete(_)));
+            }
+            Err(error) => {
+                assert_eq!(error, Error::UnsupportedGrammar);
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused);
     assert_eq!(
         cursor.poll(Tick(1), &mut output),
         Err(Error::UnsupportedGrammar)

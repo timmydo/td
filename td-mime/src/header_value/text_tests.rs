@@ -367,7 +367,7 @@ fn normalized_output_refusal_retires_the_whole_provisional_value() {
 }
 
 #[test]
-fn text_grammar_is_checked_before_output_in_single_and_all_modes() {
+fn unsupported_text_grammar_refuses_before_value_in_single_and_all_modes() {
     for key in [
         "header:Content-Transfer-Encoding:asText",
         "header:Content-Transfer-Encoding:asText:all",
@@ -380,16 +380,40 @@ fn text_grammar_is_checked_before_output_in_single_and_all_modes() {
         let mut cursor =
             Text::new(input(source, key), &mut scratch, &mut work, &mut budget).unwrap();
         let mut output = [0xa5; 8];
+        let mut prefix = Vec::new();
+        let mut refused = false;
+        for _ in 0..1000 {
+            output.fill(0xa5);
+            match cursor.poll(Tick(1), &mut output) {
+                Ok(progress) => {
+                    assert!(!matches!(progress.status, Status::Complete(_)));
+                    prefix.extend_from_slice(&output[..progress.written]);
+                }
+                Err(error) => {
+                    assert_eq!(error, Error::UnsupportedGrammar);
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(refused);
         assert_eq!(
-            cursor.poll(Tick(1), &mut output),
-            Err(Error::UnsupportedGrammar)
+            prefix,
+            if key.ends_with(":all") {
+                b"[".as_slice()
+            } else {
+                b""
+            }
         );
         assert_eq!(
             cursor.poll(Tick(1), &mut output),
             Err(Error::UnsupportedGrammar)
         );
         assert_eq!(output, [0xa5; 8]);
-        assert_eq!(work.remaining().output_bytes, 1_000_000);
+        assert_eq!(
+            work.remaining().output_bytes,
+            1_000_000 - prefix.len() as u64
+        );
     }
     for (key, source) in [
         (
@@ -1035,5 +1059,168 @@ fn structured_text_selection_scratch_replay_and_refusal_keep_original_budgets() 
             }
         }
         assert!(refused);
+    }
+}
+
+#[test]
+fn absent_unsupported_text_is_null_or_empty_only_after_complete_selection() {
+    for width in 1..=8 {
+        for bytes in [
+            b"".as_slice(),
+            b"Other: value\r\n\r\nUnknown: body",
+            b"Other: value",
+        ] {
+            for (key, expected) in [
+                ("header:Unknown:asText", b"null".as_slice()),
+                ("header:Unknown:asText:all", b"[]"),
+            ] {
+                let mut work = work();
+                let mut budget = HeaderBudget::new();
+                let mut scratch = nfc::Scratch::new();
+                let mut cursor =
+                    Text::new(input(bytes, key), &mut scratch, &mut work, &mut budget).unwrap();
+                assert_eq!(
+                    cursor.poll(Tick(1), &mut []).unwrap().status,
+                    Status::NeedOutput
+                );
+                assert_eq!(drain(&mut cursor, width), expected);
+                assert!(!cursor.is_encoding_problem());
+                assert_eq!(
+                    cursor.check_deadline(Tick(100)),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert_eq!(
+                    cursor.poll(Tick(1), &mut [0; 8]),
+                    Err(Error::Work(Stop::Deadline))
+                );
+                assert_eq!(
+                    1_000_000 - work.remaining().output_bytes,
+                    expected.len() as u64
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_text_cannot_turn_source_or_budget_failure_into_absence() {
+    for all in [false, true] {
+        for fault in ["prefix", "limit", "deadline", "output"] {
+            let key = if all {
+                "header:Unknown:asText:all"
+            } else {
+                "header:Unknown:asText"
+            };
+            let mut work = if fault == "output" {
+                Meter::new(
+                    Deadline::after(Tick(0), 100).unwrap(),
+                    Charge {
+                        io_bytes: 10000,
+                        records: 10000,
+                        output_bytes: 1,
+                        ..Charge::default()
+                    },
+                )
+            } else {
+                work()
+            };
+            let mut budget = HeaderBudget::new();
+            let mut scratch = nfc::Scratch::new();
+            let mut spec = input(b"Other: value", key);
+            if fault == "prefix" {
+                spec.source_end = header_select::SourceEnd::Prefix;
+            }
+            if fault == "limit" {
+                spec.header_limit = 2;
+            }
+            let mut cursor = Text::new(spec, &mut scratch, &mut work, &mut budget).unwrap();
+            let mut refused = false;
+            let mut prefix = Vec::new();
+            for turn in 0..1000 {
+                let mut output = [0xa5; 1];
+                let now = if fault == "deadline" && turn >= 3 {
+                    Tick(100)
+                } else {
+                    Tick(1)
+                };
+                match cursor.poll(now, &mut output) {
+                    Ok(progress) => {
+                        assert!(!matches!(progress.status, Status::Complete(_)));
+                        prefix.extend_from_slice(&output[..progress.written]);
+                    }
+                    Err(error) => {
+                        let expected = match fault {
+                            "prefix" => Error::Selection(header_select::Error::Truncated),
+                            "limit" => Error::Selection(header_select::Error::Headers(
+                                crate::headers::Error::HeaderLimit,
+                            )),
+                            "deadline" => Error::Work(Stop::Deadline),
+                            _ => Error::Work(Stop::OutputBytes),
+                        };
+                        assert_eq!(error, expected);
+                        assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                        assert_eq!(output, [0xa5]);
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            assert!(refused);
+            assert_eq!(prefix, if all { b"[".as_slice() } else { b"" });
+        }
+    }
+}
+
+#[test]
+fn unsupported_present_field_obeys_streaming_first_failure_order() {
+    for all in [false, true] {
+        for truncated in [false, true] {
+            let mut work = work();
+            let mut budget = HeaderBudget::new();
+            let mut scratch = nfc::Scratch::new();
+            let key = if all {
+                "header:Unknown:asText:all"
+            } else {
+                "header:Unknown:asText"
+            };
+            let mut spec = input(b"Unknown:a\nOther:long", key);
+            if truncated {
+                spec.source_end = header_select::SourceEnd::Prefix;
+            } else {
+                spec.header_limit = 10;
+            }
+            let mut cursor = Text::new(spec, &mut scratch, &mut work, &mut budget).unwrap();
+            let expected = if all {
+                Error::UnsupportedGrammar
+            } else if truncated {
+                Error::Selection(header_select::Error::Truncated)
+            } else {
+                Error::Selection(header_select::Error::Headers(
+                    crate::headers::Error::HeaderLimit,
+                ))
+            };
+            let mut refused = false;
+            let mut prefix = Vec::new();
+            for _ in 0..1000 {
+                let mut output = [0xa5; 1];
+                match cursor.poll(Tick(1), &mut output) {
+                    Ok(progress) => {
+                        assert!(!matches!(progress.status, Status::Complete(_)));
+                        prefix.extend_from_slice(&output[..progress.written]);
+                    }
+                    Err(error) => {
+                        assert_eq!(error, expected);
+                        assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                        assert_eq!(cursor.check_deadline(Tick(1)), Err(error));
+                        assert_eq!(output, [0xa5]);
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            assert!(refused);
+            assert_eq!(prefix, if all { b"[".as_slice() } else { b"" });
+        }
     }
 }

@@ -79,6 +79,8 @@ const CASES: &[(&str, &str)] = &[
     ("sentAt", "\"1997-11-21T15:55:06Z\""),
     ("header:List-Help:asURLs", "[\"https://example.test/help\"]"),
     ("header:X-Absent:asText", "null"),
+    ("header:Absent:asText", "null"),
+    ("header:Absent:asText:all", "[]"),
 ];
 #[test]
 fn source_ordered_headers_and_all_value_forms_share_original_custody() {
@@ -625,36 +627,61 @@ fn admitted_unknown_text_grammar_preserves_existing_refusal() {
     let _guard = FIXTURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let timer = Timer(AtomicU64::new(1));
-    crate::store_fs::with_pinned_fixture(b"Subject: text\r\n\r\nbody", &timer, |mut source| {
-        let mut work = work();
-        let mut buffer = [0; 64];
-        let mut reader = Reader::new(&mut source, 62, &mut buffer, &mut work, Tick(1)).unwrap();
-        collect(&mut reader);
-        let mut budget = HeaderBudget::new();
-        let mut scratch = Scratch::new();
-        let mut input = reader
-            .into_json(&mut budget, &mut scratch, Tick(1))
-            .unwrap();
-        let mut cursor = input
-            .project(Selection::Value(property("header:Absent:asText")), Tick(1))
-            .unwrap();
-        let mut failed = false;
-        for _ in 0..1000 {
-            match cursor.poll(Tick(1), &mut [0; 64]) {
-                Ok(p) => assert_ne!(p.status, Status::Complete),
-                Err(error) => {
-                    assert_eq!(error, Error::Value(header_value::Error::UnsupportedGrammar));
-                    failed = true;
-                    break;
+    for key in ["header:Unknown:asText", "header:Unknown:asText:all"] {
+        let timer = Timer(AtomicU64::new(1));
+        crate::store_fs::with_pinned_fixture(
+            b"Unknown: value\r\n\r\nbody",
+            &timer,
+            |mut source| {
+                let mut work = work();
+                let mut buffer = [0; 64];
+                let mut reader =
+                    Reader::new(&mut source, 62, &mut buffer, &mut work, Tick(1)).unwrap();
+                collect(&mut reader);
+                let mut budget = HeaderBudget::new();
+                let mut scratch = Scratch::new();
+                let mut input = reader
+                    .into_json(&mut budget, &mut scratch, Tick(1))
+                    .unwrap();
+                let mut cursor = input
+                    .project(Selection::Value(property(key)), Tick(1))
+                    .unwrap();
+                let mut failed = false;
+                let mut prefix = Vec::new();
+                for _ in 0..1000 {
+                    let mut output = [0xa5; 64];
+                    match cursor.poll(Tick(1), &mut output) {
+                        Ok(p) => {
+                            assert_ne!(p.status, Status::Complete);
+                            prefix.extend_from_slice(&output[..p.written]);
+                        }
+                        Err(error) => {
+                            assert_eq!(
+                                error,
+                                Error::Value(header_value::Error::UnsupportedGrammar)
+                            );
+                            assert_eq!(cursor.poll(Tick(1), &mut output), Err(error));
+                            assert_eq!(output, [0xa5; 64]);
+                            failed = true;
+                            break;
+                        }
+                    }
                 }
-            }
-        }
-        assert!(failed);
-        drop(cursor);
-        assert_eq!(
-            input.finish(Tick(1)),
-            Err(Error::Value(header_value::Error::UnsupportedGrammar))
+                assert!(failed);
+                assert_eq!(
+                    prefix,
+                    if key.ends_with(":all") {
+                        b"[".as_slice()
+                    } else {
+                        b""
+                    }
+                );
+                drop(cursor);
+                assert_eq!(
+                    input.finish(Tick(1)),
+                    Err(Error::Value(header_value::Error::UnsupportedGrammar))
+                );
+            },
         );
-    });
+    }
 }
