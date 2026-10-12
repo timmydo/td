@@ -71,8 +71,8 @@ impl Default for Checkpoints {
 }
 /// This borrows a live body reader; extent validation does not authorize a part.
 /// Caller backing is one source stage's input partition, never a whole-body buffer.
-pub struct Reader<'r, 'b> {
-    source: &'r mut dyn BlobReader,
+pub struct Reader<'r, 'b, S: BlobReader + ?Sized = dyn BlobReader + 'r> {
+    source: &'r mut S,
     buffer: &'b mut [u8],
     checkpoints: Option<&'b mut Checkpoints>,
     origin: u64,
@@ -89,6 +89,49 @@ pub struct Reader<'r, 'b> {
 impl<'r, 'b> Reader<'r, 'b> {
     pub fn new(
         source: &'r mut dyn BlobReader,
+        offset: u64,
+        length: u64,
+        encoding: TransferEncoding,
+        buffer: &'b mut [u8],
+    ) -> Result<Self, Error> {
+        Self::with_source(source, offset, length, encoding, buffer)
+    }
+    pub fn with_checkpoints(
+        source: &'r mut dyn BlobReader,
+        offset: u64,
+        length: u64,
+        encoding: TransferEncoding,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+    ) -> Result<Self, Error> {
+        Self::with_source_checkpoints(source, offset, length, encoding, buffer, checkpoints)
+    }
+}
+pub(crate) struct Released<'r, 'b, S: BlobReader + ?Sized> {
+    pub source: &'r mut S,
+    pub buffer: &'b mut [u8],
+    pub checkpoints: Option<&'b mut Checkpoints>,
+}
+impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        self.source
+    }
+    pub(crate) fn release(self) -> Result<Released<'r, 'b, S>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if !self.complete {
+            return Err(Error::InvalidRange);
+        }
+        Ok(Released {
+            source: self.source,
+            buffer: self.buffer,
+            checkpoints: self.checkpoints,
+        })
+    }
+
+    pub(crate) fn with_source(
+        source: &'r mut S,
         offset: u64,
         length: u64,
         encoding: TransferEncoding,
@@ -123,15 +166,15 @@ impl<'r, 'b> Reader<'r, 'b> {
             complete: false,
         })
     }
-    pub fn with_checkpoints(
-        source: &'r mut dyn BlobReader,
+    pub(crate) fn with_source_checkpoints(
+        source: &'r mut S,
         offset: u64,
         length: u64,
         encoding: TransferEncoding,
         buffer: &'b mut [u8],
         checkpoints: &'b mut Checkpoints,
     ) -> Result<Self, Error> {
-        let mut reader = Self::new(source, offset, length, encoding, buffer)?;
+        let mut reader = Self::with_source(source, offset, length, encoding, buffer)?;
         checkpoints.slots.fill(None);
         reader.checkpoints = Some(checkpoints);
         Ok(reader)

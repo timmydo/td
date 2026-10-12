@@ -8460,3 +8460,34 @@ the original latched error without sampling time or doing work. Passive value is
 publication permission. Successful finish returns the original owners and
 facts, the selected ordinal prefix, membership storage and options. Account
 permission, native body-value decoding and enclosing Email/get remain external.
+
+## Native per-part body-value JSON
+
+`blob_body_value::Cursor` consumes an original native interpreted-part handoff,
+a caller-admitted transfer input window and checkpoint backing. The original
+part descriptor must match its traversal slot and header body start, and its
+interpreted media type must be text/*. It derives the original absolute body
+extent, transfer encoding and charset plan rather than accepting replacement
+source coordinates. Original metadata provenance and account authorization
+remain caller responsibilities; passive consistency checks do not certify
+fabricated descriptors or header labels.
+
+The existing plain/HTML JSON encoder runs with the concrete PinnedBlob retained
+through every transfer, charset scan and optional HTML replay. Default generic
+reader entry points remain available; internal typed source construction and
+consuming release preserve the native pin without another reader or budget.
+`mime_text::Input` remains the generic blob-reader input alias; its underlying
+`InputSource` also represents the internal concrete-source form.
+
+Until a failure latches, construction, empty/active/cached polling, explicit
+checks and finish freshly fence work with the native deadline. The encoder
+keeps its existing original work-meter and checked-clock rules. Late native
+refusal overrides the current turn's result; after failure, later calls return
+the original error without work. All output is provisional until the enclosing
+Email response succeeds. Successful finish returns the original interpreted
+part handoff, the exact input/checkpoint backing and body-value diagnostics.
+Failure or incomplete finish provides no retry handoff.
+
+The adapter emits one EmailBodyValue object. Selection, partId map keys,
+bodyValues map framing, request limits, final response admission and complete
+Email/get dispatch remain external. This does not advertise Mail capability.

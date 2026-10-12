@@ -4584,3 +4584,19 @@ without growing or replacing backing; partial cells remain provisional.
 Interpretation additionally charges one original record per 16 prepaid steps,
 rounding up. For T active turns, the total record debit is T + ceil(T/16).
 Unused stage credit is discarded at finish rather than transferred or refunded.
+
+## Native body-value encoder custody
+
+The native cursor fits a compiled 2 KiB ceiling and owns no heap allocation.
+Its typed child preserves the existing encoder state and at-most-47-byte
+output chunk. The caller separately admits transfer input (nonempty, at most
+6 KiB), fixed checkpoint storage, original header/metadata backing, scratch
+and response windows. No whole-body buffer or reopened native pin is created.
+
+Transfer and charset scans, plain filtering, HTML planning/replay and JSON
+framing retain the existing work charges and original Meter. Native deadline
+checks add no positive charge, and this stage does not reset or spend header
+interpretation allowance. Typed consuming release is passive and available
+only after complete healthy encoding; the native owner freshly checks before
+releasing those original borrows. Remaining input bytes/checkpoints are
+returned as their original windows, without copying or allocating replacements.

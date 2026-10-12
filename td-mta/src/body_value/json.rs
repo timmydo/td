@@ -3,8 +3,8 @@ use super::{html, Plain};
 use crate::{
     admission::work::{Charge, Meter, Stop},
     mime_input::Checkpoints,
-    mime_text::{self, CheckedClock, Input, Reader},
-    ports::{Clock, Error as PolicyError, Tick},
+    mime_text::{self, CheckedClock, Input, InputSource, Reader},
+    ports::{BlobReader, Clock, Error as PolicyError, Tick},
 };
 use td_json::string::{self, Source};
 
@@ -79,8 +79,8 @@ enum Html {
     },
 }
 
-struct Text<'r, 'b, 'w, 'c> {
-    reader: Reader<'r, 'b>,
+struct Text<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> {
+    reader: Reader<'r, 'b, S>,
     filter: Plain,
     html: Option<Html>,
     work: &'w mut Meter,
@@ -88,7 +88,7 @@ struct Text<'r, 'b, 'w, 'c> {
     pending: Option<char>,
     ended: bool,
 }
-impl Text<'_, '_, '_, '_> {
+impl<S: BlobReader + ?Sized> Text<'_, '_, '_, '_, S> {
     fn diagnostics(&self) -> Option<Diagnostics> {
         let cutoff = match &self.html {
             None => None,
@@ -104,7 +104,7 @@ impl Text<'_, '_, '_, '_> {
     }
 }
 
-impl Source for Text<'_, '_, '_, '_> {
+impl<S: BlobReader + ?Sized> Source for Text<'_, '_, '_, '_, S> {
     type Context = ();
     type Error = Error;
     fn charge_output(&mut self, (): (), bytes: u64) -> Result<(), Error> {
@@ -212,8 +212,8 @@ enum Phase {
 /// ```compile_fail,E0277
 /// fn required<T: Clone>() {} required::<td_mta::body_value::json::Cursor<'_, '_, '_, '_>>();
 /// ```
-pub struct Cursor<'r, 'b, 'w, 'c> {
-    source: Text<'r, 'b, 'w, 'c>,
+pub struct Cursor<'r, 'b, 'w, 'c, S: BlobReader + ?Sized = dyn BlobReader + 'r> {
+    source: Text<'r, 'b, 'w, 'c, S>,
     frame: string::Frame<Error>,
     phase: Phase,
     position: usize,
@@ -250,8 +250,25 @@ impl<'r, 'b, 'w, 'c> Cursor<'r, 'b, 'w, 'c> {
             max_bytes != 0,
         )
     }
+}
+impl<'r, 'b, 'w, 'c, S: BlobReader + ?Sized> Cursor<'r, 'b, 'w, 'c, S> {
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        self.source.reader.source_mut()
+    }
+    pub(crate) fn finish_retained(self) -> Result<Retained<'r, 'b, 'w, S>, Error> {
+        let diagnostics = self.value().ok_or(Error::State)?;
+        let input = self.source.reader.release()?;
+        Ok(Retained {
+            source: input.source,
+            buffer: input.buffer,
+            checkpoints: input.checkpoints.ok_or(Error::State)?,
+            work: self.source.work,
+            diagnostics,
+        })
+    }
+
     fn with_html(
-        input: Input<'r>,
+        input: InputSource<'r, S>,
         buffer: &'b mut [u8],
         checkpoints: &'b mut Checkpoints,
         max_bytes: u64,
@@ -259,12 +276,26 @@ impl<'r, 'b, 'w, 'c> Cursor<'r, 'b, 'w, 'c> {
         clock: &'c dyn Clock,
         is_html: bool,
     ) -> Result<Self, Error> {
-        let mut cursor = Self {
+        let mut cursor =
+            Self::prepare(input, buffer, checkpoints, max_bytes, work, clock, is_html)?;
+        cursor.check()?;
+        Ok(cursor)
+    }
+    pub(crate) fn prepare(
+        input: InputSource<'r, S>,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+        max_bytes: u64,
+        work: &'w mut Meter,
+        clock: &'c dyn Clock,
+        is_html: bool,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             source: Text {
                 reader: if is_html {
-                    Reader::new_replayable(input, buffer, checkpoints)?
+                    Reader::new_replayable_typed(input, buffer, checkpoints)?
                 } else {
-                    Reader::new(input, buffer, checkpoints)?
+                    Reader::new_typed(input, buffer, checkpoints)?
                 },
                 filter: Plain::new(if is_html { 0 } else { max_bytes }),
                 html: is_html.then(|| Html::Plan(html::Core::new(max_bytes))),
@@ -277,9 +308,7 @@ impl<'r, 'b, 'w, 'c> Cursor<'r, 'b, 'w, 'c> {
             phase: Phase::Head,
             position: 0,
             failure: None,
-        };
-        cursor.check()?;
-        Ok(cursor)
+        })
     }
     /// Passive diagnostics, hidden until the complete object has been emitted.
     pub fn value(&self) -> Option<Diagnostics> {
@@ -378,6 +407,13 @@ impl<'r, 'b, 'w, 'c> Cursor<'r, 'b, 'w, 'c> {
             },
         })
     }
+}
+pub(crate) struct Retained<'r, 'b, 'w, S: BlobReader + ?Sized> {
+    pub source: &'r mut S,
+    pub buffer: &'b mut [u8],
+    pub checkpoints: &'b mut Checkpoints,
+    pub work: &'w mut Meter,
+    pub diagnostics: Diagnostics,
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_, '_, '_>>() <= 1024);
 

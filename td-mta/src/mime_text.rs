@@ -10,13 +10,14 @@ use crate::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub struct Input<'a> {
-    pub source: &'a mut dyn BlobReader,
+pub struct InputSource<'a, S: BlobReader + ?Sized> {
+    pub source: &'a mut S,
     pub offset: u64,
     pub length: u64,
     pub encoding: TransferEncoding,
     pub charset: Plan,
 }
+pub type Input<'a> = InputSource<'a, dyn BlobReader + 'a>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Input(mime_input::Error),
@@ -52,8 +53,8 @@ enum Phase {
     Complete,
 }
 /// Owns the transfer cursor and its source borrow for both passes; never copied.
-pub struct Reader<'r, 'b> {
-    input: mime_input::Reader<'r, 'b>,
+pub struct Reader<'r, 'b, S: BlobReader + ?Sized = dyn BlobReader + 'r> {
+    input: mime_input::Reader<'r, 'b, S>,
     phase: Phase,
     scan: Prescan,
     decoder: Decoder,
@@ -98,12 +99,41 @@ impl<'r, 'b> Reader<'r, 'b> {
         buffer: &'b mut [u8],
         checkpoints: &'b mut Checkpoints,
     ) -> Result<Self, Error> {
+        Self::new_typed(input, buffer, checkpoints)
+    }
+    pub fn new_replayable(
+        input: Input<'r>,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+    ) -> Result<Self, Error> {
+        Self::new_replayable_typed(input, buffer, checkpoints)
+    }
+}
+impl<'r, 'b, S: BlobReader + ?Sized> Reader<'r, 'b, S> {
+    pub(crate) fn source_mut(&mut self) -> &mut S {
+        self.input.source_mut()
+    }
+    pub(crate) fn release(self) -> Result<mime_input::Released<'r, 'b, S>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.phase != Phase::Complete {
+            return Err(Error::InvalidState);
+        }
+        self.input.release().map_err(Error::Input)
+    }
+
+    pub(crate) fn new_typed(
+        input: InputSource<'r, S>,
+        buffer: &'b mut [u8],
+        checkpoints: &'b mut Checkpoints,
+    ) -> Result<Self, Error> {
         let (phase, selection, charset) = match input.charset {
             Plan::Prescan => (Phase::Save, None, Charset::Utf8),
             Plan::Selected(selection) => (Phase::Decode, Some(selection), selection.charset),
         };
         Ok(Self {
-            input: mime_input::Reader::with_checkpoints(
+            input: mime_input::Reader::with_source_checkpoints(
                 input.source,
                 input.offset,
                 input.length,
@@ -127,12 +157,12 @@ impl<'r, 'b> Reader<'r, 'b> {
     }
     /// Also saves the original transfer position for bounded complete-pass replay.
     /// Source immutability/authorization and original work custody are external.
-    pub fn new_replayable(
-        input: Input<'r>,
+    pub(crate) fn new_replayable_typed(
+        input: InputSource<'r, S>,
         buffer: &'b mut [u8],
         checkpoints: &'b mut Checkpoints,
     ) -> Result<Self, Error> {
-        let mut reader = Self::new(input, buffer, checkpoints)?;
+        let mut reader = Self::new_typed(input, buffer, checkpoints)?;
         reader.replayable = true;
         // Even empty extents first fund and retain their original checkpoint.
         reader.phase = Phase::Save;
