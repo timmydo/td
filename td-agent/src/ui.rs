@@ -2937,12 +2937,14 @@ impl App {
                     Err(e) => self.note(format!("the transcript refused a firing: {e}")),
                 }
             }
-            // Folded, a result says only that it failed, on one line; the
-            // step's line says what was called.
+            // Folded, a result says only that it failed, on one line, and
+            // shows the pictures it returned; the step's line says what
+            // was called.
             Kind::ToolResult {
                 name,
                 content,
                 error,
+                pictures,
                 ..
             } if !self.show_activity => {
                 if error {
@@ -2954,17 +2956,28 @@ impl App {
                         crate::tools::visible(&first)
                     ));
                 }
+                if !pictures.is_empty() {
+                    let pushed = Message::new(&format!("tool {}", crate::tools::visible(&name)))
+                        .and_then(|m| self.show_pictures(m, &pictures))
+                        .map_err(|e| e.to_string())
+                        .and_then(|m| self.push_message(m));
+                    if let Err(e) = pushed {
+                        self.note(format!("the transcript refused a tool's pictures: {e}"));
+                    }
+                }
             }
             Kind::ToolResult {
                 name,
                 content,
                 error,
+                pictures,
                 ..
             } => {
                 let source: std::sync::Arc<str> = std::sync::Arc::from(content.as_str());
                 let mut message = Message::new(&format!("tool {name}"))
                     .and_then(|m| m.excerpt("result", &content))
-                    .and_then(|m| m.source(source));
+                    .and_then(|m| m.source(source))
+                    .and_then(|m| self.show_pictures(m, &pictures));
                 if error {
                     message = message.and_then(|m| m.verdict("error", Tone::Bad));
                 }
@@ -9399,6 +9412,7 @@ pub mod tests {
                     kept: None,
                     digest: None,
                     digests: Vec::new(),
+                    pictures: Vec::new(),
                 },
             ),
             0,
@@ -9432,6 +9446,48 @@ pub mod tests {
             .notice()
             .unwrap()
             .starts_with("title 2: messages from other"));
+    }
+
+    /// A tool's pictures show with its result, and folded, under its
+    /// name; with no store to read them, a line says so.
+    #[test]
+    fn a_tools_pictures_show_with_its_result_folded_or_not() {
+        let result = |seq: u64| {
+            at(
+                seq,
+                Kind::ToolResult {
+                    reply: 1,
+                    id: "c1".into(),
+                    name: "mcp__shot__take".into(),
+                    call: 0,
+                    content: "took [tool image 1]".into(),
+                    error: false,
+                    kept: None,
+                    digest: None,
+                    digests: Vec::new(),
+                    pictures: vec![crate::picture::Reference {
+                        digest: "a".repeat(64),
+                        mime: crate::picture::PNG,
+                        width: 2,
+                        height: 1,
+                        bytes: 73,
+                        label: "tool image 1".into(),
+                    }],
+                },
+            )
+        };
+        for activity in [true, false] {
+            let mut app = app();
+            app.show_activity = activity;
+            app.update(result(2), 0);
+            let shown = text(&app);
+            assert!(shown.contains("tool mcp__shot__take"), "{shown}");
+            assert!(
+                shown.contains("[tool image 1] is not shown: no store to read it from"),
+                "{shown}"
+            );
+            assert_eq!(shown.contains("took [tool image 1]"), activity, "{shown}");
+        }
     }
 
     #[test]
@@ -9522,6 +9578,7 @@ pub mod tests {
                     kept: None,
                     digest: None,
                     digests: Vec::new(),
+                    pictures: Vec::new(),
                 },
             )
         };
@@ -10023,6 +10080,7 @@ pub mod tests {
             kept: None,
             digest: None,
             digests: Vec::new(),
+            pictures: Vec::new(),
         };
         app.background(&id(3), &at(7, result), 0);
         assert_eq!(app.cell(row, 1).text(), "");

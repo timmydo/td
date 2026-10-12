@@ -1582,6 +1582,9 @@ pub enum Kind {
         /// A patch's files, each with its digest now or none when it was
         /// deleted or moved away; empty for every other call.
         digests: Vec<(String, Option<String>)>,
+        /// The pictures an MCP tool returned, kept as the person's are
+        /// (DESIGN.md §6, Pictures); empty for every other call.
+        pictures: Vec<crate::picture::Reference>,
     },
     /// A compaction (DESIGN.md §14): the tool results it pruned, sent as
     /// stubs from here on, and the summary it asks for, if any, of the
@@ -1868,6 +1871,7 @@ impl Event {
                 kept,
                 digest,
                 digests,
+                pictures,
             } => {
                 put("kind", Json::Str("tool_result".into()));
                 put("reply", Json::from(*reply));
@@ -1898,6 +1902,12 @@ impl Event {
                                 })
                                 .collect(),
                         ),
+                    );
+                }
+                if !pictures.is_empty() {
+                    put(
+                        "pictures",
+                        Json::Arr(pictures.iter().map(|p| p.to_json()).collect()),
                     );
                 }
             }
@@ -2073,22 +2083,26 @@ impl Event {
                     .ok_or_else(|| format!("{name} is not a boolean")),
             }
         };
+        // A message's or a tool result's pictures, at most `MAX_PICTURES`.
+        let pictures = |value: &Json| -> Result<Vec<crate::picture::Reference>, String> {
+            match value.get("pictures") {
+                None => Ok(Vec::new()),
+                Some(list) => {
+                    let list = list.as_arr().ok_or("pictures is not a list")?;
+                    if list.len() > crate::picture::MAX_PICTURES {
+                        return Err("too many pictures".into());
+                    }
+                    list.iter()
+                        .map(crate::picture::Reference::from_json)
+                        .collect()
+                }
+            }
+        };
         let kind = match value.get("kind").and_then(Json::as_str) {
             Some("user") => Kind::User {
                 delivery: string("delivery")?,
                 text: string("text")?,
-                pictures: match value.get("pictures") {
-                    None => Vec::new(),
-                    Some(list) => {
-                        let list = list.as_arr().ok_or("pictures is not a list")?;
-                        if list.len() > crate::picture::MAX_PICTURES {
-                            return Err("too many pictures".into());
-                        }
-                        list.iter()
-                            .map(crate::picture::Reference::from_json)
-                            .collect::<Result<_, _>>()?
-                    }
-                },
+                pictures: pictures(value)?,
             },
             Some("started") => Kind::Started {
                 effect: value
@@ -2234,6 +2248,8 @@ impl Event {
                         })
                         .collect::<Result<_, _>>()?,
                 },
+                // A log from before tools' pictures holds none.
+                pictures: pictures(value)?,
             },
             Some("todo") => Kind::Todo {
                 items: value
@@ -2574,6 +2590,7 @@ impl Conversation {
                 kept: None,
                 digest: None,
                 digests: Vec::new(),
+                pictures: Vec::new(),
             })?;
             if call != 0 {
                 load.interrupted.push(call);
@@ -2650,13 +2667,27 @@ impl Conversation {
         &self.prefix
     }
 
-    /// The picture bytes its messages carry in all.
+    /// The picture bytes its messages and tool results carry in all.
     pub fn picture_bytes(&self) -> u64 {
         self.events
             .iter()
             .filter_map(|e| match &e.kind {
-                Kind::User { pictures, .. } => Some(pictures.iter().map(|p| p.bytes).sum::<u64>()),
+                Kind::User { pictures, .. } | Kind::ToolResult { pictures, .. } => {
+                    Some(pictures.iter().map(|p| p.bytes).sum::<u64>())
+                }
                 _ => None,
+            })
+            .sum()
+    }
+
+    /// The pictures its tool results carry, counted for the next one's
+    /// label.
+    pub fn tool_pictures(&self) -> usize {
+        self.events
+            .iter()
+            .map(|e| match &e.kind {
+                Kind::ToolResult { pictures, .. } => pictures.len(),
+                _ => 0,
             })
             .sum()
     }
@@ -3838,6 +3869,15 @@ pub mod tests {
                 digest: None,
                 // A patch's, one file written and one gone.
                 digests: vec![("/w/a".into(), Some("d1".into())), ("/w/b".into(), None)],
+                // An MCP tool's, kept beside the person's.
+                pictures: vec![crate::picture::Reference {
+                    digest: "e".repeat(64),
+                    mime: crate::picture::JPEG,
+                    width: 3,
+                    height: 2,
+                    bytes: 640,
+                    label: "tool image 1".into(),
+                }],
             },
             Kind::ToolResult {
                 reply: 3,
@@ -3849,6 +3889,7 @@ pub mod tests {
                 kept: None,
                 digest: None,
                 digests: Vec::new(),
+                pictures: Vec::new(),
             },
             Kind::Todo {
                 items: vec![TodoItem {
@@ -4547,6 +4588,7 @@ pub mod tests {
                     kept: None,
                     digest: None,
                     digests: Vec::new(),
+                    pictures: Vec::new(),
                 })
                 .unwrap();
             conversation

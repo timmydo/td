@@ -731,6 +731,7 @@ mod tests {
                 kept: None,
                 digest: None,
                 digests: Vec::new(),
+                pictures: Vec::new(),
             },
         )
     }

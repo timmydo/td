@@ -555,10 +555,20 @@ impl Session {
         };
         let text = match outcome {
             Ok(Ok(result)) => {
-                let (text, error) = crate::mcp::result_text(&result);
+                // Its pictures kept before the result that names them is
+                // logged (DESIGN.md §6, Pictures).
+                let dir = store::StateDir::at(self.state.clone())
+                    .conversation(&self.conversation.meta().id);
+                let first = self.conversation.tool_pictures();
+                let mut carried = self.conversation.picture_bytes();
+                let mut pictures = Vec::new();
+                let (text, error) = crate::mcp::result_text(&result, &mut |item| {
+                    tool_picture(item, &dir, first, &mut pictures, &mut carried)
+                });
                 let (shown, kept) = cut(&text);
                 let beside = Beside {
                     kept,
+                    pictures,
                     ..Beside::default()
                 };
                 return Ok((if error { Err(shown) } else { Ok(shown) }, beside));
@@ -568,6 +578,52 @@ impl Session {
             Err(failure) => format!("not answered: {failure}"),
         };
         failed(text)
+    }
+}
+
+/// An image item an MCP tool returned, kept in conversation `dir` as
+/// the next of `pictures`, labelled past the conversation's `first`
+/// before it, within a result's `MAX_PICTURES` and the conversation's
+/// `carried` bytes: the line the result's text says it by, its stand-in,
+/// or why it is not shown.
+fn tool_picture(
+    item: &Json,
+    dir: &std::path::Path,
+    first: usize,
+    pictures: &mut Vec<crate::picture::Reference>,
+    carried: &mut u64,
+) -> String {
+    use crate::picture::{MAX_CONVERSATION_PICTURE_BYTES, MAX_PICTURES};
+    let kept = || -> Result<crate::picture::Reference, String> {
+        if pictures.len() >= MAX_PICTURES {
+            return Err(format!("a result carries at most {MAX_PICTURES}"));
+        }
+        let data = item
+            .get("data")
+            .and_then(Json::as_str)
+            .ok_or("it has no data")?;
+        let label = format!("tool image {}", first + pictures.len() + 1);
+        let (reference, bytes) = crate::picture::from_tool(data, &label)?;
+        if carried.saturating_add(reference.bytes) > MAX_CONVERSATION_PICTURE_BYTES {
+            return Err(format!(
+                "a conversation's pictures are at most {} MB in all",
+                MAX_CONVERSATION_PICTURE_BYTES / 1_000_000
+            ));
+        }
+        crate::picture::keep(dir, &reference, &bytes)?;
+        Ok(reference)
+    };
+    match kept() {
+        Ok(reference) => {
+            *carried = carried.saturating_add(reference.bytes);
+            let line = reference.stand_in();
+            pictures.push(reference);
+            line
+        }
+        Err(why) => format!(
+            "[an image the tool returned, which td-agent does not show: {}]",
+            crate::tools::visible(&why)
+        ),
     }
 }
 
@@ -668,6 +724,54 @@ mod tests {
             .iter()
             .map(|name| format!(r#"{{"type":"function","function":{{"name":"mcp__gh__{name}"}}}}"#))
             .collect()
+    }
+
+    /// Each image item a tool returns is kept and named by its label,
+    /// numbered past the conversation's tool pictures before it; past a
+    /// result's `MAX_PICTURES`, past the conversation's bytes, without
+    /// data or with bad data, it is a line saying why it is not shown.
+    #[test]
+    fn a_tools_pictures_are_kept_within_their_bounds() {
+        use crate::picture::{MAX_CONVERSATION_PICTURE_BYTES, MAX_PICTURES};
+        let dir =
+            std::env::temp_dir().join(format!("td-agent-serving-pictures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bytes = crate::picture::tests::png(2, 1, [5, 6, 7]);
+        let item = td_json::parse(&format!(
+            r#"{{"type":"image","mimeType":"image/png","data":"{}"}}"#,
+            td_encoding::base64(&bytes)
+        ))
+        .unwrap();
+        let mut pictures = Vec::new();
+        let mut carried = 0;
+        let line = tool_picture(&item, &dir, 2, &mut pictures, &mut carried);
+        assert_eq!(line, "[tool image 3]");
+        assert_eq!(carried, bytes.len() as u64);
+        assert_eq!(crate::picture::read(&dir, &pictures[0]).unwrap(), bytes);
+        for _ in 1..MAX_PICTURES {
+            tool_picture(&item, &dir, 2, &mut pictures, &mut carried);
+        }
+        assert_eq!(pictures.len(), MAX_PICTURES);
+        assert_eq!(pictures[MAX_PICTURES - 1].label, "tool image 10");
+        let past = tool_picture(&item, &dir, 2, &mut pictures, &mut carried);
+        assert_eq!(
+            past,
+            "[an image the tool returned, which td-agent does not show: a result carries at most 8]"
+        );
+        let mut none = Vec::new();
+        let mut full = MAX_CONVERSATION_PICTURE_BYTES;
+        assert!(tool_picture(&item, &dir, 0, &mut none, &mut full)
+            .contains("a conversation's pictures are at most 20 MB in all"));
+        assert!(none.is_empty());
+        let mut zero = 0;
+        let bare = td_json::parse(r#"{"type":"image"}"#).unwrap();
+        assert!(tool_picture(&bare, &dir, 0, &mut none, &mut zero).contains("it has no data"));
+        let bad = td_json::parse(r#"{"type":"image","data":"%%%%"}"#).unwrap();
+        assert!(
+            tool_picture(&bad, &dir, 0, &mut none, &mut zero).contains("its base64 is malformed")
+        );
+        assert!(none.is_empty() && zero == 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A logged listing offers only what the server's `tools` keeps now,

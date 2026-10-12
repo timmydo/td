@@ -361,7 +361,7 @@ fn orient(
 /// its EXIF says to turn, so what is sent is what is shown, whatever a
 /// provider makes of EXIF. One neither PNG nor JPEG is refused.
 pub fn must_rewrite(bytes: &[u8]) -> Result<bool, String> {
-    let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
+    let mime = sniff(bytes).ok_or("the picture is neither a PNG nor a JPEG")?;
     Ok(!within_bounds(mime, bytes)? || (mime == JPEG && orientation(bytes) != 1))
 }
 
@@ -384,7 +384,7 @@ pub fn shrink(bytes: &[u8]) -> Result<(Vec<u8>, String), String> {
 
 /// `shrink` within `most` bytes.
 fn shrink_within(bytes: &[u8], most: u64) -> Result<(Vec<u8>, String), String> {
-    let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
+    let mime = sniff(bytes).ok_or("the picture is neither a PNG nor a JPEG")?;
     let (was_width, was_height) = size(mime, bytes)?;
     let (mut width, mut height, mut rgba) = decode(mime, bytes, SHRUNK_AXIS)?;
     while width.max(height) > SHRUNK_AXIS {
@@ -489,7 +489,7 @@ pub fn check(bytes: &[u8], label: &str) -> Result<Reference, String> {
             length as f64 / 1e6
         ));
     }
-    let mime = sniff(bytes).ok_or("the clipboard's picture is neither a PNG nor a JPEG")?;
+    let mime = sniff(bytes).ok_or("the picture is neither a PNG nor a JPEG")?;
     // Its size as its header says, refused before it is decoded whole.
     let (width, height) = size(mime, bytes)?;
     let axis = |n: usize| {
@@ -608,6 +608,35 @@ pub fn adopt(state: &StateDir, id: &Id, dir: &Path, reference: &Reference) -> Re
     Ok(())
 }
 
+/// A picture a tool returned, as its base64 `data`, made one to keep
+/// labelled `label`: decoded, a PNG or a JPEG by its bytes whatever the
+/// tool called it, written anew as a pasted one is where `must_rewrite`
+/// says or where it is past `SHRUNK_AXIS` a side, which no provider looks
+/// past and the window need not decode, and checked.
+pub fn from_tool(data: &str, label: &str) -> Result<(Reference, Vec<u8>), String> {
+    let bytes = td_encoding::from_base64(data).ok_or("its base64 is malformed")?;
+    let mime = sniff(&bytes).ok_or("the picture is neither a PNG nor a JPEG")?;
+    let (width, height) = size(mime, &bytes)?;
+    let bytes = if must_rewrite(&bytes)? || width.max(height) > SHRUNK_AXIS {
+        shrink(&bytes)?.0
+    } else {
+        bytes
+    };
+    Ok((check(&bytes, label)?, bytes))
+}
+
+/// Writes a picture into conversation `dir`'s own, once and durably under
+/// its digest; one already kept is checked where it is.
+pub fn keep(dir: &Path, reference: &Reference, bytes: &[u8]) -> Result<(), String> {
+    if read(dir, reference).is_ok() {
+        return Ok(());
+    }
+    verify(reference, bytes)?;
+    let kept_dir = kept(dir);
+    create_private(&kept_dir)?;
+    crate::store::replace(&kept_dir, &reference.digest, bytes)
+}
+
 /// That `bytes` are what `reference` names.
 fn verify(reference: &Reference, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() as u64 != reference.bytes
@@ -631,13 +660,15 @@ pub fn read(dir: &Path, reference: &Reference) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The pictures a conversation's messages carry, each as often as a
-/// message names it: what a request body's placeholders may stand for.
+/// The pictures a conversation's messages and tool results carry, each
+/// as often as one names it: what a request body's placeholders may stand
+/// for.
 pub fn known(events: &[crate::store::Event]) -> Vec<Reference> {
     events
         .iter()
         .filter_map(|e| match &e.kind {
-            crate::store::Kind::User { pictures, .. } => Some(pictures.iter()),
+            crate::store::Kind::User { pictures, .. }
+            | crate::store::Kind::ToolResult { pictures, .. } => Some(pictures.iter()),
             _ => None,
         })
         .flatten()
@@ -684,6 +715,15 @@ fn placeholders<'a>(
         }
     }
     out
+}
+
+/// What pictures weigh in a request as §14's estimate counts it: four
+/// bytes for each token each costs.
+pub fn weight(pictures: &[Reference]) -> u64 {
+    pictures
+        .iter()
+        .map(|p| tokens(p).saturating_mul(4))
+        .fold(0, u64::saturating_add)
 }
 
 /// The tokens a picture is counted as: its pixels over 750, as providers
@@ -743,7 +783,7 @@ pub fn inline(body: &str, dir: &Path, taken: bool, known: &[Reference]) -> Strin
                 (
                     "text".into(),
                     Json::Str(format!(
-                        "[td-agent: the {}x{} picture {} the person pasted is left out: {}]",
+                        "[td-agent: the {}x{} picture {} is left out: {}]",
                         reference.width,
                         reference.height,
                         reference.stand_in(),
@@ -1116,6 +1156,66 @@ pub(crate) mod tests {
         assert_eq!(orientation(&filled), 6);
     }
 
+    /// A tool's picture is decoded from its base64, a PNG or a JPEG by
+    /// its bytes, written anew past the bounds as a pasted one is, and
+    /// kept once under its digest; the conversation's tool results' are
+    /// known to its requests.
+    #[test]
+    fn a_tools_picture_is_decoded_kept_and_known() {
+        let bytes = png(2, 1, [9, 8, 7]);
+        let (reference, decoded) = from_tool(&td_encoding::base64(&bytes), "tool image 1").unwrap();
+        assert_eq!(decoded, bytes);
+        assert_eq!(reference, check(&bytes, "tool image 1").unwrap());
+        assert_eq!(reference.stand_in(), "[tool image 1]");
+        assert!(from_tool("not base64", "tool image 1")
+            .unwrap_err()
+            .contains("base64"));
+        assert_eq!(
+            from_tool(&td_encoding::base64(b"GIF89a"), "tool image 1").unwrap_err(),
+            "the picture is neither a PNG nor a JPEG"
+        );
+        let wide = png(MAX_PICTURE_AXIS + 2, 3, [1; 3]);
+        let (shrunk, _) = from_tool(&td_encoding::base64(&wide), "tool image 2").unwrap();
+        assert_eq!((shrunk.mime, shrunk.width, shrunk.height), (JPEG, 2001, 1));
+        // Within the bounds but past what a provider looks at: shrunk too,
+        // where a paste would be kept as it is.
+        let large = png(SHRUNK_AXIS as u32 + 2, 2, [1; 3]);
+        assert!(!must_rewrite(&large).unwrap());
+        let (halved, _) = from_tool(&td_encoding::base64(&large), "tool image 3").unwrap();
+        assert_eq!((halved.mime, halved.width, halved.height), (JPEG, 1025, 1));
+        let at_most = png(SHRUNK_AXIS as u32, 1, [1; 3]);
+        let (kept, _) = from_tool(&td_encoding::base64(&at_most), "tool image 4").unwrap();
+        assert_eq!((kept.mime, kept.width), (PNG, 2048));
+
+        let dir = scratch("tool");
+        keep(&dir, &reference, &decoded).unwrap();
+        assert_eq!(read(&dir, &reference).unwrap(), bytes);
+        keep(&dir, &reference, &decoded).unwrap();
+        // Bytes that are not what the reference names are not kept.
+        let other = check(&png(1, 1, [0; 3]), "tool image 3").unwrap();
+        assert!(keep(&dir, &other, &bytes).is_err());
+        assert!(read(&dir, &other).is_err());
+
+        let events = [crate::store::Event {
+            seq: 1,
+            time: 0,
+            kind: crate::store::Kind::ToolResult {
+                reply: 0,
+                id: "c1".into(),
+                name: "mcp__s__t".into(),
+                call: 0,
+                content: "[tool image 1]".into(),
+                error: false,
+                kept: None,
+                digest: None,
+                digests: Vec::new(),
+                pictures: vec![reference.clone()],
+            },
+        }];
+        assert_eq!(known(&events), [reference]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn what_is_not_a_picture_within_bounds_is_refused() {
         assert!(check(b"GIF89a", "image 1").is_err());
@@ -1237,7 +1337,7 @@ pub(crate) mod tests {
         // To a model that takes none, a word in its place.
         let said = inline(&body, &dir, false, &known);
         assert!(
-            said.contains("the 2x1 picture [image 1] the person pasted is left out: this model takes no pictures"),
+            said.contains("the 2x1 picture [image 1] is left out: this model takes no pictures"),
             "{said}"
         );
         assert!(placeholders(&said, &known).is_empty());

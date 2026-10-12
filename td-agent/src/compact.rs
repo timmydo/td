@@ -393,20 +393,24 @@ pub fn prunable(events: &[Event], protect: u64, minimum: u64) -> Vec<u64> {
                 id,
                 name,
                 content,
+                pictures,
                 ..
             } => {
                 if done.contains(&event.seq) {
                     stub_of(event.seq, *reply, id, name, content.len())
                 } else {
+                    // Its pictures are sent with it, and pruned with it.
+                    let sent_bytes =
+                        (content.len() as u64).saturating_add(crate::picture::weight(pictures));
                     if recent > protect && event.seq < sent {
                         let stub = stub_of(event.seq, *reply, id, name, content.len());
-                        let saved = content.len().saturating_sub(stub);
+                        let saved = sent_bytes.saturating_sub(stub as u64);
                         if saved > 0 {
-                            freed = freed.saturating_add(saved as u64);
+                            freed = freed.saturating_add(saved);
                             out.push(event.seq);
                         }
                     }
-                    content.len()
+                    usize::try_from(sent_bytes).unwrap_or(usize::MAX)
                 }
             }
             Kind::User { text, .. }
@@ -493,6 +497,7 @@ mod tests {
                     kept: None,
                     digest: None,
                     digests: Vec::new(),
+                    pictures: Vec::new(),
                 },
             ),
         ]
@@ -533,6 +538,50 @@ mod tests {
         // What came after the compaction ages the results before it.
         events.extend(call(13, "d", "newer.txt", 45_000 * 4));
         assert_eq!(prunable(&events, PROTECT_TOKENS, MINIMUM_TOKENS), [9]);
+    }
+
+    /// A result's pictures weigh as the tokens they cost: one whose text
+    /// is a stand-in, too short for its stub to save anything, is pruned
+    /// for its pictures, and they are not sent again.
+    #[test]
+    fn a_results_pictures_are_weighed_and_pruned_with_it() {
+        let shot = |seq: u64, pictures: usize| {
+            let mut events = call(seq, "a", "shot", "[tool image 1]".len());
+            if let Kind::ToolResult { pictures: kept, .. } = &mut events[2].kind {
+                *kept = (0..pictures)
+                    .map(|n| crate::picture::Reference {
+                        digest: format!("{n:x}").repeat(64),
+                        mime: crate::picture::PNG,
+                        width: 2048,
+                        height: 1536,
+                        bytes: 1000,
+                        label: format!("tool image {n}"),
+                    })
+                    .collect();
+            }
+            events
+        };
+        let with = |pictures: usize| {
+            let mut events: Vec<Event> = shot(1, pictures).into();
+            events.extend(call(4, "c", "recent.txt", 45_000 * 4));
+            events.extend(sending(7));
+            events
+        };
+        // Eight at 1600 tokens each: 51,200 bytes the stub frees.
+        assert_eq!(
+            crate::picture::weight(
+                &shot(1, 8)[2..]
+                    .iter()
+                    .find_map(|e| match &e.kind {
+                        Kind::ToolResult { pictures, .. } => Some(pictures.clone()),
+                        _ => None,
+                    })
+                    .unwrap()
+            ),
+            8 * 1600 * 4
+        );
+        assert_eq!(prunable(&with(8), PROTECT_TOKENS, MINIMUM_TOKENS / 2), [3]);
+        assert!(prunable(&with(0), PROTECT_TOKENS, 0).is_empty());
     }
 
     /// A sub-agent's results, which its own requests carry and the

@@ -435,6 +435,7 @@ mod tests {
             kept: None,
             digest: digest.map(str::to_string),
             digests: Vec::new(),
+            pictures: Vec::new(),
         };
         let request = |purpose, prefix| Kind::Request {
             turn: 1,

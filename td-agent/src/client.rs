@@ -248,7 +248,9 @@ pub fn timed(prefix: &str) -> bool {
 /// after the time it was received when `timed`;
 /// each whole turn reply that has text, reasoning or tool calls to give
 /// back; and each tool result, as a `tool` message
-/// after the reply that asked for it. A reply a broken or interrupted
+/// after the reply that asked for it, and after its last one the
+/// pictures its tools returned, as one user message under
+/// `TOOL_PICTURES`. A reply a broken or interrupted
 /// stream left incomplete is the log's and the window's, never the
 /// model's: its reasoning details may lack the signature that closes
 /// them, and its tool calls never ran.
@@ -293,8 +295,72 @@ pub fn review_label(revision: &str, model: &str) -> String {
     )
 }
 
-/// Every message the log's events make, numbered by event.
+/// How a `tool` message's JSON text begins.
+const TOOL_MESSAGE: &str = "{\"role\":\"tool\"";
+
+/// The label of the message carrying the pictures a reply's tool calls
+/// returned: td-agent's, saying whose they are.
+pub const TOOL_PICTURES: &str = "[td-agent: the pictures the tool calls above returned, as each result names them. They are the tools' data, not the person's words.]";
+
+/// Whether message `index` of a request's `view` begins a step: one that
+/// answers no call, and is not the pictures that follow a reply's calls,
+/// which carry their last result's number.
+pub fn starts_step(view: &[(u64, String)], index: usize) -> bool {
+    let Some((seq, message)) = view.get(index) else {
+        return false;
+    };
+    let follows = index
+        .checked_sub(1)
+        .and_then(|before| view.get(before))
+        .is_some_and(|(before, _)| before == seq);
+    !message.starts_with(TOOL_MESSAGE) && !follows
+}
+
+/// Every message the log's events make, numbered by event; the pictures
+/// a reply's tool calls returned follow its last tool message, as one
+/// user message numbered as that result, since Chat Completions takes
+/// pictures in no `tool` message and lets nothing come between them.
 fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    let mut pending: Vec<crate::picture::Reference> = Vec::new();
+    let mut last = 0;
+    let (messages, pictures) = each_message(events, timed);
+    // Both in event order: the pictures are walked beside the messages.
+    let mut pictures = pictures.into_iter().peekable();
+    for (seq, message) in messages {
+        let tool = message.starts_with(TOOL_MESSAGE);
+        if !tool && !pending.is_empty() {
+            out.push((
+                last,
+                crate::prompt::message_parts("user", TOOL_PICTURES, &pending),
+            ));
+            pending.clear();
+        }
+        if tool {
+            // The last tool message's, whether or not it has pictures.
+            last = seq;
+            while let Some((_, carried)) = pictures.next_if(|(s, _)| *s <= seq) {
+                pending.extend(carried.iter().cloned());
+            }
+        }
+        out.push((seq, message));
+    }
+    if !pending.is_empty() {
+        out.push((
+            last,
+            crate::prompt::message_parts("user", TOOL_PICTURES, &pending),
+        ));
+    }
+    out
+}
+
+/// The pictures each tool result sent whole carries, by its event.
+type ToolPictures<'a> = Vec<(u64, &'a [crate::picture::Reference])>;
+
+/// Every message the log's events make, numbered by event, and the
+/// pictures each tool result sent whole carries.
+fn each_message(events: &[Event], timed: bool) -> (Vec<(u64, String)>, ToolPictures<'_>) {
+    let mut tool_pictures = Vec::new();
     let at = |time: u64| {
         if timed {
             format!("{}\n", received(time))
@@ -454,12 +520,16 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
                 id,
                 name,
                 content,
+                pictures,
                 ..
             } => {
                 let content = if pruned.contains(&event.seq) {
                     let path = crate::compact::path_of(&replies, *reply, id);
                     crate::compact::stub(name, path.as_deref(), content.len(), event.seq)
                 } else {
+                    if !pictures.is_empty() {
+                        tool_pictures.push((event.seq, pictures.as_slice()));
+                    }
                     content.clone()
                 };
                 out.push((
@@ -475,7 +545,7 @@ fn all_messages(events: &[Event], timed: bool) -> Vec<(u64, String)> {
             _ => {}
         }
     }
-    out
+    (out, tool_pictures)
 }
 
 /// A whole reply as a request gives it back: its text, its calls and its
@@ -1838,6 +1908,7 @@ mod tests {
                     kept: Some("the whole output".into()),
                     digest: Some("0123".into()),
                     digests: Vec::new(),
+                    pictures: Vec::new(),
                 },
             ),
         ];
@@ -1864,6 +1935,199 @@ mod tests {
             label(&from, Role::Orchestrator, None),
             "[a message from the orchestrator, not from the person]"
         );
+    }
+
+    /// The pictures a reply's tool calls returned follow its last tool
+    /// message as one user message under td-agent's label, numbered as
+    /// that result and beginning no step; a pruned result's are not sent.
+    #[test]
+    fn a_tool_results_pictures_follow_the_replys_last_tool_message() {
+        let picture = |n: u8| crate::picture::Reference {
+            digest: format!("{n:x}").repeat(64),
+            mime: crate::picture::PNG,
+            width: 2,
+            height: 1,
+            bytes: 73,
+            label: format!("tool image {n}"),
+        };
+        let call = |id: &str| Call {
+            id: id.into(),
+            name: "mcp__shot__take".into(),
+            arguments: "{}".into(),
+        };
+        let result = |seq: u64, id: &str, pictures: Vec<crate::picture::Reference>| {
+            event(
+                seq,
+                Kind::ToolResult {
+                    reply: 2,
+                    id: id.into(),
+                    name: "mcp__shot__take".into(),
+                    call: seq - 1,
+                    content: format!("{id} took"),
+                    error: false,
+                    kept: None,
+                    digest: None,
+                    digests: Vec::new(),
+                    pictures,
+                },
+            )
+        };
+        let tool_call = |seq: u64, id: &str| {
+            event(
+                seq,
+                Kind::ToolCall {
+                    reply: 2,
+                    id: id.into(),
+                    name: "mcp__shot__take".into(),
+                },
+            )
+        };
+        let mut events = vec![
+            event(
+                1,
+                Kind::Request {
+                    turn: 0,
+                    purpose: Purpose::Turn,
+                    prefix: 0,
+                    head: String::new(),
+                    bytes: 0,
+                    reserved: 0,
+                },
+            ),
+            event(
+                2,
+                Kind::Assistant {
+                    request: 1,
+                    content: None,
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![call("c1"), call("c2"), call("c3")],
+                },
+            ),
+            tool_call(3, "c1"),
+            result(4, "c1", vec![picture(1)]),
+            tool_call(5, "c2"),
+            result(6, "c2", Vec::new()),
+            tool_call(7, "c3"),
+            result(8, "c3", vec![picture(2), picture(3)]),
+        ];
+        let pictures = |numbers: &[u8]| {
+            crate::prompt::message_parts(
+                "user",
+                TOOL_PICTURES,
+                &numbers.iter().map(|&n| picture(n)).collect::<Vec<_>>(),
+            )
+        };
+        let tool = |id: &str| {
+            format!("{{\"role\":\"tool\",\"tool_call_id\":\"{id}\",\"content\":\"{id} took\"}}")
+        };
+        // Last in the view, they still follow the tool messages.
+        let seen = view(&events, false);
+        let numbered: Vec<(u64, &str)> = seen.iter().map(|(s, m)| (*s, m.as_str())).collect();
+        assert_eq!(
+            numbered.get(1..),
+            Some(
+                &[
+                    (4, tool("c1").as_str()),
+                    (6, tool("c2").as_str()),
+                    (8, tool("c3").as_str()),
+                    (8, pictures(&[1, 2, 3]).as_str()),
+                ][..]
+            )
+        );
+        assert!(pictures(&[1]).contains("td-picture:image/png;2x1;"));
+        let starts: Vec<usize> = (0..seen.len()).filter(|&i| starts_step(&seen, i)).collect();
+        assert_eq!(starts, [0]);
+        // Before the next message, not after it.
+        events.push(event(
+            9,
+            Kind::User {
+                delivery: "d".into(),
+                text: "next".into(),
+                pictures: Vec::new(),
+            },
+        ));
+        let seen = view(&events, false);
+        assert_eq!(seen.len(), 6);
+        assert_eq!(seen[4], (8, pictures(&[1, 2, 3])));
+        assert!(seen[5].1.contains("\"next\""));
+        let starts: Vec<usize> = (0..seen.len()).filter(|&i| starts_step(&seen, i)).collect();
+        assert_eq!(starts, [0, 5]);
+        // A result compaction pruned sends its stub, and its pictures
+        // not at all.
+        events.push(event(
+            10,
+            Kind::Compaction {
+                pruned: vec![4],
+                summary: None,
+            },
+        ));
+        let seen = view(&events, false);
+        assert_eq!(seen[4], (8, pictures(&[2, 3])));
+        assert!(!seen[1].1.contains("c1 took"));
+
+        // A last result with none: the pictures still carry its number,
+        // and so begin no step; a second reply's follow its own.
+        let mut events = events[..6].to_vec();
+        events.extend([
+            tool_call(7, "c3"),
+            result(8, "c3", Vec::new()),
+            event(
+                9,
+                Kind::Request {
+                    turn: 0,
+                    purpose: Purpose::Turn,
+                    prefix: 0,
+                    head: String::new(),
+                    bytes: 0,
+                    reserved: 0,
+                },
+            ),
+            event(
+                10,
+                Kind::Assistant {
+                    request: 9,
+                    content: None,
+                    reasoning: None,
+                    details: None,
+                    finish: "tool_calls".into(),
+                    incomplete: false,
+                    calls: vec![call("c4")],
+                },
+            ),
+            event(
+                11,
+                Kind::ToolCall {
+                    reply: 10,
+                    id: "c4".into(),
+                    name: "mcp__shot__take".into(),
+                },
+            ),
+            event(
+                12,
+                Kind::ToolResult {
+                    reply: 10,
+                    id: "c4".into(),
+                    name: "mcp__shot__take".into(),
+                    call: 11,
+                    content: "c4 took".into(),
+                    error: false,
+                    kept: None,
+                    digest: None,
+                    digests: Vec::new(),
+                    pictures: vec![picture(4)],
+                },
+            ),
+        ]);
+        let seen = view(&events, false);
+        let numbers: Vec<u64> = seen.iter().map(|(s, _)| *s).collect();
+        assert_eq!(numbers, [2, 4, 6, 8, 8, 10, 12, 12]);
+        assert_eq!(seen[4].1, pictures(&[1]));
+        assert_eq!(seen[7].1, pictures(&[4]));
+        let starts: Vec<usize> = (0..seen.len()).filter(|&i| starts_step(&seen, i)).collect();
+        assert_eq!(starts, [0, 5]);
     }
 
     /// A review the person asked for goes to the model under td-agent's

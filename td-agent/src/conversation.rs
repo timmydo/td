@@ -387,6 +387,8 @@ struct Beside {
     kept: Option<String>,
     digest: Option<String>,
     digests: Vec<(String, Option<String>)>,
+    /// The pictures an MCP tool returned, kept already.
+    pictures: Vec<crate::picture::Reference>,
 }
 /// What a call the log has no room to run is answered with.
 const CALL_NO_ROOM: &str =
@@ -2242,11 +2244,8 @@ impl Session {
         let view = client::view(events, client::timed(&prefix_text));
         let summarized = compact::in_force(events).is_some();
         // Each step begins at a message that answers no call.
-        let starts: Vec<usize> = view
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, m))| !m.starts_with("{\"role\":\"tool\""))
-            .map(|(i, _)| i)
+        let starts: Vec<usize> = (0..view.len())
+            .filter(|&i| client::starts_step(&view, i))
             .collect();
         // Each picture counted as the tokens it costs (DESIGN.md §6,
         // Pictures).
@@ -2554,9 +2553,9 @@ impl Session {
                 // From the last message that answers no call, as
                 // `summarize` keeps the last step.
                 let view = client::view(events, client::timed(prefix_text));
-                let start = view
-                    .iter()
-                    .rposition(|(_, m)| !m.starts_with("{\"role\":\"tool\""))
+                let start = (0..view.len())
+                    .rev()
+                    .find(|&i| client::starts_step(&view, i))
                     .unwrap_or(0);
                 let last = view
                     .get(start..)
@@ -2969,7 +2968,8 @@ impl Session {
              error: bool,
              kept: Option<String>,
              digest: Option<String>,
-             digests: Vec<(String, Option<String>)>| Kind::ToolResult {
+             digests: Vec<(String, Option<String>)>,
+             pictures: Vec<crate::picture::Reference>| Kind::ToolResult {
                 reply,
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -2979,9 +2979,11 @@ impl Session {
                 kept,
                 digest,
                 digests,
+                pictures,
             };
         let digest = beside.digest.clone();
         let digests = beside.digests.clone();
+        let pictures = beside.pictures.clone();
         if self
             .log(result(
                 content.clone(),
@@ -2989,18 +2991,20 @@ impl Session {
                 beside.kept,
                 beside.digest,
                 beside.digests,
+                beside.pictures,
             ))
             .is_ok()
         {
             return Ok(());
         }
         // The kept output is what may not fit: the result without it.
-        if let Err(e) = self.log(result(content, error, None, digest, digests)) {
+        if let Err(e) = self.log(result(content, error, None, digest, digests, pictures)) {
             self.log(result(
                 format!("error: the result could not be logged: {e}"),
                 true,
                 None,
                 None,
+                Vec::new(),
                 Vec::new(),
             ))?;
         }
@@ -4286,6 +4290,7 @@ impl Session {
                                 kept: done.kept,
                                 digest: done.digest,
                                 digests: done.digests,
+                                ..Beside::default()
                             };
                             (Ok(done.text), beside)
                         }

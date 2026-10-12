@@ -7753,6 +7753,7 @@ fn read_two(conversation: &mut Conversation, old: usize, recent: usize) -> u64 {
                 kept: None,
                 digest: None,
                 digests: Vec::new(),
+                pictures: Vec::new(),
             })
             .unwrap()
             .seq;

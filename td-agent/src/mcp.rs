@@ -783,9 +783,10 @@ pub fn fit(servers: Vec<Vec<Offered>>) -> (Vec<Vec<Offered>>, Vec<Vec<String>>) 
 }
 
 /// A `tools/call` result as the call's text, and whether it is an error:
-/// its content in order, joined by blank lines, what td-agent does not
-/// show named; with no content, its structured content encoded.
-pub fn result_text(result: &Json) -> (String, bool) {
+/// its content in order, joined by blank lines, each image item the line
+/// `picture` gives for it (the picture kept, or why not), what td-agent
+/// does not show named; with no content, its structured content encoded.
+pub fn result_text(result: &Json, picture: &mut dyn FnMut(&Json) -> String) -> (String, bool) {
     let error = result.get("isError").is_some_and(Json::is_true);
     let items = result
         .get("content")
@@ -817,10 +818,10 @@ pub fn result_text(result: &Json) -> (String, bool) {
                     let uri = item.get("uri").and_then(Json::as_str).unwrap_or_default();
                     format!("[a link the tool returned: {}]", one_line(uri))
                 }
+                "image" => picture(item),
                 other => format!(
                     "[{} the tool returned, which td-agent does not show]",
                     match other {
-                        "image" => "an image".to_string(),
                         "audio" => "audio".to_string(),
                         _ => format!("an item of kind {}", one_line(other)),
                     }
@@ -987,7 +988,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(result_text(&result), ("done".to_string(), false));
+        assert_eq!(
+            result_text(&result, &mut |_| String::new()),
+            ("done".to_string(), false)
+        );
     }
 
     /// Past `MAX_PAGES` the listing stops and says more was left; a
@@ -1129,7 +1133,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(result_text(&result), (String::new(), false));
+        assert_eq!(
+            result_text(&result, &mut |_| String::new()),
+            (String::new(), false)
+        );
         assert!(s.list_changed);
         let answers: Vec<String> = s
             .transport
@@ -1316,14 +1323,22 @@ mod tests {
             r#"{"content":[{"type":"text","text":"one"},{"type":"image","data":"AAAA","mimeType":"image/png"},{"type":"resource","resource":{"uri":"file:///a","text":"two"}},{"type":"resource","resource":{"uri":"file:///b","blob":"AA"}},{"type":"resource_link","uri":"file:///c\u202e","name":"c"},{"type":"audio","data":""},{"type":"weird"}],"isError":true}"#,
         )
         .unwrap();
-        let (text, error) = result_text(&result);
+        let mut images = Vec::new();
+        let (text, error) = result_text(&result, &mut |item| {
+            images.push(item.get("data").and_then(Json::as_str).unwrap().to_string());
+            "[tool image 1]".to_string()
+        });
+        assert_eq!(images, ["AAAA"]);
         assert!(error);
         assert_eq!(
             text,
-            "one\n\n[an image the tool returned, which td-agent does not show]\n\ntwo\n\n[a resource of bytes the tool returned, which td-agent does not show]\n\n[a link the tool returned: file:///c<U+202E>]\n\n[audio the tool returned, which td-agent does not show]\n\n[an item of kind weird the tool returned, which td-agent does not show]"
+            "one\n\n[tool image 1]\n\ntwo\n\n[a resource of bytes the tool returned, which td-agent does not show]\n\n[a link the tool returned: file:///c<U+202E>]\n\n[audio the tool returned, which td-agent does not show]\n\n[an item of kind weird the tool returned, which td-agent does not show]"
         );
         let structured = td_json::parse(r#"{"structuredContent":{"n":1}}"#).unwrap();
-        assert_eq!(result_text(&structured), (r#"{"n":1}"#.to_string(), false));
+        assert_eq!(
+            result_text(&structured, &mut |_| String::new()),
+            (r#"{"n":1}"#.to_string(), false)
+        );
         let error = RpcError {
             code: -32602,
             message: "bad\nargs".into(),
@@ -1536,7 +1551,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(result_text(&result), ("done".to_string(), false));
+        assert_eq!(
+            result_text(&result, &mut |_| String::new()),
+            ("done".to_string(), false)
+        );
         server.join().unwrap();
         // The server's socket closed with ours still open: its reader
         // sees the end, and the next wait says it is gone.

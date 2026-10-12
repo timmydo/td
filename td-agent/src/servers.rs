@@ -802,7 +802,10 @@ mod tests {
         assert!(!CALLED.load(Ordering::Relaxed));
         // The server is not failed: a call after is answered.
         let result = call(&run, "echo").unwrap().unwrap();
-        assert_eq!(crate::mcp::result_text(&result), ("hi".to_string(), false));
+        assert_eq!(
+            crate::mcp::result_text(&result, &mut |_| String::new()),
+            ("hi".to_string(), false)
+        );
         assert!(CALLED.load(Ordering::Relaxed));
         run.end.store(true, Ordering::Relaxed);
         run.thread.join().unwrap();
@@ -817,7 +820,10 @@ mod tests {
         assert_eq!(started.protocol, "2025-06-18");
         assert_eq!(started.tools.len(), 1);
         let result = call(&run, "echo").unwrap().unwrap();
-        assert_eq!(crate::mcp::result_text(&result), ("hi".to_string(), false));
+        assert_eq!(
+            crate::mcp::result_text(&result, &mut |_| String::new()),
+            ("hi".to_string(), false)
+        );
         run.end.store(true, Ordering::Relaxed);
         run.thread.join().unwrap();
         assert!(run.ended.load(Ordering::Relaxed));

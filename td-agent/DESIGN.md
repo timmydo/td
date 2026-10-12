@@ -124,9 +124,9 @@ plugin host, and not a client of any td-run server (principle 5).
 Out of scope for the first increments, each a later reviewed addition: an
 MCP client (planned, §12, MCP servers: servers are commands in the jail,
 never loaded into td-agent), web search, a provider dialect other than
-OpenAI Chat Completions, pictures other than the person's pasted PNG
-and JPEG (§6, Pictures: a tool's or a reply's pictures are a later
-increment), plugins, and any socket listening outside a jail's own
+OpenAI Chat Completions, pictures other than the PNG and JPEG the person
+pastes or an MCP tool returns (§6, Pictures: a reply's pictures are a
+later increment), plugins, and any socket listening outside a jail's own
 loopback.
 
 ## 2. Processes and trust
@@ -1137,7 +1137,9 @@ says.
   their text, read from where the conversation keeps them and decoded
   within 1024 pixels a side, a JPEG at the DCT scale that brings it
   within and a PNG halved until it is; one that cannot be read shows as
-  a line saying why.
+  a line saying why. A tool result's pictures (§6, Pictures) show below
+  it the same way, and with tool activity folded, under the tool's name
+  alone.
 - a status row: the model, the mode (`ask` or `auto`), the network policy,
   whether the workspace is unconfined, context used against the model's
   length, the resource limits (`no limits` until §8's land), the count
@@ -2416,13 +2418,43 @@ removes its staging directory, once the conversation is renamed away; a
 picture staged for a message never taken stays there until then, as one
 taken for a message refused after it stays in `pictures/`.
 
+A picture an MCP tool returns (§12, MCP servers, Results) is kept the
+same way, by the child as the call's result arrives: its base64 decoded
+strictly (td-encoding's, one spelling of each value), a PNG or a JPEG by
+its bytes whatever the tool called it, written anew where a pasted one
+would be and wherever it is past 2048 pixels a side, which no provider
+looks past and the window need not decode, and refused past a result's 8
+or the conversation's 20 MB, which tools' pictures share with the
+person's. The bound that comes first is the MCP line's (§12, MCP
+servers): a result of more than 1 MiB, base64 and all, ends its server,
+so a tool's pictures are some 750 KB a result in practice. Each is
+labelled `tool image <n>`, numbered across the conversation's tool
+results, written into `pictures/` before the result that names it is
+logged, and named in the result's text by that label; one refused or
+unreadable is a line in its place saying why, and the call still has its
+result. A `tool` message takes no picture in Chat Completions, and
+nothing may come between a reply's `tool` messages, so a reply's tools'
+pictures go after its last `tool` message, as one user message under
+td-agent's label saying they are the tools' data and not the person's
+words. That message carries the last result's number, so compaction
+(§14) never begins its kept tail there, apart from the calls; a result
+compaction pruned sends its stub and none of its pictures, which
+`history_read` does not bring back, and pruning weighs a result's
+pictures as the tokens they cost. A server knows its own picture's
+digest, so it can spell that picture's placeholder out in its tool
+schema, which the prefix carries ahead of the messages; the schema's
+copy is then the one filled, and the result's goes as written and fails
+the request. That reaches no picture but its own, as no other's digest
+is its to know.
+
 The log names a picture by reference only, and a request's messages
 carry each as a placeholder part, `td-picture:<type>;<w>x<h>;<digest>`,
 after a text part holding its label, so every request is still a pure
 function of `prefix` and `log` and the log's lines stay small; the Debug
 view (§4), rebuilding a body from the log, shows the placeholder. As the
 request is sent, each placeholder of a picture the person's messages
-carry, at most as often as they carry it, becomes the picture's `data:`
+or tool results carry, at most as often as they carry it, becomes the
+picture's `data:`
 URL, read from `pictures/` and checked against its reference; any other
 text that spells a placeholder out (a provider's reasoning details, an
 MCP server's schema) is left as it is, so such text cannot send more
@@ -5917,9 +5949,11 @@ reach a server the model started, nor the model's commands it.
 
 *Results.* A result's `content` items become the call's text in order,
 joined by blank lines: `text` as it is, a `resource` with `text` as that
-text, a `resource_link` as a line naming its URI made visible, and any
-other item (an image, audio, a resource of bytes) as a line saying what
-td-agent did not show; with no content, `structuredContent` encoded.
+text, a `resource_link` as a line naming its URI made visible, an
+`image` kept as a picture (§6, Pictures) and named by its label, or by a
+line saying why it was not, and any other item (audio, a resource of
+bytes) as a line saying what td-agent did not show; with no content,
+`structuredContent` encoded.
 `isError` makes it an error result; a JSON-RPC error makes one naming
 its code and message. The text is cut as a `shell` call's output is, to
 a head and a tail (§12), and kept in the log as a `shell` call's is. It
@@ -6795,7 +6829,8 @@ prunes, when they free at least 20,000 tokens, and is built again; with
 `auto_compact = false` the turn stops there and says why. The selection
 walks the log from its end, a quarter of a token a byte of what each
 event sends (a reply only when a turn's and whole, as a request sends
-it), and takes each result, of those the view still sends, older than
+it; a result's pictures as the tokens they cost, §6, Pictures), and
+takes each result, of those the view still sends, older than
 the most recent 40,000 tokens whose stub is shorter than it and which a
 turn request answered whole has sent: a result the model has not seen, a
 refused request notwithstanding, is never pruned. From that event on, a
@@ -6829,7 +6864,8 @@ recent tail's first event (`tail`) and the focus, then the request, of
 purpose `compact`, and its reply as an `assistant` event that no turn
 sends, so the summary is the log's and the request is rebuilt from it as
 a turn's is. The tail is the latest steps, each beginning at a message
-that answers no call, within `compact_keep_tokens` and what the context
+that answers no call and is not the pictures a reply's tools returned
+(§6, Pictures), within `compact_keep_tokens` and what the context
 leaves after the prefix, the carried state, the summary's bound and the
 turn's `max_tokens`, and at least the last step, all within `compact_at`
 as the request after it is checked. A summary asked for while one is in
@@ -8079,5 +8115,5 @@ person's commands, `/review` and the MCP client are built (§3, §12,
   checkout of the publish repository, so that writing git commands never
   run in a jail-written worktree.
 - **Transcript rendering.** Replies render Markdown (§4); whether a
-  table is worth laying out as columns, and how an image a reply or a
-  tool returns is shown inline, with nothing fetched by the rendering.
+  table is worth laying out as columns, and how an image a reply
+  returns is shown inline, with nothing fetched by the rendering.
