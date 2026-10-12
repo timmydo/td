@@ -41,6 +41,8 @@ pub mod requested_selected_json;
 pub mod requested_selected_window;
 #[path = "mime_response/response.rs"]
 pub mod response;
+#[path = "mime_response/root_header_json.rs"]
+pub mod root_header_json;
 #[path = "mime_response/selected_body_json.rs"]
 pub mod selected_body_json;
 #[path = "mime_response/selected_body_window.rs"]

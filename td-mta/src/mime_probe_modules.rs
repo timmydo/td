@@ -203,3 +203,7 @@ use td_mime::{buffer, time, work};
 use unfold as mime_unfold;
 
 pub use structure as mime_structure;
+
+#[path = "root_headers.rs"]
+#[allow(unused)] // The library remains the lint authority for the collector.
+pub mod root_headers;

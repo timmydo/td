@@ -48,6 +48,7 @@ pub struct Cursor<'p, 'v, 'c, 'b, 'w> {
     buffer: &'b mut [u8],
     scanner: Scanner,
     total: u64,
+    header_limit: u64,
     ceiling: usize,
     filled: usize,
     consumed: usize,
@@ -79,6 +80,7 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             buffer,
             scanner: Scanner::new(0, header_limit),
             total,
+            header_limit,
             ceiling,
             filled: 0,
             consumed: 0,
@@ -206,8 +208,44 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             end,
         })
     }
+    pub fn into_json<'h>(
+        self,
+        budget: &'h mut crate::nfc::HeaderBudget,
+        scratch: &'h mut crate::nfc::Scratch,
+        now: Tick,
+    ) -> Result<
+        crate::mime_response::root_header_json::Input<'p, 'v, 'c, 'b, 'w, 'h>,
+        crate::mime_response::root_header_json::Error,
+    > {
+        crate::mime_response::root_header_json::Input::new(self, budget, scratch, now)
+    }
+    pub(crate) fn into_json_parts(
+        mut self,
+        now: Tick,
+    ) -> Result<JsonParts<'p, 'v, 'c, 'b, 'w>, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.check(now)?;
+        let end = self.end.ok_or(Error::State)?;
+        let source_end = self.source_end();
+        let bytes = self.buffer.get(..self.filled).ok_or(Error::State)?;
+        Ok((
+            self.source,
+            self.work,
+            View {
+                bytes,
+                source_end,
+                end,
+            },
+            self.header_limit,
+        ))
+    }
 }
 const _: () = assert!(std::mem::size_of::<Cursor<'_, '_, '_, '_, '_>>() <= 512);
+pub(crate) type JsonParts<'p, 'v, 'c, 'b, 'w> =
+    (&'p mut PinnedBlob<'v, 'c>, &'w mut Meter, View<'b>, u64);
+
 #[cfg(test)]
 #[path = "root_headers_tests.rs"]
 mod tests;

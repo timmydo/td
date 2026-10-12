@@ -7838,3 +7838,44 @@ access; finish performs fresh checks before its consuming handoff. The caller re
 authorization and aggregate header budget through interpretation and final
 publication. This reader neither performs initial blob verification nor
 replaces it, and it activates no Email/get or Mail capability.
+
+## Root-header JSON with original custody
+
+root_headers::Cursor::into_json consumes complete collection with fresh
+checks, transferring its original source and work borrows into
+mime_response::root_header_json::Input. It also exclusively borrows the
+caller's original aggregate HeaderBudget and normalization Scratch
+across successive properties. Even the crate-private constructor
+consumes the collector; a passive root View cannot construct this owner.
+No bytes are rehashed or reread during projection; they remain the
+immutable bytes collected from the retained verified native blob.
+
+Input::project borrows that owner for either source-ordered headers JSON
+or one already-recognized header property. Shared MIME cursors own every
+grammar and JSON conversion. Each poll brackets one shared parser turn
+with native snapshot and original parser-budget checks; even cached
+completion checks freshness. Successful parser completion must agree
+with the collected root End. Empty output preserves bounded NeedOutput
+behavior. By inspection, the owner allocates no property list or output
+buffer; caller output remains provisional.
+
+A fresh consuming projection finish returns encoding/leap diagnostics
+and releases the borrow for the next property. Starting a projection
+marks Input open before returning the cursor; only successful finish
+restores idle. Errors, dropping or forgetting a projection without
+successful finish retire the Input, including an abandoned complete
+projection. Later properties on that owner cannot renew admission. A
+retired Input must fail the whole request: dropping it and
+reconstructing a collector with the released borrows is not a permitted
+request-recovery mechanism. The caller retains the unpublished response
+tail and consumes Input::finish under fresh checks, then checks
+account/request authorization before publication. Input::finish refuses
+an open or failed projection; dropping Input is not successful
+completion. No Email/get dispatch or Mail capability advertisement is
+added.
+
+The shared Text projector currently refuses unknown non-X- fields with
+UnsupportedGrammar, although property recognition admits them. This is an
+existing Mail conformance blocker, including absent fields; resolve it in
+the shared parser before advertising Mail. This owner preserves the typed
+refusal and retires the whole input instead of bypassing that parser.
