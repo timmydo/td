@@ -184,6 +184,28 @@ impl<'s, 'sr, P> ResponseRetention<'_, 's, '_, 'sr, '_, P> {
         self.charge(0, false)?;
         self.check()
     }
+    /// Charge a CPU turn and report whether the narrower execution phase is
+    /// still open. Phase expiry does not retire the outer owner: it must retain
+    /// capacity and time to encode method errors and transmit the response.
+    pub fn admit_before(&mut self, phase: ports::Deadline) -> Result<bool, ports::Error> {
+        if phase >= self.deadline {
+            return Err(ports::Error::Invalid);
+        }
+        self.admit_work_turn()?;
+        Ok(!phase.expired(self.last))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_record_budget(&mut self, records: u64) {
+        self.meter = Meter::new(
+            self.deadline,
+            WorkCharge {
+                records,
+                io_bytes: u64::MAX,
+                output_bytes: u64::MAX,
+                unlinks: 0,
+            },
+        );
+    }
     /// One worker turn, at most 64 KiB. Cap refusal writes nothing and permits
     /// abandoning the unpublished tail; I/O/work/clock failure is terminal.
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ports::Error> {

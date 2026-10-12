@@ -103,6 +103,14 @@ impl<'io, 'path, 'c, 's, 'r, 'sr, 'a, P> Resolution<'io, 'path, 'c, 's, 'r, 'sr,
             failure: None,
         })
     }
+    /// Check an enclosing execution phase through the same original clock and
+    /// meter. A false result leaves the tail cancellable under the outer budget.
+    pub fn admit_before(&mut self, phase: ports::Deadline) -> Result<bool, Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.retention.admit_before(phase).map_err(Error::Store)
+    }
     /// One bounded turn. Scratch is used for at most TURN_BYTES of value copy;
     /// it is not retained and may be reused between polls. Empty scratch is a
     /// terminal State error in every phase; like other failed polls it spends
@@ -267,7 +275,7 @@ impl<P> Drop for Resolution<'_, '_, '_, '_, '_, '_, '_, P> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         admission::{logical::Cell as LeaseCell, DiskLimits, ViewMode, WorkLimits},
@@ -284,24 +292,37 @@ mod tests {
             Arc,
         },
     };
-    struct Timer(AtomicU64);
+    pub(crate) struct Timer(pub(crate) AtomicU64, AtomicU64);
+    impl Timer {
+        pub(crate) fn advance_until(&self, tick: u64) {
+            self.1.store(tick, Ordering::SeqCst);
+        }
+    }
     impl Clock for Timer {
         fn sample(&self) -> Result<Time, ports::Error> {
             Ok(Time {
                 utc_ms: 0,
-                monotonic: Tick(self.0.load(Ordering::SeqCst)),
+                monotonic: Tick(
+                    self.0
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                            (now < self.1.load(Ordering::SeqCst)).then(|| now + 1)
+                        })
+                        .unwrap_or_else(|now| now),
+                ),
             })
         }
     }
     fn deadline() -> Deadline {
         Deadline::after(Tick(0), 100).unwrap()
     }
-    fn run(test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer)) {
+    pub(crate) fn run(
+        test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer),
+    ) {
         let fixture = Fixture::new();
         let mut root = fixture.locked();
         let files = Fixture::new();
         let mut file_root = files.locked();
-        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let clock = Arc::new(Timer(AtomicU64::new(1), AtomicU64::new(0)));
         let spool = RequestSpool::open(&mut file_root, clock.clone(), deadline()).unwrap();
         let resources = Limits {
             json_bytes: 64,

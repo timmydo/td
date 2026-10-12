@@ -3,6 +3,7 @@ use crate::limits::ResourcePlan;
 use std::fmt;
 use td_json::arena::{self, Object, ParseLimit, ParseLimits, Token, Value};
 
+pub mod dispatch;
 pub mod pointer;
 pub mod resolution;
 pub mod response;

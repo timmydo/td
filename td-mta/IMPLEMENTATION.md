@@ -2914,6 +2914,19 @@ invalid extents and truncated source I/O. Earlier published bytes survive
 failed expansion. The dispatcher still owns response-index/file binding,
 execution deadlines, method error mapping and final HTTP framing.
 
+The first retained Core batch dispatcher now executes Core/echo, resolves
+its referenced arguments, records ordinary method errors in order and permits
+later calls to reference those errors. Tests bind wildcard results and duplicate
+call IDs to real retained bytes, continue after bad references/argument
+collisions/unknown methods, and preserve error space under output pressure or
+execution expiry. Regression cases cover linear collision scanning across
+1600 references, collision precedence, terminal work/outer-time failure,
+mid-method expiry and reference cancellation, and expansion exhaustion after
+an earlier complete expansion. Shared borrowed JSON emission keeps the request arena pinned
+while copying selected values without per-value trees. This is a worker
+adapter, not advertised Core: final Response framing, PushSubscription,
+Session/discovery and HTTPS dispatch remain integration work.
+
 **Private response retention.**
 
 The inert request spool and coordinator owner reserve each response's

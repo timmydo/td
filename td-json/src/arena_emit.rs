@@ -137,6 +137,58 @@ impl OwnedEmitter {
 }
 const _: () = assert!(std::mem::size_of::<OwnedEmitter>() <= 8192);
 
+const _: () = assert!(std::mem::size_of::<BorrowedEmitter<'_>>() <= 8192);
+
+/// Bounded emission while the immutable source remains with its enclosing
+/// request owner. Uses the same engine and limits as OwnedEmitter, without
+/// transferring the arena or allocating a copy. The document borrow pins both
+/// byte and token storage until this emitter is dropped.
+pub struct BorrowedEmitter<'a> {
+    document: arena::Document<'a>,
+    emitter: Emitter,
+}
+impl std::fmt::Debug for BorrowedEmitter<'_> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("BorrowedEmitter(<redacted>)")
+    }
+}
+impl<'a> BorrowedEmitter<'a> {
+    pub fn new(document: arena::Document<'a>, index: usize, limit: u64) -> Result<Self, Error> {
+        if document.value_at(index).is_none() {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            document,
+            emitter: Emitter::new(index, limit),
+        })
+    }
+    /// Emit one object's decoded member name, optionally omitting a prefix.
+    /// The offset must lie at a UTF-8 scalar boundary in that immutable key.
+    pub fn member_name(
+        document: arena::Document<'a>,
+        index: usize,
+        offset: usize,
+        limit: u64,
+    ) -> Result<Self, Error> {
+        let (key, _) = document.member_at(index).ok_or(Error::Invalid)?;
+        if offset > key.len() || key.get(offset).is_some_and(|byte| byte & 0xc0 == 0x80) {
+            return Err(Error::Invalid);
+        }
+        let mut emitter = Emitter::new(index, limit);
+        emitter.text(Text::Key(index), After::Return);
+        emitter.string_offset = offset;
+        Ok(Self { document, emitter })
+    }
+    /// Original work/time admission belongs to the enclosing owner. Empty
+    /// output makes no progress; refusals latch and completion is cached.
+    pub fn poll(&mut self, output: &mut [u8]) -> Result<Progress, Error> {
+        self.emitter.poll(&self.document, output)
+    }
+    pub const fn total(&self) -> u64 {
+        self.emitter.total
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Frame {
     next: Option<usize>,
@@ -245,7 +297,7 @@ impl Emitter {
         self.string_offset = 0;
         self.mode = Mode::String { text, after };
     }
-    // OwnedEmitter keeps these positions with one immutable document.
+    // The public owners bind these positions to one immutable document.
     fn poll(
         &mut self,
         document: &arena::Document<'_>,
@@ -714,6 +766,85 @@ mod tests {
             }
             assert!(turns > 1);
             assert_eq!(total, input.len());
+        }
+    }
+    #[test]
+    fn borrowed_selected_values_complete_and_limit_refusals_stay_sticky() {
+        for (limit, succeeds) in [(64, true), (3, false)] {
+            let input = r#"{"v":[true,null,12.50,{"s":"é"}]}"#;
+            let mut bytes = input.as_bytes().to_vec();
+            let mut tokens = [arena::Token::EMPTY; 32];
+            let document = arena::parse(
+                &mut bytes,
+                &mut tokens,
+                arena::ParseLimits {
+                    max_bytes: input.len(),
+                    max_depth: 8,
+                    max_tokens: 32,
+                },
+            )
+            .unwrap();
+            let index = document.root().get("v").unwrap().token_index();
+            let mut emitter = BorrowedEmitter::new(document, index, limit).unwrap();
+            assert_eq!(emitter.poll(&mut []).unwrap().written, 0);
+            let mut out = Vec::new();
+            let mut complete = false;
+            for _ in 0..128 {
+                let mut scratch = [0; 1];
+                match emitter.poll(&mut scratch) {
+                    Ok(next) => {
+                        out.extend_from_slice(&scratch[..next.written]);
+                        if next.complete {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        assert!(!succeeds);
+                        assert_eq!(error, Error::Limit);
+                        assert!(matches!(emitter.poll(&mut scratch), Err(Error::Limit)));
+                        break;
+                    }
+                }
+            }
+            assert_eq!(complete, succeeds);
+            if succeeds {
+                assert_eq!(out, "[true,null,12.50,{\"s\":\"é\"}]".as_bytes());
+                assert_eq!(emitter.total(), out.len() as u64);
+                let next = emitter.poll(&mut [0; 1]).unwrap();
+                assert!(next.complete);
+                assert_eq!(next.written, 0);
+            }
+        }
+    }
+    #[test]
+    fn borrowed_member_names_preserve_escaping_after_a_prefix() {
+        let input = r##"{"#é\"":{"list":[true,null,12.50]},"other":0}"##;
+        for chunk in 1..=17 {
+            let mut bytes = input.as_bytes().to_vec();
+            let mut tokens = [arena::Token::EMPTY; 32];
+            let document = arena::parse(
+                &mut bytes,
+                &mut tokens,
+                arena::ParseLimits {
+                    max_bytes: input.len(),
+                    max_depth: 8,
+                    max_tokens: 32,
+                },
+            )
+            .unwrap();
+            let mut emitter = BorrowedEmitter::member_name(document, 1, 1, 64).unwrap();
+            let mut out = Vec::new();
+            let mut scratch = vec![0; chunk];
+            for _ in 0..64 {
+                let next = emitter.poll(&mut scratch).unwrap();
+                out.extend_from_slice(&scratch[..next.written]);
+                if next.complete {
+                    break;
+                }
+            }
+            assert_eq!(out, "\"é\\\"\"".as_bytes());
+            assert_eq!(emitter.total(), out.len() as u64);
         }
     }
     #[test]

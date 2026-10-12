@@ -41,6 +41,12 @@ impl Span {
         self.length
     }
 }
+/// Borrowed wire-order metadata; the retention owner still controls reads.
+pub struct Response<'a> {
+    pub name: &'static str,
+    pub call_id: &'a [u8],
+    pub arguments: Span,
+}
 #[derive(Clone, Copy)]
 struct Entry {
     call: usize,
@@ -75,6 +81,26 @@ impl Responses {
     }
     pub fn request(&self) -> &OwnedRequest {
         &self.request
+    }
+    pub fn get(&self, index: usize) -> Result<Option<Response<'_>>, Error> {
+        if index >= self.count {
+            return Ok(None);
+        }
+        let entry = self
+            .entries
+            .get(index)
+            .copied()
+            .flatten()
+            .ok_or(Error::State)?;
+        let document = self.request.document.view().map_err(|_| Error::State)?;
+        let call_id = document
+            .string_bytes_at(entry.id_token)
+            .ok_or(Error::State)?;
+        Ok(Some(Response {
+            name: entry.name,
+            call_id,
+            arguments: entry.arguments,
+        }))
     }
     pub fn into_request(self) -> OwnedRequest {
         self.request

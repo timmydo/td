@@ -208,6 +208,24 @@ encoded-header adapters or combined service RSS.
   Cancellation attempts truncation of only the unpublished tail; terminal
   failures leave it for whole-file cleanup. Neither path releases the owner's full-cap reservation. Combined runtime RSS qualification
   and dispatcher execution-phase admission remain pending.
+  The first Core batch worker stores a bounded vector of resolved argument
+  token/range pairs, at most one per top-level request argument and therefore
+  bounded by the admitted token arena. Allocation uses fallible reservation.
+  It streams argument values and member names through the same shared JSON
+  engine as the owned emitter; immutable arena borrows pin source identity.
+  Reads, copies and emission use at most 4096-byte scratch windows; small
+  fragments are separate writes, not accumulated into full windows. Argument
+  collisions use a linear merge of sorted names before resolving references,
+  charging each member and at most 256 compared bytes per turn. Capability
+  membership and the at-most-64 call-token vector are collected once.
+  Reference field scans charge each member. Path conversion charges each
+  256-byte chunk before one bounded UTF-8 validation scan. Successful echo
+  arguments copy expansions into their result object, so expansion bytes can
+  occupy the file twice, plus framing. Previously published expansions remain
+  charged even when a later reference or method fails. Optional output leaves the entire
+  mandatory preflight amount unavailable. The execution-phase check uses the
+  retention clock without replacing its enclosing deadline or work budget.
+  Runtime peak RSS and largest accepted chain qualification remain pending.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.

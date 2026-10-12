@@ -138,6 +138,9 @@ pub struct Plan<'s> {
     seed_bytes: u64,
 }
 impl<'s> Plan<'s> {
+    pub const fn session_state(&self) -> &'s str {
+        self.state
+    }
     pub const fn required_bytes(&self) -> u64 {
         self.required
     }

@@ -797,6 +797,34 @@ freshly checks admission before returning the passive range. HTTP encoding
 must frame indexed values, never transmit this mixed-content file wholesale.
 No method dispatcher or endpoint uses this adapter yet.
 
+The inert `jmap_request::dispatch::run` now binds a fresh retention file to
+one response index while executing an admitted/preflighted batch. It resolves
+top-level referenced arguments before method selection, emits Core/echo with
+the resulting values, and retains ordered method errors without skipping later
+calls. Missing Core in `using` makes Core/echo unknownMethod. Ordinary and
+referenced forms of the same argument are invalidArguments. Error responses
+are themselves eligible earlier responses; opaque duplicate call IDs retain
+the first-match rule. Creation-looking strings in echo values remain ordinary
+strings; the input createdIds map remains in the owned request for framing.
+
+Optional expansions and successful arguments cannot consume the preflighted
+mandatory reserve. Each expansion receives the remaining optional ceiling;
+normal arguments use the shared bounded arena emitter. A recoverable optional
+capacity refusal rolls back the current tail and retains a serverFail result.
+Successful expansions from a subsequently failed method remain private and
+charged until whole-file cleanup. Terminal original work, I/O or outer-time
+failure aborts this read-only batch; it cannot be represented as a healthy
+per-method capacity refusal. The shorter execution deadline uses the same
+clock and meter and must precede the outer deadline; expiry retains
+serverUnavailable with executionDeadline while outer time/capacity remain.
+Collision validation precedes all reference resolution. A refused run drops
+its request arenas; recycling is not part of this interface.
+
+The returned index and Session state are passive completion data. Final
+Response framing/transmission, initial-map serialization, PushSubscription
+handlers, HTTP worker handoff and authenticated discovery remain unimplemented.
+No Core capability or API endpoint is advertised by this adapter.
+
 A missing target, wrong response name or failed pointer traversal is
 invalidResultReference. A successfully resolved value of the wrong argument
 type is invalidArguments when the method validates it. Simultaneous normal and
