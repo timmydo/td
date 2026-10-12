@@ -53,6 +53,7 @@ pub mod mailbox_order;
 pub mod mailbox_parents;
 pub mod mailbox_response;
 pub mod mailbox_sweep;
+pub mod mailbox_tree;
 pub mod metadata_sweep;
 pub use td_mime::attribute as mime_attribute;
 pub use td_mime::base64 as mime_base64;

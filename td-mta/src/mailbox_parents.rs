@@ -62,6 +62,9 @@ impl ParentWalk {
             failed: false,
         })
     }
+    pub(crate) fn next_id(&self) -> Option<MailboxId> {
+        (!self.complete && !self.failed).then_some(self.current)
+    }
     pub const fn is_failed(&self) -> bool {
         self.failed
     }

@@ -7556,3 +7556,31 @@ terminal Busy even within an admitted job; callers propagate it rather than
 retrying with a renewed budget. Engine admission is per fixed record, never
 for an entire resident run. On any read_output error, discard its destination
 buffer: an I/O or post-read freshness failure may follow buffer mutation.
+
+## Mailbox query paths
+
+mailbox_tree::Walk retains the query policy's at most 32 mailbox IDs while
+reusing ParentWalk's one-lookup row/sequence/view validation. Each advance
+performs at most one lookup and retains no mailbox names or account-sized
+hierarchy. A path over the depth limit fails with ReadLimit before a 33rd
+lookup; incomplete or failed walks cannot return a truncated successful Path.
+
+Path::from_root yields the root-to-self chain. Path::relation requires the
+same captured view identity. Ancestors sort before descendants independently
+of comparator direction; otherwise it identifies the nearest two ancestors
+sharing a parent, including distinct roots whose parent is null. The query
+then compares those mailboxes with mailbox_order::Plan, preserving its final
+ID tie. Ancestor filtering can traverse the same bounded IDs. These passive
+paths retain no storage pin or authorization; the query owns original work,
+deadline and fresh view/authorization checks. No query method is activated.
+
+Tree relations order ancestors before descendants regardless of comparator
+direction; apply direction only through the sibling comparator. A query must
+charge any sibling-key re-reads (at most two rows per comparison) and ancestor
+filter re-reads (at most 32 rows per candidate), yielding between bounded
+steps. Paths are transient candidate/scratch metadata, never an in-memory
+account-wide directory. The 32-node depth includes the mailbox itself; future
+create/move methods must enforce it for the whole affected subtree before
+activation. API.md does not claim those currently disabled writers enforce it.
+Walk errors, including Busy, are terminal; do not renew its deadline or resume
+a failed walk. Completed advances still validate the supplied view identity.
