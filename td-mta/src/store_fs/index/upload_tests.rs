@@ -28,6 +28,7 @@ struct PolicyState {
     allowed: bool,
     generation: u64,
     device: DeviceId,
+    read_mismatch: bool,
 }
 struct Policy(Arc<Mutex<PolicyState>>);
 struct Guard<'a>(MutexGuard<'a, PolicyState>);
@@ -229,6 +230,7 @@ fn fixture_plan(
         allowed: true,
         generation: 1,
         device: DEVICE,
+        read_mismatch: false,
     }));
     let coordinator = StoreCoordinator::new(
         store,
@@ -1344,6 +1346,16 @@ fn expired_lease_preserves_email_and_completed_submission_owners() {
                     Err(UploadError::Ledger(logical::Error::Quota(Kind::BlobCount)))
                 ));
                 drop(pending);
+                let mut read = blob_request();
+                read.device = DeviceId::from_bytes([99; 16]);
+                coordinator
+                    .with_authorized_blob(&td_crypto::Provider, read, |body| {
+                        let mut bytes = [0; 4];
+                        assert_eq!(body.read_at(0, &mut bytes)?, 4);
+                        assert_eq!(&bytes, b"seed");
+                        Ok(())
+                    })
+                    .unwrap();
                 let result = coordinator
                     .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
                     .unwrap()
@@ -2473,4 +2485,325 @@ fn chunked_https_quota_refusal_does_not_speculatively_evict() {
             None
         },
     );
+}
+
+struct ReadGuard<'a>(Guard<'a>, DeviceId);
+impl UploadGuard for ReadGuard<'_> {
+    fn access(&self) -> Access {
+        Access {
+            principal: Principal::Device(self.1),
+            ..self.0.access()
+        }
+    }
+}
+impl BlobAuthorization for Policy {
+    type Guard<'a> = ReadGuard<'a>;
+    fn authorize_blob(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<ReadGuard<'_>, ports::Error> {
+        if device != DEVICE && device != DeviceId::from_bytes([99; 16]) {
+            return Err(ports::Error::Forbidden);
+        }
+        self.authorize(account, DEVICE, deadline).map(|guard| {
+            let principal = if guard.0.read_mismatch {
+                DeviceId::from_bytes([98; 16])
+            } else {
+                device
+            };
+            ReadGuard(guard, principal)
+        })
+    }
+}
+fn blob_request() -> BlobReadRequest {
+    BlobReadRequest {
+        account: ACCOUNT,
+        device: DEVICE,
+        id: SEED,
+        maximum: 8,
+        deadline: deadline(),
+    }
+}
+#[test]
+fn authorized_blob_verifies_before_callback_and_releases_snapshot() {
+    fixture(|coordinator, _, _, policy, _| {
+        let verified = std::sync::atomic::AtomicBool::new(false);
+        let crypto = CheckingCrypto(|| {
+            assert!(policy.try_lock().is_ok());
+            verified.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        let bytes = coordinator
+            .with_authorized_blob(&crypto, blob_request(), |body| {
+                assert!(verified.load(Ordering::Relaxed));
+                assert!(policy.try_lock().is_ok());
+                assert_eq!(body.len(), 4);
+                let mut bytes = [0; 4];
+                assert_eq!(body.read_at(0, &mut bytes)?, 4);
+                Ok(bytes)
+            })
+            .unwrap();
+        assert_eq!(&bytes, b"seed");
+        assert_read_pool_free(coordinator);
+        None
+    });
+}
+#[test]
+fn authorized_blob_refuses_missing_expired_foreign_and_oversized_input() {
+    fixture(|coordinator, _, clock, policy, _| {
+        let no_output = |_: &mut dyn ports::BlobReader| -> Result<(), ports::Error> {
+            panic!("unauthorized output")
+        };
+        let mut request = blob_request();
+        request.id = BlobId::from_bytes([99; 16]);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, request, no_output),
+            Err(ports::Error::NotFound)
+        );
+        assert_read_pool_free(coordinator);
+        request = blob_request();
+        request.device = DeviceId::from_bytes([99; 16]);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, request, no_output),
+            Err(ports::Error::NotFound)
+        );
+        assert_read_pool_free(coordinator);
+        request = blob_request();
+        request.maximum = 3;
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, request, no_output),
+            Err(ports::Error::Capacity)
+        );
+        assert_read_pool_free(coordinator);
+        request = blob_request();
+        request.account = AccountId::from_bytes([99; 16]);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, request, no_output),
+            Err(ports::Error::Forbidden)
+        );
+        policy.lock().unwrap().allowed = false;
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, blob_request(), no_output),
+            Err(ports::Error::Forbidden)
+        );
+        policy.lock().unwrap().allowed = true;
+        clock.2.store(100000, Ordering::Relaxed);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, blob_request(), no_output),
+            Err(ports::Error::NotFound)
+        );
+        assert_read_pool_free(coordinator);
+        None
+    });
+}
+#[test]
+fn authorized_blob_rechecks_policy_and_expiry_after_verification() {
+    for expiry in [false, true] {
+        fixture(|coordinator, _, clock, policy, _| {
+            let crypto = CheckingCrypto(|| {
+                if expiry {
+                    clock.2.store(100000, Ordering::Relaxed);
+                } else {
+                    policy.lock().unwrap().allowed = false;
+                }
+                Ok(())
+            });
+            let result = coordinator.with_authorized_blob(
+                &crypto,
+                blob_request(),
+                |_| -> Result<(), ports::Error> { panic!("stale output") },
+            );
+            assert_eq!(
+                result,
+                Err(if expiry {
+                    ports::Error::NotFound
+                } else {
+                    ports::Error::Forbidden
+                })
+            );
+            None
+        });
+    }
+}
+#[test]
+fn authorized_blob_admitted_callback_keeps_original_deadline_after_revocation() {
+    fixture(|coordinator, _, clock, policy, _| {
+        let result =
+            coordinator.with_authorized_blob(&td_crypto::Provider, blob_request(), |body| {
+                policy.lock().unwrap().allowed = false;
+                let mut bytes = [0; 4];
+                assert_eq!(body.read_at(0, &mut bytes)?, 4);
+                assert_eq!(&bytes, b"seed");
+                clock.0.store(100, Ordering::Relaxed);
+                assert_eq!(body.read_at(0, &mut bytes), Err(ports::Error::Deadline));
+                Ok(())
+            });
+        assert_eq!(result, Err(ports::Error::Deadline));
+        None
+    });
+}
+
+#[test]
+fn authorized_blob_corruption_never_reaches_callback() {
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            let writer = lock(&store.writer).unwrap();
+            lock(&writer.native.connection)
+                .unwrap()
+                .execute(
+                    "UPDATE blobs SET digest=zeroblob(32) WHERE account=?1 AND id=?2",
+                    params![ACCOUNT.as_bytes().as_slice(), SEED.as_bytes().as_slice()],
+                )
+                .unwrap();
+        },
+        |coordinator, _, _, _, _| {
+            assert_eq!(
+                coordinator.with_authorized_blob(
+                    &td_crypto::Provider,
+                    blob_request(),
+                    |_| -> Result<(), ports::Error> { panic!("unverified bytes") }
+                ),
+                Err(ports::Error::Corrupt)
+            );
+            assert_read_pool_free(coordinator);
+            None
+        },
+    );
+}
+
+fn assert_read_pool_free<P>(coordinator: &StoreCoordinator<'_, '_, P>) {
+    let views: Vec<_> = (0..2)
+        .map(|_| coordinator.store.view(ACCOUNT, deadline()).unwrap())
+        .collect();
+    assert_eq!(views.len(), 2);
+    assert!(matches!(
+        coordinator.store.view(ACCOUNT, deadline()),
+        Err(ports::Error::Busy)
+    ));
+}
+#[test]
+fn authorized_blob_refuses_mismatched_policy_and_hash_deadline_without_leaking_views() {
+    fixture(|coordinator, _, clock, policy, _| {
+        policy.lock().unwrap().read_mismatch = true;
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, blob_request(), |_| Ok(())),
+            Err(ports::Error::Forbidden)
+        );
+        policy.lock().unwrap().read_mismatch = false;
+        let mut unknown = blob_request();
+        unknown.device = DeviceId::from_bytes([97; 16]);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, unknown, |_| Ok(())),
+            Err(ports::Error::Forbidden)
+        );
+        let crypto = CheckingCrypto(|| {
+            clock.0.store(100, Ordering::Relaxed);
+            Ok(())
+        });
+        assert_eq!(
+            coordinator.with_authorized_blob(
+                &crypto,
+                blob_request(),
+                |_| -> Result<(), ports::Error> { panic!("expired hashing") }
+            ),
+            Err(ports::Error::Deadline)
+        );
+        clock.0.store(1, Ordering::Relaxed);
+        assert_read_pool_free(coordinator);
+        None
+    });
+}
+#[test]
+fn authorized_blob_snapshot_survives_retirement_and_releases_on_callback_failure() {
+    fixture(|coordinator, _, clock, _, _| {
+        let result = coordinator.with_authorized_blob(
+            &td_crypto::Provider,
+            blob_request(),
+            |body| -> Result<(), ports::Error> {
+                clock.2.store(100000, Ordering::Relaxed);
+                let retired = coordinator
+                    .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    retired.outcome,
+                    Ok(UploadSweepDisposition::Retired {
+                        body_removed: true,
+                        ..
+                    })
+                ));
+                let mut bytes = [0; 4];
+                assert_eq!(body.read_at(0, &mut bytes)?, 4);
+                assert_eq!(&bytes, b"seed");
+                Err(ports::Error::Crypto)
+            },
+        );
+        assert_eq!(result, Err(ports::Error::Crypto));
+        assert_read_pool_free(coordinator);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, blob_request(), |_| Ok(())),
+            Err(ports::Error::NotFound)
+        );
+        assert_read_pool_free(coordinator);
+        None
+    });
+}
+#[test]
+fn authorized_empty_blob_checks_callback_deadline_and_releases_after_panic() {
+    fixture(|coordinator, spool, clock, _, _| {
+        let mut upload = coordinator
+            .reserve(&td_crypto::Provider, &mut Random(8), spool, request(0))
+            .unwrap();
+        upload.prepare().unwrap();
+        let id = upload.id();
+        assert!(matches!(
+            upload.commit().unwrap(),
+            UploadAttempt::Complete(_)
+        ));
+        drop(upload);
+        let mut request = blob_request();
+        request.id = id;
+        coordinator
+            .with_authorized_blob(&td_crypto::Provider, request, |body| {
+                assert!(body.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coordinator.with_authorized_blob(
+                &td_crypto::Provider,
+                request,
+                |_| -> Result<(), ports::Error> { panic!("callback panic") },
+            )
+        }));
+        assert!(panic.is_err());
+        assert_read_pool_free(coordinator);
+        assert_eq!(
+            coordinator.with_authorized_blob(&td_crypto::Provider, request, |_| {
+                clock.0.store(100, Ordering::Relaxed);
+                Ok(())
+            }),
+            Err(ports::Error::Deadline)
+        );
+        clock.0.store(1, Ordering::Relaxed);
+        assert_read_pool_free(coordinator);
+        assert_eq!(
+            coordinator.with_authorized_blob(
+                &td_crypto::Provider,
+                request,
+                |_| -> Result<(), ports::Error> {
+                    clock.0.store(100, Ordering::Relaxed);
+                    Err(ports::Error::Crypto)
+                }
+            ),
+            Err(ports::Error::Crypto)
+        );
+        clock.0.store(1, Ordering::Relaxed);
+        assert_read_pool_free(coordinator);
+        None
+    });
 }

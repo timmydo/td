@@ -48,7 +48,7 @@ pub fn basic(
     store.authenticate(decoded.get(colon + 1..).ok_or(DeviceError::Invalid)?)
 }
 
-/// Binds upload commit admission to the live device registry. Callers may
+/// Binds upload commits and blob-read admission to the live device registry. Callers may
 /// supply only the device ID obtained by successful HTTPS authentication.
 /// The fixed configuration generation is retained for the service lifetime;
 /// a future reload must replace policy under the same publication exclusion.
@@ -256,9 +256,96 @@ impl Attempts {
     }
 }
 
+// The personal-account policy grants reads and writes to active devices;
+// blob ownership is checked separately by the read coordinator.
+impl<'r> crate::store_fs::BlobAuthorization for DevicePolicy<'_, 'r> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_blob(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        crate::store_fs::UploadAuthorization::authorize(self, account, device, deadline)
+    }
+}
+impl<'r> crate::store_fs::BlobAuthorization for Option<DevicePolicy<'_, 'r>> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_blob(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        self.as_ref()
+            .ok_or(Error::Forbidden)?
+            .authorize_blob(account, device, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn blob_policy_requires_a_live_registered_device_and_correct_account() {
+        use crate::{
+            ports::{Tick, Time},
+            store_fs::{tests::Fixture, BlobAuthorization, UploadGuard},
+        };
+        struct Now;
+        impl Clock for Now {
+            fn sample(&self) -> Result<Time, Error> {
+                Ok(Time {
+                    utc_ms: 1,
+                    monotonic: Tick(1),
+                })
+            }
+        }
+        let fixture = Fixture::new();
+        let mut root = fixture.locked();
+        let account = AccountId::from_bytes([1; 16]);
+        let mut store = DeviceStore::open_or_create(&mut root, account).unwrap();
+        let (device, _) = store
+            .create(
+                "reader",
+                1,
+                &mut td_crypto::SystemEntropy::try_new().unwrap(),
+            )
+            .unwrap();
+        let devices = Mutex::new(store);
+        let policy = Some(DevicePolicy::new(&devices, &Now, 7));
+        let deadline = Deadline::after(Tick(1), 100).unwrap();
+        let guard = policy.authorize_blob(account, device, deadline).unwrap();
+        assert_eq!(guard.access().principal, Principal::Device(device));
+        assert_eq!(guard.access().config_generation, 7);
+        assert!(devices.try_lock().is_err());
+        drop(guard);
+        assert!(matches!(
+            policy.authorize_blob(account, DeviceId::from_bytes([99; 16]), deadline),
+            Err(Error::Forbidden)
+        ));
+        assert!(matches!(
+            policy.authorize_blob(AccountId::from_bytes([99; 16]), device, deadline),
+            Err(Error::Forbidden)
+        ));
+        devices.lock().unwrap().revoke(device, 2).unwrap();
+        assert!(matches!(
+            policy.authorize_blob(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
+        let absent: Option<DevicePolicy<'_, '_>> = None;
+        assert!(matches!(
+            absent.authorize_blob(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
+    }
     #[test]
     fn canonical_basic_base64_only() {
         let mut out = [0; DECODED];

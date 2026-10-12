@@ -794,3 +794,7 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
 #[path = "response_retention.rs"]
 mod response_retention;
 pub use response_retention::{ResponseError, ResponseRetention};
+
+#[path = "blob_access.rs"]
+mod blob_access;
+pub use blob_access::{BlobAuthorization, BlobReadRequest};

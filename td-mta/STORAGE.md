@@ -518,6 +518,30 @@ POLICY.md owns exact identifier selection. Runtime transport/credential
 binding and fair socket/worker scheduling remain separate. No SQL schema version
 or body layout changes in this increment.
 
+### Authorized blob reads
+
+StoreCoordinator::with_authorized_blob uses its separate BlobAuthorization
+policy with passive account/device/blob bounds and the original deadline. The
+personal-account DevicePolicy grants reads to active devices; upload authority
+alone does not implement this separate contract. Inside one pooled snapshot,
+email or submission ownership permits an account read. An unreferenced upload
+requires that same device's unexpired lease. Missing or inaccessible blobs
+return NotFound; an unauthorized account/device refuses before lookup.
+
+The complete body is verified through PinnedBlobInput using fixed 16 KiB
+scratch before the callback receives a BlobReader. The snapshot stays pinned
+through verification and callback reads. Current device authority and lease
+expiry are checked again before callback admission. No credential registry
+lock spans hashing or callback I/O. An already admitted read may finish after
+revocation or concurrent reclamation, within its original snapshot deadline;
+it cannot transfer the borrowed reader out of the callback. Callback code
+must enforce that deadline for its own work and I/O: the storage boundary
+cannot interrupt arbitrary synchronous callback code. Successful return
+requires a fresh pinned check; a callback error retains its original cause.
+Every request hashes the complete body, even if the callback requests a small
+range. HTTP scheduling must bound verification concurrency and admission.
+This is the storage boundary for downloads, not an activated HTTP endpoint.
+
 ### Snapshots, changes, reclamation and backup
 
 The cold pool owns one to eight connections. Capturing a view under the writer

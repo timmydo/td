@@ -3789,3 +3789,10 @@ bounded retries seek a fitting reservation, preserving referenced mail, foreign 
 ingress. Device guards and original deadlines cover each deletion and ledger
 settlement. Core discovery, download, Blob/copy, API and EventSource runtime
 integration remain pending; the capability is still unadvertised.
+
+Authorized raw blob reading now checks account/device ownership under one
+pooled snapshot, verifies all bytes before callback admission, and rechecks
+policy and upload expiry after verification. Referenced mail is account
+readable; unreferenced uploads require the originating device's live lease.
+The personal-account device registry supplies the separate read policy.
+HTTPS download routing and Core capability advertisement remain pending.

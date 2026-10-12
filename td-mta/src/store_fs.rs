@@ -14,13 +14,14 @@ pub use devices::{DeviceError, DevicePassword, DeviceStore, DEVICE_CAPACITY, DEV
 #[path = "store_fs/index.rs"]
 mod index;
 pub use index::{
-    smtp_trace_allowance, AuxiliaryUsage, BackupError, BackupReceipt, BlobSource, CommitCompletion,
-    CommitError, CommitFileUsage, CommitRequest, Delivery, DeliveryAuthorization,
-    DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest,
-    HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore, LedgerInitError, LogicalUsage,
-    ResponseError, ResponseRetention, StoreCoordinator, StoreFileUsage, StoreLogicalUsage, Upload,
-    UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion, UploadError, UploadGuard,
-    UploadMaintenance, UploadRequest, UploadSweepDisposition, UsageFence,
+    smtp_trace_allowance, AuxiliaryUsage, BackupError, BackupReceipt, BlobAuthorization,
+    BlobReadRequest, BlobSource, CommitCompletion, CommitError, CommitFileUsage, CommitRequest,
+    Delivery, DeliveryAuthorization, DeliveryCompletion, DeliveryError, DeliveryGuard,
+    DeliveryPeer, DeliveryRequest, HistoryPruneRequest, HistoryPruned, IndexReadView, IndexStore,
+    LedgerInitError, LogicalUsage, ResponseError, ResponseRetention, StoreCoordinator,
+    StoreFileUsage, StoreLogicalUsage, Upload, UploadAttempt, UploadAuthorization, UploadCleanup,
+    UploadCompletion, UploadError, UploadGuard, UploadMaintenance, UploadRequest,
+    UploadSweepDisposition, UsageFence,
 };
 #[path = "store_fs/body_verify.rs"]
 mod body_verify;
