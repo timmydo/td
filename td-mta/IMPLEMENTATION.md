@@ -3780,5 +3780,12 @@ The mailbox-access HTTPS worker now joins authenticated upload routing to the
 native quota/spool/publication coordinator. Real TLS fixtures cover fixed and
 chunked bodies, empty uploads, Continue admission, device revocation before
 commit and reopened durable bytes/leases. The single upload permit survives
-through response flush. Core remains unadvertised pending quota-pressure
-eviction and the remaining endpoint/dispatch activation work.
+through response flush. Core remains unadvertised pending the remaining
+endpoint/dispatch activation work.
+
+The upload worker now uses coordinator quota-pressure reclamation before
+accepting a new body. Each deletion of an oldest unreferenced upload is atomic;
+bounded retries seek a fitting reservation, preserving referenced mail, foreign accounts and pending
+ingress. Device guards and original deadlines cover each deletion and ledger
+settlement. Core discovery, download, Blob/copy, API and EventSource runtime
+integration remain pending; the capability is still unadvertised.

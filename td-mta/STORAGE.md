@@ -489,6 +489,18 @@ account/BlobId key. It atomically deletes the expired lease and, only when
 no email or submission owns it, the body. The owning coordinator releases
 logical charges only after proven commit, retaining charges for an
 indeterminate outcome. No expiry index or new schema is required.
+Quota-pressure upload admission reclaims committed unreferenced uploads in
+account-local creation-date order, breaking ties by BlobId, until a fresh
+reservation fits. The uploader's live device guard spans each deletion and
+its ledger settlement. The same atomic retirement path serves expiry and
+pressure; referenced email/submission bodies and pending ingress are never
+pressure victims. The current single-user account shares this quota across
+its devices; upload access remains credential-scoped. Selection retains one
+candidate under the native view deadline/VM bound, with no new schema/index.
+A dense account may exhaust that bound and refuse rather than hide a scan
+or renew its budget. Repeated cleanup uses the original upload deadline.
+ADMISSION.md owns the per-step coverability check, shared clock watermark,
+64-victim limit, partial-reclamation outcomes and chunked admission policy.
 Other service mutations and broader maintenance still need their own
 coordinated admission paths.
 ADMISSION.md section 2 owns upload, receiving and maintenance contracts.

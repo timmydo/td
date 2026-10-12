@@ -1925,8 +1925,8 @@ increments; authenticated `/.well-known/jmap` currently returns 503.
 Authenticated POST `/jmap/upload/{accountId}` now streams binary uploads into
 the configured account, with one upload at a time, bounded framing and a
 JSON durable receipt. It shares the app-password registry and storage quota
-coordinator. Quota-pressure eviction remains pending, so this does not yet
-make Core discoverable.
+coordinator. Quota pressure reclaims oldest unreferenced uploads before body
+admission, but the remaining Core endpoints still block discovery.
 
 Run `td-mta device create --runtime PATH --label LABEL`, `device list --runtime
 PATH`, or `device revoke --runtime PATH --id ID` for the running profile.

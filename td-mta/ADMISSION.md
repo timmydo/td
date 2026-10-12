@@ -1057,7 +1057,32 @@ a lost connection or expired exchange can leave a durable upload without an
 observed receipt. The fixed connection cap is one hour; raised transfer limits
 remain subject to that cap. Body progress does not extend the absolute limit.
 The worker wakes on admission and polls nonblocking TLS progress at 5 ms.
-Oldest-first eviction under upload quota pressure and complete Core discovery,
-API, download and EventSource activation remain prerequisites to advertising
-Core. This endpoint currently refuses quota exhaustion rather than performing
-that pending eviction policy.
+Upload quota pressure reclaims committed unreferenced uploads oldest first
+within the configured account, with BlobId breaking equal creation dates.
+Only BodyBytes, BlobCount and UploadBytes pressure initiates reclamation;
+contention, physical storage limits and other failures do not. Every deletion
+rechecks device authorization and holds its guard through atomic deletion
+and ledger settlement. Admission rechecks current quota before choosing a victim,
+never reclaims pending ingress, and stops once a fresh reservation fits.
+No available unreferenced victim leaves the original quota refusal. A stopped
+or uncertain cleanup retires admission rather than proceeding to a new body.
+All retries retain the original deadline; native selection also retains its
+existing VM/heap bounds. Discovery, API, download and EventSource activation
+remain prerequisites to advertising Core.
+
+Before each pressure retirement, an aggregate over the same eligible rows
+must cover every current shortfall; otherwise that step deletes no victim. The aggregate
+and oldest-row selection share the native scope and existing email/submission
+blob indexes. Reservation and reclamation share one monotonic watermark.
+A single no-progress retry covers quota released by concurrent work without
+allowing an unchanged fits/refusal disagreement to spin.
+
+An admission retires at most 64 victims before returning transient Busy if
+reservation still fails. Each scan has the native VM bound and all attempts
+share the original deadline. Earlier committed evictions remain after later
+quota consumption, refusal or operational failure. Reclamation uses the
+Content-Length declared for a fixed-length request. A chunked request reserves
+its maximum without eviction and receives the quota refusal if it cannot fit;
+its unknown actual size cannot justify premature deletion of recent uploads.
+Referenced bodies retain any upload-lease charge until ordinary expiry;
+future reference-creating methods must account for that retained charge.

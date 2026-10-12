@@ -99,20 +99,25 @@ impl<P: UploadAuthorization + Sync> Backend for Service<'_, '_, '_, P> {
             .ok_or(Error::Capacity)?;
         let mut body = BodyReader::new(request.framing, maximum, wire_max).map_err(body_error)?;
         let mut entropy = td_crypto::SystemEntropy::try_new()?;
-        let mut upload = self
-            .coordinator
-            .reserve(
+        let admission = UploadRequest {
+            account: request.account,
+            device: request.device,
+            maximum,
+            deadline: request.deadline,
+        };
+        let mut upload = match request.framing {
+            Framing::Length(_) => self.coordinator.reserve_reclaiming(
                 &td_crypto::Provider,
                 &mut entropy,
                 self.spool,
-                UploadRequest {
-                    account: request.account,
-                    device: request.device,
-                    maximum,
-                    deadline: request.deadline,
-                },
-            )
-            .map_err(upload_error)?;
+                admission,
+            ),
+            Framing::Chunked => {
+                self.coordinator
+                    .reserve(&td_crypto::Provider, &mut entropy, self.spool, admission)
+            }
+        }
+        .map_err(upload_error)?;
         let body_deadline = request.body_deadline.min(request.deadline);
         let mut last = self.clock.sample()?.monotonic;
         if request.expect_continue {

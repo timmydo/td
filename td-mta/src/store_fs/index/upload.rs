@@ -135,6 +135,17 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
         spool: &'s IngressSpool<'r>,
         request: UploadRequest,
     ) -> Result<Upload<'c, 's, 'r, 'a, C, P>, UploadError> {
+        let mut last = self.store.clock.sample()?.monotonic;
+        self.reserve_at(crypto, entropy, spool, request, &mut last)
+    }
+    fn reserve_at<'c, 's, C: Crypto>(
+        &'c self,
+        crypto: &'c C,
+        entropy: &mut impl Entropy,
+        spool: &'s IngressSpool<'r>,
+        request: UploadRequest,
+        last: &mut Tick,
+    ) -> Result<Upload<'c, 's, 'r, 'a, C, P>, UploadError> {
         let UploadRequest {
             account,
             device,
@@ -152,8 +163,7 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
         if maximum > spool.capacity().bytes_each {
             return Err(ports::Error::Capacity.into());
         }
-        let mut last = self.store.clock.sample()?.monotonic;
-        check_time(&self.store, deadline, &mut last)?;
+        check_time(&self.store, deadline, last)?;
         let access = {
             let guard = self.authorization.authorize(account, device, deadline)?;
             let access = guard.access();
@@ -164,7 +174,7 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
         let mut bytes = [0; 16];
         entropy.fill(&mut bytes).map_err(ports::Error::from)?;
         let id = BlobId::from_bytes(bytes);
-        let now = check_time(&self.store, deadline, &mut last)?;
+        let now = check_time(&self.store, deadline, last)?;
         let lease = state.ledger.reserve(
             &[[
                 Charge {
@@ -203,7 +213,7 @@ impl<'r, 'a, P: UploadAuthorization> StoreCoordinator<'r, 'a, P> {
             maximum,
             length: 0,
             deadline,
-            last,
+            last: *last,
             failed: None,
             replan_allowed: false,
             replanned: false,

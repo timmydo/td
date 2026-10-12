@@ -87,12 +87,21 @@ fn seed(store: &IndexStore<'_>, expires_at: i64) {
     seed_at(store, ACCOUNT, SEED, expires_at);
 }
 fn seed_at(store: &IndexStore<'_>, account: AccountId, id: BlobId, expires_at: i64) {
+    seed_dated(store, account, id, expires_at, 0);
+}
+fn seed_dated(
+    store: &IndexStore<'_>,
+    account: AccountId,
+    id: BlobId,
+    expires_at: i64,
+    created_at: i64,
+) {
     let mut hash = td_crypto::Provider.sha256().unwrap();
     hash.update(b"seed").unwrap();
     let blob = row_bytes(Row::Blob(crate::format::row::BlobRow {
         length: 4,
         digest: hash.finish().unwrap(),
-        created_at: 0,
+        created_at,
     }));
     let lease = row_bytes(Row::Lease(LeaseRow {
         account,
@@ -1321,7 +1330,20 @@ fn expired_lease_preserves_email_and_completed_submission_owners() {
                     )
                     .unwrap();
             },
-            |coordinator, _, _, _, _| {
+            |coordinator, spool, _, _, _| {
+                let pending = coordinator
+                    .reserve(&td_crypto::Provider, &mut Random(30), spool, request(4))
+                    .unwrap();
+                assert!(matches!(
+                    coordinator.reserve_reclaiming(
+                        &td_crypto::Provider,
+                        &mut Random(40),
+                        spool,
+                        request(4)
+                    ),
+                    Err(UploadError::Ledger(logical::Error::Quota(Kind::BlobCount)))
+                ));
+                drop(pending);
                 let result = coordinator
                     .expire_next_upload(&td_crypto::Provider, ACCOUNT, None, deadline())
                     .unwrap()
@@ -1948,4 +1970,507 @@ fn retry_checkpoint(
     Err(UploadError::Ledger(logical::Error::Slot(
         crate::ownership::Error::Contended,
     )))
+}
+
+#[test]
+fn pressure_reclaims_by_date_before_id_and_publishes_after_reclamation() {
+    const YOUNGER: BlobId = BlobId::from_bytes([1; 16]);
+    fixture_config(
+        4,
+        100000,
+        |store| seed_dated(store, ACCOUNT, YOUNGER, 100000, 1),
+        |coordinator, spool, _, _, _| {
+            let mut upload = coordinator
+                .reserve_reclaiming(&td_crypto::Provider, &mut Random(10), spool, request(4))
+                .unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut row = [0; 128];
+            assert!(view.get(Key::Blob(SEED), &mut row).unwrap().is_none());
+            assert!(view.get(Key::Lease(SEED), &mut row).unwrap().is_none());
+            assert!(view.get(Key::Blob(YOUNGER), &mut row).unwrap().is_some());
+            drop(view);
+            upload.write(b"body").unwrap();
+            upload.prepare().unwrap();
+            let id = upload.id();
+            let UploadAttempt::Complete(result) = upload.commit().unwrap() else {
+                panic!("commit");
+            };
+            assert_eq!(result.outcome, Ok(Sequence::from_u64(4)));
+            drop(upload);
+            assert_recount(coordinator);
+            Some(id)
+        },
+    );
+}
+
+#[test]
+fn pressure_reclaims_multiple_oldest_ties_only_until_quota_fits() {
+    fixture_plan(
+        4,
+        100000,
+        5,
+        |store| {
+            for byte in [1, 2, 4] {
+                seed_at(store, ACCOUNT, BlobId::from_bytes([byte; 16]), 100000);
+            }
+        },
+        |coordinator, spool, _, _, _| {
+            let upload = coordinator
+                .reserve_reclaiming(&td_crypto::Provider, &mut Random(10), spool, request(8))
+                .unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut row = [0; 128];
+            for byte in [1, 2, 3, 4] {
+                assert_eq!(
+                    view.get(Key::Blob(BlobId::from_bytes([byte; 16])), &mut row)
+                        .unwrap()
+                        .is_some(),
+                    byte >= 3
+                );
+            }
+            drop(view);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::BodyBytes)
+                    .unwrap(),
+                8
+            );
+            drop(upload);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn pressure_preserves_active_ingress_and_refuses_when_only_pending_work_remains() {
+    fixture(|coordinator, spool, _, _, _| {
+        let pending = coordinator
+            .reserve(&td_crypto::Provider, &mut Random(10), spool, request(8))
+            .unwrap();
+        let next = coordinator
+            .reserve_reclaiming(&td_crypto::Provider, &mut Random(20), spool, request(8))
+            .unwrap();
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .pending(Kind::BodyBytes)
+                .unwrap(),
+            16
+        );
+        assert!(matches!(
+            coordinator.reserve_reclaiming(
+                &td_crypto::Provider,
+                &mut Random(30),
+                spool,
+                request(1)
+            ),
+            Err(UploadError::Ledger(logical::Error::Quota(_)))
+        ));
+        drop(next);
+        drop(pending);
+        assert_recount(coordinator);
+        None
+    });
+}
+
+#[test]
+fn pressure_refusals_do_not_delete_rows_or_bypass_authorization() {
+    fixture_config(
+        4,
+        100000,
+        |store| seed_at(store, ACCOUNT, BlobId::from_bytes([4; 16]), 100000),
+        |coordinator, spool, clock, policy, _| {
+            policy.lock().unwrap().allowed = false;
+            assert!(matches!(
+                coordinator.reserve_reclaiming(
+                    &td_crypto::Provider,
+                    &mut Random(10),
+                    spool,
+                    request(4)
+                ),
+                Err(UploadError::Store(ports::Error::Forbidden))
+            ));
+            policy.lock().unwrap().allowed = true;
+            clock.0.store(100, Ordering::Relaxed);
+            assert!(matches!(
+                coordinator.reserve_reclaiming(
+                    &td_crypto::Provider,
+                    &mut Random(10),
+                    spool,
+                    request(4)
+                ),
+                Err(UploadError::Store(ports::Error::Deadline))
+            ));
+            clock.0.store(1, Ordering::Relaxed);
+            set_writer_authorizer(coordinator, |context| {
+                if matches!(context.action, AuthAction::Delete { table_name, .. } if table_name == "blobs")
+                {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            });
+            assert!(matches!(
+                coordinator.reserve_reclaiming(
+                    &td_crypto::Provider,
+                    &mut Random(10),
+                    spool,
+                    request(4)
+                ),
+                Err(UploadError::Store(_))
+            ));
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            assert!(!coordinator.admission_stopped());
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+            assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 2);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn pressure_is_account_scoped_even_when_foreign_upload_is_older() {
+    const OTHER: AccountId = AccountId::from_bytes([99; 16]);
+    const FOREIGN: BlobId = BlobId::from_bytes([1; 16]);
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            store.create_account(OTHER, deadline()).unwrap();
+            seed_dated(store, OTHER, FOREIGN, 100000, -1);
+        },
+        |coordinator, spool, _, _, _| {
+            let upload = coordinator
+                .reserve_reclaiming(&td_crypto::Provider, &mut Random(10), spool, request(4))
+                .unwrap();
+            let mut view = coordinator.store.view(OTHER, deadline()).unwrap();
+            let mut row = [0; 128];
+            assert!(view.get(Key::Blob(FOREIGN), &mut row).unwrap().is_some());
+            assert!(view.get(Key::Lease(FOREIGN), &mut row).unwrap().is_some());
+            drop(view);
+            let mut local = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert!(local.get(Key::Blob(SEED), &mut row).unwrap().is_none());
+            drop(local);
+            drop(upload);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn pressure_holds_authorization_through_commit_and_stops_on_uncertain_cleanup() {
+    for deny in [false, true] {
+        fixture_config(
+            4,
+            100000,
+            |store| seed_at(store, ACCOUNT, BlobId::from_bytes([4; 16]), 100000),
+            |coordinator, spool, clock, policy, _| {
+                let timer = clock.clone();
+                let policy = policy.clone();
+                let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = held.clone();
+                set_writer_authorizer(coordinator, move |context| {
+                    if matches!(context.action, AuthAction::Transaction { operation }
+                            if !matches!(operation, TransactionOperation::Begin | TransactionOperation::Rollback))
+                    {
+                        observed.store(policy.try_lock().is_err(), Ordering::Relaxed);
+                        timer.0.store(100, Ordering::Relaxed);
+                        if deny {
+                            return Authorization::Deny;
+                        }
+                    }
+                    Authorization::Allow
+                });
+                assert!(matches!(
+                    coordinator.reserve_reclaiming(
+                        &td_crypto::Provider,
+                        &mut Random(10),
+                        spool,
+                        request(4)
+                    ),
+                    Err(UploadError::Store(ports::Error::WriterStopped))
+                ));
+                assert!(held.load(Ordering::Relaxed));
+                assert!(coordinator.admission_stopped());
+                assert_eq!(
+                    coordinator.used(Kind::BodyBytes).unwrap(),
+                    if deny { 8 } else { 4 }
+                );
+                assert_eq!(
+                    coordinator.used(Kind::UploadBytes).unwrap(),
+                    if deny { 8 } else { 4 }
+                );
+                lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                    .unwrap()
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+                None
+            },
+        );
+    }
+}
+
+#[test]
+fn pressure_refuses_uncoverable_shortfall_without_deleting_any_upload() {
+    const OTHER: AccountId = AccountId::from_bytes([99; 16]);
+    fixture_plan(
+        4,
+        100000,
+        3,
+        |store| {
+            store.create_account(OTHER, deadline()).unwrap();
+            seed_at(store, OTHER, BlobId::from_bytes([1; 16]), 100000);
+        },
+        |coordinator, spool, _, _, _| {
+            let pending = coordinator
+                .reserve(&td_crypto::Provider, &mut Random(10), spool, request(8))
+                .unwrap();
+            assert!(matches!(
+                coordinator.reserve_reclaiming(
+                    &td_crypto::Provider,
+                    &mut Random(20),
+                    spool,
+                    request(8)
+                ),
+                Err(UploadError::Ledger(logical::Error::Quota(Kind::BodyBytes)))
+            ));
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut row = [0; 128];
+            assert!(view.get(Key::Blob(SEED), &mut row).unwrap().is_some());
+            assert!(view.get(Key::Lease(SEED), &mut row).unwrap().is_some());
+            drop(view);
+            drop(pending);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn pressure_rechecks_revocation_and_clock_between_failed_reserve_and_deletion() {
+    struct Change<'a> {
+        clock: &'a Arc<Timer>,
+        policy: &'a Arc<Mutex<PolicyState>>,
+        regression: bool,
+    }
+    impl Entropy for Change<'_> {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<(), td_crypto::Error> {
+            bytes.fill(19);
+            if self.regression {
+                self.clock.1.lock().unwrap().extend([10, 5]);
+            } else {
+                self.policy.lock().unwrap().allowed = false;
+            }
+            Ok(())
+        }
+    }
+    for regression in [false, true] {
+        fixture_config(
+            4,
+            100000,
+            |store| seed_at(store, ACCOUNT, BlobId::from_bytes([4; 16]), 100000),
+            |coordinator, spool, clock, policy, _| {
+                let mut entropy = Change {
+                    clock,
+                    policy,
+                    regression,
+                };
+                let expected = if regression {
+                    ports::Error::Invalid
+                } else {
+                    ports::Error::Forbidden
+                };
+                assert!(
+                    matches!(coordinator.reserve_reclaiming(&td_crypto::Provider, &mut entropy, spool, request(4)),
+                    Err(UploadError::Store(error)) if error == expected)
+                );
+                policy.lock().unwrap().allowed = true;
+                clock.0.store(20, Ordering::Relaxed);
+                assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+                assert_recount(coordinator);
+                None
+            },
+        );
+    }
+}
+
+#[test]
+fn pressure_ownership_probes_use_existing_blob_indexes() {
+    fixture(|coordinator, _, _, _, _| {
+        let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+        view.read_snapshot(|native| {
+            native.run(|db| {
+                for query in [
+                    super::cleanup::RECLAIMABLE_TOTAL,
+                    super::cleanup::OLDEST_RECLAIMABLE,
+                ] {
+                    let mut statement = db
+                        .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                        .map_err(sql)?;
+                    let details = statement
+                        .query_map(params![ACCOUNT.as_bytes().as_slice()], |row| {
+                            row.get::<_, String>(3)
+                        })
+                        .map_err(sql)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(sql)?
+                        .join("\n");
+                    assert!(details.contains("emails_blob"), "{details}");
+                    assert!(details.contains("submissions_blob"), "{details}");
+                }
+                Ok(())
+            })
+        })
+        .unwrap();
+        None
+    });
+}
+
+fn set_writer_authorizer<P>(
+    coordinator: &StoreCoordinator<'_, '_, P>,
+    hook: impl for<'r> FnMut(AuthContext<'r>) -> Authorization + Send + 'static,
+) {
+    let writer = lock(&coordinator.store.writer).unwrap();
+    lock(&writer.native.connection)
+        .unwrap()
+        .authorizer(Some(hook))
+        .unwrap();
+}
+
+#[test]
+fn pressure_stops_at_victim_budget_and_keeps_prior_durable_eviction() {
+    fixture_plan(
+        4,
+        100000,
+        5,
+        |store| {
+            for byte in [1, 2, 4] {
+                seed_at(store, ACCOUNT, BlobId::from_bytes([byte; 16]), 100000);
+            }
+        },
+        |coordinator, spool, _, _, _| {
+            assert!(matches!(
+                coordinator.reserve_with_reclaim_limit(
+                    &td_crypto::Provider,
+                    &mut Random(10),
+                    spool,
+                    request(8),
+                    1
+                ),
+                Err(UploadError::Store(ports::Error::Busy))
+            ));
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut row = [0; 128];
+            assert!(view
+                .get(Key::Blob(BlobId::from_bytes([1; 16])), &mut row)
+                .unwrap()
+                .is_none());
+            assert!(view
+                .get(Key::Blob(BlobId::from_bytes([2; 16])), &mut row)
+                .unwrap()
+                .is_some());
+            drop(view);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 12);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+#[test]
+fn pressure_does_not_reclaim_for_a_spool_capacity_refusal() {
+    fixture(|coordinator, spool, _, _, _| {
+        assert!(matches!(
+            coordinator.reserve_reclaiming(
+                &td_crypto::Provider,
+                &mut Random(10),
+                spool,
+                request(9)
+            ),
+            Err(UploadError::Store(ports::Error::Capacity))
+        ));
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+        assert_recount(coordinator);
+        None
+    });
+}
+
+#[test]
+fn chunked_https_quota_refusal_does_not_speculatively_evict() {
+    use crate::https_upload::Backend;
+    use crate::ports::{FlushProgress, IoProgress, Transport};
+    struct NoIo;
+    impl Transport for NoIo {
+        fn read(&mut self, _: &mut [u8]) -> Result<IoProgress, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn write(&mut self, _: &[u8]) -> Result<IoProgress, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn flush(&mut self) -> Result<FlushProgress, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn close(&mut self) -> Result<FlushProgress, ports::Error> {
+            Err(ports::Error::Invalid)
+        }
+        fn abort(&mut self) {}
+    }
+    fixture_config(
+        4,
+        100000,
+        |store| seed_at(store, ACCOUNT, BlobId::from_bytes([4; 16]), 100000),
+        |coordinator, spool, clock, _, _| {
+            let resources = Limits::default().plan().unwrap();
+            let admission = DiskLimits::default()
+                .plan(
+                    &resources,
+                    WorkLimits::default(),
+                    ViewMode::OnlineBackground,
+                )
+                .unwrap();
+            let timeouts = crate::admission::timers::NetworkLimits::default()
+                .plan(&admission)
+                .unwrap();
+            let service = crate::https_upload::Service {
+                coordinator,
+                spool,
+                account: ACCOUNT,
+                maximum: 8,
+                clock: clock.as_ref(),
+                timeouts: &timeouts,
+            };
+            let result = service.receive(
+                crate::https_upload::Request {
+                    account: ACCOUNT,
+                    device: DEVICE,
+                    framing: crate::http_request::Framing::Chunked,
+                    content_type: "text/plain",
+                    prefix: &[],
+                    deadline: deadline(),
+                    body_deadline: deadline(),
+                    expect_continue: true,
+                },
+                &mut NoIo,
+                &crate::smtp_receiving::Control::default(),
+            );
+            assert!(matches!(result, Err(ports::Error::Quota)));
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 8);
+            assert_recount(coordinator);
+            None
+        },
+    );
 }
