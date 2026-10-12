@@ -8219,3 +8219,41 @@ not freshly authorize publication. Consuming finish freshly checks admission
 and returns the same native/job/header owners beside immutable header input,
 passive interpretation and disjoint reusable backing. The caller retains
 those owners through traversal and eventual response publication.
+
+## Native complete MIME traversal
+
+`blob_structure::Cursor` joins a verified PinnedBlob to the shared fragmented
+structure cursor. Settings supply a clipped extent and the existing structure
+limits; caller buffers supply header backing, one reusable body-read buffer,
+descriptors and corresponding preorder header-view slots. It retains the
+original native snapshot, Meter and aggregate HeaderBudget throughout.
+
+Every poll either advances bounded header collection, reads at most 4096 body
+bytes, advances one shared parser turn, or checks one completed descriptor
+against its retained header view. Read buffers may be reused across parent and
+child extents; requested offsets, including QP rewinds, select only bytes from
+the same snapshot. Requested read bytes and repeated parser visits spend original
+work. Each retained header slot funds one record and its fixed output size.
+The shared parser owns all MIME clipping, nesting, sizing and diagnostic rules.
+
+The native owner validates header bases, body starts, preorder ordinals and
+the aggregate recognized-header total before successful handoff. Header views
+remain immutable while unused backing can hold subsequent entities. A late
+native refusal overrides provisional progress, including would-be or cached
+completion, and remains sticky. Consuming finish freshly returns the original
+owners, complete passive descriptors and matching header views; every returned
+header slot is present. Those values do not create part IDs, authorize account
+access or publish a response. The caller retains the live owners through any
+later property generation and publication.
+
+Body-buffer exhaustion reports Interpretation(OutputCapacity); an extent
+outside the pin reports Headers(Range), matching the entity collector's range
+validation. Header arena exhaustion remains Headers(Capacity). A failed
+consuming collector constructor or handoff retires its borrowed owners; the
+outer cursor preserves that exact failure and grants no recovery/publication
+operation. Dropping it releases borrows, not the caller-owned snapshot itself.
+
+Retained fields are passive and intentionally accessible for subsequent owner
+composition. The presence/pairing guarantee describes successful finish, not
+arbitrarily reconstructed structs. Consumers must validate supplied ordinal,
+view and descriptor correspondence and retain live source/work custody.

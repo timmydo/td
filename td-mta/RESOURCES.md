@@ -4417,3 +4417,33 @@ its consuming handoff on completion. Boundary output is at most 70 bytes and
 uses the original work budget. A handoff returns original live owners and
 unused backing; it reserves no new job or interpretation quota. This is not
 whole-tree or whole-service memory qualification.
+
+## Native complete MIME owner
+
+The native structure cursor plus HeaderBudget has a compiled 16 KiB ceiling.
+The frame array and entity interpreter remain in the shared cursor; no second
+traversal or whole-body buffer is added. Callers reserve descriptor slots,
+matching optional header-view slots, retained header backing and one nonempty
+body buffer separately. Reads use at most min(4096, body-buffer length) bytes.
+Header collection retains its existing read/scanner bounds and consuming
+witness handoff. Recognized header limits do not replace actual witness-backing
+capacity; an insufficient arena or slot set refuses the whole operation.
+
+Each poll performs one bounded read/parser/validation turn. Correspondence
+validation checks one descriptor and header view for one work record; cached
+completion is freshly fenced without positive work debit. Output accounting
+includes each retained header-view slot beside shared part descriptors and
+boundary/decoder output. Rewinds and overlapping parent/child scans charge
+requested repeated read bytes (including any short read) and parser visits.
+This component does not qualify whole-service
+memory, native allocator maxima or Mail capability advertisement.
+
+Descriptor and header-view capacities of mime_parts cover every successful
+tree. At each header request, the remaining arena must first hold the smaller
+of the clipped entity length and remaining recognized-header limit plus two;
+subsequent tentative header bytes may need more. The immutable consumed prefix
+and its actual lookahead witness stay reserved across later requests. No bound
+from recognized header bytes alone guarantees successful witness retention.
+A checked product of maximum part count and total source extent length is a
+conservative backing bound, but can be impractical; the enclosing job instead
+admits a fixed arena ceiling and explicitly refuses when it is insufficient.
