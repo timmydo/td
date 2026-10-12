@@ -305,6 +305,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"Mailbox/query" if mail => "Mailbox/query",
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
+            b"Email/changes" if mail => "Email/changes",
             b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
@@ -323,6 +324,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 start..end,
                 responses.request().envelope.maximum_objects,
                 object_changes::ChangesKind::Mailbox,
+            )
+        } else if name == "Email/changes" {
+            self.object_changes(
+                start..end,
+                responses.request().envelope.maximum_objects,
+                object_changes::ChangesKind::Email,
             )
         } else if name == "Thread/changes" {
             self.object_changes(

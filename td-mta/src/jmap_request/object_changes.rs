@@ -5,7 +5,7 @@ use super::{
     Error, Worker,
 };
 use crate::{
-    ids::{MailboxId, ThreadId},
+    ids::{EmailId, MailboxId, ThreadId},
     jmap_changes,
     ports::ChangeAction,
     sync::{DataState, DataType},
@@ -18,18 +18,21 @@ use td_json::{arena, scan};
 pub(super) enum ChangesKind {
     Mailbox,
     Thread,
+    Email,
 }
 impl ChangesKind {
     fn data_type(self) -> DataType {
         match self {
             Self::Mailbox => DataType::Mailbox,
             Self::Thread => DataType::Thread,
+            Self::Email => DataType::Email,
         }
     }
     fn encode(self, id: [u8; 16], output: &mut [u8]) -> Result<&str, Error> {
         match self {
             Self::Mailbox => wire::encode_id(MailboxId::from_bytes(id), output),
             Self::Thread => wire::encode_id(ThreadId::from_bytes(id), output),
+            Self::Email => wire::encode_id(EmailId::from_bytes(id), output),
         }
         .map_err(|_| Error::State)
     }
@@ -286,3 +289,7 @@ mod tests;
 #[cfg(test)]
 #[path = "thread_changes_tests.rs"]
 mod thread_tests;
+
+#[cfg(test)]
+#[path = "email_changes_tests.rs"]
+mod email_tests;

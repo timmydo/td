@@ -7666,3 +7666,25 @@ while request custody is still healthy. No precedence between those cumulative
 meters is promised. An anchor sum outside JMAP's safe integer range produces
 an empty page positioned at the result end, keeping the response integer
 representable without refusing an otherwise valid out-of-range query.
+
+## Retained Email/changes dispatch
+
+The opt-in Mail dispatcher uses the existing account-scoped atomic change
+cursor for Email/changes, with Email data-state tags and Email wire IDs.
+Created/updated/destroyed sets coalesce the retained journal and never split a
+transaction to meet maxChanges. The first indivisible oversized page returns
+cannotCalculateChanges; ordinary pressure and execution errors preserve their
+existing method classifications. Email responses omit Mailbox's additional
+updatedProperties member. Original snapshot freshness precedes publication.
+
+This adds a reader, not new writers or live Mail advertisement. Before Mail
+activation, every enabled Email membership/keyword/create/destroy path must
+prove that it writes the corresponding Email history in the same transaction;
+Thread membership history remains a separate obligation. Native fixture
+transactions explicitly provide both Email and affected Thread journal rows.
+
+A transaction larger than the requested (or server-selected) Email change
+page cap forces a full client resync from that boundary. Future bulk writers
+must account for that cost; the reader does not split a transaction or claim
+an unlimited default page. The fixture tests journal reading, not complete
+writer invariants such as each Email retaining a mailbox membership.
