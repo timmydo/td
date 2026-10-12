@@ -1,5 +1,5 @@
-//! Credential-scoped, empty-registration PushSubscription policy.
-use super::{Error, Worker};
+//! Bounded Core argument walks and single-account method policies.
+use super::{AccountId, Error, Worker};
 use std::ops::Range;
 use td_json::{arena, scan};
 
@@ -32,11 +32,12 @@ impl Name {
         self.length = end;
         Ok(())
     }
-    fn id(&self) -> Result<(), Error> {
+    fn wire_id(&self) -> Result<crate::wire::Id<'_>, Error> {
         let text = std::str::from_utf8(self.bytes()).map_err(|_| Error::InvalidArguments)?;
-        crate::wire::Id::parse(text)
-            .map(|_| ())
-            .map_err(|_| Error::InvalidArguments)
+        crate::wire::Id::parse(text).map_err(|_| Error::InvalidArguments)
+    }
+    fn id(&self) -> Result<(), Error> {
+        self.wire_id().map(|_| ())
     }
 }
 struct Item {
@@ -321,5 +322,45 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         self.append(if count == 0 { b"null" } else { b"}" })?;
         Ok(count)
+    }
+}
+
+impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+    pub(super) fn blob_copy(&mut self, arguments: Range<u64>) -> Result<Range<u64>, Error> {
+        let mut fields = Children::new(arguments, scan::Kind::Object)?;
+        let mut source = None;
+        let mut destination = None;
+        let mut blobs = None;
+        while let Some(item) = fields.next(self)? {
+            match item.key.bytes() {
+                b"fromAccountId" => source = Some(item),
+                b"accountId" => destination = Some(item),
+                b"blobIds" => blobs = Some(item),
+                _ => return Err(Error::InvalidArguments),
+            }
+        }
+        let source = self.copy_account(source.ok_or(Error::InvalidArguments)?)?;
+        let destination = self.copy_account(destination.ok_or(Error::InvalidArguments)?)?;
+        let mut blobs = Children::new(
+            blobs.ok_or(Error::InvalidArguments)?.range,
+            scan::Kind::Array,
+        )?;
+        while let Some(item) = blobs.next(self)? {
+            self.push_string(&item)?.id()?;
+        }
+        self.check()?;
+        // RFC 8620 section 6.3 copies between different accounts. There is
+        // only one accessible account, so no successful pair is possible.
+        Err(if destination != Some(self.account) {
+            Error::AccountNotFound
+        } else if source != Some(self.account) {
+            Error::FromAccountNotFound
+        } else {
+            Error::InvalidArguments
+        })
+    }
+    fn copy_account(&mut self, item: Item) -> Result<Option<AccountId>, Error> {
+        let name = self.push_string(&item)?;
+        Ok(name.wire_id()?.local())
     }
 }

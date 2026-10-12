@@ -1,6 +1,6 @@
-//! Ordered, retained Core/echo batches. This worker adapter activates no API.
+//! Ordered, retained Core method batches. This worker adapter activates no API.
 use super::{pointer, resolution, response, result_index, Invocation, CORE};
-use crate::{ports, store_fs::ResponseRetention};
+use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "push.rs"]
@@ -12,6 +12,8 @@ pub enum Error {
     Storage(ports::Error),
     ExecutionDeadline,
     InvalidArguments,
+    AccountNotFound,
+    FromAccountNotFound,
     InvalidResultReference,
     UnknownMethod,
     Forbidden,
@@ -60,7 +62,9 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
 }
 
 /// Execute on a storage worker after authentication and whole-request
-/// admission/preflight. The fresh file and index are bound for this entire
+/// admission/preflight. `account` is the sole authenticated personal account,
+/// supplied by trusted service configuration. The fresh file and index are
+/// bound for this entire
 /// invocation. All methods here are side-effect free; errors never stop later
 /// calls. Terminal original work/I/O/outer-deadline failure aborts the batch.
 /// Refusal drops the request arenas; allocation recycling is not promised.
@@ -69,6 +73,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
+    account: AccountId,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
@@ -100,6 +105,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention: &mut retention,
         execution,
         optional_end,
+        account,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core);
@@ -110,6 +116,8 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     return Err(Error::Storage(error));
                 }
                 let body: &[u8] = match error {
+                    Error::AccountNotFound => br#"{"type":"accountNotFound"}"#,
+                    Error::FromAccountNotFound => br#"{"type":"fromAccountNotFound"}"#,
                     Error::InvalidArguments => br#"{"type":"invalidArguments"}"#,
                     Error::InvalidResultReference => br#"{"type":"invalidResultReference"}"#,
                     Error::UnknownMethod => br#"{"type":"unknownMethod"}"#,
@@ -156,6 +164,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     retention: &'io mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     optional_end: u64,
+    account: AccountId,
 }
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
@@ -249,6 +258,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let name = match call.name {
             b"Core/echo" => "Core/echo",
+            b"Blob/copy" => "Blob/copy",
             b"PushSubscription/get" => "PushSubscription/get",
             b"PushSubscription/set" => "PushSubscription/set",
             _ => return Err(Error::UnknownMethod),
@@ -260,11 +270,15 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = self.push_method(
-            name,
-            start..end,
-            responses.request().envelope.maximum_objects,
-        )?;
+        let result = if name == "Blob/copy" {
+            self.blob_copy(start..end)
+        } else {
+            self.push_method(
+                name,
+                start..end,
+                responses.request().envelope.maximum_objects,
+            )
+        }?;
         Ok((name, result))
     }
     fn reference(
@@ -517,6 +531,7 @@ pub(super) mod tests {
                 plan.finish().unwrap(),
                 retention,
                 Deadline::after(Tick(0), phase).unwrap(),
+                AccountId::from_bytes([1; 16]),
             ) {
                 Ok(complete) => complete,
                 Err(error) => {
@@ -676,6 +691,7 @@ pub(super) mod tests {
                 retention: &mut retention,
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
+                account: AccountId::from_bytes([1; 16]),
             };
             assert_eq!(
                 worker.reference(&responses, 1, value),
@@ -941,5 +957,147 @@ pub(super) mod tests {
             br#"{"type":"serverFail","description":"responseCapacity"}"#
         );
         assert_eq!(replies[1].1, br#"{"ok":true}"#);
+    }
+    fn copy_call(arguments: &str) -> String {
+        batch(&format!(
+            r#"[["Blob/copy",{arguments},"copy"],["Core/echo",{{"ok":true}},"next"]]"#
+        ))
+    }
+    #[test]
+    fn blob_copy_validates_single_account_pairs_and_preserves_later_calls() {
+        let account = format!("a{}", "01".repeat(16));
+        let other = format!("a{}", "02".repeat(16));
+        for (source, destination, error) in [
+            (other.as_str(), account.as_str(), "fromAccountNotFound"),
+            (account.as_str(), other.as_str(), "accountNotFound"),
+            (other.as_str(), other.as_str(), "accountNotFound"),
+            (account.as_str(), account.as_str(), "invalidArguments"),
+            ("foreign", account.as_str(), "fromAccountNotFound"),
+            (account.as_str(), "foreign", "accountNotFound"),
+            ("foreign", "foreign", "accountNotFound"),
+        ] {
+            for ids in ["[]", r#"["absent","absent"]"#] {
+                let arguments = format!(
+                    r#"{{"fromAccountId":"{source}","accountId":"{destination}","blobIds":{ids}}}"#
+                );
+                let replies = execute(&copy_call(&arguments), 90);
+                assert_eq!(
+                    replies[0],
+                    (
+                        "error".into(),
+                        format!(r#"{{"type":"{error}"}}"#).into_bytes(),
+                        b"copy".to_vec()
+                    )
+                );
+                assert_eq!(replies[1].1, br#"{"ok":true}"#);
+            }
+        }
+    }
+    #[test]
+    fn blob_copy_checks_all_arguments_before_account_errors() {
+        for arguments in [
+            r#"{}"#,
+            r#"{"accountId":"foreign","blobIds":[]}"#,
+            r#"{"fromAccountId":"foreign","blobIds":[]}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign"}"#,
+            r#"{"fromAccountId":null,"accountId":"foreign","blobIds":[]}"#,
+            r#"{"fromAccountId":"foreign","accountId":1,"blobIds":[]}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":null}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":{}}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":[null]}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":["bad id"]}"#,
+            r#"{"fromAccountId":"bad id","accountId":"foreign","blobIds":[]}"#,
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":[],"extra":true}"#,
+        ] {
+            let replies = execute(&copy_call(arguments), 90);
+            assert_eq!(
+                replies[0].1, br#"{"type":"invalidArguments"}"#,
+                "{arguments}"
+            );
+            assert_eq!(replies[1].1, br#"{"ok":true}"#);
+        }
+        let limits = Limits {
+            objects_per_method: 1,
+            ..Limits::default()
+        };
+        let input = copy_call(
+            r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":["same","same"]}"#,
+        );
+        for input in [
+            input.clone(),
+            input.replace("\"same\",\"same\"", "\"same\""),
+        ] {
+            let replies = execute_with_limits(&input, 90, None, None, limits).unwrap();
+            assert_eq!(replies[0].1, br#"{"type":"accountNotFound"}"#);
+            assert_eq!(replies[1].1, br#"{"ok":true}"#);
+        }
+        for value in ["".to_owned(), "bad id".to_owned(), "x".repeat(256)] {
+            for field in ["fromAccountId", "accountId", "blobIds"] {
+                let source = if field == "fromAccountId" {
+                    &value
+                } else {
+                    "foreign"
+                };
+                let destination = if field == "accountId" {
+                    &value
+                } else {
+                    "foreign"
+                };
+                let blob = if field == "blobIds" { &value } else { "blob" };
+                let arguments = format!(
+                    r#"{{"fromAccountId":"{source}","accountId":"{destination}","blobIds":["{blob}"]}}"#
+                );
+                assert_eq!(
+                    execute(&copy_call(&arguments), 90)[0].1,
+                    br#"{"type":"invalidArguments"}"#
+                );
+            }
+        }
+    }
+    #[test]
+    fn blob_copy_uses_resolved_arguments_core_opt_in_and_phase_deadline() {
+        let account = format!("a{}", "01".repeat(16));
+        let input = batch(&format!(
+            r##"[
+            ["Core/echo",{{"source":"foreign","blobs":["blob"]}},"first"],
+            ["Blob/copy",{{"accountId":"{account}",
+                "#fromAccountId":{{"resultOf":"first","name":"Core/echo","path":"/source"}},
+                "#blobIds":{{"resultOf":"first","name":"Core/echo","path":"/blobs"}}}},"copy"],
+            ["Core/echo",{{"#error":{{"resultOf":"copy","name":"error","path":"/type"}}}},"last"]
+        ]"##
+        ));
+        let replies = execute(&input, 90);
+        assert_eq!(replies[1].1, br#"{"type":"fromAccountNotFound"}"#);
+        assert_eq!(replies[2].1, br#"{"error":"fromAccountNotFound"}"#);
+        let input = copy_call(r#"{"fromAccountId":"foreign","accountId":"foreign","blobIds":[]}"#);
+        let replies = execute(&input.replace(r#"["urn:ietf:params:jmap:core"]"#, "[]"), 90);
+        assert_eq!(replies[0].1, br#"{"type":"unknownMethod"}"#);
+        let replies = execute(&input, 0);
+        assert_eq!(
+            replies[0].1,
+            br#"{"type":"serverUnavailable","description":"executionDeadline"}"#
+        );
+    }
+    #[test]
+    fn blob_copy_walk_checks_execution_during_retained_array_scan() {
+        resolution::tests::run(|coordinator, spool, _, clock| {
+            let until = Deadline::after(Tick(0), 100).unwrap();
+            let mut retention = coordinator.retain_response(spool, until).unwrap();
+            let ids = vec!["\"blob\""; 256].join(",");
+            let arguments =
+                format!(r#"{{"fromAccountId":"foreign","accountId":"foreign","blobIds":[{ids}]}}"#);
+            retention.append(arguments.as_bytes()).unwrap();
+            let end = retention.publish().unwrap();
+            clock.advance_until(50);
+            let mut worker = Worker {
+                retention: &mut retention,
+                execution: Deadline::after(Tick(0), 50).unwrap(),
+                optional_end: 70000,
+                account: AccountId::from_bytes([1; 16]),
+            };
+            assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));
+            assert_eq!(retention.failure(), None);
+            assert_eq!(retention.published_len(), end);
+        });
     }
 }

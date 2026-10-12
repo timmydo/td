@@ -3803,3 +3803,11 @@ chunked and empty uploads, preserve decoded name/type headers, and check
 missing/foreign IDs, methods, GET bodies, shared-slot contention, revoked
 credentials and another device's inaccessible unreferenced upload. Discovery,
 Blob/copy, API and EventSource runtime activation remain pending.
+
+Core Blob/copy now validates resolved arguments and returns the standard
+single-account outcomes through the retained dispatcher. Tests cover required
+fields, invalid types/IDs, arrays beyond get/set object limits, foreign-account
+precedence, same-account refusal, references, capability opt-in, deadline
+expiry and later-call continuation. Successful cross-account copying is
+unreachable in the personal-account profile. Discovery, API and EventSource
+runtime activation remain pending.

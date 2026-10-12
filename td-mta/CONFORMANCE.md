@@ -58,7 +58,7 @@ properties, conditional states, boundary limits and unknown account IDs.
 | `Core/echo` | 8620 §4 | M13 | Arbitrary valid arguments returned within request/output bounds |
 | Upload HTTP endpoint | 8620 §6.1 | M13/M15 | Streaming quota, content type, account, blob ID and size response |
 | Download HTTP endpoint | 8620 §6.2 | M13/M14 | Account authorization, URL templates, bytes and media/filename handling |
-| `Blob/copy` | 8620 §6.3 | M15 | Authorized blob copying and defined errors for inaccessible source/destination |
+| `Blob/copy` | 8620 §6.3 | M15 | Distinct-account copy contract: same accessible account is `invalidArguments`; unavailable destination/source is `accountNotFound`/`fromAccountNotFound`; successful cross-account copy is unreachable in v1 |
 | `PushSubscription/get` | 8620 §7.2.1 | M13 | Empty actual registration set; requested absent IDs reported correctly; explicit `url` or `keys` projection gets method-level `forbidden`, even for an empty set |
 | `PushSubscription/set` | 8620 §7.2.2 | M13 | Registration creation refused as `forbidden`; no outbound URL request; absent update/destroy IDs use `notFound` |
 | EventSource HTTP endpoint | 8620 §7.3 | M13 | StateChange event, type filtering, ping, closeafter, authenticated reconnect; no held read view |
@@ -246,3 +246,20 @@ must split grouped rows when their coverage differs. Capability enablement
 requires every mandatory row, not just the current client inventory. External
 push registration refusal, read-only identities and uncomputable query changes
 are real policy/error tests, never missing handlers disguised as conformance.
+
+## Core Blob/copy worker coverage
+
+The retained Core dispatcher implements RFC 8620 §6.3 for the single-account
+profile. It validates the required `fromAccountId`, `accountId` and `blobIds`,
+rejects unknown arguments, and walks the blob array under the retained-source
+work and deadline bounds. Generic valid foreign IDs remain valid inputs.
+The get/set object limit does not apply to Blob/copy: §6.3 defines no such
+method limit or requestTooLarge error. Duplicates do not allocate an index.
+After validation, unavailable destination and source accounts receive
+`accountNotFound` and `fromAccountNotFound`, respectively; destination takes
+precedence when both are unavailable. Copying within the sole accessible
+account is `invalidArguments`: this profile interprets §6.3's distinct-account
+wording consistently with §5.4's explicit rule and Cyrus's copy parser. No distinct accessible pair exists in this profile, so no successful
+copy or per-blob mutation is reachable. Tests cover result references,
+capability opt-in, phase expiry and continued later calls. This worker evidence
+does not activate discovery or the HTTP API.

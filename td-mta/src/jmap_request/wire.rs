@@ -412,6 +412,7 @@ mod tests {
                 preflight.finish().unwrap(),
                 retention,
                 Deadline::after(Tick(0), 90).unwrap(),
+                crate::ids::AccountId::from_bytes([1; 16]),
             )
             .unwrap();
             let mut encoder = completed.encoder().unwrap();
@@ -476,6 +477,7 @@ mod tests {
                 preflight.finish().unwrap(),
                 retention,
                 Deadline::after(Tick(0), 90).unwrap(),
+                crate::ids::AccountId::from_bytes([1; 16]),
             )
             .unwrap();
             {
@@ -512,6 +514,7 @@ mod tests {
                 preflight.finish().unwrap(),
                 retention,
                 Deadline::after(Tick(0), 90).unwrap(),
+                crate::ids::AccountId::from_bytes([1; 16]),
             )
             .unwrap();
             std::fs::OpenOptions::new()
@@ -552,6 +555,7 @@ mod tests {
                 preflight.finish().unwrap(),
                 retention,
                 Deadline::after(Tick(0), 90).unwrap(),
+                crate::ids::AccountId::from_bytes([1; 16]),
             )
             .unwrap();
             let mut encoder = completed.encoder().unwrap();
