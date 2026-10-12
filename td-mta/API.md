@@ -8491,3 +8491,42 @@ Failure or incomplete finish provides no retry handoff.
 The adapter emits one EmailBodyValue object. Selection, partId map keys,
 bodyValues map framing, request limits, final response admission and complete
 Email/get dispatch remain external. This does not advertise Mail capability.
+
+## Native bodyValues map
+
+`blob_body_values::Cursor` consumes the original native value selection and
+emits one `"bodyValues":{...}` member. Selected ordinal keys are emitted once
+in ascending original preorder. Empty selection emits an empty object. A
+`NeedValue(ordinal)` result lets the caller lend reusable metadata, scratch,
+transfer-input and checkpoint buffers to a single child via `begin_value`.
+The child reinterprets that original part, checks its descriptor, node and
+text kind against the retained fact, and then streams its EmailBodyValue
+object directly to the caller's response window. Healthy consuming child
+finish releases those short borrows and advances the parent; the caller can
+reuse the same buffers for every selected part.
+
+The parent retains the original pin, work/header budgets, traversal and
+selection throughout. Child creation reborrows those owners without reopening
+a read view or creating quotas. The original selector's fact provenance and
+account authorization remain caller preconditions. Passive fact checks do
+not authenticate arbitrary caller-fabricated metadata.
+
+Until failure, native checks fence construction, child transitions, polling,
+explicit checks and consuming finish. Child operations delegate their native
+postchecks to blob_part and blob_body_value, including their failure paths;
+the map preserves those typed refusals. Parent framing and child metadata use
+the supplied job Tick; text encoding uses its supplied sampled Clock and
+existing checked-clock rules. Both must represent the enclosing worker's
+actual monotonic time. Late native refusal overrides that live turn's result;
+latched errors are returned unchanged thereafter. Empty output does not
+advance parent framing, but a metadata child can progress without producing
+bytes. Dropping or forgetting a child before healthy finish leaves the parent
+busy, so it cannot complete or yield another value. Failed or unfinished
+children provide no retry handoff.
+
+All emitted bytes remain provisional until successful parent finish and final
+response admission. `value` is only a passive completion observation. The
+finished map returns the original selection handoff; it adds no account
+permission or capability advertisement. Outer Email object composition,
+preview, full Email/get dispatch and aggregate response admission remain
+separate.

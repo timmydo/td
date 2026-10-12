@@ -2,7 +2,7 @@
 use super::*;
 use crate::blob_body_lists::tests::{self as fixture, Lists, Storage, Timer};
 use crate::{blob_part, nfc::Scratch};
-fn exercise(
+pub(crate) fn exercise(
     bytes: &[u8],
     test: impl FnOnce(blob_body_lists::Retained<'_, '_, '_, '_, '_, '_, '_>, &[Fact], &Timer),
 ) {
@@ -62,7 +62,7 @@ fn drain(cursor: &mut Cursor<'_, '_, '_, '_, '_, '_, '_, '_, '_>) -> Result<(), 
     }
     panic!("selection stalled");
 }
-const SOURCE: &[u8] = b"Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\np\r\n--x\r\nContent-Type: text/html\r\n\r\n<h>\r\n--x\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\r\ni\r\n--x\r\nContent-Type: text/calendar\r\nContent-Disposition: attachment\r\n\r\nc\r\n--x--\r\n";
+pub(crate) const SOURCE: &[u8] = b"Content-Type: multipart/mixed;boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\np\r\n--x\r\nContent-Type: text/html\r\n\r\n<h>\r\n--x\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\n\r\ni\r\n--x\r\nContent-Type: text/calendar\r\nContent-Disposition: attachment\r\n\r\nc\r\n--x--\r\n";
 #[test]
 fn flags_select_text_union_once_in_preorder_and_keep_original_owners() {
     exercise(SOURCE, |mut original, facts, _| {

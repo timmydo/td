@@ -4600,3 +4600,25 @@ interpretation allowance. Typed consuming release is passive and available
 only after complete healthy encoding; the native owner freshly checks before
 releasing those original borrows. Remaining input bytes/checkpoints are
 returned as their original windows, without copying or allocating replacements.
+
+## Native bodyValues map storage
+
+The parent fits 1 KiB and its single borrowed child fits 8 KiB, including
+inline metadata and value cursor slots. Neither allocates. Reusable caller
+storage comprises one set of metadata windows, one Scratch, one transfer
+input window capped at 6 KiB and fixed checkpoints. These are additional to
+the original admitted structure, selection/facts and response output window;
+no per-selected-part value buffer or whole-body retention is introduced.
+
+Each parent copy writes at most 64 bytes and charges one original work record
+and interpretation step, plus its exact emitted bytes before copying. Stage
+interpretation Credit additionally costs ceil(T/16) records for T framing
+turns; unused credit is discarded at finish. Deadline checks, empty output,
+NeedValue and cached completion add no positive parent charge. Child metadata
+and decoding preserve their existing original-budget charges. Child bytes go
+directly to the response window, without a second staging-copy charge.
+
+Selection traversal and map framing are linear in selected parts and emitted
+framing bytes. Metadata replay and body decoding retain their original bounds
+and native I/O charges. This compositional ceiling is not whole-worker or
+pinned-musl memory qualification.
