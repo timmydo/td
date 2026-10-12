@@ -149,7 +149,7 @@ impl<'v, 'c> Input<'_, 'v, 'c, '_, '_, '_> {
             Selection::Headers => mime_headers::json::Cursor::new(
                 mime_headers::json::Input {
                     source: self.view.bytes,
-                    base: 0,
+                    base: self.view.base,
                     source_end: self.view.source_end,
                     header_limit: self.header_limit,
                 },
@@ -162,7 +162,7 @@ impl<'v, 'c> Input<'_, 'v, 'c, '_, '_, '_> {
             Selection::Value(property) => header_value::Cursor::new(
                 header_value::Input {
                     bytes: self.view.bytes,
-                    base: 0,
+                    base: self.view.base,
                     source_end: self.view.source_end,
                     header_limit: self.header_limit,
                     property,

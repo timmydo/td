@@ -314,3 +314,307 @@ fn read_edges_and_scanner_work_keep_exact_limits() {
         assert!(cursor.value().is_none());
     });
 }
+
+fn rescan(view: View<'_>, limit: u64, work: &mut Meter) -> mime_headers::End {
+    let mut scanner = Scanner::new(view.base, limit);
+    let mut position = 0;
+    for _ in 0..10_000 {
+        let step = scanner
+            .poll(
+                &view.bytes[position..],
+                view.source_end == SourceEnd::Eof,
+                Tick(1),
+                work,
+            )
+            .unwrap();
+        position += step.consumed;
+        match step.status {
+            mime_headers::Status::Complete(end) => return end,
+            mime_headers::Status::NeedInput => panic!("retained header witness is incomplete"),
+            _ => {}
+        }
+    }
+    panic!("retained header witness did not complete");
+}
+#[test]
+fn clipped_entity_offsets_and_split_witness_replay_are_exact() {
+    for body in [
+        b"".as_slice(),
+        b"Subject: x\r\n\r\nbody",
+        b"X:y",
+        b"X:y\r",
+        b" bad body",
+        b"bad body\r\nmore",
+        b"\rx",
+        b"AAAA",
+        b"X:y\n\n",
+        b"X:y\r\n\r",
+        b"X:y\r\n\rZ",
+        b"X:y\r\r",
+    ] {
+        let mut stored = b"outer prefix\r\n".to_vec();
+        let base = stored.len();
+        stored.extend_from_slice(body);
+        let end = stored.len();
+        stored.extend_from_slice(b"Subject: outside\r\n\r\n");
+        pinned(&stored, |mut source, _| {
+            let mut work = work();
+            let mut buffer = [0; 128];
+            let mut cursor = Cursor::new_extent(
+                &mut source,
+                base as u64..end as u64,
+                100,
+                &mut buffer,
+                &mut work,
+                Tick(1),
+            )
+            .unwrap();
+            complete(&mut cursor);
+            let expected = cursor.value().unwrap().end;
+            let consumed = cursor.consumed;
+            let filled = cursor.filled;
+            let (view, remaining) = cursor.finish_split(Tick(1)).unwrap();
+            assert_eq!(view.base, base as u64);
+            assert_eq!(view.end, expected);
+            assert_eq!(view.bytes, &body[..view.bytes.len()]);
+            assert_eq!(view.bytes.len(), consumed + usize::from(consumed < filled));
+            assert_eq!(view.bytes.len() + remaining.len(), 128);
+            assert_eq!(
+                view.source_end,
+                if view.bytes.len() == body.len() {
+                    SourceEnd::Eof
+                } else {
+                    SourceEnd::Prefix
+                }
+            );
+            remaining.fill(0xa5);
+            assert_eq!(rescan(view, 100, &mut work), expected);
+        });
+    }
+}
+#[test]
+fn one_arena_retains_multiple_disjoint_entity_headers() {
+    let first = b"A: one\r\n\r\nbody-one";
+    let second = b"B: two\n\nbody-two";
+    let mut stored = first.to_vec();
+    stored.extend_from_slice(second);
+    pinned(&stored, |mut source, _| {
+        let mut work = work();
+        let mut arena = [0; 256];
+        let mut cursor = Cursor::new_extent(
+            &mut source,
+            0..first.len() as u64,
+            100,
+            &mut arena,
+            &mut work,
+            Tick(1),
+        )
+        .unwrap();
+        complete(&mut cursor);
+        let (first_view, remaining) = cursor.finish_split(Tick(1)).unwrap();
+        let saved = first_view.bytes.to_vec();
+        let mut cursor = Cursor::new_extent(
+            &mut source,
+            first.len() as u64..stored.len() as u64,
+            100,
+            remaining,
+            &mut work,
+            Tick(1),
+        )
+        .unwrap();
+        complete(&mut cursor);
+        let (second_view, remaining) = cursor.finish_split(Tick(1)).unwrap();
+        remaining.fill(0xa5);
+        assert_eq!(first_view.bytes, saved);
+        assert_eq!(first_view.base, 0);
+        assert_eq!(second_view.base, first.len() as u64);
+        assert_eq!(rescan(first_view, 100, &mut work), first_view.end);
+        assert_eq!(rescan(second_view, 100, &mut work), second_view.end);
+        assert!(remaining.len() > 200);
+    });
+}
+#[test]
+fn entity_range_and_split_handoff_require_original_freshness() {
+    pinned(b"X:y\n\nbody", |mut source, _| {
+        let mut work = work();
+        let mut buffer = [0; 128];
+        for extent in [20..20, 10..10, std::ops::Range { start: 3, end: 2 }, 0..20] {
+            assert!(matches!(
+                Cursor::new_extent(&mut source, extent, 100, &mut buffer, &mut work, Tick(1)),
+                Err(Error::Range)
+            ));
+        }
+        let mut empty = [];
+        let mut cursor =
+            Cursor::new_extent(&mut source, 9..9, 100, &mut empty, &mut work, Tick(1)).unwrap();
+        complete(&mut cursor);
+        let (view, remaining) = cursor.finish_split(Tick(1)).unwrap();
+        assert!(view.bytes.is_empty());
+        assert!(remaining.is_empty());
+        assert_eq!(view.base, 9);
+        assert_eq!(view.source_end, SourceEnd::Eof);
+        assert_eq!(
+            view.end,
+            mime_headers::End {
+                header_bytes: 0,
+                body_start: 9
+            }
+        );
+        let cursor =
+            Cursor::new_extent(&mut source, 0..9, 100, &mut buffer, &mut work, Tick(1)).unwrap();
+        assert!(matches!(cursor.finish_split(Tick(1)), Err(Error::State)));
+    });
+    for native in [false, true] {
+        pinned(b"X:y\n\nbody", |mut source, timer| {
+            let mut work = work();
+            let mut buffer = [0; 128];
+            let mut cursor =
+                Cursor::new_extent(&mut source, 0..9, 100, &mut buffer, &mut work, Tick(1))
+                    .unwrap();
+            complete(&mut cursor);
+            if native {
+                timer.0.store(100, Ordering::Relaxed);
+            }
+            let now = if native { Tick(1) } else { Tick(100) };
+            let expected = if native {
+                Error::Policy(PolicyError::Deadline)
+            } else {
+                Error::Work(Stop::Deadline)
+            };
+            assert!(matches!(cursor.finish_split(now), Err(error) if error == expected));
+        });
+    }
+}
+
+#[test]
+fn exhaustive_scanner_completion_witness_needs_at_most_one_unconsumed_byte() {
+    const ALPHABET: &[u8] = b"X: \r\n";
+    for length in 0..=6u32 {
+        for mut encoded in 0..ALPHABET.len().pow(length) {
+            let mut prefix = vec![0; length as usize];
+            for byte in &mut prefix {
+                *byte = ALPHABET[encoded % ALPHABET.len()];
+                encoded /= ALPHABET.len();
+            }
+            for suffix in [b"".as_slice(), b"\n\nbody tail"] {
+                let mut bytes = prefix.clone();
+                bytes.extend_from_slice(suffix);
+                for width in [1, 3, bytes.len().max(1)] {
+                    let mut meter = work();
+                    let mut scanner = Scanner::new(10000, 100);
+                    let mut filled = width.min(bytes.len());
+                    let mut consumed = 0;
+                    let mut end = None;
+                    for _ in 0..100 {
+                        let step = scanner
+                            .poll(
+                                &bytes[consumed..filled],
+                                filled == bytes.len(),
+                                Tick(1),
+                                &mut meter,
+                            )
+                            .unwrap();
+                        consumed += step.consumed;
+                        match step.status {
+                            mime_headers::Status::Complete(value) => {
+                                end = Some(value);
+                                break;
+                            }
+                            mime_headers::Status::NeedInput => {
+                                assert_eq!(consumed, filled);
+                                assert!(filled < bytes.len());
+                                filled = (filled + width).min(bytes.len());
+                            }
+                            _ => {}
+                        }
+                    }
+                    let end = end.unwrap();
+                    let retained = consumed + usize::from(consumed < filled);
+                    let view = View {
+                        bytes: &bytes[..retained],
+                        base: 10000,
+                        end,
+                        source_end: if retained == bytes.len() {
+                            SourceEnd::Eof
+                        } else {
+                            SourceEnd::Prefix
+                        },
+                    };
+                    assert_eq!(
+                        rescan(view, 100, &mut meter),
+                        end,
+                        "source={bytes:?}, width={width}"
+                    );
+                }
+            }
+        }
+    }
+}
+#[test]
+fn deep_entity_multi_read_limit_and_split_match_zero_base() {
+    let mut entity = b"X:".to_vec();
+    entity.extend(vec![b'a'; 8189]);
+    entity.extend_from_slice(b"\n\n");
+    entity.extend(vec![b'b'; 20000]);
+    for base in [0, 20000] {
+        let mut stored = vec![b'z'; base];
+        stored.extend_from_slice(&entity);
+        let end = stored.len() as u64;
+        pinned(&stored, |mut source, _| {
+            for split in [false, true] {
+                let mut meter = work();
+                let mut buffer = vec![0; 8194];
+                let mut cursor = Cursor::new_extent(
+                    &mut source,
+                    base as u64..end,
+                    8192,
+                    &mut buffer,
+                    &mut meter,
+                    Tick(1),
+                )
+                .unwrap();
+                complete(&mut cursor);
+                assert!(cursor.filled > 2 * READ_BYTES);
+                let view = if split {
+                    cursor.finish_split(Tick(1)).unwrap().0
+                } else {
+                    cursor.finish(Tick(1)).unwrap()
+                };
+                assert_eq!(view.end.header_bytes, 8192);
+                assert_eq!(view.end.body_start, base as u64 + 8193);
+                assert_eq!(view.source_end, SourceEnd::Prefix);
+                assert_eq!(rescan(view, 8192, &mut meter), view.end);
+            }
+            let mut meter = work();
+            let mut buffer = vec![0; 8193];
+            let mut cursor = Cursor::new_extent(
+                &mut source,
+                base as u64..end,
+                8191,
+                &mut buffer,
+                &mut meter,
+                Tick(1),
+            )
+            .unwrap();
+            let mut failure = None;
+            for _ in 0..20000 {
+                match cursor.poll(Tick(1)) {
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    Ok(Status::Complete) => panic!("oversized header was accepted"),
+                    Ok(Status::Yield) => {}
+                }
+            }
+            assert_eq!(
+                failure,
+                Some(Error::Headers(mime_headers::Error::HeaderLimit))
+            );
+            assert!(matches!(
+                cursor.finish_split(Tick(1)),
+                Err(Error::Headers(mime_headers::Error::HeaderLimit))
+            ));
+        });
+    }
+}

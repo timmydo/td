@@ -685,3 +685,54 @@ fn admitted_unknown_text_grammar_preserves_existing_refusal() {
         );
     }
 }
+
+#[test]
+fn nonzero_entity_header_projection_never_reads_sibling_headers() {
+    let _guard = FIXTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let timer = Timer(AtomicU64::new(1));
+    let mut prefix = b"Subject: outer\r\n\r\n".to_vec();
+    prefix.resize(20000, b'x');
+    let entity = b"Subject: inner\r\n\r\nbody";
+    let mut bytes = prefix.to_vec();
+    bytes.extend_from_slice(entity);
+    let end = bytes.len();
+    bytes.extend_from_slice(b"Subject: sibling\r\n\r\n");
+    crate::store_fs::with_pinned_fixture(&bytes, &timer, |mut source| {
+        let mut work = work();
+        let mut buffer = [0; 128];
+        let mut reader = Reader::new_extent(
+            &mut source,
+            prefix.len() as u64..end as u64,
+            100,
+            &mut buffer,
+            &mut work,
+            Tick(1),
+        )
+        .unwrap();
+        collect(&mut reader);
+        let mut budget = HeaderBudget::new();
+        let mut scratch = Scratch::new();
+        assert_eq!(reader.value().unwrap().base, prefix.len() as u64);
+        assert_eq!(
+            reader.value().unwrap().end.body_start,
+            prefix.len() as u64 + 18
+        );
+        let mut input = reader
+            .into_json(&mut budget, &mut scratch, Tick(1))
+            .unwrap();
+        let mut cursor = input
+            .project(Selection::Value(property("subject")), Tick(1))
+            .unwrap();
+        assert_eq!(drain(&mut cursor, 1), br#""inner""#);
+        cursor.finish(Tick(1)).unwrap();
+        let mut cursor = input.project(Selection::Headers, Tick(1)).unwrap();
+        assert_eq!(
+            drain(&mut cursor, 1),
+            br#"[{"name":"Subject","value":" inner"}]"#
+        );
+        cursor.finish(Tick(1)).unwrap();
+        input.finish(Tick(1)).unwrap();
+    });
+}

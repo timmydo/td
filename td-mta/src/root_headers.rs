@@ -1,4 +1,4 @@
-//! Retain bounded root-header input from one verified native blob.
+//! Retain bounded entity-header input from one verified native blob.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     header_select::SourceEnd,
@@ -14,16 +14,18 @@ pub enum Error {
     Work(Stop),
     Headers(mime_headers::Error),
     Capacity,
+    Range,
     State,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Policy(error) => write!(f, "root header source: {error}"),
-            Self::Work(error) => write!(f, "root header work: {error}"),
-            Self::Headers(error) => write!(f, "root headers: {error}"),
-            Self::Capacity => f.write_str("root header storage too small"),
-            Self::State => f.write_str("invalid root header read state"),
+            Self::Policy(error) => write!(f, "entity header source: {error}"),
+            Self::Work(error) => write!(f, "entity header work: {error}"),
+            Self::Headers(error) => write!(f, "entity headers: {error}"),
+            Self::Capacity => f.write_str("entity header storage too small"),
+            Self::Range => f.write_str("invalid entity header extent"),
+            Self::State => f.write_str("invalid entity header read state"),
         }
     }
 }
@@ -37,6 +39,7 @@ pub enum Status {
 #[derive(Clone, Copy)]
 pub struct View<'b> {
     pub bytes: &'b [u8],
+    pub base: u64,
     pub source_end: SourceEnd,
     pub end: mime_headers::End,
 }
@@ -47,6 +50,7 @@ pub struct Cursor<'p, 'v, 'c, 'b, 'w> {
     work: &'w mut Meter,
     buffer: &'b mut [u8],
     scanner: Scanner,
+    base: u64,
     total: u64,
     header_limit: u64,
     ceiling: usize,
@@ -64,9 +68,25 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
         work: &'w mut Meter,
         now: Tick,
     ) -> Result<Self, Error> {
+        let total = source.len();
+        Self::new_extent(source, 0..total, header_limit, buffer, work, now)
+    }
+    /// Collect an already-clipped, authorized entity within the same native blob.
+    /// Bounds and header bytes are passive evidence, not MIME-part authority.
+    pub fn new_extent(
+        source: &'p mut PinnedBlob<'v, 'c>,
+        extent: std::ops::Range<u64>,
+        header_limit: u64,
+        buffer: &'b mut [u8],
+        work: &'w mut Meter,
+        now: Tick,
+    ) -> Result<Self, Error> {
         source.check_deadline().map_err(Error::Policy)?;
         work.charge(now, Charge::default()).map_err(Error::Work)?;
-        let total = source.len();
+        let total = extent.end.checked_sub(extent.start).ok_or(Error::Range)?;
+        if extent.end > source.len() {
+            return Err(Error::Range);
+        }
         let required = usize::try_from(total.min(header_limit.saturating_add(2)))
             .map_err(|_| Error::Capacity)?;
         if buffer.len() < required {
@@ -78,7 +98,8 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             source,
             work,
             buffer,
-            scanner: Scanner::new(0, header_limit),
+            scanner: Scanner::new(extent.start, header_limit),
+            base: extent.start,
             total,
             header_limit,
             ceiling,
@@ -134,7 +155,12 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             let output = self.buffer.get_mut(self.filled..end).ok_or(Error::State)?;
             let read = self
                 .source
-                .read_at(self.filled as u64, output)
+                .read_at(
+                    self.base
+                        .checked_add(self.filled as u64)
+                        .ok_or(Error::State)?,
+                    output,
+                )
                 .map_err(Error::Policy)?;
             if read == 0 || read > count {
                 return Err(Error::Policy(PolicyError::Corrupt));
@@ -182,6 +208,7 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
         }
         Some(View {
             bytes: self.buffer.get(..self.filled)?,
+            base: self.base,
             source_end: self.source_end(),
             end: self.end?,
         })
@@ -204,9 +231,42 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
         let source_end = self.source_end();
         Ok(View {
             bytes: self.buffer.get(..self.filled).ok_or(Error::State)?,
+            base: self.base,
             source_end,
             end,
         })
+    }
+    /// Freeze only the complete header witness and return unused arena capacity.
+    /// A nonconsumed lookahead byte may prove liberal end-of-headers; retain it.
+    /// The returned view is passive and the caller retains the original pin/job.
+    pub fn finish_split(mut self, now: Tick) -> Result<(View<'b>, &'b mut [u8]), Error> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        self.check(now)?;
+        let end = self.end.ok_or(Error::State)?;
+        let retained = self
+            .consumed
+            .checked_add(usize::from(self.consumed < self.filled))
+            .ok_or(Error::State)?;
+        let source_end = if retained as u64 == self.total {
+            SourceEnd::Eof
+        } else {
+            SourceEnd::Prefix
+        };
+        let (bytes, remaining) = self
+            .buffer
+            .split_at_mut_checked(retained)
+            .ok_or(Error::State)?;
+        Ok((
+            View {
+                bytes,
+                base: self.base,
+                source_end,
+                end,
+            },
+            remaining,
+        ))
     }
     pub fn into_json<'h>(
         self,
@@ -235,6 +295,7 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             self.work,
             View {
                 bytes,
+                base: self.base,
                 source_end,
                 end,
             },

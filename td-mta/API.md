@@ -8167,3 +8167,33 @@ child extents still need the delimiter preceding_end clamp. The inline
 native owner fits 512 bytes; its caller backing and native connection remain
 separate reservations. Complete MIME traversal and Email/get integration
 remain separate; this path adds no whole-body buffering.
+
+## Clipped entity header input
+
+root_headers::Cursor::new_extent collects the root headers of one already
+clipped and authorized raw entity within the retained PinnedBlob. The range
+must be ordered and lie within the blob; child clipping and MIME-part
+identity remain the traversal owner's responsibility. The existing new
+entry point remains the whole-blob shorthand with unchanged costs and
+capacity rules. Each read stays within the supplied extent. View.base and
+all scanner/header end offsets use its absolute source base; SourceEnd::Eof
+means the whole entity extent is present, not the whole enclosing blob.
+Native header JSON uses that base for both header arrays and typed values.
+
+Consuming finish_split performs the existing fresh native/job check and
+requires complete collection. It freezes the consumed prefix plus at most
+one available lookahead byte, returning a passive View and the disjoint
+unused mutable backing. The shared liberal scanner may establish end of
+headers from a byte it examined without consuming; that byte is necessary
+replay evidence even when body_start precedes it. SourceEnd reflects this
+retained prefix's actual extent coverage. No EOF or separator is fabricated.
+The ordinary finish and JSON handoff keep their existing full-read prefix.
+
+A caller can use returned backing for subsequent entities while keeping
+prior views immutable. This adds no arena or allocation; backing must be
+reserved by the enclosing traversal, and retained input may include a
+non-header witness. Recognized-header accounting and resident witness
+capacity remain distinct limits. Every subsequent read and interpretation
+uses the original job and header budgets and retains the original native
+snapshot through publication. These passive header views do not bind a
+complete MIME tree or authorize a response.

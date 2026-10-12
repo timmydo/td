@@ -1227,6 +1227,16 @@ charge their existing costs. No heap allocation occurs in the adapters by
 inspection; this is not a native-allocation, stack or RSS measurement.
 The existing resident traversal's layout and reservations are unchanged.
 
+Clipped entity header collection reuses root_headers' existing 512-byte
+owner ceiling and bounded read/scanner turns. The source base adds no new
+backing. finish_split returns the consumed header witness plus at most one
+already-read lookahead byte and releases the disjoint remainder for another
+entity. There is no allocation or copying in this split. Callers reserve
+aggregate resident witness capacity independently of recognized-header
+accounting; tentative names and liberal non-header terminators can retain
+bytes outside that recognized count. This does not create or qualify a
+whole-worker arena, native stack or RSS reservation.
+
 M06ce's private protocol Reader, delimiter Core and metadata context poll
 replace their former inline mechanisms. Public cursor bounds and original
 per-turn charging are unchanged. Detached shared delimiter State fits eight
