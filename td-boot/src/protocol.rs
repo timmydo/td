@@ -237,6 +237,15 @@ pub const CRYPTSETUP: &str = "cryptsetup";
 pub const VOLUME_KEY_MEMBER: &str = "td-volume-key-v1";
 #[allow(dead_code)]
 pub const VOLUME_KEY_BYTES: usize = 64;
+// The protected tier's admission record (td-install/ENCRYPTION.md "Verified
+// account handoff"): td-kexec's `--fds-key-admit` appends it after the key,
+// as the same archive's second member under this rootfs-relative name and
+// of exactly this many bytes, and the deployment initramfs's `td-boot admit`
+// moves it to the system's /run. A permanent v1 contract, as the key's is.
+#[allow(dead_code)]
+pub const ADMIT_MEMBER: &str = "td-admit-v1";
+#[allow(dead_code)]
+pub const ADMIT_RECORD_BYTES: usize = 46;
 // The device-mapper name the deployment initramfs opens a td LUKS2 volume
 // under, so its dm uuid is `CRYPT-LUKS2-<hex UUID>-td-system`. The selector's
 // own, `td-selector` (selector_release.rs), does not survive kexec, so the

@@ -132,7 +132,8 @@ tier is planned to add no surface ("Unsafe and syscall surfaces" there).
 td-tpm's signing commands are bytes over its safe file I/O, in the same
 sessions. td-secret keeps its own §15 surface, and the planned
 `td-fat` forbids `unsafe` as td-fido does. PIN entry is secret-line's existing surface (§3),
-the admission record rides td-kexec's existing calls (§1), the event log
+the admission record rides td-kexec's existing calls (§1, where
+`--fds-key-admit` is current), the event log
 and power-supply reads are file reads, and securityfs and the optional
 Secure Boot enrollment's efivarfs are mounted through td-init's existing
 `mount` applet, and the selector attaches a verified `root.erofs` with
@@ -286,7 +287,11 @@ instruction, `syscall5`, copied from `sys.rs` and the crate's only scoped
   descriptor that `memfd_create` returned. These serve only `--fds-key`,
   the device-bound volume key handoff (`td-install/ENCRYPTION.md`
   increment 6, "Boot and authority boundaries"), which the installed
-  selector, td-boot, invokes for an encrypted volume.
+  selector, td-boot, invokes for an encrypted volume, and
+  `--fds-key-admit`, the same handoff that also appends the protected
+  tier's 46-byte admission record from a second pipe as the archive's
+  second member (increment 8d, "Verified account handoff"), through the
+  same calls and the same std open and reads.
 
 No descriptor is adopted: the memfd stays a raw number, released at exit
 or by the kexec, and td-kexec writes it through a second open of
@@ -294,8 +299,9 @@ or by the kexec, and td-kexec writes it through a second open of
 seals, since `kexec_file_load` refuses an initramfs open for writing.
 Adopting the descriptor into a `File`, or closing it, would be a second
 scoped `#[allow]` or a further syscall and amends this section. Key
-material reaches td-kexec only by descriptor: a pipe named
-`/proc/<pid>/fd/<n>`, never argv or the environment. A `kexec_file_load`
+material, and the admission record beside it, reach td-kexec only by
+descriptor: a pipe named `/proc/<pid>/fd/<n>`, never argv or the
+environment. A `kexec_file_load`
 that fails with ENOMEM is retried once after td-kexec writes `1` to
 `/proc/sys/vm/drop_caches` through std, which is no request of its own:
 the installed selector's page cache holds the root image it hashed

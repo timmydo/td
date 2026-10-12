@@ -22,10 +22,14 @@
 //! Usage: `td-kexec <kernel> <initramfs|-> <cmdline>`
 //!        `td-kexec --fds <cmdline>` (kernel on fd 0, initramfs on fd 1)
 //!        `td-kexec --fds-key <initramfs sha256> <key pipe> <cmdline>`
+//!        `td-kexec --fds-key-admit <initramfs sha256> <key pipe> <record pipe> <cmdline>`
 //!   `<initramfs>` == "-" boots with no initramfs (`KEXEC_FILE_NO_INITRAMFS`).
 //!   `--fds-key` takes the kernel and initramfs as `--fds` does and the volume
 //!   key from a pipe named `/proc/<pid>/fd/<n>`, never from argv or the
 //!   environment (td-install/ENCRYPTION.md "Boot and authority boundaries").
+//!   `--fds-key-admit` also takes the protected tier's admission record from
+//!   a second pipe named the same way, under the key's rules, and appends it
+//!   as the archive's second member ("Verified account handoff").
 #![deny(unsafe_code)]
 
 // The handoff's archive member and key length, which the deployment
@@ -98,6 +102,9 @@ const COPY_CHUNK: usize = 64 * 1024;
 // Owner-read only; the deployment initramfs removes it before starting the
 // system.
 const VOLUME_KEY_MODE: u32 = 0o400;
+// The admission record's member has the key's mode; the deployment
+// initramfs's `td-boot admit` moves it to the system's /run.
+const ADMIT_RECORD_MODE: u32 = 0o400;
 // newc's fixed header length (engine/src/cpio.rs).
 const CPIO_HEADER_BYTES: usize = 110;
 
@@ -142,7 +149,9 @@ fn usage_err() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "usage: td-kexec <kernel> <initramfs|-> <cmdline>\n       td-kexec --fds <cmdline>\n       \
-         td-kexec --fds-key <initramfs sha256> </proc/PID/fd/N key pipe> <cmdline>",
+         td-kexec --fds-key <initramfs sha256> </proc/PID/fd/N key pipe> <cmdline>\n       \
+         td-kexec --fds-key-admit <initramfs sha256> </proc/PID/fd/N key pipe> \
+         </proc/PID/fd/N record pipe> <cmdline>",
     )
 }
 
@@ -156,6 +165,8 @@ enum Inputs {
     FdsKey {
         expected: [u8; 64],
         key_pipe: PathBuf,
+        /// `--fds-key-admit`'s record pipe; none for `--fds-key`.
+        record_pipe: Option<PathBuf>,
         cmdline: OsString,
     },
 }
@@ -169,16 +180,25 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> std::io::Result<Inpu
         }
         return Ok(Inputs::Fds(cmdline));
     }
-    if first == OsStr::new("--fds-key") {
+    let admits = first == OsStr::new("--fds-key-admit");
+    if admits || first == OsStr::new("--fds-key") {
         let digest = args.next().ok_or_else(usage_err)?;
         let key_pipe = args.next().ok_or_else(usage_err)?;
+        let record_pipe = if admits {
+            Some(args.next().ok_or_else(usage_err)?)
+        } else {
+            None
+        };
         let cmdline = args.next().ok_or_else(usage_err)?;
         if args.next().is_some() {
             return Err(usage_err());
         }
         return Ok(Inputs::FdsKey {
             expected: expected_digest(&digest)?,
-            key_pipe: key_pipe_path(&key_pipe)?,
+            key_pipe: pipe_path(&key_pipe, "volume key")?,
+            record_pipe: record_pipe
+                .map(|record| pipe_path(&record, "admission record"))
+                .transpose()?,
             cmdline,
         });
     }
@@ -206,9 +226,10 @@ fn expected_digest(arg: &OsStr) -> std::io::Result<[u8; 64]> {
 
 /// `/proc/<pid>/fd/<n>`, decimal and nothing else: the name of a descriptor
 /// the caller holds, as td-install names one to cryptsetup. The shape carries
-/// no secret and admits no other file; `open_key_pipe` then requires a pipe.
-fn key_pipe_path(arg: &OsStr) -> std::io::Result<PathBuf> {
-    let refuse = || invalid("the volume key must be named as /proc/<pid>/fd/<n>".to_string());
+/// no secret and admits no other file; `open_pipe` then requires a pipe.
+/// `what` names the payload: the volume key or the admission record.
+fn pipe_path(arg: &OsStr, what: &str) -> std::io::Result<PathBuf> {
+    let refuse = || invalid(format!("the {what} must be named as /proc/<pid>/fd/<n>"));
     let rest = arg.as_bytes().strip_prefix(b"/proc/").ok_or_else(refuse)?;
     let mut parts = rest.split(|byte| *byte == b'/');
     let (Some(pid), Some(b"fd"), Some(fd), None) =
@@ -231,19 +252,18 @@ fn canonical_decimal(text: &[u8]) -> bool {
 }
 
 /// Opens the named pipe end anew and refuses anything but a pipe, so the key
-/// never comes from a file that persists. Non-blocking: the caller writes the
-/// whole key and closes every write end first, so a read that would wait is
-/// a refusal rather than a selector hung on its own pipe.
-fn open_key_pipe(path: &Path) -> std::io::Result<File> {
+/// or the record never comes from a file that persists. Non-blocking: the
+/// caller writes the whole payload and closes every write end first, so a
+/// read that would wait is a refusal rather than a selector hung on its own
+/// pipe.
+fn open_pipe(path: &Path, what: &str) -> std::io::Result<File> {
     let pipe = OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)
         .open(path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("volume key pipe: {e}")))?;
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{what} pipe: {e}")))?;
     if !pipe.metadata()?.file_type().is_fifo() {
-        return Err(invalid(
-            "the volume key descriptor is not a pipe".to_string(),
-        ));
+        return Err(invalid(format!("the {what} descriptor is not a pipe")));
     }
     Ok(pipe)
 }
@@ -348,47 +368,58 @@ fn zero(bytes: &mut [u8]) {
     std::hint::black_box(bytes);
 }
 
+/// Fills `buffer` from `source` and then requires end of file: exactly
+/// `buffer.len()` bytes, the key's rule and the record's. A short or long
+/// payload is refused without naming a byte of it; `what` names it.
+fn read_exactly(source: &mut dyn Read, buffer: &mut [u8], what: &str) -> std::io::Result<()> {
+    let length = buffer.len();
+    source.read_exact(buffer).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => {
+            invalid(format!("the {what} ended before {length} bytes"))
+        }
+        std::io::ErrorKind::WouldBlock => invalid(format!(
+            "the {what} pipe held fewer than {length} bytes with a write end open"
+        )),
+        _ => e,
+    })?;
+    let mut extra = [0u8; 1];
+    loop {
+        match source.read(&mut extra) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                zero(&mut extra);
+                return Err(invalid(format!("the {what} is longer than {length} bytes")));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(invalid(format!(
+                    "the {what} pipe still has a write end open"
+                )));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The volume key, in one heap allocation of its exact length that is never
 /// moved or grown, zeroed on drop. Neither `Debug` nor `Clone`.
 struct VolumeKey(Box<[u8]>);
 
 impl VolumeKey {
-    /// Exactly `VOLUME_KEY_BYTES` and then end of file; a short or long key
-    /// is refused without naming a byte of it.
+    /// Exactly `VOLUME_KEY_BYTES` and then end of file.
     fn read(source: &mut dyn Read) -> std::io::Result<Self> {
         let mut key = VolumeKey(vec![0u8; protocol::VOLUME_KEY_BYTES].into_boxed_slice());
-        source.read_exact(&mut key.0).map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => invalid(format!(
-                "the volume key ended before {} bytes",
-                protocol::VOLUME_KEY_BYTES
-            )),
-            std::io::ErrorKind::WouldBlock => invalid(format!(
-                "the volume key pipe held fewer than {} bytes with a write end open",
-                protocol::VOLUME_KEY_BYTES
-            )),
-            _ => e,
-        })?;
-        let mut extra = [0u8; 1];
-        loop {
-            match source.read(&mut extra) {
-                Ok(0) => return Ok(key),
-                Ok(_) => {
-                    zero(&mut extra);
-                    return Err(invalid(format!(
-                        "the volume key is longer than {} bytes",
-                        protocol::VOLUME_KEY_BYTES
-                    )));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Err(invalid(
-                        "the volume key pipe still has a write end open".to_string(),
-                    ));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        read_exactly(source, &mut key.0, "volume key")?;
+        Ok(key)
     }
+}
+
+/// The admission record: exactly `ADMIT_RECORD_BYTES` and then end of file.
+/// td-boot writes and judges its fields; td-kexec only carries its bytes.
+fn read_record(source: &mut dyn Read) -> std::io::Result<[u8; protocol::ADMIT_RECORD_BYTES]> {
+    let mut record = [0u8; protocol::ADMIT_RECORD_BYTES];
+    read_exactly(source, &mut record, "admission record")?;
+    Ok(record)
 }
 
 impl Drop for VolumeKey {
@@ -397,17 +428,27 @@ impl Drop for VolumeKey {
     }
 }
 
-/// The handoff archive with zeros where the key goes, and where that is. The
-/// key itself never enters this buffer: it is written to the memfd straight
-/// from `VolumeKey` between the archive's two halves.
-fn key_archive() -> std::io::Result<(Vec<u8>, usize)> {
+/// The handoff archive with zeros where the key goes, and where that is: the
+/// key member, then `record`'s member when there is one, then the trailer.
+/// The key itself never enters this buffer: it is written to the memfd
+/// straight from `VolumeKey` between the archive's two halves.
+fn key_archive(
+    record: Option<&[u8; protocol::ADMIT_RECORD_BYTES]>,
+) -> std::io::Result<(Vec<u8>, usize)> {
     let placeholder = [0u8; protocol::VOLUME_KEY_BYTES];
-    let archive = cpio::build(&[cpio::Entry {
+    let mut entries = vec![cpio::Entry {
         name: protocol::VOLUME_KEY_MEMBER,
         mode: VOLUME_KEY_MODE,
         kind: cpio::Kind::File(&placeholder),
-    }])
-    .map_err(invalid)?;
+    }];
+    if let Some(record) = record {
+        entries.push(cpio::Entry {
+            name: protocol::ADMIT_MEMBER,
+            mode: ADMIT_RECORD_MODE,
+            kind: cpio::Kind::File(record),
+        });
+    }
+    let archive = cpio::build(&entries).map_err(invalid)?;
     // newc: the header, the name and its NUL padded to 4, then the data.
     let named = CPIO_HEADER_BYTES
         .saturating_add(protocol::VOLUME_KEY_MEMBER.len())
@@ -446,8 +487,10 @@ fn add_seals(fd: i32) -> std::io::Result<()> {
 
 /// Builds the sealed initramfs `--fds-key` hands to kexec_file_load: a copy
 /// of `initramfs`, refused unless it hashes to `expected`, padded to 4, then
-/// one newc archive holding only the volume key, read from `key` only after
-/// the copy verified. Returns the memfd's descriptor.
+/// one newc archive holding the volume key, read from `key` only after the
+/// copy verified, and for `--fds-key-admit` the admission record from
+/// `record` before it in time and after it in the archive, read only then
+/// too. Returns the memfd's descriptor.
 ///
 /// The memfd is written through a second open file of it, closed before the
 /// seals: kexec_file_load refuses an initramfs open for writing (ETXTBSY),
@@ -456,6 +499,7 @@ fn prepare_handoff(
     initramfs: &File,
     expected: &[u8; 64],
     key: &mut dyn Read,
+    record: Option<&mut dyn Read>,
 ) -> std::io::Result<i32> {
     let metadata = initramfs.metadata()?;
     if !metadata.is_file() {
@@ -504,8 +548,11 @@ fn prepare_handoff(
             String::from_utf8_lossy(expected)
         )));
     }
+    // The record is read before the key, so the key lives only from its read
+    // to its write; the archive puts it after the key.
+    let record = record.map(read_record).transpose()?;
     let padding = cpio::alignment_padding((length % 4) as usize);
-    let (archive, data_end) = key_archive()?;
+    let (archive, data_end) = key_archive(record.as_ref())?;
     let total = length
         .saturating_add(padding as u64)
         .saturating_add(archive.len() as u64);
@@ -571,14 +618,29 @@ fn refuse_initrd_retention(cmdline: &OsStr) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `--fds-key`: the kernel on fd 0 and the verified initramfs on fd 1, as
-/// `--fds`; kexec_file_load then takes the sealed copy in its place.
-fn run_fds_key(expected: &[u8; 64], key_pipe: &Path, cmdline: &OsStr) -> std::io::Result<()> {
+/// `--fds-key` and `--fds-key-admit`: the kernel on fd 0 and the verified
+/// initramfs on fd 1, as `--fds`; kexec_file_load then takes the sealed copy
+/// in its place.
+fn run_fds_key(
+    expected: &[u8; 64],
+    key_pipe: &Path,
+    record_pipe: Option<&Path>,
+    cmdline: &OsStr,
+) -> std::io::Result<()> {
     refuse_initrd_retention(cmdline)?;
-    let mut key = open_key_pipe(key_pipe)?;
+    let mut key = open_pipe(key_pipe, "volume key")?;
+    let mut record = record_pipe
+        .map(|path| open_pipe(path, "admission record"))
+        .transpose()?;
     let initramfs = File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
-    let memfd = prepare_handoff(&initramfs, expected, &mut key)?;
+    let memfd = prepare_handoff(
+        &initramfs,
+        expected,
+        &mut key,
+        record.as_mut().map(|pipe| pipe as &mut dyn Read),
+    )?;
     drop(key);
+    drop(record);
     load(0, memfd, 0, cmdline)
 }
 
@@ -594,8 +656,9 @@ fn run() -> std::io::Result<()> {
         Inputs::FdsKey {
             expected,
             key_pipe,
+            record_pipe,
             cmdline,
-        } => run_fds_key(&expected, &key_pipe, &cmdline),
+        } => run_fds_key(&expected, &key_pipe, record_pipe.as_deref(), &cmdline),
     }
 }
 
@@ -768,16 +831,54 @@ mod tests {
             Inputs::FdsKey {
                 expected,
                 key_pipe,
+                record_pipe,
                 cmdline,
             } => {
                 assert_eq!(&expected, DIGEST.as_bytes());
                 assert_eq!(key_pipe, PathBuf::from("/proc/42/fd/7"));
+                assert_eq!(record_pipe, None, "no record without the flag");
                 assert_eq!(cmdline, OsString::from("console=ttyS0"));
             }
             _ => panic!("expected the key handoff mode"),
         }
         assert!(parse_args(args(&["--fds-key", DIGEST, "/proc/42/fd/7"])).is_err());
         assert!(parse_args(args(&["--fds-key", DIGEST, "/proc/42/fd/7", "c", "extra"])).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_the_admitting_handoff_mode() {
+        let parsed = parse_args(args(&[
+            "--fds-key-admit",
+            DIGEST,
+            "/proc/42/fd/7",
+            "/proc/42/fd/8",
+            "console=ttyS0",
+        ]))
+        .unwrap();
+        match parsed {
+            Inputs::FdsKey {
+                expected,
+                key_pipe,
+                record_pipe,
+                cmdline,
+            } => {
+                assert_eq!(&expected, DIGEST.as_bytes());
+                assert_eq!(key_pipe, PathBuf::from("/proc/42/fd/7"));
+                assert_eq!(record_pipe, Some(PathBuf::from("/proc/42/fd/8")));
+                assert_eq!(cmdline, OsString::from("console=ttyS0"));
+            }
+            _ => panic!("expected the admitting handoff mode"),
+        }
+        assert!(parse_args(args(&["--fds-key-admit", DIGEST, "/proc/42/fd/7", "c"])).is_err());
+        assert!(parse_args(args(&[
+            "--fds-key-admit",
+            DIGEST,
+            "/proc/42/fd/7",
+            "/proc/42/fd/8",
+            "c",
+            "extra"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -790,15 +891,27 @@ mod tests {
                 parse_args(args(&["--fds-key", bad, "/proc/1/fd/3", "c"])).is_err(),
                 "{bad:?}"
             );
+            assert!(
+                parse_args(args(&[
+                    "--fds-key-admit",
+                    bad,
+                    "/proc/1/fd/3",
+                    "/proc/1/fd/4",
+                    "c"
+                ]))
+                .is_err(),
+                "{bad:?}"
+            );
         }
     }
 
-    /// The key operand is a descriptor's NAME: anything that is not
-    /// `/proc/<decimal>/fd/<decimal>` — a key's own bytes included — is
-    /// refused before anything is opened.
+    /// The key and record operands are descriptors' NAMES: anything that is
+    /// not `/proc/<decimal>/fd/<decimal>` — a key's own bytes included — is
+    /// refused before anything is opened, in either position.
     #[test]
     fn the_key_never_rides_argv() {
         let hex_key = "ab".repeat(protocol::VOLUME_KEY_BYTES);
+        let good = "/proc/42/fd/3";
         for bad in [
             hex_key.as_str(),
             "/proc/self/fd/3",
@@ -817,64 +930,90 @@ mod tests {
                 parse_args(args(&["--fds-key", DIGEST, bad, "c"])).is_err(),
                 "{bad:?}"
             );
+            for (key, record) in [(bad, good), (good, bad)] {
+                assert!(
+                    parse_args(args(&["--fds-key-admit", DIGEST, key, record, "c"])).is_err(),
+                    "{key:?} {record:?}"
+                );
+            }
         }
         assert!(parse_args(args(&["--fds-key", DIGEST, "/proc/0/fd/0", "c"])).is_ok());
+        assert!(parse_args(args(&[
+            "--fds-key-admit",
+            DIGEST,
+            "/proc/0/fd/0",
+            "/proc/0/fd/1",
+            "c"
+        ]))
+        .is_ok());
+    }
+
+    /// `/proc/<this process>/fd/<fd>`, as td-boot names a pipe it holds.
+    fn proc_name(fd: i32, what: &str) -> PathBuf {
+        pipe_path(
+            OsStr::new(&format!("/proc/{}/fd/{fd}", std::process::id())),
+            what,
+        )
+        .unwrap()
+    }
+
+    const PAYLOADS: [(&str, usize); 2] = [
+        ("volume key", protocol::VOLUME_KEY_BYTES),
+        ("admission record", protocol::ADMIT_RECORD_BYTES),
+    ];
+
+    /// Reads one payload as its mode reads it.
+    fn read_payload(what: &str, pipe: &mut File) -> std::io::Result<Vec<u8>> {
+        if what == "volume key" {
+            VolumeKey::read(pipe).map(|key| key.0.to_vec())
+        } else {
+            read_record(pipe).map(|record| record.to_vec())
+        }
     }
 
     #[test]
-    fn a_key_descriptor_that_is_not_a_pipe_is_refused() {
+    fn a_descriptor_that_is_not_a_pipe_is_refused() {
         let dir = std::env::temp_dir().join(format!("td-kexec-key-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("key");
-        std::fs::write(&path, [7u8; 64]).unwrap();
-        let file = File::open(&path).unwrap();
-        let named = key_pipe_path(OsStr::new(&format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            file.as_raw_fd()
-        )))
-        .unwrap();
-        let err = open_key_pipe(&named).unwrap_err();
-        assert!(err.to_string().contains("not a pipe"), "{err}");
+        for (what, length) in PAYLOADS {
+            let path = dir.join("payload");
+            std::fs::write(&path, vec![7u8; length]).unwrap();
+            let file = File::open(&path).unwrap();
+            let err = open_pipe(&proc_name(file.as_raw_fd(), what), what).unwrap_err();
+            assert!(err.to_string().contains("not a pipe"), "{err}");
+            assert!(err.to_string().contains(what), "{err}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_key_pipe_is_opened_anew_by_its_proc_name() {
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        writer.write_all(&[9u8; 64]).unwrap();
-        drop(writer);
-        let named = key_pipe_path(OsStr::new(&format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            reader.as_raw_fd()
-        )))
-        .unwrap();
-        let mut pipe = open_key_pipe(&named).unwrap();
-        let key = VolumeKey::read(&mut pipe).unwrap();
-        assert_eq!(&*key.0, &[9u8; 64][..]);
+    fn a_pipe_is_opened_anew_by_its_proc_name() {
+        for (what, length) in PAYLOADS {
+            let (reader, mut writer) = std::io::pipe().unwrap();
+            writer.write_all(&vec![9u8; length]).unwrap();
+            drop(writer);
+            let mut pipe = open_pipe(&proc_name(reader.as_raw_fd(), what), what).unwrap();
+            assert_eq!(read_payload(what, &mut pipe).unwrap(), vec![9u8; length]);
+        }
     }
 
     /// A write end left open is refused, not waited on: empty, short, and
-    /// whole but not yet closed.
+    /// whole but not yet closed, for the key and the record alike.
     #[test]
-    fn a_key_pipe_with_a_write_end_open_is_refused_without_waiting() {
-        for length in [0usize, 10, 64] {
-            let (reader, mut writer) = std::io::pipe().unwrap();
-            writer.write_all(&vec![9u8; length]).unwrap();
-            let named = key_pipe_path(OsStr::new(&format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                reader.as_raw_fd()
-            )))
-            .unwrap();
-            let mut pipe = open_key_pipe(&named).unwrap();
-            let err = VolumeKey::read(&mut pipe).err().unwrap();
-            assert!(
-                err.to_string().contains("write end open"),
-                "{length}: {err}"
-            );
-            drop(writer);
+    fn a_pipe_with_a_write_end_open_is_refused_without_waiting() {
+        for (what, whole) in PAYLOADS {
+            for length in [0usize, 10, whole] {
+                let (reader, mut writer) = std::io::pipe().unwrap();
+                writer.write_all(&vec![9u8; length]).unwrap();
+                let mut pipe = open_pipe(&proc_name(reader.as_raw_fd(), what), what).unwrap();
+                let err = read_payload(what, &mut pipe).err().unwrap();
+                assert!(
+                    err.to_string().contains("write end open"),
+                    "{what} {length}: {err}"
+                );
+                assert!(err.to_string().contains(what), "{err}");
+                drop(writer);
+            }
         }
     }
 
@@ -943,6 +1082,9 @@ mod tests {
         assert_eq!(protocol::VOLUME_KEY_MEMBER, "td-volume-key-v1");
         assert_eq!(protocol::VOLUME_KEY_BYTES, 64);
         assert_eq!(VOLUME_KEY_MODE, 0o400);
+        assert_eq!(protocol::ADMIT_MEMBER, "td-admit-v1");
+        assert_eq!(protocol::ADMIT_RECORD_BYTES, 46);
+        assert_eq!(ADMIT_RECORD_MODE, 0o400);
     }
 
     fn hex_field(archive: &[u8], header_at: usize, index: usize) -> u32 {
@@ -977,11 +1119,73 @@ mod tests {
         assert!(archive[trailer + 121..].iter().all(|byte| *byte == 0));
     }
 
+    /// The same independent parse of `--fds-key-admit`'s archive: the key
+    /// member exactly as above, then the record's member, a regular root
+    /// file of mode 0400 named `td-admit-v1` holding exactly the record's
+    /// 46 bytes, then the trailer.
+    fn assert_admit_archive(archive: &[u8], key: &[u8], record: &[u8]) {
+        assert_eq!(record.len(), 46);
+        // The key member, byte for byte as `--fds-key` writes it.
+        let (key_only, _) = key_archive(None).unwrap();
+        assert_eq!(&archive[..128], &key_only[..128]);
+        assert_eq!(&archive[128..192], key);
+        let member = 192;
+        assert_eq!(&archive[member..member + 6], b"070701");
+        assert_eq!(
+            hex_field(archive, member, 1),
+            0o100400,
+            "regular file, 0400"
+        );
+        assert_eq!(hex_field(archive, member, 2), 0, "uid");
+        assert_eq!(hex_field(archive, member, 3), 0, "gid");
+        assert_eq!(hex_field(archive, member, 4), 1, "nlink");
+        assert_eq!(hex_field(archive, member, 6), 46, "filesize");
+        assert_eq!(hex_field(archive, member, 11), 12, "namesize with its NUL");
+        assert_eq!(hex_field(archive, member, 12), 0, "chksum");
+        assert_eq!(&archive[member + 110..member + 122], b"td-admit-v1\0");
+        // 192 + 110 + 12 = 314, padded to 316.
+        assert_eq!(&archive[314..316], &[0, 0]);
+        assert_eq!(&archive[316..362], record);
+        // 362 padded to 364, then the trailer.
+        assert_eq!(&archive[362..364], &[0, 0]);
+        let trailer = 364;
+        assert_eq!(&archive[trailer..trailer + 6], b"070701");
+        assert_eq!(hex_field(archive, trailer, 4), 1, "trailer nlink");
+        assert_eq!(hex_field(archive, trailer, 6), 0, "trailer filesize");
+        assert_eq!(hex_field(archive, trailer, 11), 11, "trailer namesize");
+        assert_eq!(&archive[trailer + 110..trailer + 121], b"TRAILER!!!\0");
+        assert_eq!(archive.len(), trailer + 124, "trailer name padded to 4");
+        assert!(archive[trailer + 121..].iter().all(|byte| *byte == 0));
+    }
+
+    /// A 46-byte record whose every byte differs from its neighbours, as
+    /// td-boot's would: `TDADMIT1`, version, UID, method, manifest ID.
+    fn record_bytes() -> [u8; 46] {
+        let mut record = [0u8; 46];
+        record[..8].copy_from_slice(b"TDADMIT1");
+        record[8] = 1;
+        record[9..13].copy_from_slice(&1000u32.to_be_bytes());
+        record[13] = 1;
+        for (index, byte) in record[14..].iter_mut().enumerate() {
+            *byte = 0xa0 ^ index as u8;
+        }
+        record
+    }
+
     #[test]
     fn the_key_archive_layout_is_newc_with_the_key_at_128() {
-        let (archive, data_end) = key_archive().unwrap();
+        let (archive, data_end) = key_archive(None).unwrap();
         assert_eq!(data_end, 192);
         assert_key_archive(&archive, &[0u8; 64]);
+    }
+
+    /// The record follows the key; the key's place does not move.
+    #[test]
+    fn the_admitting_archive_puts_the_record_after_the_key() {
+        let record = record_bytes();
+        let (archive, data_end) = key_archive(Some(&record)).unwrap();
+        assert_eq!(data_end, 192);
+        assert_admit_archive(&archive, &[0u8; 64], &record);
     }
 
     struct Fixture {
@@ -1033,13 +1237,65 @@ mod tests {
             let fixture = Fixture::new("layout");
             let body: Vec<u8> = (0..length).map(|i| (i % 251) as u8 | 1).collect();
             let initramfs = fixture.initramfs(&body);
-            let memfd = prepare_handoff(&initramfs, &digest_of(&body), &mut &key[..]).unwrap();
+            let memfd =
+                prepare_handoff(&initramfs, &digest_of(&body), &mut &key[..], None).unwrap();
             let bytes = memfd_bytes(memfd);
             let padded = length.div_ceil(4) * 4;
             assert_eq!(&bytes[..length], &body[..], "length {length}");
             assert!(bytes[length..padded].iter().all(|byte| *byte == 0));
             assert_eq!(padded % 4, 0);
             assert_key_archive(&bytes[padded..], &key);
+        }
+    }
+
+    /// `--fds-key-admit`'s handoff: the same copy and join, then the key's
+    /// member and the record's exact 46 bytes after it, sealed as the key's
+    /// handoff is.
+    #[test]
+    fn the_admitting_handoff_carries_the_record_after_the_key() {
+        let key: Vec<u8> = (0u8..64).map(|byte| byte.wrapping_mul(7)).collect();
+        let record = record_bytes();
+        for length in [0usize, 1, 2, 3, 4, 5, 511, COPY_CHUNK + 3] {
+            let fixture = Fixture::new("admit");
+            let body: Vec<u8> = (0..length).map(|i| (i % 251) as u8 | 1).collect();
+            let initramfs = fixture.initramfs(&body);
+            let memfd = prepare_handoff(
+                &initramfs,
+                &digest_of(&body),
+                &mut &key[..],
+                Some(&mut &record[..]),
+            )
+            .unwrap();
+            let bytes = memfd_bytes(memfd);
+            let padded = length.div_ceil(4) * 4;
+            assert_eq!(&bytes[..length], &body[..], "length {length}");
+            assert!(bytes[length..padded].iter().all(|byte| *byte == 0));
+            assert_admit_archive(&bytes[padded..], &key, &record);
+            assert_eq!(
+                add_seals(memfd).unwrap_err().raw_os_error(),
+                Some(1),
+                "sealed"
+            );
+        }
+    }
+
+    /// The record is refused under the key's rules: short, long or empty.
+    #[test]
+    fn a_record_of_the_wrong_length_refuses_the_handoff() {
+        let fixture = Fixture::new("record-length");
+        let body = b"abc".to_vec();
+        let initramfs = fixture.initramfs(&body);
+        for length in [0usize, 45, 47, 92] {
+            let record = vec![1u8; length];
+            let err = prepare_handoff(
+                &initramfs,
+                &digest_of(&body),
+                &mut &[1u8; 64][..],
+                Some(&mut &record[..]),
+            )
+            .err()
+            .unwrap();
+            assert!(err.to_string().contains("admission record"), "{err}");
         }
     }
 
@@ -1050,7 +1306,8 @@ mod tests {
         let fixture = Fixture::new("seals");
         let body = b"0707010000".to_vec();
         let initramfs = fixture.initramfs(&body);
-        let memfd = prepare_handoff(&initramfs, &digest_of(&body), &mut &[3u8; 64][..]).unwrap();
+        let memfd =
+            prepare_handoff(&initramfs, &digest_of(&body), &mut &[3u8; 64][..], None).unwrap();
         let link = std::fs::read_link(format!("/proc/self/fd/{memfd}")).unwrap();
         assert_eq!(
             link.as_os_str().as_bytes(),
@@ -1152,7 +1409,8 @@ mod tests {
         let fixture = Fixture::new("writers");
         let body = b"initramfs".to_vec();
         let initramfs = fixture.initramfs(&body);
-        let memfd = prepare_handoff(&initramfs, &digest_of(&body), &mut &[4u8; 64][..]).unwrap();
+        let memfd =
+            prepare_handoff(&initramfs, &digest_of(&body), &mut &[4u8; 64][..], None).unwrap();
         if !leases_enabled(memfd) {
             return;
         }
@@ -1163,17 +1421,27 @@ mod tests {
 
     impl Read for Untouchable {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            panic!("the key was read before the copy verified");
+            panic!("the key or record was read before the copy verified");
         }
     }
 
+    /// Neither pipe is read before the copy verifies.
     #[test]
     fn a_copy_that_does_not_hash_to_the_verified_digest_is_refused_unread() {
         let fixture = Fixture::new("digest");
         let initramfs = fixture.initramfs(b"the deployment initramfs");
-        let err = prepare_handoff(&initramfs, &digest_of(b"another"), &mut Untouchable)
+        let err = prepare_handoff(&initramfs, &digest_of(b"another"), &mut Untouchable, None)
             .err()
             .unwrap();
+        assert!(err.to_string().contains("no volume key was read"), "{err}");
+        let err = prepare_handoff(
+            &initramfs,
+            &digest_of(b"another"),
+            &mut Untouchable,
+            Some(&mut Untouchable),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("no volume key was read"), "{err}");
     }
 
@@ -1182,15 +1450,15 @@ mod tests {
         let fixture = Fixture::new("short");
         let body = b"abc".to_vec();
         let initramfs = fixture.initramfs(&body);
-        assert!(prepare_handoff(&initramfs, &digest_of(&body), &mut &[1u8; 63][..]).is_err());
-        assert!(prepare_handoff(&initramfs, &digest_of(&body), &mut &[1u8; 65][..]).is_err());
+        assert!(prepare_handoff(&initramfs, &digest_of(&body), &mut &[1u8; 63][..], None).is_err());
+        assert!(prepare_handoff(&initramfs, &digest_of(&body), &mut &[1u8; 65][..], None).is_err());
     }
 
     #[test]
     fn a_non_regular_initramfs_is_refused() {
         let fixture = Fixture::new("dir");
         let dir = File::open(&fixture.dir).unwrap();
-        assert!(prepare_handoff(&dir, &digest_of(b""), &mut Untouchable).is_err());
+        assert!(prepare_handoff(&dir, &digest_of(b""), &mut Untouchable, None).is_err());
     }
 
     /// The UNSAFE.md §1 contract the compiler cannot express: which requests
@@ -1326,15 +1594,20 @@ mod tests {
         }
 
         /// The seals go on the memfd and nothing else, once, after its
-        /// writer closed; the cmdline check precedes the key pipe's open.
+        /// writer closed; the cmdline check precedes both pipes' opens, and
+        /// the one non-blocking open serves the key and the record.
         #[test]
         fn seals_only_the_memfd_and_checks_the_cmdline_first() {
             let code = production();
             assert_eq!(code.matches("add_seals(").count(), 2);
             assert!(code.contains("    drop(copy);\n    add_seals(memfd)?;\n    Ok(memfd)\n"));
             assert!(code.contains(
-                "    refuse_initrd_retention(cmdline)?;\n    let mut key = open_key_pipe(key_pipe)?;"
+                "    refuse_initrd_retention(cmdline)?;\n    \
+                 let mut key = open_pipe(key_pipe, \"volume key\")?;\n    \
+                 let mut record = record_pipe\n        \
+                 .map(|path| open_pipe(path, \"admission record\"))\n"
             ));
+            assert_eq!(code.matches("open_pipe(").count(), 3);
             assert_eq!(code.matches("custom_flags(").count(), 1);
             assert!(code.contains(".custom_flags(O_NONBLOCK)"));
         }
