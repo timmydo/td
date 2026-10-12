@@ -7957,3 +7957,46 @@ client syntax/selection and storage-capacity causes remain distinguishable.
 The caller must keep the same original Meter across polls: these passive
 cursors do not own that borrow. New Email-path allocation absence is by
 inspection; the retained allocation probe exercises the body-policy alias.
+
+## Plain body-value JSON
+
+body_value::json::Cursor composes an admitted non-HTML mime_text::Input,
+caller-owned input ring/checkpoints, body_value::Plain and td-json string
+framing into one provisional EmailBodyValue object. It writes value,
+isEncodingProblem and isTruncated in that order. Its exclusive original
+source/work borrows and retained clock survive charset prescan, decoding,
+plain filtering, JSON escaping and diagnostic suffix output. The same checked
+clock watermark covers nested reader samples and framing turns. No whole-body
+buffer or per-scalar allocation is introduced; allocation absence is an
+inspection claim, not a new measured probe scenario.
+
+Each turn performs one bounded reader operation, one plain-filter operation,
+one shared JSON-framer turn or one fixed literal copy bounded by
+MAX_CHUNK_BYTES (47 bytes).
+Empty output performs fresh admission without source progress. Transfer
+output funds every decoded byte on every pass, including discarded bytes
+past the cap and a charset prescan when needed. Plain filtering additionally
+funds projected UTF-8 bytes; JSON funds wire bytes. max_bytes counts only
+Plain's projected UTF-8 bytes. Admission must cover all of these charges,
+not merely the capped value or response size. Zero disables only that
+argument's truncation cap.
+Decoding continues to actual EOF after truncation so malformed transfer,
+charset and noncharacter tails contribute to isEncodingProblem, and later
+source/work errors still fail the whole provisional property. No NFC or HTML
+truncation is applied. The caller must select a non-HTML part.
+
+Every poll brackets work with fresh original clock/work admission, including
+cached completion. Backward time, clock, source, work and framing errors latch
+permanently and hide diagnostics. Direct reader Policy errors are lifted to
+the outer Policy variant; nested input errors retain their operation context.
+An Input(Policy) error can originate in clock or I/O checks and does not
+reliably identify disk failure. A failing post-turn clock/work check takes
+precedence over a step failure. value is passive and exists only after all
+object bytes complete; consuming finish checks admission again and refuses
+premature or failed state. The inline owner is at most 1024 bytes, excluding
+caller-backed input/checkpoints and the source itself. All emitted bytes stay
+unpublished until complete enclosing-method success. The source owner must
+retain its authorized native view/lease, and enclosing publication must check
+native custody and account/request authorization afresh. This cursor neither
+opens nor authorizes a part, creates a pin, or activates Email/get. HTML body
+values, bodyValues map selection and enclosing method composition are separate.

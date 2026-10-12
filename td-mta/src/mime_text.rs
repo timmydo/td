@@ -66,9 +66,20 @@ pub struct Reader<'r, 'b> {
     failure: Option<Error>,
 }
 // Nested transfer operations and outer scalar turns share one watermark.
-struct CheckedClock<'a> {
+pub(crate) struct CheckedClock<'a> {
     source: &'a dyn Clock,
     last: AtomicU64,
+}
+impl<'a> CheckedClock<'a> {
+    pub(crate) fn new(source: &'a dyn Clock, last: Tick) -> Self {
+        Self {
+            source,
+            last: AtomicU64::new(last.0),
+        }
+    }
+    pub(crate) fn last(&self) -> Tick {
+        Tick(self.last.load(Ordering::Relaxed))
+    }
 }
 impl Clock for CheckedClock<'_> {
     fn sample(&self) -> Result<Time, PolicyError> {
@@ -136,10 +147,7 @@ impl<'r, 'b> Reader<'r, 'b> {
         if self.phase == Phase::Complete {
             return Ok(Status::Complete);
         }
-        let clock = CheckedClock {
-            source: source_clock,
-            last: AtomicU64::new(self.last.0),
-        };
+        let clock = CheckedClock::new(source_clock, self.last);
         let result = (|| {
             let now = clock.sample().map_err(Error::Policy)?.monotonic;
             meter.charge(now, Charge::default()).map_err(Error::Work)?;
@@ -150,7 +158,7 @@ impl<'r, 'b> Reader<'r, 'b> {
                 .map_err(Error::Work)?;
             result
         })();
-        self.last = Tick(clock.last.load(Ordering::Relaxed));
+        self.last = clock.last();
         if let Err(error) = result {
             self.failure = Some(error);
         }

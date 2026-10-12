@@ -430,3 +430,7 @@ mod tests {
         assert_eq!(raw.reads, 8);
     }
 }
+
+/// Streaming non-HTML body-value JSON; source authorization remains external.
+#[path = "body_value/json.rs"]
+pub mod json;
