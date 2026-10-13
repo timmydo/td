@@ -16,6 +16,7 @@ pub mod blob_part_locators;
 pub mod blob_preview;
 pub mod blob_preview_selection;
 pub mod blob_selected_metadata;
+pub mod blob_selected_preview;
 pub mod blob_structure;
 pub mod blob_value_parts;
 pub mod body_properties;

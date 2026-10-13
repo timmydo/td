@@ -8665,3 +8665,34 @@ healthy finish returns all original owners and the choice. This component
 emits no JSON; an enclosing response admits an empty preview for no choice
 or drives the selected native part's decoder. Whole Email/get admission and
 Mail advertisement remain separate.
+
+## Selected native preview composition
+
+`blob_selected_preview::Cursor` consumes a freshly completed preview selector
+and caller-owned metadata, normalization and text input backing. It interprets
+only the chosen original part, checks the interpreted classification and
+actual Plain/Html content type and media class against the retained selection,
+checks membership in the selector-validated sorted body lists, and then drives
+native preview decoding and JSON framing. A mismatch refuses before preview
+bytes. Passive choices remain evidence from the original classification pass,
+not authorization for caller-fabricated membership.
+
+No choice emits `""` under the original native pin and work/header budgets.
+A chosen empty body stays empty; no later part is tried. One poll advances one
+metadata turn (including completion/classification and decoder admission) or
+one native preview turn, or copies one empty-string quote.
+At most six bytes are copied per poll. Every byte remains provisional until
+healthy finish; a failure hides completion and is terminal, including empty
+output, cached completion and native expiry after a copy. Metadata and empty
+stages use the caller's fresh job Tick as other native metadata cursors do;
+the decoder instead samples its supplied Clock; its stages do not use the
+caller Tick.
+
+Healthy finish returns the original selector/body-list/traversal owners,
+input ring, checkpoints and normalization scratch, plus optional preview
+diagnostics. None means no
+textual source; an empty selected part has diagnostics. Interpretation views are dropped at finish; metadata backing still shares
+the returned work lifetime. A worker that reuses that backing must scope this
+operation to a short reborrow of the outer work owner. Scratch is explicitly
+returned so it can be passed directly to the next stage. This composes one preview
+value, not the full Email/get worker or Mail capability admission.

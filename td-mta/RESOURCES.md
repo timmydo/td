@@ -4666,7 +4666,7 @@ increases that original allowance.
 ## Preview JSON composition storage
 
 The preview JSON cursor fits 2 KiB and uses the existing caller-owned text
-input storage (at most 6 KiB including checkpoints). It retains only fixed
+input storage (at most 6 KiB plus 2 KiB for checkpoints). It retains only fixed
 reader, HTML, preview and JSON framing state, with one pending decoded and
 one pending extracted scalar. It allocates no source-sized or result-sized
 buffer. Each output call writes at most six bytes and leaves the remaining
@@ -4693,7 +4693,8 @@ The 256-scalar result cap does not bound the first two terms.
 
 The native preview cursor fits 2 KiB, including its generic JSON child and
 original traversal/metadata references. Its external input ring and
-checkpoints keep the existing 6 KiB ceiling. The original header/MIME storage
+checkpoints keep the existing 8 KiB combined ceiling (6 KiB input and
+2 KiB checkpoints). The original header/MIME storage
 is borrowed through completion; this wrapper allocates no source, metadata
 or preview collection and does not add a second native reader or snapshot.
 
@@ -4718,3 +4719,21 @@ records are N + ceil(N / 16). No I/O or output bytes are charged. Ordinal bounds
 malformed lists as well as healthy ones; positive progress cannot exceed the
 u16 part space per list. Empty and cached freshness operations spend no new
 positive allowance. Enclosing admission owns all borrowed backing costs.
+
+## Selected native preview composition storage
+
+The selected-preview cursor fits 8 KiB including an inline union of metadata,
+native preview and empty-source states. The union intentionally retains the
+largest fixed variant without a heap box; stages reuse that same storage.
+Caller-owned metadata and normalization backing retain their existing limits,
+as do the input ring (6 KiB) and checkpoints (2 KiB), 8 KiB together. No source or projected
+preview collection is allocated, and no snapshot or budget is replaced.
+
+Selected-part interpretation and decoding retain their original charges. One
+additional job record funds the bounded class and binary-search membership
+checks on the selector-validated lists before decoder construction. The
+empty-source branch spends exactly two job records and two output bytes, one
+per quote, with no I/O or positive header steps. Empty output and cached
+completion still check admission but spend no positive allowance. Outer worker
+admission must reserve this cursor, all borrowed backing and response staging;
+this component does not establish a whole-response memory bound.
