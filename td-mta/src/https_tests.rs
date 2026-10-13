@@ -506,6 +506,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     .unwrap();
     let api = crate::https_api::Service {
         transfers: &uploads,
+        drafts: &uploads,
         coordinator: &coordinator,
         spool: &request_spool,
         policy: DevicePolicy::new(&devices, clock.as_ref(), 1),
@@ -567,6 +568,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 let upload_url = discovered["uploadUrl"].as_str().unwrap().replace("{accountId}", account_wire);
                 let download_template = discovered["downloadUrl"].as_str().unwrap();
                 api_cases(address, &lease, clock.clone(), &authorization, account_wire, session.state().unwrap(), &resource, &devices, api_url);
+                draft_api_cases(address, &lease, clock.clone(), &authorization, account_wire, api_url, download_template);
                 assert_eq!(request_spool.status().occupied_slots, 0);
                 assert_eq!(coordinator.used(crate::admission::quota::Kind::ResponseBytes).unwrap(), 0);
                 let large = "x".repeat(65537);
@@ -1599,4 +1601,113 @@ fn finish_event(wire: &mut impl Transport) {
         _ => false,
     });
     wire.abort();
+}
+
+fn draft_api_cases(
+    address: std::net::SocketAddr,
+    lease: &GenerationLease<TlsPolicies>,
+    clock: Arc<Now>,
+    authorization: &str,
+    account: &str,
+    api_url: &str,
+    download_template: &str,
+) {
+    use crate::jmap_request::{CORE, MAIL};
+    let post = |calls: td_json::Json| {
+        clock.1.fetch_add(2000, Ordering::Relaxed);
+        let body = td_json::json!({"using":[CORE, MAIL],"methodCalls":calls}).to_string();
+        let mut wire = client(address, lease, clock.clone());
+        let head = format!("POST {api_url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", address.port(), body.len());
+        send(&mut wire, head.as_bytes());
+        let (status, _, body) = full_reply(&mut wire);
+        assert_eq!(status, 200, "{body}");
+        finish_api(&mut wire);
+        td_json::parse(&body).unwrap()
+    };
+    let folders = post(
+        td_json::json!([["Mailbox/set",{"accountId":account,"create":{"drafts":{"name":"Drafts"}}},"folder"]]),
+    );
+    let mailbox = folders["methodResponses"][0][1]["created"]["drafts"]["id"]
+        .as_str()
+        .unwrap();
+    let draft = td_json::json!({
+        "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},
+        "from":[{"name":"Sender","email":"sender@example.test"}],
+        "to":[{"name":null,"email":"recipient@example.test"}],
+        "bcc":[{"name":null,"email":"hidden@example.test"}],
+        "subject":"HTTPS draft", "messageId":["https-draft@example.test"],
+        "sentAt":"2026-10-13T12:00:59Z",
+        "textBody":[{"partId":"text","type":"text/plain"}],
+        "bodyValues":{"text":{"value":"line one\nline two","isEncodingProblem":false,"isTruncated":false}}
+    });
+    let created = post(
+        td_json::json!([["Email/set",{"accountId":account,"create":{"draft":draft.clone()}},"create"],["Core/echo",{"after":true},"after"]]),
+    );
+    assert!(created["methodResponses"][1][1]["after"].is_true());
+    let result = &created["methodResponses"][0][1];
+    let object = &result["created"]["draft"];
+    let email = object["id"].as_str().unwrap();
+    let blob = object["blobId"].as_str().unwrap();
+    assert!(object["threadId"].as_str().unwrap().starts_with('t'));
+    assert_ne!(result["oldState"], result["newState"]);
+    let retrieved = post(
+        td_json::json!([["Email/get",{"accountId":account,"ids":[email],"properties":["id","subject","messageId","bcc","bodyValues","textBody","keywords","mailboxIds"],"fetchTextBodyValues":true},"read"]]),
+    );
+    let message = &retrieved["methodResponses"][0][1]["list"][0];
+    assert_eq!(message["subject"].as_str(), Some("HTTPS draft"));
+    assert_eq!(
+        message["messageId"][0].as_str(),
+        Some("https-draft@example.test")
+    );
+    assert_eq!(
+        message["bcc"][0]["email"].as_str(),
+        Some("hidden@example.test")
+    );
+    assert!(message["keywords"]["$draft"].is_true());
+    assert!(message["keywords"]["$seen"].is_true());
+    assert!(message["mailboxIds"][mailbox].is_true());
+    let part = message["textBody"][0]["partId"].as_str().unwrap();
+    let text = message["bodyValues"][part]["value"].as_str().unwrap();
+    assert!(text.contains("line one") && text.contains("line two"));
+    let stale = post(
+        td_json::json!([["Email/set",{"accountId":account,"ifInState":result["oldState"].clone(),"create":{"stale":draft.clone()}},"stale"]]),
+    );
+    assert_eq!(
+        stale["methodResponses"][0][1]["type"].as_str(),
+        Some("stateMismatch")
+    );
+    let bad = draft.to_string();
+    let bad = td_json::parse(&format!(
+        "{},\"attachments\":[{{\"blobId\":\"{blob}\"}}]}}",
+        bad.strip_suffix('}').unwrap()
+    ))
+    .unwrap();
+    let refused =
+        post(td_json::json!([["Email/set",{"accountId":account,"create":{"bad":bad}},"bad"]]));
+    let refused = &refused["methodResponses"][0][1];
+    assert_eq!(
+        refused["notCreated"]["bad"]["properties"][0].as_str(),
+        Some("attachments")
+    );
+    assert_eq!(refused["oldState"], refused["newState"]);
+    clock.1.fetch_add(2000, Ordering::Relaxed);
+    let url = download_template
+        .replace("{accountId}", account)
+        .replace("{blobId}", blob)
+        .replace("{name}", "draft.eml")
+        .replace("{type}", "message/rfc822");
+    let mut wire = client(address, lease, clock.clone());
+    send(&mut wire, format!("GET {url} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n",address.port()).as_bytes());
+    let (status, _, raw) = full_reply(&mut wire);
+    assert_eq!(status, 200);
+    assert_eq!(raw.len() as u64, object["size"].as_u64().unwrap());
+    assert!(raw.contains("Bcc:") && raw.contains("<hidden@example.test>"));
+    assert!(raw.contains("Message-ID:\r\n <https-draft@example.test>"));
+    finish_api(&mut wire);
+    let removed =
+        post(td_json::json!([["Email/set",{"accountId":account,"destroy":[email]},"remove"]]));
+    assert_eq!(
+        removed["methodResponses"][0][1]["destroyed"][0].as_str(),
+        Some(email)
+    );
 }

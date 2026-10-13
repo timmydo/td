@@ -2359,3 +2359,33 @@ from the original work meter before UTF-8 scanning, with fresh monotonic
 and phase checks before and after; each input member spends a record. A
 shorter execution deadline never renews the meter. The decoder does not
 activate HTTPS creation or Submission.
+
+## HTTPS plain-text draft creation
+
+Authenticated Mail dispatch accepts td-mail's singleton literal Email/set
+creation shape through `draft_input` and `create_text_draft`. It refuses
+nonempty mixed create/update/destroy calls, multiple creations and resolved
+`#create` arguments in this profile. Existing flag, move and destruction
+calls retain their own paths. Account and scoped ifInState checks precede
+creation; publication rechecks conditional state and fresh device authority.
+
+The dispatcher materializes and prepays the complete bounded result before
+calling the body-worker adapter. Input refusal returns notCreated with
+invalidProperties and a known field where available. Ambiguous native Invalid
+or NotFound errors return per-object serverFail, never a guessed bad property;
+this can conservatively include a composition or missing-mailbox refusal.
+Native message-size Quota returns tooLarge, distinct from work capacity and
+logical account quota admission. Exhausted staging slots are normalized to
+Busy before composition so they remain temporary service pressure. Success returns Email, Blob and Thread IDs,
+size and the native before/after Email state. Known publication survives
+accounting stop flags and staging cleanup errors; an indeterminate commit
+becomes serverPartialFail. Draft staging cleanup failure retires the fully
+charged ingress slot until quiescent restart; it does not itself retire the
+service. A stopped coordinator still retires the service after the response. An outer deadline or failed physical response write can
+still lose the response and never makes creation safe to replay.
+
+The original parsed arena supplies borrowed body text, while retained
+arguments still enforce ordinary argument validation and result-reference
+resolution. No second JSON tree or full composed-message buffer is created.
+Draft creation does not advertise Submission, authorize a sending identity,
+resolve creation IDs for later calls, or take responsibility for delivery.

@@ -73,10 +73,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         &mut self,
         arguments: Range<u64>,
         maximum: usize,
+        source: td_json::arena::Value<'_>,
     ) -> Result<Range<u64>, Error> {
         let (flags, device) = self.flags.ok_or(Error::UnknownMethod)?;
         let mut fields = Children::new(arguments, scan::Kind::Object)?;
-        let (mut account, mut update, mut expected, mut destroy) = (None, None, None, None);
+        let (mut account, mut update, mut expected, mut destroy, mut create) =
+            (None, None, None, None, None);
         while let Some(item) = fields.next(self)? {
             match item.key.bytes() {
                 b"accountId" => account = Some(self.push_string(&item)?),
@@ -84,14 +86,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 b"ifInState" => expected = Some(self.push_string(&item)?),
                 b"update" => update = Some(item),
                 b"create" | b"destroy" if item.kind == scan::Kind::Null => (),
-                b"create" => {
-                    if Children::new(item.range, scan::Kind::Object)?
-                        .next(self)?
-                        .is_some()
-                    {
-                        return Err(Error::InvalidArguments);
-                    }
-                }
+                b"create" => create = Some(item),
                 b"destroy" => {
                     if item.kind != scan::Kind::Array {
                         return Err(Error::InvalidArguments);
@@ -116,6 +111,30 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 Ok((state.epoch, state.sequence))
             })
             .transpose()?;
+        if let Some(create) = create {
+            let mut objects = Children::new(create.range, scan::Kind::Object)?;
+            if objects.next(self)?.is_some() {
+                for item in [&update, &destroy].into_iter().flatten() {
+                    if item.kind != scan::Kind::Null {
+                        let kind = if item.key.bytes() == b"update" {
+                            scan::Kind::Object
+                        } else {
+                            scan::Kind::Array
+                        };
+                        if Children::new(item.range.clone(), kind)?
+                            .next(self)?
+                            .is_some()
+                        {
+                            return Err(Error::InvalidArguments);
+                        }
+                    }
+                }
+                // td-mail sends literal creation fields. Never substitute unresolved
+                // request data for a retained result-reference value.
+                let value = source.get("create").ok_or(Error::InvalidArguments)?;
+                return self.email_create(value, account, expected, maximum);
+            }
+        }
         if let Some(destroy) = destroy {
             let mut objects = Children::new(destroy.range.clone(), scan::Kind::Array)?;
             if objects.next(self)?.is_some() {

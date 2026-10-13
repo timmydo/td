@@ -62,6 +62,7 @@ pub mod http_request;
 pub mod https;
 pub mod https_api;
 pub mod https_download;
+pub mod https_draft;
 mod https_exchange;
 pub mod https_upload;
 pub mod identity_catalog;

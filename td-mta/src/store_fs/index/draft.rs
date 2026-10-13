@@ -166,7 +166,17 @@ impl<P: DraftAuthorization> StoreCoordinator<'_, '_, P> {
             coordinator: self,
             lease: Some(lease),
         };
-        let mut writer = spool.begin(crypto, request.account, blob, request.deadline)?;
+        let mut writer = spool
+            .begin(crypto, request.account, blob, request.deadline)
+            .map_err(|error| {
+                // Occupied staging slots are transient pressure, not a draft
+                // size refusal. Preserve Quota for the composer's size bound.
+                if error == ports::Error::Quota {
+                    ports::Error::Busy
+                } else {
+                    error
+                }
+            })?;
         let clock = ComposeClock {
             deadline: request.deadline,
             clock: self.store.clock.as_ref(),

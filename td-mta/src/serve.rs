@@ -261,6 +261,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
             let api_service = match (devices.as_ref(), request_spool.as_ref(), session.as_ref()) {
                 (Some(devices), Some(spool), Some(session)) => Some(td_mta::https_api::Service {
                     transfers: &upload_service,
+                    drafts: &upload_service,
                     coordinator: &coordinator,
                     spool,
                     policy: td_mta::http_auth::DevicePolicy::new(

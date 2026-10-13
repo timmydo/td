@@ -1051,3 +1051,55 @@ fn drafts_and_received_messages_share_exact_parser_anchors_in_both_directions() 
         vec![draft]
     });
 }
+
+#[test]
+fn exhausted_staging_is_busy_and_creation_recovers_after_slots_are_released() {
+    fixture(|coordinator, spool, _| {
+        let mut held = Vec::new();
+        for slot in 0..spool.capacity().slots {
+            held.push(
+                spool
+                    .begin(
+                        &td_crypto::Provider,
+                        ACCOUNT,
+                        BlobId::from_bytes([slot; 16]),
+                        deadline(),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            coordinator.create_text_draft(
+                &td_crypto::Provider,
+                &mut Random(10),
+                spool,
+                request(),
+                &message("busy@example.test"),
+                &mut meter(),
+            ),
+            Err(UploadError::Store(ports::Error::Busy))
+        ));
+        assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 0);
+        assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+        assert_eq!(
+            coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity()
+                .committed_sequence,
+            Sequence::from_u64(1),
+        );
+        drop(held);
+        vec![coordinator
+            .create_text_draft(
+                &td_crypto::Provider,
+                &mut Random(20),
+                spool,
+                request(),
+                &message("after-busy@example.test"),
+                &mut meter(),
+            )
+            .unwrap()]
+    });
+}

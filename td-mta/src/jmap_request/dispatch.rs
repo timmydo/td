@@ -6,6 +6,9 @@ use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "email_set.rs"]
 mod email_set;
 pub use email_set::EmailMutator;
+#[path = "email_create.rs"]
+mod email_create;
+pub use email_create::{DraftCreator, DraftError, DraftInput};
 #[path = "mailbox_set.rs"]
 mod mailbox_set;
 pub use mailbox_set::MailboxMutator;
@@ -114,7 +117,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     account: AccountId,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
-    run_inner(plan, retention, execution, account, None, None, None)
+    run_inner(plan, retention, execution, account, Profile::default())
 }
 
 /// Email-only mutation fixture; runtime uses the complete mail-access profile.
@@ -132,9 +135,10 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention,
         execution,
         account,
-        Some((flags, device)),
-        None,
-        None,
+        Profile {
+            flags: Some((flags, device)),
+            ..Profile::default()
+        },
     )
 }
 /// Authenticated td-mail mutations, including root-folder creation.
@@ -145,15 +149,19 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
     account: AccountId,
     device: crate::ids::DeviceId,
     mutations: &(impl EmailMutator + MailboxMutator),
+    drafts: Option<&dyn DraftCreator>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     run_inner(
         plan,
         retention,
         execution,
         account,
-        Some((mutations, device)),
-        Some((mutations, device)),
-        None,
+        Profile {
+            flags: Some((mutations, device)),
+            mailboxes: Some((mutations, device)),
+            drafts: drafts.map(|creator| (creator, device)),
+            identities: None,
+        },
     )
 }
 /// Prepared identity read fixture; runtime integration requires a device.
@@ -170,9 +178,10 @@ pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention,
         execution,
         account,
-        None,
-        None,
-        Some(identities),
+        Profile {
+            identities: Some(identities),
+            ..Profile::default()
+        },
     )
 }
 fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
@@ -180,10 +189,14 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     account: AccountId,
-    flags: Option<(&dyn EmailMutator, crate::ids::DeviceId)>,
-    mailboxes: Option<(&dyn MailboxMutator, crate::ids::DeviceId)>,
-    identities: Option<&crate::identity_catalog::Catalog>,
+    profile: Profile<'_>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let Profile {
+        flags,
+        mailboxes,
+        drafts,
+        identities,
+    } = profile;
     if identities.is_some_and(|catalog| catalog.account() != account) {
         return Err(Error::State);
     }
@@ -224,6 +237,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         flags,
         mailboxes,
+        drafts,
         identities,
         submission,
     };
@@ -291,6 +305,13 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention,
     })
 }
+#[derive(Default)]
+struct Profile<'a> {
+    flags: Option<(&'a dyn EmailMutator, crate::ids::DeviceId)>,
+    mailboxes: Option<(&'a dyn MailboxMutator, crate::ids::DeviceId)>,
+    drafts: Option<(&'a dyn DraftCreator, crate::ids::DeviceId)>,
+    identities: Option<&'a crate::identity_catalog::Catalog>,
+}
 struct Resolved {
     value: usize,
     range: Range<u64>,
@@ -302,6 +323,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     account: AccountId,
     flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
+    drafts: Option<(&'io dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'io crate::identity_catalog::Catalog>,
     submission: bool,
 }
@@ -435,7 +457,11 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         } else if name == "Mailbox/set" {
             self.mailbox_set(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Email/set" {
-            self.email_set(start..end, responses.request().envelope.maximum_objects)
+            self.email_set(
+                start..end,
+                responses.request().envelope.maximum_objects,
+                call.arguments,
+            )
         } else if name == "Email/get" {
             self.email_get(start..end, &responses.request().envelope.mail_limits)
         } else if name == "Blob/copy" {
@@ -909,6 +935,7 @@ pub(super) mod tests {
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
+                drafts: None,
                 identities: None,
                 submission: false,
             };
@@ -1315,6 +1342,7 @@ pub(super) mod tests {
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
+                drafts: None,
                 identities: None,
                 submission: false,
             };

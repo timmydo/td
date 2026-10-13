@@ -28,6 +28,7 @@ pub struct Request<'a> {
 
 pub struct Service<'s, 'r, 'a, 'sr, 'd, P> {
     pub transfers: &'s dyn https_upload::Backend,
+    pub drafts: &'s dyn dispatch::DraftCreator,
     pub coordinator: &'s StoreCoordinator<'r, 'a, P>,
     pub spool: &'s RequestSpool<'sr>,
     pub policy: DevicePolicy<'s, 'd>,
@@ -330,6 +331,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
             self.transfers.account(),
             device,
             self.coordinator,
+            Some(self.drafts),
         )
         .map_err(|error| {
             ApiError::Io(match error {

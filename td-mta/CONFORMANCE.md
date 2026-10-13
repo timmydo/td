@@ -370,3 +370,22 @@ native observation. Completion also requires no client replay-refusal log after
 the fenced attempt, including the already-absent retry, so server-side removal
 alone cannot hide a rejected response. This does not qualify
 structured Email creation, submission or sending.
+
+## Plain-text Email creation evidence
+
+The native HTTPS fixture now creates a Drafts folder and a singleton
+plain-text Email from td-mail's structured field shape. It retrieves the
+message, checks draft/seen flags, mailbox, subject, Message-ID, Bcc and body
+text, then downloads the exact-size stored message and destroys it. Stale
+ifInState and unsupported attachment creation are refused without another
+creation. Dispatcher fixtures cover mixed writes, multiple creations,
+unsupported result-reference creation, wrong account, output capacity,
+known commits with cleanup failures, and indeterminate outcomes. Device
+policy fixtures pin the fresh live-device guard and revocation refusal.
+
+This qualifies plain-text draft storage through HTTPS, not the complete
+real td-mail send flow. That client also needs Submission capability,
+creation-ID resolution, submission history and success filing. Creation IDs
+are not yet added to the response envelope, attachments are refused, and
+sending remains unavailable. The existing real td-mail read fixture runs
+unchanged beside this endpoint fixture.

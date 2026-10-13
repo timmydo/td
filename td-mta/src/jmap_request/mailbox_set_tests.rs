@@ -115,6 +115,7 @@ fn run_profile(
                 ACCOUNT,
                 DEVICE,
                 mutator,
+                None,
             )
         } else {
             dispatch::run(

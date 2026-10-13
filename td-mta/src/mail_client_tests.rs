@@ -335,6 +335,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
     .unwrap();
     let api = crate::https_api::Service {
         transfers: &transfers,
+        drafts: &transfers,
         coordinator: &coordinator,
         spool: &response_spool,
         policy: DevicePolicy::new(&devices, clock.as_ref(), 1),
