@@ -396,6 +396,7 @@ fn prepare_tree(repo: &Path, state: &State, sha: &str) -> Result<PathBuf, String
             .ok_or_else(|| format!("{} is not UTF-8", tree.display()))?;
         git_ok(repo, &["worktree", "add", "--detach", "--quiet", path, sha])?;
     }
+    protect_tree(repo, state)?;
     git_ok(&tree, &["checkout", "--detach", "--force", "--quiet", sha])?;
     git_ok(&tree, &["clean", "-fd", "--quiet"])?;
     let at = git_text(&tree, &["rev-parse", "HEAD"])?;
@@ -404,6 +405,40 @@ fn prepare_tree(repo: &Path, state: &State, sha: &str) -> Result<PathBuf, String
     } else {
         Err(format!("{} is at {at}, not {sha}", tree.display()))
     }
+}
+
+/// The runner keeps its detached build cache across idle main heads.
+fn protect_tree(repo: &Path, state: &State) -> Result<(), String> {
+    let tree = state.tree();
+    if !tree.join(".git").exists() {
+        return Ok(());
+    }
+    let path = tree
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", tree.display()))?;
+    let list = git_text(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let marker = format!("worktree {path}\0");
+    let row = list
+        .split("\0\0")
+        .find(|row| row.starts_with(&marker))
+        .ok_or_else(|| format!("{} is not this repository's worktree", tree.display()))?;
+    if !row
+        .split('\0')
+        .any(|line| line == "locked" || line.starts_with("locked "))
+    {
+        git_ok(
+            repo,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "main-integration cache",
+                "--",
+                path,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -608,6 +643,7 @@ fn run(opts: &RunOpts) -> Result<u8, String> {
     let repo = repo_root()?;
     let state = State { dir: state_dir()? };
     let _lock = hold_lock(&state)?;
+    protect_tree(&repo, &state)?;
     println!(
         ">> main-integration: {}/main in {}, state in {}",
         opts.remote,
@@ -615,6 +651,7 @@ fn run(opts: &RunOpts) -> Result<u8, String> {
         state.dir.display()
     );
     let mut idle_said: Option<String> = None;
+    let mut next_gc = std::time::Instant::now();
     loop {
         let pass = pass_once(&repo, &state, &opts.remote, opts.again, &mut |tree, log| {
             println!(
@@ -656,6 +693,17 @@ fn run(opts: &RunOpts) -> Result<u8, String> {
                 1
             }
         };
+        if pass.is_ok() && opts.remote == "origin" && std::time::Instant::now() >= next_gc {
+            next_gc = std::time::Instant::now() + Duration::from_secs(86400);
+            if let Err(e) = crate::worktree_gc::sweep(
+                &repo,
+                crate::worktree_gc::DEFAULT_IDLE_DAYS,
+                false,
+                false,
+            ) {
+                eprintln!("main-integration: worktree GC: {e}");
+            }
+        }
         if opts.once {
             return Ok(code);
         }
@@ -875,9 +923,7 @@ mod tests {
             eprintln!("SKIP: no git (the in-sandbox gate)");
             return;
         }
-        let _base_cleanup =
-            crate::test_temp::TempDir::new(&format!("td-main-integration-{}", std::process::id()))
-                .unwrap();
+        let _base_cleanup = crate::test_temp::TempDir::new("td-main-integration").unwrap();
         let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let (origin, work, clone) = (base.join("origin"), base.join("work"), base.join("repo"));

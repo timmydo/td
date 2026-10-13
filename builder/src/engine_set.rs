@@ -62,6 +62,7 @@ pub const HOST_ONLY: &[&str] = &[
     "integration.rs",
     "main_integration.rs",
     "ready.rs",
+    "worktree_gc.rs",
     "verdict_journal.rs",
 ];
 
@@ -81,6 +82,7 @@ pub const HOST_ONLY_VERBS: &[&str] = &[
     "install-fonts",
     "main-integration",
     "ready",
+    "worktree-gc",
     "stage0-place-without-guix",
     // argv0 applets the isolated crypto build binds into its own sandbox.
     "td-crypto-decoy",

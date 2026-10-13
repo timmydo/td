@@ -544,6 +544,47 @@ repository in a folder above is never taken for it, and no `GIT_DIR`
 or like variable may override it. Git then runs in it as it would
 under `-C`, repository configuration included.
 
+## Reclaiming landed worktrees
+
+The builder runs local worktree reclamation after a successful fetch/run
+cycle of `main-integration run` using `origin`, at most once a day. It
+keeps seven days of idle worktrees. Run the same cleanup independently,
+including on a machine that runs no integration loop:
+
+```text
+td-builder worktree-gc --idle-days 7 --dry-run
+td-builder worktree-gc --idle-days 7
+```
+
+The command fetches `origin/main` and checks exact HEAD ancestry: every
+commit reachable from HEAD must be on main. Patch-equivalent replay or
+squash landings are deliberately retained. Unlanded private HEAD reflog
+and worktree-ref commits retain the tree unless they also survive in the
+retained branch's global reflog; ordinary amendments remain recoverable
+there after removing the worktree. It keeps primary and invoking
+checkouts, main, rolling workstreams, locked worktrees, and any tree with
+uncommitted or untracked files or a Git operation in progress. Local and
+remote branch refs and their reflogs are retained. `--idle-days 0` disables
+the age check; `--dry-run` still fetches but removes no trees.
+Idle age is the newest
+mtime or ctime anywhere in the checkout (ignored build output included)
+or its private Git metadata. Reads alone do not restart the age, and
+GC's own directory reads do not make a tree active.
+
+Before removal it inspects every visible thread belonging to the
+worktree owner (any real, effective, saved or filesystem UID), checking
+cwd, root, executable, open descriptors and file mappings for paths
+under the checkout or its private Git directory. Other users' processes
+are outside this maintenance check. An unreadable owner process retains
+the tree. A procfs mount using `hidepid` is refused because it may omit
+processes entirely. Run from the host PID namespace. The integration
+runner Git-locks its own detached cache tree. It repeats the checks and
+lock listing before `git worktree remove`, without force. This is
+maintenance of trusted local checkouts during a quiet period; an
+uncooperative writer can start after the last check. A Git lock is the
+way to reserve an otherwise idle tree. A repository-wide file lock
+prevents overlapping builder GC passes.
+
 ## Rebase a rolling workstream
 
 Periodically, and after the integrator lands part of the stack, rebase the

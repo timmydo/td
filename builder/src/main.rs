@@ -78,6 +78,7 @@ mod test_root;
 mod test_temp;
 mod toolchain_x86_64;
 mod verdict_journal;
+mod worktree_gc;
 mod xz;
 
 // The JSON value/parser/canonical writer, SHA-256 and CRC-32 live in the
@@ -9623,6 +9624,7 @@ fn main() -> ExitCode {
         }
         // bootstrap-recipe <name> | --list — run a structured source-bootstrap rung
         // (the tests/bootstrap-*.sh drivers as typed Rust data; see bootstrap.rs).
+        Some("worktree-gc") => worktree_gc::cli(args.get(2..).unwrap_or(&[])),
         Some("bootstrap-recipe") => bootstrap::cli(&args),
         // toolchain-recipe <name> — build a /td/store toolchain rung as a structured Rust
         // recipe (see toolchain_x86_64.rs).
