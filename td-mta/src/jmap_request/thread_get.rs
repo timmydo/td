@@ -187,4 +187,4 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
 
 #[cfg(test)]
 #[path = "thread_get_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -15,17 +15,17 @@ use std::sync::Mutex;
 static FIXTURE: Mutex<()> = Mutex::new(());
 const THREAD: ThreadId = ThreadId::from_bytes([3; 16]);
 const EMPTY: ThreadId = ThreadId::from_bytes([4; 16]);
-fn id<T: wire::LocalId>(value: T) -> String {
+pub(crate) fn id<T: wire::LocalId>(value: T) -> String {
     wire::encode_id(value, &mut [0; wire::IdKind::WIRE_BYTES])
         .unwrap()
         .to_owned()
 }
-fn email(n: u16) -> EmailId {
+pub(crate) fn email(n: u16) -> EmailId {
     let mut b = [0; 16];
     b[..2].copy_from_slice(&n.to_be_bytes());
     EmailId::from_bytes(b)
 }
-fn date(n: u16) -> i64 {
+pub(crate) fn date(n: u16) -> i64 {
     100 - i64::from(n / 3)
 }
 fn encoded(row: Row<'_>) -> Vec<u8> {
@@ -34,7 +34,7 @@ fn encoded(row: Row<'_>) -> Vec<u8> {
     b.truncate(len);
     b
 }
-fn seed(store: &IndexStore<'_>, count: u16) {
+pub(crate) fn seed(store: &IndexStore<'_>, count: u16) {
     let body = BlobId::from_bytes([5; 16]);
     let blob = encoded(Row::Blob(BlobRow {
         length: 0,

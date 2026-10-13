@@ -8696,3 +8696,22 @@ the returned work lifetime. A worker that reuses that backing must scope this
 operation to a short reborrow of the outer work owner. Scratch is explicitly
 returned so it can be passed directly to the next stage. This composes one preview
 value, not the full Email/get worker or Mail capability admission.
+
+## td-mail inbox query worker
+
+The retained dispatcher implements Email/query for td-mail's initial inbox
+listing: an absent/null/empty filter or one `inMailbox`, a receivedAt comparator
+in either direction, `collapseThreads:false`, nonnegative position, bounded
+limit and optional calculateTotal. Ties use ascending Email ID. Unknown valid
+mailbox IDs produce an empty match set; foreign accounts refuse. Additional
+filters (including text/date conditions), thread collapse, anchors, negative
+positions and other comparators remain explicit unsupported/invalid requests.
+They are outside this initial listing increment, not fabricated empty results.
+
+One original account snapshot feeds the existing quota-charged external sort.
+A maximum-sized Email row read and its membership lookup use separate source
+turns. The sorted page is retained under the original request, so result
+references use actual emitted IDs. Final snapshot and request checks precede
+publication. Native/view/sort pressure or expiry withholds the page; the
+existing dispatcher retains ordered method errors and later-call behavior.
+Live Mail activation and the real td-mail read fixture still require Email/get.

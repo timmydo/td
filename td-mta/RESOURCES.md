@@ -4737,3 +4737,29 @@ per quote, with no I/O or positive header steps. Empty output and cached
 completion still check admission but spend no positive allowance. Outer worker
 admission must reserve this cursor, all borrowed backing and response staging;
 this component does not establish a whole-response memory bound.
+## td-mail inbox query storage
+
+Email/query's source owns one 64 KiB row buffer, a pending ID/date pair and
+fixed arguments. Its 24-byte sort records contain an order-preserving signed
+received timestamp and the Email ID; the shared native sorter retains at most
+256 records and eight merge heads. The row buffer belongs to the existing
+read-view row reservation; sort vectors use the existing exclusive 1 MiB
+workspace reservation. No mailbox-sized vector of Email IDs is retained.
+
+A source row read conservatively charges 64 KiB and one record before native
+access, then yields. A matching-mailbox lookup charges 32 bytes and one record
+on a separate turn, keeping each callback within the native sort-job ceiling.
+Comparisons charge one record and inspect at most 24 bytes. Empty pages and
+zero limits still scan/sort matches when needed to compute truthful totals.
+One original sort-job meter covers all passes and output reads; exhaustion
+returns an error without a new job or partial successful page.
+
+Each nonzero page repeats the account-wide scan and matching-row sort. The
+600-row fixture establishes ordering and paging, not large-mailbox performance.
+At defaults the 64 KiB row charge alone bounds a scan below roughly 131000
+account rows; native VM fuel and the two-million-record work grant can refuse
+considerably earlier. Review estimated a dense mailbox near 17000 rows could
+exhaust the sorter record grant; that is an unmeasured estimate, not a supported
+mailbox-size promise. An indexed mailbox/date read is follow-up work before
+large-mailbox qualification. A zero limit without a total skips source rows;
+it still acquires the ordinary bounded view/sort reservation.

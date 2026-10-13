@@ -3,6 +3,8 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "email_query.rs"]
+mod email_query;
 #[path = "get_ids.rs"]
 mod get_ids;
 #[path = "mailbox_get.rs"]
@@ -307,6 +309,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"Mailbox/get" if mail => "Mailbox/get",
             b"Mailbox/changes" if mail => "Mailbox/changes",
             b"Email/changes" if mail => "Email/changes",
+            b"Email/query" if mail => "Email/query",
             b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
@@ -340,6 +343,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             )
         } else if name == "Thread/get" {
             self.thread_get(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Email/query" {
+            self.email_query(start..end, responses.request().envelope.query_page)
         } else if name == "Mailbox/query" || name == "Mailbox/queryChanges" {
             let limits = &responses.request().envelope;
             self.mailbox_query(
