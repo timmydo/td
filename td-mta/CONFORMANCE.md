@@ -212,7 +212,7 @@ Recheck them when implementing M14-M16 and M22.
 | `get_emails`, `get_emails_with_extra_properties`, `get_emails_for_rules` | Email/get projection, header properties, text/HTML body-value requests; rule reads omit bodies | M06/M14/M22 |
 | `get_email_for_reply` | Email/get messageId, references, replyTo and body context | M06/M14/M22 |
 | `mark_emails_read`, `mark_email_read`, `mark_email_unread`, `set_email_flagged`, `move_email`, `destroy_emails` | Email/set patches for keywords/mailboxIds and destroy; per-object results | M15/M22 |
-| `get_threads`, `query_thread_emails` | Thread/get; existing nonstandard inThread query noted below | M14/M22 |
+| `get_threads`, `query_thread_emails` | Thread/get membership followed by Email/get batches of 50 | M14/M22 |
 | `get_email_raw`, `download_blob` | Email/get blobId and template download; attachments use part blob IDs | M06/M14/M22 |
 | `get_identities`, `upload_blob` | Identity/get; upload HTTP request with MIME type and bounded response blobId | M13/M15/M22 |
 | `submit_email` | Email/set create under `draft`, then EmailSubmission/set referencing `#draft`; `#submission` success patch removes $draft and files Sent; client checks the implicit Email/set result under call ID 1 separately | M15-M16/M22 |
@@ -233,14 +233,10 @@ client expectations only. M22 repeats the flows against real td-mta/td-fetch.
 
 ### Compatibility gaps discovered by M01
 
-`query_thread_emails` sends `Email/query` with `inThread`, which is not a
-standard RFC 8621 filter, and requests 500 results. The default td-mta query
-page is 256. Before declaring compatibility, M14/M22 must replace this client
-path with Thread/get plus bounded Email/get batches, or another standard
-sequence preserving ordering/completeness. V1 must not silently implement an
-unadvertised extension or truncate a thread to make this call pass. Also audit
-all client get/set batches against the advertised 256-object limit. M01 records
-the mismatch; it does not change client behavior or widen the server policy.
+`query_thread_emails` uses Thread/get membership followed by Email/get
+batches of 50. The real-server fixture must still prove a thread larger than
+256 messages. Audit other client get/set batches against the advertised
+256-object limit before activating those flows.
 
 `submissions_between` omits query `limit`/`position`/`calculateTotal` and reads
 only one submission page. M16/M22 must make lost-response reconciliation page

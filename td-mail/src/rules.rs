@@ -477,6 +477,9 @@ pub fn apply_rules(
     );
 
     for email in emails {
+        if email.is_unreadable() {
+            continue;
+        }
         let mut matched_rule_names = Vec::new();
         let mut queued_rule_summaries = Vec::new();
         for rule in rules {
@@ -1167,6 +1170,37 @@ mark_read = true
         }];
         let filtered = filter_noop_actions(&actions, &email, &mailboxes);
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn unreadable_cache_roundtrip_cannot_match_negated_rule() {
+        use td_json::ToJson;
+        let config = RulesConfig::parse(
+            r#"
+[[rule]]
+name = "negated"
+[rule.match.not]
+header = "From"
+regex = "trusted@example.com"
+[rule.actions]
+delete = true
+"#,
+        )
+        .unwrap();
+        let rules = config
+            .rule
+            .into_iter()
+            .map(compile_rule)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut email = make_email("unreadable");
+        email.from = None;
+        let me = UserRegex::compile("me@example.com").unwrap();
+        assert_eq!(apply_rules(&rules, &[email.clone()], &[], &me).len(), 1);
+        email.mark_unreadable();
+        let cached = Email::from_json(&email.to_json()).unwrap();
+        assert!(cached.is_unreadable());
+        assert!(apply_rules(&rules, &[cached], &[], &me).is_empty());
     }
 
     #[test]

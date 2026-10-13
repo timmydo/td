@@ -260,9 +260,7 @@ impl EmailListView {
             label.push_str(spam);
             label.push(' ');
         }
-        label.push_str(&strip_newlines(
-            email.subject.as_deref().unwrap_or("(no subject)"),
-        ));
+        label.push_str(&strip_newlines(email.display_subject()));
         if let Some((unread, total)) = self.get_thread_counts(email) {
             if total > 1 {
                 label.push_str(&format!(" [{}/{}]", total.saturating_sub(unread), total));

@@ -294,10 +294,7 @@ impl EmailView {
             if let Some(ref date) = email.received_at {
                 lines.push(format!("Date: {}", date));
             }
-            lines.push(format!(
-                "Subject: {}",
-                email.subject.as_deref().unwrap_or("(no subject)")
-            ));
+            lines.push(format!("Subject: {}", email.display_subject()));
         }
     }
 
@@ -350,6 +347,14 @@ impl EmailView {
     }
 
     fn extract_body(email: &Email, prefer_html: bool) -> String {
+        if email.is_unreadable() {
+            let blob = email
+                .extra
+                .get("blobId")
+                .and_then(td_json::Json::as_str)
+                .unwrap_or("unavailable");
+            return format!("This message could not be interpreted. Original blob_id: {blob}\nUse td-mail CLI download_attachment with this blob_id, an unused name ending in .eml, and content_type message/rfc822.");
+        }
         if prefer_html {
             // When user explicitly requests HTML rendering
             if let Some(ref html_body) = email.html_body {
@@ -609,7 +614,7 @@ impl EmailView {
     fn subject(&self) -> &str {
         self.email
             .as_ref()
-            .and_then(|email| email.subject.as_deref())
+            .map(Email::display_subject)
             .filter(|subject| !subject.is_empty())
             .unwrap_or("(no subject)")
     }

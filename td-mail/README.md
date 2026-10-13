@@ -412,6 +412,28 @@ For all command-line options, run:
 td-mail --help
 ```
 
+## Unreadable messages
+
+A `serverFail/messageInterpretation` response from td-mta triggers bounded
+single-message isolation. The unreadable message retains its stored identity,
+filing and date. Its subject and body remain absent; the window shows an
+unreadable notice and CLI JSON sets `unreadable: true`. Rules, spam annotation
+and automatic triage exclude it, and a later online open retries its content.
+Authentication, transport, storage and work-budget errors remain errors.
+
+CLI JSON also exposes the original `blob_id`. Pass that value to
+`download_attachment` with a unique `name` ending in `.eml` and
+`content_type: "message/rfc822"` to save the exact original bytes. An existing filename is refused.
+
+Each refresh currently repeats isolation: one unreadable message in a full
+50-message batch costs 52 requests. This bounded linear recovery is the
+initial read milestone, with no negative-result cache or bisection yet.
+Ordinary message reads use batches of 50 IDs. Recovery adds at most one full
+and one stored-only request per ID after the failed batch; additional header
+properties are omitted from stored-only recovery. Thread reading uses
+`Thread/get` membership followed by those batches, without a 500-message cut. Raw spam-training fetches still require UTF-8;
+that pre-existing limitation is separate from byte-exact original export.
+
 ## Development
 
 ```bash

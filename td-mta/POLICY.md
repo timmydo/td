@@ -55,8 +55,8 @@ SMTP envelope lacks SMTPUTF8.
 SMTP can store a message whose body exceeds MIME interpretation limits. Its
 raw blob, stored metadata and mutations independent of parsed content remain
 usable. A requested interpretation exceeding a structural limit returns a
-typed method failure, not a fabricated empty body or a successful partial
-tree. Email/parse reports structurally unparseable/over-limit blobs as
+serverFail method failure with description messageInterpretation, not a
+fabricated empty body or a successful partial tree. Email/parse reports structurally unparseable/over-limit blobs as
 notParsable; transient I/O/slot pressure remains a method resource error.
 Email/get can still return an explicit projection of
 id/blobId/threadId/mailboxIds/keywords/ size/receivedAt and top-level header

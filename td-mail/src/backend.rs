@@ -1715,6 +1715,7 @@ fn backend_loop(
                                 emails.clone()
                             };
 
+                            emails_for_rules.retain(|email| !email.is_unreadable());
                             if !emails_for_rules.is_empty() {
                                 let scorer = SpamScorer {
                                     config: &spam_config,
@@ -1776,11 +1777,14 @@ fn backend_loop(
                                 }
                             }
 
-                            // Mark all fetched emails as processed
+                            // Unreadable messages remain eligible after a later successful read.
                             if let Some(ref cache) = cache {
-                                let all_ids: Vec<String> =
-                                    emails.iter().map(|e| e.id.clone()).collect();
-                                cache.mark_rules_processed(&all_ids);
+                                let readable_ids: Vec<String> = emails
+                                    .iter()
+                                    .filter(|email| !email.is_unreadable())
+                                    .map(|email| email.id.clone())
+                                    .collect();
+                                cache.mark_rules_processed(&readable_ids);
                             }
                         } else {
                             log_debug!(
@@ -1864,7 +1868,10 @@ fn backend_loop(
             }
             BackendCommand::GetEmail { id } => {
                 // Check cache first
-                let cached_email = cache.as_ref().and_then(|c| c.get_email(&id));
+                let cached_email = cache
+                    .as_ref()
+                    .and_then(|c| c.get_email(&id))
+                    .filter(|email| !email.is_unreadable());
                 let result = if let Some(email) = cached_email {
                     log_debug!("[Backend] Cache hit for email {}", id);
                     Ok(email)
@@ -2139,7 +2146,18 @@ fn backend_loop(
 
                     let safe_name = name.replace(['/', '\\', '\0'], "_");
                     let path = dir.join(&safe_name);
-                    std::fs::write(&path, &bytes)
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map_err(|e| {
+                            format!(
+                                "Cannot create download {}: {} (choose an unused name)",
+                                path.display(),
+                                e
+                            )
+                        })?;
+                    std::io::Write::write_all(&mut file, &bytes)
                         .map_err(|e| format!("Failed to write file: {}", e))?;
 
                     log_info!(

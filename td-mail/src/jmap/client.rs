@@ -650,46 +650,7 @@ impl JmapClient {
     }
 
     pub fn get_emails(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        log_info!("[JMAP] Email/get for {} email IDs", ids.len());
-
-        let request = JmapRequest {
-            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            method_calls: vec![MethodCall(
-                "Email/get",
-                json!({
-                    "accountId": self.account_id,
-                    "ids": ids,
-                    "properties": [
-                        "id", "threadId", "from", "to", "cc", "subject",
-                        "receivedAt", "preview", "textBody", "htmlBody", "bodyValues", "keywords",
-                        "mailboxIds", "attachments"
-                    ],
-                    "fetchTextBodyValues": true,
-                    "fetchHTMLBodyValues": true
-                }),
-                "0".to_string(),
-            )],
-        };
-
-        let response = self.call(request)?;
-
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/get" {
-                let email_response =
-                    EmailGetResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
-                log_info!(
-                    "[JMAP] Email/get returned {} emails",
-                    email_response.list.len()
-                );
-                return Ok(email_response.list);
-            }
-        }
-
-        Err(JmapError::Api("Unexpected response".to_string()))
+        self.get_emails_with_extra_properties(ids, &[])
     }
 
     pub fn get_emails_with_extra_properties(
@@ -697,18 +658,9 @@ impl JmapClient {
         ids: &[String],
         extra_properties: &[String],
     ) -> Result<Vec<Email>, JmapError> {
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        log_info!(
-            "[JMAP] Email/get for {} email IDs with {} extra properties",
-            ids.len(),
-            extra_properties.len()
-        );
-
         let mut properties = vec![
             "id",
+            "blobId",
             "threadId",
             "from",
             "to",
@@ -723,11 +675,62 @@ impl JmapClient {
             "mailboxIds",
             "attachments",
         ];
+        properties.extend(extra_properties.iter().map(String::as_str));
+        let mut emails = Vec::new();
+        for chunk in ids.chunks(50) {
+            if let Some(mut batch) = self.read_projection(chunk, &properties, true)? {
+                emails.append(&mut batch);
+                continue;
+            }
+            log_warn!(
+                "[JMAP] Isolating interpretation refusal in {} messages",
+                chunk.len()
+            );
+            for id in chunk {
+                let one = std::slice::from_ref(id);
+                if chunk.len() > 1 {
+                    if let Some(mut batch) = self.read_projection(one, &properties, true)? {
+                        emails.append(&mut batch);
+                        continue;
+                    }
+                }
+                let mut stored = self
+                    .read_projection(
+                        one,
+                        &[
+                            "id",
+                            "blobId",
+                            "threadId",
+                            "receivedAt",
+                            "keywords",
+                            "mailboxIds",
+                        ],
+                        false,
+                    )?
+                    .ok_or_else(|| {
+                        JmapError::Api(format!(
+                            "Stored message metadata could not be read for {id}"
+                        ))
+                    })?;
+                for email in &mut stored {
+                    email.mark_unreadable();
+                    log_warn!("[JMAP] Message {} has unreadable content", email.id);
+                }
+                emails.append(&mut stored);
+            }
+        }
+        Ok(emails)
+    }
 
-        let extra_strs: Vec<&str> = extra_properties.iter().map(|s| s.as_str()).collect();
-        properties.extend(extra_strs);
-
-        let request = JmapRequest {
+    /// None is td-mta's deterministic interpretation refusal, never transport,
+    /// storage, work-budget or authentication failure.
+    fn read_projection(
+        &self,
+        ids: &[String],
+        properties: &[&str],
+        bodies: bool,
+    ) -> Result<Option<Vec<Email>>, JmapError> {
+        let response = self.call(JmapRequest {
             using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
             method_calls: vec![MethodCall(
                 "Email/get",
@@ -735,28 +738,28 @@ impl JmapClient {
                     "accountId": self.account_id,
                     "ids": ids,
                     "properties": properties,
-                    "fetchTextBodyValues": true,
-                    "fetchHTMLBodyValues": true
+                    "fetchTextBodyValues": bodies,
+                    "fetchHTMLBodyValues": bodies
                 }),
                 "0".to_string(),
             )],
-        };
-
-        let response = self.call(request)?;
-
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/get" {
-                let email_response =
-                    EmailGetResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
-                log_info!(
-                    "[JMAP] Email/get returned {} emails",
-                    email_response.list.len()
-                );
-                return Ok(email_response.list);
-            }
+        })?;
+        let method = response
+            .method_responses
+            .first()
+            .ok_or_else(|| JmapError::Api("Empty response for Email/get".into()))?;
+        if method.0 == "Email/get" {
+            return EmailGetResponse::from_json(&method.1)
+                .map(|response| Some(response.list))
+                .map_err(JmapError::Parse);
         }
-
-        Err(JmapError::Api("Unexpected response".to_string()))
+        if method.0 == "error"
+            && method.1.get("type").and_then(Json::as_str) == Some("serverFail")
+            && method.1.get("description").and_then(Json::as_str) == Some("messageInterpretation")
+        {
+            return Ok(None);
+        }
+        Err(Self::method_error("Email/get", method))
     }
 
     pub fn get_emails_for_rules(
@@ -1702,41 +1705,11 @@ impl JmapClient {
     }
 
     pub fn query_thread_emails(&self, thread_id: &str) -> Result<Vec<Email>, JmapError> {
-        log_info!("[JMAP] Querying emails for thread: {}", thread_id);
-
-        let request = JmapRequest {
-            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            method_calls: vec![MethodCall(
-                "Email/query",
-                json!({
-                    "accountId": self.account_id,
-                    "filter": { "inThread": thread_id },
-                    "sort": [{ "property": "receivedAt", "isAscending": true }],
-                    "limit": 500
-                }),
-                "0".to_string(),
-            )],
+        let threads = self.get_threads(&[thread_id.to_string()])?;
+        let Some(thread) = threads.into_iter().find(|thread| thread.id == thread_id) else {
+            return Ok(Vec::new());
         };
-
-        let response = self.call(request)?;
-
-        let ids = if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/query" {
-                let query_response =
-                    EmailQueryResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
-                query_response.ids
-            } else {
-                return Err(JmapError::Api("Unexpected response".to_string()));
-            }
-        } else {
-            return Err(JmapError::Api("Unexpected response".to_string()));
-        };
-
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-
-        self.get_emails(&ids)
+        self.get_emails(&thread.email_ids)
     }
 
     pub fn get_email_raw(&self, id: &str) -> Result<Option<String>, JmapError> {

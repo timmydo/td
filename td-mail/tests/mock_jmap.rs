@@ -70,6 +70,9 @@ impl EmailRecord {
 }
 
 struct MockState {
+    read_refusal: Option<(String, String)>,
+    refuse_stored: bool,
+    read_calls: Vec<Value>,
     emails: HashMap<String, EmailRecord>,
     /// Every blob uploaded: its id, type and bytes.
     uploads: Vec<(String, String, Vec<u8>)>,
@@ -177,6 +180,9 @@ impl MockState {
         }
 
         Self {
+            read_refusal: None,
+            refuse_stored: false,
+            read_calls: Vec::new(),
             emails,
             uploads: Vec::new(),
             created: Vec::new(),
@@ -665,6 +671,36 @@ impl MockJmapServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn refuse_read(&self, id: &str, description: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.read_refusal = Some((id.into(), description.into()));
+        state.read_calls.clear();
+    }
+    #[allow(dead_code)]
+    pub fn seed_large_thread(&self, count: usize) {
+        let mut state = self.state.lock().unwrap();
+        let seed = state.emails.get("email-001").unwrap().clone();
+        for index in 0..count {
+            let mut email = seed.clone();
+            email.id = format!("large-{index:04}");
+            email.thread_id = "large-thread".into();
+            state.emails.insert(email.id.clone(), email);
+        }
+    }
+    #[allow(dead_code)]
+    pub fn refuse_stored_metadata(&self) {
+        self.state.lock().unwrap().refuse_stored = true;
+    }
+    #[allow(dead_code)]
+    pub fn clear_read_refusal(&self) {
+        self.state.lock().unwrap().read_refusal = None;
+    }
+    #[allow(dead_code)]
+    pub fn read_calls(&self) -> Vec<Value> {
+        self.state.lock().unwrap().read_calls.clone()
+    }
+
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -777,6 +813,14 @@ impl MockJmapServer {
         let method = parts[0];
         let path = parts[1];
 
+        if method == "GET" && path.starts_with("/download/") {
+            let (status, body) = Self::handle_download(path, state);
+            let head = format!("HTTP/1.1 {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", status, body.len());
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+            return;
+        }
         let (status, response_body, content_type) =
             if method == "GET" && path.contains("/.well-known/jmap") {
                 let (s, b) = Self::handle_session(port);
@@ -784,9 +828,6 @@ impl MockJmapServer {
             } else if method == "POST" && path.contains("/api") {
                 let (s, b) = Self::handle_api(&body, state);
                 (s, b, "application/json")
-            } else if method == "GET" && path.starts_with("/download/") {
-                let (s, b) = Self::handle_download(path);
-                (s, b, "application/octet-stream")
             } else if method == "POST" && path.starts_with("/upload/account-001") {
                 let mut guard = state.lock().expect("state lock");
                 let blob_id = format!("blob-up-{}", guard.uploads.len() + 1);
@@ -823,7 +864,7 @@ impl MockJmapServer {
         let _ = stream.flush();
     }
 
-    fn handle_download(path: &str) -> (String, String) {
+    fn handle_download(path: &str, state: &Mutex<MockState>) -> (String, Vec<u8>) {
         // Path format: /download/{accountId}/{blobId}/{name}?type={type}
         let path_no_query = path.split('?').next().unwrap_or(path);
         let segments: Vec<&str> = path_no_query.split('/').collect();
@@ -831,10 +872,7 @@ impl MockJmapServer {
         let blob_id = segments.get(3).copied().unwrap_or("");
         if blob_id == "blob-att-001" {
             let fake_pdf_content = b"%PDF-1.4 fake test content for blob-att-001";
-            (
-                "200 OK".to_string(),
-                String::from_utf8_lossy(fake_pdf_content).to_string(),
-            )
+            ("200 OK".to_string(), fake_pdf_content.to_vec())
         } else if let Some(email_id) = blob_id.strip_prefix("blob-raw-") {
             // Synthesize a raw RFC822 message for the spam classifier to tokenize.
             let raw = format!(
@@ -845,9 +883,21 @@ impl MockJmapServer {
                  This is the raw body of {id} with words to tokenize.\r\n",
                 id = email_id
             );
-            ("200 OK".to_string(), raw)
+            {
+                let mut bytes = raw.into_bytes();
+                if state
+                    .lock()
+                    .unwrap()
+                    .read_refusal
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == email_id)
+                {
+                    bytes.extend_from_slice(b"\xff\x00");
+                }
+                ("200 OK".to_string(), bytes)
+            }
         } else {
-            ("404 Not Found".to_string(), "blob not found".to_string())
+            ("404 Not Found".to_string(), b"blob not found".to_vec())
         }
     }
 
@@ -993,34 +1043,79 @@ impl MockJmapServer {
                         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                         .unwrap_or_default();
 
-                    let list = {
-                        let guard = state.lock().expect("state lock");
-                        if requested_ids.is_empty() {
-                            guard
-                                .emails
-                                .values()
-                                .map(EmailRecord::to_jmap_email)
-                                .collect::<Vec<_>>()
-                        } else {
-                            requested_ids
-                                .into_iter()
-                                .filter_map(|id| {
-                                    guard.emails.get(id).map(EmailRecord::to_jmap_email)
-                                })
-                                .collect::<Vec<_>>()
-                        }
+                    let refused = {
+                        let mut guard = state.lock().unwrap();
+                        guard.read_calls.push(args.clone());
+                        guard.read_refusal.as_ref().and_then(|(id, reason)| {
+                            let stored = [
+                                "id",
+                                "blobId",
+                                "threadId",
+                                "receivedAt",
+                                "size",
+                                "keywords",
+                                "mailboxIds",
+                            ];
+                            let derived = args["properties"].as_array().is_none_or(|properties| {
+                                properties
+                                    .iter()
+                                    .any(|p| !stored.contains(&p.as_str().unwrap_or("")))
+                            });
+                            if !requested_ids.contains(&id.as_str()) {
+                                None
+                            } else if derived {
+                                Some(reason.clone())
+                            } else if guard.refuse_stored {
+                                Some("storageWorkLimit".into())
+                            } else {
+                                None
+                            }
+                        })
                     };
+                    if let Some(reason) = refused {
+                        json!(["error", {"type":"serverFail", "description":reason}, call_id])
+                    } else {
+                        let mut list = {
+                            let guard = state.lock().expect("state lock");
+                            if requested_ids.is_empty() {
+                                guard
+                                    .emails
+                                    .values()
+                                    .map(EmailRecord::to_jmap_email)
+                                    .collect::<Vec<_>>()
+                            } else {
+                                requested_ids
+                                    .into_iter()
+                                    .filter_map(|id| {
+                                        guard.emails.get(id).map(EmailRecord::to_jmap_email)
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                        };
 
-                    json!([
-                        "Email/get",
+                        if !args["fetchTextBodyValues"].is_true()
+                            && state.lock().unwrap().read_refusal.is_some()
                         {
-                            "accountId": "account-001",
-                            "state": "estate-001",
-                            "list": list,
-                            "notFound": []
-                        },
-                        call_id
-                    ])
+                            let properties = args["properties"].as_array().unwrap();
+                            for value in &mut list {
+                                if let Value::Obj(fields) = value {
+                                    fields.retain(|(key, _)| {
+                                        properties.iter().any(|p| p.as_str() == Some(key))
+                                    });
+                                }
+                            }
+                        }
+                        json!([
+                            "Email/get",
+                            {
+                                "accountId": "account-001",
+                                "state": "estate-001",
+                                "list": list,
+                                "notFound": []
+                            },
+                            call_id
+                        ])
+                    }
                 }
                 "Email/set" => {
                     let payload = {
@@ -1146,21 +1241,28 @@ impl MockJmapServer {
                         call_id
                     ])
                 }
-                "Thread/get" => json!([
-                    "Thread/get",
-                    {
-                        "accountId": "account-001",
-                        "state": "tstate-001",
-                        "list": [
-                            {
-                                "id": "thread-001",
-                                "emailIds": ["email-001"]
-                            }
-                        ],
-                        "notFound": []
-                    },
-                    call_id
-                ]),
+                "Thread/get" => {
+                    let guard = state.lock().unwrap();
+                    let mut list = Vec::new();
+                    let mut missing = Vec::new();
+                    for id in args["ids"].as_array().unwrap() {
+                        let name = id.as_str().unwrap();
+                        let mut members: Vec<&str> = guard
+                            .emails
+                            .values()
+                            .filter(|e| e.thread_id == name)
+                            .map(|e| e.id.as_str())
+                            .collect();
+                        members.sort();
+                        if members.is_empty() {
+                            missing.push(name);
+                        } else {
+                            list.push(json!({"id": name, "emailIds":members}));
+                        }
+                    }
+                    json!(["Thread/get", {"accountId":"account-001",
+                        "state":"tstate-001", "list":list, "notFound":missing}, call_id])
+                }
                 _ => json!([
                     "error",
                     {

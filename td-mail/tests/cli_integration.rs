@@ -68,7 +68,9 @@ password_command = "echo test"
         command
             .arg("--cli")
             .arg(format!("--config={}", config_path.display()))
-            .env("XDG_RUNTIME_DIR", fetch.runtime_dir());
+            .env("XDG_RUNTIME_DIR", fetch.runtime_dir())
+            .env("XDG_CACHE_HOME", config_dir.path().join("cache"))
+            .env("XDG_DOWNLOAD_DIR", config_dir.path().join("downloads"));
         if offline {
             command.arg("--offline");
         }
@@ -112,6 +114,11 @@ password_command = "echo test"
                 self._config_dir.path().join("config.toml").display()
             ))
             .env("XDG_RUNTIME_DIR", self._fetch.runtime_dir())
+            .env("XDG_CACHE_HOME", self._config_dir.path().join("cache"))
+            .env(
+                "XDG_DOWNLOAD_DIR",
+                self._config_dir.path().join("downloads"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1220,4 +1227,191 @@ fn test_send_draft_offline_is_refused_not_queued() {
         resp
     );
     assert!(draft.exists());
+}
+
+#[test]
+fn unreadable_message_isolated_without_hiding_its_batch() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    h.server().refuse_read("email-001", "messageInterpretation");
+    let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "limit":50}));
+    assert!(response["ok"].is_true(), "{response}");
+    let emails = response["emails"].as_array().unwrap();
+    let unreadable = emails
+        .iter()
+        .find(|e| e["id"].as_str() == Some("email-001"))
+        .unwrap();
+    assert!(unreadable["unreadable"].is_true());
+    assert!(unreadable["subject"].is_null());
+    assert!(unreadable["preview"].is_null());
+    assert!(unreadable["attachments"].is_null());
+    assert_eq!(unreadable["body"].as_str(), Some("(no body)"));
+    assert_eq!(unreadable["thread_id"].as_str(), Some("thread-001"));
+    assert!(unreadable["received_at"].as_str().is_some());
+    assert_eq!(unreadable["mailbox_ids"], json!(["mbox-inbox"]));
+    assert_eq!(unreadable["blob_id"].as_str(), Some("blob-raw-email-001"));
+    let downloaded = h.send(json!({"command":"download_attachment",
+        "blob_id":unreadable["blob_id"], "name":"unreadable.eml",
+        "content_type":"message/rfc822"}));
+    assert!(downloaded["ok"].is_true(), "{downloaded}");
+    let bytes = std::fs::read(downloaded["path"].as_str().unwrap()).unwrap();
+    assert_eq!(bytes, b"From: sender-email-001@example.com\r\nTo: test@example.com\r\nSubject: raw message for email-001\r\n\r\nThis is the raw body of email-001 with words to tokenize.\r\n\xff\x00");
+    let repeat = h.send(json!({"command":"download_attachment",
+        "blob_id":unreadable["blob_id"], "name":"unreadable.eml",
+        "content_type":"message/rfc822"}));
+    assert!(!repeat["ok"].is_true(), "{repeat}");
+    assert_eq!(
+        std::fs::read(downloaded["path"].as_str().unwrap()).unwrap(),
+        bytes
+    );
+    assert!(emails.iter().any(|e| e["id"].as_str() == Some("email-002")));
+    let calls = h.server().read_calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call["fetchTextBodyValues"].is_true())
+            .count(),
+        emails.len() + 1
+    );
+    assert!(calls.iter().any(|c| c["properties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.as_str() == Some("blobId"))));
+}
+
+#[test]
+fn storage_work_refusal_does_not_trigger_message_recovery() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    h.server().refuse_read("email-001", "storageWorkLimit");
+    let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox", "limit":50}));
+    assert!(!response["ok"].is_true(), "{response}");
+    assert_eq!(h.server().read_calls().len(), 1);
+}
+
+#[test]
+fn thread_read_uses_thread_members_then_message_retrieval() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({"command":"get_thread", "thread_id":"thread-001"}));
+    assert!(response["ok"].is_true(), "{response}");
+    assert_eq!(response["emails"].as_array().unwrap().len(), 1);
+    assert_eq!(response["emails"][0]["id"].as_str(), Some("email-001"));
+}
+
+#[test]
+fn unreadable_single_thread_member_uses_only_one_body_attempt() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    h.server().refuse_read("email-001", "messageInterpretation");
+    let response = h.send(json!({"command":"get_thread", "thread_id":"thread-001"}));
+    assert!(response["ok"].is_true(), "{response}");
+    assert!(response["emails"][0]["unreadable"].is_true());
+    assert_eq!(h.server().read_calls().len(), 2);
+}
+
+#[test]
+fn automatic_rules_skip_unreadable_and_retry_after_recovery() {
+    let mut h = CliHarness::start_with_mail_config("rules_mailbox_regex = \".*\"");
+    std::fs::write(
+        h._config_dir.path().join("rules.toml"),
+        r#"
+[[rule]]
+name = "flag-not-trusted"
+[rule.match.not]
+header = "From"
+regex = "trusted@example.com"
+[rule.actions]
+flag = true
+"#,
+    )
+    .unwrap();
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    h.server().refuse_read("email-001", "messageInterpretation");
+    let first = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox"}));
+    assert!(first["ok"].is_true(), "{first}");
+    let unreadable = first["emails"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"].as_str() == Some("email-001"))
+        .unwrap();
+    assert!(unreadable["unreadable"].is_true());
+    assert!(!unreadable["is_flagged"].is_true());
+    let plan = h.send(json!({"command":"triage_suggest", "mailbox_id":"mbox-inbox"}));
+    assert!(plan["ok"].is_true(), "{plan}");
+    let kept = plan["keep"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"].as_str() == Some("email-001"))
+        .unwrap();
+    assert!(kept["reason"].as_str().unwrap().contains("Unreadable"));
+    let opened = h.send(json!({"command":"get_email", "id":"email-001"}));
+    assert!(opened["ok"].is_true(), "{opened}");
+    assert!(opened["unreadable"].is_true());
+    h.server().clear_read_refusal();
+    let second = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox"}));
+    assert!(second["ok"].is_true(), "{second}");
+    let refreshed = h.send(json!({"command":"get_email", "id":"email-001"}));
+    assert!(refreshed["ok"].is_true(), "{refreshed}");
+    assert!(!refreshed["unreadable"].is_true());
+    assert!(refreshed["is_flagged"].is_true(), "{refreshed}");
+}
+
+#[test]
+fn thread_larger_than_256_preserves_all_members_in_bounded_batches() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({"command":"get_thread", "thread_id":"large-thread"}));
+    assert!(response["ok"].is_true(), "{response}");
+    let emails = response["emails"].as_array().unwrap();
+    assert_eq!(emails.len(), 300);
+    for (index, email) in emails.iter().enumerate() {
+        assert_eq!(
+            email["id"].as_str(),
+            Some(format!("large-{index:04}").as_str())
+        );
+    }
+    let calls = h.server().read_calls();
+    assert_eq!(calls.len(), 6);
+    assert!(calls
+        .iter()
+        .all(|c| c["ids"].as_array().unwrap().len() == 50));
+}
+
+#[test]
+fn stored_metadata_failure_remains_an_error() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    h.server().refuse_read("email-001", "messageInterpretation");
+    h.server().refuse_stored_metadata();
+    let response = h.send(json!({"command":"get_thread", "thread_id":"thread-001"}));
+    assert!(!response["ok"].is_true(), "{response}");
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("storageWorkLimit"));
+    assert_eq!(h.server().read_calls().len(), 2);
+}
+
+#[test]
+fn offline_open_retains_cached_unreadable_metadata() {
+    let cache = testing::tempdir().unwrap();
+    {
+        let mut h = CliHarness::start_with_opts("", false, Some(cache.path().into()), None);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        h.server().refuse_read("email-001", "messageInterpretation");
+        let response = h.send(json!({"command":"query_emails", "mailbox_id":"mbox-inbox"}));
+        assert!(response["ok"].is_true(), "{response}");
+    }
+    let mut h = CliHarness::start_with_opts("", true, Some(cache.path().into()), None);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let response = h.send(json!({"command":"get_email", "id":"email-001"}));
+    assert!(response["ok"].is_true(), "{response}");
+    assert!(response["unreadable"].is_true());
+    assert_eq!(response["blob_id"].as_str(), Some("blob-raw-email-001"));
 }

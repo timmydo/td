@@ -562,6 +562,23 @@ pub struct Email {
 }
 
 impl Email {
+    pub fn is_unreadable(&self) -> bool {
+        self.extra.get("tdMailUnreadable").and_then(Json::as_bool) == Some(true)
+    }
+
+    pub fn mark_unreadable(&mut self) {
+        self.extra
+            .insert("tdMailUnreadable".into(), Json::Bool(true));
+    }
+
+    pub fn display_subject(&self) -> &str {
+        if self.is_unreadable() {
+            "[Unreadable message]"
+        } else {
+            self.subject.as_deref().unwrap_or("(no subject)")
+        }
+    }
+
     pub fn from_json(value: &Json) -> Result<Self, JsonError> {
         let obj = object(value, "Email")?;
         let body_values = match present(obj, "bodyValues") {

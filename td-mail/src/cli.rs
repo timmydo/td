@@ -184,6 +184,8 @@ fn serialize_email(email: &Email, headers_only: bool, max_body_chars: usize) -> 
     let mut obj = json!({
         "id": email.id,
         "thread_id": email.thread_id,
+        "unreadable": email.is_unreadable(),
+        "blob_id": email.extra.get("blobId"),
         "from": from,
         "to": to,
         "cc": cc,
@@ -1018,7 +1020,13 @@ fn cmd_triage_suggest(state: &mut CliState, input: &Value) -> Value {
     let mut keep = Vec::new();
 
     for email in emails {
-        let (target, reason, confidence) = if let Some((t, r, c)) = rule_targets.get(&email.id) {
+        let (target, reason, confidence) = if email.is_unreadable() {
+            (
+                TriageTarget::Keep,
+                "Unreadable content; inspect original before triage".into(),
+                0.0,
+            )
+        } else if let Some((t, r, c)) = rule_targets.get(&email.id) {
             (*t, r.clone(), *c)
         } else {
             triage_from_heuristics(&email)
