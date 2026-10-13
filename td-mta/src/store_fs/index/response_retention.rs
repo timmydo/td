@@ -164,6 +164,26 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
     }
 }
 impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
+    pub(crate) fn method_body_context(
+        &mut self,
+        phase: Deadline,
+    ) -> Result<(std::sync::Arc<dyn Clock>, Meter), ports::Error> {
+        if !self.admit_before(phase)? {
+            return Err(ports::Error::Deadline);
+        }
+        Ok((
+            self.coordinator.store.clock.clone(),
+            Meter::new(
+                phase,
+                WorkCharge {
+                    io_bytes: self.coordinator.work.foreground_io_bytes,
+                    records: self.coordinator.work.foreground_records,
+                    output_bytes: self.coordinator.work.foreground_io_bytes,
+                    unlinks: 0,
+                },
+            ),
+        ))
+    }
     pub(crate) fn method_sort_context(
         &mut self,
         phase: Deadline,
@@ -261,6 +281,15 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
             return Err(ports::Error::Invalid);
         }
         self.admit_work_turn()?;
+        Ok(!phase.expired(self.last))
+    }
+    /// MIME turns use their own original meter; observe outer/phase freshness
+    /// without billing those same turns to the response encoder's record grant.
+    pub(crate) fn observe_before(&mut self, phase: ports::Deadline) -> Result<bool, ports::Error> {
+        if phase >= self.deadline {
+            return Err(ports::Error::Invalid);
+        }
+        self.check()?;
         Ok(!phase.expired(self.last))
     }
     #[cfg(test)]

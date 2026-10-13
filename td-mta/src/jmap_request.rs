@@ -208,6 +208,7 @@ impl<'a, 'c> Validation<'a, 'c> {
                 limits.query_page,
                 limits.json_depth,
                 limits.json_tokens,
+                *limits,
             ),
         })
     }
@@ -296,6 +297,7 @@ impl<'c> OwnedValidation<'c> {
                     limits.query_page,
                     limits.json_depth,
                     limits.json_tokens,
+                    *limits,
                 ),
             }),
             Err(error) => Err(ValidationRefusal { error, document }),
@@ -458,6 +460,7 @@ impl Walk {
     }
 }
 struct Envelope {
+    mail_limits: crate::limits::Limits,
     maximum_calls: usize,
     maximum_objects: usize,
     query_page: usize,
@@ -480,8 +483,10 @@ impl Envelope {
         query_page: usize,
         query_depth: usize,
         query_nodes: usize,
+        mail_limits: crate::limits::Limits,
     ) -> Self {
         Self {
+            mail_limits,
             maximum_calls,
             maximum_objects,
             query_page,

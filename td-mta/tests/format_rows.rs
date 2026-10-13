@@ -531,6 +531,7 @@ fn structurally_valid_fields_still_require_semantic_validation(
     );
     let limits = td_mta::limits::Limits {
         smtp_recipients: MAX_RECIPIENTS as usize,
+        index_cache_bytes: 2 * 1024 * 1024,
         memory_budget_bytes: 128 * 1024 * 1024,
         ..Default::default()
     };

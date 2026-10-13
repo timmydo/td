@@ -34,7 +34,7 @@ changing that validator requires an explicit atomic implementation update.
 | --- | ---: | ---: | ---: |
 | SMTP slots | 8 | 376064 | 3008512 |
 | HTTPS slots | 8 | 1703936 | 13631488 |
-| Body/search jobs | 2 | 425984 | 851968 |
+| Body/search jobs | 2 | 1310720 | 2621440 |
 | Storage read views | 2 | 299008 | 598016 |
 | SQLite writer and WAL-index mapping | 1 | 54919168 | 54919168 |
 | Resident index cache | 1 | 4194304 | 4194304 |
@@ -51,13 +51,13 @@ changing that validator requires an explicit atomic implementation update.
 | Certificate generations | 2 | 8388608 | 16777216 |
 | Cold reload overlap | 1 | 2097152 | 2097152 |
 | Process and allocator allowance | 1 | 8388608 | 8388608 |
-| **Total** | | | **131515648** |
+| **Total** | | | **133285120** |
 
-The total is approximately 125.42 MiB against a 128 MiB configured budget;
-the remaining 2702080 bytes are unassigned headroom, not another cache.
+The total is approximately 127.11 MiB against a 128 MiB configured budget;
+the remaining 932608 bytes are unassigned headroom, not another cache.
 The default includes SQLite's separate 34 MiB WAL-index mapping reservation
 and a 4 MiB disposable index cache. Default connection counts are unchanged.
-With all other defaults, three TLS handshake slots require 135709952 bytes,
+With all other defaults, three TLS handshake slots require 137479424 bytes,
 exceeding the unchanged 128 MiB compiled maximum. Reduce other configured
 reservations, such as the disposable cache, before adding that third slot.
 The 64 MiB idle and 128 MiB workload RSS figures are provisional goals under
@@ -255,7 +255,8 @@ encoded-header adapters or combined service RSS.
   Earlier method results and created-ID maps use the bounded disk retention
   contract in ADMISSION.md, never extra per-method heap trees. Event streams
   use slots without pinning storage views between emissions.
-- Body job: headers, 64 bytes per MIME descriptor, 96 KiB decode/work scratch.
+- Body job: headers, 512 bytes per MIME part and its projections, 512 KiB
+  decode/metadata/output scratch.
   Nested parsing and transfer decoding share that reservation.
 - Read view: 292 KiB caller-owned key/value/cursor scratch and one cold
   pooled SQLite connection. No journal prefix, replay map, overlay descriptor
@@ -648,7 +649,7 @@ explicitly under DESIGN section 5 without a speculative ledger proof.
 
 | Reservation | Partition |
 | --- | --- |
-| Body work, 96 KiB/job | Six 8 KiB nested-decode rings (NestedPartId::MAX_STEPS); 16 KiB parser/boundary/locator state; 32 KiB conversion/output |
+| Body work, 512 KiB/job | Bounded part metadata, one 192 KiB generated fragment, decode rings, normalization/parser state and output staging; header and per-part arrays are separate |
 | Read cursor/value, 292 KiB/view | 68 KiB row input/reserve; 64 KiB retained result value; 1 KiB key; 5 KiB selected metadata; 1 KiB pool bookkeeping; 4 KiB pinned-body input/reader state; 149 KiB typed row/change cursors, native wrapper bookkeeping and reference validation scratch |
 | Outbound scratch, 128 KiB | 64 KiB body transfer; 16 KiB reply assembly; 16 KiB SMTP/TLS handoff state; 32 KiB transaction-planning/ID/diagnostic scratch |
 | DNS/control, 512 KiB | 128 KiB resolver + 384 KiB control as detailed below |
@@ -4763,3 +4764,56 @@ exhaust the sorter record grant; that is an unmeasured estimate, not a supported
 mailbox-size promise. An indexed mailbox/date read is follow-up work before
 large-mailbox qualification. A zero limit without a total skips source rows;
 it still acquires the ordinary bounded view/sort reservation.
+
+
+## td-mail Email/get composition
+
+The body-job ledger now reserves configured header_bytes plus 512 bytes per
+configured MIME part and 512 KiB of scratch. The per-part allowance covers the
+original Part, optional header view, body-list Node, value-selection Fact,
+locator Candidate and list/selection membership cells; a compiled assertion
+bounds their combined representation. Part arrays are bounded by mime_parts,
+not message byte length or account size.
+
+Per-message storage includes one configured header arena; six metadata windows
+of at most 16 KiB plus 14 bytes; one 192 KiB generated part fragment; 6 KiB input
+and 2 KiB checkpoints; 3 KiB normalization scratch; and fixed parser/output
+state. Metadata backing is reused through short part borrows; the fragment allocation is
+reused for the next part. One 4 KiB staging buffer and 4 KiB source/output
+buffer avoid per-scalar response file I/O. Requested stored rows reuse one
+64 KiB method buffer in the read-view allowance. There is never a retained
+collection of body strings or generated fragments for all parts/messages.
+
+The same method meter survives all messages and transformations. Decoding,
+preview extraction and JSON stages retain their original cumulative charges;
+a small requested preview can still hit the work ceiling while validating a
+large source. The response spool cap independently limits emitted bytes.
+Default planned total is 133285120 bytes under the unchanged 128 MiB budget;
+capacity-growth fixtures rebalance disposable cache within that budget.
+These are bounded implementation allocations and planner figures, not a new
+whole-service RSS or large-mailbox qualification claim.
+
+The current 512 KiB scratch reservation contains the earlier components'
+96 KiB base partition, including their named 16 KiB parser and 32 KiB
+conversion regions. References to those original partitions below remain
+component ceilings, not the current whole-job total. The per-part arrays now
+have their separate 512-byte allowance; retained lists do not borrow the old
+96 KiB partition. Header backing additionally reserves one lookahead byte per
+part and two final bytes within that allowance and scratch.
+
+The larger per-part ledger can reject an old high-part-count configuration:
+with all other defaults, mime_parts above about 1900 no longer fits 128 MiB.
+The scalar maximum remains 4096; raising it requires rebalancing another
+reservation or increasing the admitted memory budget. Scalar maxima are not a
+promise that their combination fits the same memory budget.
+
+The reduced default headroom also affects previously admitted non-default
+settings: with other defaults, smtp_recipients 465..1000, https_connections 9,
+smtp_sessions 11..15, storage_views 6..8, or body_jobs 3..8 no longer fit the
+128 MiB plan. Existing deployments with raised concurrency or object limits
+must rebalance disposable cache or raise memory before this planner change.
+The reservation applies at startup even while live Mail is not advertised.
+CONFIG.md's resource validation uses this same combined plan; independent
+scalar maxima do not establish admission. Selection additionally retains up
+to 64 names (264 bytes each) and their parsed header properties, bounded by
+the worker's parser/conversion scratch partition.

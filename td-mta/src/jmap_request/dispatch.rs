@@ -5,6 +5,9 @@ use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "email_query.rs"]
 mod email_query;
+
+#[path = "email_get.rs"]
+mod email_get;
 #[path = "get_ids.rs"]
 mod get_ids;
 #[path = "mailbox_get.rs"]
@@ -42,6 +45,7 @@ pub enum Error {
     ResponseCapacity,
     StorageCapacity,
     StorageBusy,
+    MessageInterpretation,
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -154,6 +158,9 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     Error::RequestTooLarge => br#"{"type":"requestTooLarge"}"#,
                     Error::ExecutionDeadline => {
                         br#"{"type":"serverUnavailable","description":"executionDeadline"}"#
+                    }
+                    Error::MessageInterpretation => {
+                        br#"{"type":"serverFail","description":"messageInterpretation"}"#
                     }
                     Error::StorageCapacity => {
                         br#"{"type":"serverFail","description":"storageWorkLimit"}"#
@@ -310,6 +317,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"Mailbox/changes" if mail => "Mailbox/changes",
             b"Email/changes" if mail => "Email/changes",
             b"Email/query" if mail => "Email/query",
+
+            b"Email/get" if mail => "Email/get",
             b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
@@ -321,7 +330,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "Blob/copy" {
+        let result = if name == "Email/get" {
+            self.email_get(start..end, &responses.request().envelope.mail_limits)
+        } else if name == "Blob/copy" {
             self.blob_copy(start..end)
         } else if name == "Mailbox/changes" {
             self.object_changes(

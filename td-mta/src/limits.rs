@@ -245,7 +245,7 @@ impl Limits {
             ));
         }
         let json_descriptors = product("JSON tokens", self.json_tokens, 16)?;
-        let mime_descriptors = product("MIME parts", self.mime_parts, 64)?;
+        let mime_descriptors = product("MIME parts and projections", self.mime_parts, 512)?;
         let recipient_bytes = product("SMTP recipients", self.smtp_recipients, 320)?;
         let mutation_slots = product(
             "transaction operation index",
@@ -284,7 +284,10 @@ impl Limits {
             Reservation {
                 name: "body jobs",
                 count: self.body_jobs,
-                bytes_each: sum("body job", &[self.header_bytes, mime_descriptors, 96 * KIB])?,
+                bytes_each: sum(
+                    "body job",
+                    &[self.header_bytes, mime_descriptors, 512 * KIB],
+                )?,
             },
             Reservation {
                 name: "read views",
@@ -417,7 +420,7 @@ mod tests {
     #[test]
     fn default_ledger_pins_documented_budget() -> Result<(), ResourceError> {
         let plan = Limits::default().plan()?;
-        assert_eq!(plan.total_bytes(), 131_515_648);
+        assert_eq!(plan.total_bytes(), 133_285_120);
         const { assert!(crate::format::MAX_VALUE_BYTES + crate::format::MAX_KEY_BYTES + 48 <= 68 * KIB) };
         assert_eq!(
             READ_VIEW_SCRATCH_BYTES,
@@ -466,13 +469,13 @@ mod tests {
             }
             .plan(),
             Err(ResourceError::MemoryBudget {
-                required: 135_709_952,
+                required: 137_479_424,
                 available: 128 * MIB
             })
         );
         assert!(Limits {
             tls_handshakes: 3,
-            index_cache_bytes: 2 * MIB,
+            index_cache_bytes: 512 * KIB,
             ..defaults
         }
         .plan()
@@ -483,7 +486,7 @@ mod tests {
     #[test]
     fn tls_slot_growth_does_not_multiply_serial_record_work() -> Result<(), ResourceError> {
         let defaults = Limits {
-            index_cache_bytes: MIB,
+            index_cache_bytes: 512 * KIB,
             ..Limits::default()
         };
         let original = defaults.plan()?;
@@ -531,6 +534,7 @@ mod tests {
         let plan = Limits::default().plan()?;
         let larger_inbound = Limits {
             smtp_recipients: 1000,
+            index_cache_bytes: 2 * MIB,
             memory_budget_bytes: 128 * MIB,
             ..Limits::default()
         }
@@ -552,7 +556,7 @@ mod tests {
         }
         assert_eq!(
             larger_inbound.total_bytes() - plan.total_bytes(),
-            8 * 900 * 320
+            8 * 900 * 320 - 2 * MIB
         );
         Ok(())
     }
@@ -706,7 +710,7 @@ mod tests {
             Err(ResourceError::MemoryBudget { .. })
         ));
         let plan = Limits {
-            index_cache_bytes: MIB,
+            index_cache_bytes: 512 * KIB,
             ..limits
         }
         .plan()?;

@@ -65,6 +65,18 @@ pub fn write_stored(
     scratch: &mut [u8],
     mut emit: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<bool, Error> {
+    write_members(view, email, selected, scratch, &mut emit, true)
+}
+
+/// Internal composition keeps the object open for interpreted properties.
+pub(crate) fn write_members(
+    view: &mut IndexReadView<'_, '_>,
+    email: EmailId,
+    selected: Stored,
+    scratch: &mut [u8],
+    mut emit: impl FnMut(&[u8]) -> Result<(), Error>,
+    close: bool,
+) -> Result<bool, Error> {
     view.check_snapshot()?;
     let Some(metadata) = view.email_metadata(email, scratch)? else {
         return Ok(false);
@@ -151,8 +163,10 @@ pub fn write_stored(
         buffered(view, &mut out, &mut emit, format_args!("}}"))?;
         flush(view, &mut out, &mut emit)?;
     }
-    append(&mut out, "}")?;
-    flush(view, &mut out, &mut emit)?;
+    if close {
+        append(&mut out, "}")?;
+        flush(view, &mut out, &mut emit)?;
+    }
     Ok(true)
 }
 fn append(out: &mut TextBuffer<'_>, text: &str) -> Result<(), Error> {

@@ -108,6 +108,18 @@ pub(crate) fn run_configured(
     cutoff: Option<u64>,
     setup: impl FnOnce(&IndexStore<'_>),
 ) -> td_json::Json {
+    run_configured_response(input, count, (limits, 72000), phase, busy, cutoff, setup)
+}
+pub(crate) fn run_configured_response(
+    input: &str,
+    count: u16,
+    profile: (Limits, u64),
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+    setup: impl FnOnce(&IndexStore<'_>),
+) -> td_json::Json {
+    let (limits, response_bytes) = profile;
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let files = Fixture::new();
@@ -122,8 +134,8 @@ pub(crate) fn run_configured(
     .plan()
     .unwrap();
     let plan = DiskLimits {
-        response_bytes: 72000,
-        response_total_bytes: 144000,
+        response_bytes,
+        response_total_bytes: 2 * response_bytes,
         ..DiskLimits::default()
     }
     .plan(

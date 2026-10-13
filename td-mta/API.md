@@ -8715,3 +8715,61 @@ references use actual emitted IDs. Final snapshot and request checks precede
 publication. Native/view/sort pressure or expiry withholds the page; the
 existing dispatcher retains ordered method errors and later-call behavior.
 Live Mail activation and the real td-mail read fixture still require Email/get.
+
+## td-mail Email/get worker projection
+
+The opt-in Mail dispatcher handles Email/get from the authenticated account's
+single original read view. Explicit IDs retain order, deduplicate and use
+notFound for absent/foreign IDs. Omitted/null IDs enumerate only when all IDs
+fit objects_per_method. State comes from that same snapshot. Unsupported
+properties/arguments refuse before publication; successful response ranges
+remain available to later result references.
+
+The default properties match td-mail's regular read request: id, threadId,
+from, to, cc, subject, receivedAt, preview, textBody, htmlBody, bodyValues,
+keywords, mailboxIds and attachments. Stored id/blobId/threadId/mailboxIds/
+keywords/size/receivedAt and existing header aliases/named projections can be
+selected explicitly. Body-part objects expose the five fields td-mail consumes:
+partId, blobId, type, name and size. bodyStructure, headers, hasAttachment and
+bodyProperties are not added to this client projection. Existing MIME components
+retain their own broader APIs independently.
+
+fetchTextBodyValues, fetchHTMLBodyValues, fetchAllBodyValues and
+maxBodyValueBytes select the existing bounded body-value decoder. HTML values
+preserve their markup; preview alone extracts visible text when no plaintext
+body was selected. The raw stored blob ID remains independently retrievable
+with properties [id, blobId], without MIME parsing. Derived attachment locators
+are provisional until successful response publication; HTTPS locator download
+activation remains separate.
+
+One method meter covers property recognition, every requested message and all
+MIME phases under the original execution deadline. The original retention
+meter separately charges response work/I/O, once per staged output chunk;
+MIME turns observe its deadline without double-billing its record grant.
+Every body is verified and pinned
+under the same account view before interpretation. Per-message HeaderBudget,
+metadata buffers and short reborrows allow sequential part interpretation;
+there is no new meter per part, decoder or preview. Four-KiB output staging
+avoids scalar-sized file writes. Both snapshot and execution admission precede
+publication; a failed method rolls back its entire unpublished list.
+
+Deterministic interpreter/capacity refusals are serverFail/messageInterpretation;
+storage failures preserve their storage label and exhausted method work is
+serverFail/storageWorkLimit. As POLICY.md specifies, td-mail must isolate failed
+batches and show stored-metadata placeholders before live activation. Response
+capacity retains its existing label, and expired execution takes precedence as
+serverUnavailable/executionDeadline. No failed body is replaced by fabricated
+empty text. The metadata projection has six bounded 16 KiB windows (the head
+window additionally admits its 14-byte default), and one 192 KiB generated
+fragment allocated once per message and reused across its parts. Headers and
+part counts remain bounded by the admitted resource plan. Large or unsupported
+interpretations can refuse. This does not yet activate live Mail discovery.
+
+The header projection cap is 64 distinct names; exceeding it returns
+requestTooLarge. Metadata interpretation validates all parsed parts, including
+containers and unselected parts. A filename, charset, Content-ID, language or
+location exceeding its 16 KiB window can therefore refuse a batch even when
+td-mail does not display that field. The single HTTPS body worker currently
+serializes API calls, uploads and downloads; a costly bounded read delays the
+others. Live client qualification must measure that behavior before making
+concurrency or large-mailbox claims.
