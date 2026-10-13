@@ -1292,7 +1292,9 @@ single-destination mailboxIds replacement td-mail emits. Destination refusal
 reports invalidProperties with properties ["mailboxIds"]. Its complete entry
 uses ID length plus 60 bytes, within the reserved ID length plus 96. Unsupported
 properties or false values refuse that object as invalidProperties; absent
-Email IDs report notFound. Nonempty create/destroy are not implemented.
+Email IDs report notFound. Nonempty create remains unimplemented. Pure
+destroy requests use the separate bounded path below; mixed update/destroy
+requests refuse before effects.
 ifInState is checked against the account epoch and sequence under coordination.
 The batch ceiling is the smaller of objects_per_method and 256, also advertised
 as maxObjectsInSet. Device activity is checked again under the registry guard
@@ -1335,3 +1337,16 @@ is an explicit exception to the full creation profile above. The created
 objects contain only id; td-mail obtains defaults, counts and rights from its
 following Mailbox/get. Explicit extra properties, even default-valued ones,
 are refused by this name-only profile.
+
+## td-mail permanent deletion admission
+
+Pure Email/set destroy admits at most min(maxObjectsInSet, 256) array entries,
+including duplicates in that count. Deduplication retains first-seen wire IDs;
+foreign IDs remain typed per-object absence. Mixed nonempty updates/creation
+are rejected before effects. The adapter reserves fixed framing/account/state
+bytes plus each distinct ID length and 96 bytes before native planning, and
+passes the original execution deadline, meter and optional Email ifInState.
+Known successful commits produce destroyed/notDestroyed; indeterminate outcomes
+and postcommit encoding invariants produce serverPartialFail. Retention I/O
+failure still closes the incomplete exchange. Later methods retain the existing
+original request work and deadline limits.

@@ -45,6 +45,7 @@ struct Client {
     _process: Process,
     input: std::process::ChildStdin,
     output: mpsc::Receiver<String>,
+    log_path: std::path::PathBuf,
 }
 impl Client {
     fn start(config: &Path, root: &Path) -> Self {
@@ -82,6 +83,7 @@ impl Client {
             _process: process,
             input,
             output: rx,
+            log_path: root.join("state/td-mail/td-mail.log"),
         }
     }
     fn ask(&mut self, request: Json) -> Json {
@@ -92,6 +94,52 @@ impl Client {
             .recv_timeout(Duration::from_secs(30))
             .expect("td-mail response deadline");
         td_json::parse(&line).unwrap()
+    }
+    fn replay_until(
+        &mut self,
+        clock: &RealClock,
+        mut committed: impl FnMut(Deadline) -> Result<bool, crate::store_fs::ResponseError>,
+    ) {
+        let mut log_start = std::fs::read(&self.log_path).map_or(0, |bytes| bytes.len());
+        for attempt in 0..3 {
+            let connected = self.ask(json!({"command":"connect", "account":"test"}));
+            assert!(connected["ok"].is_true(), "{connected}");
+            let listing = self.ask(json!({"command":"list_mailboxes"}));
+            assert!(listing["ok"].is_true(), "{listing}");
+            let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
+            let complete = loop {
+                match committed(phase) {
+                    Ok(complete) => break complete,
+                    Err(crate::store_fs::ResponseError::Store(crate::ports::Error::Busy)) => {
+                        assert!(clock.sample().unwrap().monotonic < phase.tick());
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("native replay probe failed: {error}"),
+                }
+            };
+            let log = std::fs::read(&self.log_path).unwrap();
+            let tail = std::str::from_utf8(&log[log_start..]).unwrap();
+            let replay_failed = tail.lines().any(|line| {
+                line.contains("[Backend] queue replay stopped at seq=")
+                    || line.contains("deferred for replay")
+            });
+            if complete && !replay_failed {
+                return;
+            }
+            assert!(
+                tail.lines().any(
+                    |line| line.contains("[Backend] queue replay stopped at seq=")
+                        && (line.contains("status code 429") || line.contains("status code 503"))
+                ),
+                "replay may reconnect only after a verified HTTP 429 or 503"
+            );
+            log_start = log.len();
+            assert!(
+                attempt < 2,
+                "queued mutation replay did not commit after three attempts"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 fn wire_id<T: wire::LocalId>(id: T) -> String {
@@ -437,9 +485,14 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 } else { json!({"command":command, "id":target}) };
                 let moved = client.ask(input);
                 assert!(moved["ok"].is_true(), "{moved}");
+                client.replay_until(&clock, |phase| {
+                    let mut retained = coordinator.retain_response(&response_spool, until)?;
+                    let mut view = retained.method_view(account, phase)?;
+                    Ok(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16)?.values == [destination])
+                });
                 let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(destination)}));
                 assert!(listing["ok"].is_true(), "{listing}");
-                assert!(listing["emails"].as_array().unwrap().iter().any(|item| item["id"].as_str() == Some(target.as_str())));
+                assert!(listing["emails"].as_array().unwrap().iter().any(|item| item["id"].as_str() == Some(target.as_str())), "{command}: {listing}; client log: {}", std::fs::read_to_string(&client.log_path).unwrap());
                 let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
                 let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
                 let mut view = retained.method_view(account, phase).unwrap();
@@ -471,42 +524,31 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 std::str::from_utf8(replacement.expose()).unwrap()
             )).unwrap();
             let mut client = Client::start(&config, &runtime.path);
-            let log_path = runtime.path.join("state/td-mail/td-mail.log");
-            let mut log_start = std::fs::read(&log_path).map_or(0, |bytes| bytes.len());
-            for attempt in 0..3 {
-                let connected = client.ask(json!({"command":"connect", "account":"test"}));
-                assert!(connected["ok"].is_true(), "{connected}");
-                // Fence this replay attempt; transient refusal may leave work queued.
-                let listing = client.ask(json!({"command":"list_mailboxes"}));
-                assert!(listing["ok"].is_true(), "{listing}");
+            client.replay_until(&clock, |phase| {
+                let mut retained = coordinator.retain_response(&response_spool, until)?;
+                let mut view = retained.method_view(account, phase)?;
+                let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
+                Ok(view.get(key, &mut [0; 128])?.is_some()
+                    && view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16)?.values == [archive])
+            });
+            for (byte, thread_byte, thread_survives) in [(12, 12, false), (10, 10, true), (11, 10, false)] {
+                let email = EmailId::from_bytes([byte; 16]);
+                let result = client.ask(json!({"command":"destroy", "ids":[wire_id(email)]}));
+                assert!(result["ok"].is_true(), "{result}");
+                client.replay_until(&clock, |phase| {
+                    let mut retained = coordinator.retain_response(&response_spool, until)?;
+                    let mut view = retained.method_view(account, phase)?;
+                    Ok(view.get(Key::Email(email), &mut [0; 128])?.is_none())
+                });
+                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
                 let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
-                let complete = loop {
-                    let observed = (|| -> Result<bool, crate::store_fs::ResponseError> {
-                        let mut retained = coordinator.retain_response(&response_spool, until)?;
-                        let mut view = retained.method_view(account, phase)?;
-                        let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
-                        Ok(view.get(key, &mut [0; 128])?.is_some()
-                            && view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16)?.values == [archive])
-                    })();
-                    match observed {
-                        Ok(complete) => break complete,
-                        Err(crate::store_fs::ResponseError::Store(crate::ports::Error::Busy)) => {
-                            assert!(clock.sample().unwrap().monotonic < phase.tick());
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => panic!("native replay probe failed: {error}"),
-                    }
-                };
-                if complete { break; }
-                let log = std::fs::read(&log_path).unwrap();
-                let tail = std::str::from_utf8(&log[log_start..]).unwrap();
-                assert!(tail.lines().any(|line| line.contains("[Backend] queue replay stopped at seq=")
-                    && (line.contains("status code 429") || line.contains("status code 503"))),
-                    "replay may reconnect only after a verified HTTP 429 or 503");
-                log_start = log.len();
-                assert!(attempt < 2, "queued flag and archive replay did not commit after three attempts");
-                std::thread::sleep(Duration::from_secs(1));
+                let mut view = retained.method_view(account, phase).unwrap();
+                assert!(view.get(Key::Blob(BlobId::from_bytes([byte; 16])), &mut [0;128]).unwrap().is_none());
+                assert_eq!(view.get(Key::Thread(ThreadId::from_bytes([thread_byte; 16])), &mut []).unwrap().is_some(), thread_survives);
             }
+            let retry = client.ask(json!({"command":"destroy", "ids":[target]}));
+            assert!(retry["ok"].is_true(), "{retry}");
+            client.replay_until(&clock, |_| Ok(true));
             drop(client);
             drop(stop);
             assert!(worker.join().unwrap().is_ok());

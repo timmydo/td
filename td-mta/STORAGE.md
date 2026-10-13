@@ -2894,5 +2894,5 @@ body/thread candidates, and two vectors reserving 4096 slots each with at most
 4096 deletion/history entries combined. Owned key
 bytes plus operation framing are capped below the native 1-MiB transaction
 ceiling. Operation, encoded-byte, work and deadline exhaustion refuse the entire
-plan before writes. The HTTPS Email/set destroy operation is not activated by
-this storage increment.
+plan before writes. The HTTPS Email/set destroy adapter now invokes this coordinator after
+reserving its complete response.

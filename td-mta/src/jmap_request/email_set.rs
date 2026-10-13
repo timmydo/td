@@ -1,4 +1,4 @@
-//! The td-mail flag and move subset of Email/set, with response capacity before effects.
+//! The td-mail flag, move and deletion subset of Email/set, with response capacity before effects.
 use super::{
     mailbox_get::storage,
     push::{Children, Name},
@@ -10,8 +10,9 @@ use crate::{
     ids::{EmailId, MailboxId},
     ports,
     store_fs::{
-        EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest,
-        EmailUpdateResult, StoreCoordinator, UploadError, MAX_EMAIL_UPDATES,
+        EmailDestroyCompletion, EmailDestroyRequest, EmailUpdate, EmailUpdateAuthorization,
+        EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult, StoreCoordinator,
+        UploadError, MAX_EMAIL_UPDATES,
     },
     sync::{DataState, DataType},
 };
@@ -25,6 +26,13 @@ pub trait EmailMutator {
         request: EmailUpdateRequest<'_>,
         meter: &mut Meter,
     ) -> Result<EmailUpdateCompletion, UploadError>;
+    fn destroy(
+        &self,
+        _: EmailDestroyRequest<'_>,
+        _: &mut Meter,
+    ) -> Result<EmailDestroyCompletion, UploadError> {
+        Err(ports::Error::Forbidden.into())
+    }
 }
 impl<P: EmailUpdateAuthorization> EmailMutator for StoreCoordinator<'_, '_, P> {
     fn update(
@@ -33,6 +41,13 @@ impl<P: EmailUpdateAuthorization> EmailMutator for StoreCoordinator<'_, '_, P> {
         meter: &mut Meter,
     ) -> Result<EmailUpdateCompletion, UploadError> {
         self.update_emails(&td_crypto::Provider, request, meter)
+    }
+    fn destroy(
+        &self,
+        request: EmailDestroyRequest<'_>,
+        meter: &mut Meter,
+    ) -> Result<EmailDestroyCompletion, UploadError> {
+        self.destroy_emails(&td_crypto::Provider, request, meter)
     }
 }
 struct Update {
@@ -61,7 +76,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     ) -> Result<Range<u64>, Error> {
         let (flags, device) = self.flags.ok_or(Error::UnknownMethod)?;
         let mut fields = Children::new(arguments, scan::Kind::Object)?;
-        let (mut account, mut update, mut expected) = (None, None, None);
+        let (mut account, mut update, mut expected, mut destroy) = (None, None, None, None);
         while let Some(item) = fields.next(self)? {
             match item.key.bytes() {
                 b"accountId" => account = Some(self.push_string(&item)?),
@@ -78,12 +93,10 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     }
                 }
                 b"destroy" => {
-                    if Children::new(item.range, scan::Kind::Array)?
-                        .next(self)?
-                        .is_some()
-                    {
+                    if item.kind != scan::Kind::Array {
                         return Err(Error::InvalidArguments);
                     }
+                    destroy = Some(item);
                 }
                 _ => return Err(Error::InvalidArguments),
             }
@@ -103,6 +116,20 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 Ok((state.epoch, state.sequence))
             })
             .transpose()?;
+        if let Some(destroy) = destroy {
+            let mut objects = Children::new(destroy.range.clone(), scan::Kind::Array)?;
+            if objects.next(self)?.is_some() {
+                if let Some(update) = update.as_ref().filter(|item| item.kind != scan::Kind::Null) {
+                    if Children::new(update.range.clone(), scan::Kind::Object)?
+                        .next(self)?
+                        .is_some()
+                    {
+                        return Err(Error::InvalidArguments);
+                    }
+                }
+                return self.email_destroy(destroy.range, account, expected, maximum);
+            }
+        }
         let maximum = maximum.min(MAX_EMAIL_UPDATES);
         let mut updates = Vec::new();
         updates
@@ -316,3 +343,6 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
 #[cfg(test)]
 #[path = "email_set_tests.rs"]
 mod tests;
+
+#[path = "email_destroy.rs"]
+mod email_destroy;

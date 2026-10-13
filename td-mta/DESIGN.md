@@ -2238,7 +2238,8 @@ commit together,
 and known commit outcomes survive later accounting refusal. Authenticated
 HTTPS Email/set activates td-mail keyword patches for these two flags and
 single-destination mailbox replacement, with matching Session and Mailbox
-rights. Structured Email creation and permanent deletion remain absent.
+rights. Pure Email/set destruction now removes messages and last-owner bodies.
+Structured Email creation remains absent.
 
 Authenticated Mailbox/set accepts the root-folder name-only create objects
 td-mail emits. The bounded native creation coordinator owns validation,

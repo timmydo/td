@@ -1710,3 +1710,74 @@ fn explicitly_missing_message_retires_a_queued_move() {
     assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
     assert_eq!(h.server().update_calls().len(), attempts);
 }
+
+#[test]
+fn refused_destructions_remain_queued_across_replay_and_restart() {
+    for error in [
+        "wrongAccount",
+        "accountNotFound",
+        "unknownMethod",
+        "forbidden",
+    ] {
+        let mut h = CliHarness::start();
+        h.server().refuse_destroy(Some(error));
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"destroy", "ids":["email-002"]}))["ok"].is_true());
+        assert!(h.server().email_state("email-002").is_some());
+        h.restart();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+        assert!(h.server().email_state("email-002").is_some());
+        h.server().refuse_destroy(None);
+        h.restart();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+        assert!(h.server().email_state("email-002").is_none(), "{error}");
+    }
+}
+
+#[test]
+fn legacy_thread_deletion_replay_obeys_set_limit_and_retires_intent() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    {
+        let store =
+            td_kv::Store::open(&h._config_dir.path().join("cache/td-mail/test.tdkv")).unwrap();
+        let mut txn = store.write();
+        txn.insert(
+            "op_queue",
+            &td_kv::Key::from_u64(1),
+            br#"{"kind":"destroy_thread","op_id":1,"thread_id":"large-thread"}"#,
+        );
+        txn.commit().unwrap();
+    }
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    let calls = h.server().destroy_calls();
+    assert_eq!(calls.len(), 5);
+    let counts: Vec<_> = calls
+        .iter()
+        .map(|call| call["destroy"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(counts, [64, 64, 64, 64, 44]);
+    for index in 0..300 {
+        assert!(h
+            .server()
+            .email_state(&format!("large-{index:04}"))
+            .is_none());
+    }
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    let store = td_kv::Store::open(&h._config_dir.path().join("cache/td-mail/test.tdkv")).unwrap();
+    assert!(store
+        .read()
+        .table("op_queue")
+        .unwrap()
+        .get(&td_kv::Key::from_u64(1))
+        .is_none());
+}

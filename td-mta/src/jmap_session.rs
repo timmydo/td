@@ -97,7 +97,8 @@ impl Session {
             limits
                 .objects_per_method
                 .min(crate::store_fs::MAX_EMAIL_UPDATES)
-                .min(crate::store_fs::MAX_MAILBOX_CREATES),
+                .min(crate::store_fs::MAX_MAILBOX_CREATES)
+                .min(crate::store_fs::MAX_EMAIL_DESTROYS),
             id,
         ))
         .map_err(|_| Error::Capacity)?;

@@ -75,6 +75,8 @@ struct MockState {
     read_calls: Vec<Value>,
     flag_refusal: Option<String>,
     move_refusal: Option<String>,
+    destroy_refusal: Option<String>,
+    destroy_calls: Vec<Value>,
     wrong_flag_account: bool,
     update_calls: Vec<Value>,
     emails: HashMap<String, EmailRecord>,
@@ -189,6 +191,8 @@ impl MockState {
             read_calls: Vec::new(),
             flag_refusal: None,
             move_refusal: None,
+            destroy_refusal: None,
+            destroy_calls: Vec::new(),
             wrong_flag_account: false,
             update_calls: Vec::new(),
             emails,
@@ -599,6 +603,7 @@ impl MockState {
         let mut updated = ObjectBuilder::new();
         let mut not_updated = ObjectBuilder::new();
         let mut not_destroyed = ObjectBuilder::new();
+        let mut destroyed = Vec::new();
 
         let mut created = ObjectBuilder::new();
         if let Some(create) = args.get("create").and_then(Value::as_object) {
@@ -638,12 +643,19 @@ impl MockState {
         }
 
         if let Some(destroy) = args.get("destroy").and_then(Value::as_array) {
+            self.destroy_calls.push(args.clone());
             for idv in destroy {
                 let Some(id) = idv.as_str() else {
                     continue;
                 };
+                if self.destroy_refusal.as_deref() == Some("forbidden") {
+                    not_destroyed.insert(id.to_string(), json!({"type":"forbidden"}));
+                    continue;
+                }
                 if self.emails.remove(id).is_none() {
                     not_destroyed.insert(id.to_string(), json!({"type": "notFound"}));
+                } else {
+                    destroyed.push(id.to_string());
                 }
             }
         }
@@ -659,6 +671,9 @@ impl MockState {
             )
             .set("oldState", "estate-001")
             .set("newState", "estate-002");
+        if !destroyed.is_empty() {
+            resp = resp.set("destroyed", json!(destroyed));
+        }
         let created = created.build();
         let updated = updated.build();
         let not_updated = not_updated.build();
@@ -794,6 +809,16 @@ impl MockJmapServer {
     #[allow(dead_code)]
     pub fn refuse_flag(&self, id: Option<&str>) {
         self.state.lock().unwrap().flag_refusal = id.map(str::to_owned);
+    }
+
+    #[allow(dead_code)]
+    pub fn refuse_destroy(&self, error: Option<&str>) {
+        self.state.lock().unwrap().destroy_refusal = error.map(str::to_owned);
+    }
+
+    #[allow(dead_code)]
+    pub fn destroy_calls(&self) -> Vec<Value> {
+        self.state.lock().unwrap().destroy_calls.clone()
     }
 
     #[allow(dead_code)]
@@ -1191,7 +1216,16 @@ impl MockJmapServer {
                 }
                 "Email/set" => {
                     let mut guard = state.lock().expect("state lock");
-                    if let Some(error) = guard.move_refusal.as_deref().filter(|error| {
+                    if args.get("destroy").and_then(Value::as_array).is_some()
+                        && guard.destroy_refusal.as_deref() == Some("wrongAccount")
+                    {
+                        json!(["Email/set", {"accountId":"wrong", "destroyed":args["destroy"]}, call_id])
+                    } else if let Some(error) = guard.destroy_refusal.as_deref().filter(|error| {
+                        *error != "forbidden"
+                            && args.get("destroy").and_then(Value::as_array).is_some()
+                    }) {
+                        json!(["error", {"type":error}, call_id])
+                    } else if let Some(error) = guard.move_refusal.as_deref().filter(|error| {
                         *error != "invalidProperties"
                             && args["update"].as_object().is_some_and(|updates| {
                                 updates

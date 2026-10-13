@@ -871,3 +871,16 @@ parent/role editing and onDestroyRemoveEmails remain unsupported. Creation
 references across calls are not part of td-mail's create flow; clients read
 returned IDs or list mailboxes. A duplicate name is a refusal, not a second
 folder and not a claim that a lost earlier response failed to commit.
+
+## td-mail permanent deletion profile
+
+Email/set accepts a pure destroy array under fresh device Email-mutation
+authorization. It refuses a nonempty create or update in the same request;
+td-mail sends these separately. The request limit includes duplicate array
+entries, while each distinct ID is mutated once. Valid generic JMAP IDs in
+a foreign format and absent local IDs produce per-object notFound. Invalid ID
+syntax refuses the method before effects. Output uses the original IDs and Email states;
+only a known commit returns destroyed IDs. No role or Trash membership is
+required: td-mail's explicit permanent-delete command chooses the target.
+Mailbox removal rights already cover this operation; folder deletion remains
+unavailable. STORAGE.md owns relationship, last-body-owner and quota handling.

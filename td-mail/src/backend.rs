@@ -787,14 +787,6 @@ fn apply_local_mutation(cache: Option<&Cache>, op: &QueuedMutation) {
     }
 }
 
-fn is_missing_remote_error(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("not found")
-        || lower.contains("notfound")
-        || lower.contains("unknown")
-        || lower.contains("invalid email id")
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_mutation_via_queue(
     client: &JmapClient,
@@ -837,23 +829,12 @@ fn process_mutation_via_queue(
             let _ = cache.remove_queued_operation(seq);
         }
         Err(e) => {
-            let resolved =
-                matches!(op, QueuedMutation::DestroyEmail { .. }) && is_missing_remote_error(&e);
-            if resolved {
-                log_info!(
-                    "[Backend] queue op seq={} resolved by conflict policy: {}",
-                    seq,
-                    e
-                );
-                let _ = cache.remove_queued_operation(seq);
-            } else {
-                log_warn!(
-                    "[Backend] queued op seq={} deferred for replay kind={:?}: {}",
-                    seq,
-                    op,
-                    e
-                );
-            }
+            log_warn!(
+                "[Backend] queued op seq={} deferred for replay kind={:?}: {}",
+                seq,
+                op,
+                e
+            );
         }
     }
     Ok(())
@@ -1505,13 +1486,7 @@ fn execute_queued_mutation(
                 my_email_regex,
                 cache,
             );
-            if let Err(error) = result {
-                if !matches!(action, QueuedMutation::DestroyEmail { .. })
-                    || !is_missing_remote_error(&error)
-                {
-                    return Err(error);
-                }
-            }
+            result?;
             if let Some(cache) = cache {
                 let next = completed
                     .checked_add(offset)
@@ -1659,19 +1634,6 @@ fn replay_queued_mutations(
                 let _ = cache.remove_queued_operation(seq);
             }
             Err(e) => {
-                let resolved = matches!(
-                    op,
-                    QueuedMutation::DestroyEmail { .. } | QueuedMutation::DestroyThread { .. }
-                ) && is_missing_remote_error(&e);
-                if resolved {
-                    log_info!(
-                        "[Backend] queue op seq={} resolved by conflict policy: {}",
-                        seq,
-                        e
-                    );
-                    let _ = cache.remove_queued_operation(seq);
-                    continue;
-                }
                 log_warn!(
                     "[Backend] queue replay stopped at seq={} kind={:?}: {}",
                     seq,

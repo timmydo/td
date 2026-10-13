@@ -501,3 +501,11 @@ it reports success. td-mta supports the name-only root folders this client
 emits; Archive and Trash can be created through the client and selected by
 their configured names. A duplicate name is reported as a refusal. Creation
 is an online operation, not a durable queued assignment.
+
+Permanent deletion confirms the matching Email/set call, account and each
+requested destroyed ID (or explicit per-object notFound). A method error,
+missing result or different account leaves durable intent queued; replay no
+longer interprets words such as "unknown" as proof of deletion. Requests obey
+the server's maxObjectsInSet. td-mta accepts pure destruction requests and
+atomically removes relationships and unowned bodies; shared or leased bodies
+remain until their last owner releases them.

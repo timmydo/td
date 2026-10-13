@@ -1167,37 +1167,76 @@ impl JmapClient {
         }
 
         log_info!("[JMAP] Email/set destroying {} emails", ids.len());
-        let request = JmapRequest {
-            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            method_calls: vec![MethodCall(
-                "Email/set",
-                json!({
-                    "accountId": self.account_id,
-                    "destroy": ids
-                }),
-                "0".to_string(),
-            )],
+        for chunk in ids.chunks(self.max_objects_in_set) {
+            let request = JmapRequest {
+                using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                method_calls: vec![MethodCall(
+                    "Email/set",
+                    json!({"accountId": self.account_id, "destroy": chunk}),
+                    "0".to_string(),
+                )],
+            };
+            let response = self.call(request)?;
+            self.confirm_destructions(&response, chunk)?;
+        }
+        Ok(())
+    }
+
+    fn confirm_destructions(
+        &self,
+        response: &JmapResponse,
+        ids: &[String],
+    ) -> Result<(), JmapError> {
+        let reply = response
+            .method_responses
+            .first()
+            .filter(|reply| reply.0 == "Email/set" && reply.2 == "0")
+            .ok_or_else(|| {
+                JmapError::Api(format!(
+                    "Unexpected response for Email/set destroy: {:?}",
+                    response.method_responses.first()
+                ))
+            })?;
+        if reply.1.get("accountId").and_then(Json::as_str) != Some(self.account_id.as_str()) {
+            return Err(JmapError::Api(
+                "Email/set destroy returned a missing, invalid, or different account".into(),
+            ));
+        }
+        let destroyed = match reply.1.get("destroyed") {
+            None | Some(Json::Null) => &[][..],
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| JmapError::Api("Invalid Email/set destroyed".into()))?,
         };
-
-        let response = self.call(request)?;
-
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/set" {
-                if let Some(not_destroyed) = method_response.1.get("notDestroyed") {
-                    if not_destroyed.as_object().is_some_and(|o| !o.is_empty()) {
-                        return Err(JmapError::Api(format!(
-                            "Failed to destroy some emails: {:?}",
-                            not_destroyed
-                        )));
-                    }
+        if destroyed.iter().any(|value| value.as_str().is_none()) {
+            return Err(JmapError::Api("Invalid Email/set destroyed ID".into()));
+        }
+        let refused = reply.1.get("notDestroyed");
+        if refused.is_some_and(|value| !value.is_null() && value.as_object().is_none()) {
+            return Err(JmapError::Api("Invalid Email/set notDestroyed".into()));
+        }
+        for id in ids {
+            let confirmed = destroyed
+                .iter()
+                .any(|value| value.as_str() == Some(id.as_str()));
+            let error = refused.and_then(|value| value.get(id));
+            match (confirmed, error) {
+                (true, None) => (),
+                (false, Some(error))
+                    if error.get("type").and_then(Json::as_str) == Some("notFound") => {}
+                (_, Some(error)) => {
+                    return Err(JmapError::Api(format!(
+                        "Email/set destroy refused {id}: {error}"
+                    )))
                 }
-                return Ok(());
+                _ => {
+                    return Err(JmapError::Api(format!(
+                        "Email/set destroy did not confirm {id}"
+                    )))
+                }
             }
         }
-
-        Err(JmapError::Api(
-            "Unexpected response for Email/set".to_string(),
-        ))
+        Ok(())
     }
 
     // ---- submission ------------------------------------------------------
@@ -1881,6 +1920,46 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destruction_requires_typed_confirmation_for_every_requested_id() {
+        let client = JmapClient::unreachable_for_tests();
+        let response = |method: &str, call: &str, body| JmapResponse {
+            method_responses: vec![MethodResponse(method.into(), body, call.into())],
+            session_state: "state".into(),
+        };
+        let ids = ["a".to_string(), "b".to_string()];
+        let good = json!({"accountId":"account","destroyed":["a"],"notDestroyed":{"b":{"type":"notFound"}}});
+        assert!(client
+            .confirm_destructions(&response("Email/set", "0", good.clone()), &ids)
+            .is_ok());
+        assert!(client
+            .confirm_destructions(
+                &response("error", "0", json!({"type":"accountNotFound"})),
+                &ids
+            )
+            .is_err());
+        assert!(client
+            .confirm_destructions(&response("Email/set", "other", good), &ids)
+            .is_err());
+        for body in [
+            json!({"accountId":"wrong","destroyed":["a","b"]}),
+            json!({"destroyed":["a","b"]}),
+            json!({"accountId":"account","destroyed":["a"]}),
+            json!({"accountId":"account","destroyed":["a","b"],"notDestroyed":{"b":{"type":"notFound"}}}),
+            json!({"accountId":"account","destroyed":["a",true]}),
+            json!({"accountId":"account","destroyed":{}}),
+            json!({"accountId":"account","notDestroyed":[]}),
+            json!({"accountId":"account","notDestroyed":{"a":{"type":"accountNotFound"},"b":{"type":"notFound"}}}),
+        ] {
+            assert!(
+                client
+                    .confirm_destructions(&response("Email/set", "0", body.clone()), &ids)
+                    .is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn mailbox_creation_requires_account_call_and_created_id_confirmation() {

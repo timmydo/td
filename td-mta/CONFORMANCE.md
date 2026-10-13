@@ -19,7 +19,7 @@ Authenticated
 Session discovery, bounded Core and Mail read batches, upload/download, the
 single-account Blob/copy outcome and PushSubscription policy are active.
 Email/set read/unread, star patches and single-destination mailbox replacement
-are active; permanent deletion and structured creation remain absent. The native td-mail fixture sets and clears
+and permanent deletion are active; structured creation remains absent. The native td-mail fixture sets and clears
 both flags over HTTPS and checks persisted keyword rows after each result.
 It creates archive/trash folders through td-mail, refuses a duplicate name,
 then archives, trashes and restores messages using those returned folders,
@@ -333,8 +333,9 @@ credential revocation. The refused message remains visibly unreadable.
 This is a small native read fixture, not the full M22/M24 release oracle.
 SMTP receipt/recovery have their own fixtures; this case seeds native commits.
 It qualifies seen/star flags, archive/trash/restore and queued flag/move
-recovery. It does not qualify other mutations, search, submission, Mail state events, large
-mailbox latency or whole-service RSS. Existing worker/client fixtures retain
+recovery. Permanent deletion is qualified below. Other mutations, search, submission,
+Mail state events, large
+mailbox latency and whole-service RSS are not qualified here. Existing worker/client fixtures retain
 separate coverage of bounded large queries and 300-message thread batching.
 
 A repeated real-client run exposed HTTP 429 during a rapid thread read after
@@ -359,3 +360,13 @@ createdIds map, and creation references are not resolved. Defaulted mailbox
 properties, counts and rights arrive through the following Mailbox/get.
 Explicit parentId (including null), role and other properties are refused.
 This is not a general JMAP Mailbox/set conformance claim.
+
+The same real td-mail HTTPS fixture now permanently deletes the attachment
+message and the two members of a shared thread. It checks committed Email and
+last-owner Blob absence, preserves the Thread until its final Email is removed,
+and retries an already absent ID. The same three-attempt reconnect helper
+requires a logged 429/503 before retrying and a fixed deadline for Busy-only
+native observation. Completion also requires no client replay-refusal log after
+the fenced attempt, including the already-absent retry, so server-side removal
+alone cannot hide a rejected response. This does not qualify
+structured Email creation, submission or sending.

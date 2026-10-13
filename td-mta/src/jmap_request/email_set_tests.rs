@@ -14,6 +14,7 @@ const DEVICE: DeviceId = DeviceId::from_bytes([2; 16]);
 #[derive(Default)]
 struct Flags {
     calls: RefCell<Vec<Vec<EmailUpdate>>>,
+    destroys: RefCell<Vec<Vec<EmailId>>>,
     refuse: bool,
     commit_error: Option<crate::store_fs::CommitError>,
     broken: bool,
@@ -59,6 +60,44 @@ impl EmailMutator for Flags {
             admission_stopped: self.stopped,
         })
     }
+    fn destroy(
+        &self,
+        request: EmailDestroyRequest<'_>,
+        _: &mut Meter,
+    ) -> Result<EmailDestroyCompletion, UploadError> {
+        use crate::store_fs::EmailDestroyResult;
+        assert_eq!(request.account, ACCOUNT);
+        assert_eq!(request.device, DEVICE);
+        self.destroys.borrow_mut().push(request.emails.to_vec());
+        if self.refuse {
+            return Err(ports::Error::Conflict.into());
+        }
+        Ok(EmailDestroyCompletion {
+            before: ViewIdentity {
+                account: ACCOUNT,
+                epoch: StoreEpoch::from_bytes([7; 16]),
+                committed_sequence: Sequence::from_u64(3),
+                history_floor: Sequence::default(),
+            },
+            outcome: self.commit_error.map_or(Ok(Sequence::from_u64(4)), Err),
+            results: if self.broken {
+                Vec::new()
+            } else {
+                request
+                    .emails
+                    .iter()
+                    .map(|id| {
+                        if *id == EmailId::from_bytes([99; 16]) {
+                            EmailDestroyResult::NotFound
+                        } else {
+                            EmailDestroyResult::Destroyed
+                        }
+                    })
+                    .collect()
+            },
+            admission_stopped: self.stopped,
+        })
+    }
 }
 fn id<T: wire::LocalId>(value: T) -> String {
     wire::encode_id(value, &mut [0; wire::IdKind::WIRE_BYTES])
@@ -86,6 +125,17 @@ fn run_timing(
             meter: &mut Meter,
         ) -> Result<EmailUpdateCompletion, UploadError> {
             let result = self.flags.update(request, meter);
+            if self.expire {
+                self.clock.0.store(95, std::sync::atomic::Ordering::SeqCst);
+            }
+            result
+        }
+        fn destroy(
+            &self,
+            request: EmailDestroyRequest<'_>,
+            meter: &mut Meter,
+        ) -> Result<EmailDestroyCompletion, UploadError> {
+            let result = self.flags.destroy(request, meter);
             if self.expire {
                 self.clock.0.store(95, std::sync::atomic::Ordering::SeqCst);
             }
@@ -220,7 +270,7 @@ fn malformed_and_oversized_sets_never_reach_mutation() {
             "requestTooLarge",
         ),
         (
-            format!(r#"{{"accountId":"{}","destroy":["{a}"]}}"#, id(ACCOUNT)),
+            format!(r#"{{"accountId":"{}","destroy":{{}}}}"#, id(ACCOUNT)),
             "invalidArguments",
         ),
     ] {
@@ -465,5 +515,110 @@ fn moves_accept_standalone_replacement_and_refuse_path_patches() {
             );
             assert!(flags.calls.borrow()[0].is_empty());
         }
+    }
+}
+
+#[test]
+fn destroy_reports_missing_and_foreign_ids_without_duplicate_native_effects() {
+    let flags = Flags::default();
+    let a = id(EmailId::from_bytes([3; 16]));
+    let missing = id(EmailId::from_bytes([99; 16]));
+    let input = td_json::json!({"accountId":id(ACCOUNT),"destroy":[a.clone(),missing.clone(),"foreign",a.clone()]});
+    let result = run(input, &flags, 256);
+    let answer = &result["methodResponses"][1][1];
+    assert_eq!(answer["destroyed"], td_json::json!([a]));
+    for id in [missing.as_str(), "foreign"] {
+        assert_eq!(
+            answer["notDestroyed"][id]["type"].as_str(),
+            Some("notFound")
+        );
+    }
+    assert_eq!(
+        *flags.destroys.borrow(),
+        vec![vec![
+            EmailId::from_bytes([3; 16]),
+            EmailId::from_bytes([99; 16])
+        ]]
+    );
+    assert!(flags.calls.borrow().is_empty());
+}
+#[test]
+fn destroy_refuses_mixed_writes_bad_shapes_and_capacity_before_effects() {
+    let a = id(EmailId::from_bytes([3; 16]));
+    for input in [
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":[a.clone()],"update":{a.clone():{"keywords/$seen":true}}}),
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":[a.clone()],"create":{"x":{}}}),
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":[true]}),
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":["bad\"id"]}),
+    ] {
+        let flags = Flags::default();
+        let result = run(input, &flags, 256);
+        assert_eq!(
+            result["methodResponses"][1][1]["type"].as_str(),
+            Some("invalidArguments")
+        );
+        assert!(flags.destroys.borrow().is_empty());
+        assert!(flags.calls.borrow().is_empty());
+    }
+    let flags = Flags::default();
+    let wrong = run(
+        td_json::json!({"accountId":id(crate::ids::AccountId::from_bytes([9;16])),"destroy":[a.clone()]}),
+        &flags,
+        256,
+    );
+    assert_eq!(
+        wrong["methodResponses"][1][1]["type"].as_str(),
+        Some("accountNotFound")
+    );
+    assert!(flags.destroys.borrow().is_empty());
+    let result = run(
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":[a.clone(),a]}),
+        &flags,
+        1,
+    );
+    assert_eq!(
+        result["methodResponses"][1][1]["type"].as_str(),
+        Some("requestTooLarge")
+    );
+    assert!(flags.destroys.borrow().is_empty());
+    let ids: Vec<_> = (0..256)
+        .map(|n| format!("{}{:03}", "x".repeat(240), n))
+        .collect();
+    let result = run(
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":ids}),
+        &flags,
+        256,
+    );
+    assert_eq!(
+        result["methodResponses"][1][1]["description"].as_str(),
+        Some("responseCapacity")
+    );
+    assert!(flags.destroys.borrow().is_empty());
+}
+#[test]
+fn destroy_preserves_known_commit_after_deadline_and_refuses_uncertain_or_broken_results() {
+    let input =
+        td_json::json!({"accountId":id(ACCOUNT),"destroy":[id(EmailId::from_bytes([3;16]))]});
+    let flags = Flags::default();
+    let result = run_timing(input.clone(), &flags, 256, true).unwrap();
+    assert_eq!(result["methodResponses"][1][0].as_str(), Some("Email/set"));
+    for flags in [
+        Flags {
+            broken: true,
+            ..Default::default()
+        },
+        Flags {
+            commit_error: Some(crate::store_fs::CommitError::Indeterminate(
+                ports::Error::WriterStopped,
+            )),
+            ..Default::default()
+        },
+    ] {
+        let result = run(input.clone(), &flags, 256);
+        assert_eq!(
+            result["methodResponses"][1][1]["type"].as_str(),
+            Some("serverPartialFail")
+        );
+        assert!(result["methodResponses"][1][1].get("destroyed").is_none());
     }
 }
