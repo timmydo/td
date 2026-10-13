@@ -78,12 +78,12 @@ pub use completion::{CommitCompletion, CommitFileUsage};
 use completion::{CommitPhase, CommitWork};
 pub use upload::{
     smtp_trace_allowance, BlobAuthorization, BlobReadRequest, Delivery, DeliveryAuthorization,
-    DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest,
-    EmailFlagUpdate, FlagAuthorization, FlagCompletion, FlagRequest, NativeSortJob, ResponseError,
-    ResponseRetention, SortError, SortRetention, SortSource, SortWork, SortWorkspace,
-    StoreCoordinator, Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion,
-    UploadError, UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition,
-    MAX_FLAG_UPDATES,
+    DeliveryCompletion, DeliveryError, DeliveryGuard, DeliveryPeer, DeliveryRequest, EmailUpdate,
+    EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest, EmailUpdateResult,
+    NativeSortJob, ResponseError, ResponseRetention, SortError, SortRetention, SortSource,
+    SortWork, SortWorkspace, StoreCoordinator, Upload, UploadAttempt, UploadAuthorization,
+    UploadCleanup, UploadCompletion, UploadError, UploadGuard, UploadMaintenance, UploadRequest,
+    UploadSweepDisposition, MAX_EMAIL_UPDATES,
 };
 #[path = "index/backup.rs"]
 mod backup;

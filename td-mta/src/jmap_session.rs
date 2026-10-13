@@ -95,7 +95,7 @@ impl Session {
             limits.objects_per_method,
             limits
                 .objects_per_method
-                .min(crate::store_fs::MAX_FLAG_UPDATES),
+                .min(crate::store_fs::MAX_EMAIL_UPDATES),
             id,
         ))
         .map_err(|_| Error::Capacity)?;

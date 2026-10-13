@@ -82,7 +82,7 @@ fn buffer<T: Clone>(length: usize, value: T) -> Result<Box<[T]>, Error> {
     bytes.resize(length, value);
     Ok(bytes.into_boxed_slice())
 }
-impl<P: crate::store_fs::FlagAuthorization + Sync> https_upload::Backend
+impl<P: crate::store_fs::EmailUpdateAuthorization + Sync> https_upload::Backend
     for Service<'_, '_, '_, '_, '_, P>
 {
     fn account(&self) -> AccountId {
@@ -155,7 +155,7 @@ impl<P: crate::store_fs::FlagAuthorization + Sync> https_upload::Backend
         })
     }
 }
-impl<P: crate::store_fs::FlagAuthorization> Service<'_, '_, '_, '_, '_, P> {
+impl<P: crate::store_fs::EmailUpdateAuthorization> Service<'_, '_, '_, '_, '_, P> {
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
         let limits = self.resources.limits();
         let device = request.device;

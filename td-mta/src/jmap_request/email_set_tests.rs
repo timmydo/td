@@ -13,7 +13,7 @@ const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const DEVICE: DeviceId = DeviceId::from_bytes([2; 16]);
 #[derive(Default)]
 struct Flags {
-    calls: RefCell<Vec<Vec<EmailFlagUpdate>>>,
+    calls: RefCell<Vec<Vec<EmailUpdate>>>,
     refuse: bool,
     commit_error: Option<crate::store_fs::CommitError>,
     broken: bool,
@@ -22,16 +22,16 @@ struct Flags {
 impl FlagMutator for Flags {
     fn update(
         &self,
-        request: FlagRequest<'_>,
+        request: EmailUpdateRequest<'_>,
         _: &mut Meter,
-    ) -> Result<FlagCompletion, UploadError> {
+    ) -> Result<EmailUpdateCompletion, UploadError> {
         assert_eq!(request.account, ACCOUNT);
         assert_eq!(request.device, DEVICE);
         self.calls.borrow_mut().push(request.updates.to_vec());
         if self.refuse {
             return Err(ports::Error::Conflict.into());
         }
-        Ok(FlagCompletion {
+        Ok(EmailUpdateCompletion {
             before: ViewIdentity {
                 account: ACCOUNT,
                 epoch: StoreEpoch::from_bytes([7; 16]),
@@ -39,13 +39,19 @@ impl FlagMutator for Flags {
                 history_floor: Sequence::from_u64(0),
             },
             outcome: self.commit_error.map_or(Ok(Sequence::from_u64(4)), Err),
-            found: if self.broken {
-                vec![true]
+            results: if self.broken {
+                vec![EmailUpdateResult::Updated]
             } else {
                 request
                     .updates
                     .iter()
-                    .map(|u| u.email != EmailId::from_bytes([99; 16]))
+                    .map(|u| {
+                        if u.email == EmailId::from_bytes([99; 16]) {
+                            EmailUpdateResult::NotFound
+                        } else {
+                            EmailUpdateResult::Updated
+                        }
+                    })
                     .collect()
             },
             admission_stopped: self.stopped,
@@ -74,9 +80,9 @@ fn run_timing(
     impl FlagMutator for Timed<'_> {
         fn update(
             &self,
-            request: FlagRequest<'_>,
+            request: EmailUpdateRequest<'_>,
             meter: &mut Meter,
-        ) -> Result<FlagCompletion, UploadError> {
+        ) -> Result<EmailUpdateCompletion, UploadError> {
             let result = self.flags.update(request, meter);
             if self.expire {
                 self.clock.0.store(95, std::sync::atomic::Ordering::SeqCst);

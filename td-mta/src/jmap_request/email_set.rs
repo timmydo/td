@@ -10,8 +10,8 @@ use crate::{
     ids::EmailId,
     ports,
     store_fs::{
-        EmailFlagUpdate, FlagAuthorization, FlagCompletion, FlagRequest, StoreCoordinator,
-        UploadError, MAX_FLAG_UPDATES,
+        EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest,
+        EmailUpdateResult, StoreCoordinator, UploadError, MAX_EMAIL_UPDATES,
     },
     sync::{DataState, DataType},
 };
@@ -22,22 +22,22 @@ use td_json::scan;
 pub trait FlagMutator {
     fn update(
         &self,
-        request: FlagRequest<'_>,
+        request: EmailUpdateRequest<'_>,
         meter: &mut Meter,
-    ) -> Result<FlagCompletion, UploadError>;
+    ) -> Result<EmailUpdateCompletion, UploadError>;
 }
-impl<P: FlagAuthorization> FlagMutator for StoreCoordinator<'_, '_, P> {
+impl<P: EmailUpdateAuthorization> FlagMutator for StoreCoordinator<'_, '_, P> {
     fn update(
         &self,
-        request: FlagRequest<'_>,
+        request: EmailUpdateRequest<'_>,
         meter: &mut Meter,
-    ) -> Result<FlagCompletion, UploadError> {
-        self.update_flags(&td_crypto::Provider, request, meter)
+    ) -> Result<EmailUpdateCompletion, UploadError> {
+        self.update_emails(&td_crypto::Provider, request, meter)
     }
 }
 struct Update {
     name: Name,
-    value: EmailFlagUpdate,
+    value: EmailUpdate,
     local: bool,
     valid: bool,
 }
@@ -102,7 +102,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 Ok((state.epoch, state.sequence))
             })
             .transpose()?;
-        let maximum = maximum.min(MAX_FLAG_UPDATES);
+        let maximum = maximum.min(MAX_EMAIL_UPDATES);
         let mut updates = Vec::new();
         updates
             .try_reserve_exact(maximum)
@@ -114,7 +114,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     return Err(Error::RequestTooLarge);
                 }
                 let id: Option<EmailId> = item.key.wire_id()?.local();
-                let mut value = EmailFlagUpdate {
+                let mut value = EmailUpdate {
+                    mailbox: None,
                     email: id.unwrap_or(EmailId::from_bytes([0; 16])),
                     seen: None,
                     flagged: None,
@@ -175,7 +176,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             .retention
             .reserve_mutation_output(bound)
             .map_err(Error::Storage)?;
-        let request = FlagRequest {
+        let request = EmailUpdateRequest {
             account: self.account,
             device,
             expected,
@@ -197,7 +198,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 return Err(Error::ServerPartialFail)
             }
         };
-        if completion.found.len() != changes.len() {
+        if completion.results.len() != changes.len() {
             return Err(Error::State);
         }
         let mut before = [0; DataState::WIRE_BYTES];
@@ -214,7 +215,11 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         let account = std::str::from_utf8(account.bytes()).map_err(|_| Error::State)?;
         let mut out = TextBuffer::new(&mut output);
         out.format(format_args!("{{\"accountId\":\"{account}\",\"oldState\":\"{old}\",\"newState\":\"{new}\",\"created\":null,\"destroyed\":null,\"notCreated\":null,\"notDestroyed\":null")).map_err(|_| Error::State)?;
-        let successes = completion.found.iter().filter(|found| **found).count();
+        let successes = completion
+            .results
+            .iter()
+            .filter(|result| **result == EmailUpdateResult::Updated)
+            .count();
         for errors in [false, true] {
             let name = if errors { "notUpdated" } else { "updated" };
             out.format(format_args!(",\"{name}\":"))
@@ -229,20 +234,22 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 continue;
             }
             out.append("{").map_err(|_| Error::State)?;
-            let mut found = completion.found.iter();
+            let mut found = completion.results.iter();
             let mut first = true;
             for update in &updates {
-                let exists = if update.valid && update.local {
+                let result = if update.valid && update.local {
                     *found.next().ok_or(Error::State)?
                 } else {
-                    false
+                    EmailUpdateResult::NotFound
                 };
                 let error = if !update.valid {
                     Some("invalidProperties")
-                } else if !exists {
-                    Some("notFound")
                 } else {
-                    None
+                    match result {
+                        EmailUpdateResult::Updated => None,
+                        EmailUpdateResult::NotFound => Some("notFound"),
+                        EmailUpdateResult::InvalidMailbox => Some("invalidProperties"),
+                    }
                 };
                 if error.is_some() != errors {
                     continue;

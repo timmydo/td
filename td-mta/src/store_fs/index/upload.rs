@@ -810,5 +810,6 @@ pub use sort_job::{NativeSortJob, SortSource, SortWork, SortWorkspace};
 #[path = "flags.rs"]
 mod flags;
 pub use flags::{
-    EmailFlagUpdate, FlagAuthorization, FlagCompletion, FlagRequest, MAX_FLAG_UPDATES,
+    EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest,
+    EmailUpdateResult, MAX_EMAIL_UPDATES,
 };

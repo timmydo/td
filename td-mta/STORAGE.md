@@ -2783,33 +2783,44 @@ an owned keyword for that extra row. Every row also checks the native deadline.
 Invalid keyword cursors return Invalid before snapshot entry; this error-only
 precedence grants no result or freshness claim.
 
-### Device flag coordination
+### Device Email update coordination
 
-StoreCoordinator::update_flags plans at most 256 distinct Email assignments
-under its coordination mutex. Its separate FlagAuthorization guard binds the
+StoreCoordinator::update_emails plans at most 256 distinct Email assignments
+under its coordination mutex. Its separate EmailUpdateAuthorization guard binds the
 account/device and excludes revocation through COMMIT; read/upload admission
-alone supplies no flag authority. Callers reserve the complete method response
+alone supplies no Email mutation authority. Callers reserve the complete method response
 before entry and supply the enclosing request's original work meter. The
 execution deadline may be narrower than the meter's, never wider.
 
-Only optional seen and flagged booleans are accepted by this typed boundary.
-Planning reads Email existence, the selected keyword rows, and bounded native
+This typed boundary accepts optional seen/flagged booleans and replacement
+of all mailbox memberships with one existing account mailbox, matching
+td-mail's move operation. Destination existence is checked before planning
+any flag change for that Email. Results distinguish successful assignments,
+missing Emails and invalid destinations; a refused object has no effects.
+Multiple current memberships are read through bounded windows and removed
+atomically. An already sole destination is a no-op. Membership changes emit
+one deduplicated Mailbox Updated record for each changed source/destination;
+a retained destination needs history only when its unread count changes.
+Planning reads Email and destination Mailbox existence, selected keyword rows,
+and bounded native
 membership windows; no MIME/body bytes are interpreted. A missing Email is a
 per-object absence in request order. An unchanged assignment is a no-op. A
 supplied expected epoch/sequence must match the captured account endpoint.
 Duplicate IDs, work/deadline exhaustion, or a plan exceeding 4096 operations
 refuse before any writes. Allocations are bounded by the input ceiling, row
-scratch, two keyword keys per Email, and the transaction operation ceiling.
+scratch, two keyword keys per Email, and bounded membership/operation arrays.
 
 One commit publishes all changed keywords and one Email Updated history row
 per changed Email. Seen changes also publish one Mailbox Updated per affected
 mailbox, deduplicated across the batch; star-only changes do not alter mailbox
 counts. Unread thread counts include only unread non-draft Emails in that
-mailbox, so a seen change affects only the Email's own mailboxes. Thread membership and immutable bodies remain unchanged. The existing
+mailbox, so a seen change affects only the Email's own mailboxes. Thread identity and immutable bodies remain unchanged. The existing
 physical database/WAL lease covers the commit and its original-scope file
 observations. Settlement preserves a known durable success even when admission
 must stop; only recoverable file-accounting refusal permits checkpoint recovery.
 No-op batches retain their original sequence and perform no storage commit.
 The HTTPS owner activates this entry only for authenticated device
 read/star patches and reserves its complete response before entry. Native tests cover history, unchanged raw bytes,
-no-op/clear, refusals without partial writes, and flags/history after reopen.
+no-op/clear, paged membership replacement, invalid destinations without flag
+effects, work refusal without partial writes, and moves/flags after reopen.
+The HTTPS adapter still accepts flags only; move activation follows separately.

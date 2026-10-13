@@ -289,12 +289,12 @@ impl<'r> crate::store_fs::BlobAuthorization for Option<DevicePolicy<'_, 'r>> {
     }
 }
 
-impl<'r> crate::store_fs::FlagAuthorization for DevicePolicy<'_, 'r> {
+impl<'r> crate::store_fs::EmailUpdateAuthorization for DevicePolicy<'_, 'r> {
     type Guard<'a>
         = DeviceGuard<'a, 'r>
     where
         Self: 'a;
-    fn authorize_flags(
+    fn authorize_email_update(
         &self,
         account: AccountId,
         device: DeviceId,
@@ -303,12 +303,12 @@ impl<'r> crate::store_fs::FlagAuthorization for DevicePolicy<'_, 'r> {
         crate::store_fs::UploadAuthorization::authorize(self, account, device, deadline)
     }
 }
-impl<'r> crate::store_fs::FlagAuthorization for Option<DevicePolicy<'_, 'r>> {
+impl<'r> crate::store_fs::EmailUpdateAuthorization for Option<DevicePolicy<'_, 'r>> {
     type Guard<'a>
         = DeviceGuard<'a, 'r>
     where
         Self: 'a;
-    fn authorize_flags(
+    fn authorize_email_update(
         &self,
         account: AccountId,
         device: DeviceId,
@@ -316,7 +316,7 @@ impl<'r> crate::store_fs::FlagAuthorization for Option<DevicePolicy<'_, 'r>> {
     ) -> Result<Self::Guard<'_>, Error> {
         self.as_ref()
             .ok_or(Error::Forbidden)?
-            .authorize_flags(account, device, deadline)
+            .authorize_email_update(account, device, deadline)
     }
 }
 
@@ -353,8 +353,10 @@ mod tests {
         let devices = Mutex::new(store);
         let policy = Some(DevicePolicy::new(&devices, &Now, 7));
         let deadline = Deadline::after(Tick(1), 100).unwrap();
-        use crate::store_fs::FlagAuthorization;
-        let flags = policy.authorize_flags(account, device, deadline).unwrap();
+        use crate::store_fs::EmailUpdateAuthorization;
+        let flags = policy
+            .authorize_email_update(account, device, deadline)
+            .unwrap();
         assert_eq!(flags.access().principal, Principal::Device(device));
         assert!(devices.try_lock().is_err());
         drop(flags);
@@ -377,12 +379,12 @@ mod tests {
             Err(Error::Forbidden)
         ));
         assert!(matches!(
-            policy.authorize_flags(account, device, deadline),
+            policy.authorize_email_update(account, device, deadline),
             Err(Error::Forbidden)
         ));
         let absent: Option<DevicePolicy<'_, '_>> = None;
         assert!(matches!(
-            absent.authorize_flags(account, device, deadline),
+            absent.authorize_email_update(account, device, deadline),
             Err(Error::Forbidden)
         ));
         assert!(matches!(

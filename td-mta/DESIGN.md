@@ -2227,11 +2227,13 @@ still emits only pings: td-mail does not consume it. Future Mail state delivery
 requires passive state capture without blocking the network reactor or holding
 a store view across socket work; this profile makes no such claim.
 
-## Device read/star transaction foundation
+## Device Email update transaction foundation
 
-The storage coordinator now accepts bounded, device-authorized `$seen` and
-`$flagged` assignments through the typed update_flags boundary documented in
-STORAGE.md. Values and corresponding Email/Mailbox history commit together,
+The storage coordinator now accepts bounded, device-authorized single-mailbox
+replacement plus `$seen` and `$flagged` assignments through the typed
+update_emails boundary documented in
+STORAGE.md. Memberships, flags and corresponding Email/Mailbox history
+commit together,
 and known commit outcomes survive later accounting refusal. Authenticated
 HTTPS Email/set activates only td-mail keyword patches for these two flags,
 with matching Session and Mailbox rights. Other Email mutations are absent.
