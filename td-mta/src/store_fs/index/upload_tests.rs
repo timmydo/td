@@ -2808,3 +2808,485 @@ fn authorized_empty_blob_checks_callback_deadline_and_releases_after_panic() {
         None
     });
 }
+
+impl FlagAuthorization for Policy {
+    type Guard<'a> = Guard<'a>;
+    fn authorize_flags(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Guard<'_>, ports::Error> {
+        self.authorize(account, device, deadline)
+    }
+}
+const FLAG_EMAIL: crate::ids::EmailId = crate::ids::EmailId::from_bytes([40; 16]);
+const FLAG_MAILBOX: MailboxId = MailboxId::from_bytes([41; 16]);
+fn seed_flag_email(store: &IndexStore<'_>) {
+    use crate::format::row::{EmailOrigin, EmailRow, MailboxRow};
+    let thread = crate::ids::ThreadId::from_bytes([42; 16]);
+    let email = row_bytes(Row::Email(EmailRow {
+        blob: SEED,
+        thread,
+        received_at: 0,
+        origin: EmailOrigin::Jmap,
+    }));
+    let mailbox = row_bytes(Row::Mailbox(MailboxRow {
+        name: "Inbox",
+        parent: None,
+        role: Some("inbox"),
+        sort_order: 0,
+        subscribed: true,
+    }));
+    let mut membership = [0; 32];
+    Key::Membership(FLAG_EMAIL, FLAG_MAILBOX)
+        .encode(&mut membership)
+        .unwrap();
+    let expected = store
+        .view(ACCOUNT, deadline())
+        .unwrap()
+        .identity()
+        .committed_sequence;
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account: ACCOUNT,
+                epoch: store.epoch(),
+                expected,
+                utc_ms: 0,
+                deadline: deadline(),
+            },
+            &[
+                Operation::put(Table::Threads, thread.as_bytes(), &[]).unwrap(),
+                Operation::put(Table::Emails, FLAG_EMAIL.as_bytes(), &email).unwrap(),
+                Operation::put(Table::Mailboxes, FLAG_MAILBOX.as_bytes(), &mailbox).unwrap(),
+                Operation::put(Table::Memberships, &membership, &[]).unwrap(),
+            ],
+            &mut [],
+        )
+        .unwrap();
+}
+fn flag_meter(records: u64) -> crate::admission::work::Meter {
+    crate::admission::work::Meter::new(
+        deadline(),
+        crate::admission::work::Charge {
+            records,
+            ..Default::default()
+        },
+    )
+}
+#[test]
+fn flag_batch_records_email_and_mailbox_history_without_rewriting_body() {
+    fixture_config(4, 100000, seed_flag_email, |coordinator, _, _, _, _| {
+        let updates = [
+            EmailFlagUpdate {
+                email: FLAG_EMAIL,
+                seen: Some(true),
+                flagged: Some(true),
+            },
+            EmailFlagUpdate {
+                email: crate::ids::EmailId::from_bytes([99; 16]),
+                seen: Some(true),
+                flagged: None,
+            },
+        ];
+        let request = FlagRequest {
+            account: ACCOUNT,
+            device: DEVICE,
+            expected: None,
+            updates: &updates,
+            deadline: deadline(),
+        };
+        let before = coordinator
+            .store
+            .view(ACCOUNT, deadline())
+            .unwrap()
+            .identity();
+        let complete = coordinator
+            .update_flags(&td_crypto::Provider, request, &mut flag_meter(10000))
+            .unwrap();
+        let sequence = complete.outcome.unwrap();
+        assert!(sequence > before.committed_sequence);
+        assert_eq!(complete.before, before);
+        assert_eq!(complete.found, [true, false]);
+        assert!(!complete.admission_stopped);
+        assert_recount(coordinator);
+        let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+        let mut scratch = [0; 128];
+        for name in ["$seen", "$flagged"] {
+            assert!(view
+                .get(Key::Keyword(FLAG_EMAIL, name), &mut scratch)
+                .unwrap()
+                .is_some());
+        }
+        let cursor = ChangeCursor {
+            sequence: before.committed_sequence,
+            operation: u32::MAX,
+        };
+        for (kind, id) in [
+            (ObjectType::Email, *FLAG_EMAIL.as_bytes()),
+            (ObjectType::Mailbox, *FLAG_MAILBOX.as_bytes()),
+        ] {
+            let ChangeStep::Record(record) = view.next_change(cursor, kind).unwrap() else {
+                panic!("missing history")
+            };
+            assert_eq!(record.change.id, id);
+            assert_eq!(record.change.action, ChangeAction::Updated);
+            assert_eq!(record.cursor.sequence, sequence);
+        }
+        let mut input = view.open_blob_input(&td_crypto::Provider, SEED, 8).unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(input.read(&mut bytes).unwrap(), 4);
+        input.finish().unwrap();
+        assert_eq!(&bytes, b"seed");
+        drop(view);
+        let noop = coordinator
+            .update_flags(&td_crypto::Provider, request, &mut flag_meter(10000))
+            .unwrap();
+        assert_eq!(noop.outcome, Ok(sequence));
+        let updates = [EmailFlagUpdate {
+            email: FLAG_EMAIL,
+            seen: Some(false),
+            flagged: Some(false),
+        }];
+        let clear = coordinator
+            .update_flags(
+                &td_crypto::Provider,
+                FlagRequest {
+                    updates: &updates,
+                    ..request
+                },
+                &mut flag_meter(10000),
+            )
+            .unwrap();
+        assert!(clear.outcome.unwrap() > sequence);
+        let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+        for name in ["$seen", "$flagged"] {
+            assert!(view
+                .get(Key::Keyword(FLAG_EMAIL, name), &mut scratch)
+                .unwrap()
+                .is_none());
+        }
+        None
+    });
+}
+#[test]
+fn flag_refusals_have_no_partial_writes_or_history() {
+    fixture_config(
+        4,
+        100000,
+        seed_flag_email,
+        |coordinator, _, clock, policy, _| {
+            let updates = [EmailFlagUpdate {
+                email: FLAG_EMAIL,
+                seen: Some(true),
+                flagged: Some(true),
+            }];
+            let request = FlagRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                updates: &updates,
+                deadline: deadline(),
+            };
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(3)),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            assert!(matches!(
+                coordinator.update_flags(
+                    &td_crypto::Provider,
+                    FlagRequest {
+                        expected: Some((
+                            StoreEpoch::from_bytes([8; 16]),
+                            before.committed_sequence
+                        )),
+                        ..request
+                    },
+                    &mut flag_meter(10000)
+                ),
+                Err(UploadError::Store(ports::Error::Conflict))
+            ));
+            policy.lock().unwrap().allowed = false;
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(10000)),
+                Err(UploadError::Store(ports::Error::Forbidden))
+            ));
+            policy.lock().unwrap().allowed = true;
+            policy.lock().unwrap().device = DeviceId::from_bytes([90; 16]);
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(10000)),
+                Err(UploadError::Store(ports::Error::Forbidden))
+            ));
+            policy.lock().unwrap().device = DEVICE;
+            clock.0.store(100, Ordering::Relaxed);
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(10000)),
+                Err(UploadError::Store(ports::Error::Deadline))
+            ));
+            clock.0.store(1, Ordering::Relaxed);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity(), before);
+            let mut scratch = [0; 128];
+            for name in ["$seen", "$flagged"] {
+                assert!(view
+                    .get(Key::Keyword(FLAG_EMAIL, name), &mut scratch)
+                    .unwrap()
+                    .is_none());
+            }
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn committed_flags_reopen_with_the_same_history_endpoint() {
+    let fixture = Fixture::new();
+    let mut root = fixture.locked();
+    let clock = Arc::new(Timer(
+        AtomicU64::new(1),
+        Mutex::new(Default::default()),
+        AtomicI64::new(0),
+    ));
+    let resources = Limits::default().plan().unwrap();
+    let plan = DiskLimits::default()
+        .plan(
+            &resources,
+            WorkLimits::default(),
+            ViewMode::OnlineBackground,
+        )
+        .unwrap();
+    let store = IndexStore::create(
+        &mut root,
+        StoreEpoch::from_bytes([7; 16]),
+        clock.clone(),
+        2,
+        deadline(),
+    )
+    .unwrap();
+    store.create_account(ACCOUNT, deadline()).unwrap();
+    seed(&store, 100000);
+    seed_flag_email(&store);
+    let policy = Policy(Arc::new(Mutex::new(PolicyState {
+        allowed: true,
+        generation: 1,
+        device: DEVICE,
+        read_mismatch: false,
+    })));
+    let mut states = [const { SlotState::EMPTY }; 4];
+    let mut cells = [const { LeaseCell::EMPTY }; 4];
+    let coordinator = StoreCoordinator::new(
+        store,
+        &plan,
+        AuxiliaryUsage {
+            sort_bytes: 0,
+            response_bytes: 0,
+            cache_bytes: 0,
+            log_bytes: 0,
+            cold_bytes: 0,
+        },
+        &mut states,
+        &mut cells,
+        policy,
+        deadline(),
+    )
+    .unwrap();
+    let updates = [EmailFlagUpdate {
+        email: FLAG_EMAIL,
+        seen: Some(true),
+        flagged: Some(true),
+    }];
+    let complete = coordinator
+        .update_flags(
+            &td_crypto::Provider,
+            FlagRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                updates: &updates,
+                deadline: deadline(),
+            },
+            &mut flag_meter(10000),
+        )
+        .unwrap();
+    let sequence = complete.outcome.unwrap();
+    drop(coordinator);
+    let store = IndexStore::open(&mut root, clock, 2, deadline()).unwrap();
+    store.validate_integrity(deadline()).unwrap();
+    let mut view = store.view(ACCOUNT, deadline()).unwrap();
+    assert_eq!(view.identity().committed_sequence, sequence);
+    let mut scratch = [0; 128];
+    for keyword in ["$seen", "$flagged"] {
+        assert_eq!(
+            view.get(Key::Keyword(FLAG_EMAIL, keyword), &mut scratch)
+                .unwrap()
+                .unwrap()
+                .1,
+            sequence
+        );
+    }
+    let ChangeStep::Record(change) = view
+        .next_change(
+            ChangeCursor {
+                sequence: complete.before.committed_sequence,
+                operation: u32::MAX,
+            },
+            ObjectType::Email,
+        )
+        .unwrap()
+    else {
+        panic!("durable history")
+    };
+    assert_eq!(change.cursor.sequence, sequence);
+    assert_eq!(change.change.id, *FLAG_EMAIL.as_bytes());
+}
+
+#[test]
+fn flags_page_memberships_and_keep_star_history_email_only() {
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            seed_flag_email(store);
+            let mailbox = row_bytes(Row::Mailbox(crate::format::row::MailboxRow {
+                name: "Other",
+                parent: None,
+                role: None,
+                sort_order: 0,
+                subscribed: true,
+            }));
+            for byte in 50..70 {
+                let id = MailboxId::from_bytes([byte; 16]);
+                let mut key = [0; 32];
+                Key::Membership(FLAG_EMAIL, id).encode(&mut key).unwrap();
+                let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+                store
+                    .commit(
+                        &td_crypto::Provider,
+                        CommitRequest {
+                            account: ACCOUNT,
+                            epoch: before.epoch,
+                            expected: before.committed_sequence,
+                            utc_ms: 0,
+                            deadline: deadline(),
+                        },
+                        &[
+                            Operation::put(Table::Mailboxes, id.as_bytes(), &mailbox).unwrap(),
+                            Operation::put(Table::Memberships, &key, &[]).unwrap(),
+                        ],
+                        &mut [],
+                    )
+                    .unwrap();
+            }
+        },
+        |coordinator, _, _, _, _| {
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            let updates = [EmailFlagUpdate {
+                email: FLAG_EMAIL,
+                seen: None,
+                flagged: Some(true),
+            }];
+            let request = FlagRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: Some((before.epoch, before.committed_sequence)),
+                updates: &updates,
+                deadline: deadline(),
+            };
+            let star = coordinator
+                .update_flags(&td_crypto::Provider, request, &mut flag_meter(4))
+                .unwrap();
+            let star_sequence = star.outcome.unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let cursor = ChangeCursor {
+                sequence: before.committed_sequence,
+                operation: u32::MAX,
+            };
+            assert!(matches!(
+                view.next_change(cursor, ObjectType::Mailbox).unwrap(),
+                ChangeStep::Advanced { .. } | ChangeStep::Complete
+            ));
+            drop(view);
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(10000)),
+                Err(UploadError::Store(ports::Error::Conflict))
+            ));
+            let seen = [EmailFlagUpdate {
+                seen: Some(true),
+                flagged: None,
+                ..updates[0]
+            }];
+            let request = FlagRequest {
+                expected: None,
+                updates: &seen,
+                ..request
+            };
+            // Planning completes, then the final operation charge refuses before COMMIT.
+            assert!(matches!(
+                coordinator.update_flags(&td_crypto::Provider, request, &mut flag_meter(36)),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            assert_eq!(
+                coordinator
+                    .store
+                    .view(ACCOUNT, deadline())
+                    .unwrap()
+                    .identity()
+                    .committed_sequence,
+                star_sequence
+            );
+            let done = coordinator
+                .update_flags(&td_crypto::Provider, request, &mut flag_meter(10000))
+                .unwrap();
+            let sequence = done.outcome.unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut cursor = ChangeCursor {
+                sequence: star_sequence,
+                operation: u32::MAX,
+            };
+            let mut count = 0;
+            while let ChangeStep::Record(record) =
+                view.next_change(cursor, ObjectType::Mailbox).unwrap()
+            {
+                assert_eq!(record.cursor.sequence, sequence);
+                count += 1;
+                cursor = record.cursor;
+            }
+            assert_eq!(count, 21);
+            drop(view);
+            for (batch, expected) in [
+                (vec![updates[0]; 2], ports::Error::Invalid),
+                (vec![updates[0]; 257], ports::Error::Capacity),
+            ] {
+                assert!(
+                    matches!(coordinator.update_flags(&td_crypto::Provider, FlagRequest {updates: &batch, ..request}, &mut flag_meter(10000)), Err(UploadError::Store(error)) if error == expected)
+                );
+            }
+            let wider = Deadline::after(Tick(0), 101).unwrap();
+            assert!(matches!(
+                coordinator.update_flags(
+                    &td_crypto::Provider,
+                    FlagRequest {
+                        deadline: wider,
+                        ..request
+                    },
+                    &mut flag_meter(10000)
+                ),
+                Err(UploadError::Store(ports::Error::Invalid))
+            ));
+            assert_recount(coordinator);
+            None
+        },
+    );
+}

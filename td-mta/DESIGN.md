@@ -2225,3 +2225,12 @@ read-only. CONFORMANCE.md records the actual client/TLS evidence. EventSource
 still emits only pings: td-mail does not consume it. Future Mail state delivery
 requires passive state capture without blocking the network reactor or holding
 a store view across socket work; this read profile makes no such claim.
+
+## Device read/star transaction foundation
+
+The storage coordinator now accepts bounded, device-authorized `$seen` and
+`$flagged` assignments through the typed update_flags boundary documented in
+STORAGE.md. Values and corresponding Email/Mailbox history commit together,
+and known commit outcomes survive later accounting refusal. HTTPS Email/set
+activation and matching Session/Mailbox rights remain a separate increment;
+the running td-mail profile remains read-only until that integration lands.

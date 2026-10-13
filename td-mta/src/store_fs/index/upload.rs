@@ -806,3 +806,9 @@ pub use blob_access::{BlobAuthorization, BlobReadRequest};
 #[path = "sort_job.rs"]
 mod sort_job;
 pub use sort_job::{NativeSortJob, SortSource, SortWork, SortWorkspace};
+
+#[path = "flags.rs"]
+mod flags;
+pub use flags::{
+    EmailFlagUpdate, FlagAuthorization, FlagCompletion, FlagRequest, MAX_FLAG_UPDATES,
+};
