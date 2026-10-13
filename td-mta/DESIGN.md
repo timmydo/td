@@ -2340,3 +2340,22 @@ original work meter; exhausted work refuses creation. This is linear in
 retained kind history, not an ID-point lookup. Pruned history is outside
 this collision claim, matching QUEUE.md's random-ID policy. Composition
 enforces a shorter execution-phase deadline without renewing its meter.
+
+## td-mail structured draft input
+
+The inert `draft_input` decoder borrows text from an already parsed request
+and retains only bounded address and identifier descriptor vectors. It
+accepts td-mail's single From, optional recipient/reply lists, Subject,
+Message-ID, whole-second UTC sentAt in years 1900 through 9999 with seconds
+00 through 59, one `text`/`text/plain` body part,
+complete untruncated body value, one local-form mailbox ID, and exactly
+`$draft` plus `$seen`. Nonempty attachments, HTML and other creation fields
+are refused in this increment. Message header syntax and MIME composition
+remain `compose_text` work; decoding confers no authorization or storage.
+
+Each descriptor list has the composer's 1000-entry bound. The admitted JSON
+byte ceiling also bounds aggregate decoded strings. Text validation is paid
+from the original work meter before UTF-8 scanning, with fresh monotonic
+and phase checks before and after; each input member spends a record. A
+shorter execution deadline never renews the meter. The decoder does not
+activate HTTPS creation or Submission.

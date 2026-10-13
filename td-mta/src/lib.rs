@@ -27,6 +27,7 @@ pub mod bounded;
 pub mod clock;
 pub mod compose_text;
 pub mod config;
+pub mod draft_input;
 pub mod email_preview;
 pub mod email_properties;
 pub mod email_property;
