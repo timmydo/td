@@ -37,59 +37,56 @@ const MAX_MAX_TOKENS: u64 = 200_000;
 /// base85 runs can approach.
 const ASCII_BYTES_PER_TOKEN: u64 = 3;
 
-pub const USAGE: &str = "usage: td-agent review [--model MODEL] [--effort LEVEL] \
-                         [--max-tokens N] [--max-cost USD] [--log-dir DIRECTORY] [--routing MODE] [--] [FILE]\n\
-       td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
-                       [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
-                       [--max-cost USD] [--log-dir DIRECTORY]\n\
-                       [--tool-output-bytes N] [--tool-context-bytes N] [--context-tokens N]\n\
-                       [--routing MODE] [--provider SLUG]... [--no-provider-fallbacks]\n\
-                       [--max-input-price USD/M] [--max-output-price USD/M]\n\
-                       [--vendor DIRECTORY] [--test-runner TD-BUILDER]\n\
-\n\
-With --repo, reviews REV (HEAD by default) in a disposable sparse checkout,\n\
-with read/search tools and confined commands for tests. Source and git\n\
-metadata are read-only; scratch outputs are writable; network, edits,\n\
-publication and peer tools are unavailable. Changed top-level directories\n\
-are included automatically; --sparse adds directories, and the model can\n\
-widen the checkout. Tool results default to 8192 UTF-8 bytes each and\n\
-512 KiB total (not tokens); full results remain in logs. --vendor mounts\n\
-explicit offline Cargo sources read-only. --test-runner copies a compatible\n\
-td-builder into scratch; otherwise source target/release/td-builder is used\n\
-when present. td-agent review-log FILE summarizes a retained trace.\n\
---max-cost caps all model requests in this review,\n\
-defaulting to max_cost_per_turn (or $0.50 when disabled). Missing usage\n\
-is charged at its reservation. The checkout is removed on completion or\n\
-error; after abrupt process death it is collected by the next review.\n\
-\n\
-Without --repo, reviews the git commit in FILE, or on standard input when FILE is absent\n\
-or -, as `git show` prints it: one request to the configured API with\n\
-td-agent's key, the review written to standard output as it arrives and\n\
-the model and provider that served it, its token counts and cost to\n\
-standard error. MODEL defaults to the configured `model`; LEVEL, one of\n\
-none, minimal, low, medium, high or xhigh, is sent only when given; N\n\
-defaults to 32768, cut to the model's own limit. Its worst case must fit\n\
-max_cost_per_turn, priced from model or endpoint metadata: for a dear model,\n\
-ask a smaller N or raise that limit. It exits non-zero unless the review\n\
-finished whole. It needs td's fetch service: on td, run it from a\n\
-terminal with XDG_RUNTIME_DIR naming /run/user/1000; on a host, as\n\
-./install-apps installs it from a td checkout, whose launch serves it.\n\
-\n\
-Both review forms retain full session traces after cleanup in\n\
-$XDG_STATE_HOME/td-agent/reviews (or ~/.local/state/td-agent/reviews).\n\
---log-dir selects another private directory. The\n\
-private JSONL path is printed to stderr before the review starts.\n\
-\n\
---routing selects balanced (default), cheapest, floor, fastest, nitro or latency.\n\
---provider SLUG restricts eligible providers (repeatable); --max-input-price\n\
-and --max-output-price set dollars per million tokens. --no-provider-fallbacks\n\
-disables fallback attempts. Floor/Nitro enable\n\
-flex/priority tiers; cheapest/fastest only sort. Every request carries a\n\
-session id; priced requests carry a provider price envelope.\n\
-\n\
-For example:\n\
-\n\
-  td-agent review --repo . --commit HEAD --model google/gemini-3.8-flash \\\n    --effort high --max-cost 0.50\n";
+pub const USAGE: &str = r"usage: td-agent review --commit REV [--model opus-latest|gpt-sol-latest]
+                       [--max-cost USD] [--log-dir DIRECTORY]
+                       [--repo DIRECTORY] [--sparse DIRECTORY]...
+                       [--max-tokens N] [--effort high]
+                       [--tool-output-bytes N] [--tool-context-bytes N]
+                       [--context-tokens N] [--routing MODE]
+                       [--provider SLUG]... [--no-provider-fallbacks]
+                       [--max-input-price USD/M] [--max-output-price USD/M]
+                       [--vendor DIRECTORY] [--test-runner TD-BUILDER]
+
+Reviews one local commit from the current directory; --repo selects another
+local repository (HEAD is its default commit). Unpublished commits need no
+remote or fetch. td-agent generates the full diff and review instruction,
+creates an internal checkout pinned to the commit, and removes it and its
+scratch on completion or error. Source and Git metadata are read-only;
+private test outputs are writable. Network, edits, publication and peer
+tools are unavailable to the reviewer. Abruptly abandoned scratch is swept
+by the next review.
+
+The model defaults to opus-latest. opus-latest and gpt-sol-latest resolve to
+the newest concrete frontier release in the API model list, recorded in
+the trace. A concrete model id is also accepted. All reviews use high effort.
+Changed top-level directories are included automatically; --sparse adds
+directories, and the reviewer may widen the checkout. Tools default to 8192
+UTF-8 bytes per result and 512 KiB total; full results remain in the trace.
+--vendor mounts explicit offline Cargo sources read-only. --test-runner
+copies a compatible td-builder into scratch; otherwise a source
+ target/release/td-builder is used when present.
+
+--max-cost caps all requests, defaulting to max_cost_per_turn (or $0.50
+when disabled). Missing usage is charged at its reservation. --max-tokens
+defaults to 32768, cut to the model's limit. An incomplete review exits
+nonzero. The API key and fetch service are the configured td-agent ones.
+
+Full traces remain in $XDG_STATE_HOME/td-agent/reviews (or
+~/.local/state/td-agent/reviews). --log-dir selects a private directory;
+the JSONL path is printed to stderr. td-agent review-log FILE summarizes it.
+
+--routing selects balanced (default), cheapest, floor, fastest, nitro or
+latency. Provider and price filters restrict endpoints; floor/nitro enable
+flex/priority tiers. Every request carries a session id and priced requests
+carry the selected provider price envelope.
+
+Legacy diagnostic form: td-agent review [--model MODEL] [--effort high]
+[--max-tokens N] [--log-dir DIRECTORY] [--] [FILE]. Without --commit or
+--repo, FILE or noninteractive stdin is reviewed in one request without tools.
+
+Example:
+  td-agent review --commit HEAD --model gpt-sol-latest
+";
 
 /// The instruction the model is given. The commit follows it in the
 /// user message, between the markers `{OPEN}` and `{CLOSE}` name.
@@ -135,12 +132,16 @@ pub struct Options {
 
 impl Options {
     pub fn parse(args: &[String]) -> Result<Self, String> {
-        let mut options = Self::default();
+        let mut options = Self {
+            effort: Some("high".into()),
+            ..Self::default()
+        };
         let mut args = args.iter();
         let usage = || USAGE.trim_end().to_string();
         // Whether the input was named, `-` included: it is named once.
         let mut named = false;
         let mut options_done = false;
+        let mut effort_named = false;
         while let Some(arg) = args.next() {
             // An option's value is never another option.
             let mut value = || {
@@ -195,8 +196,12 @@ impl Options {
                         .ok_or("provider price must be nonnegative dollars per million tokens")?;
                     *slot = Some(amount / 1_000_000);
                 }
-                "--effort" if !options_done && options.effort.is_none() => {
+                "--effort" if !options_done && !effort_named => {
+                    effort_named = true;
                     let text = value()?;
+                    if text != "high" {
+                        return Err("code reviews use --effort high".into());
+                    }
                     options.effort = Some(config::effort(&text).map_err(|_| {
                         format!(
                             "--effort is one of {}; not {text:?}",
@@ -277,6 +282,17 @@ impl Options {
                 }
                 _ => return Err(usage()),
             }
+        }
+        if options.revision.is_some() && options.repository.is_none() {
+            if named {
+                return Err("--commit reviews the local repository, not FILE or stdin".into());
+            }
+            options.repository = Some(
+                std::env::current_dir().map_err(|e| format!("review working directory: {e}"))?,
+            );
+        }
+        if options.repository.is_some() && options.model.is_none() {
+            options.model = Some("opus-latest".into());
         }
         if options.repository.is_some() && named {
             return Err("--repo reviews --commit (HEAD by default), not FILE or stdin".into());
@@ -385,7 +401,7 @@ pub fn plan(
     }
     if options.effort.is_some() && listed.is_some_and(|m| !m.supports("reasoning")) {
         return Err(format!(
-            "{model} takes no reasoning effort; ask without --effort"
+            "{model} takes no reasoning effort; code reviews require high"
         ));
     }
     let limit = client.limits.turn;
@@ -685,21 +701,31 @@ fn run_diff(
     let client = &*client_config;
     // The prompt is the body's messages; the head is short.
     let sized = body("", &commit, &nonce)?;
+    let mut resolved = options.clone();
+    let options = &mut resolved;
     // Without a per-turn limit, a list that cannot be had only leaves
     // the model unlisted.
+    let alias = matches!(
+        options.model.as_deref().unwrap_or(&client.model),
+        "opus-latest" | "gpt-sol-latest"
+    );
     let listed = match crate::review_routing::prepare(options, client, journal) {
         Ok(listed) => listed,
-        Err(_) if client.limits.turn.is_none() && !crate::review_routing::explicit(options) => {
+        Err(_)
+            if client.limits.turn.is_none()
+                && !crate::review_routing::explicit(options)
+                && !alias =>
+        {
             Models::default()
         }
         Err(e) => return Err(e),
     };
-    let model = options.model.as_deref().unwrap_or(&client.model);
     let prompt = if options.max_cost.is_some() {
         crate::review_session::prompt_bound(&sized)
     } else {
         prompt_tokens(&sized)
     };
+    let model = options.model.as_deref().unwrap_or(&client.model);
     if let Some(metadata) = listed.find(model) {
         journal.model(metadata)?;
     }
@@ -966,7 +992,13 @@ mod tests {
                 ..Options::default()
             }
         );
-        assert_eq!(Options::parse(&args("-")).unwrap(), Options::default());
+        assert_eq!(
+            Options::parse(&args("-")).unwrap(),
+            Options {
+                effort: Some("high".into()),
+                ..Options::default()
+            }
+        );
         assert_eq!(
             Options::parse(&args("-- -x.diff")).unwrap().input,
             Some(PathBuf::from("-x.diff"))
@@ -979,7 +1011,10 @@ mod tests {
             "--repo . --tool-context-bytes 1024 --tool-context-bytes 2048",
             "--repo . --vendor a --vendor b",
             "--test-runner runner",
-            "--commit HEAD",
+            "--commit HEAD c.diff",
+            "--remote example",
+            "--effort medium",
+            "--effort xhigh",
             "--sparse src",
             "--repo . -",
             "--repo . c.diff",
@@ -1007,12 +1042,17 @@ mod tests {
             assert!(Options::parse(&args(bad)).is_err(), "{bad}");
         }
         let said = Options::parse(&args("--effort extreme")).unwrap_err();
-        assert!(said.starts_with("--effort is one of"), "{said}");
+        assert_eq!(said, "code reviews use --effort high");
         let repository = Options::parse(&args(
             "--repo . --commit HEAD --sparse td-agent --sparse td-json --max-cost 0.10",
         ))
         .unwrap();
         assert_eq!(repository.repository, Some(PathBuf::from(".")));
+        let local = Options::parse(&args("--commit HEAD")).unwrap();
+        assert_eq!(local.repository, Some(std::env::current_dir().unwrap()));
+        assert_eq!(local.model.as_deref(), Some("opus-latest"));
+        assert_eq!(local.effort.as_deref(), Some("high"));
+
         assert_eq!(repository.revision.as_deref(), Some("HEAD"));
         assert_eq!(repository.sparse, ["td-agent", "td-json"]);
         assert_eq!(repository.max_cost, Some(crate::cost::ONE / 10));

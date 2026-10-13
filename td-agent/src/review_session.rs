@@ -333,8 +333,10 @@ fn run_workspace(
             ),
         ]),
     )?;
+    let mut resolved = options.clone();
+    let listed = crate::review_routing::prepare(&mut resolved, client, journal)?;
+    let options = &resolved;
     let model = options.model.as_deref().unwrap_or(&client.model);
-    let listed = crate::review_routing::prepare(options, client, journal)?;
     let supported = listed
         .find(model)
         .ok_or("review model is absent from the models list")?;

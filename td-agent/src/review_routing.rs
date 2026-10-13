@@ -60,13 +60,32 @@ pub(crate) fn explicit(options: &review::Options) -> bool {
 }
 
 pub(crate) fn prepare(
-    options: &review::Options,
+    options: &mut review::Options,
     client: &Client,
     journal: &mut Journal,
 ) -> Result<models::Models, String> {
+    let selected = options.model.as_deref().unwrap_or(&client.model);
+    let mut listed = None;
+    if matches!(selected, "opus-latest" | "gpt-sol-latest") {
+        let models = review::models(&client.base_url, &[])?;
+        let resolved = models.review_model(selected)?;
+        journal.event(
+            "review_model_resolved",
+            Json::Obj(vec![
+                ("requested".into(), Json::Str(selected.into())),
+                ("model".into(), Json::Str(resolved.clone())),
+                ("effort".into(), Json::Str("high".into())),
+            ]),
+        )?;
+        options.model = Some(resolved);
+        listed = Some(models);
+    }
     let model = options.model.as_deref().unwrap_or(&client.model);
     if !explicit(options) {
-        return review::models(&client.base_url, &[model]);
+        return match listed {
+            Some(models) => Ok(models),
+            None => review::models(&client.base_url, &[model]),
+        };
     }
     let raw = listing(&client.base_url, model)?;
     journal.event("routing_endpoints", raw.clone())?;

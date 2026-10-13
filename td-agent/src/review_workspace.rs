@@ -189,6 +189,38 @@ fn said(command: &mut Command, limit: u64) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "git returned non-UTF-8 text".into())
 }
 
+fn owned_root(key_path: &Path) -> Result<(PathBuf, File), String> {
+    let parent = key_path.parent().ok_or("the key has no parent directory")?;
+    let base = parent.join("reviews");
+    directory(&base)?;
+    sweep(&base)?;
+    // Hold the sweep lock through creation and locking, so a concurrent
+    // review never collects a directory whose owner is still starting.
+    let serial = lock(&base.join("sweep.lock"))?;
+    serial.lock().map_err(|e| e.to_string())?;
+    let root = base.join(format!("run-{}", crate::store::random_hex(16)?));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .map_err(|e| e.to_string())?;
+    let locked = (|| {
+        let held = lock(&root.join("owner.lock"))?;
+        held.lock().map_err(|e| e.to_string())?;
+        Ok::<File, String>(held)
+    })();
+    let held = match locked {
+        Ok(held) => held,
+        Err(why) => {
+            return match workspace::remove_tree(&root) {
+                Ok(()) => Err(why),
+                Err(cleanup) => Err(format!("{why}; cleanup: {cleanup}")),
+            };
+        }
+    };
+    drop(serial);
+    Ok((root, held))
+}
+
 impl Workspace {
     pub fn prepare(
         source: &Path,
@@ -222,31 +254,17 @@ impl Workspace {
             8192,
         )?;
         let common = fs::canonicalize(common.trim()).map_err(|e| e.to_string())?;
-        let parent = key_path.parent().ok_or("the key has no parent directory")?;
-        let base = parent.join("reviews");
-        directory(&base)?;
-        sweep(&base)?;
-        // Hold the sweep lock through creation and locking, so a concurrent
-        // review never collects a directory whose owner is still starting.
-        let serial = lock(&base.join("sweep.lock"))?;
-        serial.lock().map_err(|e| e.to_string())?;
-        let root = base.join(format!("run-{}", crate::store::random_hex(16)?));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .map_err(|e| e.to_string())?;
-        let held = lock(&root.join("owner.lock"))?;
-        held.lock().map_err(|e| e.to_string())?;
-        drop(serial);
+        let borrowed = borrowed(
+            &common.join("objects"),
+            &fs::canonicalize(key_path).map_err(|e| format!("the key: {e}"))?,
+        )?;
+        let (root, held) = owned_root(key_path)?;
         let mut result = Self {
             checkout: root.join("source"),
             scratch: root.join("scratch"),
             repository: root.join("repository.git"),
             objects: common.join("objects"),
-            borrowed: borrowed(
-                &common.join("objects"),
-                &fs::canonicalize(key_path).map_err(|e| format!("the key: {e}"))?,
-            )?,
+            borrowed,
             root,
             cleaned: false,
             _lock: held,

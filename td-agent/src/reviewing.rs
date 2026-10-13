@@ -100,20 +100,11 @@ impl Session {
             Err(why) => return Ok(could_not(&why)),
         };
         let client = &asking.client;
-        // The conversation's effort, for its own model where it takes one.
-        let (model, effort) = match &client.review_model {
-            Some(model) if *model != asking.name => (model.clone(), None),
-            _ => {
-                let takes = asking
-                    .model
-                    .as_ref()
-                    .is_none_or(|m| m.supports("reasoning"));
-                (
-                    asking.name.clone(),
-                    takes.then(|| asking.reasoning_effort.clone()),
-                )
-            }
-        };
+        let model = client
+            .review_model
+            .clone()
+            .unwrap_or_else(|| "opus-latest".into());
+        let effort = Some("high".to_string());
         let cap = client.review_max_cost;
         if let Err(why) = cost::within(
             "max_cost_per_conversation",
@@ -177,7 +168,10 @@ impl Session {
                 return Ok(could_not(&why));
             }
         };
-        let (charged, basis) = charge(&ran.head, cap);
+        let ((charged, basis), resolved) = receipt(&ran.head, cap);
+        let identified =
+            resolved.is_some() || !matches!(model.as_str(), "opus-latest" | "gpt-sol-latest");
+        let model = resolved.unwrap_or(model);
         let log = session_log(&ran.head)
             .map(|path| format!("; its session log is {}", path.display()))
             .unwrap_or_default();
@@ -192,6 +186,10 @@ impl Session {
             ),
             Ended::Interrupted => (
                 format!("the review of {revision} was interrupted, having spent {spent}{log}"),
+                false,
+            ),
+            Ended::Exited(status) if status.success() && !identified => (
+                format!("the review of {revision} has no concrete model identity, having spent {spent}{log}"),
                 false,
             ),
             Ended::Exited(status) if status.success() && !review.is_empty() => (
@@ -389,23 +387,36 @@ fn session_log(stderr: &str) -> Option<PathBuf> {
 /// no log, or a log that holds no request, since each request's body is
 /// logged before it is sent; what the log accounts otherwise; its cap
 /// when the log cannot be read.
-fn charge(stderr: &str, cap: u64) -> (u64, Basis) {
+fn receipt(stderr: &str, cap: u64) -> ((u64, Basis), Option<String>) {
     let Some(path) = session_log(stderr) else {
-        return (0, Basis::Nothing);
+        return ((0, Basis::Nothing), None);
     };
     let summary = std::fs::File::open(&path)
         .ok()
         .and_then(|file| crate::review_metrics::summarize(file).ok());
     let Some(summary) = summary else {
-        return (cap, Basis::Reserved);
+        return ((cap, Basis::Reserved), None);
     };
     if summary.get("requests").and_then(Json::as_u64) == Some(0) {
-        return (0, Basis::Nothing);
+        return ((0, Basis::Nothing), None);
     }
-    match summary.get("accounted_cost").and_then(Json::as_u64) {
+    let model = summary
+        .get_path(&["diagnostics", "requests"])
+        .and_then(Json::as_arr)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("model"))
+        .and_then(Json::as_str)
+        .map(str::to_owned);
+    let charged = match summary.get("accounted_cost").and_then(Json::as_u64) {
         Some(cost) => (cost, Basis::Reported),
         None => (cap, Basis::Reserved),
-    }
+    };
+    (charged, model)
+}
+
+#[cfg(test)]
+fn charge(stderr: &str, cap: u64) -> (u64, Basis) {
+    receipt(stderr, cap).0
 }
 
 /// At most `MAX_REVIEW` bytes of `input`, the rest read and dropped so
@@ -561,6 +572,25 @@ mod tests {
         .unwrap();
         // Its reservation, as the log accounts usage it never reported.
         assert_eq!(charge(&named(&asked), 9), (5, Basis::Reported));
+        let concrete = dir.join("concrete.jsonl");
+        std::fs::write(
+            &concrete,
+            [
+                line(0, "start", r#"{"version":1,"model":"opus-latest"}"#),
+                line(
+                    1,
+                    "request_body",
+                    r#""{\"model\":\"anthropic/claude-opus-5.5\",\"messages\":[]}""#,
+                ),
+                String::new(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt(&named(&concrete), 9).1.as_deref(),
+            Some("anthropic/claude-opus-5.5")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

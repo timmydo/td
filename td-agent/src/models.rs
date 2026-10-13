@@ -393,9 +393,44 @@ impl Models {
         crate::store::replace(state, CACHE, self.to_cache().as_bytes())
     }
 
+    /// Resolve a review tier once to a concrete base model. Numeric release
+    /// versions sort naturally; routed and reduced variants do not qualify.
+    pub fn review_model(&self, selector: &str) -> Result<String, String> {
+        let family = match selector {
+            "opus-latest" => "opus",
+            "gpt-sol-latest" => "gpt-sol",
+            _ => return Ok(selector.to_string()),
+        };
+        self.models
+            .iter()
+            .filter_map(|m| {
+                let version = review_version(&m.id, family)?;
+                Some((version, &m.id))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+            .map(|(_, id)| id.clone())
+            .ok_or_else(|| {
+                format!("no concrete {selector} model is available in the provider's models list")
+            })
+    }
+
     pub fn find(&self, id: &str) -> Option<&Model> {
         self.models.iter().find(|m| m.id == id)
     }
+}
+
+fn review_version(id: &str, family: &str) -> Option<Vec<u64>> {
+    let text = match family {
+        "opus" => id.strip_prefix("anthropic/claude-opus-")?,
+        "gpt-sol" => id.strip_prefix("openai/gpt-")?.strip_suffix("-sol")?,
+        _ => return None,
+    };
+    if !text.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    text.split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 /// The key's credit as `GET /key` gives it.
@@ -441,6 +476,40 @@ impl Credit {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn review_aliases_select_numeric_frontier_releases_only() {
+        let ids = [
+            "openai/gpt-6.9-sol",
+            "openai/gpt-6.10-sol",
+            "openai/gpt-7-sol-mini",
+            "openai/gpt-8-sol:nitro",
+            "anthropic/claude-opus-5-20270101",
+            "openai/gpt-6-20270101-sol",
+            "anthropic/claude-opus-4.8",
+            "anthropic/claude-opus-5.5",
+            "anthropic/claude-opus-9.0:floor",
+            "anthropic/claude-sonnet-10.0",
+        ];
+        let entries: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}","pricing":{{"prompt":"0","completion":"0"}},"context_length":100000,"supported_parameters":["reasoning","tools"]}}"#)).collect();
+        let body = format!(r#"{{"data":[{}]}}"#, entries.join(","));
+        let models = super::Models::from_provider(body.as_bytes()).unwrap();
+        assert_eq!(
+            models.review_model("gpt-sol-latest").unwrap(),
+            "openai/gpt-6.10-sol"
+        );
+        assert_eq!(
+            models.review_model("opus-latest").unwrap(),
+            "anthropic/claude-opus-5.5"
+        );
+        assert_eq!(models.review_model("fixed/model").unwrap(), "fixed/model");
+        assert!(super::Models::default()
+            .review_model("opus-latest")
+            .is_err());
+        assert!(super::Models::default()
+            .review_model("gpt-sol-latest")
+            .is_err());
+    }
 
     /// A model the list leaves out, as its endpoints listing says (Jev's,
     /// recorded): priced per field at its dearest endpoint, unpriced when

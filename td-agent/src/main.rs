@@ -12,11 +12,8 @@ use td_agent::store::{Id, Role, StateDir};
 use td_agent::workspace::Workspace;
 
 const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
-\x20      td-agent review [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
-\x20                      [--max-cost USD] [--log-dir DIRECTORY] [--] [FILE]\n\
-\x20      td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...\n\
-\x20                      [--model MODEL] [--effort LEVEL] [--max-tokens N]\n\
-\x20                      [--max-cost USD] [--log-dir DIRECTORY]\n\
+\x20      td-agent review --commit REV [--model opus-latest|gpt-sol-latest]\n\
+\x20                      [--max-cost USD] [--repo DIRECTORY]\n\
 \x20      td-agent review-log FILE\n\
 \x20      td-agent calibrate FIXTURES\n\
 \x20      td-agent --help\n\
@@ -52,9 +49,9 @@ API key: one line in $XDG_CONFIG_HOME/td-agent/openrouter.key, a file\n\
 of your own, mode 0600, in directories only you and root can write,\n\
 which File > Set OpenRouter key... writes.\n\
 \n\
-td-agent review reviews the git commit in FILE (or standard input) as\n\
-`git show` prints it, with the same configuration and key, and writes\n\
-the review to standard output; td-agent review --help says more.\n\
+td-agent review --commit REV reviews a local commit from the current\n\
+directory at high effort, prepares its own read-only checkout and scratch,\n\
+and writes the report to standard output. td-agent review --help says more.\n\
 \n\
 td-agent calibrate puts the classifier fixtures in FIXTURES to both of\n\
 its stages, live, and counts their false allows and escalations;\n\

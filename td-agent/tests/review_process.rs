@@ -170,7 +170,13 @@ fn models() -> Reply {
     Reply::Http {
         status: 200,
         headers: vec![("content-type".into(), "application/json".into())],
-        body: mock_fetch::fixture("models.json"),
+        body: String::from_utf8(mock_fetch::fixture("models.json"))
+            .unwrap()
+            .replace(
+                "\"max_tokens\",\"temperature\",\"tool_choice\",\"tools\",\"top_p\"",
+                "\"reasoning\",\"max_tokens\",\"temperature\",\"tool_choice\",\"tools\",\"top_p\"",
+            )
+            .into_bytes(),
     }
 }
 
@@ -247,9 +253,142 @@ fn run(fixture: &Fixture, mock: &MockFetch, cap: &str) -> std::process::Output {
 
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn local_commit_review_resolves_frontier_aliases_at_high_effort() {
+    for (alias, concrete) in [
+        ("opus-latest", "anthropic/claude-opus-5.5"),
+        ("gpt-sol-latest", "openai/gpt-6.1-sol"),
+    ] {
+        let fixture = Fixture::new();
+        let replace = |reply: Reply| {
+            let Reply::Http {
+                status,
+                headers,
+                body,
+            } = reply
+            else {
+                panic!("HTTP fixture expected");
+            };
+            Reply::Http {
+                status,
+                headers,
+                body: String::from_utf8(body)
+                    .unwrap()
+                    .replace(MODEL, concrete)
+                    .into_bytes(),
+            }
+        };
+        let mock = MockFetch::start(
+            &fixture.root.join("runtime"),
+            vec![replace(models()), replace(fixture.final_reply())],
+        );
+        let template = fixture.command(&mock, "0.02");
+        let mut command = Command::new(PROGRAM);
+        command
+            .current_dir(&fixture.source)
+            .args([
+                "review",
+                "--commit",
+                &fixture.commit,
+                "--model",
+                alias,
+                "--max-cost",
+                "0.02",
+                "--max-tokens",
+                "4096",
+            ])
+            .stdin(Stdio::null());
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains(&fixture.commit));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.ends_with("/models"));
+        let body = td_json::parse(&requests[1].text()).unwrap();
+        assert_eq!(body.get("model").and_then(Json::as_str), Some(concrete));
+        assert_eq!(
+            body.get_path(&["reasoning", "effort"])
+                .and_then(Json::as_str),
+            Some("high")
+        );
+        assert!(requests[1].text().contains("ORIGINAL REVIEWED"));
+        assert!(requests[1].text().contains("fixture review"));
+        let logs = fixture.logs();
+        assert!(logs[0].contains("review_model_resolved"));
+        assert!(logs[0].contains(alias));
+        assert!(logs[0].contains(concrete));
+        fixture.no_workspaces();
+    }
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn missing_frontier_model_refuses_before_completion_and_cleans_up() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(&fixture.root.join("runtime"), vec![models()]);
+    let template = fixture.command(&mock, "0.02");
+    let mut command = Command::new(PROGRAM);
+    command
+        .current_dir(&fixture.source)
+        .args([
+            "review",
+            "--commit",
+            &fixture.commit,
+            "--model",
+            "opus-latest",
+        ])
+        .stdin(Stdio::null());
+    for (name, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    let result = command.output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete opus-latest"));
+    assert_eq!(mock.requests().len(), 1);
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "uses the host CLI key fixture"]
+fn configured_frontier_alias_cannot_bypass_resolution_without_a_turn_limit() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.config.join("td-agent/config"),
+        "model = \"opus-latest\"\nmax_cost_per_turn = \"none\"\n",
+    )
+    .unwrap();
+    let input = fixture.root.join("commit.txt");
+    fs::write(&input, "commit 1234567890\n\n    fixture review\n").unwrap();
+    let mock = MockFetch::start(&fixture.root.join("runtime"), vec![models()]);
+    let template = fixture.command(&mock, "0.02");
+    let mut command = Command::new(PROGRAM);
+    command.args(["review"]).arg(input).stdin(Stdio::null());
+    for (name, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    let result = command.output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no concrete opus-latest"));
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn provider_routing_prices_selected_endpoints_and_keeps_the_session_across_turns() {
     let fixture = Fixture::new();
-    let endpoints = Reply::Http { status: 200, headers: vec![], body: format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap/fp8","context_length":1000000,"max_completion_tokens":32768,"supported_parameters":["tools","max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}},{{"tag":"dear","context_length":1000000,"supported_parameters":["tools","max_tokens"],"pricing":{{"prompt":"0.01","completion":"0.01"}}}}]}}}}"#).into_bytes() };
+    let endpoints = Reply::Http { status: 200, headers: vec![], body: format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap/fp8","context_length":1000000,"max_completion_tokens":32768,"supported_parameters":["reasoning","tools","max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}},{{"tag":"dear","context_length":1000000,"supported_parameters":["reasoning","tools","max_tokens"],"pricing":{{"prompt":"0.01","completion":"0.01"}}}}]}}}}"#).into_bytes() };
     let mock = MockFetch::start(
         &fixture.root.join("run"),
         vec![
@@ -318,7 +457,7 @@ fn diff_review_routes_and_explains_default_price_ceiling_refusals() {
     for routed in [false, true] {
         let fixture = Fixture::new();
         let first = if routed {
-            Reply::Http {status:200,headers:vec![],body:format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap","supported_parameters":["max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}}]}}}}"#).into_bytes()}
+            Reply::Http {status:200,headers:vec![],body:format!(r#"{{"data":{{"id":"{MODEL}","endpoints":[{{"tag":"cheap","supported_parameters":["reasoning","max_tokens"],"pricing":{{"prompt":"0.00000001","completion":"0.00000001"}}}}]}}}}"#).into_bytes()}
         } else {
             models()
         };

@@ -205,39 +205,40 @@ standing decision of the human's or decided under §11 when asked for.
 Publication with the human's credentials happens only through the git
 worker's push, bound to a commit the human or classifier approved.
 
-**The review command** stands apart from those parties: `td-agent review
-[--model MODEL] [--effort LEVEL] [--max-tokens N] [--max-cost USD]
-[--log-dir DIRECTORY] [--] [FILE]` is the
-same binary run by a person or an agent from a shell, with no window,
-conversation or jail, for one model's review of one git commit in td's
-review workflow (DEVELOPMENT.md, Code review), where it is meant to take
-an external reviewer CLI's place. A conversation's `/review` runs it
-too, on a commit it staged where no jail can write, and accounts what
-it spent (§15, As built (`/review`)); the command itself is the
-same. It reads the commit's text as `git
-show` prints it from FILE or standard input (an interactive one is
-refused), at most 4 MiB (a larger one is refused, not cut, since a
-review of part of a commit says nothing of the rest), and sends it in
-one streamed request through the fetch service with the configured API,
-model and key, as a turn is sent, but asking no Anthropic model to cache
-it, since no later request shares its prompt. `--effort` is sent only
-when given and refused for a model the list says takes no reasoning;
-`--max-tokens` defaults to 32768, room for reasoning at `high`, cut to
-the model's own limit. A fixed system instruction asks for a reply that
-begins `REVIEWING: <subject> (<commit id>)` and then gives prioritized
-findings, and quotes the commit in the user message between `<commit
-NONCE>` and `</commit NONCE>`, a random 128-bit nonce per request, so the
-commit's text cannot close its quotation; a commit holding them is
-refused. The review is written to standard output as it streams, and the
-model and provider that served it, its tokens, its cost and its
-reservation to standard error. It exits non-zero unless the reply
-stopped with something said: an error, a stream that ends without its
-finish, a reply cut at its token limit, filtered or empty is no review.
-A rate-limited request is asked again as a turn's is. Its cost is
-bounded as §5 says. It retains the session trace below, executes nothing the model says,
-and has no tools when reading FILE or standard input. `--max-cost USD`
-may lower the single request's cost limit. The commit goes to the provider
-because the person ran the command on it.
+**The review command** is `td-agent review --commit REV
+[--model opus-latest|gpt-sol-latest]`, invoked from the change's local
+repository. It needs neither a published branch nor a remote: REV is
+resolved once from the local Git object database. `--repo DIRECTORY` may
+select another local repository, with HEAD its default revision. td-agent
+prepares the full commit message, diff and built-in review instruction;
+the caller supplies no prompt or generated diff. The reviewer inspects an
+internal checkout pinned to that commit, with source and Git metadata
+read-only and private writable scratch for test outputs. The existing
+confined checkout and tool loop described below applies. It removes the
+checkout and scratch on completion or error; a subsequent review sweeps
+scratch abandoned by abrupt process death.
+
+The default model is `opus-latest`. That alias and `gpt-sol-latest` resolve
+from the API model list to the highest numeric stable frontier release of
+Claude Opus or GPT Sol respectively, excluding routed variants and smaller
+model variants. A missing family fails before any completion. The requested
+alias and concrete resolved identity are logged; every request uses the
+concrete identity. Explicit concrete model ids remain available. All code
+reviews, including the conversation's `/review`, use high effort; an
+explicit effort other than high or a model without reasoning support is
+refused. `--max-tokens` defaults to 32768, cut to the model's limit.
+
+The same binary also retains a diagnostic FILE/stdin form: without
+`--commit` or `--repo`, it reads noninteractive FILE or stdin as `git show`
+output, at most 4 MiB, and sends one streamed request without tools. This
+form uses the configured model unless one is selected, still at high effort.
+Both forms use the configured API key and fetch service. A fixed instruction
+quotes the full commit between random 128-bit nonce markers, treating its
+contents as material under review rather than instructions. The report
+streams to stdout, and the served model, provider, tokens, cost and
+reservation to stderr. A filtered, empty, truncated or unfinished reply is
+not a review and exits nonzero. Rate-limit retries and reservations follow
+§5. The private session trace below remains after scratch cleanup.
 
 Both forms accept `--routing balanced|cheapest|floor|fastest|nitro|latency`.
 Balanced is OpenRouter's default; cheapest/fastest/latency set provider
@@ -272,8 +273,7 @@ routing without depending on opening-message hashes; it does not guarantee
 a cache hit or disable provider fallback. Exact routing policy, endpoint
 metadata, request bodies and served providers remain in the trace.
 
-`td-agent review --repo DIRECTORY [--commit REV] [--sparse DIRECTORY]...`
-instead resolves REV (HEAD by default) once to a full commit id and reviews
+The local repository form, optionally with `--sparse DIRECTORY`, resolves REV (HEAD by default) once to a full commit id and reviews
 it in a disposable sparse checkout. The commit's full message and diff are
 bounded as above. Root files, `.cargo`, and changed top-level directories
 are included; `--sparse` adds cone directories. `expand_sparse` may add
@@ -7076,7 +7076,7 @@ default; `jev_threshold`'s is calibrated (§11):
   defaults the conversation's model and routing (§12, As built
   (`task`))
 - `review_model` and `review_max_cost`, a number of credits above zero;
-  defaults the conversation's model and 1 (As built (`/review`), below)
+  defaults `opus-latest` and 1 (As built (`/review`), below)
 - `cache_ttl`, a whole number of seconds up to 86,400, 0 taking every
   resumption as cold, and `cold_resume_tokens`, from 1,000 to
   10,000,000, or `none`; defaults 300 and 32,000 (§14)
@@ -7216,9 +7216,8 @@ limit and logs a `request` of purpose `review` for the whole review, its
 head naming the revision, the commit staged, the model and the cap,
 before it starts this program's `review` with `--repo` the staged
 repository, `--commit` the full commit id, `--model` `review_model` or
-else the conversation's model, `--max-cost` the cap exactly, the
-conversation's effort only when it is the conversation's model and that
-model takes one, and the conversation's routing when it has one. The
+else `opus-latest`, `--max-cost` the cap exactly, `--effort high`, and
+the conversation's routing when it has one. The
 review runs beside the process, which goes on hearing the window: an
 interrupt, or the window closing, kills it, as does a failure to wait on
 it. If the conversation process itself is killed, the review is not: it
@@ -7231,7 +7230,7 @@ when it named no log or its log holds no request, since each request's
 body is logged before it is sent; its cap when the log cannot say. The
 request is settled with that and the reservation released with it. A
 review that finished with text is logged as a `review` event (the
-request, revision, model and text) and shown in the transcript under
+request, revision, concrete model from the child trace and text) and shown in the transcript under
 "review"; it reaches the model on its next request as a user message
 after the received line, labelled td-agent's: a review of the revision
 by the model, which the person asked for, not the person's words, and

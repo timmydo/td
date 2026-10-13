@@ -334,22 +334,19 @@ boundaries are:
 
 # Code review
 
-- Each commit receives the required independent subagent and cross-model
-  reviews over its own diff. Model-selected td-agent subagents may fill the
-  reviewer slots; `DEVELOPMENT.md` defines their roster and record. One panel
-  cycle is scheduled per commit; later passes are the review subagent alone,
+- Each commit receives two independent reviews: `opus-latest` and
+  `gpt-sol-latest`, both at high effort. Invoke a fresh harness subagent
+  with the required model when supported; otherwise use `td-agent review`.
+  `DEVELOPMENT.md` defines the command and durable record. One panel cycle
+  is scheduled per commit; later passes use the review subagent alone,
   and re-running the panel needs a named escalation trigger. Stop and ask
   when the passes stop converging.
 - The acting agent reconciles every finding and records its own summary,
-  reviewer identities, and checks in the commit message.
+  concrete reviewer identities, and checks in the commit message.
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
 verifies that every touched path ends in `.md`. Other unavailable-reviewer
-waivers require a reason and the human approver named in the trailer. A
-cross-model CLI that refuses for spent quota may be replaced by a normal
-model-selected task review. The legacy capped `td-agent review` transport
-instead requires the same family and a `Review-fallback:` record
-(`DEVELOPMENT.md`, Quota fallback).
+waivers require a reason and the human approver named in the trailer.
 
 Commit messages are the durable review record. Put rationale, design
 decisions, findings and dispositions, and verified-red evidence there. Hard

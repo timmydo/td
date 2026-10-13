@@ -1,423 +1,331 @@
-# tests/review-record.cases — the per-commit review record (AGENTS.md, "Code
-# review"), as cases.
-#
-# TWO implementations read this: `td-builder ready`, which gates on the record,
-# and td-review, which shows the integrator whether a branch carries it. Neither
-# crate may depend on the other (separate workspaces, separate locks), so this
-# fixture is the only thing that keeps their verdicts the same. Both crates fail
-# their tests if a case here disagrees with them.
-#
-# Format:  case <name> <ready|not-ready> [paths=<comma,list>]
-#          <message lines, until the next `case` line>
-# `paths` defaults to a single source file — i.e. "not a docs-only commit".
+# Shared review policy fixtures for td-builder and td-review.
+# case NAME ready|not-ready [paths=comma,separated]
 
-case complete ready paths=builder/src/ready.rs
-td-sh: `local` is ash's, not bash's
+case mixed ready paths=src/a.rs
+subject
 
-A body explaining why.
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
+case both-subagent ready paths=src/a.rs
+subject
 
-case subagent-alone not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: subagent/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Checks: affected-checks --committed-only (green)
+case both-harness ready paths=src/a.rs
+subject
 
-case one-cross-model not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: harness/opus-5.5
+Reviewed-by: harness/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Checks: affected-checks --committed-only (green)
+case both-td-agent ready paths=src/a.rs
+subject
 
-case same-cli-twice not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: td-agent/opus-5.5
+Reviewed-by: td-agent/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: codex/gpt-5.6-sol
-Checks: affected-checks --committed-only (green)
+case both-td-agent-subagent ready paths=src/a.rs
+subject
 
-case no-checks not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: td-agent-subagent/opus-5.5
+Reviewed-by: td-agent-subagent/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
+case opus-alone not-ready paths=src/a.rs
+subject
 
-case waiver-with-reason ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Review-waiver: agy — CLI unavailable, approved by tester
-Checks: affected-checks --committed-only (green)
+case gpt-alone not-ready paths=src/a.rs
+subject
 
-case waiver-without-reason not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Review-waiver: agy
-Checks: affected-checks --committed-only (green)
+case no-reviews not-ready paths=src/a.rs
+subject
 
-case docs-only ready paths=AGENTS.md,README.md
-docs: say what the record is
+Checks: green
 
-Review-waiver: docs-only
-Checks: affected-checks --committed-only (green)
+case no-checks not-ready paths=src/a.rs
+subject
 
-case docs-only-touching-code not-ready paths=AGENTS.md,builder/src/ready.rs
-docs: say what the record is
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
 
-Review-waiver: docs-only
-Checks: affected-checks --committed-only (green)
+case empty-checks not-ready paths=src/a.rs
+subject
 
-case unknown-reviewer not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks:
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: gemini/3.1-pro
-Checks: affected-checks --committed-only (green)
+case same-family not-ready paths=src/a.rs
+subject
 
-case malformed-identity not-ready paths=builder/src/ready.rs
-td-sh: something
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/opus-4.8
+Checks: green
+
+case duplicates not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Checks: green
+
+case pair-duplicates ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
+
+case alias-opus not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/opus-latest
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
+
+case alias-gpt not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/gpt-sol-latest
+Checks: green
+
+case non-sol not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: subagent/gpt-6.1
+Checks: green
+
+case gemini not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/google/gemini-3.8-flash
+Checks: green
+
+case ambiguous not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: subagent/opus-gpt-6-sol
+Checks: green
+
+case unknown-tool not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Reviewed-by: unknown/opus-5.5
+Checks: green
+
+case malformed not-ready paths=src/a.rs
+subject
 
 Reviewed-by: subagent
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
 
-case quoted-record not-ready paths=AGENTS.md
-docs: explain the record
-
-A commit that SHOWS the shape must not thereby claim it:
-
-    Reviewed-by: subagent/opus-4.8
-    Reviewed-by: codex/gpt-5.6-sol
-    Reviewed-by: agy/gemini-3.1-pro
-    Checks: affected-checks --committed-only (green)
-
-so the indented block above counts for nothing, and this commit — which
-is documentation — still has to carry a real record or waive it.
-
-case trailing-block-wins ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/an-earlier-round
-
-prose written after that round, which ends the block
+case legacy-pair ready paths=src/a.rs
+subject
 
 Reviewed-by: subagent/opus-4.8
 Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
+Reviewed-by: agy/gemini-3.8-flash
+Checks: green
 
-case agy-missing not-ready paths=builder/src/ready.rs
-td-sh: something
+case legacy-wrong-family not-ready paths=src/a.rs
+subject
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: claude/opus-4.8
-Checks: affected-checks --committed-only (green)
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: codex/opus-5.5
+Checks: green
 
-case agy-alone not-ready paths=builder/src/ready.rs
-td-sh: something
+case fallback-no-effect not-ready paths=src/a.rs
+subject
 
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Review-fallback: codex — quota
+Checks: green
 
-case miscased-keys ready paths=builder/src/ready.rs
-td-sh: something
+case fallback-not-required ready paths=src/a.rs
+subject
 
-Reviewed-By: subagent/opus-4.8
-REVIEWED-BY: codex/gpt-5.6-sol
-reviewed-by: agy/gemini-3.1-pro
-checks: affected-checks --committed-only (green)
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
 
-case waiver-punctuation ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Review-waiver: agy: not installed on this host, approved by tester
-Checks: affected-checks --committed-only (green)
-
-case record-does-not-close-the-message not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-Next: finish the parser, then wire the CLI
-
-case docs-only-with-no-paths not-ready paths=
-docs: a commit whose paths could not be read
+case docs ready paths=AGENTS.md,README.md
+subject
 
 Review-waiver: docs-only
-Checks: affected-checks --committed-only (green)
-
-case cross-model-is-the-acting-model not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: claude/opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case cross-model-is-the-acting-model-codex not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/gpt-5.6-sol
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case codex-actor-reviewed-by-claude ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/gpt-5.6-sol
-Reviewed-by: claude/opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case waiving-the-subagent not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Review-waiver: subagent — skipped, approved by tester
-Checks: affected-checks --committed-only (green)
-
-case waiving-everything not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Review-waiver: subagent — skipped
-Review-waiver: agy — skipped
-Review-waiver: codex — skipped
-Checks: affected-checks --committed-only (green)
-
-case two-reviewers-waived not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Review-waiver: agy — CLI unavailable, approved by tester
-Review-waiver: codex — CLI unavailable, approved by tester
-Checks: affected-checks --committed-only (green)
-
-case waiver-names-no-approver not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Review-waiver: agy — the CLI is not installed on this host
-Checks: affected-checks --committed-only (green)
-
-case vendor-prefixed-same-model not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/claude-opus-4.8
-Reviewed-by: claude/opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case miscased-same-model not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: claude/Opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case unknown-model not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/some-new-thing
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case fallback-for-codex ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: codex — You've hit your usage limit
-Checks: affected-checks --committed-only (green)
-
-case fallback-for-claude ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/gpt-5.6-sol
-Reviewed-by: td-agent/anthropic/claude-opus-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: claude — 5-hour limit reached
-Checks: affected-checks --committed-only (green)
-
-case fallback-unrecorded not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: agy/gemini-3.1-pro
-Checks: affected-checks --committed-only (green)
-
-case fallback-not-quota not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: codex — CLI crashed
-Checks: affected-checks --committed-only (green)
-
-case fallback-third-family not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/google/gemini-3.1-pro
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: codex — usage limit reached
-Checks: affected-checks --committed-only (green)
-
-case fallback-acting-cli not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/anthropic/claude-sonnet-4.8
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: claude — usage limit reached
-Checks: affected-checks --committed-only (green)
-
-case fallback-for-agy not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: td-agent/google/gemini-3.1-pro
-Review-fallback: agy — usage limit reached
-Checks: affected-checks --committed-only (green)
-
-case fallback-and-waiver not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: td-agent/openai/gpt-6.1-sol
-Reviewed-by: agy/gemini-3.1-pro
-Review-fallback: codex — usage limit reached
-Review-waiver: codex — CLI unavailable, approved by tester
-Checks: affected-checks --committed-only (green)
-
-case fallback-waived not-ready paths=builder/src/ready.rs
-td-sh: something
-
-Reviewed-by: subagent/opus-4.8
-Reviewed-by: codex/gpt-5.6-sol
-Reviewed-by: agy/gemini-3.1-pro
-Review-waiver: td-agent — down, approved by tester
-Checks: affected-checks --committed-only (green)
-
-case td-agent-panel-codex ready
-Use model-selected tasks
-
-Reviewed-by: td-agent-subagent/openai/gpt-6-sol
-Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
 Checks: green
 
-case td-agent-panel-claude ready
-Use model-selected tasks
+case docs-code not-ready paths=README.md,a.rs
+subject
 
-Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Review-waiver: docs-only
 Checks: green
 
-case td-agent-mixed-panel ready
-Mixed native and task transports
+case docs-empty not-ready paths=
+subject
 
-Reviewed-by: subagent/gpt-6-sol
-Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
+Review-waiver: docs-only
+Checks: green
+
+case approved-opus ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-waiver: opus — service unavailable; approved by tester
+Checks: green
+
+case approved-gpt ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Review-waiver: gpt-sol: unavailable, approved by tester
+Checks: green
+
+case waiver-no-reason not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-waiver: opus approved by tester
+Checks: green
+
+case waiver-no-human not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-waiver: opus — unavailable
+Checks: green
+
+case waiver-placeholder not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-waiver: opus — unavailable; approved by <who>
+Checks: green
+
+case waive-both not-ready paths=src/a.rs
+subject
+
+Review-waiver: opus — unavailable; approved by tester
+Review-waiver: gpt-sol — unavailable; approved by tester
+Checks: green
+
+case waive-transport not-ready paths=src/a.rs
+subject
+
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Review-waiver: subagent — unavailable; approved by tester
+Checks: green
+
+case quoted not-ready paths=src/a.rs
+subject
+
+    Reviewed-by: subagent/anthropic/claude-opus-5.5
+    Reviewed-by: td-agent/openai/gpt-6.1-sol
+    Checks: green
+
+Quoted shape only.
+
+case trailing-prose not-ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
+
+Next: more work
+then done
+
+case final-block ready paths=src/a.rs
+subject
+
+Reviewed-by: subagent/unknown
+
+Body after old block
+
+Reviewed-by: subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol
+Checks: green
+
+case case-insensitive-keys ready paths=src/a.rs
+subject
+
+REVIEWED-BY: subagent/anthropic/claude-opus-5.5
+Reviewed-By: td-agent/openai/gpt-6.1-sol
+checks: green
+
+case docs-upper-extension ready paths=NOTES.MD
+subject
+
+Review-waiver: docs-only
+Checks: green
+
+case separated-checks not-ready paths=a.rs
+subject
+
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: td-agent/gpt-6.1-sol
+
+Checks: green
+
+case legacy-astra ready paths=a.rs
+subject
+
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: codex/gpt-6-astra
 Reviewed-by: agy/gemini-3.8-flash-high
 Checks: green
 
-case td-agent-wrong-cross-family not-ready
-Wrong slot model
+case new-astra not-ready paths=a.rs
+subject
 
-Reviewed-by: td-agent-subagent/openai/gpt-6-sol
-Reviewed-by: td-agent-claude/openai/gpt-6.1-sol
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: td-agent/gpt-6-astra
 Checks: green
 
-case td-agent-wrong-gemini-family not-ready
-Wrong shared slot model
+case non-frontier-mini not-ready paths=a.rs
+subject
 
-Reviewed-by: td-agent-subagent/openai/gpt-6-sol
-Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-agy/openai/gpt-6.1-sol
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: td-agent/openai/gpt-6.1-sol-mini
 Checks: green
 
-case td-agent-own-cross-family not-ready
-Same family twice
+case preview-id not-ready paths=a.rs
+subject
 
-Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: td-agent/openai/gpt-sol-preview-123
 Checks: green
 
-case td-agent-duplicate-primary-not-cross not-ready
-Two primary transports cannot replace the cross-model slot
+case historical-hyphenated-opus ready paths=a.rs
+subject
 
 Reviewed-by: subagent/gpt-6-sol
-Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Reviewed-by: claude/claude-opus-5-5
+Reviewed-by: agy/gemini-3.8-flash-high
 Checks: green
 
-case td-agent-unknown-transport not-ready
-Misspelled transport
+case new-hyphenated-opus not-ready paths=a.rs
+subject
 
-Reviewed-by: td-agent-subagent/openai/gpt-6-sol
-Reviewed-by: td-agent-claud/anthropic/claude-opus-5.5
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
-Checks: green
-
-case td-agent-primary-gemini-3.8-flash not-ready
-Primary reviewer outside roster
-
-Reviewed-by: td-agent-subagent/google/gemini-3.8-flash
-Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
-Checks: green
-
-case td-agent-primary-claude-haiku-4.5 not-ready
-Primary reviewer outside roster
-
-Reviewed-by: td-agent-subagent/anthropic/claude-haiku-4.5
-Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
-Checks: green
-
-case td-agent-primary-claude-sonnet-5.5 not-ready
-Primary reviewer outside roster
-
-Reviewed-by: td-agent-subagent/anthropic/claude-sonnet-5.5
-Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
-Checks: green
-
-case td-agent-duplicate-primary-reversed-not-cross not-ready
-Task primary cannot be replaced by a native second primary
-
-Reviewed-by: td-agent-subagent/openai/gpt-6-sol
-Reviewed-by: subagent/opus-5.5
-Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Reviewed-by: subagent/gpt-6-sol
+Reviewed-by: td-agent/claude-opus-5-5
 Checks: green

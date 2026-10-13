@@ -27,438 +27,9 @@ options:
   -h, --help      this text
 ";
 
-/// The reviewers a record may name. Closed on purpose: a misspelt reviewer is a
-/// review nobody ran, and an open roster cannot tell those two apart.
-pub const SUBAGENT: &str = "subagent";
-pub const CLI_REVIEWERS: &[&str] = &["agy", "claude", "codex"];
-/// The cross-model reviewer BOTH acting-agent rosters name. Whichever model is
-/// acting, the other two reviews are Agy plus the model that is not the actor —
-/// so "any two of three" would accept a Codex agent reviewed by Codex and
-/// Claude, no Agy, which the roster does not allow.
-const SHARED_CLI: &str = "agy";
-/// The cross-model slot's stand-in when its CLI refuses for quota: a
-/// `td-agent review` through OpenRouter, `Reviewed-by: td-agent/<model>`,
-/// counted only beside the `Review-fallback: <cli> — <why>` that says which
-/// CLI it replaced (DEVELOPMENT.md, `Quota fallback`). Not a roster entry:
-/// it cannot be waived and cannot fill the Agy slot.
-pub const FALLBACK: &str = "td-agent";
-/// The one waiver that stands in for all three, and only on a commit whose every
-/// path is documentation — a claim this checks rather than believes.
-pub const DOCS_ONLY: &str = "docs-only";
-
-/// What one commit's message claims about its review.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Record {
-    /// `(tool, model)` per `Reviewed-by:`, deduped by tool, first-seen order.
-    /// The MODEL is kept because the rule is two distinct models, not two
-    /// distinct commands: `subagent/opus-4.8` + `claude/opus-4.8` is one model
-    /// reviewing itself through two front ends.
-    pub reviewers: Vec<(String, String)>,
-    /// `Review-waiver:` subjects paired with the reason given.
-    pub waivers: Vec<(String, String)>,
-    /// `Review-fallback:` subjects, the CLI a td-agent review replaced, paired
-    /// with the reason given.
-    pub fallbacks: Vec<(String, String)>,
-    pub checks: Option<String>,
-    /// Trailers of ours that did not parse — reported, never ignored.
-    pub malformed: Vec<String>,
-}
-
-/// An unindented `Key: value` line, no spaces in the key. What keeps a message
-/// that SHOWS the record from claiming it is that such a quote is indented (or
-/// fenced, whose closing line is not a trailer) and so never reaches the
-/// trailing block.
-fn is_trailer_line(line: &str) -> bool {
-    match line.split_once(':') {
-        Some((key, _)) => {
-            key.starts_with(|c: char| c.is_ascii_alphabetic())
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        }
-        None => false,
-    }
-}
-
-/// A line that looks like part of the record, wherever it sits. Used only to
-/// tell "no review" apart from "a review that does not close the message".
-fn is_record_line(line: &str) -> bool {
-    is_trailer_line(line)
-        && line.split_once(':').is_some_and(|(key, _)| {
-            ["reviewed-by", "review-waiver", "review-fallback", "checks"]
-                .iter()
-                .any(|k| key.eq_ignore_ascii_case(k))
-        })
-}
-
-/// The trailing run of trailer lines. Only the LAST block counts, the way git's
-/// own trailers do: a record quoted mid-body is prose, not a claim.
-fn trailer_block(message: &str) -> Vec<&str> {
-    let lines: Vec<&str> = message.lines().collect();
-    let mut end = lines.len();
-    while end > 0 && lines.get(end - 1).is_some_and(|l| l.trim().is_empty()) {
-        end -= 1;
-    }
-    let mut start = end;
-    while start > 0 && lines.get(start - 1).is_some_and(|l| is_trailer_line(l)) {
-        start -= 1;
-    }
-    lines
-        .get(start..end)
-        .map(<[&str]>::to_vec)
-        .unwrap_or_default()
-}
-
-/// `agy — CLI unavailable, approved by <who>` splits into the reviewer excused
-/// and why. The reason is load-bearing for a reviewer waiver: one without it
-/// records nothing a human could later disagree with.
-fn split_waiver(value: &str) -> (String, String) {
-    let mut parts = value.splitn(2, char::is_whitespace);
-    // `agy: unavailable` and `agy — unavailable` name the same reviewer; the
-    // punctuation belongs to the separator, not to the name, and keeping it
-    // would report "unknown reviewer 'agy:'".
-    let subject = parts
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches([':', '-', ','])
-        .to_string();
-    let reason = parts
-        .next()
-        .unwrap_or_default()
-        .trim_start_matches(|c: char| c == '—' || c == '-' || c == ':' || c.is_whitespace())
-        .trim()
-        .to_string();
-    (subject, reason)
-}
-
-pub fn parse_record(message: &str) -> Record {
-    let mut rec = Record::default();
-    for line in trailer_block(message) {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        // Case-insensitively, as git matches its own trailer tokens: a
-        // `Reviewed-By:` that fell through would be reported as no review at
-        // all, which sends an agent looking for the wrong thing.
-        let key = key.to_ascii_lowercase();
-        match key.as_str() {
-            "reviewed-by" => match value.split_once('/') {
-                Some((tool, model)) if !tool.trim().is_empty() && !model.trim().is_empty() => {
-                    let tool = match reviewer::slot(tool.trim(), model.trim()) {
-                        Ok(slot) => slot.to_string(),
-                        Err(why) => {
-                            rec.malformed.push(why);
-                            continue;
-                        }
-                    };
-                    let model = model.trim().to_string();
-                    if !rec.reviewers.iter().any(|(t, _)| *t == tool) {
-                        rec.reviewers.push((tool, model));
-                    }
-                }
-                _ => rec
-                    .malformed
-                    .push(format!("`Reviewed-by: {value}` is not <tool>/<model>")),
-            },
-            "review-waiver" => {
-                let (subject, reason) = split_waiver(value);
-                if subject.is_empty() {
-                    rec.malformed
-                        .push("`Review-waiver:` names no reviewer".to_string());
-                } else {
-                    rec.waivers.push((subject, reason));
-                }
-            }
-            "review-fallback" => {
-                let (subject, reason) = split_waiver(value);
-                if subject.is_empty() {
-                    rec.malformed
-                        .push("`Review-fallback:` names no reviewer".to_string());
-                } else {
-                    rec.fallbacks.push((subject, reason));
-                }
-            }
-            "checks" if !value.is_empty() => rec.checks = Some(value.to_string()),
-            _ => {}
-        }
-    }
-    rec
-}
-
-/// Who approved this waiver, out of its reason. A waiver is not something an
-/// agent may issue: it records the answer a HUMAN gave when asked, so the
-/// answer has to name them. The gate cannot see that the question was asked —
-/// naming the person who answered is the closest checkable thing to it.
-fn approver(reason: &str) -> Option<&str> {
-    let lower = reason.to_ascii_lowercase();
-    let at = lower.find("approved by")?;
-    let who = reason.get(at.saturating_add("approved by".len())..)?.trim();
-    (!who.is_empty()).then_some(who)
-}
-
-fn known_reviewer(name: &str) -> bool {
-    name == SUBAGENT || CLI_REVIEWERS.contains(&name)
-}
-
-/// The model families an identity may name — closed, like the tool roster, and
-/// for the same reason: this has to answer WHICH MODEL looked, and a spelling it
-/// does not recognise is one it cannot compare. Splitting on the first `-` was
-/// not enough: `claude-opus-4.8` and `opus-4.8` are the same model, and that is
-/// the spelling an agent naturally writes for its own subagent.
-const MODELS: &[&str] = &["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
-
-/// The families each cross-model CLI reviews as. A td-agent review standing
-/// in for one must share them: the fallback replaces the CLI's quota, not
-/// its model, so the slot's second opinion stays that family's.
-fn cli_families(cli: &str) -> &'static [&'static str] {
-    match cli {
-        "codex" => &["gpt"],
-        "claude" => &["opus", "sonnet", "haiku", "fable"],
-        _ => &[],
-    }
-}
-
-/// What a quoted quota refusal says, Codex's ("usage limit") and the Claude
-/// CLI's ("limit reached", "hit your limit") among them. A crash, a missing
-/// CLI or a timeout is an unavailable reviewer and needs a human's waiver.
-const QUOTA_WORDS: &[&str] = &[
-    "quota",
-    "usage limit",
-    "rate limit",
-    "limit reached",
-    "hit your limit",
-];
-
-/// Matched with `-` and `_` read as spaces, so `rate_limit_exceeded` and
-/// `5-hour limit reached`, quoted as printed, are found.
-fn quota_refusal(reason: &str) -> bool {
-    let spaced: String = reason
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c == '-' || c == '_' { ' ' } else { c })
-        .collect();
-    QUOTA_WORDS.iter().any(|w| spaced.contains(w))
-}
-
-fn family(model: &str) -> Option<&'static str> {
-    let lower = model.to_ascii_lowercase();
-    MODELS.iter().copied().find(|m| {
-        lower
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|token| token == *m)
-    })
-}
-
-/// Everything wrong with one commit's record. Empty means the commit may land.
-/// `paths` are the files the commit touches, which only the `docs-only` waiver
-/// consults — it is the one claim here that the message alone cannot support.
-pub fn problems(message: &str, paths: &[String]) -> Vec<String> {
-    let rec = parse_record(message);
-    let mut out = rec.malformed.clone();
-
-    let docs_only = rec.waivers.iter().any(|(s, _)| s == DOCS_ONLY);
-    for (subject, reason) in &rec.waivers {
-        if subject == DOCS_ONLY {
-            // An EMPTY path list is not agreement. `git show --name-only` prints
-            // nothing for a merge, and a failed query prints nothing either —
-            // this is the one place the gate checks reality instead of believing
-            // the message, so "no evidence" must not read as "no code".
-            if paths.is_empty() {
-                out.push("waived as docs-only, but no paths could be read".to_string());
-            } else if let Some(p) = paths
-                .iter()
-                .find(|p| !p.to_ascii_lowercase().ends_with(".md"))
-            {
-                out.push(format!("waived as docs-only, but it touches {p}"));
-            }
-        } else if subject == SUBAGENT {
-            // The waiver exists for a reviewer CLI that is UNAVAILABLE. The
-            // subagent is not a CLI and cannot be unavailable, so waiving it is
-            // just declining the one review that always could have run.
-            out.push("the subagent review cannot be waived".to_string());
-        } else if !known_reviewer(subject) {
-            out.push(format!("waives unknown reviewer '{subject}'"));
-        } else if reason.is_empty() {
-            out.push(format!("waiver for '{subject}' gives no reason"));
-        } else if approver(reason).is_none() {
-            out.push(format!(
-                "waiver for '{subject}' names nobody who approved it — a waiver records \
-                 a human's answer, so it ends `approved by <who>`"
-            ));
-        }
-    }
-
-    // One at most — a backstop, not an allowance. Nothing here can see whether
-    // the human was actually asked, so what the gate CAN do is bound what a
-    // waiver reaches: stacked ones get to "no reviews at all" in four extra
-    // words, and a commit with two reviewers down is one to stop on anyway.
-    let reviewer_waivers = rec.waivers.iter().filter(|(s, _)| s != DOCS_ONLY).count();
-    if reviewer_waivers > 1 {
-        out.push(format!(
-            "{reviewer_waivers} reviewers waived at once — ask a human rather than record around it"
-        ));
-    }
-
-    // The CLIs whose slot is the cross-model one, the only slot a fallback
-    // may fill.
-    let others: Vec<&str> = CLI_REVIEWERS
-        .iter()
-        .copied()
-        .filter(|c| *c != SHARED_CLI)
-        .collect();
-    let reviewed = |who: &str| rec.reviewers.iter().any(|(t, _)| t == who);
-    let stand_in = rec
-        .reviewers
-        .iter()
-        .find(|(t, _)| t == FALLBACK)
-        .map(|(_, m)| m.as_str());
-    let acting = rec
-        .reviewers
-        .iter()
-        .find(|(t, _)| t == SUBAGENT)
-        .and_then(|(_, m)| family(m));
-    // The CLI a well-formed fallback stands in for; nothing otherwise.
-    let mut stands_for: Option<&str> = None;
-    match rec.fallbacks.as_slice() {
-        [] if reviewed(FALLBACK) => out.push(format!(
-            "a {FALLBACK} review stands in for a CLI only beside \
-             `Review-fallback: <cli> — <why>`"
-        )),
-        [] => {}
-        [(subject, reason)] => {
-            let families = cli_families(subject);
-            if !others.contains(&subject.as_str()) {
-                out.push(format!(
-                    "falls back from '{subject}', not the cross-model CLI ({})",
-                    others.join(" or ")
-                ));
-            } else if !quota_refusal(reason) {
-                out.push(format!(
-                    "fallback from '{subject}' does not quote a quota refusal ({}) — \
-                     any other failure is an unavailable reviewer, which needs a waiver",
-                    QUOTA_WORDS.join(", ")
-                ));
-            } else if reviewed(subject) {
-                out.push(format!(
-                    "falls back from '{subject}', which reviewed it as well"
-                ));
-            } else if rec.waivers.iter().any(|(s, _)| s == subject) {
-                out.push(format!("falls back from '{subject}' and waives it as well"));
-            } else if acting.is_some_and(|a| families.contains(&a)) {
-                out.push(format!(
-                    "falls back from '{subject}', the acting model's own CLI — the \
-                     cross-model slot is the other family's"
-                ));
-            } else if let Some(model) = stand_in {
-                if family(model).is_some_and(|f| families.contains(&f)) {
-                    stands_for = Some(subject.as_str());
-                } else {
-                    out.push(format!(
-                        "the {FALLBACK} review is {model}, not {subject}'s model family ({}) \
-                         — a fallback replaces the CLI's quota, not its model",
-                        families.join("/")
-                    ));
-                }
-            }
-            if !reviewed(FALLBACK) {
-                out.push(format!(
-                    "falls back from '{subject}' but records no \
-                     `Reviewed-by: {FALLBACK}/<model>`"
-                ));
-            }
-        }
-        more => out.push(format!(
-            "{} fallbacks at once — one td-agent review replaces one CLI",
-            more.len()
-        )),
-    }
-
-    for (tool, model) in &rec.reviewers {
-        if !known_reviewer(tool) && tool != FALLBACK {
-            out.push(format!("unknown reviewer '{tool}'"));
-        } else if family(model).is_none() {
-            out.push(format!(
-                "'{model}' is not a known model ({}) — the cross-model rule cannot compare it",
-                MODELS.join("/")
-            ));
-        }
-    }
-
-    if !docs_only {
-        // A waiver stands in for a review only with a reason; the roster check
-        // above has already reported an unknown subject.
-        // Only a waiver that names its approver stands in for a review.
-        let waived = |who: &str| {
-            rec.waivers
-                .iter()
-                .any(|(s, r)| s == who && approver(r).is_some())
-        };
-        let model_of = |who: &str| {
-            rec.reviewers
-                .iter()
-                .find(|(t, _)| t == who)
-                .map(|(_, m)| m.as_str())
-        };
-        let have = |who: &str| model_of(who).is_some() || waived(who);
-        if !have(SUBAGENT) {
-            out.push("no subagent review".to_string());
-        }
-        if !have(SHARED_CLI) {
-            out.push(format!(
-                "no {SHARED_CLI} review — both acting-agent rosters name it"
-            ));
-        }
-        // The remaining slot is the model that is NOT acting. Comparing tools
-        // alone would accept `subagent/opus-4.8` + `claude/opus-4.8`: the same
-        // model reviewing its own work through a second front end, which is the
-        // exact blind spot the cross-model rule exists to cover. A waived slot
-        // has no model to compare, and its reason is the record.
-        // A CLI's review, or the td-agent review a fallback with a reason says
-        // replaced it; the family rule binds the stand-in as it binds the CLI.
-        let review_of =
-            |c: &str| model_of(c).or_else(|| stand_in.filter(|_| stands_for == Some(c)));
-        // An unrecognised model counts as NOT cross-model: it was reported just
-        // above, and a spelling nothing can compare must not settle the check.
-        let cross = others.iter().any(|c| match review_of(c) {
-            Some(m) => family(m).is_some_and(|f| acting.is_none_or(|a| f != a)),
-            None => waived(c),
-        });
-        if !cross {
-            let named = others.join(" or ");
-            match others.iter().find_map(|c| review_of(c)) {
-                Some(m) => out.push(format!(
-                    "the {named} review is {m}, the model that reviewed it as subagent — \
-                     the second opinion must be the model that is not acting"
-                )),
-                None => out.push(format!("no cross-model review from {named}")),
-            }
-        }
-    }
-
-    if rec.checks.is_none() {
-        out.push("no `Checks:` trailer".to_string());
-    }
-
-    // Only when something IS missing: a record that does not close the message
-    // is invisible to the block scan (a `Next:` paragraph or a wrapped trailer
-    // below it is enough), and reporting the reviews as absent would send an
-    // agent looking for the wrong thing. A complete record plus a quoted example
-    // elsewhere is not an error, which is why this is not checked unconditionally.
-    if !out.is_empty() {
-        let block = trailer_block(message);
-        let stray = message
-            .lines()
-            .filter(|l| is_record_line(l) && !block.contains(l))
-            .count();
-        if stray > 0 {
-            out.push(format!(
-                "{stray} record line(s) do not close the message — the record must be the \
-                 last block, one trailer per line (do not wrap them)"
-            ));
-        }
-    }
-    out
-}
+pub use reviewer::problems;
+#[cfg(test)]
+use reviewer::{parse as parse_record, Record};
 
 /// git's stdout, or `None` if it failed. A gate may not read a failed query as
 /// an empty answer: that is how "rev-list broke" becomes "nothing to land".
@@ -479,7 +50,7 @@ fn git_out(root: &Path, args: &[&str]) -> String {
 /// detected rename, and this list is the one place the gate checks reality
 /// rather than believing the message: `git mv builder/src/nar.rs notes.md`
 /// reports `notes.md` alone, so every path ends in `.md` and a commit that
-/// DELETED a Rust source waives all three reviews. Off, a rename is a delete
+/// DELETED a Rust source waives both frontier reviews. Off, a rename is a delete
 /// plus an add and both sides are seen.
 fn commit_paths(root: &Path, oid: &str) -> Vec<String> {
     git_try(
@@ -883,290 +454,38 @@ Checks: affected-checks --committed-only (green)
     }
 
     #[test]
-    fn subagent_alone_is_not() {
-        let p = probs("s\n\nReviewed-by: subagent/opus-4.8\nChecks: green\n");
-        assert!(p.iter().any(|s| s.starts_with("no agy review")));
-        assert!(p.iter().any(|s| s.starts_with("no cross-model review")));
+    fn each_frontier_family_is_required() {
+        assert_eq!(
+            probs("s\n\nReviewed-by: subagent/opus-5.5\nChecks: green\n"),
+            ["no gpt-sol review"]
+        );
+        assert_eq!(
+            probs("s\n\nReviewed-by: td-agent/openai/gpt-6.1-sol\nChecks: green\n"),
+            ["no opus review"]
+        );
     }
 
-    /// The roster is agy PLUS the model that is not acting, so two reviews that
-    /// skip agy are not two cross-model reviews.
     #[test]
-    fn agy_is_required_by_both_rosters() {
-        let p = probs("s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: claude/opus-4.8\nChecks: g\n");
-        assert_eq!(p.len(), 1);
-        assert!(p.first().is_some_and(|s| s.starts_with("no agy review")));
-    }
-
-    /// The acting model reviewing its own work through a second front end is
-    /// not a second opinion: `subagent/opus-4.8` + `claude/opus-4.8` is one
-    /// model, and the blind spot the cross-model rule covers is exactly the one
-    /// it would share with itself.
-    #[test]
-    fn the_acting_model_cannot_be_its_own_cross_model_review() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: claude/opus-4.8\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        let p = probs(m);
-        assert_eq!(p.len(), 1);
-        assert!(
-            p.first()
-                .is_some_and(|s| s.contains("model that is not acting")),
-            "{p:?}"
-        );
-
-        // The same shape the other way round, which is the Codex actor's.
-        let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        assert_eq!(probs(m).len(), 1);
-
-        // A version apart is still the same model family.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: claude/opus-4.7\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        assert_eq!(probs(m).len(), 1);
-
-        // And the roster's own pairing passes.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        assert!(probs(m).is_empty());
-    }
-
-    /// A td-agent review fills the cross-model slot only with the
-    /// `Review-fallback:` that says which CLI refused, and the family rule
-    /// binds it as it binds that CLI.
-    #[test]
-    fn a_td_agent_review_stands_in_for_the_cross_model_cli_on_record() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
-                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-fallback: codex — usage limit reached\nChecks: g\n";
-        assert!(probs(m).is_empty(), "{:?}", probs(m));
-
-        // Unrecorded, it is no cross-model review.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
-                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("only beside")), "{p:?}");
-        assert!(
-            p.iter().any(|s| s.starts_with("no cross-model review")),
-            "{p:?}"
-        );
-
-        // Without a reason, or for anything but quota, likewise: a crash is
-        // an unavailable reviewer, which only a human may waive.
-        for fallback in ["codex", "codex — CLI crashed"] {
-            let m = format!(
-                "s\n\nReviewed-by: subagent/opus-4.8\n\
-                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nReview-fallback: {fallback}\nChecks: g\n"
-            );
-            let p = probs(&m);
-            assert!(p.iter().any(|s| s.contains("quota refusal")), "{p:?}");
-            assert!(
-                p.iter().any(|s| s.starts_with("no cross-model review")),
-                "{p:?}"
-            );
-        }
-
-        // A stand-in from a third family is not Codex's second opinion,
-        // even where it differs from the acting model.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
-                 Reviewed-by: td-agent/google/gemini-3.1-pro\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-fallback: codex — usage limit reached\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter().any(|s| s.contains("not codex's model family")),
-            "{p:?}"
-        );
-        assert!(
-            p.iter().any(|s| s.starts_with("no cross-model review")),
-            "{p:?}"
-        );
-
-        // With Codex acting, the Claude CLI's stand-in is Claude's family,
-        // and the acting model through OpenRouter is not.
-        let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\n\
-                 Reviewed-by: td-agent/anthropic/claude-opus-4.8\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-fallback: claude — rate limit reached\nChecks: g\n";
-        assert!(probs(m).is_empty(), "{:?}", probs(m));
-        let m = "s\n\nReviewed-by: subagent/gpt-5.6-sol\n\
-                 Reviewed-by: td-agent/openai/gpt-6.1-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-fallback: claude — rate limit reached\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter().any(|s| s.contains("not claude's model family")),
-            "{p:?}"
-        );
-        assert!(
-            p.iter().any(|s| s.starts_with("no cross-model review")),
-            "{p:?}"
-        );
-
-        // Agy's slot is not the fallback's.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: td-agent/google/gemini-3.1-pro\n\
-                 Review-fallback: agy — usage limit reached\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter().any(|s| s.contains("not the cross-model CLI")),
-            "{p:?}"
-        );
-        assert!(p.iter().any(|s| s.starts_with("no agy review")), "{p:?}");
-
-        // A fallback with no td-agent review, or from a CLI that reviewed.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-fallback: codex — usage limit reached\nChecks: g\n";
-        let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("records no")), "{p:?}");
-        assert!(p.iter().any(|s| s.contains("reviewed it as well")), "{p:?}");
-
-        // It cannot be waived: it is no roster entry.
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Reviewed-by: agy/gemini-3.1-pro\n\
-                 Review-waiver: td-agent — down, approved by Timmy\nChecks: g\n";
-        assert!(probs(m).iter().any(|s| s.contains("unknown reviewer")));
-    }
-
-    /// The same model spelled differently is still the same model. Each of
-    /// these was accepted while `family()` was "everything before the first
-    /// `-`", and the first is the spelling an agent naturally writes for its
-    /// own subagent.
-    #[test]
-    fn spelling_does_not_get_round_the_same_model_check() {
-        for cli in ["claude/opus-4.8", "claude/Opus-4.8", "claude/opus_4.8"] {
-            let m = format!(
-                "s\n\nReviewed-by: subagent/claude-opus-4.8\nReviewed-by: {cli}\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n"
-            );
-            let p = probs(&m);
-            assert!(
-                p.iter().any(|s| s.contains("model that is not acting")),
-                "{cli}: {p:?}"
-            );
+    fn either_transport_can_supply_both_models() {
+        for transport in ["subagent", "td-agent"] {
+            let message = format!("s\n\nReviewed-by: {transport}/anthropic/claude-opus-5.5\nReviewed-by: {transport}/openai/gpt-6.1-sol\nChecks: green\n");
+            assert!(probs(&message).is_empty());
         }
     }
 
-    /// A model nothing recognises cannot settle the cross-model check, and is
-    /// reported rather than passed over.
     #[test]
-    fn an_unknown_model_is_named() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/some-new-thing\n\
-                 Reviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter().any(|s| s.contains("is not a known model")),
-            "{p:?}"
-        );
-    }
-
-    #[test]
-    fn agy_alone_is_not_enough_either() {
-        let p = probs(
-            "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n",
-        );
-        assert_eq!(p.len(), 1);
-        assert!(p
-            .first()
-            .is_some_and(|s| s.starts_with("no cross-model review from claude or codex")));
-    }
-
-    #[test]
-    fn the_same_cli_twice_counts_once() {
-        let p = probs("s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: codex/gpt-5.6-sol\nChecks: g\n");
-        assert!(p.iter().any(|s| s.starts_with("no agy review")));
-    }
-
-    #[test]
-    fn checks_trailer_is_required() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\n";
-        assert_eq!(probs(m), vec!["no `Checks:` trailer"]);
-    }
-
-    #[test]
-    fn a_waiver_with_a_reason_substitutes() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Review-waiver: agy — CLI unavailable, approved by tester\nChecks: green\n";
-        assert!(probs(m).is_empty());
-    }
-
-    #[test]
-    fn a_waiver_without_one_does_not() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReview-waiver: agy\nChecks: g\n";
-        let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("gives no reason")));
-        assert!(p.iter().any(|s| s.starts_with("no agy review")));
-    }
-
-    /// `agy: unavailable` names agy — the punctuation is the separator, and
-    /// reporting "unknown reviewer 'agy:'" would send an agent hunting a typo
-    /// that is not the problem.
-    #[test]
-    fn waiver_punctuation_is_not_part_of_the_name() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Review-waiver: agy: not installed here, approved by tester\nChecks: g\n";
-        assert!(probs(m).is_empty());
-    }
-
-    /// The waiver is for a reviewer CLI that is UNAVAILABLE. The subagent is
-    /// not a CLI, so waiving it is declining the one review that always could
-    /// have run — and three stacked waivers were a commit with no reviews at
-    /// all passing the gate in four extra words.
-    /// A waiver is the record of an answer a HUMAN gave. An agent that decides
-    /// on its own that a reviewer was unavailable has recorded nothing: the
-    /// reason has to name who approved it.
-    #[test]
-    fn a_waiver_must_name_who_approved_it() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
-                 Review-waiver: agy — the CLI is not installed on this host\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter().any(|s| s.contains("names nobody who approved it")),
-            "{p:?}"
-        );
-        assert!(p.iter().any(|s| s.starts_with("no agy review")), "{p:?}");
-    }
-
-    #[test]
-    fn the_subagent_review_cannot_be_waived() {
-        let m = "s\n\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\n\
-                 Review-waiver: subagent — skipped, approved by tester\nChecks: g\n";
-        let p = probs(m);
-        assert!(
-            p.iter()
-                .any(|s| s == "the subagent review cannot be waived"),
-            "{p:?}"
-        );
-    }
-
-    #[test]
-    fn only_one_reviewer_may_be_waived_at_a_time() {
-        let m = "s\n\nReviewed-by: subagent/opus-4.8\n\
-                 Review-waiver: agy — unavailable, approved by tester\n\
-                 Review-waiver: codex — unavailable, approved by tester\nChecks: g\n";
-        let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("waived at once")), "{p:?}");
-
-        let m = "s\n\nReview-waiver: subagent — skipped\nReview-waiver: agy — skipped\n\
-                 Review-waiver: codex — skipped\nChecks: green\n";
-        assert!(
-            !probs(m).is_empty(),
-            "a commit with no reviews at all must not pass"
-        );
+    fn two_versions_of_one_family_are_one_opinion() {
+        assert_eq!(probs("s\n\nReviewed-by: subagent/opus-5.5\nReviewed-by: td-agent/opus-4.8\nChecks: green\n"), ["no gpt-sol review"]);
     }
 
     #[test]
     fn docs_only_waives_the_reviews_but_is_checked() {
-        let m = "s\n\nReview-waiver: docs-only\nChecks: none needed\n";
-        assert!(problems(m, &code(&["AGENTS.md", "README.md"])).is_empty());
-        let p = problems(m, &code(&["AGENTS.md", "builder/src/ready.rs"]));
-        assert_eq!(p.len(), 1);
-        assert!(p
-            .first()
-            .is_some_and(|s| s.contains("builder/src/ready.rs")));
+        let message = "s\n\nReview-waiver: docs-only\nChecks: none needed\n";
+        assert!(problems(message, &code(&["AGENTS.md", "README.md"])).is_empty());
+        assert_eq!(
+            problems(message, &code(&["AGENTS.md", "builder/src/ready.rs"])),
+            ["docs-only waiver touches builder/src/ready.rs"]
+        );
     }
 
     /// A rename must not launder a source file into a docs-only waiver.
@@ -1263,8 +582,8 @@ Checks: affected-checks --committed-only (green)
     fn a_malformed_identity_is_reported_not_ignored() {
         let m = "s\n\nReviewed-by: subagent\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
         let p = probs(m);
-        assert!(p.iter().any(|s| s.contains("is not <tool>/<model>")));
-        assert!(p.iter().any(|s| s == "no subagent review"));
+        assert!(p.iter().any(|s| s.contains("malformed Reviewed-by")));
+        assert!(p.iter().any(|s| s == "no opus review"));
     }
 
     /// git matches its own trailer tokens case-insensitively, and an agent that
@@ -1313,7 +632,7 @@ Checks: affected-checks --committed-only (green)
                  Reviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\nReviewed-by: agy/gemini-3.1-pro\nChecks: g\n";
         let rec = parse_record(m);
         let tools: Vec<&str> = rec.reviewers.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(tools, vec!["subagent", "codex", "agy"]);
+        assert_eq!(tools, vec!["subagent", "legacy-cli"]);
         assert!(probs(m).is_empty());
     }
 
@@ -1325,8 +644,7 @@ Checks: affected-checks --committed-only (green)
     }
 
     /// The fixture two crates share: `td-builder ready` gates on the record and
-    /// td-review displays it, from separate implementations that share only
-    /// transport normalization. This pins their remaining rules together.
+    /// td-review displays it, using the same parser and policy. The fixture pins both entry points.
     #[test]
     fn shared_fixture_cases() {
         let root = repo_root();
