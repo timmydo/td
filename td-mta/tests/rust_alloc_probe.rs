@@ -17,6 +17,10 @@ use allocation_shim::TD_MTA_ALLOCATION_COUNTERS as COUNTERS;
 use std::hint::black_box;
 use td_crypto::Digest;
 
+#[path = "../src/compose_text.rs"]
+#[allow(unused)]
+mod compose_text;
+
 // Compile filesystem and checker sources with their cfg(test) fixtures.
 // Filesystem fixtures need no production exception for the mapped test identity.
 use td_mta::metadata_sweep;
@@ -11840,6 +11844,80 @@ fn mime_base64() {
     assert_eq!(before, after, "MIME base64 allocated");
 }
 
+fn compose_text_allocations() {
+    use compose_text::{Address, Message};
+    use td_mime::{
+        time::{Deadline, Tick},
+        work::{Charge, Meter},
+    };
+    struct Clock;
+    impl ports::Clock for Clock {
+        fn sample(&self) -> Result<ports::Time, ports::Error> {
+            Ok(ports::Time {
+                utc_ms: 0,
+                monotonic: Tick(1),
+            })
+        }
+    }
+    let text = "hé\r\nx\n".repeat(300);
+    let before = COUNTERS.snapshot();
+    let mut message = Message {
+        from: Address {
+            name: "Unicode ☃",
+            email: "probe@example.test",
+        },
+        to: &[],
+        cc: &[],
+        bcc: &[],
+        reply_to: &[],
+        subject: "composed subject",
+        message_id: "probe@example.test",
+        in_reply_to: &[],
+        references: &[],
+        sent_at_ms: 0,
+        text: &text,
+    };
+    for maximum in [100000, 1] {
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 100000,
+                records: 100000,
+                output_bytes: 100000,
+                unlinks: 0,
+            },
+        );
+        let mut written = 0u64;
+        let result = compose_text::compose(&message, maximum, &Clock, &mut meter, |bytes| {
+            written += black_box(bytes).len() as u64;
+            Ok(())
+        });
+        if maximum == 1 {
+            assert_eq!(result, Err(ports::Error::Quota));
+        } else {
+            assert_eq!(result, Ok(written));
+            assert!(written > text.len() as u64);
+        }
+    }
+    message.subject = "bad\r\nheader";
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 100000,
+            records: 100000,
+            output_bytes: 100000,
+            unlinks: 0,
+        },
+    );
+    assert_eq!(
+        compose_text::compose(&message, 100000, &Clock, &mut meter, |_| Ok(())),
+        Err(ports::Error::Invalid)
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "plain-text composition allocated");
+}
+
 fn mime_header_encode() {
     use header_encode::{Cursor, Error, Status};
     use td_mime::{
@@ -12352,6 +12430,7 @@ fn main() {
         mime_base64();
         mime_base64_encode();
         mime_header_encode();
+        compose_text_allocations();
         mime_qp();
         mime_qp_input();
         unicode_lookups();
@@ -12551,6 +12630,7 @@ fn main() {
     mime_base64();
     mime_base64_encode();
     mime_header_encode();
+    compose_text_allocations();
     mime_qp();
     mime_qp_input();
     unicode_lookups();

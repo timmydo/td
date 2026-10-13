@@ -25,6 +25,7 @@ pub mod body_value;
 pub mod body_value_options;
 pub mod bounded;
 pub mod clock;
+pub mod compose_text;
 pub mod config;
 pub mod email_preview;
 pub mod email_properties;

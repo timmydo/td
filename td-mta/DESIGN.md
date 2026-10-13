@@ -2279,3 +2279,35 @@ and identity state binds the catalog digest to the live store epoch. Output
 uses the original retained-response quota and deadline, with bounded copying
 and a final snapshot check. Other calls in a batch retain normal error and
 result-reference handling.
+
+## Plain-text draft composition
+
+The inert `compose_text` worker composes td-mail's plain-text structured
+creation fields into caller-owned private staging. It writes ASCII MIME
+headers, UTF-8 encoded display words, validated ASCII mailboxes and single
+strict Message-IDs. Generated IDs admit visible ASCII only, forbid escapes
+and quoted local parts, and retain the shared parser's dot-atom or
+non-folding domain-literal grammar. Reply-ID lists retain order. Each identifier occupies
+one continuation line and is limited to 995 bytes; address and identifier
+lists have a 1000-item ceiling. Caller-supplied Date and Message-ID are not
+regenerated. Date is whole-second UTC in the supported 1900..9999 range.
+The stored copy retains Bcc. This worker does not prepare a relay copy,
+construct attachments, authorize an account, create an Email, or advertise
+Submission; those are separate service steps.
+
+Text preserves its UTF-8 bytes, canonicalizing CRLF, bare CR and bare LF to
+CRLF before bounded base64 encoding. The worker counts that extent first,
+then streams it using fixed scratch, the original work meter and freshly
+sampled monotonic time between bounded turns. Each 1024-byte newline
+conversion buffer prepays up to 1025 input bytes for CRLF lookahead,
+forfeiting unused credit. It rejects clock regression.
+Validation, encoding and sink publication spend separately; no replay
+renews the meter. A caller-supplied total encoded-byte ceiling is enforced
+before each sink write. Any failure leaves only provisional bytes: the
+caller must discard staging and publish nothing. Success requires a fresh
+final budget/deadline check. Durable quota admission and the native
+transaction remain the future creation adapter's responsibility.
+
+The native Rust allocation probe compiles the same composition source and
+checks complete Unicode/text output, size refusal and invalid-header refusal
+without allocation; caller-owned text and sink backing are outside it.
