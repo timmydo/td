@@ -19,7 +19,7 @@ struct Flags {
     broken: bool,
     stopped: bool,
 }
-impl FlagMutator for Flags {
+impl EmailMutator for Flags {
     fn update(
         &self,
         request: EmailUpdateRequest<'_>,
@@ -48,6 +48,8 @@ impl FlagMutator for Flags {
                     .map(|u| {
                         if u.email == EmailId::from_bytes([99; 16]) {
                             EmailUpdateResult::NotFound
+                        } else if u.mailbox == Some(MailboxId::from_bytes([99; 16])) {
+                            EmailUpdateResult::InvalidMailbox
                         } else {
                             EmailUpdateResult::Updated
                         }
@@ -77,7 +79,7 @@ fn run_timing(
         clock: &'a resolution::tests::Timer,
         expire: bool,
     }
-    impl FlagMutator for Timed<'_> {
+    impl EmailMutator for Timed<'_> {
         fn update(
             &self,
             request: EmailUpdateRequest<'_>,
@@ -111,7 +113,7 @@ fn run_timing(
         );
         let mut plan = response::Preflight::new(request, "session", retention.maximum()).unwrap();
         while !plan.step(&mut [0; 4096]).unwrap() {}
-        let mut complete = match dispatch::run_with_flags(
+        let mut complete = match dispatch::run_with_email_updates(
             plan.finish().unwrap(),
             retention,
             Deadline::after(Tick(0), 90).unwrap(),
@@ -373,4 +375,95 @@ fn foreign_account_and_non_email_ids_have_typed_absence() {
         );
     }
     assert!(flags.calls.borrow()[0].is_empty());
+}
+
+#[test]
+fn moves_accept_the_client_replacement_and_refuse_invalid_destinations() {
+    let email = id(EmailId::from_bytes([3; 16]));
+    let target = id(MailboxId::from_bytes([8; 16]));
+    for (mailboxes, error) in [
+        (format!(r#"{{"{target}":true}}"#), None),
+        (
+            format!(r#"{{"{}":true}}"#, id(MailboxId::from_bytes([99; 16]))),
+            Some("invalidProperties"),
+        ),
+        (
+            format!(
+                r#"{{"{target}":true,"{}":true}}"#,
+                id(MailboxId::from_bytes([7; 16]))
+            ),
+            Some("invalidProperties"),
+        ),
+        ("{}".into(), Some("invalidProperties")),
+        ("null".into(), Some("invalidProperties")),
+        (
+            format!(r#"{{"{target}":false}}"#),
+            Some("invalidProperties"),
+        ),
+        (
+            format!(r#"{{"{target}":true,"foreign":true}}"#),
+            Some("invalidProperties"),
+        ),
+        ("{\"foreign\":true}".into(), Some("invalidProperties")),
+    ] {
+        let flags = Flags::default();
+        let input = format!(
+            r#"{{"accountId":"{}","update":{{"{email}":{{"mailboxIds":{mailboxes},"keywords/$seen":true}}}}}}"#,
+            id(ACCOUNT)
+        );
+        let response = run(td_json::parse(&input).unwrap(), &flags, 256);
+        let answer = &response["methodResponses"][1][1];
+        if let Some(error) = error {
+            assert_eq!(
+                answer["notUpdated"][email.as_str()]["type"].as_str(),
+                Some(error)
+            );
+            assert_eq!(
+                answer["notUpdated"][email.as_str()]["properties"][0].as_str(),
+                Some("mailboxIds")
+            );
+            if !mailboxes.contains(&id(MailboxId::from_bytes([99; 16]))) {
+                assert!(flags.calls.borrow()[0].is_empty(), "{mailboxes}");
+            }
+        } else {
+            assert!(answer["updated"].get(&email).is_some());
+            assert_eq!(
+                flags.calls.borrow()[0][0].mailbox,
+                Some(MailboxId::from_bytes([8; 16]))
+            );
+            assert_eq!(flags.calls.borrow()[0][0].seen, Some(true));
+        }
+    }
+}
+
+#[test]
+fn moves_accept_standalone_replacement_and_refuse_path_patches() {
+    let email = id(EmailId::from_bytes([3; 16]));
+    let target = id(MailboxId::from_bytes([8; 16]));
+    for (property, value, accepted) in [
+        (
+            "mailboxIds".to_owned(),
+            format!(r#"{{"{target}":true}}"#),
+            true,
+        ),
+        (format!("mailboxIds/{target}"), "true".into(), false),
+    ] {
+        let flags = Flags::default();
+        let input = format!(
+            r#"{{"accountId":"{}","update":{{"{email}":{{"{property}":{value}}}}}}}"#,
+            id(ACCOUNT)
+        );
+        let response = run(td_json::parse(&input).unwrap(), &flags, 256);
+        let answer = &response["methodResponses"][1][1];
+        if accepted {
+            assert!(answer["updated"].get(&email).is_some());
+            assert_eq!(flags.calls.borrow()[0][0].seen, None);
+        } else {
+            assert_eq!(
+                answer["notUpdated"][email.as_str()]["type"].as_str(),
+                Some("invalidProperties")
+            );
+            assert!(flags.calls.borrow()[0].is_empty());
+        }
+    }
 }

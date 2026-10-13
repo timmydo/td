@@ -490,7 +490,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     let mut response_root = response_fixture.locked();
     let request_spool =
         crate::store_fs::RequestSpool::open(&mut response_root, clock.clone(), until).unwrap();
-    let session = crate::jmap_session::Session::mail_flags(
+    let session = crate::jmap_session::Session::mail_access(
         Origin::parse(&origin_text).unwrap(),
         crate::config::identities::AccountView {
             id: account,

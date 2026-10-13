@@ -463,18 +463,26 @@ batches, transport failures and other statuses remain errors, as do 429 without
 a supported delay, 503 with an unsupported supplied delay, and continued pressure. Delays are synchronous; ordinary mailbox
 reads wait on the backend thread.
 
-Read/unread and star updates require an explicit success or `notFound` for
-every requested message before the client retires the queued change. Per-message refusals or
-missing outcomes keep it queued for reconnect replay. Earlier remote successes
-remain applied; retrying these flag assignments is idempotent. The existing
-optimistic local display and offline queue remain in effect.
-Mailbox-wide mark-read freezes message IDs before queueing (the cached IDs
-when offline, which may cover only part of the mailbox). An online ID-query
-failure returns an error before queueing, so the user can retry that action. Batch progress removes confirmed IDs durably; a per-message
-refusal does not prevent later batches from running. An explicit `notFound`
-resolves a flag assignment because the message is gone. New flag assignments
-atomically supersede older queued assignments to the same flag and message.
-Other refusals remain queued under the existing stop-on-failure replay policy.
+Read/unread, star and mailbox move updates require success or `notFound` for
+every requested message before the client retires the queued change. Per-
+message refusals or missing outcomes keep it queued for reconnect replay.
+Earlier remote successes remain applied; retrying these flag or destination
+assignments is idempotent. The existing optimistic local display and offline
+queue remain in effect. Mailbox-wide mark-read freezes message IDs before
+queueing (the cached IDs when offline, which may cover only part of the
+mailbox). An online ID-query failure returns an error before queueing, so the
+user can retry that action. Batch progress removes confirmed IDs durably; a
+per-message refusal does not prevent later batches from running. An explicit
+`notFound` resolves a flag or move assignment because the message is gone. New
+flag assignments atomically supersede older queued assignments to the same
+flag and message. A new move atomically supersedes older queued destinations
+for the same message, including pending rule actions. Older thread moves and
+unplanned rule runs must resolve on reconnect before a new move can be queued. Other refusals, including a missing
+move destination, remain queued under the existing stop-on-failure replay
+policy. They are logged and can hold later queued work;
+this flow does not silently discard user intent. Folder deletion and recovery
+from a permanently removed destination require a separate queue-policy
+increment.
 Legacy mailbox-wide entries freeze their selections before any reconnect
 replay effects; new seen assignments are rejected while such an entry still
 has no selection. Before replay effects, rules persist their concrete action list in the older

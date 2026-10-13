@@ -1283,10 +1283,13 @@ fill it before its CPU/I/O/deadline ceiling. Deterministic job work exhaustion
 is storageWorkLimit; elapsed deadline and shared workspace/file/view pressure
 are temporary serverUnavailable. Neither publishes partial IDs or totals.
 
-## Device read/star response admission
+## Device Email update response admission
 
-The active Email/set subset accepts only update patches for `keywords/$seen`
-and `keywords/$flagged`, with true to set and null to remove. Unsupported
+The active Email/set subset accepts update patches for `keywords/$seen`
+and `keywords/$flagged`, with true to set and null to remove, plus the
+single-destination mailboxIds replacement td-mail emits. Destination refusal
+reports invalidProperties with properties ["mailboxIds"]. Its complete entry
+uses ID length plus 60 bytes, within the reserved ID length plus 96. Unsupported
 properties or false values refuse that object as invalidProperties; absent
 Email IDs report notFound. Nonempty create/destroy are not implemented.
 ifInState is checked against the account epoch and sequence under coordination.

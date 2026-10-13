@@ -150,8 +150,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 };
                 let rights = Rights {
                     may_read_items: true,
-                    may_add_items: false,
-                    may_remove_items: false,
+                    may_add_items: self.flags.is_some(),
+                    may_remove_items: self.flags.is_some(),
                     may_set_seen: self.flags.is_some(),
                     may_set_keywords: self.flags.is_some(),
                     may_create_child: false,

@@ -5,7 +5,7 @@ use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "email_set.rs"]
 mod email_set;
-pub use email_set::FlagMutator;
+pub use email_set::EmailMutator;
 
 #[path = "email_query.rs"]
 mod email_query;
@@ -112,14 +112,14 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     run_inner(plan, retention, execution, account, None)
 }
 
-/// Authenticated flag profile; device is supplied by the HTTPS owner.
-pub fn run_with_flags<'state, 'c, 's, 'r, 'sr, 'a, P>(
+/// Authenticated Email update profile; device is supplied by the HTTPS owner.
+pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     account: AccountId,
     device: crate::ids::DeviceId,
-    flags: &dyn FlagMutator,
+    flags: &dyn EmailMutator,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     run_inner(plan, retention, execution, account, Some((flags, device)))
 }
@@ -128,7 +128,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     account: AccountId,
-    flags: Option<(&dyn FlagMutator, crate::ids::DeviceId)>,
+    flags: Option<(&dyn EmailMutator, crate::ids::DeviceId)>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
@@ -238,7 +238,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     execution: ports::Deadline,
     optional_end: u64,
     account: AccountId,
-    flags: Option<(&'io dyn FlagMutator, crate::ids::DeviceId)>,
+    flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {

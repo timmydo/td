@@ -28,7 +28,8 @@ pub struct Concurrency {
 
 /// Immutable metadata for one authenticated account and one admission plan.
 /// The caller must enforce both concurrency counts and complete the Core
-/// and td-mail read/flag contracts before exposing this document. It conveys no authentication.
+/// and td-mail read/flag/move contracts before exposing this document.
+/// It conveys no authentication.
 pub struct Session {
     concurrency: Concurrency,
     bytes: Vec<u8>,
@@ -40,7 +41,7 @@ impl std::fmt::Debug for Session {
     }
 }
 impl Session {
-    pub fn mail_flags(
+    pub fn mail_access(
         origin: Origin<'_>,
         account: AccountView<'_>,
         resources: &ResourcePlan,
@@ -210,7 +211,7 @@ mod tests {
         uploads: usize,
         requests: usize,
     ) -> Session {
-        Session::mail_flags(
+        Session::mail_access(
             Origin::parse(origin).unwrap(),
             account,
             &limits.plan().unwrap(),
@@ -383,7 +384,7 @@ mod tests {
         let over = plan.limits().https_connections + 1;
         for (uploads, requests) in [(0, 1), (1, 0), (over, 1), (1, over)] {
             assert_eq!(
-                Session::mail_flags(
+                Session::mail_access(
                     Origin::parse("https://mail.test").unwrap(),
                     account,
                     &plan,
@@ -399,7 +400,7 @@ mod tests {
             "\u{10ffff}".into(),
         ] {
             assert_eq!(
-                Session::mail_flags(
+                Session::mail_access(
                     Origin::parse("https://mail.test").unwrap(),
                     AccountView {
                         name: &name,
@@ -466,7 +467,7 @@ mod tests {
         assert!(session.bytes().len() < MAX_BYTES);
         for username in ["x".repeat(255), "\u{fdd0}".into()] {
             assert_eq!(
-                Session::mail_flags(
+                Session::mail_access(
                     Origin::parse(&origin).unwrap(),
                     AccountView {
                         username: &username,
@@ -497,7 +498,7 @@ mod flag_profile_tests {
         }
         .plan()
         .unwrap();
-        let session = Session::mail_flags(
+        let session = Session::mail_access(
             Origin::parse("https://mail.example").unwrap(),
             AccountView {
                 id: crate::ids::AccountId::from_bytes([1; 16]),

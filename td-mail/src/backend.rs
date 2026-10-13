@@ -662,7 +662,11 @@ fn queue_mutation(cache: Option<&Cache>, op: &QueuedMutation) -> Result<u64, Str
         QueuedMutation::SetFlagged { id, .. } => Some(id),
         _ => None,
     };
-    if seen_ids.is_empty() && flagged_id.is_none() {
+    let moved_id = match op {
+        QueuedMutation::MoveEmail { id, .. } => Some(id),
+        _ => None,
+    };
+    if seen_ids.is_empty() && flagged_id.is_none() && moved_id.is_none() {
         return cache.enqueue_operation(&op.to_json().to_vec());
     }
     let mut replacements = Vec::new();
@@ -679,18 +683,36 @@ fn queue_mutation(cache: Option<&Cache>, op: &QueuedMutation) -> Result<u64, Str
                 seen_ids.contains(&id.as_str())
             }
             QueuedMutation::SetFlagged { id, .. } => flagged_id == Some(id),
+            QueuedMutation::MoveEmail { id, .. } => moved_id == Some(id),
+            QueuedMutation::MoveThread { .. } | QueuedMutation::RunRulesForMailbox { .. }
+                if moved_id.is_some() =>
+            {
+                return Err("Reconnect to resolve an older queued move selection first".into());
+            }
             QueuedMutation::RuleActions { actions } => {
                 let completed = cache.queued_progress(seq)?;
                 if completed > actions.len() {
                     return Err("invalid queued action cursor".into());
                 }
                 actions.drain(..completed);
+                if moved_id.is_some()
+                    && actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            QueuedMutation::MoveThread { .. }
+                                | QueuedMutation::RunRulesForMailbox { .. }
+                        )
+                    })
+                {
+                    return Err("Reconnect to resolve an older queued move selection first".into());
+                }
                 let before = actions.len();
                 actions.retain(|action| match action {
                     QueuedMutation::MarkRead { id, .. } | QueuedMutation::MarkUnread { id, .. } => {
                         !seen_ids.contains(id.as_str())
                     }
                     QueuedMutation::SetFlagged { id, .. } => flagged_id != Some(id),
+                    QueuedMutation::MoveEmail { id, .. } => moved_id != Some(id),
                     _ => true,
                 });
                 changed = completed != 0 || actions.len() != before;
@@ -815,10 +837,8 @@ fn process_mutation_via_queue(
             let _ = cache.remove_queued_operation(seq);
         }
         Err(e) => {
-            let resolved = matches!(
-                op,
-                QueuedMutation::MoveEmail { .. } | QueuedMutation::DestroyEmail { .. }
-            ) && is_missing_remote_error(&e);
+            let resolved =
+                matches!(op, QueuedMutation::DestroyEmail { .. }) && is_missing_remote_error(&e);
             if resolved {
                 log_info!(
                     "[Backend] queue op seq={} resolved by conflict policy: {}",
@@ -1486,10 +1506,8 @@ fn execute_queued_mutation(
                 cache,
             );
             if let Err(error) = result {
-                if !matches!(
-                    action,
-                    QueuedMutation::MoveEmail { .. } | QueuedMutation::DestroyEmail { .. }
-                ) || !is_missing_remote_error(&error)
+                if !matches!(action, QueuedMutation::DestroyEmail { .. })
+                    || !is_missing_remote_error(&error)
                 {
                     return Err(error);
                 }
@@ -1643,10 +1661,7 @@ fn replay_queued_mutations(
             Err(e) => {
                 let resolved = matches!(
                     op,
-                    QueuedMutation::MoveEmail { .. }
-                        | QueuedMutation::MoveThread { .. }
-                        | QueuedMutation::DestroyEmail { .. }
-                        | QueuedMutation::DestroyThread { .. }
+                    QueuedMutation::DestroyEmail { .. } | QueuedMutation::DestroyThread { .. }
                 ) && is_missing_remote_error(&e);
                 if resolved {
                     log_info!(
@@ -3723,6 +3738,58 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn newer_moves_supersede_pending_rule_destinations_and_refuse_legacy_selections() {
+        let _env = crate::testing::env_lock();
+        let dir = crate::testing::tempdir().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("move-queue").unwrap();
+        let movement = |id: &str, target: &str| QueuedMutation::MoveEmail {
+            op_id: 1,
+            id: id.into(),
+            to_mailbox_id: target.into(),
+        };
+        let plan = QueuedMutation::RuleActions {
+            actions: vec![
+                movement("done", "archive"),
+                movement("a", "archive"),
+                QueuedMutation::MarkRead {
+                    op_id: 2,
+                    id: "a".into(),
+                },
+            ],
+        };
+        let seq = queue_mutation(Some(&cache), &plan).unwrap();
+        cache.advance_queued_operation(seq, 1).unwrap();
+        let old = queue_mutation(Some(&cache), &movement("a", "trash")).unwrap();
+        let latest = queue_mutation(Some(&cache), &movement("a", "inbox")).unwrap();
+        assert!(cache.queued_operation(old).is_none());
+        assert!(cache.queued_operation(latest).is_some());
+        assert_eq!(cache.queued_progress(seq).unwrap(), 0);
+        let value = td_json::parse_slice(&cache.queued_operation(seq).unwrap()).unwrap();
+        let QueuedMutation::RuleActions { actions } = QueuedMutation::from_json(&value).unwrap()
+        else {
+            panic!("plan")
+        };
+        assert!(matches!(actions.as_slice(), [QueuedMutation::MarkRead { id, .. }] if id == "a"));
+        for legacy in [
+            QueuedMutation::MoveThread {
+                op_id: 3,
+                thread_id: "thread".into(),
+                to_mailbox_id: "archive".into(),
+            },
+            QueuedMutation::RunRulesForMailbox {
+                mailbox_id: "inbox".into(),
+            },
+        ] {
+            let seq = queue_mutation(Some(&cache), &legacy).unwrap();
+            let before = cache.queued_operations();
+            assert!(queue_mutation(Some(&cache), &movement("a", "trash")).is_err());
+            assert_eq!(cache.queued_operations(), before);
+            assert!(cache.remove_queued_operation(seq));
+        }
+    }
 
     #[test]
     fn queued_flags_supersede_only_the_same_flag_and_preserve_legacy_entries() {

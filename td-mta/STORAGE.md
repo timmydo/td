@@ -2820,7 +2820,7 @@ observations. Settlement preserves a known durable success even when admission
 must stop; only recoverable file-accounting refusal permits checkpoint recovery.
 No-op batches retain their original sequence and perform no storage commit.
 The HTTPS owner activates this entry only for authenticated device
-read/star patches and reserves its complete response before entry. Native tests cover history, unchanged raw bytes,
+read/star patches and single-mailbox moves, reserving its response before entry. Native tests cover history, unchanged raw bytes,
 no-op/clear, paged membership replacement, invalid destinations without flag
 effects, work refusal without partial writes, and moves/flags after reopen.
-The HTTPS adapter still accepts flags only; move activation follows separately.
+The HTTPS adapter returns invalidProperties with mailboxIds for invalid destinations.

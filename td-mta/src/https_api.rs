@@ -320,7 +320,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization> Service<'_, '_, '_, '_, '_, P
             self.policy
                 .authorize_blob(self.transfers.account(), device, sender.deadline)?,
         );
-        let mut complete = dispatch::run_with_flags(
+        let mut complete = dispatch::run_with_email_updates(
             plan.finish().map_err(|_| Error::Capacity)?,
             retention,
             execution,

@@ -74,6 +74,7 @@ struct MockState {
     refuse_stored: bool,
     read_calls: Vec<Value>,
     flag_refusal: Option<String>,
+    move_refusal: Option<String>,
     wrong_flag_account: bool,
     update_calls: Vec<Value>,
     emails: HashMap<String, EmailRecord>,
@@ -187,6 +188,7 @@ impl MockState {
             refuse_stored: false,
             read_calls: Vec::new(),
             flag_refusal: None,
+            move_refusal: None,
             wrong_flag_account: false,
             update_calls: Vec::new(),
             emails,
@@ -617,6 +619,15 @@ impl MockState {
                     not_updated.insert(id.clone(), json!({"type": "forbidden"}));
                     continue;
                 }
+                if patch.get("mailboxIds").is_some()
+                    && self.move_refusal.as_deref() == Some("invalidProperties")
+                {
+                    not_updated.insert(
+                        id.clone(),
+                        json!({"type": "invalidProperties", "properties": ["mailboxIds"]}),
+                    );
+                    continue;
+                }
                 let Some(email) = self.emails.get_mut(id) else {
                     not_updated.insert(id.clone(), json!({"type": "notFound"}));
                     continue;
@@ -783,6 +794,11 @@ impl MockJmapServer {
     #[allow(dead_code)]
     pub fn refuse_flag(&self, id: Option<&str>) {
         self.state.lock().unwrap().flag_refusal = id.map(str::to_owned);
+    }
+
+    #[allow(dead_code)]
+    pub fn refuse_move(&self, error: Option<&str>) {
+        self.state.lock().unwrap().move_refusal = error.map(str::to_owned);
     }
 
     #[allow(dead_code)]
@@ -1174,11 +1190,20 @@ impl MockJmapServer {
                     }
                 }
                 "Email/set" => {
-                    let payload = {
-                        let mut guard = state.lock().expect("state lock");
-                        guard.apply_email_set(args)
-                    };
-                    json!(["Email/set", payload, call_id])
+                    let mut guard = state.lock().expect("state lock");
+                    if let Some(error) = guard.move_refusal.as_deref().filter(|error| {
+                        *error != "invalidProperties"
+                            && args["update"].as_object().is_some_and(|updates| {
+                                updates
+                                    .iter()
+                                    .any(|(_, patch)| patch.get("mailboxIds").is_some())
+                            })
+                    }) {
+                        json!(["error", {"type": error}, call_id])
+                    } else {
+                        let payload = guard.apply_email_set(args);
+                        json!(["Email/set", payload, call_id])
+                    }
                 }
                 "Identity/get" => json!([
                     "Identity/get",

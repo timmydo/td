@@ -929,7 +929,7 @@ impl JmapClient {
         Err(JmapError::Api("Unexpected response".to_string()))
     }
 
-    fn validate_flag_response<'a>(
+    fn validate_update_response<'a>(
         &self,
         response: &'a JmapResponse,
     ) -> Result<&'a Json, JmapError> {
@@ -960,16 +960,16 @@ impl JmapClient {
         Ok(&reply.1)
     }
 
-    fn confirm_flag_updates<'a>(
+    fn confirm_updates<'a>(
         &self,
         response: &JmapResponse,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), JmapError> {
-        let reply = self.validate_flag_response(response)?;
-        Self::confirm_flag_objects(reply, ids)
+        let reply = self.validate_update_response(response)?;
+        Self::confirm_update_objects(reply, ids)
     }
 
-    fn confirm_flag_objects<'a>(
+    fn confirm_update_objects<'a>(
         reply: &Json,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), JmapError> {
@@ -1024,10 +1024,10 @@ impl JmapClient {
 
             let response = self.call(request)?;
 
-            let reply = self.validate_flag_response(&response)?;
+            let reply = self.validate_update_response(&response)?;
             let mut completed = Vec::new();
             for id in chunk {
-                match Self::confirm_flag_objects(reply, [id.as_str()]) {
+                match Self::confirm_update_objects(reply, [id.as_str()]) {
                     Ok(()) => completed.push(id.clone()),
                     Err(error) => {
                         refused.get_or_insert(error);
@@ -1061,7 +1061,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        self.confirm_flag_updates(&response, [id])
+        self.confirm_updates(&response, [id])
     }
 
     pub fn mark_email_unread(&self, id: &str) -> Result<(), JmapError> {
@@ -1085,7 +1085,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        self.confirm_flag_updates(&response, [id])
+        self.confirm_updates(&response, [id])
     }
 
     pub fn set_email_flagged(&self, id: &str, flagged: bool) -> Result<(), JmapError> {
@@ -1113,7 +1113,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        self.confirm_flag_updates(&response, [id])
+        self.confirm_updates(&response, [id])
     }
 
     pub fn move_email(&self, id: &str, to_mailbox_id: &str) -> Result<(), JmapError> {
@@ -1141,23 +1141,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/set" {
-                if let Some(not_updated) = method_response.1.get("notUpdated") {
-                    if not_updated.get(id).is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to move email: {:?}",
-                            not_updated
-                        )));
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        Err(JmapError::Api(
-            "Unexpected response for Email/set".to_string(),
-        ))
+        self.confirm_updates(&response, [id])
     }
 
     pub fn destroy_emails(&self, ids: &[String]) -> Result<(), JmapError> {
@@ -1891,13 +1875,13 @@ mod tests {
         let success =
             json!({"accountId":"account", "updated":{"a":null,"b":{}}, "notUpdated":null});
         assert!(client
-            .confirm_flag_updates(&response("Email/set", "0", success.clone()), ["a", "b"])
+            .confirm_updates(&response("Email/set", "0", success.clone()), ["a", "b"])
             .is_ok());
         assert!(client
-            .confirm_flag_updates(&response("Email/set", "other", success.clone()), ["a"])
+            .confirm_updates(&response("Email/set", "other", success.clone()), ["a"])
             .is_err());
         assert!(client
-            .confirm_flag_updates(&response("error", "0", success), ["a"])
+            .confirm_updates(&response("error", "0", success), ["a"])
             .is_err());
         for body in [
             json!({"accountId":"account", "updated":{"a":null}}),
@@ -1910,13 +1894,13 @@ mod tests {
         ] {
             assert!(
                 client
-                    .confirm_flag_updates(&response("Email/set", "0", body.clone()), ["a", "b"])
+                    .confirm_updates(&response("Email/set", "0", body.clone()), ["a", "b"])
                     .is_err(),
                 "{body}"
             );
         }
         assert!(client
-            .confirm_flag_updates(
+            .confirm_updates(
                 &response(
                     "Email/set",
                     "0",

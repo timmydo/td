@@ -1606,3 +1606,107 @@ mark_read = true
     assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
     assert!(h.server().email_state("email-002").unwrap().1);
 }
+
+#[test]
+fn refused_moves_remain_queued_across_replay_and_restart() {
+    for error in ["accountNotFound", "unknownMethod", "invalidProperties"] {
+        let mut h = CliHarness::start();
+        h.server().refuse_move(Some(error));
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(
+            json!({"command":"move_email", "id":"email-002", "to_mailbox_id":"mbox-archive"})
+        )["ok"]
+            .is_true());
+        assert_eq!(h.server().email_state("email-002").unwrap().0, "mbox-inbox");
+        h.restart();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+        assert_eq!(h.server().email_state("email-002").unwrap().0, "mbox-inbox");
+        h.server().refuse_move(None);
+        h.restart();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+        assert_eq!(
+            h.server().email_state("email-002").unwrap().0,
+            "mbox-archive",
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn newer_successful_move_supersedes_an_older_refused_destination() {
+    let mut h = CliHarness::start();
+    h.server().refuse_move(Some("invalidProperties"));
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h
+        .send(json!({"command":"move_email", "id":"email-002", "to_mailbox_id":"mbox-archive"}))
+        ["ok"]
+        .is_true());
+    h.server().refuse_move(None);
+    assert!(h
+        .send(json!({"command":"move_email", "id":"email-002", "to_mailbox_id":"mbox-inbox"}))
+        ["ok"]
+        .is_true());
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert_eq!(h.server().email_state("email-002").unwrap().0, "mbox-inbox");
+}
+
+#[test]
+fn refused_rule_move_holds_its_cursor_and_later_queued_work() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    {
+        let store =
+            td_kv::Store::open(&h._config_dir.path().join("cache/td-mail/test.tdkv")).unwrap();
+        let mut txn = store.write();
+        txn.insert("op_queue", &td_kv::Key::from_u64(1), br#"{"kind":"rule_actions","actions":[{"kind":"move_email","op_id":1,"id":"email-002","to_mailbox_id":"mbox-archive"}]}"#);
+        txn.insert(
+            "op_queue",
+            &td_kv::Key::from_u64(2),
+            br#"{"kind":"mark_read","op_id":2,"id":"email-003"}"#,
+        );
+        txn.commit().unwrap();
+    }
+    h.server().refuse_move(Some("accountNotFound"));
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert_eq!(h.server().email_state("email-002").unwrap().0, "mbox-inbox");
+    assert!(!h.server().email_state("email-003").unwrap().1);
+    h.server().refuse_move(None);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert_eq!(
+        h.server().email_state("email-002").unwrap().0,
+        "mbox-archive"
+    );
+    assert!(h.server().email_state("email-003").unwrap().1);
+}
+
+#[test]
+fn explicitly_missing_message_retires_a_queued_move() {
+    let mut h = CliHarness::start();
+    h.server().refuse_move(Some("invalidProperties"));
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(
+        json!({"command":"move_email", "id":"missing-email", "to_mailbox_id":"mbox-archive"})
+    )["ok"]
+        .is_true());
+    h.server().refuse_move(None);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    let attempts = h.server().update_calls().len();
+    assert_eq!(attempts, 2);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert_eq!(h.server().update_calls().len(), attempts);
+}

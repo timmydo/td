@@ -1,4 +1,4 @@
-//! The td-mail flag subset of Email/set, with response capacity before effects.
+//! The td-mail flag and move subset of Email/set, with response capacity before effects.
 use super::{
     mailbox_get::storage,
     push::{Children, Name},
@@ -7,7 +7,7 @@ use super::{
 use crate::{
     admission::work::Meter,
     bounded::TextBuffer,
-    ids::EmailId,
+    ids::{EmailId, MailboxId},
     ports,
     store_fs::{
         EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest,
@@ -19,14 +19,14 @@ use std::ops::Range;
 use td_json::scan;
 
 /// Trusted device mutation adapter; results retain known commit outcomes.
-pub trait FlagMutator {
+pub trait EmailMutator {
     fn update(
         &self,
         request: EmailUpdateRequest<'_>,
         meter: &mut Meter,
     ) -> Result<EmailUpdateCompletion, UploadError>;
 }
-impl<P: EmailUpdateAuthorization> FlagMutator for StoreCoordinator<'_, '_, P> {
+impl<P: EmailUpdateAuthorization> EmailMutator for StoreCoordinator<'_, '_, P> {
     fn update(
         &self,
         request: EmailUpdateRequest<'_>,
@@ -40,6 +40,7 @@ struct Update {
     value: EmailUpdate,
     local: bool,
     valid: bool,
+    invalid_mailbox: bool,
 }
 fn failure(error: UploadError, conditional: bool) -> Error {
     match error {
@@ -121,9 +122,35 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     flagged: None,
                 };
                 let mut valid = item.kind == scan::Kind::Object;
+                let mut invalid_mailbox = false;
                 if valid {
                     let mut patch = Children::new(item.range, scan::Kind::Object)?;
                     while let Some(property) = patch.next(self)? {
+                        if property.key.bytes() == b"mailboxIds" {
+                            if property.kind != scan::Kind::Object {
+                                invalid_mailbox = true;
+                                valid = false;
+                                continue;
+                            }
+                            let mut destinations =
+                                Children::new(property.range, scan::Kind::Object)?;
+                            let mut count = 0;
+                            while let Some(destination) = destinations.next(self)? {
+                                count += 1;
+                                let mailbox: Option<MailboxId> =
+                                    destination.key.wire_id().ok().and_then(|id| id.local());
+                                if destination.kind != scan::Kind::Boolean
+                                    || !self.query_boolean(&destination)?
+                                    || mailbox.is_none()
+                                {
+                                    invalid_mailbox = true;
+                                }
+                                value.mailbox = mailbox;
+                            }
+                            invalid_mailbox |= count != 1;
+                            valid &= !invalid_mailbox;
+                            continue;
+                        }
                         let desired = match property.kind {
                             scan::Kind::Boolean if self.query_boolean(&property)? => Some(true),
                             scan::Kind::Null => Some(false),
@@ -144,6 +171,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     value,
                     local: id.is_some(),
                     valid,
+                    invalid_mailbox,
                 });
             }
         }
@@ -262,7 +290,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 out.format(format_args!("\"{id}\":"))
                     .map_err(|_| Error::State)?;
                 if let Some(error) = error {
-                    out.format(format_args!("{{\"type\":\"{error}\"}}"))
+                    let properties = if error == "invalidProperties"
+                        && (update.invalid_mailbox || result == EmailUpdateResult::InvalidMailbox)
+                    {
+                        ",\"properties\":[\"mailboxIds\"]"
+                    } else {
+                        ""
+                    };
+                    out.format(format_args!("{{\"type\":\"{error}\"{properties}}}"))
                         .map_err(|_| Error::State)?;
                 } else {
                     out.append("null").map_err(|_| Error::State)?;

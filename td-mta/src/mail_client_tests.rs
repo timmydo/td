@@ -123,6 +123,8 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
     let mut devices_root = devices_dir.locked();
     let account = AccountId::from_bytes([0xaa; 16]);
     let inbox = MailboxId::from_bytes([1; 16]);
+    let archive = MailboxId::from_bytes([2; 16]);
+    let trash = MailboxId::from_bytes([3; 16]);
     let mut registry = DeviceStore::open_or_create(&mut devices_root, account).unwrap();
     let (device, password) = registry
         .create(
@@ -175,6 +177,20 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
         sort_order: 0,
         subscribed: true,
     }));
+    let archive_row = row(Row::Mailbox(MailboxRow {
+        name: "archive",
+        parent: None,
+        role: Some("archive"),
+        sort_order: 1,
+        subscribed: true,
+    }));
+    let trash_row = row(Row::Mailbox(MailboxRow {
+        name: "trash",
+        parent: None,
+        role: Some("trash"),
+        sort_order: 2,
+        subscribed: true,
+    }));
     store
         .commit(
             &Provider,
@@ -185,7 +201,11 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 utc_ms: 0,
                 deadline: until,
             },
-            &[Operation::put(Table::Mailboxes, inbox.as_bytes(), &mailbox).unwrap()],
+            &[
+                Operation::put(Table::Mailboxes, inbox.as_bytes(), &mailbox).unwrap(),
+                Operation::put(Table::Mailboxes, archive.as_bytes(), &archive_row).unwrap(),
+                Operation::put(Table::Mailboxes, trash.as_bytes(), &trash_row).unwrap(),
+            ],
             &mut [],
         )
         .unwrap();
@@ -271,7 +291,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
         clock: clock.as_ref(),
         timeouts: &timeouts,
     };
-    let session = crate::jmap_session::Session::mail_flags(
+    let session = crate::jmap_session::Session::mail_access(
         Origin::parse(&origin).unwrap(),
         crate::config::identities::AccountView {
             id: account,
@@ -363,7 +383,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
             let mailboxes = client.ask(json!({"command":"list_mailboxes"}));
             assert!(mailboxes["ok"].is_true(), "{mailboxes}");
             let listed = mailboxes["mailboxes"].as_array().unwrap();
-            assert_eq!(listed.len(), 1);
+            assert_eq!(listed.len(), 3);
             assert_eq!(listed[0]["id"].as_str(), Some(wire_id(inbox).as_str()));
             let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox), "limit":50}));
             assert!(listing["ok"].is_true(), "{listing}");
@@ -417,6 +437,20 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                     assert_eq!(view.get(key, &mut scratch).unwrap().is_some(), present);
                 }
             }
+            for (command, destination) in [("archive", archive), ("delete_email", trash), ("move_email", inbox)] {
+                let input = if command == "move_email" {
+                    json!({"command":command, "id":target, "to_mailbox_id":wire_id(destination)})
+                } else { json!({"command":command, "id":target}) };
+                let moved = client.ask(input);
+                assert!(moved["ok"].is_true(), "{moved}");
+                let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(destination)}));
+                assert!(listing["ok"].is_true(), "{listing}");
+                assert!(listing["emails"].as_array().unwrap().iter().any(|item| item["id"].as_str() == Some(target.as_str())));
+                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
+                let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
+                let mut view = retained.method_view(account, phase).unwrap();
+                assert_eq!(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16).unwrap().values, [destination]);
+            }
             devices.lock().unwrap().revoke(device, 2).unwrap();
             let revoked = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox)}));
             assert!(!revoked["ok"].is_true(), "{revoked}");
@@ -424,12 +458,15 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
             // The CLI acknowledges durable local intent, including remote refusal.
             let queued = client.ask(json!({"command":"mark_read", "id":target}));
             assert!(queued["ok"].is_true(), "{queued}");
+            let queued = client.ask(json!({"command":"archive", "id":target}));
+            assert!(queued["ok"].is_true(), "{queued}");
             {
                 let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
                 let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
                 let mut view = retained.method_view(account, phase).unwrap();
                 let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
                 assert!(view.get(key, &mut [0; 128]).unwrap().is_none());
+                assert_eq!(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16).unwrap().values, [inbox]);
             }
             drop(client);
             let (_, replacement) = devices.lock().unwrap().create(
@@ -451,6 +488,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 let mut view = retained.method_view(account, phase).unwrap();
                 let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
                 assert!(view.get(key, &mut [0; 128]).unwrap().is_some());
+                assert_eq!(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16).unwrap().values, [archive]);
             }
             drop(client);
             drop(stop);

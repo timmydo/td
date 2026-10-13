@@ -119,7 +119,26 @@ pub(crate) fn run_configured_response(
     cutoff: Option<u64>,
     setup: impl FnOnce(&IndexStore<'_>),
 ) -> td_json::Json {
-    let (limits, response_bytes) = profile;
+    run_profile(
+        input,
+        count,
+        (profile.0, profile.1, false),
+        phase,
+        busy,
+        cutoff,
+        setup,
+    )
+}
+fn run_profile(
+    input: &str,
+    count: u16,
+    profile: (Limits, u64, bool),
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+    setup: impl FnOnce(&IndexStore<'_>),
+) -> td_json::Json {
+    let (limits, response_bytes, writable) = profile;
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let files = Fixture::new();
@@ -237,12 +256,30 @@ pub(crate) fn run_configured_response(
             .1
             .store(clock.0.load(Ordering::Relaxed) + cutoff, Ordering::Relaxed);
     }
-    let mut completed = dispatch::run(
-        preflight.finish().unwrap(),
-        retention,
-        Deadline::after(Tick(0), phase).unwrap(),
-        ACCOUNT,
-    )
+    struct Mutator;
+    impl dispatch::EmailMutator for Mutator {
+        fn update(
+            &self,
+            _: crate::store_fs::EmailUpdateRequest<'_>,
+            _: &mut crate::admission::work::Meter,
+        ) -> Result<crate::store_fs::EmailUpdateCompletion, crate::store_fs::UploadError> {
+            panic!("Mailbox/get must not mutate")
+        }
+    }
+    let planned = preflight.finish().unwrap();
+    let phase = Deadline::after(Tick(0), phase).unwrap();
+    let mut completed = if writable {
+        dispatch::run_with_email_updates(
+            planned,
+            retention,
+            phase,
+            ACCOUNT,
+            crate::ids::DeviceId::from_bytes([9; 16]),
+            &Mutator,
+        )
+    } else {
+        dispatch::run(planned, retention, phase, ACCOUNT)
+    }
     .unwrap();
     let mut encoder = completed.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
@@ -781,4 +818,38 @@ fn default_counts_with_only_foreign_ids_has_no_local_count_batch() {
             .len(),
         2
     );
+}
+
+#[test]
+fn device_profile_advertises_only_implemented_mailbox_rights() {
+    for writable in [false, true] {
+        let response = run_profile(
+            &call(&format!(r#"{{"accountId":"{}"}}"#, account())),
+            2,
+            (Limits::default(), 72000, writable),
+            90,
+            false,
+            None,
+            |_| {},
+        );
+        let list = response["methodResponses"][0][1]["list"]
+            .as_array()
+            .unwrap();
+        assert_eq!(list.len(), 2);
+        for item in list {
+            for (right, expected) in [
+                ("mayReadItems", true),
+                ("maySetSeen", writable),
+                ("maySetKeywords", writable),
+                ("mayAddItems", writable),
+                ("mayRemoveItems", writable),
+                ("mayCreateChild", false),
+                ("mayRename", false),
+                ("mayDelete", false),
+                ("maySubmit", false),
+            ] {
+                assert_eq!(item["myRights"][right].as_bool(), Some(expected));
+            }
+        }
+    }
 }

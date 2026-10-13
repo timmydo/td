@@ -18,9 +18,14 @@ The mailbox-access profile advertises Core and the td-mail Mail profile.
 Authenticated
 Session discovery, bounded Core and Mail read batches, upload/download, the
 single-account Blob/copy outcome and PushSubscription policy are active.
-Email/set read/unread and star patches are active; moves, deletion and
-structured creation remain absent. The native td-mail fixture sets and clears
+Email/set read/unread, star patches and single-destination mailbox replacement
+are active; permanent deletion and structured creation remain absent. The native td-mail fixture sets and clears
 both flags over HTTPS and checks persisted keyword rows after each result.
+It archives, trashes and restores messages using pre-provisioned fixture
+folders, and checks native membership after each operation. Revoked credentials
+leave queued moves unapplied; restarting td-mail with replacement credentials
+replays its durable flag and archive intentions. Folder creation remains a
+separate endpoint increment; these tests do not claim that flow.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Submission remains unadvertised. Activation follows
 the supported td-mail workflow tests, not every reference-table row.

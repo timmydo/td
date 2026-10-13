@@ -838,8 +838,14 @@ requirement.
 ## 8. Personal-account Mailbox rights
 
 The configured personal account owns every stored Mailbox. The active
-td-mail profile reports mayReadItems, maySetSeen and maySetKeywords true.
-Only `$seen` and `$flagged` patches are implemented. For this td-mail-only
+td-mail profile reports mayReadItems, maySetSeen, maySetKeywords, mayAddItems
+and mayRemoveItems true. `$seen` and `$flagged` patches and replacement with
+one existing account mailbox are implemented. Archive and trash are ordinary
+moves to the client's configured folders. Session maxMailboxesPerEmail
+remains null because storage can hold multiple memberships; the accepted
+single-destination update is the narrower td-mail call profile. Empty/multiple destinations and
+mailboxIds path patches are outside this td-mail call profile and return
+invalidProperties. No move rewrites bodies or changes thread identity. For this td-mail-only
 profile, maySetKeywords advertises starring; it does not promise arbitrary
 keyword editing as the general RFC right would. All other mutation and
 submission rights remain false. The Session reports isReadOnly false.
