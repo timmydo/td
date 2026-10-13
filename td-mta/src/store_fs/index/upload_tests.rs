@@ -12,9 +12,20 @@ use std::sync::{
 const ACCOUNT: AccountId = AccountId::from_bytes([1; 16]);
 const DEVICE: DeviceId = DeviceId::from_bytes([2; 16]);
 const SEED: BlobId = BlobId::from_bytes([3; 16]);
-struct Timer(AtomicU64, Mutex<std::collections::VecDeque<u64>>, AtomicI64);
+struct Timer(
+    AtomicU64,
+    Mutex<std::collections::VecDeque<u64>>,
+    AtomicI64,
+    Mutex<Option<Arc<Mutex<PolicyState>>>>,
+);
 impl Clock for Timer {
     fn sample(&self) -> Result<Time, ports::Error> {
+        if let Some(policy) = self.3.lock().unwrap().as_ref() {
+            assert!(
+                matches!(policy.try_lock(), Err(TryLockError::WouldBlock)),
+                "authorization released before commit completed"
+            );
+        }
         if let Some(next) = self.1.lock().unwrap().pop_front() {
             self.0.store(next, Ordering::Relaxed);
         }
@@ -193,6 +204,7 @@ fn fixture_plan(
         AtomicU64::new(1),
         Mutex::new(std::collections::VecDeque::new()),
         AtomicI64::new(1234),
+        Mutex::new(None),
     ));
     let resources = Limits {
         message_bytes: 8,
@@ -3061,6 +3073,7 @@ fn committed_move_and_flags_reopen_with_the_same_history_endpoint() {
         AtomicU64::new(1),
         Mutex::new(Default::default()),
         AtomicI64::new(0),
+        Mutex::new(None),
     ));
     let resources = Limits::default().plan().unwrap();
     let plan = DiskLimits::default()
@@ -3582,6 +3595,459 @@ fn mixed_moves_commit_only_valid_objects_and_track_retained_unread_counts() {
                 ChangeStep::Complete | ChangeStep::Advanced { .. }
             ));
             drop(view);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+impl MailboxAuthorization for Policy {
+    type Guard<'a> = Guard<'a>;
+    fn authorize_mailboxes(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Guard<'_>, ports::Error> {
+        self.authorize(account, device, deadline)
+    }
+}
+fn mailbox_meter() -> crate::admission::work::Meter {
+    crate::admission::work::Meter::new(
+        deadline(),
+        crate::admission::work::Charge {
+            records: 1_000_000,
+            io_bytes: 1_000_000,
+            ..Default::default()
+        },
+    )
+}
+#[test]
+fn root_folder_creation_has_partial_results_unique_names_and_history() {
+    fixture_config(
+        4,
+        100000,
+        seed_flag_email,
+        |coordinator, _, clock, policy, _| {
+            let names = [
+                "archive",
+                "trash",
+                "archive",
+                "Inbox",
+                "",
+                "bad\nname",
+                "Cafe\u{301}",
+                "Café",
+                "\u{ffff}",
+            ];
+            let request = MailboxCreateRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                names: &names,
+                deadline: deadline(),
+            };
+            struct Armed<'a> {
+                random: Random,
+                clock: &'a Timer,
+                policy: &'a Arc<Mutex<PolicyState>>,
+            }
+            impl Entropy for Armed<'_> {
+                fn fill(&mut self, bytes: &mut [u8]) -> Result<(), td_crypto::Error> {
+                    *self.clock.3.lock().unwrap() = Some(self.policy.clone());
+                    self.random.fill(bytes)
+                }
+            }
+            let complete = coordinator
+                .create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Armed {
+                        random: Random(90),
+                        clock,
+                        policy,
+                    },
+                    request,
+                    &mut mailbox_meter(),
+                )
+                .unwrap();
+            *clock.3.lock().unwrap() = None;
+            assert!(!complete.admission_stopped);
+            let files = coordinator
+                .store
+                .usage_fence(deadline())
+                .unwrap()
+                .file_usage();
+            for (kind, bytes) in [
+                (Kind::DatabaseBytes, files.database_bytes),
+                (Kind::WalBytes, files.wal_bytes),
+            ] {
+                assert_eq!(coordinator.used(kind).unwrap(), bytes);
+                assert_eq!(
+                    coordinator
+                        .state
+                        .lock()
+                        .unwrap()
+                        .ledger
+                        .pending(kind)
+                        .unwrap(),
+                    0
+                );
+            }
+            let sequence = complete.outcome.unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            for (index, name) in names.iter().enumerate() {
+                if [0, 1, 7].contains(&index) {
+                    let MailboxCreateResult::Created(id) = complete.results[index] else {
+                        panic!("creation");
+                    };
+                    let mut scratch = [0; 128];
+                    let (Row::Mailbox(row), changed) =
+                        view.get(Key::Mailbox(id), &mut scratch).unwrap().unwrap()
+                    else {
+                        panic!("mailbox");
+                    };
+                    assert_eq!(row.name, *name);
+                    assert_eq!(row.parent, None);
+                    assert_eq!(row.role, None);
+                    assert!(row.subscribed);
+                    assert_eq!(changed, sequence);
+                } else if [2, 3].contains(&index) {
+                    assert_eq!(complete.results[index], MailboxCreateResult::AlreadyExists);
+                } else {
+                    assert_eq!(complete.results[index], MailboxCreateResult::InvalidName);
+                }
+            }
+            let mut cursor = ChangeCursor {
+                sequence: complete.before.committed_sequence,
+                operation: u32::MAX,
+            };
+            let mut count = 0;
+            while let ChangeStep::Record(record) =
+                view.next_change(cursor, ObjectType::Mailbox).unwrap()
+            {
+                assert_eq!(record.change.action, ChangeAction::Created);
+                assert_eq!(record.cursor.sequence, sequence);
+                count += 1;
+                cursor = record.cursor;
+            }
+            assert_eq!(count, 3);
+            drop(view);
+            struct NoEntropy;
+            impl Entropy for NoEntropy {
+                fn fill(&mut self, _: &mut [u8]) -> Result<(), td_crypto::Error> {
+                    Err(td_crypto::Error::Entropy)
+                }
+            }
+            let retry = coordinator
+                .create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut NoEntropy,
+                    request,
+                    &mut mailbox_meter(),
+                )
+                .unwrap();
+            assert_eq!(retry.outcome, Ok(sequence));
+            assert!(!retry
+                .results
+                .iter()
+                .any(|result| matches!(result, MailboxCreateResult::Created(_))));
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+#[test]
+fn folder_creation_checks_authorization_state_and_original_work_before_effects() {
+    fixture_config(
+        4,
+        100000,
+        seed_flag_email,
+        |coordinator, _, _, policy, _| {
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            let names = ["archive"];
+            let request = MailboxCreateRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                names: &names,
+                deadline: deadline(),
+            };
+            assert!(matches!(
+                coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    request,
+                    &mut flag_meter(0)
+                ),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            assert!(matches!(
+                coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    MailboxCreateRequest {
+                        expected: Some((before.epoch, Sequence::default())),
+                        ..request
+                    },
+                    &mut mailbox_meter()
+                ),
+                Err(UploadError::Store(ports::Error::Conflict))
+            ));
+            assert!(matches!(
+                coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    MailboxCreateRequest {
+                        deadline: Deadline::after(Tick(0), 101).unwrap(),
+                        ..request
+                    },
+                    &mut mailbox_meter()
+                ),
+                Err(UploadError::Store(ports::Error::Invalid))
+            ));
+            policy.lock().unwrap().allowed = false;
+            assert!(matches!(
+                coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    request,
+                    &mut mailbox_meter()
+                ),
+                Err(UploadError::Store(ports::Error::Forbidden))
+            ));
+            assert_eq!(
+                coordinator
+                    .store
+                    .view(ACCOUNT, deadline())
+                    .unwrap()
+                    .identity(),
+                before
+            );
+            None
+        },
+    );
+}
+
+#[test]
+fn folder_creation_bounds_names_collision_attempts_and_entropy_deadline() {
+    fixture_config(
+        4,
+        100000,
+        seed_flag_email,
+        |coordinator, _, clock, policy, _| {
+            struct Collision<'a> {
+                clock: &'a Timer,
+                policy: &'a Mutex<PolicyState>,
+                late: bool,
+                calls: usize,
+            }
+            impl Entropy for Collision<'_> {
+                fn fill(&mut self, output: &mut [u8]) -> Result<(), td_crypto::Error> {
+                    assert!(matches!(
+                        self.policy.try_lock(),
+                        Err(TryLockError::WouldBlock)
+                    ));
+                    output.copy_from_slice(FLAG_MAILBOX.as_bytes());
+                    self.calls += 1;
+                    if self.late {
+                        self.clock.0.store(100, Ordering::Relaxed);
+                    }
+                    Ok(())
+                }
+            }
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            for late in [false, true] {
+                let mut entropy = Collision {
+                    clock,
+                    policy,
+                    late,
+                    calls: 0,
+                };
+                let result = coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut entropy,
+                    MailboxCreateRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        names: &["archive"],
+                        deadline: deadline(),
+                    },
+                    &mut mailbox_meter(),
+                );
+                assert!(
+                    matches!(result, Err(UploadError::Store(error)) if error == if late { ports::Error::Deadline } else { ports::Error::Capacity })
+                );
+                assert_eq!(entropy.calls, if late { 1 } else { 4 });
+                clock.0.store(1, Ordering::Relaxed);
+                assert_eq!(
+                    coordinator
+                        .store
+                        .view(ACCOUNT, deadline())
+                        .unwrap()
+                        .identity(),
+                    before
+                );
+            }
+            let too_long = "x".repeat(format::row::MAX_MAILBOX_NAME + 1);
+            let names = [too_long.as_str()];
+            let request = MailboxCreateRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                names: &names,
+                deadline: deadline(),
+            };
+            let result = coordinator
+                .create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    request,
+                    &mut mailbox_meter(),
+                )
+                .unwrap();
+            assert_eq!(result.results, [MailboxCreateResult::InvalidName]);
+            assert_eq!(result.outcome, Ok(before.committed_sequence));
+            let names = vec!["archive"; MAX_MAILBOX_CREATES + 1];
+            assert!(matches!(
+                coordinator.create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Random(90),
+                    MailboxCreateRequest {
+                        names: &names,
+                        ..request
+                    },
+                    &mut mailbox_meter()
+                ),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn root_creation_ignores_child_names_and_retries_in_batch_id_collisions() {
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            seed_flag_email(store);
+            let encoded = row_bytes(Row::Mailbox(crate::format::row::MailboxRow {
+                name: "archive",
+                parent: Some(FLAG_MAILBOX),
+                role: None,
+                sort_order: 0,
+                subscribed: true,
+            }));
+            let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: ACCOUNT,
+                        epoch: before.epoch,
+                        expected: before.committed_sequence,
+                        utc_ms: 0,
+                        deadline: deadline(),
+                    },
+                    &[Operation::put(
+                        Table::Mailboxes,
+                        MailboxId::from_bytes([60; 16]).as_bytes(),
+                        &encoded,
+                    )
+                    .unwrap()],
+                    &mut [],
+                )
+                .unwrap();
+        },
+        |coordinator, _, _, _, _| {
+            struct Repeated(std::collections::VecDeque<u8>);
+            impl Entropy for Repeated {
+                fn fill(&mut self, bytes: &mut [u8]) -> Result<(), td_crypto::Error> {
+                    bytes.fill(self.0.pop_front().unwrap());
+                    Ok(())
+                }
+            }
+            let mut entropy = Repeated([91, 91, 92].into());
+            let complete = coordinator
+                .create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut entropy,
+                    MailboxCreateRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        names: &["archive", "trash"],
+                        deadline: deadline(),
+                    },
+                    &mut mailbox_meter(),
+                )
+                .unwrap();
+            assert!(complete.outcome.is_ok());
+            assert_eq!(
+                complete.results,
+                [
+                    MailboxCreateResult::Created(MailboxId::from_bytes([91; 16])),
+                    MailboxCreateResult::Created(MailboxId::from_bytes([92; 16]))
+                ]
+            );
+            assert!(entropy.0.is_empty());
+            None
+        },
+    );
+}
+
+#[test]
+fn root_folder_exact_batch_and_utf8_byte_limits_are_accepted() {
+    struct Counter(u128);
+    impl Entropy for Counter {
+        fn fill(&mut self, output: &mut [u8]) -> Result<(), td_crypto::Error> {
+            self.0 += 1;
+            output.copy_from_slice(&self.0.to_be_bytes());
+            Ok(())
+        }
+    }
+    fixture_config(
+        4,
+        100000,
+        |_| {},
+        |coordinator, _, _, _, _| {
+            let mut owned: Vec<_> = (0..MAX_MAILBOX_CREATES)
+                .map(|n| format!("folder{n}"))
+                .collect();
+            owned[0] = format!("{}é", "a".repeat(1022));
+            assert_eq!(owned[0].len(), format::row::MAX_MAILBOX_NAME);
+            let names: Vec<_> = owned.iter().map(String::as_str).collect();
+            let complete = coordinator
+                .create_mailboxes(
+                    &td_crypto::Provider,
+                    &mut Counter(1000),
+                    MailboxCreateRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        names: &names,
+                        deadline: deadline(),
+                    },
+                    &mut mailbox_meter(),
+                )
+                .unwrap();
+            assert!(complete.outcome.is_ok());
+            assert_eq!(complete.results.len(), MAX_MAILBOX_CREATES);
+            assert!(complete
+                .results
+                .iter()
+                .all(|result| matches!(result, MailboxCreateResult::Created(_))));
             assert_recount(coordinator);
             None
         },

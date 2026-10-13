@@ -296,45 +296,24 @@ impl<P: EmailUpdateAuthorization> StoreCoordinator<'_, '_, P> {
                 admission_stopped: false,
             });
         }
-        let time = check_time(&self.store, request.deadline, &mut last)?;
-        let (lease, mut ticket) = reserve_physical(
-            &mut state.ledger,
-            &mut state.stopped,
-            &mut state.recoverable_files,
-            request.deadline,
-            time.monotonic,
-        )?;
-        let completion = self.store.commit_with_files(
+        let outcome = self.commit_metadata(
             crypto,
-            CommitRequest {
-                account: request.account,
-                epoch: before.epoch,
-                expected: before.committed_sequence,
-                utc_ms: time.utc_ms,
-                deadline: request.deadline,
-            },
+            state,
+            before,
+            request.deadline,
+            &mut last,
             &operations,
-            &mut [],
-        );
+        )?;
         drop(guard);
-        let accounted = settle_physical(&mut state.ledger, &mut ticket, completion.files());
-        let canceled = state.ledger.cancel(lease).is_ok();
-        if !accounted || !canceled || completion.writer_stopped() {
-            state.stopped = true;
-            state.recoverable_files = false;
-        } else if matches!(completion.files(), CommitFileUsage::Unavailable(_)) {
-            state.stopped = true;
-            state.recoverable_files = true;
-        }
         Ok(EmailUpdateCompletion {
             before,
-            outcome: completion.outcome(),
+            outcome,
             results,
             admission_stopped: state.stopped,
         })
     }
 }
-fn charge(
+pub(super) fn charge(
     store: &IndexStore<'_>,
     deadline: Deadline,
     last: &mut Tick,

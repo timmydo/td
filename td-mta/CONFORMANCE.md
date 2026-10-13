@@ -331,7 +331,8 @@ credential revocation. The refused message remains visibly unreadable.
 
 This is a small native read fixture, not the full M22/M24 release oracle.
 SMTP receipt/recovery have their own fixtures; this case seeds native commits.
-It does not qualify search, mutations, submission, Mail state events, large
+It qualifies seen/star flags, archive/trash/restore and queued flag/move
+recovery. It does not qualify other mutations, search, submission, Mail state events, large
 mailbox latency or whole-service RSS. Existing worker/client fixtures retain
 separate coverage of bounded large queries and 300-message thread batching.
 
@@ -341,3 +342,12 @@ for GETs and explicit read batches; mutation requests are never replayed.
 The same bounded retry covers HTTP 503 at the API/download worker handoff,
 using a one-second delay when the server supplies no Retry-After.
 The server's authentication rate limits remain unchanged.
+
+The queued flag/archive recovery fixture allows at most three explicit
+connect attempts, accepting a retry only when the client log identifies
+HTTP 429 or 503 as the replay refusal. A following read fences
+that attempt but does not prove its entire durable queue drained. Qualification
+requires the committed keyword and membership state. Native observation retries
+only Busy under one fixed phase deadline. The client transport never
+automatically retries mutation requests. Replay currently resumes on connect,
+backend start or cache reopen; a transient refusal can require reconnecting.

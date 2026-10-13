@@ -813,3 +813,57 @@ pub use flags::{
     EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion, EmailUpdateRequest,
     EmailUpdateResult, MAX_EMAIL_UPDATES,
 };
+
+#[path = "mailbox_create.rs"]
+mod mailbox_create;
+pub use mailbox_create::{
+    MailboxAuthorization, MailboxCreateCompletion, MailboxCreateRequest, MailboxCreateResult,
+    MAX_MAILBOX_CREATES,
+};
+
+impl<P> StoreCoordinator<'_, '_, P> {
+    // The caller retains its authorization guard and original work meter.
+    fn commit_metadata<C: Crypto>(
+        &self,
+        crypto: &C,
+        state: &mut AdmissionState<'_>,
+        before: ViewIdentity,
+        deadline: Deadline,
+        last: &mut Tick,
+        operations: &[Operation<'_>],
+    ) -> Result<Result<Sequence, CommitError>, UploadError> {
+        let time = check_time(&self.store, deadline, last)?;
+        if operations.is_empty() {
+            return Ok(Ok(before.committed_sequence));
+        }
+        let (lease, mut ticket) = reserve_physical(
+            &mut state.ledger,
+            &mut state.stopped,
+            &mut state.recoverable_files,
+            deadline,
+            time.monotonic,
+        )?;
+        let completion = self.store.commit_with_files(
+            crypto,
+            CommitRequest {
+                account: before.account,
+                epoch: before.epoch,
+                expected: before.committed_sequence,
+                utc_ms: time.utc_ms,
+                deadline,
+            },
+            operations,
+            &mut [],
+        );
+        let accounted = settle_physical(&mut state.ledger, &mut ticket, completion.files());
+        let canceled = state.ledger.cancel(lease).is_ok();
+        if !accounted || !canceled || completion.writer_stopped() {
+            state.stopped = true;
+            state.recoverable_files = false;
+        } else if matches!(completion.files(), CommitFileUsage::Unavailable(_)) {
+            state.stopped = true;
+            state.recoverable_files = true;
+        }
+        Ok(completion.outcome())
+    }
+}

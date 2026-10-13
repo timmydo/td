@@ -477,18 +477,41 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 std::str::from_utf8(replacement.expose()).unwrap()
             )).unwrap();
             let mut client = Client::start(&config, &runtime.path);
-            let connected = client.ask(json!({"command":"connect", "account":"test"}));
-            assert!(connected["ok"].is_true(), "{connected}");
-            // The next command fences replay from the same durable client cache.
-            let listing = client.ask(json!({"command":"list_mailboxes"}));
-            assert!(listing["ok"].is_true(), "{listing}");
-            {
-                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
+            let log_path = runtime.path.join("state/td-mail/td-mail.log");
+            let mut log_start = std::fs::read(&log_path).map_or(0, |bytes| bytes.len());
+            for attempt in 0..3 {
+                let connected = client.ask(json!({"command":"connect", "account":"test"}));
+                assert!(connected["ok"].is_true(), "{connected}");
+                // Fence this replay attempt; transient refusal may leave work queued.
+                let listing = client.ask(json!({"command":"list_mailboxes"}));
+                assert!(listing["ok"].is_true(), "{listing}");
                 let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
-                let mut view = retained.method_view(account, phase).unwrap();
-                let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
-                assert!(view.get(key, &mut [0; 128]).unwrap().is_some());
-                assert_eq!(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16).unwrap().values, [archive]);
+                let complete = loop {
+                    let observed = (|| -> Result<bool, crate::store_fs::ResponseError> {
+                        let mut retained = coordinator.retain_response(&response_spool, until)?;
+                        let mut view = retained.method_view(account, phase)?;
+                        let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
+                        Ok(view.get(key, &mut [0; 128])?.is_some()
+                            && view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16)?.values == [archive])
+                    })();
+                    match observed {
+                        Ok(complete) => break complete,
+                        Err(crate::store_fs::ResponseError::Store(crate::ports::Error::Busy)) => {
+                            assert!(clock.sample().unwrap().monotonic < phase.tick());
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("native replay probe failed: {error}"),
+                    }
+                };
+                if complete { break; }
+                let log = std::fs::read(&log_path).unwrap();
+                let tail = std::str::from_utf8(&log[log_start..]).unwrap();
+                assert!(tail.lines().any(|line| line.contains("[Backend] queue replay stopped at seq=")
+                    && (line.contains("status code 429") || line.contains("status code 503"))),
+                    "replay may reconnect only after a verified HTTP 429 or 503");
+                log_start = log.len();
+                assert!(attempt < 2, "queued flag and archive replay did not commit after three attempts");
+                std::thread::sleep(Duration::from_secs(1));
             }
             drop(client);
             drop(stop);

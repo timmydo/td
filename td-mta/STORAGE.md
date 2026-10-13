@@ -2824,3 +2824,32 @@ read/star patches and single-mailbox moves, reserving its response before entry.
 no-op/clear, paged membership replacement, invalid destinations without flag
 effects, work refusal without partial writes, and moves/flags after reopen.
 The HTTPS adapter returns invalidProperties with mailboxIds for invalid destinations.
+
+### Device root-folder creation
+
+StoreCoordinator::create_mailboxes admits at most 256 root-folder names with
+an independent MailboxAuthorization guard binding account and device through
+COMMIT. The caller reserves its entire method response before entry and
+supplies the original request work meter and execution deadline. A supplied
+account epoch/sequence must match the captured endpoint before planning.
+
+Names are nonempty NFC UTF-8, at most 1024 bytes, with no control characters
+or Unicode noncharacters. Invalid names and exact duplicate root names are
+per-object refusals. Names are case-sensitive. A bounded account mailbox scan
+checks stored names; request-order comparison also refuses duplicates in the
+batch. The original work meter covers normalization, comparisons and scans.
+No hierarchy, role assignment, rename or folder deletion is activated here.
+Created folders are subscribed, have sortOrder zero, and no parent or role.
+
+Existing-name refusal precedes ID allocation, and an empty or entirely
+invalid plan skips the account scan. IDs come from bounded entropy attempts and must be absent from both the
+account and the planned batch. Each success writes one mailbox and one
+Mailbox Created history entry in a single commit. An entirely refused or
+empty batch performs no commit. Allocations are bounded by 256 names/results,
+one maximum-value read buffer, up to 256 encoded row buffers of 1088 bytes,
+fixed NFC scratch and two operations per success. Each name has its own NFC
+interpretation allowance while all names share the original request meter.
+The shared metadata commit helper retains the existing physical database/WAL
+reservation, original file observations and known-outcome settlement used by
+Email updates. No authorization or work budget is refreshed by that helper.
+The HTTPS Mailbox/set adapter remains a subsequent increment.

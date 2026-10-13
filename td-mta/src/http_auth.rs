@@ -320,6 +320,37 @@ impl<'r> crate::store_fs::EmailUpdateAuthorization for Option<DevicePolicy<'_, '
     }
 }
 
+impl<'r> crate::store_fs::MailboxAuthorization for DevicePolicy<'_, 'r> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_mailboxes(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        crate::store_fs::UploadAuthorization::authorize(self, account, device, deadline)
+    }
+}
+impl<'r> crate::store_fs::MailboxAuthorization for Option<DevicePolicy<'_, 'r>> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_mailboxes(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        self.as_ref()
+            .ok_or(Error::Forbidden)?
+            .authorize_mailboxes(account, device, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +384,13 @@ mod tests {
         let devices = Mutex::new(store);
         let policy = Some(DevicePolicy::new(&devices, &Now, 7));
         let deadline = Deadline::after(Tick(1), 100).unwrap();
-        use crate::store_fs::EmailUpdateAuthorization;
+        use crate::store_fs::{EmailUpdateAuthorization, MailboxAuthorization};
+        let folders = policy
+            .authorize_mailboxes(account, device, deadline)
+            .unwrap();
+        assert_eq!(folders.access().principal, Principal::Device(device));
+        assert!(devices.try_lock().is_err());
+        drop(folders);
         let flags = policy
             .authorize_email_update(account, device, deadline)
             .unwrap();
@@ -382,7 +419,15 @@ mod tests {
             policy.authorize_email_update(account, device, deadline),
             Err(Error::Forbidden)
         ));
+        assert!(matches!(
+            policy.authorize_mailboxes(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
         let absent: Option<DevicePolicy<'_, '_>> = None;
+        assert!(matches!(
+            absent.authorize_mailboxes(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
         assert!(matches!(
             absent.authorize_email_update(account, device, deadline),
             Err(Error::Forbidden)
