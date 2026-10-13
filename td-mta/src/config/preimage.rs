@@ -165,10 +165,10 @@ pub fn write<E>(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{inputs, load, stanza::Pending, storage::Storage, stream, text};
-    const BASE: &str = r#"version = 1
+    pub(crate) const BASE: &str = r#"version = 1
 [server]
 hostname = "mail.example.test"
 jmap_origin = "https://jmap.example.test"
@@ -203,12 +203,12 @@ kind = "https"
 bind = "0.0.0.0:443"
 certificate = "public"
 "#;
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
         text::TEST_CONSTRUCTION_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    fn resolved(source: &str) -> materialize::ResolvedText {
+    pub(crate) fn resolved(source: &str) -> materialize::ResolvedText {
         let mut scratch = vec![0; stream::SCRATCH_BYTES];
         let loaded = load::read(
             Storage::try_new().unwrap(),

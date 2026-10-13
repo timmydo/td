@@ -6934,16 +6934,17 @@ Default error Display/Debug and value Debug do not expose identity text; typed
 sink errors remain accessible through the enum and error source, whose
 explicit inspection is the trusted caller's responsibility. Validation reports
 the first refusal in encoding traversal order; no cross-field diagnostic
-precedence is promised. M07 owns hashing with the
-real provider, and M15 owns state-token publication from a pinned snapshot.
+precedence is promised. The cold identity catalog performs real-provider
+hashing; serving-state publication from a pinned snapshot remains separate.
 
 Stable representation codes are `identity_preimage_count`,
 `identity_preimage_address_count`, `identity_preimage_text_limit`,
 `identity_preimage_size_limit` and `identity_preimage_order`. They identify
 codec refusals; the schema/CLI must supply configuration source locations.
 
-Identity digest oracles (literal preimages; M07 verifies with the real
-provider, M04 verifies the canonical encoder):
+Identity digest oracles (literal preimages; the cold identity catalog
+verifies the single-identity digest with the real provider, and the canonical
+encoder has independent literal-preimage fixtures):
 
 - Empty snapshot preimage hex:
   `74642d6d74612d6964656e7469746965732d76310000000000`.

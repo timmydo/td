@@ -1636,10 +1636,13 @@ inspection retains the underlying validation or sink error.
 
 Sink failure can leave a prefix and must discard that output/digest. Sink
 allocation, blocking and panic behavior remain trusted caller obligations.
-The writer is for private configuration work until M05/M07 complete; it
-confers no file trust, authentication, digest or publication authority.
-The local td-crypto streaming Digest can consume the writer later without
-retaining a second 192 KiB buffer. Actual combined reader/materializer/view
+The writer emits private configuration bytes; it confers no file trust,
+authentication or publication authority. Digest ownership belongs to its
+caller.
+The cold identity catalog streams this writer directly into the local
+td-crypto Digest without retaining a second 192 KiB preimage buffer. It
+preserves representation refusal codes and crypto adapter failures; HTTP
+publication remains separate. Actual combined reader/materializer/view
 stack qualification for the test instances is described below; installed
 service integration must assess concrete stack risks under DESIGN section 5.
 This object-layout guard

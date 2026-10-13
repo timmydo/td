@@ -62,6 +62,7 @@ pub mod https_api;
 pub mod https_download;
 mod https_exchange;
 pub mod https_upload;
+pub mod identity_catalog;
 pub mod ids;
 pub use td_mime::json_string;
 pub mod jmap_changes;

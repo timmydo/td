@@ -2247,3 +2247,23 @@ uniqueness, IDs, authorization and commit outcomes. The adapter prepays the
 entire response before calling it, preserves per-object refusals and exposes
 mayCreateTopLevelMailbox only with this active endpoint. No hierarchy, rename,
 role mutation or folder deletion is activated.
+
+## Prepared sending identities
+
+The sending identity catalog is a cold preparation boundary for td-mail's
+default Identity/get objects. It validates the existing bounded canonical
+visible-identity preimage before hashing it, then retains only JSON-visible
+identity data and IDs. Relay credentials and signature paths are excluded.
+The cold encoder reserves at most six times the 192-KiB preimage ceiling
+plus 512 bytes per permitted identity. It fallibly copies the used bytes
+into a retained allocation and releases that scratch; at most 64 entries
+index the immutable bytes. The temporary and retained allocations overlap
+only during that bounded copy. JSON escaping expands a source byte at most
+sixfold, while the per-identity slack covers object framing. This is an
+explicit cold allocation under section 5, not a claim that the proposed
+1-MiB configuration-generation partition already covers activation. It
+provides immutable object slices and configuration-digest identity state
+under a serving snapshot's store epoch after checking its account ID.
+Noncharacters in any visible text refuse preparation, matching Session's
+I-JSON policy. It confers no authority and does not yet enable Identity/get,
+submission capability or sending.
