@@ -1,0 +1,276 @@
+//! The td-mail flag subset of Email/set, with response capacity before effects.
+use super::{
+    mailbox_get::storage,
+    push::{Children, Name},
+    Error, Worker,
+};
+use crate::{
+    admission::work::Meter,
+    bounded::TextBuffer,
+    ids::EmailId,
+    ports,
+    store_fs::{
+        EmailFlagUpdate, FlagAuthorization, FlagCompletion, FlagRequest, StoreCoordinator,
+        UploadError, MAX_FLAG_UPDATES,
+    },
+    sync::{DataState, DataType},
+};
+use std::ops::Range;
+use td_json::scan;
+
+/// Trusted device mutation adapter; results retain known commit outcomes.
+pub trait FlagMutator {
+    fn update(
+        &self,
+        request: FlagRequest<'_>,
+        meter: &mut Meter,
+    ) -> Result<FlagCompletion, UploadError>;
+}
+impl<P: FlagAuthorization> FlagMutator for StoreCoordinator<'_, '_, P> {
+    fn update(
+        &self,
+        request: FlagRequest<'_>,
+        meter: &mut Meter,
+    ) -> Result<FlagCompletion, UploadError> {
+        self.update_flags(&td_crypto::Provider, request, meter)
+    }
+}
+struct Update {
+    name: Name,
+    value: EmailFlagUpdate,
+    local: bool,
+    valid: bool,
+}
+fn failure(error: UploadError, conditional: bool) -> Error {
+    match error {
+        UploadError::Store(ports::Error::Conflict) if conditional => Error::StateMismatch,
+        UploadError::Store(ports::Error::Conflict) => Error::StorageBusy,
+        UploadError::Store(ports::Error::Forbidden) => Error::Forbidden,
+        UploadError::Store(ports::Error::NotFound) => Error::AccountNotFound,
+        UploadError::Store(error) => storage(error),
+        UploadError::Ledger(_) => Error::StorageBusy,
+        UploadError::Format(_) => Error::State,
+    }
+}
+impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+    pub(super) fn email_set(
+        &mut self,
+        arguments: Range<u64>,
+        maximum: usize,
+    ) -> Result<Range<u64>, Error> {
+        let (flags, device) = self.flags.ok_or(Error::UnknownMethod)?;
+        let mut fields = Children::new(arguments, scan::Kind::Object)?;
+        let (mut account, mut update, mut expected) = (None, None, None);
+        while let Some(item) = fields.next(self)? {
+            match item.key.bytes() {
+                b"accountId" => account = Some(self.push_string(&item)?),
+                b"ifInState" if item.kind == scan::Kind::Null => (),
+                b"ifInState" => expected = Some(self.push_string(&item)?),
+                b"update" => update = Some(item),
+                b"create" | b"destroy" if item.kind == scan::Kind::Null => (),
+                b"create" => {
+                    if Children::new(item.range, scan::Kind::Object)?
+                        .next(self)?
+                        .is_some()
+                    {
+                        return Err(Error::InvalidArguments);
+                    }
+                }
+                b"destroy" => {
+                    if Children::new(item.range, scan::Kind::Array)?
+                        .next(self)?
+                        .is_some()
+                    {
+                        return Err(Error::InvalidArguments);
+                    }
+                }
+                _ => return Err(Error::InvalidArguments),
+            }
+        }
+        let account = account.ok_or(Error::InvalidArguments)?;
+        if account.wire_id()?.local() != Some(self.account) {
+            return Err(Error::AccountNotFound);
+        }
+        let expected = expected
+            .map(|value| {
+                let text =
+                    std::str::from_utf8(value.bytes()).map_err(|_| Error::InvalidArguments)?;
+                let state = DataState::decode(text).map_err(|_| Error::StateMismatch)?;
+                if state.account != self.account || state.kind != DataType::Email {
+                    return Err(Error::StateMismatch);
+                }
+                Ok((state.epoch, state.sequence))
+            })
+            .transpose()?;
+        let maximum = maximum.min(MAX_FLAG_UPDATES);
+        let mut updates = Vec::new();
+        updates
+            .try_reserve_exact(maximum)
+            .map_err(|_| Error::ResponseCapacity)?;
+        if let Some(update) = update.filter(|item| item.kind != scan::Kind::Null) {
+            let mut objects = Children::new(update.range, scan::Kind::Object)?;
+            while let Some(item) = objects.next(self)? {
+                if updates.len() == maximum {
+                    return Err(Error::RequestTooLarge);
+                }
+                let id: Option<EmailId> = item.key.wire_id()?.local();
+                let mut value = EmailFlagUpdate {
+                    email: id.unwrap_or(EmailId::from_bytes([0; 16])),
+                    seen: None,
+                    flagged: None,
+                };
+                let mut valid = item.kind == scan::Kind::Object;
+                if valid {
+                    let mut patch = Children::new(item.range, scan::Kind::Object)?;
+                    while let Some(property) = patch.next(self)? {
+                        let desired = match property.kind {
+                            scan::Kind::Boolean if self.query_boolean(&property)? => Some(true),
+                            scan::Kind::Null => Some(false),
+                            _ => {
+                                valid = false;
+                                None
+                            }
+                        };
+                        match property.key.bytes() {
+                            b"keywords/$seen" => value.seen = desired,
+                            b"keywords/$flagged" => value.flagged = desired,
+                            _ => valid = false,
+                        }
+                    }
+                }
+                updates.push(Update {
+                    name: item.key,
+                    value,
+                    local: id.is_some(),
+                    valid,
+                });
+            }
+        }
+        // Each ID is validated ASCII with no JSON escaping. Cover either result
+        // map plus fixed account/state/framing fields before invoking storage.
+        let mut bound = 256 + account.bytes().len() + 2 * DataState::WIRE_BYTES;
+        for update in &updates {
+            bound = bound
+                .checked_add(update.name.bytes().len() + 96)
+                .ok_or(Error::ResponseCapacity)?;
+        }
+        if bound as u64 > self.available()? {
+            return Err(Error::ResponseCapacity);
+        }
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(bound)
+            .map_err(|_| Error::ResponseCapacity)?;
+        output.resize(bound, 0);
+        let mut changes = Vec::new();
+        changes
+            .try_reserve_exact(updates.len())
+            .map_err(|_| Error::ResponseCapacity)?;
+        for update in &updates {
+            if update.valid && update.local {
+                changes.push(update.value);
+            }
+        }
+        let reserved = self
+            .retention
+            .reserve_mutation_output(bound)
+            .map_err(Error::Storage)?;
+        let request = FlagRequest {
+            account: self.account,
+            device,
+            expected,
+            updates: &changes,
+            deadline: self.execution,
+        };
+        let completion = self
+            .retention
+            .with_mutation_meter(self.execution, |meter| flags.update(request, meter))
+            .map_err(|error| failure(error, expected.is_some()))?;
+        // The coordinator already applied admission_stopped to its own state;
+        // preserve this call's known result even when future writes must stop.
+        let sequence = match completion.outcome {
+            Ok(sequence) => sequence,
+            Err(crate::store_fs::CommitError::Rejected(error)) => {
+                return Err(failure(error.into(), expected.is_some()))
+            }
+            Err(crate::store_fs::CommitError::Indeterminate(_)) => {
+                return Err(Error::ServerPartialFail)
+            }
+        };
+        if completion.found.len() != changes.len() {
+            return Err(Error::State);
+        }
+        let mut before = [0; DataState::WIRE_BYTES];
+        let mut after = [0; DataState::WIRE_BYTES];
+        let old = DataState {
+            account: self.account,
+            epoch: completion.before.epoch,
+            kind: DataType::Email,
+            sequence: completion.before.committed_sequence,
+        };
+        let new = DataState { sequence, ..old };
+        let old = old.encode(&mut before).map_err(|_| Error::State)?;
+        let new = new.encode(&mut after).map_err(|_| Error::State)?;
+        let account = std::str::from_utf8(account.bytes()).map_err(|_| Error::State)?;
+        let mut out = TextBuffer::new(&mut output);
+        out.format(format_args!("{{\"accountId\":\"{account}\",\"oldState\":\"{old}\",\"newState\":\"{new}\",\"created\":null,\"destroyed\":null,\"notCreated\":null,\"notDestroyed\":null")).map_err(|_| Error::State)?;
+        let successes = completion.found.iter().filter(|found| **found).count();
+        for errors in [false, true] {
+            let name = if errors { "notUpdated" } else { "updated" };
+            out.format(format_args!(",\"{name}\":"))
+                .map_err(|_| Error::State)?;
+            let count = if errors {
+                updates.len() - successes
+            } else {
+                successes
+            };
+            if count == 0 {
+                out.append("null").map_err(|_| Error::State)?;
+                continue;
+            }
+            out.append("{").map_err(|_| Error::State)?;
+            let mut found = completion.found.iter();
+            let mut first = true;
+            for update in &updates {
+                let exists = if update.valid && update.local {
+                    *found.next().ok_or(Error::State)?
+                } else {
+                    false
+                };
+                let error = if !update.valid {
+                    Some("invalidProperties")
+                } else if !exists {
+                    Some("notFound")
+                } else {
+                    None
+                };
+                if error.is_some() != errors {
+                    continue;
+                }
+                if !first {
+                    out.append(",").map_err(|_| Error::State)?;
+                }
+                first = false;
+                let id = std::str::from_utf8(update.name.bytes()).map_err(|_| Error::State)?;
+                out.format(format_args!("\"{id}\":"))
+                    .map_err(|_| Error::State)?;
+                if let Some(error) = error {
+                    out.format(format_args!("{{\"type\":\"{error}\"}}"))
+                        .map_err(|_| Error::State)?;
+                } else {
+                    out.append("null").map_err(|_| Error::State)?;
+                }
+            }
+            out.append("}").map_err(|_| Error::State)?;
+        }
+        out.append("}").map_err(|_| Error::State)?;
+        let length = out.len();
+        self.retention
+            .finish_mutation_output(reserved, output.get(..length).ok_or(Error::State)?)
+            .map_err(Error::Storage)
+    }
+}
+
+#[cfg(test)]
+#[path = "email_set_tests.rs"]
+mod tests;

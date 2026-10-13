@@ -1,4 +1,4 @@
-//! Authenticated td-mail read API work on the fixed HTTPS body worker.
+//! Authenticated td-mail API work on the fixed HTTPS body worker.
 use crate::{
     admission::timers::{self, TimeoutPlan},
     bounded::TextBuffer,
@@ -82,7 +82,9 @@ fn buffer<T: Clone>(length: usize, value: T) -> Result<Box<[T]>, Error> {
     bytes.resize(length, value);
     Ok(bytes.into_boxed_slice())
 }
-impl<P: Sync> https_upload::Backend for Service<'_, '_, '_, '_, '_, P> {
+impl<P: crate::store_fs::FlagAuthorization + Sync> https_upload::Backend
+    for Service<'_, '_, '_, '_, '_, P>
+{
     fn account(&self) -> AccountId {
         self.transfers.account()
     }
@@ -153,7 +155,7 @@ impl<P: Sync> https_upload::Backend for Service<'_, '_, '_, '_, '_, P> {
         })
     }
 }
-impl<P> Service<'_, '_, '_, '_, '_, P> {
+impl<P: crate::store_fs::FlagAuthorization> Service<'_, '_, '_, '_, '_, P> {
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
         let limits = self.resources.limits();
         let device = request.device;
@@ -318,11 +320,13 @@ impl<P> Service<'_, '_, '_, '_, '_, P> {
             self.policy
                 .authorize_blob(self.transfers.account(), device, sender.deadline)?,
         );
-        let mut complete = dispatch::run(
+        let mut complete = dispatch::run_with_flags(
             plan.finish().map_err(|_| Error::Capacity)?,
             retention,
             execution,
             self.transfers.account(),
+            device,
+            self.coordinator,
         )
         .map_err(|error| {
             ApiError::Io(match error {

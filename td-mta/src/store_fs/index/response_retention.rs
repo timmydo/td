@@ -49,6 +49,11 @@ pub struct ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
     meter: Meter,
     failed: Option<ports::Error>,
 }
+/// Prepaid unpublished tail; constructed and consumed only by this owner.
+pub(crate) struct MutationOutput {
+    start: u64,
+    maximum: usize,
+}
 /// Sort files use the same custody failures as response retention.
 pub type SortError = ResponseError;
 
@@ -213,6 +218,67 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
             return Err(ports::Error::Deadline);
         }
         self.coordinator.store.view(account, phase)
+    }
+
+    /// Materialize the complete result bound and prepay its final overwrite.
+    /// Any capacity, allocation or initial spool failure precedes store effects.
+    pub(crate) fn reserve_mutation_output(
+        &mut self,
+        maximum: usize,
+    ) -> Result<MutationOutput, ports::Error> {
+        self.check()?;
+        let start = self.length;
+        let end = start
+            .checked_add(maximum as u64)
+            .ok_or(ports::Error::Capacity)?;
+        if end > self.maximum {
+            return Err(ports::Error::Capacity);
+        }
+        let zero = [0; 16 * 1024];
+        let mut remaining = maximum;
+        while remaining > 0 {
+            let count = remaining.min(zero.len());
+            self.append(zero.get(..count).ok_or(ports::Error::Invalid)?)?;
+            self.charge(count, false)?;
+            remaining -= count;
+        }
+        Ok(MutationOutput { start, maximum })
+    }
+    /// Consume prepaid write credit after a known store result. Only the original
+    /// outer clock and physical spool can now prevent retaining that result.
+    pub(crate) fn finish_mutation_output(
+        &mut self,
+        reserved: MutationOutput,
+        bytes: &[u8],
+    ) -> Result<std::ops::Range<u64>, ports::Error> {
+        self.check()?;
+        if bytes.len() > reserved.maximum
+            || self.length != reserved.start + reserved.maximum as u64
+            || self.published > reserved.start
+        {
+            return Err(ports::Error::Invalid);
+        }
+        let mut offset = reserved.start;
+        for chunk in bytes.chunks(16 * 1024) {
+            self.check()?;
+            let result = self.temporary()?.write_at(offset, chunk);
+            self.record(result)?;
+            offset += chunk.len() as u64;
+        }
+        self.length = offset;
+        self.publish()?;
+        Ok(reserved.start..offset)
+    }
+
+    pub(crate) fn with_mutation_meter<T>(
+        &mut self,
+        phase: Deadline,
+        mutate: impl FnOnce(&mut Meter) -> Result<T, UploadError>,
+    ) -> Result<T, UploadError> {
+        if !self.admit_before(phase)? {
+            return Err(ports::Error::Deadline.into());
+        }
+        mutate(&mut self.meter)
     }
 
     pub fn len(&self) -> u64 {

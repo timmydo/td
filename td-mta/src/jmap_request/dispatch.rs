@@ -3,6 +3,10 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "email_set.rs"]
+mod email_set;
+pub use email_set::FlagMutator;
+
 #[path = "email_query.rs"]
 mod email_query;
 
@@ -29,6 +33,8 @@ use super::MAIL;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     State,
+    StateMismatch,
+    ServerPartialFail,
     Storage(ports::Error),
     ExecutionDeadline,
     InvalidArguments,
@@ -95,12 +101,34 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
 /// invocation. All methods here are side-effect free; errors never stop later
 /// calls. Terminal original work/I/O/outer-deadline failure aborts the batch.
 /// Refusal drops the request arenas; allocation recycling is not promised.
-/// HTTP activation remains separate.
+/// Read-only fixtures use this entry; runtime dispatch requires a device.
+#[cfg(test)]
 pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    run_inner(plan, retention, execution, account, None)
+}
+
+/// Authenticated flag profile; device is supplied by the HTTPS owner.
+pub fn run_with_flags<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+    device: crate::ids::DeviceId,
+    flags: &dyn FlagMutator,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    run_inner(plan, retention, execution, account, Some((flags, device)))
+}
+fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     account: AccountId,
+    flags: Option<(&dyn FlagMutator, crate::ids::DeviceId)>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
@@ -135,6 +163,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
         execution,
         optional_end,
         account,
+        flags,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core, mail);
@@ -145,6 +174,8 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     return Err(Error::Storage(error));
                 }
                 let body: &[u8] = match error {
+                    Error::StateMismatch => br#"{"type":"stateMismatch"}"#,
+                    Error::ServerPartialFail => br#"{"type":"serverPartialFail"}"#,
                     Error::UnsupportedFilter => br#"{"type":"unsupportedFilter"}"#,
                     Error::UnsupportedSort => br#"{"type":"unsupportedSort"}"#,
                     Error::AnchorNotFound => br#"{"type":"anchorNotFound"}"#,
@@ -207,6 +238,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     execution: ports::Deadline,
     optional_end: u64,
     account: AccountId,
+    flags: Option<(&'io dyn FlagMutator, crate::ids::DeviceId)>,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
@@ -319,6 +351,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             b"Email/query" if mail => "Email/query",
 
             b"Email/get" if mail => "Email/get",
+            b"Email/set" if mail && self.flags.is_some() => "Email/set",
             b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
@@ -330,7 +363,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "Email/get" {
+        let result = if name == "Email/set" {
+            self.email_set(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Email/get" {
             self.email_get(start..end, &responses.request().envelope.mail_limits)
         } else if name == "Blob/copy" {
             self.blob_copy(start..end)
@@ -801,6 +836,7 @@ pub(super) mod tests {
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
                 account: AccountId::from_bytes([1; 16]),
+                flags: None,
             };
             assert_eq!(
                 worker.reference(&responses, 1, value),
@@ -1203,6 +1239,7 @@ pub(super) mod tests {
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
                 account: AccountId::from_bytes([1; 16]),
+                flags: None,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));
             assert_eq!(retention.failure(), None);

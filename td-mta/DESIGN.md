@@ -1812,7 +1812,7 @@ filesystem paths. It must authorize and admit body storage before sending
 100 Continue, check decoder completion before publication, and close on
 framing failure. The current HTTPS runtime serves authenticated uploads, raw
 downloads, the Core API and EventSource with these bounds. Authenticated
-discovery advertises Core and the read-only td-mail Mail profile. Device persistence
+discovery advertises Core and the td-mail Mail profile. Device persistence
 and local administration are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
@@ -1850,7 +1850,7 @@ After responding it applies RESOURCES.md's bounded write-half closure.
 Refusals may drain bounded unread data; successful uploads already consumed
 their body and do not drain. Downloads also close without drain. Slots remain
 active until retired.
-Authenticated GET /.well-known/jmap returns Core and read-only Mail Session
+Authenticated GET /.well-known/jmap returns Core and Mail Session
 metadata; unknown targets get 404. Submission remains unadvertised.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
 credentials receive the same 401 Basic challenge. No credential enters error
@@ -2220,17 +2220,18 @@ The mailbox-access Core API now runs on the bounded HTTPS body worker.
 ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
 owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
 is exposed by authenticated discovery now that its required endpoints are
-active. Mail read methods are exposed for td-mail and the account is marked
-read-only. CONFORMANCE.md records the actual client/TLS evidence. EventSource
+active. Mail reads and read/star flag assignments are exposed for td-mail. The
+account permits those writes; POLICY.md specifies its Mailbox rights.
+CONFORMANCE.md records the actual client/TLS evidence. EventSource
 still emits only pings: td-mail does not consume it. Future Mail state delivery
 requires passive state capture without blocking the network reactor or holding
-a store view across socket work; this read profile makes no such claim.
+a store view across socket work; this profile makes no such claim.
 
 ## Device read/star transaction foundation
 
 The storage coordinator now accepts bounded, device-authorized `$seen` and
 `$flagged` assignments through the typed update_flags boundary documented in
 STORAGE.md. Values and corresponding Email/Mailbox history commit together,
-and known commit outcomes survive later accounting refusal. HTTPS Email/set
-activation and matching Session/Mailbox rights remain a separate increment;
-the running td-mail profile remains read-only until that integration lands.
+and known commit outcomes survive later accounting refusal. Authenticated
+HTTPS Email/set activates only td-mail keyword patches for these two flags,
+with matching Session and Mailbox rights. Other Email mutations are absent.

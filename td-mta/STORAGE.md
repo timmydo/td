@@ -2810,6 +2810,6 @@ physical database/WAL lease covers the commit and its original-scope file
 observations. Settlement preserves a known durable success even when admission
 must stop; only recoverable file-accounting refusal permits checkpoint recovery.
 No-op batches retain their original sequence and perform no storage commit.
-This typed storage entry does not yet activate Email/set or change Session
-read-only advertisement. Native tests cover history, unchanged raw bytes,
+The HTTPS owner activates this entry only for authenticated device
+read/star patches and reserves its complete response before entry. Native tests cover history, unchanged raw bytes,
 no-op/clear, refusals without partial writes, and flags/history after reopen.

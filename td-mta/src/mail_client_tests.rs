@@ -15,7 +15,7 @@ use crate::{
     ids::{AccountId, BlobId, EmailId, MailboxId, StoreEpoch, ThreadId},
     limits::Limits,
     ownership::SlotState,
-    ports::Deadline,
+    ports::{Deadline, ReadView},
     smtp_receiving::Control,
     store_fs::{
         tests::Fixture, AuxiliaryUsage, BlobSource, CommitRequest, DeviceStore, IndexStore,
@@ -271,7 +271,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
         clock: clock.as_ref(),
         timeouts: &timeouts,
     };
-    let session = crate::jmap_session::Session::mail_read(
+    let session = crate::jmap_session::Session::mail_flags(
         Origin::parse(&origin).unwrap(),
         crate::config::identities::AccountView {
             id: account,
@@ -391,10 +391,67 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
             assert_eq!(thread["emails"][0]["body"].as_str(), Some("Hello reader"));
             assert_eq!(thread["emails"][1]["id"], find(11)["id"]);
             assert!(thread["emails"][1]["body"].as_str().unwrap().contains("body-only-tail"));
+            let target = wire_id(EmailId::from_bytes([10; 16]));
+            for (command, seen, flagged) in [
+                ("mark_read", true, false),
+                ("flag", true, true),
+                ("mark_unread", false, true),
+                ("unflag", false, false),
+            ] {
+                let changed = client.ask(json!({"command":command,"id":target}));
+                assert!(changed["ok"].is_true(), "{changed}");
+                let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox)}));
+                assert!(listing["ok"].is_true(), "{listing}");
+                let item = listing["emails"]
+                    .as_array().unwrap().iter()
+                    .find(|e| e["id"].as_str() == Some(target.as_str()))
+                    .unwrap();
+                assert_eq!(item["is_read"].as_bool(), Some(seen), "{item}");
+                assert_eq!(item["is_flagged"].as_bool(), Some(flagged), "{item}");
+                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
+                let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
+                let mut view = retained.method_view(account, phase).unwrap();
+                let mut scratch = [0; 128];
+                for (keyword, present) in [("$seen", seen), ("$flagged", flagged)] {
+                    let key = Key::Keyword(EmailId::from_bytes([10; 16]), keyword);
+                    assert_eq!(view.get(key, &mut scratch).unwrap().is_some(), present);
+                }
+            }
             devices.lock().unwrap().revoke(device, 2).unwrap();
             let revoked = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox)}));
             assert!(!revoked["ok"].is_true(), "{revoked}");
             assert_eq!(revoked["error"].as_str(), Some(format!("HTTP error: {origin}/jmap/api: status code 401").as_str()), "{revoked}");
+            // The CLI acknowledges durable local intent, including remote refusal.
+            let queued = client.ask(json!({"command":"mark_read", "id":target}));
+            assert!(queued["ok"].is_true(), "{queued}");
+            {
+                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
+                let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
+                let mut view = retained.method_view(account, phase).unwrap();
+                let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
+                assert!(view.get(key, &mut [0; 128]).unwrap().is_none());
+            }
+            drop(client);
+            let (_, replacement) = devices.lock().unwrap().create(
+                "replacement", 3, &mut td_crypto::SystemEntropy::try_new().unwrap()
+            ).unwrap();
+            std::fs::write(&config, format!(
+                "[account.test]\nwell_known_url = \"{origin}/.well-known/jmap\"\nusername = \"private-user\"\npassword_command = \"printf {}\"\n",
+                std::str::from_utf8(replacement.expose()).unwrap()
+            )).unwrap();
+            let mut client = Client::start(&config, &runtime.path);
+            let connected = client.ask(json!({"command":"connect", "account":"test"}));
+            assert!(connected["ok"].is_true(), "{connected}");
+            // The next command fences replay from the same durable client cache.
+            let listing = client.ask(json!({"command":"list_mailboxes"}));
+            assert!(listing["ok"].is_true(), "{listing}");
+            {
+                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
+                let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
+                let mut view = retained.method_view(account, phase).unwrap();
+                let key = Key::Keyword(EmailId::from_bytes([10; 16]), "$seen");
+                assert!(view.get(key, &mut [0; 128]).unwrap().is_some());
+            }
             drop(client);
             drop(stop);
             assert!(worker.join().unwrap().is_ok());

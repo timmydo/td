@@ -14,9 +14,13 @@ read-mail fixture. Authorization, durable outcomes, bounded work and honest
 errors remain mandatory in every supported path. Do not report absent body
 content as successful empty data to make a client test pass.
 
-The mailbox-access profile advertises Core and read-only Mail. Authenticated
+The mailbox-access profile advertises Core and the td-mail Mail profile.
+Authenticated
 Session discovery, bounded Core and Mail read batches, upload/download, the
 single-account Blob/copy outcome and PushSubscription policy are active.
+Email/set read/unread and star patches are active; moves, deletion and
+structured creation remain absent. The native td-mail fixture sets and clears
+both flags over HTTPS and checks persisted keyword rows after each result.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Submission remains unadvertised. Activation follows
 the supported td-mail workflow tests, not every reference-table row.

@@ -289,6 +289,37 @@ impl<'r> crate::store_fs::BlobAuthorization for Option<DevicePolicy<'_, 'r>> {
     }
 }
 
+impl<'r> crate::store_fs::FlagAuthorization for DevicePolicy<'_, 'r> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_flags(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        crate::store_fs::UploadAuthorization::authorize(self, account, device, deadline)
+    }
+}
+impl<'r> crate::store_fs::FlagAuthorization for Option<DevicePolicy<'_, 'r>> {
+    type Guard<'a>
+        = DeviceGuard<'a, 'r>
+    where
+        Self: 'a;
+    fn authorize_flags(
+        &self,
+        account: AccountId,
+        device: DeviceId,
+        deadline: Deadline,
+    ) -> Result<Self::Guard<'_>, Error> {
+        self.as_ref()
+            .ok_or(Error::Forbidden)?
+            .authorize_flags(account, device, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +353,11 @@ mod tests {
         let devices = Mutex::new(store);
         let policy = Some(DevicePolicy::new(&devices, &Now, 7));
         let deadline = Deadline::after(Tick(1), 100).unwrap();
+        use crate::store_fs::FlagAuthorization;
+        let flags = policy.authorize_flags(account, device, deadline).unwrap();
+        assert_eq!(flags.access().principal, Principal::Device(device));
+        assert!(devices.try_lock().is_err());
+        drop(flags);
         let guard = policy.authorize_blob(account, device, deadline).unwrap();
         assert_eq!(guard.access().principal, Principal::Device(device));
         assert_eq!(guard.access().config_generation, 7);
@@ -340,7 +376,15 @@ mod tests {
             policy.authorize_blob(account, device, deadline),
             Err(Error::Forbidden)
         ));
+        assert!(matches!(
+            policy.authorize_flags(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
         let absent: Option<DevicePolicy<'_, '_>> = None;
+        assert!(matches!(
+            absent.authorize_flags(account, device, deadline),
+            Err(Error::Forbidden)
+        ));
         assert!(matches!(
             absent.authorize_blob(account, device, deadline),
             Err(Error::Forbidden)

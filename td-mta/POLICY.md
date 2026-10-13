@@ -838,8 +838,11 @@ requirement.
 ## 8. Personal-account Mailbox rights
 
 The configured personal account owns every stored Mailbox. The active
-read-only td-mail profile reports mayReadItems true and all eight mutation
-and submission rights false, consistently with the Session's isReadOnly.
+td-mail profile reports mayReadItems, maySetSeen and maySetKeywords true.
+Only `$seen` and `$flagged` patches are implemented. For this td-mail-only
+profile, maySetKeywords advertises starring; it does not promise arbitrary
+keyword editing as the general RFC right would. All other mutation and
+submission rights remain false. The Session reports isReadOnly false.
 The permanent Inbox remains the reception target. Enabling future client
 mutations requires implementing their methods and updating these rights with
 matching tests; account ownership alone does not advertise unimplemented

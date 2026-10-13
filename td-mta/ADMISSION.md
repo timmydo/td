@@ -1155,7 +1155,7 @@ or body-worker permit. A separate event_streams counter is bounded by the
 HTTPS connection pool, and the per-peer cap still applies. Startup refuses
 Core activation with zero event capacity. The backend snapshot operation is
 nonblocking and only tries the device registry; every turn rechecks device
-access before output. The read-only Mail profile does not yet connect account
+access before output. The td-mail Mail profile does not yet connect account
 state to this endpoint: it emits requested pings only. td-mail uses requests
 instead. The existing snapshot encoder handles future StateChange filtering,
 reconnect and close-after-state behavior.
@@ -1282,3 +1282,24 @@ conservative double charges. A disk cap is not a promise that every query can
 fill it before its CPU/I/O/deadline ceiling. Deterministic job work exhaustion
 is storageWorkLimit; elapsed deadline and shared workspace/file/view pressure
 are temporary serverUnavailable. Neither publishes partial IDs or totals.
+
+## Device read/star response admission
+
+The active Email/set subset accepts only update patches for `keywords/$seen`
+and `keywords/$flagged`, with true to set and null to remove. Unsupported
+properties or false values refuse that object as invalidProperties; absent
+Email IDs report notFound. Nonempty create/destroy are not implemented.
+ifInState is checked against the account epoch and sequence under coordination.
+The batch ceiling is the smaller of objects_per_method and 256, also advertised
+as maxObjectsInSet. Device activity is checked again under the registry guard
+held through COMMIT, independently of the initial HTTP authentication.
+
+Before store effects, the dispatcher allocates its complete bounded result,
+materializes that bound in the unpublished response tail, and prepays its final
+spool overwrite from the original request meter. The store plans and commits
+all valid existing objects atomically. The final overwrite consumes that credit
+without a new execution-phase test or work grant; it still observes the original
+outer deadline and physical spool failures. Such terminal failures close the
+exchange for reconciliation. Known commits never become serverFail or
+serverUnavailable. An indeterminate COMMIT reports serverPartialFail when
+response retention remains usable. Earlier method results remain retained.

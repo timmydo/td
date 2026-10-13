@@ -239,7 +239,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
             };
             let session = if mailbox_access {
                 Some(
-                    td_mta::jmap_session::Session::mail_read(
+                    td_mta::jmap_session::Session::mail_flags(
                         view.origin()
                             .map_err(|_| config_failure("configuration", "invariant"))?,
                         candidate
