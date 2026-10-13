@@ -846,8 +846,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
-    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
-
     struct Fixture {
         commit: Checksum,
         content: Checksum,
@@ -1146,14 +1144,8 @@ mod tests {
         }
     }
 
-    fn test_root(label: &str) -> PathBuf {
-        let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "td-builder-ostree-{label}-{}-{id}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).unwrap();
-        root
+    fn test_root(label: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-builder-ostree-{label}")).unwrap()
     }
 
     fn write_fixture(root: &Path, fixture: &Fixture) -> PathBuf {

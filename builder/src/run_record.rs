@@ -1659,14 +1659,7 @@ mod tests {
         );
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "td-run-record-{}-{tag}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("tempdir");
-        path
+    fn tempdir(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-run-record-{tag}")).unwrap()
     }
 }

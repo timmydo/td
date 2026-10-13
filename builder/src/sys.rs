@@ -1257,10 +1257,8 @@ mod tests {
 
     #[test]
     fn rename_noreplace_never_replaces_an_existing_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "td-builder-rename-noreplace-{}",
-            std::process::id()
-        ));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-builder-rename-noreplace").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let old = root.join("old");
@@ -1769,8 +1767,8 @@ mod tests {
             assert_eq!(dir, std::path::PathBuf::from(home).join(".td/kill-audit"));
             assert_eq!(kill_audit_path().unwrap(), dir.join("log"));
         }
-        let root =
-            std::env::temp_dir().join(format!("td-kill-audit-file-test-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-kill-audit-file-test").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir(&root).unwrap();
         let file = root.join(".td/kill-audit/log");

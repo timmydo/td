@@ -226,15 +226,9 @@ mod tests {
         let Ok(config) = std::fs::read_to_string(root.join(".cargo/config.toml")) else {
             return;
         };
-        let base = std::env::temp_dir().join(format!("td-crypto-config-{}", std::process::id()));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        let _base_cleanup = crate::test_temp::TempDir::new("td-crypto-config").unwrap();
+        let base = _base_cleanup.join("fixture");
         std::fs::create_dir(&base).unwrap();
-        let _cleanup = Cleanup(base.clone());
         let base = base.canonicalize().unwrap();
         let checkout = base.join("checkout");
         std::fs::create_dir_all(checkout.join(".cargo")).unwrap();

@@ -1138,7 +1138,8 @@ mod tests {
     // the baseline, so a source-pin bump forces a port re-audit.
     #[test]
     fn ported_script_pins_refuse_a_drifted_script() {
-        let base = std::env::temp_dir().join(format!("td-mesboot-pins-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-mesboot-pins").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         for (rel, _) in PORTED_SCRIPT_PINS {
             let p = base.join(rel);

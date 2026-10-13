@@ -271,11 +271,8 @@ mod tests {
 
     const LADDER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
-    fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("td-broot-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-broot-{tag}")).unwrap()
     }
 
     /// Two items, `tool` referencing `lib` by its canonical path, measured
@@ -330,7 +327,8 @@ mod tests {
         assert_eq!(root.items.len(), 2);
         assert_eq!(root.item(&tool).unwrap().refs, vec![lib.clone()]);
         let seed = base.join("seed");
-        let db = base.join("root.db");
+        let db = base.join("db/root.db");
+        std::fs::create_dir_all(base.join("db")).unwrap();
         admit_with(&root, &[base.join("cache")], &seed, &db).unwrap();
         authenticate_db_with(&root, db.to_str().unwrap(), &seed).unwrap();
         // Idempotent over an already-admitted store.
@@ -363,7 +361,8 @@ mod tests {
         let base = tmp("auth");
         let (root, lib, _tool) = fixture(&base.join("cache"));
         let seed = base.join("seed");
-        let db = base.join("root.db");
+        let db = base.join("db/root.db");
+        std::fs::create_dir_all(base.join("db")).unwrap();
         admit_with(&root, &[base.join("cache")], &seed, &db).unwrap();
         let dbs = db.to_str().unwrap();
 

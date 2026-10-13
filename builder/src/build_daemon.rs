@@ -479,7 +479,8 @@ mod tests {
     /// can exceed K. This is the same property gate `daemon-budget` asserts end to end.
     #[test]
     fn budget_caps_concurrent_builds_across_submitters() {
-        let dir = std::env::temp_dir().join(format!("td-daemon-budget-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-daemon-budget").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let socket = dir.join("sock");
         let socket_s = socket.to_string_lossy().into_owned();
@@ -530,7 +531,8 @@ mod tests {
 
     #[test]
     fn requester_disconnect_cancels_the_bounded_handler() {
-        let dir = std::env::temp_dir().join(format!("td-daemon-disconnect-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-daemon-disconnect").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let socket = dir.join("sock");
         let socket_s = socket.to_string_lossy().into_owned();
@@ -581,7 +583,8 @@ mod tests {
     #[test]
     fn daemon_survives_dead_and_silent_connections() {
         std::env::set_var("TD_DAEMON_READ_TIMEOUT_MS", "100");
-        let dir = std::env::temp_dir().join(format!("td-daemon-hol-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-daemon-hol").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let socket = dir.join("sock");
         let socket_s = socket.to_string_lossy().into_owned();

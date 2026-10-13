@@ -540,7 +540,6 @@ pub fn build_image(root: &Path) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
 
     // ---- minimal in-module reader (the decode side of the format) ------------------
 
@@ -672,11 +671,8 @@ mod tests {
         (nid, meta)
     }
 
-    fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("td-erofs-test-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+    fn tmpdir(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-erofs-test-{tag}")).unwrap()
     }
 
     fn set_mode(p: &Path, mode: u32) {

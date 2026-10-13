@@ -1129,18 +1129,9 @@ pub(crate) fn validate_dynamic_application(
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    fn scratch(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "td-dynamic-application-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(label: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-dynamic-application-{label}")).unwrap()
     }
 
     fn make_executable(path: &Path) {

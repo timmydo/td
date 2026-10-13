@@ -572,11 +572,8 @@ mod tests {
         symlink("/gnu/store/pkg", dir.join("var/guix/gcroots/booted-system")).unwrap();
     }
 
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("td-oci-test-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+    fn tmpdir(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-oci-test-{tag}")).unwrap()
     }
 
     #[test]

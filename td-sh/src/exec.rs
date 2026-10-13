@@ -2554,7 +2554,8 @@ mod tests {
     /// namespace so both are pinned without depending on the host's hostname.
     #[test]
     fn a_proc_field_distinguishes_empty_from_unreadable() {
-        let dir = std::env::temp_dir().join(format!("td-sh-procfield-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-procfield").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, body: &str| {
             let p = dir.join(name);
@@ -3535,7 +3536,8 @@ mod tests {
         // against nothing. Asserted on all three ways a redirection fails: a target
         // that will not open, a descriptor that is not open, and `set -C` refusing
         // to truncate.
-        let kept = std::env::temp_dir().join(format!("td-sh-noclobber-{}", std::process::id()));
+        let _kept_cleanup = td_fs::TempDir::new("td-sh-noclobber").unwrap();
+        let kept = _kept_cleanup.join("fixture");
         // Unwrapped: `set -C` only refuses a file that EXISTS, so a setup that
         // quietly failed would leave the case asserting nothing about noclobber.
         std::fs::write(&kept, b"").expect("noclobber fixture");
@@ -3657,7 +3659,8 @@ mod tests {
         // of the above would notice: the shape is detected by taking the
         // redirections OFF the command, so a bug there loses the body or its
         // output rather than a status.
-        let path = std::env::temp_dir().join(format!("td-sh-bgredir-{}", std::process::id()));
+        let _path_cleanup = td_fs::TempDir::new("td-sh-bgredir").unwrap();
+        let path = _path_cleanup.join("fixture");
         let (_status, out, _) = run(&format!(
             "{{ echo INSIDE; }} >'{p}' & wait $!; echo st=$?; read x <'{p}'; echo got=$x",
             p = path.display()
@@ -3674,7 +3677,8 @@ mod tests {
         // `run_command` do, so it owes what they do around one. `-n` first:
         // applying a redirection IS running, and an output target would be
         // created or truncated by a shell asked only to parse.
-        let unmade = std::env::temp_dir().join(format!("td-sh-noexec-{}", std::process::id()));
+        let _unmade_cleanup = td_fs::TempDir::new("td-sh-noexec").unwrap();
+        let unmade = _unmade_cleanup.join("fixture");
         let _ = std::fs::remove_file(&unmade);
         let (_status, _out, err) = run(&format!("set -n; {{ :; }} >'{}' &", unmade.display()));
         assert!(!unmade.exists(), "-n created the target");
@@ -3682,7 +3686,8 @@ mod tests {
         // And the line, which the redirections expand under: the target names
         // the compound's OWN line, as it does in every other position. Written
         // on line 3 below, and the bug this pins reported the script's first.
-        let dir = std::env::temp_dir().join(format!("td-sh-bgline-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-bgline").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -3737,7 +3742,8 @@ mod tests {
     /// table, not a sweep: a site absent from it is a site nothing checks.
     #[test]
     fn no_diagnostic_carries_rusts_os_error_number() {
-        let dir = std::env::temp_dir().join(format!("td-sh-oserr-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-oserr").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("f"), b"x");
         let d = dir.display();
@@ -3773,7 +3779,8 @@ mod tests {
     #[test]
     fn dot_names_the_file_path_resolved_not_the_operand() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("td-sh-dotpath-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-dotpath").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let sub = dir.join("pdir");
         let _ = std::fs::create_dir_all(&sub);
         let target = sub.join("target.sh");
@@ -3806,7 +3813,8 @@ mod tests {
     #[test]
     fn a_command_that_cannot_be_run_says_why_and_answers_ashs_status() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("td-sh-execwhy-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-execwhy").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let a = dir.join("a");
         let _ = std::fs::create_dir_all(a.join("dirtool"));
         let _ = std::fs::write(a.join("only"), b"data");
@@ -3936,7 +3944,8 @@ mod tests {
     #[test]
     fn a_command_that_cannot_be_spawned_gives_the_systems_reason() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("td-sh-spawnfail-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-spawnfail").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let f = dir.join("noexec");
         let _ = std::fs::write(&f, b"x");
@@ -4172,7 +4181,8 @@ mod tests {
         // A `.` script is the third text that owns its end, and takes a file to
         // be one. What it pins beyond the body is that the SOURCING script
         // carries on afterwards, which is ash's answer too.
-        let dir = std::env::temp_dir().join(format!("td-sh-heredoc-eof-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-heredoc-eof").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let script = dir.join("sourced.sh");
         let _ = std::fs::write(&script, format!("{l} <<E\none"));
@@ -5208,7 +5218,8 @@ mod tests {
     /// only by which spelling asked.
     #[test]
     fn every_redirect_spelling_takes_the_word_ash_gives_it() {
-        let dir = std::env::temp_dir().join(format!("td-sh-spelling-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-spelling").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let p = format!("{}/no/such/dir/x", dir.display());
         for op in ["<", ">", ">>", "<>", ">|"] {
@@ -5308,7 +5319,8 @@ mod tests {
     /// and the line is the file's own, not the caller's.
     #[test]
     fn a_sourced_file_is_the_name_a_failure_inside_it_carries() {
-        let dir = std::env::temp_dir().join(format!("td-sh-srcname-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-srcname").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             return;
@@ -5336,7 +5348,8 @@ mod tests {
     /// they take the system's word for ENOENT where a redirection substitutes.
     #[test]
     fn cd_and_dot_give_the_reason_the_system_gives() {
-        let dir = std::env::temp_dir().join(format!("td-sh-whyfail-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-whyfail").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join("f"), b"x");
         let d = dir.display();
@@ -5435,7 +5448,8 @@ mod tests {
         // classified stops the command before an EARLIER redirection has
         // truncated its file or moved the descriptor the diagnostic goes to.
         // All three assertions below are one fact seen from three sides.
-        let dir = std::env::temp_dir().join(format!("td-sh-twophase-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-twophase").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -5556,7 +5570,8 @@ mod tests {
         // busybox ash's `BASH_REDIR_OUTPUT`, which td's defconfig enables for the
         // same reason `[[` is available: `>&word` whose word is not a descriptor
         // is bash's `&>` -- the word names a FILE and BOTH streams go to it.
-        let dir = std::env::temp_dir().join(format!("td-sh-redirout-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-redirout").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -5636,7 +5651,8 @@ mod tests {
     /// The two decisions in the `set -C` check that `>` and `>&word` share.
     #[test]
     fn noclobber_refuses_an_existing_regular_file_and_only_that() {
-        let dir = std::env::temp_dir().join(format!("td-sh-noclob-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-noclob").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -5710,7 +5726,8 @@ mod tests {
         // did not name, by the option whose whole job is not to. ash creates
         // with `O_CREAT|O_EXCL`, which the kernel refuses to follow a symlink
         // for, so there is no window between the two.
-        let dir = std::env::temp_dir().join(format!("td-sh-dangle-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-dangle").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -5749,7 +5766,8 @@ mod tests {
         // (`LONE_DASH`, ash.c:12012), so a word that needs expanding never
         // reaches that test: `>&'-'` and `>&$v` are ordinary non-digit targets,
         // which on fd 1 name a FILE called `-`. Measured on busybox 1.37.0 ash.
-        let dir = std::env::temp_dir().join(format!("td-sh-baredash-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-baredash").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let both = "sh_o() { echo O; echo E >&2; }; ";
         for (n, spell) in [("q", "$v"), ("r", "'-'"), ("s", "\"-\""), ("t", "\\-")] {
@@ -5786,7 +5804,8 @@ mod tests {
         // number")` (ash.c:12026) and fatal. Without the split the file arm above
         // swallows the overflow and CREATES `99999999999` -- the wrong outcome in
         // the worst direction, since it succeeds.
-        let dir = std::env::temp_dir().join(format!("td-sh-badfd-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-badfd").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -5868,7 +5887,8 @@ mod tests {
         // (the first diagnostic lands in it, since `2>log` had already taken)
         // before checking the later marker is absent -- otherwise a `log` that
         // was never created passes both halves saying nothing.
-        let dir = std::env::temp_dir().join(format!("td-sh-rollback-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-rollback").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -6039,7 +6059,8 @@ mod tests {
         assert_eq!((out.as_str(), err.as_str()), ("CMD\nAFTER\n", ""));
         // And a file-backed descriptor duped onto stdout carries the write to
         // the file, which is the ordinary case the refusal must not reach.
-        let dir = std::env::temp_dir().join(format!("td-sh-dupfile-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-dupfile").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -6062,7 +6083,8 @@ mod tests {
     /// into a job whose output still reaches the terminal.
     #[test]
     fn ampersand_greater_sends_both_streams_to_one_file() {
-        let dir = std::env::temp_dir().join(format!("td-sh-ampgt-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-ampgt").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -6186,7 +6208,8 @@ mod tests {
         // `>>` must not truncate and `<>` must not either; both were moved
         // verbatim into `Plan` arms, where a stray `truncate(true)` reads like
         // its neighbours and destroys the file instead of extending it.
-        let dir = std::env::temp_dir().join(format!("td-sh-openmode-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-openmode").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
@@ -6241,8 +6264,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let uniq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("td-sh-prefix-{}-{}", std::process::id(), uniq));
+        let _path_cleanup =
+            td_fs::TempDir::new(&format!("td-sh-prefix-{}-{}", std::process::id(), uniq)).unwrap();
+        let path = _path_cleanup.join("fixture");
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(b"#!/bin/sh\nprintf %s \"$FOO\"\n").unwrap();

@@ -1398,11 +1398,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("td-stage0-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-stage0-test-{tag}")).unwrap()
     }
 
     /// A shebang line naming a POSIX shell that EXISTS here: a dev host's
@@ -1526,7 +1523,7 @@ mod tests {
         }
     }
 
-    fn native_fixture(tag: &str) -> (PathBuf, ProvisionEnv) {
+    fn native_fixture(tag: &str) -> (crate::test_temp::TempDir, ProvisionEnv) {
         let root = scratch(tag);
         let bin = root.join("toolchain/bin");
         let sysroot = root.join("toolchain");

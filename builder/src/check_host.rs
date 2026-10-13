@@ -2723,15 +2723,8 @@ fn read_frame(stream: &mut UnixStream) -> Result<(u8, Vec<u8>), FrameError> {
 mod request_tmp_tests {
     use super::*;
 
-    fn base(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "td-request-tmp-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn base(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-request-tmp-{tag}")).unwrap()
     }
 
     fn records(dir: &Path) -> PathBuf {
@@ -2750,11 +2743,11 @@ mod request_tmp_tests {
         let records = records(&dir);
         let env = vec![
             (OsString::from("TMPDIR"), OsString::from("/nonexistent")),
-            (OsString::from("TMPDIR"), dir.clone().into_os_string()),
+            (OsString::from("TMPDIR"), dir.to_path_buf().into_os_string()),
         ];
         let one = RequestTmp::new(&env, Path::new("/"), &records).unwrap();
         let two = RequestTmp::new(&env, Path::new("/"), &records).unwrap();
-        assert_eq!(one.path.parent(), Some(dir.as_path()));
+        assert_eq!(one.path.parent(), Some(dir.path()));
         assert!(one.chosen, "under the client's TMPDIR");
         assert_ne!(one.path, two.path);
         let mode = std::fs::metadata(&one.path).unwrap().permissions().mode();
@@ -2946,15 +2939,8 @@ mod tests {
     use super::*;
 
     /// A private directory for one test, named so two cannot collide.
-    fn scratch_runtime(name: &str) -> PathBuf {
-        let runtime = std::env::temp_dir().join(format!(
-            "td-check-host-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&runtime);
-        std::fs::create_dir_all(&runtime).unwrap();
-        runtime
+    fn scratch_runtime(name: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-check-host-{name}")).unwrap()
     }
 
     /// The replacement must not erase the record of what it replaced.
@@ -3957,7 +3943,8 @@ mod tests {
 
     #[test]
     fn request_codec_round_trips_non_utf8_fields() {
-        let dir = std::env::temp_dir().join(format!("td-check-host-codec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-check-host-codec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_file(&dir);
         let listener = UnixListener::bind(&dir).unwrap();
         let client = std::thread::spawn({
@@ -4252,7 +4239,7 @@ mod tests {
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = runtime.join(SOCKET_NAME);
         let serving = {
-            let runtime = runtime.clone();
+            let runtime = runtime.to_path_buf();
             std::thread::spawn(move || serve_with_budget(&runtime, budget))
         };
 

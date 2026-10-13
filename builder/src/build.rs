@@ -5205,7 +5205,8 @@ mod tests {
     /// component below it.
     #[test]
     fn copy_file_places_one_regular_file_strictly() {
-        let base = std::env::temp_dir().join(format!("td-copy-file-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-copy-file").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("store")).unwrap();
         fs::create_dir_all(base.join("tools")).unwrap();
@@ -5309,7 +5310,8 @@ mod tests {
 
     #[test]
     fn line_exception_runtime_is_present_and_not_an_ordinary_alias() {
-        let base = std::env::temp_dir().join(format!("td-line-exception-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-line-exception").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("bin")).unwrap();
         fs::create_dir_all(base.join("lib")).unwrap();
@@ -5332,7 +5334,8 @@ mod tests {
 
     #[test]
     fn cargo_workspace_selection_stays_below_the_source_root() {
-        let base = std::env::temp_dir().join(format!("td-cargo-workspace-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cargo-workspace").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("tool-ws")).unwrap();
         fs::create_dir_all(base.join("nested")).unwrap();
@@ -5376,10 +5379,9 @@ mod tests {
 
     #[test]
     fn cargo_workspace_selection_refuses_explicit_workspace_redirection() {
-        let base = std::env::temp_dir().join(format!(
-            "td-cargo-workspace-redirection-{}",
-            std::process::id()
-        ));
+        let _base_cleanup =
+            crate::test_temp::TempDir::new("td-cargo-workspace-redirection").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let source = base.join("source");
         let selected = source.join("tool-ws");
@@ -5418,8 +5420,8 @@ mod tests {
 
     #[test]
     fn committed_cargo_lock_must_byte_match() {
-        let base =
-            std::env::temp_dir().join(format!("td-cargo-lock-enforcement-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cargo-lock-enforcement").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let cargo_dir = base.join("workspace");
         let vendor_dir = base.join("vendor");
@@ -5447,8 +5449,8 @@ mod tests {
 
     #[test]
     fn committed_cargo_lock_refuses_symlinks_and_non_files() {
-        let base =
-            std::env::temp_dir().join(format!("td-cargo-lock-node-types-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cargo-lock-node-types").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let cargo_dir = base.join("workspace");
         let vendor_dir = base.join("vendor");
@@ -5493,8 +5495,8 @@ mod tests {
 
     #[test]
     fn native_rust_host_linker_is_a_scratch_only_declared_toolchain_wrapper() {
-        let base =
-            std::env::temp_dir().join(format!("td-native-rust-host-linker-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-native-rust-host-linker").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let path = install_native_rust_host_linker(
@@ -5544,7 +5546,8 @@ mod tests {
 
     #[test]
     fn debug_size_deduplicates_hard_links_and_enforces_the_external_ceiling() {
-        let base = std::env::temp_dir().join(format!("td-debug-size-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-debug-size").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let debug = base.join("root/pkg/lib/debug/bin");
         fs::create_dir_all(&debug).unwrap();
@@ -5565,7 +5568,8 @@ mod tests {
 
     #[test]
     fn compare_files_streams_equal_bytes_and_names_the_first_difference() {
-        let base = std::env::temp_dir().join(format!("td-compare-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-compare").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let left = base.join("left");
@@ -5594,8 +5598,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
-    fn test_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("td-build-{tag}-{}", std::process::id()))
+    fn test_dir(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-build-{tag}")).unwrap()
     }
 
     fn minimal_static_elf() -> Vec<u8> {
@@ -5621,7 +5625,7 @@ mod tests {
         bytes
     }
 
-    fn static_application_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    fn static_application_fixture(tag: &str) -> (crate::test_temp::TempDir, PathBuf, PathBuf) {
         let directory = test_dir(tag);
         let _ = fs::remove_dir_all(&directory);
         let out = directory.join("out");
@@ -5997,7 +6001,8 @@ mod tests {
         // leave the mode untouched — a plain fs::write would EACCES (the bug this
         // guards). PR-tier coverage: patch-mesboot's full build is UNPROVISIONED,
         // so this is the only per-PR gate on the read-only rewrite path.
-        let d = std::env::temp_dir().join(format!("td-writero-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-writero").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d); // clear any 0444 leftover from a crashed prior run
         fs::create_dir_all(&d).unwrap();
         let f = d.join("ro.c");
@@ -6034,7 +6039,8 @@ mod tests {
     fn write_preserving_mode_rejects_symlink_target() {
         // A symlinked target must be rejected (not followed) so the grant/write
         // cannot land on a different file than substituteText validated.
-        let d = std::env::temp_dir().join(format!("td-writesym-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-writesym").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         let real = d.join("real.c");
@@ -6077,8 +6083,8 @@ mod tests {
 
     #[test]
     fn application_metadata_finalizer_is_literal_fixed_and_non_overwriting() {
-        let directory =
-            std::env::temp_dir().join(format!("td-application-manifest-{}", std::process::id()));
+        let _directory_cleanup = crate::test_temp::TempDir::new("td-application-manifest").unwrap();
+        let directory = _directory_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         let text = "name=firefox\nversion=1\nruntime=empty-runtime\nentry=/app/bin/firefox\nprovenance=foreign\n\n[Environment]\nTOKEN={root}\n";
@@ -6202,8 +6208,8 @@ mod tests {
 
     #[test]
     fn application_tables_bind_exports_to_exact_package_paths() {
-        let directory =
-            std::env::temp_dir().join(format!("td-application-tables-{}", std::process::id()));
+        let _directory_cleanup = crate::test_temp::TempDir::new("td-application-tables").unwrap();
+        let directory = _directory_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&directory);
         let store = directory.join("store");
         let package = store.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ripgrep-seed-15.2.0");
@@ -6461,7 +6467,8 @@ mod tests {
     /// `noexec` does not cover for `-I`/`-L`.
     #[test]
     fn a_glob_may_not_read_its_way_out_of_the_build_tree() {
-        let d = std::env::temp_dir().join(format!("td-globdir-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-globdir").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d);
         let root = d.join("build");
         let out = d.join("out");
@@ -6503,7 +6510,8 @@ mod tests {
 
     #[test]
     fn a_tool_farm_refuses_a_missing_target_before_linking_it() {
-        let d = std::env::temp_dir().join(format!("td-tool-farm-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-tool-farm").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d);
         let tools = d.join("tools");
         let target = d.join("input/bin/as");
@@ -6674,7 +6682,8 @@ mod tests {
 
     #[test]
     fn mesboot_glob_one_star_matches_sorted_and_rejects_bad_patterns() {
-        let d = std::env::temp_dir().join(format!("td-glob-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-glob").unwrap();
+        let d = _d_cleanup.join("fixture");
         fs::create_dir_all(&d).unwrap();
         for f in ["b.o", "a.o", "c.txt"] {
             fs::write(d.join(f), b"x").unwrap();
@@ -6694,7 +6703,8 @@ mod tests {
 
     #[test]
     fn mesboot_ld_script_relocation_rewrites_marked_so_and_a_scripts() {
-        let d = std::env::temp_dir().join(format!("td-ldscripts-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-ldscripts").unwrap();
+        let d = _d_cleanup.join("fixture");
         let lib = d.join("lib");
         fs::create_dir_all(&lib).unwrap();
         let script = "/* GNU ld script */\nGROUP ( /td/store/glibc-test/lib/libc.so.6 /td/store/glibc-test/lib/libc_nonshared.a )\n";
@@ -6758,7 +6768,8 @@ mod tests {
         // The stage0 SEAL's output half (#378): any /gnu/store byte in the seed
         // rung's output must red the BUILD in the engine. Verified-red by
         // construction: the poisoned tree errors, the clean twin passes.
-        let d = std::env::temp_dir().join(format!("td-stage0-seal-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-stage0-seal").unwrap();
+        let d = _d_cleanup.join("fixture");
         let sub = d.join("AMD64/bin");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("M1"), b"clean bytes").unwrap();
@@ -6788,7 +6799,8 @@ mod tests {
     fn stage0_copy_tree_writable_preserves_exec_and_adds_write() {
         // run_stage0's working copy: store trees are read-only (0444/0555) and the
         // kaem build must write into its tree; exec bits must survive the copy.
-        let d = std::env::temp_dir().join(format!("td-stage0-copy-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-stage0-copy").unwrap();
+        let d = _d_cleanup.join("fixture");
         let src = d.join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("tool"), b"#!x").unwrap();
@@ -6810,7 +6822,8 @@ mod tests {
     fn run_rust_copies_its_source_as_cp_a_and_chmod_u_w_did() {
         // `cp -aT` then `chmod -R u+w`: modes and times kept, links recreated,
         // and every file and directory owner-writable for cargo's target/.
-        let d = std::env::temp_dir().join(format!("td-rust-copy-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-rust-copy").unwrap();
+        let d = _d_cleanup.join("fixture");
         let src = d.join("src");
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("sub/data"), b"d").unwrap();
@@ -7053,7 +7066,8 @@ mod tests {
     /// mount, which is the `noexec` bind undone by another door.
     #[test]
     fn a_payload_may_be_a_root_but_may_not_be_reached_from_an_ordinary_input() {
-        let d = std::env::temp_dir().join(format!("td-payload-refs-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-payload-refs").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d);
         let hash_app = "a".repeat(32);
         let hash_pay = "b".repeat(32);
@@ -7116,7 +7130,8 @@ mod tests {
     /// the exact arrangement §B.8 describes, and rung 5 would have hit it first.
     #[test]
     fn a_payload_may_reach_itself_and_a_second_payload() {
-        let d = std::env::temp_dir().join(format!("td-payload-self-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-payload-self").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&d);
         let hash_app = "a".repeat(32);
         let hash_pay = "b".repeat(32);
@@ -7530,7 +7545,8 @@ mod tests {
     fn vendor_dir_collects_crates_by_filename_guix_free() {
         // TD_VENDOR_DIR: every *.crate is collected, nv = the filename (no /gnu/store path),
         // sorted, non-.crate files ignored — this is td's guix-free crate set.
-        let tmp = std::env::temp_dir().join(format!("td-vendor-dir-test-{}", std::process::id()));
+        let _tmp_cleanup = crate::test_temp::TempDir::new("td-vendor-dir-test").unwrap();
+        let tmp = _tmp_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         fs::write(tmp.join("aho-corasick-1.1.2.crate"), b"y").unwrap();
@@ -7555,7 +7571,8 @@ mod tests {
         // must surface the TAIL of every config.log under the build tree — the
         // failing conftest — bounded (a real tail, not a whole-file dump) and
         // top-level first (a gnulib probe like socklen_t writes the top-level log).
-        let base = std::env::temp_dir().join(format!("td-configlog-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-configlog").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let srcdir = base.join("sed-4.9");
         fs::create_dir_all(srcdir.join("lib")).unwrap();
@@ -7668,7 +7685,8 @@ mod tests {
 
     #[test]
     fn patch_shebangs_rewrites_only_bin_sh_bash_keeping_exec_and_args() {
-        let base = std::env::temp_dir().join(format!("td-shebang-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-shebang").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("sub")).unwrap();
         let bash = "/gnu/store/zzz-bash-5.2.37/bin/bash";
@@ -7734,7 +7752,8 @@ mod tests {
     fn patch_shebangs_rewrites_a_read_only_script_and_restores_its_mode() {
         // less's mkinstalldirs ships 0444 — fs::write would EACCES. The rewrite
         // must succeed (grant write temporarily) and leave the original mode.
-        let base = std::env::temp_dir().join(format!("td-shebang-ro-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-shebang-ro").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let bash = "/gnu/store/zzz-bash-5.2.37/bin/bash";

@@ -1329,7 +1329,8 @@ mod tests {
     /// musl both read it as one empty entry, the cwd); NO_PATH does not.
     #[test]
     fn the_loop_path_reaches_no_bare_name_in_the_cwd() {
-        let dir = std::env::temp_dir().join(format!("td-no-path-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-no-path").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::os::unix::fs::symlink(
@@ -1410,11 +1411,8 @@ mod tests {
 
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("td-subst-env-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(name: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-subst-env-{name}")).unwrap()
     }
 
     /// A usable store: executable td-subst + a narinfo + a non-empty pubkey.
@@ -1542,22 +1540,17 @@ mod scope_key_tests {
     /// another runner each change it.
     #[test]
     fn the_tree_key_survives_a_message_amend_and_nothing_else() {
-        let root = std::env::temp_dir().join(format!(
+        let _root_cleanup = crate::test_temp::TempDir::new(&format!(
             "td-tree-key-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::create_dir_all(root.join("repo")).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).ok();
-            }
-        }
-        let _cleanup = Cleanup(root.clone());
         let repo = root.join("repo");
         if Command::new("git").arg("--version").output().is_err() {
             eprintln!("SKIP: no git");
@@ -1651,7 +1644,8 @@ mod scope_key_tests {
 mod vendor_prelude_tests {
     #[test]
     fn vendor_marker_refuses_symlinks_and_oversized_contents() {
-        let root = std::env::temp_dir().join(format!("td-vendor-marker-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-vendor-marker").unwrap();
+        let root = _root_cleanup.join("fixture");
         let cache = root.join(".td-build-cache/crate-vendor/td-net/vendor");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::create_dir_all(root.join("net")).unwrap();
@@ -1687,7 +1681,8 @@ mod vendor_prelude_tests {
 
     #[test]
     fn consumed_cache_is_checked_before_any_network_capable_tool_resolution() {
-        let root = std::env::temp_dir().join(format!("td-vendor-prelude-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-vendor-prelude").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         let cache = root.join(".td-build-cache/crate-vendor/td-net/vendor");
         std::fs::create_dir_all(&cache).unwrap();

@@ -1188,8 +1188,8 @@ fn ioerr(ctx: &'static str) -> impl Fn(io::Error) -> String {
 mod tests {
     use super::*;
 
-    fn tmp(prefix: &str) -> PathBuf {
-        mktemp_dir(prefix).expect("mktemp")
+    fn tmp(prefix: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-toolchain-test-{prefix}")).unwrap()
     }
 
     // A minimal uncompressed ustar archive of `(path, contents)` members —

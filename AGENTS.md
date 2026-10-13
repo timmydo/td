@@ -312,6 +312,14 @@ branch diff; `--path FILE` explains one path's mapping.
 boundaries are:
 
 - change work happens in an isolated worktree branch;
+- agent review copies, continuations, and other disposable scratch belong
+  under that worktree's `.td-build-cache/agent-scratch/`, never as loose
+  `/tmp` trees. Each agent owns its scratch and deletes it before finishing,
+  restoring owner directory permissions when fixtures removed them;
+- new or changed test fixtures own their temporary trees with the shared
+  `td-fs::TempDir` guard
+  (the control-plane workspace includes its source only under `cfg(test)`),
+  so normal return and assertion unwinding both reclaim them;
 - reserve the `-rolling` suffix for a long-lived stacked workstream that
   continues after partial landings; use a descriptive non-rolling branch for a
   one-off change;

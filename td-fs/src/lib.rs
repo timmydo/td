@@ -6,7 +6,8 @@
 //! use, and that helper's file-system calls, never reach it: td-boot,
 //! td-install and the recipe library include `real_file.rs` alone, td-net
 //! `real_file.rs` and `replace.rs`, and td-update and td-vm-guest
-//! `private_dir.rs` alone.
+//! `private_dir.rs` alone. The control-plane workspace includes
+//! `temp_dir.rs` only under `cfg(test)` to own disposable fixtures.
 
 mod bounded;
 mod private_dir;
@@ -17,3 +18,6 @@ pub use bounded::read_bounded;
 pub use private_dir::{check_private_dir, private_dir};
 pub use real_file::{open_real_file, read_bounded_real_file};
 pub use replace::replace;
+
+mod temp_dir;
+pub use temp_dir::TempDir;

@@ -875,15 +875,11 @@ mod tests {
             eprintln!("SKIP: no git (the in-sandbox gate)");
             return;
         }
-        let base = std::env::temp_dir().join(format!("td-main-integration-{}", std::process::id()));
+        let _base_cleanup =
+            crate::test_temp::TempDir::new(&format!("td-main-integration-{}", std::process::id()))
+                .unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
-        struct Rm(PathBuf);
-        impl Drop for Rm {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let _rm = Rm(base.clone());
         let (origin, work, clone) = (base.join("origin"), base.join("work"), base.join("repo"));
         for d in [&origin, &work] {
             fs::create_dir_all(d).unwrap();

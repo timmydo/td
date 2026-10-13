@@ -73,6 +73,9 @@ mod store_db_read;
 mod sys;
 mod tar;
 mod test_root;
+#[cfg(test)]
+#[path = "../../td-fs/src/temp_dir.rs"]
+mod test_temp;
 mod toolchain_x86_64;
 mod verdict_journal;
 mod xz;
@@ -12681,8 +12684,8 @@ mod tests {
 
     #[test]
     fn check_scratch_sweep_preserves_a_live_run_and_reclaims_a_crash() {
-        let parent =
-            std::env::temp_dir().join(format!("td-check-scratch-sweep-{}", std::process::id()));
+        let _parent_cleanup = crate::test_temp::TempDir::new("td-check-scratch-sweep").unwrap();
+        let parent = _parent_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&parent);
         let stale = parent.join("run-1-0");
         let active = parent.join("run-2-0");
@@ -12732,8 +12735,8 @@ mod tests {
 
     #[test]
     fn check_scratch_cleanup_reclaims_mode_000_trees() {
-        let parent =
-            std::env::temp_dir().join(format!("td-check-scratch-mode-{}", std::process::id()));
+        let _parent_cleanup = crate::test_temp::TempDir::new("td-check-scratch-mode").unwrap();
+        let parent = _parent_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&parent);
         let run = parent.join("run-1-0");
         let nested = run.join("tmp/closed");
@@ -12798,7 +12801,8 @@ mod tests {
     /// fallback (never a comparison against an absent baseline). This pins that decision.
     #[test]
     fn output_trees_present_gates_the_repro_build_reuse() {
-        let dir = std::env::temp_dir().join(format!("td-repro-baseline-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-repro-baseline").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         // Canonical paths under the ACTIVE store (now the native `/td/store` default);
         // daemon_host_path strips that prefix to place the host tree under `dir`.
@@ -12870,7 +12874,8 @@ mod tests {
             "{err}"
         );
 
-        let dir = std::env::temp_dir().join(format!("td-shell-source-pin-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-shell-source-pin").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("ripgrep.crate");
@@ -13046,7 +13051,8 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
 
     #[test]
     fn loop_tree_helpers_find_names_and_bytes() {
-        let d = std::env::temp_dir().join(format!("td-loop-tree-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-loop-tree").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("a/b")).unwrap();
         std::fs::write(d.join("a/b/libstdc++.so.6.0"), b"hello /td/store").unwrap();
@@ -13106,7 +13112,10 @@ daemon build START (2/2 active)
 daemon build START (2/2 active)
 ";
         assert_eq!(daemon_budget_stats(log, 2).unwrap(), (2, 3));
-        let d = std::env::temp_dir().join(format!("td-daemon-budget-{}.log", std::process::id()));
+        let _d_cleanup =
+            crate::test_temp::TempDir::new(&format!("td-daemon-budget-{}.log", std::process::id()))
+                .unwrap();
+        let d = _d_cleanup.join("fixture");
         std::fs::write(&d, log).unwrap();
         assert_eq!(
             daemon_budget_check(d.to_str().unwrap(), "2").unwrap(),
@@ -13282,7 +13291,8 @@ daemon build START (2/2 active)
         // deriver, or an unknown output is a MISS (rebuild). Reuse TRUSTS the store's
         // bytes — a tampered-but-registered tree still HITS (on-disk integrity is the
         // separate `store-verify` fsck's job, not this hot path).
-        let tmp = std::env::temp_dir().join(format!("td-persist-real-{}", std::process::id()));
+        let _tmp_cleanup = crate::test_temp::TempDir::new("td-persist-real").unwrap();
+        let tmp = _tmp_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
         let base = "00000000000000000000000000000abc-persist-demo-1";
@@ -13421,7 +13431,8 @@ daemon build START (2/2 active)
     fn store_verify_catches_a_tampered_tree() {
         // The integrity check the warm reuse path drops: a registered tree that is later
         // tampered on disk verifies clean BEFORE the tamper and FAILS after.
-        let tmp = std::env::temp_dir().join(format!("td-store-verify-{}", std::process::id()));
+        let _tmp_cleanup = crate::test_temp::TempDir::new("td-store-verify").unwrap();
+        let tmp = _tmp_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
         let base = "00000000000000000000000000000abc-verify-demo-1";
@@ -13468,7 +13479,8 @@ daemon build START (2/2 active)
     #[test]
     fn link_canonical_hardlinks_canonical_copies_noncanonical() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let tmp = std::env::temp_dir().join(format!("td-linkcanon-{}", std::process::id()));
+        let _tmp_cleanup = crate::test_temp::TempDir::new("td-linkcanon").unwrap();
+        let tmp = _tmp_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
         std::fs::create_dir_all(src.join("bin")).unwrap();
@@ -13716,7 +13728,8 @@ daemon build START (2/2 active)
     // symlinks at the LOGICAL store path, so the profile resolves in a store-ns own-root.
     #[test]
     fn profile_store_native_links_logical_paths() {
-        let dir = std::env::temp_dir().join(format!("prof-sn-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("prof-sn").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::remove_dir_all(&dir).ok();
         let pkg = dir.join("aaaa-hello");
         std::fs::create_dir_all(pkg.join("bin")).unwrap();
@@ -13751,7 +13764,8 @@ daemon build START (2/2 active)
     // build_profile still refuses a name collision across packages (store-native or not).
     #[test]
     fn profile_rejects_collision() {
-        let dir = std::env::temp_dir().join(format!("prof-col-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("prof-col").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::remove_dir_all(&dir).ok();
         for p in ["aaaa-a", "bbbb-b"] {
             std::fs::create_dir_all(dir.join(p).join("bin")).unwrap();
@@ -13777,7 +13791,8 @@ daemon build START (2/2 active)
     // not a node.
     #[test]
     fn auto_topo_orders_deps_before_dependents() {
-        let d = std::env::temp_dir().join(format!("td-auto-topo-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-topo").unwrap();
+        let d = _d_cleanup.join("fixture");
         let rj = d.join("rj");
         std::fs::create_dir_all(&rj).unwrap();
         let put = |name: &str, json: &str| {
@@ -13813,7 +13828,8 @@ daemon build START (2/2 active)
     /// no injected question: the mark is a key in a file the test writes.
     #[test]
     fn auto_topo_refuses_a_marked_payload_on_the_tool_channel() {
-        let d = std::env::temp_dir().join(format!("td-auto-foreign-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-foreign").unwrap();
+        let d = _d_cleanup.join("fixture");
         let rj = d.join("rj");
         std::fs::create_dir_all(&rj).unwrap();
         let put = |name: &str, json: &str| {
@@ -13917,7 +13933,8 @@ daemon build START (2/2 active)
             assert!(e.contains("inputs"), "{e}");
         }
         // ...and it reaches the walk, rather than being a refusal nothing calls.
-        let d = std::env::temp_dir().join(format!("td-badchan-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-badchan").unwrap();
+        let d = _d_cleanup.join("fixture");
         let rj = d.join("rj");
         std::fs::create_dir_all(&rj).unwrap();
         std::fs::write(rj.join("s.json"), r#"{"name":"s","inputs":"firefox"}"#).unwrap();
@@ -14102,7 +14119,8 @@ daemon build START (2/2 active)
     // review named).
     #[test]
     fn authenticate_ca_db_admits_only_self_addressing_rows() {
-        let d = std::env::temp_dir().join(format!("td-auth-ca-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auth-ca").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         // Green: interned bytes, canonical name, matching db row.
         let items = d.join("items");
@@ -14409,7 +14427,8 @@ daemon build START (2/2 active)
     // the NAMED output; an unknown output name is an error (not a silent skip).
     #[test]
     fn drv_declared_inputs_resolves_srcs_and_input_drvs() {
-        let tmp = std::env::temp_dir().join(format!("td-declared-inputs-{}", std::process::id()));
+        let _tmp_cleanup = crate::test_temp::TempDir::new("td-declared-inputs").unwrap();
+        let tmp = _tmp_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         // A real input .drv with two named outputs, serialized the way drv::parse reads.
@@ -14471,7 +14490,8 @@ daemon build START (2/2 active)
     // producer. Green: the receipt commit_scratch_to_store writes.
     #[test]
     fn authenticate_recipe_output_db_requires_receipt_backing() {
-        let d = std::env::temp_dir().join(format!("td-auth-ro-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auth-ro").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let out_path = format!("/td/store/{}-out-1.0", "a".repeat(32));
@@ -14523,7 +14543,8 @@ daemon build START (2/2 active)
     // basename, so every engine-produced db failed `--recipe-output-db` intake.
     #[test]
     fn engine_written_receipts_pass_recipe_output_db_intake() {
-        let d = std::env::temp_dir().join(format!("td-receipt-roundtrip-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-receipt-roundtrip").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let out_path = format!("/td/store/{}-out-1.0", "b".repeat(32));
@@ -14566,7 +14587,8 @@ daemon build START (2/2 active)
     /// was missing.
     #[test]
     fn a_step_scratch_db_authenticates_through_its_written_sidecar() {
-        let d = std::env::temp_dir().join(format!("td-step-sidecar-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-step-sidecar").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let out_path = format!("/td/store/{}-out-1.0", "d".repeat(32));
@@ -14678,7 +14700,8 @@ daemon build START (2/2 active)
     /// two equal.
     #[test]
     fn a_reused_scratch_keeps_only_the_current_receipt() {
-        let d = std::env::temp_dir().join(format!("td-step-sidecar-reuse-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-step-sidecar-reuse").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let mk = |tag: &str, hash: &str| OutputReg {
@@ -14815,7 +14838,8 @@ daemon build START (2/2 active)
     // compile of this repo's builder/ source.
     #[test]
     fn an_unrecorded_builder_tree_cannot_be_typed_control_plane() {
-        let d = std::env::temp_dir().join(format!("td-lineage-intake-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-lineage-intake").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let canonical = format!("/gnu/store/{}-not-a-stage0-1.0", "f".repeat(32));
@@ -14845,7 +14869,8 @@ daemon build START (2/2 active)
     // the table never pinned. Absent db: vacuous (no rows, no authority).
     #[test]
     fn authenticate_seed_db_rejects_unpinned_rows_and_passes_pinned_ones() {
-        let d = std::env::temp_dir().join(format!("td-auth-seed-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auth-seed").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         let reg = |p: &str, h: &str| OutputReg {
             store_path: p.to_string(),
@@ -14928,7 +14953,8 @@ daemon build START (2/2 active)
     // the retained seed db would then be rejected over.
     #[test]
     fn store_path_recursive_agrees_with_the_intern_and_touches_no_store() {
-        let d = std::env::temp_dir().join(format!("td-store-path-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-store-path").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         let src = d.join("tree");
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -14963,7 +14989,8 @@ daemon build START (2/2 active)
     // the naive join would have fed to remove_dir_all.
     #[test]
     fn retain_registered_paths_never_deletes_outside_the_store() {
-        let d = std::env::temp_dir().join(format!("td-retain-esc-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-retain-esc").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         let items = d.join("items");
         std::fs::create_dir_all(&items).unwrap();
@@ -15004,8 +15031,8 @@ daemon build START (2/2 active)
     /// A build cache with one row per letter, each with its own receipt and tree, laid
     /// out the way `commit_scratch_to_store` leaves it: `store/<base>`, `db`, and
     /// `db.receipts/<drv-base>.receipt`. Returns (dir, store, db).
-    fn gc_fixture(tag: &str, regs: &[OutputReg]) -> (PathBuf, PathBuf, PathBuf) {
-        let d = std::env::temp_dir().join(format!("td-gc-{tag}-{}", std::process::id()));
+    fn gc_fixture(tag: &str, regs: &[OutputReg]) -> (crate::test_temp::TempDir, PathBuf, PathBuf) {
+        let d = crate::test_temp::TempDir::new(&format!("td-gc-{tag}")).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         let store = d.join("store");
         let receipts = d.join("db.receipts");
@@ -15287,7 +15314,8 @@ daemon build START (2/2 active)
     // fresh memo names.
     #[test]
     fn store_gc_unused_without_a_db_reclaims_orphans_only() {
-        let d = std::env::temp_dir().join(format!("td-gc-empty-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-gc-empty").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let store = d.join("store");
@@ -15370,7 +15398,8 @@ daemon build START (2/2 active)
     // `sourceInput` becomes the `<name>-source` line.
     #[test]
     fn auto_synthesize_lock_marks_owned_deps_and_resolves_the_rest() {
-        let d = std::env::temp_dir().join(format!("td-auto-synth-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-synth").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         // Seed inputs must be REAL compiled-table keys with their audited repo
@@ -15460,7 +15489,8 @@ daemon build START (2/2 active)
     // `verify-store`; provenance no longer re-hashes the on-disk bytes per rung.
     #[test]
     fn auto_seed_provenance_binds_the_compiled_table_and_trusts_interned_bytes() {
-        let d = std::env::temp_dir().join(format!("td-auto-selfreg-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-selfreg").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         // Green: the audited repo bytes at the pinned basename pass.
@@ -15617,8 +15647,8 @@ daemon build START (2/2 active)
     #[test]
     fn verify_local_source_roster_basename_reds_loudly_naming_the_key_before_touching_the_checkout()
     {
-        let scratch =
-            std::env::temp_dir().join(format!("td-verify-lsr-loud-reds-{}", std::process::id()));
+        let _scratch_cleanup = crate::test_temp::TempDir::new("td-verify-lsr-loud-reds").unwrap();
+        let scratch = _scratch_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&scratch);
 
         with_repo_root_env_raw(None, || {
@@ -15660,10 +15690,9 @@ daemon build START (2/2 active)
         with_repo_root_env(|root| {
             // A PROBE stage, independent of the function under test, just to
             // learn the checkout's own current basename as ground truth.
-            let probe_dir = std::env::temp_dir().join(format!(
-                "td-verify-local-source-roster-probe-{}",
-                std::process::id()
-            ));
+            let _probe_dir_cleanup =
+                crate::test_temp::TempDir::new("td-verify-local-source-roster-probe").unwrap();
+            let probe_dir = _probe_dir_cleanup.join("fixture");
             let _ = std::fs::remove_dir_all(&probe_dir);
             let staged = stage_roster_key(root, "td-mail-source", &probe_dir);
             let staged_s = staged.to_str().unwrap();
@@ -15674,10 +15703,9 @@ daemon build START (2/2 active)
             // The function's OWN claimed scratch directory (re #469 SHOULD-FIX
             // A): distinct from the probe above, and it must clean up after
             // itself on both the accept and the reject path.
-            let scratch = std::env::temp_dir().join(format!(
-                "td-verify-local-source-roster-scratch-{}",
-                std::process::id()
-            ));
+            let _scratch_cleanup =
+                crate::test_temp::TempDir::new("td-verify-local-source-roster-scratch").unwrap();
+            let scratch = _scratch_cleanup.join("fixture");
             let _ = std::fs::remove_dir_all(&scratch);
 
             verify_local_source_roster_basename("td-mail-source", expected_base, &scratch)
@@ -15708,13 +15736,15 @@ daemon build START (2/2 active)
     fn verify_local_source_roster_basename_rejects_a_root_whose_roster_differs() {
         // The pid alone is not unique: in a check's pid namespace it is a
         // small number every concurrent run shares, over one /tmp.
-        let d = std::env::temp_dir().join(format!(
+        let _d_cleanup = crate::test_temp::TempDir::new(&format!(
             "td-roster-anchor-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_nanos())
-        ));
+        ))
+        .unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         let real_root = seed_repo_root();
         let fake_root = d.join("root");
@@ -15780,8 +15810,8 @@ daemon build START (2/2 active)
     #[test]
     fn auto_seed_provenance_re_derives_a_local_source_roster_key_and_rejects_a_forged_basename() {
         with_repo_root_env(|root| {
-            let d =
-                std::env::temp_dir().join(format!("td-auto-local-source-{}", std::process::id()));
+            let _d_cleanup = crate::test_temp::TempDir::new("td-auto-local-source").unwrap();
+            let d = _d_cleanup.join("fixture");
             let _ = std::fs::remove_dir_all(&d);
             let seeds = d.join("seed-store");
             std::fs::create_dir_all(&seeds).unwrap();
@@ -15838,10 +15868,8 @@ daemon build START (2/2 active)
     #[test]
     fn authenticate_seed_db_refuses_a_local_source_roster_row() {
         with_repo_root_env(|root| {
-            let d = std::env::temp_dir().join(format!(
-                "td-auth-keyed-refuses-local-{}",
-                std::process::id()
-            ));
+            let _d_cleanup = crate::test_temp::TempDir::new("td-auth-keyed-refuses-local").unwrap();
+            let d = _d_cleanup.join("fixture");
             let _ = std::fs::remove_dir_all(&d);
             let items = d.join("items");
             std::fs::create_dir_all(&items).unwrap();
@@ -15869,7 +15897,8 @@ daemon build START (2/2 active)
     // present non-file is refused rather than skipped.
     #[test]
     fn present_local_seed_db_drops_an_absent_path_and_refuses_a_non_file() {
-        let d = std::env::temp_dir().join(format!("td-present-local-db-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-present-local-db").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("a-directory")).unwrap();
         std::fs::write(d.join("a-file.db"), b"").unwrap();
@@ -15900,8 +15929,8 @@ daemon build START (2/2 active)
     fn authenticate_local_seed_db_accepts_the_current_derivation_and_rejects_a_different_trees_one()
     {
         with_repo_root_env(|root| {
-            let d =
-                std::env::temp_dir().join(format!("td-auth-local-seed-db-{}", std::process::id()));
+            let _d_cleanup = crate::test_temp::TempDir::new("td-auth-local-seed-db").unwrap();
+            let d = _d_cleanup.join("fixture");
             let _ = std::fs::remove_dir_all(&d);
             let items = d.join("items");
             std::fs::create_dir_all(&items).unwrap();
@@ -15948,7 +15977,8 @@ daemon build START (2/2 active)
     // behavior, which admitted exactly these strings as `seed` lock entries.
     #[test]
     fn auto_synthesize_lock_rejects_host_paths_at_planning() {
-        let d = std::env::temp_dir().join(format!("td-auto-hostpath-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-hostpath").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(d.join("mes.json"), r#"{"name":"mes","inputs":["bash"]}"#).unwrap();
@@ -15979,7 +16009,8 @@ daemon build START (2/2 active)
     // copied any non-td-recipe-output path through unchanged.
     #[test]
     fn build_plan_rejects_host_path_and_crate_lock_entries() {
-        let d = std::env::temp_dir().join(format!("td-plan-gate-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-plan-gate").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(d.join("mes.json"), r#"{"name":"mes"}"#).unwrap();
@@ -16031,7 +16062,8 @@ daemon build START (2/2 active)
     // hash — the same record realize_drv assembles the staging manifest from.
     #[test]
     fn output_db_hashes_round_trip_for_the_staging_manifest() {
-        let d = std::env::temp_dir().join(format!("td-manifest-db-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-manifest-db").unwrap();
+        let d = _d_cleanup.join("fixture");
         std::fs::create_dir_all(&d).unwrap();
         let reg = OutputReg {
             store_path: "/td/store/aaa-mes-0.27.1".to_string(),
@@ -16058,7 +16090,8 @@ daemon build START (2/2 active)
     // on every multi-seed rung (subagent review, round 4; re #469).
     #[test]
     fn store_add_recursive_accumulates_every_interned_seed_in_one_db() {
-        let d = std::env::temp_dir().join(format!("td-seed-db-merge-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-seed-db-merge").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         for (name, bytes) in [("one", "alpha\n"), ("two", "beta\n")] {
             let s = d.join(name);
@@ -16105,7 +16138,8 @@ daemon build START (2/2 active)
     #[test]
     fn concurrent_interns_of_different_seeds_all_stay_vouched() {
         const N: usize = 8;
-        let d = std::env::temp_dir().join(format!("td-seed-db-race-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-seed-db-race").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         for i in 0..N {
             let s = d.join(format!("src{i}"));
@@ -16208,7 +16242,8 @@ daemon build START (2/2 active)
     #[test]
     fn store_add_builder_re_places_idempotently_and_rejects_a_corrupt_item() {
         use std::os::unix::fs::PermissionsExt;
-        let d = std::env::temp_dir().join(format!("td-sab-idem-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-sab-idem").unwrap();
+        let d = _d_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&d);
         let tree = d.join("tree");
         std::fs::create_dir_all(tree.join("bin")).unwrap();
@@ -16262,7 +16297,8 @@ daemon build START (2/2 active)
     // Duplicate rows with the SAME hash are merely redundant, not corrupt.
     #[test]
     fn hashes_by_path_rejects_intra_db_hash_conflicts() {
-        let d = std::env::temp_dir().join(format!("td-dup-hash-db-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-dup-hash-db").unwrap();
+        let d = _d_cleanup.join("fixture");
         std::fs::create_dir_all(&d).unwrap();
         let mk = |h: &str| OutputReg {
             store_path: "/td/store/aaa-mes-0.27.1".to_string(),
@@ -16293,7 +16329,8 @@ daemon build START (2/2 active)
     // gate passes and the not-interned arm is what fires).
     #[test]
     fn auto_synthesize_lock_rejects_uninterned_seeds_at_planning() {
-        let d = std::env::temp_dir().join(format!("td-auto-unintern-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-unintern").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         std::fs::write(
@@ -16320,7 +16357,8 @@ daemon build START (2/2 active)
     // sibling rung's output) gets NO `<name>-source` line at all — no nominal-source alias.
     #[test]
     fn auto_synthesize_lock_omits_the_source_line_when_none_declared() {
-        let d = std::env::temp_dir().join(format!("td-auto-synth-nosrc-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-synth-nosrc").unwrap();
+        let d = _d_cleanup.join("fixture");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("make-test.json"),
@@ -16341,7 +16379,8 @@ daemon build START (2/2 active)
     // error, never a silently dropped edge.
     #[test]
     fn auto_synthesize_lock_errors_on_an_unresolvable_input() {
-        let d = std::env::temp_dir().join(format!("td-auto-synth-err-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-synth-err").unwrap();
+        let d = _d_cleanup.join("fixture");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("tcc.json"),
@@ -16360,7 +16399,8 @@ daemon build START (2/2 active)
     // it) — the synthesis genuinely reads the recipe graph, not a stale hand-written one.
     #[test]
     fn auto_synthesize_lock_changes_when_declared_inputs_change() {
-        let d = std::env::temp_dir().join(format!("td-auto-synth-perturb-{}", std::process::id()));
+        let _d_cleanup = crate::test_temp::TempDir::new("td-auto-synth-perturb").unwrap();
+        let d = _d_cleanup.join("fixture");
         let seeds = d.join("seed-store");
         std::fs::create_dir_all(&seeds).unwrap();
         let mut map = std::collections::BTreeMap::new();
@@ -16411,7 +16451,8 @@ daemon build START (2/2 active)
     // the durable round-trip of the substitute server's store-coupled half, no DB/network.
     #[test]
     fn subst_export_writes_narinfos_and_restorable_nars() {
-        let base = std::env::temp_dir().join(format!("td-subst-export-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-subst-export").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         // Two synthetic store paths; "app" references "lib".
         let lib = "/gnu/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib";
@@ -16473,7 +16514,8 @@ daemon build START (2/2 active)
     // per-path export can't express (ld is not a `<hash>-name` store path).
     #[test]
     fn harness_subst_export_ships_the_whole_tree_under_a_fixed_name() {
-        let base = std::env::temp_dir().join(format!("td-harness-export-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-harness-export").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let hdir = base.join("harness");
         // A harness-shaped fixture: store/<rel>/bin/busybox (exec), a loose store/ld loader,
@@ -16554,7 +16596,8 @@ daemon build START (2/2 active)
     // build db but NOT staged in its newstore, so a per-output publish must skip them.
     #[test]
     fn subst_export_members_paths_only_exports_roots_not_their_closure() {
-        let dir = std::env::temp_dir().join(format!("td-subst-paths-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-subst-paths").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let app = "/gnu/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-app".to_string();
@@ -16597,7 +16640,8 @@ daemon build START (2/2 active)
     // to the bytes the publisher signed). The consumer's core, no network/DB.
     #[test]
     fn restore_substitute_round_trips_and_rejects_corruption() {
-        let base = std::env::temp_dir().join(format!("td-subst-restore-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-subst-restore").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let store_path = "/td/store/cccccccccccccccccccccccccccccccc-app";
         let app_base = "cccccccccccccccccccccccccccccccc-app";
@@ -16666,7 +16710,8 @@ daemon build START (2/2 active)
     // The old code only cleaned on a NarHash mismatch, not on a parse/write error.
     #[test]
     fn restore_substitute_cleans_partial_tree_on_parse_error() {
-        let base = std::env::temp_dir().join(format!("td-subst-partial-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-subst-partial").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let store_path = "/td/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-app";
         let app_base = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-app";
@@ -16720,7 +16765,8 @@ daemon build START (2/2 active)
     // substitution of itself.
     #[test]
     fn restore_substitute_clears_a_stale_file_dest() {
-        let base = std::env::temp_dir().join(format!("td-subst-stale-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-subst-stale").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let store_path = "/td/store/ffffffffffffffffffffffffffffffff-app";
         let app_base = "ffffffffffffffffffffffffffffffff-app";
@@ -16792,7 +16838,8 @@ daemon build START (2/2 active)
     // never served, and a corrupted cache entry rebuilds rather than serving garbage.
     #[test]
     fn cached_realization_hits_only_on_a_present_and_nar_verified_output() {
-        let base = std::env::temp_dir().join(format!("td-cache-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cache").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let scratch = base.join("b");
         let store_path = "/gnu/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-thing-1.0";
@@ -16928,7 +16975,8 @@ daemon build START (2/2 active)
     // not have: an EXECUTABLE file and a SYMLINK (plus a subdir + a plain file).
     #[test]
     fn copy_canonical_is_nar_identical_with_exec_and_symlink() {
-        let base = std::env::temp_dir().join(format!("td-cc-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cc").unwrap();
+        let base = _base_cleanup.join("fixture");
         let src = base.join("src");
         let dst = base.join("dst");
         let _ = std::fs::remove_dir_all(&base);
@@ -16980,7 +17028,8 @@ daemon build START (2/2 active)
     // Holds whether we reflinked (CoW) or fell back to a byte copy.
     #[test]
     fn copy_canonical_is_write_independent_of_source() {
-        let base = std::env::temp_dir().join(format!("td-cc-ind-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cc-ind").unwrap();
+        let base = _base_cleanup.join("fixture");
         let src = base.join("src");
         let dst = base.join("dst");
         let _ = std::fs::remove_dir_all(&base);
@@ -17009,7 +17058,8 @@ daemon build START (2/2 active)
     // instead of silently keeping stale bytes under a fresh store record.
     #[test]
     fn commit_tree_checked_rejects_mismatched_existing_dest() {
-        let base = std::env::temp_dir().join(format!("td-ctc-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-ctc").unwrap();
+        let base = _base_cleanup.join("fixture");
         let src = base.join("src");
         let dst = base.join("dst");
         let _ = std::fs::remove_dir_all(&base);
@@ -17058,7 +17108,8 @@ daemon build START (2/2 active)
     #[test]
     fn commit_tree_checked_link_hardlinks_into_fresh_dest() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let base = std::env::temp_dir().join(format!("td-ctc-link-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-ctc-link").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let src = base.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -17103,7 +17154,8 @@ daemon build START (2/2 active)
     // shared cache. Contrast the registered case above, which MUST fail closed.
     #[test]
     fn commit_tree_checked_recovers_a_torn_unregistered_orphan() {
-        let base = std::env::temp_dir().join(format!("td-ctc-recover-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-ctc-recover").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let src = base.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -17135,7 +17187,8 @@ daemon build START (2/2 active)
     // pid's staging tree (a concurrent committer, or our own in-flight one) is never removed.
     #[test]
     fn sweep_commit_temps_reaps_dead_pid_temps_only() {
-        let dir = std::env::temp_dir().join(format!("td-sweep-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-sweep").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A dead pid (u32::MAX is never a live process) and this live test process.
@@ -17160,7 +17213,8 @@ daemon build START (2/2 active)
     // new bytes but never a truncated file — the torn-db/torn-receipt failure mode.
     #[test]
     fn write_atomic_replaces_without_leaving_a_temp() {
-        let dir = std::env::temp_dir().join(format!("td-watomic-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-watomic").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("db");
@@ -17180,7 +17234,8 @@ daemon build START (2/2 active)
     // empty (which would misjudge every registered path a torn orphan and clobber the cache).
     #[test]
     fn read_registered_paths_distinguishes_missing_from_torn() {
-        let dir = std::env::temp_dir().join(format!("td-regpaths-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-regpaths").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("db");
@@ -17221,7 +17276,8 @@ daemon build START (2/2 active)
     // torn orphan and clobber the cache. It must fail closed.
     #[test]
     fn read_registered_paths_fails_closed_on_a_dangling_db_symlink() {
-        let dir = std::env::temp_dir().join(format!("td-regpaths-dangle-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-regpaths-dangle").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("db");
@@ -17241,7 +17297,8 @@ daemon build START (2/2 active)
     // committer the client-side ladder lock does not cover.
     #[test]
     fn lock_store_commit_is_exclusive_per_store() {
-        let dir = std::env::temp_dir().join(format!("td-commitlock-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-commitlock").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let store = dir.join("build-cache");
         std::fs::create_dir_all(&store).unwrap();
@@ -17336,7 +17393,8 @@ daemon build START (2/2 active)
     /// a different path — the channel is hashed data, not a comment.
     #[test]
     fn the_payload_channel_costs_an_unset_recipe_nothing_in_the_drv() {
-        let dir = std::env::temp_dir().join(format!("td-payload-spec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-payload-spec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17440,7 +17498,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn application_metadata_binds_final_recipe_answers_into_every_application_phase_contract() {
-        let dir = std::env::temp_dir().join(format!("td-application-spec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-application-spec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17596,8 +17655,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn static_application_validation_is_manifest_bound_terminal_and_non_spawning() {
-        let dir =
-            std::env::temp_dir().join(format!("td-static-application-spec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-static-application-spec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17771,7 +17830,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn malformed_or_oversized_application_metadata_refuses_drv_assembly() {
-        let dir = std::env::temp_dir().join(format!("td-bad-application-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-bad-application").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17895,10 +17955,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn a_non_mesboot_application_may_stage_only_its_compiled_runtime_payload() {
-        let dir = std::env::temp_dir().join(format!(
-            "td-application-extra-payload-{}",
-            std::process::id()
-        ));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-application-extra-payload").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17917,7 +17975,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_honors_td_gcc_toolchain() {
-        let dir = std::env::temp_dir().join(format!("td-gcctc-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-gcctc").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -17986,7 +18045,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_keeps_large_steps_as_exact_hashed_data() {
-        let dir = std::env::temp_dir().join(format!("td-large-steps-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-large-steps").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -18025,8 +18085,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_hashes_typed_split_debug_policy() {
-        let dir =
-            std::env::temp_dir().join(format!("td-split-debug-policy-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-split-debug-policy").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -18063,7 +18123,8 @@ daemon build START (2/2 active)
     // the recipe's drv path or output path. That is the whole point of the migration.
     #[test]
     fn assemble_recipe_drv_keys_the_builder_on_the_abi_identity_path() {
-        let dir = std::env::temp_dir().join(format!("td-abi-id-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-abi-id").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("fixture.lock");
@@ -18205,7 +18266,8 @@ daemon build START (2/2 active)
     // it (so the two genuinely differ and the fix is load-bearing).
     #[test]
     fn resolve_link_closure_excludes_a_string_only_host_shell() {
-        let dir = std::env::temp_dir().join(format!("rlc-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("rlc").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let seed = dir.join("seed");
         let cp = "/gnu/store";
@@ -18304,7 +18366,8 @@ daemon build START (2/2 active)
     // fix — the reason the content-scanned bash-static/glibc no longer reach the sandbox.
     #[test]
     fn static_builder_stages_nothing_even_when_it_embeds_glibc_host_paths() {
-        let dir = std::env::temp_dir().join(format!("sbn-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("sbn").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let seed = dir.join("seed");
         let cp = "/gnu/store";
@@ -18486,7 +18549,8 @@ daemon build START (2/2 active)
     // clears ambient env; every value must therefore ride in the drv.
     #[test]
     fn assemble_recipe_drv_forwards_td_rust_store_env() {
-        let dir = std::env::temp_dir().join(format!("td-ruststore-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-ruststore").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("ripgrep.lock");
@@ -18680,7 +18744,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn assemble_recipe_drv_hashes_and_validates_cargo_lock_policy() {
-        let dir = std::env::temp_dir().join(format!("td-cargo-lock-policy-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-cargo-lock-policy").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("tool.lock");
@@ -18950,8 +19015,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn confined_repo_lock_refuses_symlinks_and_nonregular_nodes() {
-        let root =
-            std::env::temp_dir().join(format!("td-confined-cargo-lock-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-confined-cargo-lock").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("locks")).unwrap();
         std::fs::write(root.join("locks/Cargo.lock"), "version = 4\n").unwrap();
@@ -18983,10 +19048,8 @@ daemon build START (2/2 active)
 
     #[test]
     fn confined_repo_lock_keeps_parent_directory_identity_across_rename() {
-        let base = std::env::temp_dir().join(format!(
-            "td-confined-cargo-lock-race-{}",
-            std::process::id()
-        ));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-confined-cargo-lock-race").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("repo");
         let moved = base.join("moved-repo");
@@ -19019,8 +19082,10 @@ daemon build START (2/2 active)
     // is ignored, a tampered/missing crate fails closed (re #547).
     #[test]
     fn stage_verified_vendor_gates_on_the_committed_checksums() {
-        let dir = std::env::temp_dir().join(format!("td-vendorverify-{}", std::process::id()));
-        let staged = std::env::temp_dir().join(format!("td-vendorstaged-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-vendorverify").unwrap();
+        let dir = _dir_cleanup.join("fixture");
+        let _staged_cleanup = crate::test_temp::TempDir::new("td-vendorstaged").unwrap();
+        let staged = _staged_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let write_crate = |nv: &str, bytes: &[u8]| {
@@ -19144,7 +19209,8 @@ daemon build START (2/2 active)
     // lock line is tolerated.
     #[test]
     fn assemble_recipe_drv_tolerates_no_source_only_when_the_recipe_declares_none() {
-        let dir = std::env::temp_dir().join(format!("td-nosrc-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-nosrc").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("make-test.lock");
@@ -19169,7 +19235,8 @@ daemon build START (2/2 active)
     // step execution, when a `{in:<name>-source}` template has nothing to resolve.
     #[test]
     fn assemble_recipe_drv_still_requires_source_for_a_mesboot_recipe_that_declares_one() {
-        let dir = std::env::temp_dir().join(format!("td-nosrc-bug-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-nosrc-bug").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("gcc-14.lock");
@@ -19202,7 +19269,8 @@ daemon build START (2/2 active)
         let glibc_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let gcc_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let tddep_h = "cccccccccccccccccccccccccccccccc";
-        let dir = std::env::temp_dir().join(format!("td-cscan-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-cscan").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let od = |name: &str| dir.join(name).to_string_lossy().into_owned();
@@ -19296,7 +19364,8 @@ daemon build START (2/2 active)
         use std::collections::HashMap;
         let glibc_h = "dddddddddddddddddddddddddddddddd";
         let gcc_h = "ffffffffffffffffffffffffffffffff";
-        let dir = std::env::temp_dir().join(format!("td-cmemo-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-cmemo").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let od = |name: &str| dir.join(name).to_string_lossy().into_owned();
@@ -19359,7 +19428,8 @@ daemon build START (2/2 active)
         let glibc_h = "dddddddddddddddddddddddddddddddd";
         let zlib_h = "99999999999999999999999999999999";
         let gcc_h = "ffffffffffffffffffffffffffffffff";
-        let base = std::env::temp_dir().join(format!("td-cmemo2-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-cmemo2").unwrap();
+        let base = _base_cleanup.join("fixture");
         let dir_a = base.join("a");
         let dir_b = base.join("b");
         let _ = std::fs::remove_dir_all(&base);
@@ -19408,7 +19478,8 @@ daemon build START (2/2 active)
         use std::collections::HashMap;
         let glibc_h = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let subject_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let base = std::env::temp_dir().join(format!("td-multiscan-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-multiscan").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         let seed = base.join("seed"); // the canonical /gnu/store stand-in (deps live here)
         let newstore = base.join("newstore"); // a build scratch's newstore (the output only)
@@ -19478,7 +19549,8 @@ daemon build START (2/2 active)
         let gmp_h = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // gmp (transitive: only in coreutils' bytes)
         let tc_h = "cccccccccccccccccccccccccccccccc"; // td-built toolchain (a /td/store root)
         let gl_h = "dddddddddddddddddddddddddddddddd"; // td-built glibc (a /td/store root, td-db-registered)
-        let dir = std::env::temp_dir().join(format!("td-xprefix-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-xprefix").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wr = |name: &str, bytes: String| std::fs::write(dir.join(name), bytes).unwrap();

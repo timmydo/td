@@ -4361,16 +4361,10 @@ mod tests {
     /// staged externals have no ln.)
     #[test]
     fn exists_follows_a_symlink_and_h_sees_the_link() {
-        struct Fixture(std::path::PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = std::env::temp_dir().join(format!("td-sh-test-e-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-test-e").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = Fixture(dir.clone());
         std::fs::write(dir.join("file"), b"").unwrap();
         std::os::unix::fs::symlink(dir.join("file"), dir.join("link")).unwrap();
         std::os::unix::fs::symlink(dir.join("absent"), dir.join("dangling")).unwrap();
@@ -4392,7 +4386,7 @@ mod tests {
             assert!(!super::file_cmp(&sh, "", op, "."), "\"\" {op} .");
             assert!(!super::file_cmp(&sh, ".", op, ""), ". {op} \"\"");
         }
-        drop(fixture);
+        drop(_dir_cleanup);
     }
 
     /// `times` is a special builtin, but a missing `/proc` is not a usage error
@@ -5671,7 +5665,8 @@ mod tests {
         // the name, so `..` undoes the link; -P resolves it first, so `..` is the
         // parent of the TARGET. builtin-cd pins this but cannot run -- it needs
         // `ln -s` -- so build the tree here instead.
-        let base = std::env::temp_dir().join(format!("td-sh-cd-{}", std::process::id()));
+        let _base_cleanup = td_fs::TempDir::new("td-sh-cd").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("real/sub")).unwrap();
         std::os::unix::fs::symlink(base.join("real/sub"), base.join("deep")).unwrap();
@@ -5732,7 +5727,8 @@ mod tests {
     fn dot_looks_in_path_and_prefers_it_to_the_cwd() {
         // dash resolves a name with no slash against PATH only; a file of the same
         // name in the cwd does not win, and is not even reached unless PATH says so.
-        let base = std::env::temp_dir().join(format!("td-sh-dot-{}", std::process::id()));
+        let _base_cleanup = td_fs::TempDir::new("td-sh-dot").unwrap();
+        let base = _base_cleanup.join("fixture");
         let dir = base.join("dir");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cmd"), "echo from-path\n").unwrap();
@@ -5759,7 +5755,8 @@ mod tests {
     /// an error about a command they did not run.
     #[test]
     fn source_is_dot_under_another_name() {
-        let dir = std::env::temp_dir().join(format!("td-sh-src-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-src").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("s.sh"), "echo sourced\n").unwrap();
         // Quoted: a TMPDIR with a space in it would otherwise split into two
@@ -5811,7 +5808,8 @@ mod tests {
     /// they are one command.
     #[test]
     fn dot_takes_option_words_and_gives_the_file_its_operands() {
-        let dir = std::env::temp_dir().join(format!("td-sh-dotargs-{}", std::process::id()));
+        let _dir_cleanup = td_fs::TempDir::new("td-sh-dotargs").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("s.sh"), "echo \"in:[$1][$2] n=$#\"\n").unwrap();
@@ -7479,7 +7477,8 @@ mod tests {
         // without S_ISVTX -- the corpus skips its own sticky-bit case for exactly
         // that reason, and a unit test may not reintroduce the assumption.
         use std::os::unix::fs::PermissionsExt;
-        let sticky = std::env::temp_dir().join(format!("td-sh-sticky-{}", std::process::id()));
+        let _sticky_cleanup = td_fs::TempDir::new("td-sh-sticky").unwrap();
+        let sticky = _sticky_cleanup.join("fixture");
         std::fs::create_dir_all(&sticky).unwrap();
         std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let dir = sticky.display();

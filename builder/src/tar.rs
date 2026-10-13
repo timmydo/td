@@ -1029,7 +1029,6 @@ fn pax_value_string(value: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn xz_root_cause_wins_unless_tar_closed_the_channel_first() {
@@ -1810,13 +1809,8 @@ mod tests {
         assert!(err.contains("missing length separator"), "got: {err}");
     }
 
-    fn temp_dir(prefix: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn temp_dir(prefix: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(prefix).unwrap()
     }
 
     fn append_long_name(out: &mut Vec<u8>, path: &str) {

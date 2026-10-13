@@ -1993,11 +1993,13 @@ mod tests {
     /// nor anywhere a workspace writes.
     #[test]
     fn a_local_repository_lies_where_no_jail_reaches() {
-        let base = std::env::temp_dir().join(format!(
+        let _base_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-local-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let base = _base_cleanup.join("fixture");
         for dir in [
             "srv/git/td.git/objects",
             "srv/git/td.git/refs",
@@ -2163,11 +2165,13 @@ mod tests {
 
     #[test]
     fn directories_and_shared_ones_are_admitted_or_refused_by_name() {
-        let base = std::env::temp_dir().join(format!(
+        let _base_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-workspace-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let base = _base_cleanup.join("fixture");
         for dir in [
             "home/src/a",
             "home/src/repo/.git/hooks",
@@ -2281,11 +2285,13 @@ mod tests {
 
     #[test]
     fn a_policy_binds_the_workspace_and_the_shared_directories() {
-        let root = std::env::temp_dir().join(format!(
+        let _root_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-workspace-policy-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         fs::create_dir_all(&root).unwrap();
         let root = fs::canonicalize(&root).unwrap();
         let state = StateDir::at(root.clone());
@@ -2315,11 +2321,13 @@ mod tests {
 
     #[test]
     fn a_place_not_made_yet_is_named_where_it_will_be() {
-        let base = std::env::temp_dir().join(format!(
+        let _base_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-workspace-resolved-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let base = _base_cleanup.join("fixture");
         fs::create_dir_all(base.join("real")).unwrap();
         std::os::unix::fs::symlink(base.join("real"), base.join("config")).unwrap();
         let base = fs::canonicalize(&base).unwrap();
@@ -2385,11 +2393,13 @@ mod tests {
 
     #[test]
     fn a_tree_is_removed_whatever_the_jail_left() {
-        let root = std::env::temp_dir().join(format!(
+        let _root_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-workspace-remove-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         // Deeper than the walk holds descriptors for, built a step at a
         // time, since the whole path is past what one call takes.
         let deep = root.join("tree");

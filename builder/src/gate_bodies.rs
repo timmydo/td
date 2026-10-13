@@ -5332,7 +5332,8 @@ mod tests {
     /// replaced whole, and never below zero.
     #[test]
     fn the_borrow_ledger_publishes_a_running_total() {
-        let dir = std::env::temp_dir().join(format!("td-rc-borrow-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-rc-borrow").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("recipe-checks.borrowed");
@@ -5415,7 +5416,8 @@ mod tests {
     // given, at a width that guarantees real overlap.
     #[test]
     fn the_pool_returns_one_result_per_item_in_work_order() {
-        let dir = std::env::temp_dir().join(format!("td-rc-pool-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-rc-pool").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let code = crate::check_loop::EXIT_UNPROVISIONED;
@@ -5635,7 +5637,8 @@ mod tests {
     /// is not the memo's line.
     #[test]
     fn a_recipe_check_is_memoized_only_on_a_pass_that_says_so_on_stdout() {
-        let dir = std::env::temp_dir().join(format!("td-rcm-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-rcm").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let memo = td_engine::exit::CHECK_MEMO_SENTINEL;
@@ -5739,7 +5742,8 @@ mod tests {
     /// the tee-and-scan is the part that can break.
     #[test]
     fn a_recipe_check_skips_only_on_a_69_that_carries_the_sentinel() {
-        let dir = std::env::temp_dir().join(format!("td-rcv-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-rcv").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
@@ -5917,7 +5921,8 @@ mod tests {
         // A fake repo root with a stage0 memo + placement: the resolver must
         // return the memo's cb (line 2) as the builder-of-record and the
         // placement's binary as TB — load_stage0's fast path.
-        let root = std::env::temp_dir().join(format!("td-s0memo-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-s0memo").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         let base = root.join(".td-build-cache/stage0");
         let bin = base.join("store/abc123-td-builder-0.1.0/bin");

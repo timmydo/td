@@ -749,22 +749,17 @@ mod tests {
 
     #[test]
     fn empty_selection_still_checks_the_real_branch() {
-        let root = std::env::temp_dir().join(format!(
+        let _root_cleanup = crate::test_temp::TempDir::new(&format!(
             "td-ready-empty-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::create_dir_all(&root).unwrap();
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).ok();
-            }
-        }
-        let _cleanup = Cleanup(root.clone());
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .args(args)
@@ -1173,7 +1168,8 @@ Checks: affected-checks --committed-only (green)
     /// judges ends in `.md`.
     #[test]
     fn a_rename_cannot_hide_a_source_file_from_the_docs_only_waiver() {
-        let root = std::env::temp_dir().join(format!("td-ready-rename-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-ready-rename").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         // The fixture must not inherit the developer's git config, as

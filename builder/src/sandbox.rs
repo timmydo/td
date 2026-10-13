@@ -2350,22 +2350,17 @@ mod tests {
 
     #[test]
     fn ipc_absence_requires_no_kernel_facilities_and_a_complete_inventory() {
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let _root_cleanup = crate::test_temp::TempDir::new(&format!(
             "td-ipc-capabilities-{}-{nonce}",
             std::process::id()
-        ));
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         fs::create_dir(&root).unwrap();
-        let _scratch = Scratch(root.clone());
         fs::create_dir_all(root.join("sys/fs")).unwrap();
         assert!(require_no_ipc_facilities(&root).is_err());
         for content in [
@@ -2425,7 +2420,8 @@ mod tests {
     // boundary, which bind-mounted any existing on-disk path a closure named.
     #[test]
     fn staging_rejects_unmanifested_and_tampered_items() {
-        let dir = std::env::temp_dir().join(format!("td-stage-verify-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-stage-verify").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir_all(&dir).unwrap();
         let item = dir.join("aaa-tool-1.0");
         fs::write(&item, b"trusted bytes").unwrap();
@@ -2720,8 +2716,8 @@ mod tests {
             error.to_string().contains("non-application phase"),
             "{error}"
         );
-        let dir =
-            std::env::temp_dir().join(format!("td-mesboot-steps-file-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-mesboot-steps-file").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(crate::build::MESBOOT_STEPS_FILE);
         write_mesboot_steps_file(&path, steps.as_deref()).unwrap();
@@ -2828,8 +2824,8 @@ mod tests {
 
     #[test]
     fn outer_finalizer_reads_only_the_hashed_drv_value() {
-        let directory =
-            std::env::temp_dir().join(format!("td-outer-app-finalizer-{}", std::process::id()));
+        let _directory_cleanup = crate::test_temp::TempDir::new("td-outer-app-finalizer").unwrap();
+        let directory = _directory_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         let manifest = td_engine::application::ApplicationDeclaration::new(
@@ -3220,7 +3216,8 @@ mod tests {
 
     #[test]
     fn plan_staged_item_stages_a_dir_whole() {
-        let root = std::env::temp_dir().join(format!("td-stage-whole-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-stage-whole").unwrap();
+        let root = _root_cleanup.join("fixture");
         fs::remove_dir_all(&root).ok();
         let newstore = root.join("newstore");
         fs::create_dir_all(&newstore).unwrap();
@@ -3290,7 +3287,8 @@ mod tests {
     #[test]
     fn scratch_cleanup_recovers_read_only_build_directories() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("td-readonly-scratch-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-readonly-scratch").unwrap();
+        let root = _root_cleanup.join("fixture");
         let nested = root.join("readonly/nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("artifact"), b"bytes").unwrap();
@@ -3306,8 +3304,9 @@ mod tests {
         // daemon-request exercised concurrently by another test may sweep its
         // own broad scratch root; that must not make this lock-lifetime test
         // race an unrelated sweeper.
-        let fixture_root =
-            std::env::temp_dir().join(format!("td-build-scratch-sweep-{}", std::process::id()));
+        let _fixture_root_cleanup =
+            crate::test_temp::TempDir::new("td-build-scratch-sweep").unwrap();
+        let fixture_root = _fixture_root_cleanup.join("fixture");
         let fixture = fixture_root.join("fixture/a");
         let root = fixture.join("root");
         let _ = fs::remove_dir_all(&fixture_root);
@@ -3366,8 +3365,8 @@ mod tests {
         // A FILE wearing a build tree's name is not a tree, so the sweep does
         // not remove it — but a corrupt layout left in silence is the thing
         // this report exists to prevent, so it is counted and named.
-        let root =
-            std::env::temp_dir().join(format!("td-build-scratch-foreign-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-build-scratch-foreign").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&root);
         let odd = root.join("odd");
         fs::create_dir_all(&odd).unwrap();
@@ -3399,8 +3398,8 @@ mod tests {
     fn overdeep_scratch_cannot_poison_unrelated_recovery() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("td-build-scratch-depth-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-build-scratch-depth").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&root);
         let poison = root.join("poison");
         let mut deep = poison.join("build-tmp");

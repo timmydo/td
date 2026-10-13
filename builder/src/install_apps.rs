@@ -381,12 +381,8 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("td-install-apps-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-install-apps-{tag}")).unwrap()
     }
 
     fn names(dir: &Path) -> Vec<String> {

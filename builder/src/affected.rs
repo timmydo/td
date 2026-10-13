@@ -6400,7 +6400,8 @@ mod tests {
     /// file that is not a gate.
     #[test]
     fn a_gate_dir_dropping_is_skipped_as_the_generator_skips_it() {
-        let root = std::env::temp_dir().join(format!("td-gate-files-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-files").unwrap();
+        let root = _root_cleanup.join("fixture");
         let defs = root.join("builder/src/gate_defs");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&defs).unwrap();
@@ -6800,7 +6801,8 @@ mod tests {
             ),
             ["tools/t.rs", "src/lib.rs"]
         );
-        let root = std::env::temp_dir().join(format!("td-declared-target-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-declared-target").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         for (rel, text) in [
             (
@@ -6896,7 +6898,8 @@ mod tests {
     #[test]
     fn an_unreadable_source_tree_is_an_error_not_an_empty_scan() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("td-sources-under-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-sources-under").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         let sealed = root.join("src/sealed");
         std::fs::create_dir_all(&sealed).unwrap();
@@ -9519,18 +9522,9 @@ mod tests {
 
     #[test]
     fn standalone_recipe_definition_reads_disable_recipe_cargo_narrowing() {
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = std::env::temp_dir().join(format!(
-            "td-recipe-definition-readers-{}",
-            std::process::id()
-        ));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-recipe-definition-readers").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
-        let _cleanup = Cleanup(root.clone());
         for name in ["td-aa", "td-bb"] {
             std::fs::create_dir_all(root.join(name).join("src")).unwrap();
             std::fs::write(
@@ -10187,7 +10181,8 @@ mod tests {
 
     #[test]
     fn mail_source_graph_changes_restore_workspace_coverage() {
-        let root = std::env::temp_dir().join(format!("td-mail-graph-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-mail-graph").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         for name in [
             "td-mta",
@@ -10376,15 +10371,9 @@ mod tests {
             eprintln!("SKIP: no bash or no git (the in-sandbox gate)");
             return;
         }
-        let base = std::env::temp_dir().join(format!("td-preflight-reuse-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-preflight-reuse").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&base);
-        struct Rm(PathBuf);
-        impl Drop for Rm {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _rm = Rm(base.clone());
         // The repo is the content; the counters live beside it, so running
         // a command does not itself change the key.
         let (repo, out) = (base.join("repo"), base.join("out"));
@@ -10478,17 +10467,11 @@ mod tests {
             eprintln!("SKIP: no bash on PATH (the in-sandbox gate)");
             return;
         }
-        let root = std::env::temp_dir().join(format!("td-cargo-groups-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-cargo-groups").unwrap();
+        let root = _root_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // Removed however the assertions below end.
-        struct Rm(PathBuf);
-        impl Drop for Rm {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _rm = Rm(root.clone());
         // Shell stand-ins for the cargo lines: the runner keys groups by the
         // `--manifest-path <crate>/Cargo.toml` spelling and runs the text. The
         // one on stderr proves the streams are joined in order.
@@ -10539,7 +10522,8 @@ mod tests {
     /// asserts every gate file maps, and over an empty list it asserts nothing.
     #[test]
     fn an_unreadable_gate_dir_is_an_error_not_an_empty_list() {
-        let root = std::env::temp_dir().join(format!("td-gate-none-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-none").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         let got = gate_files(&root);
@@ -10700,20 +10684,17 @@ mod tests {
 
     #[test]
     fn trusted_test_root_is_opt_in_and_both_test_legs_preserve_it() {
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("td-root-roster-{}-{stamp:x}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new(&format!(
+            "td-root-roster-{}-{stamp:x}",
+            std::process::id()
+        ))
+        .unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::create_dir(&root).unwrap();
-        let _cleanup = Cleanup(root.clone());
         for (name, option) in [("td-yes", "true"), ("td-no", "false")] {
             let dir = root.join(name);
             std::fs::create_dir(&dir).unwrap();
@@ -10846,25 +10827,7 @@ mod tests {
 
     #[test]
     fn native_tool_declaration_is_a_reader_edge_without_shared_sources() {
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = (0..100)
-            .find_map(|attempt| {
-                let path = std::env::temp_dir()
-                    .join(format!("td-native-reader-{}-{attempt}", std::process::id()));
-                match std::fs::create_dir(&path) {
-                    Ok(()) => Some(Ok(path)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .expect("unused fixture name")
-            .unwrap();
-        let _cleanup = Cleanup(root.clone());
+        let root = crate::test_temp::TempDir::new("td-native-reader").unwrap();
         for (name, native) in [("td-compositor", false), ("td-consumer", true)] {
             let base = root.join(name);
             std::fs::create_dir_all(base.join("src")).unwrap();
@@ -11069,7 +11032,8 @@ mod tests {
     /// a `td-*` directory that is not a crate does not join it by name alone.
     #[test]
     fn a_new_crate_joins_the_roster_by_existing() {
-        let root = std::env::temp_dir().join(format!("td-gate-discover-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-discover").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("td-new")).unwrap();
         std::fs::write(
@@ -11116,7 +11080,8 @@ mod tests {
     /// in the roster and never executed. Found in review.
     #[test]
     fn a_new_crate_selects_the_preflight_that_compiles_it() {
-        let root = std::env::temp_dir().join(format!("td-gate-select-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-select").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("td-fresh/src")).unwrap();
         std::fs::write(
@@ -11177,7 +11142,8 @@ mod tests {
     /// confirmation pass.
     #[test]
     fn a_stray_td_entry_does_not_red_the_roster() {
-        let root = std::env::temp_dir().join(format!("td-gate-stray-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-stray").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("td-real")).unwrap();
         std::fs::write(root.join("td-real/Cargo.toml"), "[package]\n").unwrap();
@@ -11198,7 +11164,8 @@ mod tests {
     /// backup copy of a crate.
     #[test]
     fn a_crate_under_an_unusable_name_is_refused() {
-        let root = std::env::temp_dir().join(format!("td-gate-badname-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-badname").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(root.join("td-real")).unwrap();
         std::fs::write(root.join("td-real/Cargo.toml"), "[package]\n").unwrap();
@@ -11217,7 +11184,8 @@ mod tests {
     /// over nothing exits 0 having compiled nothing at all.
     #[test]
     fn an_empty_gate_roster_is_an_error() {
-        let root = std::env::temp_dir().join(format!("td-gate-empty-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-empty").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         let got = discover_gate_crates(&root);
@@ -11239,7 +11207,8 @@ mod tests {
             "the members list and the committed workspace lock disagree"
         );
 
-        let bad = std::env::temp_dir().join(format!("td-gate-members-{}", std::process::id()));
+        let _bad_cleanup = crate::test_temp::TempDir::new("td-gate-members").unwrap();
+        let bad = _bad_cleanup.join("fixture");
         std::fs::remove_dir_all(&bad).ok();
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("Cargo.toml"), "[workspace]\nresolver = \"2\"\n").unwrap();
@@ -11254,15 +11223,9 @@ mod tests {
         if !source.join("td-crypto/Cargo.toml").exists() {
             return;
         }
-        let temp = std::env::temp_dir().join(format!("td-crypto-consumers-{}", std::process::id()));
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        let _temp_cleanup = crate::test_temp::TempDir::new("td-crypto-consumers").unwrap();
+        let temp = _temp_cleanup.join("fixture");
         std::fs::create_dir(&temp).unwrap();
-        let _cleanup = Cleanup(temp.clone());
         std::fs::create_dir(temp.join(".cargo")).unwrap();
         std::fs::copy(
             source.join(".cargo/config.toml"),
@@ -11650,7 +11613,8 @@ mod tests {
     /// closure.
     #[test]
     fn an_outside_copy_under_a_roster_name_is_refused_by_the_roster() {
-        let root = std::env::temp_dir().join(format!("td-gate-siblings-{}", std::process::id()));
+        let _root_cleanup = crate::test_temp::TempDir::new("td-gate-siblings").unwrap();
+        let root = _root_cleanup.join("fixture");
         std::fs::remove_dir_all(&root).ok();
         let write = |rel: &str, text: &str| {
             let p = root.join(rel);

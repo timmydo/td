@@ -803,8 +803,8 @@ mod tests {
 
     #[test]
     fn token_grants_share_one_pool_and_keep_the_reserved_width_free() {
-        let dir =
-            std::env::temp_dir().join(format!("td-check-memory-tokens-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-check-memory-tokens").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         let budget = HostBudget {
             work_bytes: 3 * TOKEN_BYTES,

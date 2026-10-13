@@ -897,11 +897,13 @@ mod tests {
     /// stand-in that prints both shows it.
     #[test]
     fn td_txt_is_run_under_the_applets_name() {
-        let dir = std::env::temp_dir().join(format!(
+        let _dir_cleanup = td_fs::TempDir::new(&format!(
             "td-agent-txt-{}-{}",
             std::process::id(),
             crate::store::random_hex(4).unwrap()
-        ));
+        ))
+        .unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let stand_in = dir.join("td-txt");
         std::fs::write(&stand_in, "#!/bin/sh\necho \"$0\"; printf '<%s>' \"$@\"\n").unwrap();

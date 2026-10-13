@@ -98,7 +98,8 @@ mod tests {
     #[test]
     fn a_program_held_open_for_writing_is_waited_out() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("td-busy-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-busy").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("held");

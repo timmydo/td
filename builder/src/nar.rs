@@ -423,7 +423,8 @@ mod tests {
     fn known_nar_of_single_file() {
         // NAR of a lone regular file "x" with contents "hi\n": the byte layout
         // is fully determined, so assert it token by token.
-        let dir = std::env::temp_dir().join(format!("td-nar-test-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-nar-test").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir_all(&dir).unwrap();
         let f = dir.join("x");
         fs::write(&f, b"hi\n").unwrap();
@@ -457,7 +458,8 @@ mod tests {
     fn read_nar_round_trips_a_tree() {
         // write_nar(tree) -> read_nar -> the reconstruction re-serializes to the SAME
         // NAR. This is the durable inverse-property check: no Guix oracle in the room.
-        let base = std::env::temp_dir().join(format!("td-nar-rt-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-rt").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let src = base.join("src");
         build_tree(&src);
@@ -494,7 +496,8 @@ mod tests {
     fn read_nar_rejects_a_truncated_archive() {
         // A corrupted/short download must error, never restore a partial tree — so the
         // consumer can fall back to building. (Self-discrimination: the read is strict.)
-        let base = std::env::temp_dir().join(format!("td-nar-trunc-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-trunc").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let src = base.join("src");
         build_tree(&src);
@@ -518,7 +521,8 @@ mod tests {
     fn read_nar_rejects_bad_magic() {
         // A fully valid NAR whose ONLY defect is the magic token — so the magic check is
         // the only thing that can reject it (the body would otherwise restore fine).
-        let base = std::env::temp_dir().join(format!("td-nar-magic-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-magic").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let src = base.join("src");
         fs::create_dir_all(&src).unwrap();
@@ -536,7 +540,8 @@ mod tests {
     fn directory_entries_are_sorted_by_byte() {
         // "B" (0x42) must sort before "a" (0x61) — codepoint order, not
         // case-insensitive collation.
-        let dir = std::env::temp_dir().join(format!("td-nar-sort-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-nar-sort").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("a"), b"1").unwrap();
         fs::write(dir.join("B"), b"2").unwrap();
@@ -601,7 +606,8 @@ mod tests {
         // Two entries of ONE name, symlink first: a create that follows the link writes
         // the second entry's contents wherever the first one points — outside dest, with
         // Ok(()) returned and nothing under dest to show for it.
-        let base = std::env::temp_dir().join(format!("td-nar-dup-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-dup").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let outside = base.join("outside");
@@ -636,7 +642,8 @@ mod tests {
         // ordering check is the only thing that can reject them. Equal names are the
         // symlink case above with the follow closed; descending names are the same
         // archive re-ordered, and a NAR is canonical or it is not one.
-        let base = std::env::temp_dir().join(format!("td-nar-order-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-order").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         for (leg, entries) in [
@@ -688,7 +695,8 @@ mod tests {
         // archive BEFORE the second create is reached, so no archive-level test can pin
         // this — and the case it exists for is a path planted between the check and the
         // create, at any depth, which no archive controls either.
-        let base = std::env::temp_dir().join(format!("td-nar-create-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-create").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let outside = base.join("outside");
@@ -727,7 +735,8 @@ mod tests {
         // is no header to agree with). Without `create_new` the flag is the only thing
         // that can refuse a symlink, so ELOOP is what says the kernel read it as
         // O_NOFOLLOW rather than as an ignored bit.
-        let base = std::env::temp_dir().join(format!("td-nar-nofollow-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-nofollow").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let target = base.join("target");
@@ -757,7 +766,8 @@ mod tests {
     fn read_nar_rejects_an_entry_name_holding_a_nul() {
         // Reachable: a name is arbitrary framed bytes. It fails either way (std's CString
         // conversion refuses it), but the reader's own diagnostic is what names the cause.
-        let base = std::env::temp_dir().join(format!("td-nar-nul-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-nul").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let nar = nar_of_dir(&[(&b"a\0b"[..], node_regular(b"1"))]);
@@ -773,7 +783,8 @@ mod tests {
         // A complete, otherwise valid archive with data appended: not canonical, so it
         // would not re-serialize to the bytes it arrived as — and the CLI checks no hash,
         // so this is the only thing that would notice.
-        let base = std::env::temp_dir().join(format!("td-nar-trail-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-trail").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         let src = base.join("src");
         build_tree(&src);
@@ -797,7 +808,8 @@ mod tests {
     fn read_nar_rejects_a_directory_nested_past_the_depth_cap() {
         // The bound is stated rather than inherited from PATH_MAX, so it is reachable with
         // one-byte names and a few KiB of archive.
-        let base = std::env::temp_dir().join(format!("td-nar-deep-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-deep").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
 
@@ -838,7 +850,8 @@ mod tests {
     fn read_nar_rejects_a_symlink_target_that_is_empty_or_holds_a_nul() {
         // The field whose archive bytes reach a syscall least filtered. Both fail at
         // `symlink(2)` anyway; what the check buys is a diagnostic naming the archive.
-        let base = std::env::temp_dir().join(format!("td-nar-tgt-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-tgt").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         for (leg, target) in [("empty", &b""[..]), ("nul", &b"a\0b"[..])] {
@@ -857,7 +870,8 @@ mod tests {
         // dest is documented as "must not already exist" and nothing enforced it: a
         // top-level regular node created through an existing symlink is the same
         // arbitrary write, reached from the nar-restore CLI's own argv.
-        let base = std::env::temp_dir().join(format!("td-nar-dest-{}", std::process::id()));
+        let _base_cleanup = crate::test_temp::TempDir::new("td-nar-dest").unwrap();
+        let base = _base_cleanup.join("fixture");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let outside = base.join("outside");

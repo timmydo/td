@@ -166,17 +166,16 @@ fn forget_in(path: &Path, line: &str, held: bool) {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("td-verdict-journal-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
+    fn dir(name: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-verdict-journal-{name}")).unwrap()
     }
 
     #[test]
     fn a_forget_reaches_every_key_and_keeps_the_rest() {
         let d = dir("forget");
-        let j = Journal::new(d.clone());
+        std::fs::remove_dir(d.path()).unwrap();
+        let j = Journal::new(d.to_path_buf());
+        assert!(!d.exists());
         assert!(j.read("k1").is_empty(), "nothing before the directory");
         j.record("k1", "a");
         j.record("k1", "b");
@@ -216,7 +215,7 @@ mod tests {
     #[test]
     fn a_run_hold_is_exclusive_across_handles() {
         let d = dir("hold");
-        let j = Journal::new(d.clone());
+        let j = Journal::new(d.to_path_buf());
         let first = j.hold_run().unwrap();
         let probe = OpenOptions::new().write(true).open(d.join(RUN)).unwrap();
         assert!(matches!(

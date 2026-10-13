@@ -2593,11 +2593,8 @@ mod tests {
         }
     }
 
-    fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("td-gates-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn tmpdir(tag: &str) -> crate::test_temp::TempDir {
+        crate::test_temp::TempDir::new(&format!("td-gates-test-{tag}")).unwrap()
     }
 
     #[test]
@@ -3078,7 +3075,7 @@ mod tests {
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         let with = |key: Option<&str>, resume: bool| {
             let mut c = cfg(&d, 2, None);
-            c.root = d.clone();
+            c.root = d.to_path_buf();
             c.tree_key = key.map(str::to_string);
             c.resume = resume;
             c
@@ -3138,7 +3135,7 @@ mod tests {
         let sel = expand_goals(&set, &["check".to_string()]).unwrap();
         let with = |key: &str, resume: bool| {
             let mut c = cfg(&d, 2, None);
-            c.root = d.clone();
+            c.root = d.to_path_buf();
             c.tree_key = Some(key.to_string());
             c.resume = resume;
             c

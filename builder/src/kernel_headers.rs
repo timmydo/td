@@ -541,7 +541,8 @@ mod tests {
     }
     #[test]
     fn unsupported_inputs_leave_existing_work_untouched() {
-        let dir = std::env::temp_dir().join(format!("td-header-refusal-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-header-refusal").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("owned"), b"keep").unwrap();
         let args = vec![
@@ -558,7 +559,8 @@ mod tests {
     }
     #[test]
     fn policy_changes_are_refused_before_compiling() {
-        let dir = std::env::temp_dir().join(format!("td-header-policy-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("td-header-policy").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         fs::create_dir(&dir).unwrap();
         fs::create_dir(dir.join("scripts")).unwrap();
         fs::write(dir.join("scripts/headers_install.sh"), b"altered").unwrap();

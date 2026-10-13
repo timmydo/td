@@ -2990,7 +2990,8 @@ pub(crate) mod tests {
 
     #[test]
     fn profiled_v5_elf_enforces_its_declared_string_dependency() {
-        let dir = std::env::temp_dir().join(format!("elf-test-profile-v5-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-profile-v5").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
         let debug = dir.join("debug");
@@ -3024,7 +3025,8 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_interp() {
-        let dir = std::env::temp_dir().join(format!("elf-test-r-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-r").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_elf("/lib64/ld-linux-x86-64.so.2")).unwrap();
@@ -3037,7 +3039,8 @@ pub(crate) mod tests {
 
     #[test]
     fn profiled_elf_requires_one_sha1_id_symbols_and_lines() {
-        let dir = std::env::temp_dir().join(format!("elf-test-profile-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-profile").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
         let debug = dir.join("debug");
@@ -3213,7 +3216,8 @@ pub(crate) mod tests {
 
     #[test]
     fn sets_shorter_interp_and_pads() {
-        let dir = std::env::temp_dir().join(format!("elf-test-s-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-s").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_elf("/lib64/ld-linux-x86-64.so.2")).unwrap();
@@ -3234,7 +3238,8 @@ pub(crate) mod tests {
         // of the file, a PT_NOTE is repurposed as the covering PT_LOAD, and PT_INTERP is
         // repointed at both its file offset and mapped address. This is what lets rustc/cargo
         // name the full hashed /td/store/<hash>-glibc.../ld-linux-x86-64.so.2 loader.
-        let dir = std::env::temp_dir().join(format!("elf-test-l-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-l").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_elf("/lib64/ld.so")).unwrap();
@@ -3264,7 +3269,8 @@ pub(crate) mod tests {
     #[test]
     fn grows_interp_elf32() {
         // the i686 class grows the same way (the bootstrap toolchain is i686).
-        let dir = std::env::temp_dir().join(format!("elf-test-l32-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-l32").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_interp_elf("/lib/ld.so", false)).unwrap();
@@ -3277,7 +3283,8 @@ pub(crate) mod tests {
     #[test]
     fn reads_and_sets_interp_elf32() {
         // i686 PT_INTERP round-trip: read, then rewrite in place to a shorter path.
-        let dir = std::env::temp_dir().join(format!("elf-test-32-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-32").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_interp_elf("/lib/ld-linux.so.2", false)).unwrap();
@@ -3292,7 +3299,8 @@ pub(crate) mod tests {
 
     #[test]
     fn rejects_non_elf() {
-        let dir = std::env::temp_dir().join(format!("elf-test-n-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-n").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(
@@ -3306,7 +3314,8 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_runpath_and_legacy_rpath() {
-        let dir = std::env::temp_dir().join(format!("elf-test-rp-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rp").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_dyn_elf("/build/dir/lib", true, true)).unwrap();
@@ -3319,7 +3328,8 @@ pub(crate) mod tests {
 
     #[test]
     fn sets_shorter_rpath_and_pads() {
-        let dir = std::env::temp_dir().join(format!("elf-test-rps-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rps").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // a build-dir search path, retargeted to a (shorter) /td/store run-path
@@ -3338,7 +3348,8 @@ pub(crate) mod tests {
 
     #[test]
     fn refuses_too_long_rpath() {
-        let dir = std::env::temp_dir().join(format!("elf-test-rpt-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rpt").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_dyn_elf("/short/lib", true, true)).unwrap();
@@ -3351,7 +3362,8 @@ pub(crate) mod tests {
 
     #[test]
     fn rpath_absent_reads_none_and_set_errors() {
-        let dir = std::env::temp_dir().join(format!("elf-test-rpa-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rpa").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // an interp-only ELF (no PT_DYNAMIC at all) has no run-path
@@ -3369,7 +3381,8 @@ pub(crate) mod tests {
     fn reads_and_sets_rpath_elf32() {
         // i686 run-path round-trip — the class the bootstrap toolchain ar/ranlib actually
         // are, so a /td/store run-path can be baked to drop their LD_LIBRARY_PATH wrappers.
-        let dir = std::env::temp_dir().join(format!("elf-test-rp32-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rp32").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         std::fs::write(&f, synth_dyn_elf("/tmp/build/binutils/lib", true, false)).unwrap();
@@ -3390,7 +3403,8 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_needed_shared_objects() {
-        let dir = std::env::temp_dir().join(format!("elf-test-need-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-need").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // multiple DT_NEEDED, in order
@@ -3407,7 +3421,8 @@ pub(crate) mod tests {
 
     #[test]
     fn runtime_link_search_returns_interp_and_splits_runpath() {
-        let dir = std::env::temp_dir().join(format!("elf-test-rls-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-rls").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // A run-path-only dynamic ELF (no interp): the colon-separated entries split out.
@@ -3466,7 +3481,8 @@ pub(crate) mod tests {
 
     #[test]
     fn bounded_runtime_search_charges_before_each_foreign_allocation() {
-        let dir = std::env::temp_dir().join(format!("elf-test-bounded-rls-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-bounded-rls").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a");
         let bytes = synth_needed_elf(&["libalpha.so", "libbeta.so"], true);
@@ -3563,7 +3579,8 @@ pub(crate) mod tests {
 
     #[test]
     fn static_binary_needs_nothing() {
-        let dir = std::env::temp_dir().join(format!("elf-test-need0-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-need0").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // a fully static ELF (no PT_DYNAMIC) declares no needed libraries
@@ -3577,7 +3594,8 @@ pub(crate) mod tests {
 
     #[test]
     fn assert_static_accepts_a_static_elf() {
-        let dir = std::env::temp_dir().join(format!("elf-test-as-ok-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-as-ok").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // the fully-static shape: no interpreter, no needed libs, no run-path — x86-64…
@@ -3591,7 +3609,8 @@ pub(crate) mod tests {
 
     #[test]
     fn assert_static_pie_requires_et_dyn_on_top_of_the_static_shape() {
-        let dir = std::env::temp_dir().join(format!("elf-test-aspie-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-aspie").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // A static ET_EXEC passes the static check and fails the PIE one by type.
@@ -3613,7 +3632,8 @@ pub(crate) mod tests {
 
     #[test]
     fn portable_arm_executable_does_not_pass_the_x86_launcher_contract() {
-        let dir = std::env::temp_dir().join(format!("elf-arm-exec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-arm-exec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app");
         let mut valid = synth_static_elf(true);
@@ -3636,7 +3656,8 @@ pub(crate) mod tests {
 
     #[test]
     fn application_executable_requires_x86_64_kind_and_file_backed_entry() {
-        let dir = std::env::temp_dir().join(format!("elf-app-exec-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-app-exec").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app");
         let valid = synth_static_elf(true);
@@ -3703,7 +3724,8 @@ pub(crate) mod tests {
 
     #[test]
     fn static_assertion_refuses_overflowing_segment_metadata_without_panicking() {
-        let dir = std::env::temp_dir().join(format!("elf-static-ranges-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-static-ranges").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("app");
         let valid = synth_static_elf(true);
@@ -3728,7 +3750,8 @@ pub(crate) mod tests {
 
     #[test]
     fn assert_static_rejects_dynamic_linkage() {
-        let dir = std::env::temp_dir().join(format!("elf-test-as-bad-{}", std::process::id()));
+        let _dir_cleanup = crate::test_temp::TempDir::new("elf-test-as-bad").unwrap();
+        let dir = _dir_cleanup.join("fixture");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a");
         // (1) a program interpreter (PT_INTERP) is rejected
