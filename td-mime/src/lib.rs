@@ -21,6 +21,7 @@ pub mod header_cfws;
 pub mod header_comment;
 pub mod header_date;
 pub mod header_delimited;
+pub mod header_encode;
 pub mod header_mailbox;
 pub mod header_message_ids;
 pub mod header_name;

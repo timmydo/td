@@ -11840,6 +11840,64 @@ fn mime_base64() {
     assert_eq!(before, after, "MIME base64 allocated");
 }
 
+fn mime_header_encode() {
+    use header_encode::{Cursor, Error, Status};
+    use td_mime::{
+        time::{Deadline, Tick},
+        work::{Charge, Meter},
+    };
+    let before = COUNTERS.snapshot();
+    for value in [
+        "",
+        "hé ☃",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa🦀 trailing",
+    ] {
+        let mut meter = Meter::new(
+            Deadline::after(Tick(0), 100).unwrap(),
+            Charge {
+                io_bytes: 1000,
+                records: 1000,
+                output_bytes: 1000,
+                unlinks: 0,
+            },
+        );
+        let mut cursor = Cursor::new(black_box(value), Tick(1), &mut meter).unwrap();
+        loop {
+            let step = cursor.poll(&mut [0], Tick(1), &mut meter).unwrap();
+            if step.status == Status::Complete {
+                break;
+            }
+        }
+        assert_eq!(
+            cursor.poll(&mut [], Tick(1), &mut meter).unwrap().status,
+            Status::Complete
+        );
+        cursor.finish(Tick(1), &mut meter).unwrap();
+    }
+    let capacity = Charge {
+        io_bytes: 100,
+        records: 100,
+        output_bytes: 100,
+        unlinks: 0,
+    };
+    let mut meter = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+    let mut cursor = Cursor::new("bad\r\nheader", Tick(1), &mut meter).unwrap();
+    assert_eq!(
+        cursor.poll(&mut [0; 75], Tick(1), &mut meter),
+        Err(Error::InvalidText)
+    );
+    let mut replacement = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+    assert_eq!(
+        cursor.poll(&mut [], Tick(1), &mut replacement),
+        Err(Error::InvalidText)
+    );
+    assert_eq!(replacement.remaining(), capacity);
+    assert_eq!(cursor.finish(Tick(1), &mut meter), Err(Error::InvalidText));
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "outgoing header encoding allocated");
+}
+
 fn mime_base64_encode() {
     use base64_encode::{Encoder, Error, Status};
     use td_mime::{
@@ -12293,6 +12351,7 @@ fn main() {
     {
         mime_base64();
         mime_base64_encode();
+        mime_header_encode();
         mime_qp();
         mime_qp_input();
         unicode_lookups();
@@ -12491,6 +12550,7 @@ fn main() {
     retained_requested_source_bound_properties();
     mime_base64();
     mime_base64_encode();
+    mime_header_encode();
     mime_qp();
     mime_qp_input();
     unicode_lookups();

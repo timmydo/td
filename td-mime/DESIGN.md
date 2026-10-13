@@ -195,3 +195,24 @@ Consuming finish freshly checks the original meter and requires complete
 output. The encoder has a compiled 80-byte ceiling and the mail allocation probe
 checks zero allocation. No MIME header generation or SMTP framing occurs.
 The wire encoding follows RFC 2045 section 6.8.
+
+The outgoing header encoder supplies UTF-8 RFC 2047 B words for td-mail's
+Subject, address display names and attachment descriptions. It borrows one
+immutable UTF-8 value. Each word consumes at most 45 source octets without
+splitting a scalar, contains at most 72 ASCII bytes, and begins with CRLF
+and a space. The caller writes a trusted field name before it and the field's
+final CRLF after it; trailing syntax such as an address must begin on a
+new folded continuation line. Empty input emits nothing. All controls and
+Unicode noncharacters refuse; no raw user bytes become header syntax.
+Address syntax and RFC 2231 filename parameters are separate caller work.
+
+Each poll builds at most one word and emits at most 75 bytes. It spends one
+record, a prepaid validation allowance of min(remaining input bytes, 49)
+I/O bytes, the shared body encoder's costs for that word, and one output
+byte per emitted header byte. The allowance funds 45 word octets plus one
+UTF-8 scalar of lookahead; unused validation credit is forfeited. Intermediate
+encoding and final output both spend the original budget. The fixed cursor
+has a compiled 160-byte ceiling. Cached completion and consuming finish
+freshly check the original meter; substitution and any refusal are terminal.
+Output remains provisional until finish. The mail allocation probe covers
+fragmented output, padding, completion and refusal without allocation.
