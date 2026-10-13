@@ -5287,7 +5287,8 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-civil, td-crypto, td-header,
-/// td-html, td-json, td-mime and td-nfc, its direct dependencies. td-agent left the
+/// td-html, td-json, td-mime and td-nfc directly, and td-mail through its native
+/// read fixture. td-agent left the
 /// list with its packaging (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
     "td-mta",
@@ -5297,6 +5298,7 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
         "td-header",
         "td-html",
         "td-json",
+        "td-mail",
         "td-mime",
         "td-nfc",
     ],
@@ -5890,7 +5892,15 @@ fn run_preflight(root: &Path, name: &str, changed: &[String]) -> i32 {
                 .iter()
                 .any(|cmd| cmd.contains(" gate-crates crypto-cargo "))
             {
-                if let Err(e) = crate::check_loop::warm_mail_sources(root) {
+                let native_mail = cmds.iter().any(|cmd| {
+                    cmd.contains(" gate-crates crypto-cargo test --manifest-path td-mta/Cargo.toml")
+                });
+                let prepared = if native_mail {
+                    crate::check_loop::warm_mail_client_sources(root)
+                } else {
+                    crate::check_loop::warm_mail_sources(root)
+                };
+                if let Err(e) = prepared {
                     eprintln!("affected-checks: {e}");
                     return 1;
                 }
@@ -9209,6 +9219,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -9232,7 +9243,8 @@ mod tests {
         // td-news, td-review and td-term, toolkit consumers with no native
         // case, add two each.
         // td-crypto's test-only P-256 oracle is td-fido's, which reads no
-        // compositor source, so td-crypto and td-mta are not readers here.
+        // compositor source, so td-crypto is not a reader here. The native mail read
+        // fixture makes td-mta a reader through td-mail.
         // td-open, which mounts td-secret's descriptor module, adds two;
         // the installation fixture,
         // reading td-install's codecs, adds two, and td-init, whose
@@ -9240,7 +9252,7 @@ mod tests {
         // td-boot, which includes td-init's console identity by `#[path]`,
         // and td-kexec and td-update, which read td-boot, add two each.
         // The format check rides with the workspace.
-        assert_eq!(comp.len(), 72, "{comp:?}");
+        assert_eq!(comp.len(), 74, "{comp:?}");
         // Runtime td-vm/ spellings conservatively connect the same reader set.
         assert_eq!(vm, comp);
         assert_eq!(
@@ -9262,6 +9274,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -9300,6 +9313,7 @@ mod tests {
                 "td-kexec",
                 "td-login",
                 "td-mail",
+                "td-mta",
                 "td-news",
                 "td-open",
                 "td-pass",
@@ -10182,6 +10196,7 @@ mod tests {
             "td-header",
             "td-html",
             "td-json",
+            "td-mail",
             "td-mime",
             "td-nfc",
             "td-authd",
@@ -10196,13 +10211,18 @@ mod tests {
             std::fs::write(base.join("Cargo.toml"), manifest).unwrap();
             std::fs::write(base.join("src/lib.rs"), "").unwrap();
         }
+        std::fs::write(
+            root.join("td-mta/src/lib.rs"),
+            "const CLIENT: &str = \"td-mail/Cargo.toml\";\n",
+        )
+        .unwrap();
         let changed = ["td-mta/src/lib.rs".to_string()];
         let all = cargo_test_cmds_all(&root).unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap().len(), 3);
         // A diagnostic string also counts as an edge in the conservative graph.
         std::fs::write(
             root.join("td-mta/src/lib.rs"),
-            "const DOMAIN: &[u8] = b\"td-authd/credential/v1\\0\";\n",
+            "const DOMAIN: &[u8] = b\"td-authd/credential/v1\\0\";\nconst CLIENT: &str = \"td-mail/Cargo.toml\";\n",
         )
         .unwrap();
         assert_eq!(cargo_test_cmds(&root, &changed).unwrap(), all);

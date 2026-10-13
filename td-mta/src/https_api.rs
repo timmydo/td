@@ -1,4 +1,4 @@
-//! Authenticated Core API work on the fixed HTTPS body worker.
+//! Authenticated td-mail read API work on the fixed HTTPS body worker.
 use crate::{
     admission::timers::{self, TimeoutPlan},
     bounded::TextBuffer,
@@ -278,9 +278,12 @@ impl<P> Service<'_, '_, '_, '_, '_, P> {
         }
         sender.check()?;
         let document = cursor.finish().map_err(|error| parser(error.error()))?;
-        let mut validation =
-            jmap_request::OwnedValidation::new(document, self.resources, &[jmap_request::CORE])
-                .map_err(|error| ApiError::Request(error.error()))?;
+        let mut validation = jmap_request::OwnedValidation::new(
+            document,
+            self.resources,
+            &[jmap_request::CORE, jmap_request::MAIL],
+        )
+        .map_err(|error| ApiError::Request(error.error()))?;
         loop {
             sender.check()?;
             if !retention.admit_before(execution)? {

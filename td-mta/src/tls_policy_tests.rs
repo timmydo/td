@@ -9,6 +9,8 @@ mod gateway_process_tests;
 mod https_tests;
 #[path = "tls_policy_io_tests.rs"]
 mod io_tests;
+#[path = "mail_client_tests.rs"]
+mod mail_client_tests;
 #[path = "smtp_receiving_tests.rs"]
 mod smtp_receiving_tests;
 #[path = "smtp_starttls_tests.rs"]
@@ -125,6 +127,7 @@ impl Clock for SwitchClock {
     }
 }
 struct Material {
+    ca_der: Vec<u8>,
     chain: Vec<u8>,
     key: Vec<u8>,
     ca: Vec<u8>,
@@ -142,7 +145,8 @@ impl Material {
         let l = Provider.generate_p256(&mut leaf).unwrap();
         let root_key = Provider.load_p256(&root[..r]).unwrap();
         let leaf_key = Provider.load_p256(&leaf[..l]).unwrap();
-        let ca = pem("CERTIFICATE", &certificate(&root_key, &root_key, true));
+        let ca_der = certificate(&root_key, &root_key, true);
+        let ca = pem("CERTIFICATE", &ca_der);
         let chain = [
             pem(
                 "CERTIFICATE",
@@ -154,6 +158,7 @@ impl Material {
         let key = pem("PRIVATE KEY", &leaf[..l]);
         let source = Arc::new(SwitchClock(AtomicBool::new(false)));
         Self {
+            ca_der,
             chain,
             key,
             ca,

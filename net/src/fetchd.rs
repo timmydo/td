@@ -957,6 +957,11 @@ fn open(
             Method::Post => 0,
         }))
         .user_agent("td-fetchd/1");
+    #[cfg(test)]
+    let builder = match tests::MAIL_TLS.get() {
+        Some(config) => builder.tls_config(Arc::clone(config)),
+        None => builder,
+    };
     let agent = match timing {
         // One deadline for the exchange: ureq applies it in place of its
         // per-read and per-write timeouts, so setting those would do
@@ -1840,6 +1845,32 @@ mod tests {
         assert_eq!(ureq_redirects(0), 0);
         assert_eq!(ureq_redirects(1), 2);
         assert_eq!(ureq_redirects(MAX_REDIRECTS), MAX_REDIRECTS + 1);
+    }
+
+    pub(super) static MAIL_TLS: std::sync::OnceLock<Arc<ureq::rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+
+    /// Runs only as an isolated child of td-mta's real-client oracle.
+    #[test]
+    #[ignore = "td-mta qualification supplies a private root and socket"]
+    fn mail_read_fixture() {
+        let root = std::fs::read(std::env::var_os("TD_TEST_FETCH_ROOT").unwrap()).unwrap();
+        let mut roots = ureq::rustls::RootCertStore::empty();
+        roots
+            .add(ureq::rustls::pki_types::CertificateDer::from(root))
+            .unwrap();
+        let config = ureq::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        MAIL_TLS.set(Arc::new(config)).unwrap();
+        let socket = std::env::var_os("TD_TEST_FETCH_SOCKET").unwrap();
+        serve(
+            Path::new(&socket),
+            LENIENT,
+            Some(std::os::unix::process::parent_id()),
+            LIMITS,
+        )
+        .unwrap();
     }
 
     const STRICT: Policy = Policy {

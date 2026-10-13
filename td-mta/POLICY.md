@@ -837,12 +837,10 @@ requirement.
 
 ## 8. Personal-account Mailbox rights
 
-The configured personal account owns every stored Mailbox. All nine rights
-are true except mayRename and mayDelete on the mailbox with the inbox role.
-The permanent Inbox remains the reception target; other Mailboxes may be
-renamed, reparented and deleted subject to method validation and structural
-constraints. Rights describe account authorization, not a relaxation of quota,
-hierarchy or mutation preconditions. Mailbox/get reports this policy from the
-same snapshot as the Mailbox object. The Mail capability release gate still
-requires the corresponding mutation methods before live advertisement.
-
+The configured personal account owns every stored Mailbox. The active
+read-only td-mail profile reports mayReadItems true and all eight mutation
+and submission rights false, consistently with the Session's isReadOnly.
+The permanent Inbox remains the reception target. Enabling future client
+mutations requires implementing their methods and updating these rights with
+matching tests; account ownership alone does not advertise unimplemented
+operations. Mailbox/get reports rights from the same snapshot as its object.

@@ -1920,13 +1920,16 @@ and configured HTTPS listeners with file-provisioned TLS identities. Provision
 `data/devices` mode 0700 under the same service owner and create an initial
 device offline before starting. The registry must exist and validate; startup
 does not silently initialize it. The profile has no public administration
-HTTP route. Discovery and mailbox/message APIs remain unavailable until the
-JMAP increments; authenticated `/.well-known/jmap` currently returns 503.
+HTTP route. Authenticated `/.well-known/jmap` exposes Core and the read-only Mail
+profile supported by td-mail. Mailbox listing, received-date message listing,
+message and thread reads, original-message and direct attachment downloads
+are active. Search, flags, filing changes, deletion and sending remain
+unimplemented and return explicit errors.
 Authenticated POST `/jmap/upload/{accountId}` now streams binary uploads into
 the configured account, with one upload at a time, bounded framing and a
 JSON durable receipt. It shares the app-password registry and storage quota
 coordinator. Quota pressure reclaims oldest unreferenced uploads before body
-admission, but the remaining Core endpoints still block discovery.
+admission.
 
 Run `td-mta device create --runtime PATH --label LABEL`, `device list --runtime
 PATH`, or `device revoke --runtime PATH --id ID` for the running profile.
@@ -1939,8 +1942,8 @@ status ok and the operation's data; failures carry fixed stage/error codes.
 
 The ready announcement and status report profile mailbox-access. Readiness
 waits for both SMTP initialization and HTTPS's bound certificate checks and
-network/TLS/body workers. Core API methods, EventSource and authenticated
-Core discovery are available. Stop, SIGTERM and SIGINT use the same shared
+network/TLS/body workers. Core and read-only Mail methods, EventSource and
+authenticated discovery are available. Stop, SIGTERM and SIGINT use the same shared
 stop flag. HTTPS closes
 its exchanges and joins its TLS and body workers; an upload publication
 already underway settles before shutdown returns. SMTP preserves its normal
@@ -1963,7 +1966,8 @@ expose that state; a public per-bucket runtime status report remains pending.
 
 The authenticated download route is
 `/jmap/download/{accountId}/{blobId}/{name}?type={type}`. GET streams an
-accessible raw blob; other methods receive 405 with Allow: GET. GET bodies
+accessible raw blob or transfer-decoded direct MIME attachment; other methods
+receive 405 with Allow: GET. GET bodies
 and Expect are rejected. The name and media type are template values, not
 stored blob metadata. Downloads, uploads and API requests share one body
 worker. The independent advertised maxima are upper bounds; cross-kind
@@ -1971,7 +1975,9 @@ contention receives 503. Same-kind contention receives 429.
 Raw downloads form part of the advertised Core capability.
 
 Authenticated POST `/jmap/api` now executes Core/echo, PushSubscription/get,
-PushSubscription/set and the single-account Blob/copy contract. Provision
+PushSubscription/set and the single-account Blob/copy contract, plus the
+Mailbox/get/query/queryChanges/changes, Email/get/query/changes and Thread/get/changes
+readers. Provision
 `data/tmp` and `data/tmp/requests` mode 0700 under the service owner before
 starting mailbox-access. Startup locks and cleans this separate disposable
 root before accepting requests. SMTP-only also cleans an existing request
@@ -1979,16 +1985,18 @@ root from a previous mailbox run, but does not require one. The API accepts
 application/json with fixed or chunked bodies and returns ordered retained
 responses, result references, createdIds and the prepared Session state.
 Malformed requests and advertised limits receive standard JMAP problem details.
-Authenticated GET `/.well-known/jmap` now returns the Core Session. Mail and
-Submission remain unadvertised. The event_streams limit defaults to two and
+Authenticated GET `/.well-known/jmap` returns Core and Mail capabilities,
+a sole read-only account and its Mail primary-account mapping. Submission
+remains unadvertised. The event_streams limit defaults to two and
 must be nonzero for mailbox-access. The resource plan already requires it
 strictly below https_connections, reserving capacity for other requests. The
 profile-neutral config check permits zero for SMTP-only; mailbox-access
 startup additionally validates Core-specific admission. EventSource GET uses
 the Session URL template and an independent stream ceiling within the shared
-HTTPS/per-peer connection caps. Core has no account state types, so these
-streams emit requested pings only; closeafter=state closes after an actual
-state event, not a ping. A zero ping interval keeps the stream silent until
+HTTPS/per-peer connection caps. These streams currently emit requested pings
+only; live Mail StateChange capture remains unimplemented. td-mail reads by
+requests and does not consume this endpoint. closeafter=state therefore waits
+without treating a ping as a state event. A zero ping interval keeps the stream silent until
 revocation, disconnect, shutdown or the absolute connection deadline. Each
 output frame has a fixed stall deadline. Event streams do not consume the
 API/upload body permit.

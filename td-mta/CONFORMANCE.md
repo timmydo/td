@@ -6,7 +6,7 @@ properties and argument combinations are outside the implementation scope.
 The broader tables remain a protocol reference, not an implementation backlog
 or a gate on the td-mail milestone. Existing implemented behavior stays tested.
 
-The next milestone is real td-mail over real td-fetch and td-mta: authenticate,
+The initial read milestone uses real td-mail over real td-fetch and td-mta: authenticate,
 list mailboxes and messages, read plain and HTML mail, follow threads, and
 download original messages and attachments. Search, flags, moves, deletion and
 sending follow the client's actual calls; they need not block the initial
@@ -14,12 +14,12 @@ read-mail fixture. Authorization, durable outcomes, bounded work and honest
 errors remain mandatory in every supported path. Do not report absent body
 content as successful empty data to make a client test pass.
 
-The mailbox-access profile now advertises Core only: authenticated Session
-discovery, complete
-bounded Core batches, upload/download, the single-account Blob/copy outcome,
-PushSubscription policy and EventSource are active. Mail and Submission
-remain unadvertised. Activation follows the supported td-mail workflow tests,
-not completion of every reference-table row.
+The mailbox-access profile advertises Core and read-only Mail. Authenticated
+Session discovery, bounded Core and Mail read batches, upload/download, the
+single-account Blob/copy outcome and PushSubscription policy are active.
+EventSource emits pings only; Mail StateChange integration remains absent and
+is not used by td-mail. Submission remains unadvertised. Activation follows
+the supported td-mail workflow tests, not every reference-table row.
 M22/M24 still own real-client and complete release coverage. API.md and
 QUEUE.md fix state/error and submission policies.
 [POLICY.md](POLICY.md) fixes interpretation, query and thread choices;
@@ -287,9 +287,9 @@ coverage includes requested pings, ping=0 silence, unknown reconnect IDs,
 connection-limit refusal, simultaneous API traffic, revocation and shutdown.
 The passive EventSource tests exercise StateChange coalescing, filtering,
 last-event-ID replay avoidance and closeafter=state. Core exposes no stateful
-account data type, so a Core-only runtime stream produces pings, not mail
-StateChange events. Live mail-state integration belongs with Mail activation.
-This is not a td-mail interoperability result; that remains the next milestone.
+account data type. The live stream still produces pings only; this read
+profile does not claim Mail StateChange events. The real-client fixture below
+qualifies the request-driven td-mail flow independently of passive SSE tests.
 
 ## Mailbox/query worker evidence
 
@@ -298,6 +298,37 @@ external sorting, tree rules, anchor adjustment, configured paging, totals,
 query state and result references into Mailbox/get. Its fixture includes a
 300-row merge, empty accounts, full filter validation before scans, distinct
 text limits, account/view pressure and execution expiry. This is worker-level
-evidence only: live discovery still advertises Core alone, and no td-mail
-interoperability result is claimed. Mail activation still requires the rest
-of the supported client-flow obligations above.
+evidence. The real-client fixture below separately covers live discovery and
+the initial read flow; it does not qualify every Mailbox/query combination.
+
+## Real td-mail read evidence
+
+The native crypto-cargo test wrapper builds td-mail and a td-net test
+executable from this checkout, then requires the ignored mail_client_tests
+fixture to pass. It runs td-mail's actual CLI/backend and td-fetch's Unix
+protocol, HTTP and TLS implementation against the native td-mta HTTPS driver,
+credential registry and SQLite coordinator. The private CA enters only the
+fetch test build as a replacement TLS configuration with a private trust root.
+The fixture uses production fetch limits and allows loopback for its local
+server. It does not qualify the production root set or TLS configuration.
+
+Four committed messages cover plain text, HTML-only preview and body text
+beyond that preview, a
+binary base64 attachment and an interpretation refusal. The client discovers
+the Mail account, lists Inbox and all four messages, reads two ordered members of a thread, downloads
+the attachment using the server-emitted locator, exports the refused message
+using its original blob ID with exact bytes, and receives exactly HTTP 401 after
+credential revocation. The refused message remains visibly unreadable.
+
+This is a small native read fixture, not the full M22/M24 release oracle.
+SMTP receipt/recovery have their own fixtures; this case seeds native commits.
+It does not qualify search, mutations, submission, Mail state events, large
+mailbox latency or whole-service RSS. Existing worker/client fixtures retain
+separate coverage of bounded large queries and 300-message thread batching.
+
+A repeated real-client run exposed HTTP 429 during a rapid thread read after
+listing and downloads. td-mail now honors bounded short Retry-After delays
+for GETs and explicit read batches; mutation requests are never replayed.
+The same bounded retry covers HTTP 503 at the API/download worker handoff,
+using a one-second delay when the server supplies no Retry-After.
+The server's authentication rate limits remain unchanged.

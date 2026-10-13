@@ -562,6 +562,16 @@ pub(crate) fn warm_mail_sources(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Native mail tests alone need the real fetch fixture's locked sources.
+pub(crate) fn warm_mail_client_sources(root: &Path) -> Result<(), String> {
+    warm_mail_sources(root)?;
+    warm_td_crate_closure(root);
+    if !vendor_is_complete(root, "td-net", Some("net/Cargo.lock")) {
+        return Err("native mail fetch fixture source preparation incomplete".into());
+    }
+    Ok(())
+}
+
 /// Prepare the target td-net recipe's canonical vendor set before the gates
 /// run. Use the same td-feed operation and recipe lock as the later warm
 /// prelude; an already prepared VM cache needs no registry access.
@@ -1160,7 +1170,7 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     }
     let disabled = std::env::var("TD_CHECK_DISABLE").unwrap_or_default();
     if !listing_only && crate::gates::goals_include(&goals, "cargo-test", &disabled)? {
-        if let Err(e) = warm_mail_sources(&root) {
+        if let Err(e) = warm_mail_client_sources(&root) {
             eprintln!("td-builder check: native mail source preparation: {e}; the cargo gate enforces presence when provisioned");
         }
     }

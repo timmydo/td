@@ -179,6 +179,8 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
             .env("RUSTC_WRAPPER", "")
             .env("RUSTC_WORKSPACE_WRAPPER", "")
             .env("CARGO_ENCODED_RUSTFLAGS", "")
+            .env_remove("TD_MTA_TEST_MAIL")
+            .env_remove("TD_MTA_TEST_FETCH")
             .env_remove("TD_MTA_TEST_TLS_PEER")
             .env_remove("TD_MTA_PORTABLE_CLI")
             .env(crate::stage0::target_linker_var(&host), &cc)
@@ -226,56 +228,49 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
         std::str::from_utf8(&output.stdout).map_err(|e| format!("crypto graph UTF-8: {e}"))?;
     crate::crypto_policy::active_graph(root, name, graph)?;
     let mut cmd = command(action, manifest);
+    let mut live_fixture = None;
     if action == "test" && name == "td-mta" {
-        use std::io::Read;
-        let mut peer = command("test", "td-crypto/Cargo.toml");
-        peer.args([
-            "--lib",
-            "--no-run",
-            "--message-format=json-render-diagnostics",
-        ])
-        .stdout(Stdio::piped());
-        let mut child = Child(
-            peer.spawn()
-                .map_err(|e| format!("crypto fixture build: {e}"))?,
-        );
-        let mut output = Vec::new();
-        child
-            .0
-            .stdout
-            .take()
-            .ok_or("crypto fixture build has no stdout")?
-            .take(8 * 1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .map_err(|e| format!("read crypto fixture build: {e}"))?;
-        if output.len() > 8 * 1024 * 1024 {
-            return Err("crypto fixture build output exceeds its ceiling".into());
-        }
-        if !child
-            .0
-            .wait()
-            .map_err(|e| format!("crypto fixture build wait: {e}"))?
-            .success()
-        {
-            return Err("crypto fixture build failed".into());
-        }
-        let message =
-            std::str::from_utf8(&output).map_err(|e| format!("crypto fixture JSON: {e}"))?;
-        let executable = crate::crypto_isolated::artifact_path(
-            message,
-            "td_crypto",
-            crate::crypto_isolated::ArtifactKind::LibraryTest,
-        )?;
-        let executable = executable
-            .canonicalize()
-            .map_err(|e| format!("crypto fixture executable: {e}"))?;
+        std::fs::create_dir_all(&target_dir).map_err(|e| format!("crypto fixture target: {e}"))?;
         let target = Path::new(&target_dir)
             .canonicalize()
             .map_err(|e| format!("crypto fixture target: {e}"))?;
-        if !executable.starts_with(target) || !executable.is_file() {
-            return Err("crypto fixture executable escaped its target directory".into());
-        }
-        cmd.env("TD_MTA_TEST_TLS_PEER", executable);
+        let mut peer = command("test", "td-crypto/Cargo.toml");
+        peer.args(["--lib", "--no-run"]);
+        cmd.env(
+            "TD_MTA_TEST_TLS_PEER",
+            fixture_executable(
+                peer,
+                "td_crypto",
+                crate::crypto_isolated::ArtifactKind::LibraryTest,
+                &target,
+            )?,
+        );
+        let mail = fixture_executable(
+            command("build", "td-mail/Cargo.toml"),
+            "td-mail",
+            crate::crypto_isolated::ArtifactKind::Installed,
+            &target,
+        )?;
+        let net_vendor = crate::host_bin::prepare_native_vendor(root)?;
+        let net_vendor = net_vendor
+            .to_str()
+            .ok_or("fetch fixture vendor path must be UTF-8")?;
+        let quoted = td_engine::json::Json::Str(net_vendor.into()).to_json_string();
+        let mut fetch = command("test", "net/Cargo.toml");
+        fetch.args([
+            "--bin",
+            "td-net",
+            "--no-run",
+            "--config",
+            &format!("source.td-crypto-vendor.directory={quoted}"),
+        ]);
+        let fetch = fixture_executable(
+            fetch,
+            "td-net",
+            crate::crypto_isolated::ArtifactKind::BinaryTest,
+            &target,
+        )?;
+        live_fixture = Some((mail, fetch));
     }
     if action == "clippy" {
         cmd.args(["--all-targets", "--", "-D", "warnings"]);
@@ -288,7 +283,59 @@ pub(crate) fn run(root: &Path, action: &str, manifest: &str) -> Result<()> {
     if !status.success() {
         return Err(format!("crypto {action} failed: {status}"));
     }
+    if let Some((mail, fetch)) = live_fixture {
+        let mut fixture = command("test", manifest);
+        fixture.env("TD_MTA_TEST_MAIL", mail).env("TD_MTA_TEST_FETCH", fetch)
+            .args(["--lib", "--", "--exact", "tls_policy::tests::mail_client_tests::td_mail_reads_native_mail_and_downloads_emitted_attachment_ids", "--ignored", "--nocapture"]);
+        fixture.stdout(Stdio::piped());
+        crate::native_tests::run_cases(fixture)?;
+    }
     Ok(())
+}
+
+fn fixture_executable(
+    mut command: Command,
+    name: &str,
+    kind: crate::crypto_isolated::ArtifactKind,
+    target: &Path,
+) -> Result<PathBuf> {
+    use std::io::Read;
+    command
+        .arg("--message-format=json-render-diagnostics")
+        .stdout(Stdio::piped());
+    let mut child = Child(
+        command
+            .spawn()
+            .map_err(|e| format!("{name} fixture build: {e}"))?,
+    );
+    let mut output = Vec::new();
+    child
+        .0
+        .stdout
+        .take()
+        .ok_or("fixture build has no stdout")?
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut output)
+        .map_err(|e| format!("read {name} fixture build: {e}"))?;
+    if output.len() > 8 * 1024 * 1024 {
+        return Err("fixture build output exceeds ceiling".into());
+    }
+    if !child
+        .0
+        .wait()
+        .map_err(|e| format!("{name} fixture wait: {e}"))?
+        .success()
+    {
+        return Err(format!("{name} fixture build failed"));
+    }
+    let messages = std::str::from_utf8(&output).map_err(|e| format!("{name} fixture JSON: {e}"))?;
+    let executable = crate::crypto_isolated::artifact_path(messages, name, kind)?
+        .canonicalize()
+        .map_err(|e| format!("{name} fixture executable: {e}"))?;
+    if !executable.starts_with(target) || !executable.is_file() {
+        return Err(format!("{name} fixture escaped target directory"));
+    }
+    Ok(executable)
 }
 
 #[cfg(test)]

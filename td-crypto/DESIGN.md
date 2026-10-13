@@ -92,6 +92,13 @@ these two crates. This wrapper verifies private archive copies, reconstructs
 and rehashes extracted sources before cache reuse, uses a fresh Cargo home,
 forces offline/frozen source replacement, and checks Cargo's selected graph.
 A missing, stale or tampered vendor fails; Cargo never fetches a substitute.
+The native td-mta test leg additionally builds td-mail and a td-net test
+helper for the real-client read fixture. These host-only helpers follow their
+existing roster/locked-source policies, not the private crypto active-graph
+allowlist. The td-net archives are prepared only for native mail tests;
+portable crypto/mail builds and crypto-only qualification do not require them.
+DEVELOPMENT.md owns helper selection and test-runner bounds; td-mta's
+CONFORMANCE.md owns the fixture's evidence and limits.
 Repository Cargo configuration cannot set AWS_LC_SYS controls, including
 through escaped keys or inline environment tables.
 The wrapper qualifies the provisioned host Rust/C toolchain. Host invocations

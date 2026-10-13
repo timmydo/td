@@ -490,7 +490,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     let mut response_root = response_fixture.locked();
     let request_spool =
         crate::store_fs::RequestSpool::open(&mut response_root, clock.clone(), until).unwrap();
-    let session = crate::jmap_session::Session::core(
+    let session = crate::jmap_session::Session::mail_read(
         Origin::parse(&origin_text).unwrap(),
         crate::config::identities::AccountView {
             id: account,
@@ -1468,8 +1468,10 @@ fn discovery_cases(
             assert!(json["capabilities"]["urn:ietf:params:jmap:core"]
                 .as_obj()
                 .is_some());
-            assert_eq!(json["capabilities"].as_obj().unwrap().len(), 1);
-            assert!(json["capabilities"]["urn:ietf:params:jmap:mail"].is_null());
+            assert_eq!(json["capabilities"].as_obj().unwrap().len(), 2);
+            assert!(json["capabilities"]["urn:ietf:params:jmap:mail"]
+                .as_obj()
+                .is_some());
             discovered = Some(json);
         }
         finish_event(&mut wire);

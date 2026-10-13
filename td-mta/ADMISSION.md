@@ -1155,9 +1155,10 @@ or body-worker permit. A separate event_streams counter is bounded by the
 HTTPS connection pool, and the per-peer cap still applies. Startup refuses
 Core activation with zero event capacity. The backend snapshot operation is
 nonblocking and only tries the device registry; every turn rechecks device
-access before output. Core alone exposes no account data types, so no mail
-state or account state is fabricated. The existing snapshot encoder handles
-future StateChange filtering, reconnect and close-after-state behavior.
+access before output. The read-only Mail profile does not yet connect account
+state to this endpoint: it emits requested pings only. td-mail uses requests
+instead. The existing snapshot encoder handles future StateChange filtering,
+reconnect and close-after-state behavior.
 
 The HTTP stream is close-delimited text/event-stream. Headers and each frame
 must flush within one original event_stall_seconds window; partial writes do

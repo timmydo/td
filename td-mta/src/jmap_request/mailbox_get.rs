@@ -145,20 +145,19 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 else {
                     continue;
                 };
-                let Row::Mailbox(row) = row else {
+                let Row::Mailbox(_) = row else {
                     return Err(Error::Storage(ports::Error::Corrupt));
                 };
-                let inbox = row.role == Some("inbox");
                 let rights = Rights {
                     may_read_items: true,
-                    may_add_items: true,
-                    may_remove_items: true,
-                    may_set_seen: true,
-                    may_set_keywords: true,
-                    may_create_child: true,
-                    may_rename: !inbox,
-                    may_delete: !inbox,
-                    may_submit: true,
+                    may_add_items: false,
+                    may_remove_items: false,
+                    may_set_seen: false,
+                    may_set_keywords: false,
+                    may_create_child: false,
+                    may_rename: false,
+                    may_delete: false,
+                    may_submit: false,
                 };
                 let length = mailbox_response::encode(
                     &mut view,

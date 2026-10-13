@@ -7151,8 +7151,8 @@ method envelopes and retained response ownership remain separate.
 ## Retained Mailbox/get
 
 The retained dispatcher accepts Mailbox/get only when the validated request
-opts into Mail. The live HTTPS preflight and Session remain Core-only;
-this method does not activate or advertise a partial Mail capability.
+opts into Mail. The live HTTPS preflight and Session expose the read-only
+td-mail profile qualified in CONFORMANCE.md.
 Arguments are accountId, ids and properties. The account must be the sole
 configured personal account. Unknown arguments, invalid shapes and unknown
 properties return invalidArguments; a well-formed unavailable account returns
@@ -7235,8 +7235,8 @@ output as provisional, and check that view before publishing the response.
 ## Retained Mailbox/changes dispatch
 
 The retained dispatcher executes Mailbox/changes only when the admitted
-request opts into Mail. Live HTTPS and Session remain Core-only until the
-complete Mail conformance gate. Validate accountId, required string
+request opts into Mail, including the live read-only profile.
+Validate accountId, required string
 sinceState, optional nullable maxChanges, and reject unknown arguments.
 Malformed or unavailable state strings return cannotCalculateChanges;
 non-string state arguments return invalidArguments. Validate argument
@@ -7286,8 +7286,8 @@ methods or advertise Mail.
 ## Retained Thread/get dispatch
 
 The retained dispatcher executes Thread/get only for an admitted request
-opting into Mail; live HTTPS and Session remain Core-only until the complete
-Mail gate. Null or omitted ids enumerate visible threads in ascending local
+opting into Mail, including the live read-only profile.
+Null or omitted ids enumerate visible threads in ascending local
 ID order if the complete result fits maxObjectsInGet; otherwise return
 requestTooLarge. Empty explicit arrays are valid. accountId is required;
 unknown arguments and properties are invalidArguments. properties null or
@@ -7337,11 +7337,11 @@ creation, membership updates and destruction in the same transaction as
 the corresponding objects. A created result may feed Thread/get through
 the standard result-reference resolver.
 
-Mail activation is blocked until every enabled writer of Thread rows or
-Email thread membership has evidence that it commits matching Thread
-history atomically. This dispatcher does not enforce that pairing at the
-generic storage boundary. Delivery has its own history tests; future
-import, set and purge paths must supply their own evidence before admission.
+Every enabled writer of Thread rows or Email thread membership must commit
+matching Thread history atomically. Delivery is the only active production
+writer in the read profile and has native history tests. This dispatcher does
+not enforce that pairing at the generic storage boundary; future import, set
+and purge paths require their own evidence before admission.
 
 ## Passive query-state tokens
 
@@ -8714,7 +8714,7 @@ turns. The sorted page is retained under the original request, so result
 references use actual emitted IDs. Final snapshot and request checks precede
 publication. Native/view/sort pressure or expiry withholds the page; the
 existing dispatcher retains ordered method errors and later-call behavior.
-Live Mail activation and the real td-mail read fixture still require Email/get.
+The live read profile composes this worker with Email/get as described below.
 
 ## td-mail Email/get worker projection
 
@@ -8739,8 +8739,8 @@ maxBodyValueBytes select the existing bounded body-value decoder. HTML values
 preserve their markup; preview alone extracts visible text when no plaintext
 body was selected. The raw stored blob ID remains independently retrievable
 with properties [id, blobId], without MIME parsing. Derived attachment locators
-are provisional until successful response publication; HTTPS locator download
-activation remains separate.
+are provisional until successful response publication; the HTTPS direct-part
+route below validates them independently before download.
 
 One method meter covers property recognition, every requested message and all
 MIME phases under the original execution deadline. The original retention
@@ -8763,7 +8763,7 @@ empty text. The metadata projection has six bounded 16 KiB windows (the head
 window additionally admits its 14-byte default), and one 192 KiB generated
 fragment allocated once per message and reused across its parts. Headers and
 part counts remain bounded by the admitted resource plan. Large or unsupported
-interpretations can refuse. This does not yet activate live Mail discovery.
+interpretations can refuse. Live Mail discovery exposes the read profile below.
 
 The header projection cap is 64 distinct names; exceeding it returns
 requestTooLarge. Metadata interpretation validates all parsed parts, including
@@ -8794,3 +8794,13 @@ decoder replay charge. Storage I/O and clock failure can still end a started
 response. The transfer deadline is based on parent size before parsing.
 Only td-mail's direct attachment path is activated here; no generic nested
 Email/parse download surface is added.
+
+### Live td-mail read profile
+
+The mailbox-access Session advertises Core and Mail, names the sole Mail
+primary account and marks it read-only. HTTPS envelope admission accepts
+those two capabilities; Submission and unimplemented methods remain explicit
+errors. The native real-client fixture in CONFORMANCE.md qualifies the
+request-driven read flow. Mail StateChange delivery is not wired: the existing
+EventSource endpoint emits only requested pings and td-mail does not use it.
+No generic-client or complete RFC Mail claim follows from this activation.

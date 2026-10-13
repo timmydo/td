@@ -26,6 +26,54 @@ fn no_fetch_service() -> JmapError {
     ))
 }
 
+// td-mta can rate-limit a burst of authenticated reads. Retry only explicit
+// short 429 delays or retiring-worker 503s; never replay transport failures
+// or mutation batches.
+fn read_backoff(
+    mut send: impl FnMut() -> Result<td_fetch_client::Response, td_fetch_client::Error>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<td_fetch_client::Response, td_fetch_client::Error> {
+    let mut retries = 0;
+    loop {
+        let response = send()?;
+        let retry_after = response.header("retry-after");
+        let delay = retry_after.and_then(|value| {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            value.parse::<u64>().ok().filter(|n| (1..=5).contains(n))
+        });
+        let delay =
+            delay.or_else(|| (response.status == 503 && retry_after.is_none()).then_some(1));
+        if !matches!(response.status, 429 | 503) || retries == 2 {
+            return Ok(response);
+        }
+        let Some(seconds) = delay else {
+            return Ok(response);
+        };
+        retries += 1;
+        drop(response);
+        wait(std::time::Duration::from_secs(seconds));
+    }
+}
+
+fn read_batch(request: &JmapRequest) -> bool {
+    !request.method_calls.is_empty()
+        && request.method_calls.iter().all(|call| {
+            matches!(
+                call.0,
+                "Mailbox/get"
+                    | "Mailbox/query"
+                    | "Mailbox/changes"
+                    | "Email/get"
+                    | "Email/query"
+                    | "Email/changes"
+                    | "Thread/get"
+                    | "Thread/changes"
+            )
+        })
+}
+
 /// One GET with the auth header, as a status, the `location` header if any,
 /// and the body bytes, through td's fetch service — which a jail carrying
 /// `sockets=fetch` has (td's APPLICATIONS.md §W.8). The redirect loops
@@ -46,8 +94,11 @@ fn get_with_auth(url: &str, auth: Option<&str>) -> Result<Fetched, JmapError> {
         return Err(no_fetch_service());
     }
     let headers: Vec<(&str, &str)> = auth.map(|a| ("authorization", a)).into_iter().collect();
-    let response = td_fetch_client::get(url, &headers, RESPONSE_LIMIT, Some(0))
-        .map_err(|e| JmapError::Http(e.to_string()))?;
+    let response = read_backoff(
+        || td_fetch_client::get(url, &headers, RESPONSE_LIMIT, Some(0)),
+        std::thread::sleep,
+    )
+    .map_err(|e| JmapError::Http(e.to_string()))?;
     Ok(Fetched {
         status: response.status,
         location: response.header("location").map(str::to_string),
@@ -372,15 +423,22 @@ impl JmapClient {
 
         // The fetch service carries the request; a status of 400 or more is
         // an error here rather than a reply, as it was before.
-        let response = td_fetch_client::post(
-            &self.api_url,
-            &[
-                ("authorization", auth.as_str()),
-                ("content-type", "application/json"),
-            ],
-            request_json.as_bytes(),
-            RESPONSE_LIMIT,
-        )
+        let send = || {
+            td_fetch_client::post(
+                &self.api_url,
+                &[
+                    ("authorization", auth.as_str()),
+                    ("content-type", "application/json"),
+                ],
+                request_json.as_bytes(),
+                RESPONSE_LIMIT,
+            )
+        };
+        let response = if read_batch(&request) {
+            read_backoff(send, std::thread::sleep)
+        } else {
+            send()
+        }
         .map_err(|e| {
             log_error!("[JMAP] API call failed: {}", e);
             JmapError::Http(e.to_string())
@@ -1795,6 +1853,116 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_rate_limit_delays_are_bounded_and_other_failures_are_not_replayed() {
+        use td_fetch_client::{Error, Response};
+        for (status, delay, attempts) in [
+            (429, "1", 3),
+            (429, "5", 3),
+            (429, "0", 1),
+            (429, "6", 1),
+            (429, "999999999999999999999", 1),
+            (429, "Wed, 21 Oct 2015 07:28:00 GMT", 1),
+            (429, "+1", 1),
+            (429, "", 1),
+            (401, "1", 1),
+            (503, "1", 3),
+            (503, "6", 1),
+            (503, "", 1),
+            (200, "1", 1),
+        ] {
+            let mut calls = 0;
+            let mut waits = Vec::new();
+            let reply = read_backoff(
+                || {
+                    calls += 1;
+                    Ok(Response {
+                        status,
+                        headers: vec![("retry-after".into(), delay.into())],
+                        body: vec![42],
+                    })
+                },
+                |duration| waits.push(duration),
+            )
+            .unwrap();
+            assert_eq!(calls, attempts);
+            assert_eq!(waits.len(), attempts - 1);
+            assert_eq!(reply.status, status);
+            assert_eq!(reply.body, [42]);
+            assert!(waits
+                .iter()
+                .all(|d| d.as_secs() == delay.parse::<u64>().unwrap()));
+        }
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let reply = read_backoff(
+            || {
+                calls += 1;
+                Ok(Response {
+                    status: 503,
+                    headers: vec![],
+                    body: vec![],
+                })
+            },
+            |duration| waits.push(duration.as_secs()),
+        )
+        .unwrap();
+        assert_eq!((calls, waits, reply.status), (3, vec![1, 1], 503));
+        let mut calls = 0;
+        let mut waited = 0;
+        let reply = read_backoff(
+            || {
+                calls += 1;
+                Ok(Response {
+                    status: if calls == 1 { 429 } else { 200 },
+                    headers: vec![("retry-after".into(), "1".into())],
+                    body: vec![],
+                })
+            },
+            |duration| waited += duration.as_secs(),
+        )
+        .unwrap();
+        assert_eq!((calls, waited, reply.status), (2, 1, 200));
+        let mut calls = 0;
+        assert!(read_backoff(
+            || {
+                calls += 1;
+                Err(Error::Io("disconnected".into()))
+            },
+            |_| panic!("must not wait")
+        )
+        .is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn only_explicit_read_batches_allow_rate_limit_replay() {
+        let mut request = JmapRequest {
+            using: vec![],
+            method_calls: vec![],
+        };
+        assert!(!read_batch(&request));
+        request
+            .method_calls
+            .push(MethodCall("Email/get", json!({}), "a".into()));
+        request
+            .method_calls
+            .push(MethodCall("Thread/get", json!({}), "b".into()));
+        assert!(read_batch(&request));
+        for name in [
+            "Email/set",
+            "EmailSubmission/set",
+            "Email/import",
+            "Something/get",
+        ] {
+            request
+                .method_calls
+                .push(MethodCall(name, json!({}), "c".into()));
+            assert!(!read_batch(&request));
+            request.method_calls.pop();
+        }
+    }
 
     /// The credential goes only where the request was configured to go:
     /// a redirect within that origin carries it, one to any other origin,

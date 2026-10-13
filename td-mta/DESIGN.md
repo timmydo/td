@@ -1812,7 +1812,7 @@ filesystem paths. It must authorize and admit body storage before sending
 100 Continue, check decoder completion before publication, and close on
 framing failure. The current HTTPS runtime serves authenticated uploads, raw
 downloads, the Core API and EventSource with these bounds. Authenticated
-discovery advertises only the completed Core capability. Device persistence
+discovery advertises Core and the read-only td-mail Mail profile. Device persistence
 and local administration are implemented under section 7. Framing tests
 cover split input, pipelined tails, binary bodies, output backpressure,
 smuggling patterns and exact/refused limits without a network listener.
@@ -1850,8 +1850,8 @@ After responding it applies RESOURCES.md's bounded write-half closure.
 Refusals may drain bounded unread data; successful uploads already consumed
 their body and do not drain. Downloads also close without drain. Slots remain
 active until retired.
-Authenticated GET /.well-known/jmap returns Core Session metadata; unknown
-targets get 404. Mail and Submission capabilities remain unadvertised.
+Authenticated GET /.well-known/jmap returns Core and read-only Mail Session
+metadata; unknown targets get 404. Submission remains unadvertised.
 Non-POST upload methods get 405 with Allow: POST. Missing, invalid and revoked
 credentials receive the same 401 Basic challenge. No credential enters error
 output. A failed local credential publication
@@ -1890,8 +1890,8 @@ snapshot and exchange deadline; storage owns account/device access. Filename
 and media template values are decoded once and cannot inject response
 headers. Pre-output errors return an HTTP refusal; after output starts an
 error retires the connection. ADMISSION.md owns exact bounds and status
-mapping. Other methods return 405 with Allow: GET. Discovery remains disabled
-until the complete Core capability is implemented.
+mapping. Other methods return 405 with Allow: GET. Discovery is authenticated
+and exposes the supported td-mail read profile.
 
 Implement bounded HTTP/1.1 for discovery, authenticated method calls, uploads,
 and downloads. Reject conflicting Content-Length/Transfer-Encoding, ambiguous
@@ -1919,15 +1919,15 @@ object property or a validated selection, with caller-supplied account rights
 and same-view batch counts. API.md owns its snapshot, provisional-output and
 fixed-buffer contract. The retained dispatcher implements Mailbox/get,
 including result references, bounded enumeration and same-view counts. The
-live HTTPS capability preflight remains Core-only until the supported
-td-mail reading flows pass their activation tests.
+live HTTPS capability preflight admits Core and Mail for the supported
+td-mail read flow qualified in CONFORMANCE.md.
 
 The retained Mailbox/changes dispatcher validates scoped state and exact
 UnsignedInt limits, consumes one retained change-page cursor and encodes
 transaction-aligned changes under the original request work and deadline.
 It keeps the read view through final publication and emits null
 updatedProperties because history does not track per-field changes.
-This method remains behind admitted Mail opt-in; live admission is Core-only.
+This method remains behind admitted Mail opt-in, including live requests.
 
 The retained change-page cursor coalesces typed object history into bounded
 transaction-aligned pages. API.md owns its token scope, limit, snapshot and
@@ -1943,11 +1943,11 @@ remains separate.
 Retained Thread/get handles explicit IDs or bounded all-thread enumeration
 and streams received-date member
 windows from one original snapshot. Its argument, projection and rollback
-contract is in API.md; this does not activate the Mail capability.
+contract is in API.md; CONFORMANCE.md qualifies its live td-mail read path.
 
 Retained Thread/changes shares the checked changes encoder with Mailbox,
 selecting Thread state and wire IDs and omitting Mailbox-only fields.
-API.md owns this contract; Mail activation remains separate.
+API.md owns this contract; the live read profile requires Mail opt-in.
 
 The compatibility baseline includes the current td-mail JMAP implementation,
 particularly its existing sending flow:
@@ -2220,7 +2220,8 @@ The mailbox-access Core API now runs on the bounded HTTPS body worker.
 ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
 owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
 is exposed by authenticated discovery now that its required endpoints are
-active. Mail methods remain unavailable. EventSource uses only authorized
-Core state: there are no account data types to announce yet. Pings and
-revocation still work; adding Mail requires passive state capture without
-blocking the network reactor or holding a store view across socket work.
+active. Mail read methods are exposed for td-mail and the account is marked
+read-only. CONFORMANCE.md records the actual client/TLS evidence. EventSource
+still emits only pings: td-mail does not consume it. Future Mail state delivery
+requires passive state capture without blocking the network reactor or holding
+a store view across socket work; this read profile makes no such claim.

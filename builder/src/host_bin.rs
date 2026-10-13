@@ -167,7 +167,7 @@ fn extract_vendor(root: &Path, destination: &str, lock_path: &str) -> Result<Nat
 /// Keep Cargo's source identity stable without trusting a persisted digest.
 /// Reconstruct from lock-verified archives, then compare the complete cached
 /// tree before reuse. Same-UID concurrent mutation is not an isolation boundary.
-fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn prepare_native_vendor(root: &Path) -> Result<PathBuf, String> {
     prepare_vendor(root, extract_native_vendor(root)?)
 }
 

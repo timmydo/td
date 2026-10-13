@@ -4827,3 +4827,15 @@ retained. Parsing, matching, counting and replay share one foreground meter;
 the pinned native reader retains its independent storage work bound. Native
 HTTPS coverage includes a 120,000-byte encoded part near the fixture admission maximum,
 quoted-printable, empty parts and forged ranges/encoding/container requests.
+
+The native td-mail read fixture exercises these workers serially through the
+real fetch transport with four small messages, including an interpretation
+refusal. It is functional evidence only. The single body worker and existing
+request/authentication ceilings remain unchanged; this fixture makes no
+latency, concurrent-reader or whole-service RSS qualification claim.
+
+Shared-worker pressure can return 503, including at the boundary between API
+reads and downloads while a previous exchange retires. For reads, the client
+retries 429/503 at most twice using a one-to-five-second Retry-After, or one
+second for 503 without that header. Persistent pressure remains an error.
+No seamless concurrent-read or contention-retry guarantee is made here.

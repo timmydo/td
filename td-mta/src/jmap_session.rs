@@ -1,4 +1,4 @@
-//! Prepared Core Session metadata. Construction does not enable discovery.
+//! Prepared read-only Mail Session metadata for td-mail.
 use crate::{
     bounded::TextBuffer,
     config::{
@@ -28,7 +28,7 @@ pub struct Concurrency {
 
 /// Immutable metadata for one authenticated account and one admission plan.
 /// The caller must enforce both concurrency counts and complete the Core
-/// contract before exposing this document. It conveys no authentication.
+/// and td-mail read contracts before exposing this document. It conveys no authentication.
 pub struct Session {
     concurrency: Concurrency,
     bytes: Vec<u8>,
@@ -40,7 +40,7 @@ impl std::fmt::Debug for Session {
     }
 }
 impl Session {
-    pub fn core(
+    pub fn mail_read(
         origin: Origin<'_>,
         account: AccountView<'_>,
         resources: &ResourcePlan,
@@ -84,7 +84,7 @@ impl Session {
                 ",\"maxCallsInRequest\":{}",
                 ",\"maxObjectsInGet\":{}",
                 ",\"maxObjectsInSet\":{}",
-                ",\"collationAlgorithms\":[]}}}}",
+                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}}}}",
                 ",\"accounts\":{{\"{}\":{{\"name\":",
             ),
             limits.message_bytes,
@@ -98,7 +98,20 @@ impl Session {
         ))
         .map_err(|_| Error::Capacity)?;
         quoted(&mut out, account.name)?;
-        append(&mut out, ",\"isPersonal\":true,\"isReadOnly\":false,\"accountCapabilities\":{\"urn:ietf:params:jmap:core\":{}}}},\"primaryAccounts\":{},\"username\":")?;
+        out.format(format_args!(
+            concat!(
+            ",\"isPersonal\":true,\"isReadOnly\":true,\"accountCapabilities\":{{",
+            "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
+            "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
+            "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":false}}}}}}}}",
+            ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\"}},\"username\":"
+        ),
+            crate::format::row::MAX_MAILBOX_NAME,
+            limits.message_bytes,
+            id
+        ))
+        .map_err(|_| Error::Capacity)?;
         quoted(&mut out, account.username)?;
         for (field, suffix) in [
             ("apiUrl", API_PATH),
@@ -113,7 +126,7 @@ impl Session {
         }
         let mut digest = td_crypto::Sha256::try_new().map_err(Error::from)?;
         digest
-            .update(b"td-mta Core Session v1\0")
+            .update(b"td-mta read-only Mail Session v1\0")
             .map_err(Error::from)?;
         digest
             .update(out.as_str().map_err(|_| Error::Invalid)?.as_bytes())
@@ -195,7 +208,7 @@ mod tests {
         uploads: usize,
         requests: usize,
     ) -> Session {
-        Session::core(
+        Session::mail_read(
             Origin::parse(origin).unwrap(),
             account,
             &limits.plan().unwrap(),
@@ -222,16 +235,29 @@ mod tests {
         assert_eq!(core["maxObjectsInGet"].as_u64(), Some(256));
         assert_eq!(core["maxObjectsInSet"].as_u64(), Some(256));
         assert!(core["collationAlgorithms"].as_array().unwrap().is_empty());
-        assert_eq!(value["capabilities"].as_object().unwrap().len(), 1);
+        assert_eq!(value["capabilities"].as_object().unwrap().len(), 2);
         assert_eq!(value["accounts"].as_object().unwrap().len(), 1);
         let object = &value["accounts"]["a07070707070707070707070707070707"];
         assert_eq!(object["name"].as_str(), Some("Personal mail"));
         assert_eq!(object["isPersonal"].as_bool(), Some(true));
-        assert_eq!(object["isReadOnly"].as_bool(), Some(false));
+        assert_eq!(object["isReadOnly"].as_bool(), Some(true));
+        let mail = &object["accountCapabilities"][crate::jmap_request::MAIL];
+        assert_eq!(
+            mail["maxSizeMailboxName"].as_u64(),
+            Some(crate::format::row::MAX_MAILBOX_NAME as u64)
+        );
+        assert_eq!(mail["mayCreateTopLevelMailbox"].as_bool(), Some(false));
+        assert_eq!(
+            mail["emailQuerySortOptions"],
+            td_json::json!(["receivedAt"])
+        );
         assert!(object["accountCapabilities"]["urn:ietf:params:jmap:core"]
             .as_object()
             .is_some());
-        assert!(value["primaryAccounts"].as_object().unwrap().is_empty());
+        assert_eq!(
+            value["primaryAccounts"]["urn:ietf:params:jmap:mail"].as_str(),
+            Some("a07070707070707070707070707070707")
+        );
         assert_eq!(value["username"].as_str(), Some("reader"));
         for (field, suffix) in [
             ("apiUrl", API_PATH),
@@ -355,7 +381,7 @@ mod tests {
         let over = plan.limits().https_connections + 1;
         for (uploads, requests) in [(0, 1), (1, 0), (over, 1), (1, over)] {
             assert_eq!(
-                Session::core(
+                Session::mail_read(
                     Origin::parse("https://mail.test").unwrap(),
                     account,
                     &plan,
@@ -371,7 +397,7 @@ mod tests {
             "\u{10ffff}".into(),
         ] {
             assert_eq!(
-                Session::core(
+                Session::mail_read(
                     Origin::parse("https://mail.test").unwrap(),
                     AccountView {
                         name: &name,
@@ -438,7 +464,7 @@ mod tests {
         assert!(session.bytes().len() < MAX_BYTES);
         for username in ["x".repeat(255), "\u{fdd0}".into()] {
             assert_eq!(
-                Session::core(
+                Session::mail_read(
                     Origin::parse(&origin).unwrap(),
                     AccountView {
                         username: &username,

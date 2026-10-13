@@ -288,7 +288,7 @@ fn all_mailboxes_properties_state_and_personal_policy() {
         );
         assert_eq!(
             result["list"][1]["myRights"]["mayRename"].as_bool(),
-            Some(true)
+            Some(false)
         );
         assert_eq!(result["list"][0]["totalEmails"].as_u64(), Some(0));
         let state = DataState::decode(result["state"].as_str().unwrap()).unwrap();
@@ -651,7 +651,7 @@ fn argument_shapes_escaped_ids_core_independence_and_exact_rights() {
         ] {
             assert_eq!(
                 object["myRights"][key].as_bool(),
-                Some(index != 0 || !matches!(key, "mayRename" | "mayDelete"))
+                Some(key == "mayReadItems")
             );
         }
     }

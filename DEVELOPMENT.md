@@ -850,6 +850,24 @@ only its owned tool directory. The process fixture owns editor/compositor
 cleanup. A hard-killed wrapper can leave its uniquely named scratch
 directory behind.
 
+## Native mail read fixture
+
+The td-mta native crypto-cargo test leg also builds the checkout's td-mail
+binary and td-net unit-test executable offline. Native source preparation
+warms both locked external closures; each build verifies its archived inputs.
+Cargo artifact records identify the helper executables inside the selected
+target directory. Ambient TD_MTA_TEST_MAIL and TD_MTA_TEST_FETCH cannot replace
+them. After ordinary tests, the wrapper runs the exact ignored real-client
+case and requires a positive passing libtest summary as well as exit success.
+
+td-mta/CONFORMANCE.md records what this native client fixture proves. Its
+private root certificate enters only the isolated fetch test process behind
+cfg(test); shipped fetch trust is unchanged.
+Ordinary and portable mail tests leave this host fixture ignored. Helper
+processes are killed and reaped by their owning fixture, and all mailbox,
+credential, client-cache and download data live under private temporary roots.
+This host test preparation does not add a target artifact dependency.
+
 # Code review: three per commit
 
 Every increment is read by three independent reviewers before it lands. They

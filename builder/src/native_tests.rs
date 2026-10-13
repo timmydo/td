@@ -145,7 +145,7 @@ fn test_summary(line: &str) -> Option<u64> {
     Some(passed)
 }
 
-fn run_cases(mut cmd: Command) -> Result<()> {
+pub(crate) fn run_cases(mut cmd: Command) -> Result<()> {
     let mut child = CargoChild(cmd.spawn().map_err(|e| format!("native cargo test: {e}"))?);
     let pipe = child
         .0
@@ -187,10 +187,10 @@ fn run_cases(mut cmd: Command) -> Result<()> {
         .wait()
         .map_err(|e| format!("native cargo wait: {e}"))?;
     if !status.success() {
-        return Err(format!("native compositor tests failed: {status}"));
+        return Err(format!("native tests failed: {status}"));
     }
     if !passed.is_some_and(|count| count > 0) {
-        return Err("native compositor tests reported no passing cases".into());
+        return Err("native tests reported no passing cases".into());
     }
     Ok(())
 }

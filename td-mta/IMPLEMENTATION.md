@@ -3837,3 +3837,10 @@ conflicting Host for routing while still validating its syntax. TLS tests
 cover discovery, absolute origins, event/query/method limits, pings, silent
 streams, simultaneous Core requests, revocation and shutdown. Mail capability
 activation and a real td-mail read remain subsequent work.
+
+The mailbox-access profile now exposes read-only Mail for td-mail. The native
+crypto-cargo wrapper runs a real td-mail/td-fetch TLS fixture covering account
+discovery, mailbox/message listing, plain text and HTML preview, an unreadable
+message placeholder, exact original and attachment downloads, thread reading
+and revocation. CONFORMANCE.md distinguishes this initial read evidence from
+the remaining mutation, sending, event and resource qualification work.

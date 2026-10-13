@@ -54,6 +54,7 @@ fn material() -> (Material, Vec<u8>, Vec<u8>, [u8; 32]) {
     let source = Arc::new(SwitchClock(AtomicBool::new(false)));
     (
         Material {
+            ca_der: certificate(&root_key, &root_key, true),
             chain,
             key: pem("PRIVATE KEY", &server[..s]),
             ca,

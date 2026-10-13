@@ -24,7 +24,7 @@ mod object_changes;
 mod push;
 #[path = "thread_get.rs"]
 mod thread_get;
-const MAIL: &str = "urn:ietf:params:jmap:mail";
+use super::MAIL;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

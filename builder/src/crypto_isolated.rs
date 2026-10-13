@@ -321,12 +321,13 @@ pub(crate) fn artifact_json(line: &str) -> Result<td_engine::json::Json> {
 pub(crate) enum ArtifactKind {
     Installed,
     LibraryTest,
+    BinaryTest,
     IntegrationTest,
 }
 impl ArtifactKind {
     fn target(self) -> &'static str {
         match self {
-            Self::Installed => "bin",
+            Self::Installed | Self::BinaryTest => "bin",
             Self::LibraryTest => "lib",
             Self::IntegrationTest => "test",
         }
@@ -3434,6 +3435,13 @@ mod tests {
         )
         .is_err());
         assert!(artifact_path(record, "td-mta", ArtifactKind::LibraryTest).is_err());
+        assert!(artifact_path(record, "td-mta", ArtifactKind::BinaryTest).is_err());
+        assert!(artifact_path(
+            &record.replace("false", "true"),
+            "td-mta",
+            ArtifactKind::BinaryTest
+        )
+        .is_ok());
         assert!(artifact_path(record, "td_crypto", ArtifactKind::Installed).is_err());
         assert!(artifact_path(
             &record.replace("[\"bin\"]", "[\"bin\",\"lib\"]"),
