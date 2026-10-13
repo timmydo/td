@@ -31,7 +31,9 @@ mod object_changes;
 mod push;
 #[path = "thread_get.rs"]
 mod thread_get;
-use super::MAIL;
+use super::{MAIL, SUBMISSION};
+#[path = "identity_get.rs"]
+mod identity_get;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -112,7 +114,7 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     account: AccountId,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
-    run_inner(plan, retention, execution, account, None, None)
+    run_inner(plan, retention, execution, account, None, None, None)
 }
 
 /// Email-only mutation fixture; runtime uses the complete mail-access profile.
@@ -132,6 +134,7 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         Some((flags, device)),
         None,
+        None,
     )
 }
 /// Authenticated td-mail mutations, including root-folder creation.
@@ -150,6 +153,26 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         Some((mutations, device)),
         Some((mutations, device)),
+        None,
+    )
+}
+/// Prepared identity read fixture; runtime integration requires a device.
+#[cfg(test)]
+pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+    identities: &crate::identity_catalog::Catalog,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        None,
+        None,
+        Some(identities),
     )
 }
 fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
@@ -159,7 +182,11 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     account: AccountId,
     flags: Option<(&dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&dyn MailboxMutator, crate::ids::DeviceId)>,
+    identities: Option<&crate::identity_catalog::Catalog>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    if identities.is_some_and(|catalog| catalog.account() != account) {
+        return Err(Error::State);
+    }
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
     }
@@ -175,10 +202,12 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     let request = responses.request().view().map_err(|_| Error::State)?;
     let mut core = false;
     let mut mail = false;
+    let mut submission = false;
     for capability in request.using {
         retention.admit_work_turn().map_err(Error::Storage)?;
         core |= capability.as_string_bytes() == Some(CORE.as_bytes());
         mail |= capability.as_string_bytes() == Some(MAIL.as_bytes());
+        submission |= capability.as_string_bytes() == Some(SUBMISSION.as_bytes());
     }
     let mut calls = Vec::new();
     calls
@@ -195,6 +224,8 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         flags,
         mailboxes,
+        identities,
+        submission,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core, mail);
@@ -271,6 +302,8 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     account: AccountId,
     flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
+    identities: Option<&'io crate::identity_catalog::Catalog>,
+    submission: bool,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
@@ -371,6 +404,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             });
         }
         let name = match call.name {
+            b"Identity/get" if self.submission && self.identities.is_some() => "Identity/get",
             b"Core/echo" if core => "Core/echo",
             b"Blob/copy" if core => "Blob/copy",
             b"PushSubscription/get" if core => "PushSubscription/get",
@@ -396,7 +430,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "Mailbox/set" {
+        let result = if name == "Identity/get" {
+            self.identity_get(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Mailbox/set" {
             self.mailbox_set(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Email/set" {
             self.email_set(start..end, responses.request().envelope.maximum_objects)
@@ -873,6 +909,8 @@ pub(super) mod tests {
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
+                identities: None,
+                submission: false,
             };
             assert_eq!(
                 worker.reference(&responses, 1, value),
@@ -1277,6 +1315,8 @@ pub(super) mod tests {
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
+                identities: None,
+                submission: false,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));
             assert_eq!(retention.failure(), None);

@@ -2265,5 +2265,17 @@ explicit cold allocation under section 5, not a claim that the proposed
 provides immutable object slices and configuration-digest identity state
 under a serving snapshot's store epoch after checking its account ID.
 Noncharacters in any visible text refuse preparation, matching Session's
-I-JSON policy. It confers no authority and does not yet enable Identity/get,
+I-JSON policy. It confers no authority and does not by itself enable Identity/get,
 submission capability or sending.
+
+The prepared identity dispatcher implements td-mail's default Identity/get
+projection under an explicitly supplied catalog and Submission declaration.
+It does not enter the HTTPS service or advertise Submission yet. Omitted or
+null ids selects all configured identities; explicit IDs preserve request
+order and deduplicate under maxObjectsInGet. Missing IDs are notFound. The
+td-mail profile accepts omitted/null properties and refuses property lists.
+Account validation precedes access, catalog and storage accounts must agree,
+and identity state binds the catalog digest to the live store epoch. Output
+uses the original retained-response quota and deadline, with bounded copying
+and a final snapshot check. Other calls in a batch retain normal error and
+result-reference handling.

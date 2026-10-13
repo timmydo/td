@@ -13,6 +13,7 @@ pub mod wire;
 
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
+pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 
 /// Redacted classifications, with internal parser ceilings kept separate from
 /// advertised Core limits. Resource errors must not be reported as notJSON.

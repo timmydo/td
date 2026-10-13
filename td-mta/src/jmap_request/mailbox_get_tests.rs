@@ -122,23 +122,71 @@ pub(crate) fn run_configured_response(
     run_profile(
         input,
         count,
-        (profile.0, profile.1, false),
+        (profile.0, profile.1, false, None),
         phase,
         busy,
         cutoff,
         setup,
     )
 }
+pub(crate) fn run_identities(
+    input: &str,
+    catalog: Option<&crate::identity_catalog::Catalog>,
+    maximum: usize,
+    response_bytes: u64,
+    phase: u64,
+    busy: bool,
+) -> Result<td_json::Json, dispatch::Error> {
+    run_identities_cutoff(input, catalog, maximum, response_bytes, phase, busy, None)
+}
+pub(crate) fn run_identities_cutoff(
+    input: &str,
+    catalog: Option<&crate::identity_catalog::Catalog>,
+    maximum: usize,
+    response_bytes: u64,
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+) -> Result<td_json::Json, dispatch::Error> {
+    try_run_profile(
+        input,
+        0,
+        (
+            Limits {
+                objects_per_method: maximum,
+                ..Limits::default()
+            },
+            response_bytes,
+            false,
+            catalog,
+        ),
+        phase,
+        busy,
+        cutoff,
+        |_| {},
+    )
+}
 fn run_profile(
     input: &str,
     count: u16,
-    profile: (Limits, u64, bool),
+    profile: (Limits, u64, bool, Option<&crate::identity_catalog::Catalog>),
     phase: u64,
     busy: bool,
     cutoff: Option<u64>,
     setup: impl FnOnce(&IndexStore<'_>),
 ) -> td_json::Json {
-    let (limits, response_bytes, writable) = profile;
+    try_run_profile(input, count, profile, phase, busy, cutoff, setup).unwrap()
+}
+fn try_run_profile(
+    input: &str,
+    count: u16,
+    profile: (Limits, u64, bool, Option<&crate::identity_catalog::Catalog>),
+    phase: u64,
+    busy: bool,
+    cutoff: Option<u64>,
+    setup: impl FnOnce(&IndexStore<'_>),
+) -> Result<td_json::Json, dispatch::Error> {
+    let (limits, response_bytes, writable, identities) = profile;
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let files = Fixture::new();
@@ -247,7 +295,11 @@ fn run_profile(
     let request = dispatch::tests::request_with_capabilities(
         input,
         limits,
-        &[super::super::CORE, super::super::MAIL],
+        &[
+            super::super::CORE,
+            super::super::MAIL,
+            super::super::SUBMISSION,
+        ],
     );
     let mut preflight = response::Preflight::new(request, "session", retention.maximum()).unwrap();
     while !preflight.step(&mut [0; 4096]).unwrap() {}
@@ -268,7 +320,9 @@ fn run_profile(
     }
     let planned = preflight.finish().unwrap();
     let phase = Deadline::after(Tick(0), phase).unwrap();
-    let mut completed = if writable {
+    let mut completed = if let Some(identities) = identities {
+        dispatch::run_with_identities(planned, retention, phase, ACCOUNT, identities)
+    } else if writable {
         dispatch::run_with_email_updates(
             planned,
             retention,
@@ -279,8 +333,7 @@ fn run_profile(
         )
     } else {
         dispatch::run(planned, retention, phase, ACCOUNT)
-    }
-    .unwrap();
+    }?;
     let mut encoder = completed.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let expected = encoder.begin_output().unwrap();
@@ -294,7 +347,7 @@ fn run_profile(
         }
     }
     assert_eq!(bytes.len() as u64, expected);
-    td_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap()
+    Ok(td_json::parse(std::str::from_utf8(&bytes).unwrap()).unwrap())
 }
 fn call(arguments: &str) -> String {
     batch(&format!(
@@ -826,7 +879,7 @@ fn device_profile_advertises_only_implemented_mailbox_rights() {
         let response = run_profile(
             &call(&format!(r#"{{"accountId":"{}"}}"#, account())),
             2,
-            (Limits::default(), 72000, writable),
+            (Limits::default(), 72000, writable, None),
             90,
             false,
             None,
