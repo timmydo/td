@@ -123,8 +123,6 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
     let mut devices_root = devices_dir.locked();
     let account = AccountId::from_bytes([0xaa; 16]);
     let inbox = MailboxId::from_bytes([1; 16]);
-    let archive = MailboxId::from_bytes([2; 16]);
-    let trash = MailboxId::from_bytes([3; 16]);
     let mut registry = DeviceStore::open_or_create(&mut devices_root, account).unwrap();
     let (device, password) = registry
         .create(
@@ -177,20 +175,6 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
         sort_order: 0,
         subscribed: true,
     }));
-    let archive_row = row(Row::Mailbox(MailboxRow {
-        name: "archive",
-        parent: None,
-        role: Some("archive"),
-        sort_order: 1,
-        subscribed: true,
-    }));
-    let trash_row = row(Row::Mailbox(MailboxRow {
-        name: "trash",
-        parent: None,
-        role: Some("trash"),
-        sort_order: 2,
-        subscribed: true,
-    }));
     store
         .commit(
             &Provider,
@@ -201,11 +185,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 utc_ms: 0,
                 deadline: until,
             },
-            &[
-                Operation::put(Table::Mailboxes, inbox.as_bytes(), &mailbox).unwrap(),
-                Operation::put(Table::Mailboxes, archive.as_bytes(), &archive_row).unwrap(),
-                Operation::put(Table::Mailboxes, trash.as_bytes(), &trash_row).unwrap(),
-            ],
+            &[Operation::put(Table::Mailboxes, inbox.as_bytes(), &mailbox).unwrap()],
             &mut [],
         )
         .unwrap();
@@ -380,11 +360,25 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
             let mut client = Client::start(&config, &runtime.path);
             let connected = client.ask(json!({"command":"connect", "account":"test"}));
             assert!(connected["ok"].is_true(), "{connected}");
+            let initial = client.ask(json!({"command":"list_mailboxes"}));
+            assert_eq!(initial["mailboxes"].as_array().unwrap().len(), 1);
+            for name in ["archive", "trash"] {
+                let created = client.ask(json!({"command":"create_mailbox", "name":name}));
+                assert!(created["ok"].is_true(), "{created}");
+            }
+            let duplicate = client.ask(json!({"command":"create_mailbox", "name":"archive"}));
+            assert!(!duplicate["ok"].is_true(), "{duplicate}");
             let mailboxes = client.ask(json!({"command":"list_mailboxes"}));
             assert!(mailboxes["ok"].is_true(), "{mailboxes}");
             let listed = mailboxes["mailboxes"].as_array().unwrap();
             assert_eq!(listed.len(), 3);
-            assert_eq!(listed[0]["id"].as_str(), Some(wire_id(inbox).as_str()));
+            let folder = |name: &str| {
+                let id = listed.iter().find(|item| item["name"].as_str() == Some(name)).unwrap()["id"].as_str().unwrap();
+                crate::wire::Id::parse(id).unwrap().local::<MailboxId>().unwrap()
+            };
+            assert_eq!(folder("Inbox"), inbox);
+            let archive = folder("archive");
+            let trash = folder("trash");
             let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox), "limit":50}));
             assert!(listing["ok"].is_true(), "{listing}");
             let emails = listing["emails"].as_array().unwrap();

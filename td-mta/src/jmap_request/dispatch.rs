@@ -6,6 +6,9 @@ use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "email_set.rs"]
 mod email_set;
 pub use email_set::EmailMutator;
+#[path = "mailbox_set.rs"]
+mod mailbox_set;
+pub use mailbox_set::MailboxMutator;
 
 #[path = "email_query.rs"]
 mod email_query;
@@ -109,10 +112,11 @@ pub fn run<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     account: AccountId,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
-    run_inner(plan, retention, execution, account, None)
+    run_inner(plan, retention, execution, account, None, None)
 }
 
-/// Authenticated Email update profile; device is supplied by the HTTPS owner.
+/// Email-only mutation fixture; runtime uses the complete mail-access profile.
+#[cfg(test)]
 pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -121,7 +125,32 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
     device: crate::ids::DeviceId,
     flags: &dyn EmailMutator,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
-    run_inner(plan, retention, execution, account, Some((flags, device)))
+    run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        Some((flags, device)),
+        None,
+    )
+}
+/// Authenticated td-mail mutations, including root-folder creation.
+pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+    device: crate::ids::DeviceId,
+    mutations: &(impl EmailMutator + MailboxMutator),
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        Some((mutations, device)),
+        Some((mutations, device)),
+    )
 }
 fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
@@ -129,6 +158,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     account: AccountId,
     flags: Option<(&dyn EmailMutator, crate::ids::DeviceId)>,
+    mailboxes: Option<(&dyn MailboxMutator, crate::ids::DeviceId)>,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     if !retention.is_empty() || plan.required_bytes() > retention.maximum() {
         return Err(Error::State);
@@ -164,6 +194,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         optional_end,
         account,
         flags,
+        mailboxes,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core, mail);
@@ -239,6 +270,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     optional_end: u64,
     account: AccountId,
     flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
+    mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
@@ -352,6 +384,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
 
             b"Email/get" if mail => "Email/get",
             b"Email/set" if mail && self.flags.is_some() => "Email/set",
+            b"Mailbox/set" if mail && self.mailboxes.is_some() => "Mailbox/set",
             b"Thread/changes" if mail => "Thread/changes",
             b"Thread/get" if mail => "Thread/get",
             _ => return Err(Error::UnknownMethod),
@@ -363,7 +396,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "Email/set" {
+        let result = if name == "Mailbox/set" {
+            self.mailbox_set(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Email/set" {
             self.email_set(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Email/get" {
             self.email_get(start..end, &responses.request().envelope.mail_limits)
@@ -837,6 +872,7 @@ pub(super) mod tests {
                 optional_end: 70000,
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
+                mailboxes: None,
             };
             assert_eq!(
                 worker.reference(&responses, 1, value),
@@ -1240,6 +1276,7 @@ pub(super) mod tests {
                 optional_end: 70000,
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
+                mailboxes: None,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));
             assert_eq!(retention.failure(), None);

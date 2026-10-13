@@ -494,3 +494,10 @@ Bulk mark-read uses the discovered `maxObjectsInSet`, capped at 256 messages
 per request (also the default when absent). Zero, negative, and non-integer
 limits refuse discovery. Other mutation flows keep their existing batching
 and result policy.
+
+Mailbox creation requires a matching Mailbox/set account and call ID, an
+explicit created.newMailbox.id, and no refusal for that creation key before
+it reports success. td-mta supports the name-only root folders this client
+emits; Archive and Trash can be created through the client and selected by
+their configured names. A duplicate name is reported as a refusal. Creation
+is an online operation, not a durable queued assignment.

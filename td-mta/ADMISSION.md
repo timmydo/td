@@ -644,7 +644,8 @@ spool fault alone is not database corruption; report the actual failure domain.
 Headers for the final JSON response are emitted only after complete request
 retention succeeds, then stream its exact results and release all files/pins.
 
-Known committed creations enter createdIds even if their enclosing method
+The full creation profile requires known committed creations to enter
+createdIds even if their enclosing method
 later returns serverPartialFail. Keep the successful submission-ID subset in
 its reserved private outcome records: EmailSubmission/set still dispatches the
 mandatory implicit Email/set for those successes, under the same call ID, even
@@ -1306,3 +1307,31 @@ outer deadline and physical spool failures. Such terminal failures close the
 exchange for reconciliation. Known commits never become serverFail or
 serverUnavailable. An indeterminate COMMIT reports serverPartialFail when
 response retention remains usable. Earlier method results remain retained.
+
+## td-mail root-folder creation admission
+
+Authenticated Mailbox/set admits at most min(maxObjectsInSet, 256) name-only
+create objects. Each decoded name is bounded to 1024 UTF-8 bytes, with a
+6146-byte stack buffer covering its maximally escaped JSON spelling; invalid
+or oversized names remain per-object invalidProperties. Creation keys obey
+the existing bounded JMAP ID grammar. Nonempty update/destroy and unsupported
+method arguments are refused before native effects.
+
+The adapter reserves fixed framing/account/state bytes plus each creation key
+length and 160 bytes, enough for either the created ID or error object, before
+entering storage. No creation starts without the retained-output reservation
+and resident output buffer. Native planning receives the original work meter,
+execution deadline and optional Mailbox ifInState. Only a known successful
+commit supplies created IDs; indeterminate outcomes report serverPartialFail.
+System entropy is warmed on the dedicated body worker before HTTPS accepts
+requests. A request constructs its handle on that same worker only when a new
+ID is needed, before any commit; no bounded-latency or allocation-free native
+entropy claim is made. Shutdown joins this worker under the existing contract.
+
+The active td-mail folder profile returns created IDs in Mailbox/set only.
+It does not add them to the response-level createdIds map or resolve creation
+references; an input createdIds map retains the existing echo behavior. This
+is an explicit exception to the full creation profile above. The created
+objects contain only id; td-mail obtains defaults, counts and rights from its
+following Mailbox/get. Explicit extra properties, even default-valued ones,
+are refused by this name-only profile.

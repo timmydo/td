@@ -21,11 +21,12 @@ single-account Blob/copy outcome and PushSubscription policy are active.
 Email/set read/unread, star patches and single-destination mailbox replacement
 are active; permanent deletion and structured creation remain absent. The native td-mail fixture sets and clears
 both flags over HTTPS and checks persisted keyword rows after each result.
-It archives, trashes and restores messages using pre-provisioned fixture
-folders, and checks native membership after each operation. Revoked credentials
+It creates archive/trash folders through td-mail, refuses a duplicate name,
+then archives, trashes and restores messages using those returned folders,
+and checks native membership after each operation. Revoked credentials
 leave queued moves unapplied; restarting td-mail with replacement credentials
-replays its durable flag and archive intentions. Folder creation remains a
-separate endpoint increment; these tests do not claim that flow.
+replays its durable flag and archive intentions. The creation profile is
+name-only root folders; hierarchy, rename and deletion remain absent.
 EventSource emits pings only; Mail StateChange integration remains absent and
 is not used by td-mail. Submission remains unadvertised. Activation follows
 the supported td-mail workflow tests, not every reference-table row.
@@ -351,3 +352,10 @@ requires the committed keyword and membership state. Native observation retries
 only Busy under one fixed phase deadline. The client transport never
 automatically retries mutation requests. Replay currently resumes on connect,
 backend start or cache reopen; a transient refusal can require reconnecting.
+
+The root-folder creation fixture qualifies only td-mail's name-only request
+and id-only created result. Newly created IDs do not enter the response-level
+createdIds map, and creation references are not resolved. Defaulted mailbox
+properties, counts and rights arrive through the following Mailbox/get.
+Explicit parentId (including null), role and other properties are refused.
+This is not a general JMAP Mailbox/set conformance claim.

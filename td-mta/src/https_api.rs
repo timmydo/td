@@ -82,8 +82,9 @@ fn buffer<T: Clone>(length: usize, value: T) -> Result<Box<[T]>, Error> {
     bytes.resize(length, value);
     Ok(bytes.into_boxed_slice())
 }
-impl<P: crate::store_fs::EmailUpdateAuthorization + Sync> https_upload::Backend
-    for Service<'_, '_, '_, '_, '_, P>
+impl<
+        P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuthorization + Sync,
+    > https_upload::Backend for Service<'_, '_, '_, '_, '_, P>
 {
     fn account(&self) -> AccountId {
         self.transfers.account()
@@ -155,7 +156,9 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + Sync> https_upload::Backend
         })
     }
 }
-impl<P: crate::store_fs::EmailUpdateAuthorization> Service<'_, '_, '_, '_, '_, P> {
+impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuthorization>
+    Service<'_, '_, '_, '_, '_, P>
+{
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
         let limits = self.resources.limits();
         let device = request.device;
@@ -320,7 +323,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization> Service<'_, '_, '_, '_, '_, P
             self.policy
                 .authorize_blob(self.transfers.account(), device, sender.deadline)?,
         );
-        let mut complete = dispatch::run_with_email_updates(
+        let mut complete = dispatch::run_with_mail_access(
             plan.finish().map_err(|_| Error::Capacity)?,
             retention,
             execution,

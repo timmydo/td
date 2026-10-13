@@ -527,31 +527,48 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Mailbox/set" {
-                if let Some(not_created) = method_response.1.get("notCreated") {
-                    if not_created.get("newMailbox").is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to create mailbox: {:?}",
-                            not_created
-                        )));
-                    }
-                }
-                if method_response
-                    .1
-                    .get("created")
-                    .and_then(|created| created.get("newMailbox"))
-                    .is_some()
-                {
-                    return Ok(());
-                }
-                return Err(JmapError::Api(
-                    "Mailbox creation did not return a created mailbox".to_string(),
-                ));
+        self.confirm_mailbox_creation(&response)
+    }
+
+    fn confirm_mailbox_creation(&self, response: &JmapResponse) -> Result<(), JmapError> {
+        let reply = response
+            .method_responses
+            .first()
+            .filter(|reply| reply.2 == "0")
+            .ok_or_else(|| JmapError::Api("Unexpected response for Mailbox/set".into()))?;
+        if reply.0 == "error" {
+            return Err(JmapError::Api(format!("Mailbox/set refused: {}", reply.1)));
+        }
+        if reply.0 != "Mailbox/set" {
+            return Err(JmapError::Api("Unexpected response for Mailbox/set".into()));
+        }
+        if reply.1.get("accountId").and_then(Json::as_str) != Some(self.account_id.as_str()) {
+            return Err(JmapError::Api(
+                "Mailbox/set returned a missing, invalid, or different account".into(),
+            ));
+        }
+        if let Some(errors) = reply.1.get("notCreated") {
+            if !errors.is_null() && errors.as_object().is_none() {
+                return Err(JmapError::Api("Invalid Mailbox/set notCreated".into()));
+            }
+            if let Some(error) = errors.get("newMailbox") {
+                return Err(JmapError::Api(format!("Mailbox creation refused: {error}")));
             }
         }
-
-        Err(JmapError::Api("Unexpected response".to_string()))
+        if reply
+            .1
+            .get("created")
+            .and_then(|value| value.get("newMailbox"))
+            .and_then(|value| value.get("id"))
+            .and_then(Json::as_str)
+            .is_some_and(|id| !id.is_empty())
+        {
+            Ok(())
+        } else {
+            Err(JmapError::Api(
+                "Mailbox creation did not return a created mailbox ID".into(),
+            ))
+        }
     }
 
     pub fn delete_mailbox(&self, id: &str) -> Result<(), JmapError> {
@@ -1864,6 +1881,41 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_creation_requires_account_call_and_created_id_confirmation() {
+        let client = JmapClient::unreachable_for_tests();
+        let response = |method: &str, call: &str, body| JmapResponse {
+            method_responses: vec![MethodResponse(method.into(), body, call.into())],
+            session_state: "state".into(),
+        };
+        let success = json!({"accountId":"account", "created":{"newMailbox":{"id":"mailbox"}}});
+        assert!(client
+            .confirm_mailbox_creation(&response("Mailbox/set", "0", success.clone()))
+            .is_ok());
+        assert!(client
+            .confirm_mailbox_creation(&response("Mailbox/set", "other", success.clone()))
+            .is_err());
+        assert!(client
+            .confirm_mailbox_creation(&response("error", "0", success))
+            .is_err());
+        for body in [
+            json!({"accountId":"other", "created":{"newMailbox":{"id":"mailbox"}}}),
+            json!({"created":{"newMailbox":{"id":"mailbox"}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{"id":""}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{"id":"mailbox"}}, "notCreated":{"newMailbox":{"type":"invalidProperties"}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{"id":"mailbox"}}, "notCreated":[]}),
+            json!({"accountId":"account"}),
+        ] {
+            assert!(
+                client
+                    .confirm_mailbox_creation(&response("Mailbox/set", "0", body.clone()))
+                    .is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn flag_success_requires_every_requested_update() {

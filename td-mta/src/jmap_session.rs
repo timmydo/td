@@ -28,7 +28,7 @@ pub struct Concurrency {
 
 /// Immutable metadata for one authenticated account and one admission plan.
 /// The caller must enforce both concurrency counts and complete the Core
-/// and td-mail read/flag/move contracts before exposing this document.
+/// and td-mail read/flag/move/folder contracts before exposing this document.
 /// It conveys no authentication.
 pub struct Session {
     concurrency: Concurrency,
@@ -96,7 +96,8 @@ impl Session {
             limits.objects_per_method,
             limits
                 .objects_per_method
-                .min(crate::store_fs::MAX_EMAIL_UPDATES),
+                .min(crate::store_fs::MAX_EMAIL_UPDATES)
+                .min(crate::store_fs::MAX_MAILBOX_CREATES),
             id,
         ))
         .map_err(|_| Error::Capacity)?;
@@ -107,7 +108,7 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":false}}}}}}}}",
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}}}}}}}}",
             ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\"}},\"username\":"
         ),
             crate::format::row::MAX_MAILBOX_NAME,
@@ -249,7 +250,7 @@ mod tests {
             mail["maxSizeMailboxName"].as_u64(),
             Some(crate::format::row::MAX_MAILBOX_NAME as u64)
         );
-        assert_eq!(mail["mayCreateTopLevelMailbox"].as_bool(), Some(false));
+        assert_eq!(mail["mayCreateTopLevelMailbox"].as_bool(), Some(true));
         assert_eq!(
             mail["emailQuerySortOptions"],
             td_json::json!(["receivedAt"])

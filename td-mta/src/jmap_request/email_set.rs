@@ -42,7 +42,7 @@ struct Update {
     valid: bool,
     invalid_mailbox: bool,
 }
-fn failure(error: UploadError, conditional: bool) -> Error {
+pub(super) fn failure(error: UploadError, conditional: bool) -> Error {
     match error {
         UploadError::Store(ports::Error::Conflict) if conditional => Error::StateMismatch,
         UploadError::Store(ports::Error::Conflict) => Error::StorageBusy,

@@ -2220,8 +2220,9 @@ The mailbox-access Core API now runs on the bounded HTTPS body worker.
 ADMISSION.md owns its request/response lifetime and quota contract; STORAGE.md
 owns the separate data/tmp/requests lock and cold cleanup. Core Session metadata
 is exposed by authenticated discovery now that its required endpoints are
-active. Mail reads, read/star assignments and mailbox moves are exposed for
-td-mail. The account permits those writes; POLICY.md specifies its Mailbox rights.
+active. Mail reads, read/star assignments, mailbox moves and root-folder
+creation are exposed for td-mail. The account permits those writes; POLICY.md
+specifies its Mailbox rights.
 CONFORMANCE.md records the actual client/TLS evidence. EventSource
 still emits only pings: td-mail does not consume it. Future Mail state delivery
 requires passive state capture without blocking the network reactor or holding
@@ -2237,4 +2238,11 @@ commit together,
 and known commit outcomes survive later accounting refusal. Authenticated
 HTTPS Email/set activates td-mail keyword patches for these two flags and
 single-destination mailbox replacement, with matching Session and Mailbox
-rights. Structured creation and permanent deletion remain absent.
+rights. Structured Email creation and permanent deletion remain absent.
+
+Authenticated Mailbox/set accepts the root-folder name-only create objects
+td-mail emits. The bounded native creation coordinator owns validation,
+uniqueness, IDs, authorization and commit outcomes. The adapter prepays the
+entire response before calling it, preserves per-object refusals and exposes
+mayCreateTopLevelMailbox only with this active endpoint. No hierarchy, rename,
+role mutation or folder deletion is activated.

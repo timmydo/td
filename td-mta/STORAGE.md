@@ -2852,4 +2852,6 @@ interpretation allowance while all names share the original request meter.
 The shared metadata commit helper retains the existing physical database/WAL
 reservation, original file observations and known-outcome settlement used by
 Email updates. No authorization or work budget is refreshed by that helper.
-The HTTPS Mailbox/set adapter remains a subsequent increment.
+The authenticated HTTPS Mailbox/set adapter invokes this boundary after
+reserving its full method output. It exposes only the td-mail name-only
+root-folder profile; POLICY.md and ADMISSION.md own wire admission.

@@ -853,3 +853,21 @@ The permanent Inbox remains the reception target. Enabling future client
 mutations requires implementing their methods and updating these rights with
 matching tests; account ownership alone does not advertise unimplemented
 operations. Mailbox/get reports rights from the same snapshot as its object.
+
+## 9. td-mail root-folder creation
+
+Mailbox/set accepts create objects containing only name. Names must be
+nonempty NFC UTF-8 of at most 1024 bytes, without control characters or
+Unicode noncharacters. Exact root-name duplicates return invalidProperties
+for name; comparisons are case-sensitive. Invalid objects have no effects on
+other accepted creations. Created folders are subscribed, have no parent or
+role, and sortOrder zero. Root creation is advertised by the Session's
+mayCreateTopLevelMailbox; mayCreateChild, mayRename and mayDelete remain false.
+The client's configured archive/trash names select these ordinary folders.
+
+The active profile supports optional Mailbox ifInState and bounded create
+batches. Empty/null update and destroy are harmless; nonempty update/destroy,
+parent/role editing and onDestroyRemoveEmails remain unsupported. Creation
+references across calls are not part of td-mail's create flow; clients read
+returned IDs or list mailboxes. A duplicate name is a refusal, not a second
+folder and not a claim that a lost earlier response failed to commit.

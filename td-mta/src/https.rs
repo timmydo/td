@@ -157,6 +157,7 @@ impl Https<'_, '_> {
         slots.extend((0..count).map(|_| Mutex::new(None)));
         let done = AtomicBool::new(false);
         let body_active = AtomicU8::new(0);
+        let body_warm = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let worker = std::thread::Builder::new()
                 .name("https-tls".into())
@@ -191,6 +192,11 @@ impl Https<'_, '_> {
             let uploader = match std::thread::Builder::new()
                 .name("https-body".into())
                 .spawn_scoped(scope, || {
+                    if td_crypto::SystemEntropy::try_new().is_err() {
+                        control.fail();
+                        return;
+                    }
+                    body_warm.store(true, Ordering::Release);
                     while !done.load(Ordering::Acquire) {
                         for cell in &slots {
                             let mut slot = match cell.try_lock() {
@@ -235,7 +241,19 @@ impl Https<'_, '_> {
                 done: &done,
                 worker: uploader.thread(),
             };
-            let result = self.network(&slots, &worker, &uploader, &body_active, control);
+            while !body_warm.load(Ordering::Acquire)
+                && !uploader.is_finished()
+                && !control.stop_requested()
+            {
+                std::thread::park_timeout(SCAN);
+            }
+            let result = if control.stop_requested() {
+                Ok(())
+            } else if body_warm.load(Ordering::Acquire) {
+                self.network(&slots, &worker, &uploader, &body_active, control)
+            } else {
+                Err(Error::WriterStopped)
+            };
             if result.is_err() {
                 control.fail();
             }
