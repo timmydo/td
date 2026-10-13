@@ -359,6 +359,10 @@ enum QueuedMutation {
     MarkMailboxRead {
         mailbox_id: String,
         mailbox_name: String,
+        email_ids: Option<Vec<String>>,
+    },
+    RuleActions {
+        actions: Vec<QueuedMutation>,
     },
     RunRulesForMailbox {
         mailbox_id: String,
@@ -437,12 +441,17 @@ impl ToJson for QueuedMutation {
             QueuedMutation::MarkMailboxRead {
                 mailbox_id,
                 mailbox_name,
+                email_ids,
             } => tagged(
                 "mark_mailbox_read",
                 ObjectBuilder::new()
                     .set("mailbox_id", mailbox_id)
-                    .set("mailbox_name", mailbox_name),
+                    .set("mailbox_name", mailbox_name)
+                    .set("email_ids", email_ids),
             ),
+            QueuedMutation::RuleActions { actions } => {
+                tagged("rule_actions", ObjectBuilder::new().set("actions", actions))
+            }
             QueuedMutation::RunRulesForMailbox { mailbox_id } => tagged(
                 "run_rules_for_mailbox",
                 ObjectBuilder::new().set("mailbox_id", mailbox_id),
@@ -533,7 +542,35 @@ impl QueuedMutation {
             "mark_mailbox_read" => Ok(QueuedMutation::MarkMailboxRead {
                 mailbox_id: queue_str(value, "mailbox_id")?,
                 mailbox_name: queue_str(value, "mailbox_name")?,
+                email_ids: match value.get("email_ids") {
+                    None | Some(Json::Null) => None,
+                    Some(_) => Some(queue_strs(value, "email_ids")?),
+                },
             }),
+            "rule_actions" => {
+                let items = value
+                    .get("actions")
+                    .and_then(Json::as_arr)
+                    .ok_or("missing actions")?;
+                let mut actions = Vec::new();
+                for item in items {
+                    // Plans contain only concrete rule actions, never nested plans.
+                    if !matches!(
+                        item.get("kind").and_then(Json::as_str),
+                        Some(
+                            "mark_read"
+                                | "mark_unread"
+                                | "set_flagged"
+                                | "move_email"
+                                | "destroy_email"
+                        )
+                    ) {
+                        return Err("invalid queued rule action".into());
+                    }
+                    actions.push(Self::from_json(item)?);
+                }
+                Ok(Self::RuleActions { actions })
+            }
             "run_rules_for_mailbox" => Ok(QueuedMutation::RunRulesForMailbox {
                 mailbox_id: queue_str(value, "mailbox_id")?,
             }),
@@ -608,8 +645,88 @@ impl From<&RetentionPolicySnapshot> for RetentionPolicyConfig {
 
 fn queue_mutation(cache: Option<&Cache>, op: &QueuedMutation) -> Result<u64, String> {
     let cache = cache.ok_or_else(|| "cache unavailable".to_string())?;
-    // Writing a value cannot fail, so queueing has no serialize error.
-    cache.enqueue_operation(&op.to_json().to_vec())
+    let seen_ids: std::collections::HashSet<&str> = match op {
+        QueuedMutation::MarkRead { id, .. } | QueuedMutation::MarkUnread { id, .. } => {
+            [id.as_str()].into_iter().collect()
+        }
+        QueuedMutation::MarkMailboxRead {
+            email_ids: Some(ids),
+            ..
+        }
+        | QueuedMutation::MarkThreadRead { email_ids: ids, .. } => {
+            ids.iter().map(String::as_str).collect()
+        }
+        _ => std::collections::HashSet::new(),
+    };
+    let flagged_id = match op {
+        QueuedMutation::SetFlagged { id, .. } => Some(id),
+        _ => None,
+    };
+    if seen_ids.is_empty() && flagged_id.is_none() {
+        return cache.enqueue_operation(&op.to_json().to_vec());
+    }
+    let mut replacements = Vec::new();
+    for (seq, payload) in cache.queued_operations() {
+        let Ok(mut old) = td_json::parse_slice(&payload)
+            .map_err(|e| e.to_string())
+            .and_then(|value| QueuedMutation::from_json(&value))
+        else {
+            continue;
+        };
+        let mut changed = false;
+        let remove = match &mut old {
+            QueuedMutation::MarkRead { id, .. } | QueuedMutation::MarkUnread { id, .. } => {
+                seen_ids.contains(&id.as_str())
+            }
+            QueuedMutation::SetFlagged { id, .. } => flagged_id == Some(id),
+            QueuedMutation::RuleActions { actions } => {
+                let completed = cache.queued_progress(seq)?;
+                if completed > actions.len() {
+                    return Err("invalid queued action cursor".into());
+                }
+                actions.drain(..completed);
+                let before = actions.len();
+                actions.retain(|action| match action {
+                    QueuedMutation::MarkRead { id, .. } | QueuedMutation::MarkUnread { id, .. } => {
+                        !seen_ids.contains(id.as_str())
+                    }
+                    QueuedMutation::SetFlagged { id, .. } => flagged_id != Some(id),
+                    _ => true,
+                });
+                changed = completed != 0 || actions.len() != before;
+                actions.is_empty()
+            }
+            QueuedMutation::MarkMailboxRead {
+                email_ids: Some(ids),
+                ..
+            }
+            | QueuedMutation::MarkThreadRead { email_ids: ids, .. } => {
+                let before = ids.len();
+                ids.retain(|id| !seen_ids.contains(&id.as_str()));
+                changed = ids.len() != before;
+                ids.is_empty()
+            }
+            QueuedMutation::MarkMailboxRead {
+                email_ids: None, ..
+            } if !seen_ids.is_empty() => {
+                return Err("Reconnect to resolve an older queued mailbox selection first".into());
+            }
+            _ => false,
+        };
+        if !remove && !changed {
+            continue;
+        }
+        let replacement = if remove {
+            None
+        } else {
+            Some(old.to_json().to_vec())
+        };
+        if replacement.as_deref() != Some(payload.as_slice()) {
+            replacements.push((seq, replacement));
+        }
+    }
+    // Retire superseded assignments in the same commit that queues the new one.
+    cache.enqueue_operation_replacing(&op.to_json().to_vec(), &replacements)
 }
 
 fn apply_local_mutation(cache: Option<&Cache>, op: &QueuedMutation) {
@@ -642,6 +759,7 @@ fn apply_local_mutation(cache: Option<&Cache>, op: &QueuedMutation) {
         QueuedMutation::MoveThread { .. }
         | QueuedMutation::DestroyThread { .. }
         | QueuedMutation::MarkThreadRead { .. }
+        | QueuedMutation::RuleActions { .. }
         | QueuedMutation::RunRulesForMailbox { .. }
         | QueuedMutation::ExecuteRetentionExpiry { .. } => {}
     }
@@ -683,7 +801,8 @@ fn process_mutation_via_queue(
     let seq = queue_mutation(Some(cache), op)?;
     apply_local_mutation(Some(cache), op);
 
-    match execute_remote_mutation(
+    match execute_queued_mutation(
+        seq,
         client,
         op,
         cached_mailboxes,
@@ -1047,6 +1166,15 @@ fn handle_offline_command(
             let op = QueuedMutation::MarkMailboxRead {
                 mailbox_id: mailbox_id.clone(),
                 mailbox_name: mailbox_name.clone(),
+                email_ids: Some(
+                    cache
+                        .as_ref()
+                        .and_then(|c| c.get_mailbox_emails(mailbox_id))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|email| email.id)
+                        .collect(),
+                ),
             };
             let local_updated = cache
                 .as_ref()
@@ -1243,13 +1371,34 @@ fn execute_remote_mutation(
                     .map_err(|e| e.to_string())
             }
         }
-        QueuedMutation::MarkMailboxRead { mailbox_id, .. } => {
-            let ids = fetch_all_mailbox_email_ids(client, mailbox_id)?;
+        QueuedMutation::MarkMailboxRead {
+            mailbox_id,
+            email_ids,
+            ..
+        } => {
+            let ids = match email_ids {
+                Some(ids) => ids.clone(),
+                None => fetch_all_mailbox_email_ids(client, mailbox_id)?,
+            };
             if ids.is_empty() {
                 Ok(())
             } else {
                 client.mark_emails_read(&ids).map_err(|e| e.to_string())
             }
+        }
+        QueuedMutation::RuleActions { actions } => {
+            for action in actions {
+                execute_remote_mutation(
+                    client,
+                    action,
+                    cached_mailboxes,
+                    rules,
+                    custom_headers,
+                    my_email_regex,
+                    cache,
+                )?;
+            }
+            Ok(())
         }
         QueuedMutation::RunRulesForMailbox { mailbox_id } => {
             // Offline-replay path: skip spam scoring (None); the model and config
@@ -1262,6 +1411,7 @@ fn execute_remote_mutation(
                 my_email_regex,
                 mailbox_id,
                 cache,
+                None,
                 None,
             )?;
             Ok(())
@@ -1288,6 +1438,130 @@ fn execute_remote_mutation(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_queued_mutation(
+    seq: u64,
+    client: &JmapClient,
+    op: &QueuedMutation,
+    cached_mailboxes: &mut Vec<Mailbox>,
+    rules: &[CompiledRule],
+    custom_headers: &[String],
+    my_email_regex: &UserRegex,
+    cache: Option<&Cache>,
+) -> Result<(), String> {
+    let mut pending = op.clone();
+    if let QueuedMutation::RunRulesForMailbox { mailbox_id } = &pending {
+        let mut actions = Vec::new();
+        run_rules_for_mailbox(
+            client,
+            cached_mailboxes,
+            rules,
+            custom_headers,
+            my_email_regex,
+            mailbox_id,
+            cache,
+            None,
+            Some(&mut actions),
+        )?;
+        pending = QueuedMutation::RuleActions { actions };
+        if let Some(cache) = cache {
+            cache.replace_queued_operation(seq, &pending.to_json().to_vec())?;
+        }
+    }
+    if let QueuedMutation::RuleActions { actions } = &pending {
+        let completed = cache
+            .map(|cache| cache.queued_progress(seq))
+            .transpose()?
+            .unwrap_or(0);
+        let remaining = actions
+            .get(completed..)
+            .ok_or("invalid queued action cursor")?;
+        for (offset, action) in remaining.iter().enumerate() {
+            let result = execute_remote_mutation(
+                client,
+                action,
+                cached_mailboxes,
+                rules,
+                custom_headers,
+                my_email_regex,
+                cache,
+            );
+            if let Err(error) = result {
+                if !matches!(
+                    action,
+                    QueuedMutation::MoveEmail { .. } | QueuedMutation::DestroyEmail { .. }
+                ) || !is_missing_remote_error(&error)
+                {
+                    return Err(error);
+                }
+            }
+            if let Some(cache) = cache {
+                let next = completed
+                    .checked_add(offset)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or("queued progress overflow")?;
+                cache.advance_queued_operation(seq, next)?;
+            }
+        }
+        return Ok(());
+    }
+    if let QueuedMutation::MarkMailboxRead {
+        mailbox_id,
+        email_ids,
+        ..
+    } = &mut pending
+    {
+        if email_ids.is_none() {
+            // Old queues have no selection. Freeze their first replay selection.
+            *email_ids = Some(fetch_all_mailbox_email_ids(client, mailbox_id)?);
+            if let Some(cache) = cache {
+                cache.replace_queued_operation(seq, &pending.to_json().to_vec())?;
+            }
+        }
+    }
+    let ids = match &pending {
+        QueuedMutation::MarkMailboxRead {
+            email_ids: Some(ids),
+            ..
+        }
+        | QueuedMutation::MarkThreadRead { email_ids: ids, .. } => Some(ids.clone()),
+        _ => None,
+    };
+    if let Some(ids) = ids {
+        return client
+            .mark_emails_read_progress(&ids, |confirmed| {
+                if confirmed.is_empty() {
+                    return Ok(());
+                }
+                let confirmed: std::collections::HashSet<_> = confirmed.iter().collect();
+                match &mut pending {
+                    QueuedMutation::MarkMailboxRead {
+                        email_ids: Some(ids),
+                        ..
+                    }
+                    | QueuedMutation::MarkThreadRead { email_ids: ids, .. } => {
+                        ids.retain(|id| !confirmed.contains(id));
+                    }
+                    _ => {}
+                }
+                if let Some(cache) = cache {
+                    cache.replace_queued_operation(seq, &pending.to_json().to_vec())?;
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string());
+    }
+    execute_remote_mutation(
+        client,
+        op,
+        cached_mailboxes,
+        rules,
+        custom_headers,
+        my_email_regex,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replay_queued_mutations(
     client: &JmapClient,
     cached_mailboxes: &mut Vec<Mailbox>,
@@ -1305,7 +1579,36 @@ fn replay_queued_mutations(
         queued.len()
     );
 
-    for (seq, payload) in queued {
+    for (seq, payload) in &queued {
+        let Ok(mut op) = td_json::parse_slice(payload)
+            .map_err(|e| e.to_string())
+            .and_then(|value| QueuedMutation::from_json(&value))
+        else {
+            continue;
+        };
+        if let QueuedMutation::MarkMailboxRead {
+            mailbox_id,
+            email_ids,
+            ..
+        } = &mut op
+        {
+            if email_ids.is_none() {
+                let result = fetch_all_mailbox_email_ids(client, mailbox_id).map(|ids| {
+                    *email_ids = Some(ids);
+                });
+                let result = result
+                    .and_then(|()| cache.replace_queued_operation(*seq, &op.to_json().to_vec()));
+                if let Err(error) = result {
+                    log_warn!("[Backend] legacy mailbox selection deferred: {}", error);
+                    return;
+                }
+            }
+        }
+    }
+    for (seq, _) in queued {
+        let Some(payload) = cache.queued_operation(seq) else {
+            continue;
+        };
         let parsed = td_json::parse_slice(&payload)
             .map_err(|e| e.to_string())
             .and_then(|value| QueuedMutation::from_json(&value));
@@ -1322,7 +1625,8 @@ fn replay_queued_mutations(
             }
         };
 
-        let result = execute_remote_mutation(
+        let result = execute_queued_mutation(
+            seq,
             client,
             &op,
             cached_mailboxes,
@@ -2049,22 +2353,24 @@ fn backend_loop(
                     mailbox_name,
                     mailbox_id
                 );
-                let op = QueuedMutation::MarkMailboxRead {
-                    mailbox_id: mailbox_id.clone(),
-                    mailbox_name: mailbox_name.clone(),
-                };
-                let updated = fetch_all_mailbox_email_ids(client, &mailbox_id)
-                    .map(|ids| ids.len())
-                    .unwrap_or(0);
-                let result = process_mutation_via_queue(
-                    client,
-                    &op,
-                    &mut cached_mailboxes,
-                    &rules,
-                    &custom_headers,
-                    &my_email_regex,
-                    cache.as_ref(),
-                );
+                let ids = fetch_all_mailbox_email_ids(client, &mailbox_id);
+                let updated = ids.as_ref().map(Vec::len).unwrap_or(0);
+                let result = ids.and_then(|ids| {
+                    let op = QueuedMutation::MarkMailboxRead {
+                        mailbox_id: mailbox_id.clone(),
+                        mailbox_name: mailbox_name.clone(),
+                        email_ids: Some(ids),
+                    };
+                    process_mutation_via_queue(
+                        client,
+                        &op,
+                        &mut cached_mailboxes,
+                        &rules,
+                        &custom_headers,
+                        &my_email_regex,
+                        cache.as_ref(),
+                    )
+                });
                 let _ = resp_tx.send(BackendResponse::MailboxMarkedRead {
                     mailbox_id,
                     mailbox_name,
@@ -2261,6 +2567,7 @@ fn backend_loop(
                     &mailbox_id,
                     cache.as_ref(),
                     Some(&scorer),
+                    None,
                 );
                 let _ = resp_tx.send(BackendResponse::RulesRun {
                     mailbox_id,
@@ -3042,6 +3349,7 @@ fn run_rules_for_mailbox(
     mailbox_id: &str,
     cache: Option<&Cache>,
     spam: Option<&SpamScorer>,
+    plan: Option<&mut Vec<QueuedMutation>>,
 ) -> Result<RulesRunResult, String> {
     if rules.is_empty() {
         return Ok(RulesRunResult {
@@ -3069,16 +3377,20 @@ fn run_rules_for_mailbox(
     if !applications.is_empty() {
         let mut mailboxes_for_mutation = mailboxes.to_vec();
         let ops = queued_mutations_for_rule_actions(&applications, mailboxes);
-        for op in &ops {
-            process_mutation_via_queue(
-                client,
-                op,
-                &mut mailboxes_for_mutation,
-                rules,
-                custom_headers,
-                my_email_regex,
-                cache,
-            )?;
+        if let Some(plan) = plan {
+            plan.extend(ops);
+        } else {
+            for op in &ops {
+                process_mutation_via_queue(
+                    client,
+                    op,
+                    &mut mailboxes_for_mutation,
+                    rules,
+                    custom_headers,
+                    my_email_regex,
+                    cache,
+                )?;
+            }
         }
     }
 
@@ -3411,6 +3723,90 @@ fn received_days(received: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::cache::Cache;
+
+    #[test]
+    fn queued_flags_supersede_only_the_same_flag_and_preserve_legacy_entries() {
+        let _env = crate::testing::env_lock();
+        let dir = crate::testing::tempdir().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("flag-queue").unwrap();
+        let bulk = QueuedMutation::MarkMailboxRead {
+            mailbox_id: "inbox".into(),
+            mailbox_name: "Inbox".into(),
+            email_ids: Some(vec!["a".into(), "b".into()]),
+        };
+        let seq = queue_mutation(Some(&cache), &bulk).unwrap();
+        let star = QueuedMutation::SetFlagged {
+            op_id: 1,
+            id: "a".into(),
+            flagged: true,
+        };
+        let star_seq = queue_mutation(Some(&cache), &star).unwrap();
+        let unread = QueuedMutation::MarkUnread {
+            op_id: 2,
+            id: "a".into(),
+        };
+        queue_mutation(Some(&cache), &unread).unwrap();
+        let persisted = td_json::parse_slice(&cache.queued_operation(seq).unwrap()).unwrap();
+        assert_eq!(queue_strs(&persisted, "email_ids").unwrap(), ["b"]);
+        assert!(cache.queued_operation(star_seq).is_some());
+        let legacy = td_json::parse_slice(
+            br#"{"kind":"mark_mailbox_read","mailbox_id":"inbox","mailbox_name":"Inbox"}"#,
+        )
+        .unwrap();
+        let legacy = QueuedMutation::from_json(&legacy).unwrap();
+        let legacy_seq = queue_mutation(Some(&cache), &legacy).unwrap();
+        assert!(queue_mutation(Some(&cache), &unread).is_err());
+        assert!(cache.queued_operation(legacy_seq).is_some());
+    }
+
+    #[test]
+    fn rule_progress_is_a_small_cursor_and_supersession_rebases_it_atomically() {
+        let _env = crate::testing::env_lock();
+        let dir = crate::testing::tempdir().unwrap();
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        let cache = Cache::open("rule-cursor").unwrap();
+        let plan = QueuedMutation::RuleActions {
+            actions: vec![
+                QueuedMutation::MoveEmail {
+                    op_id: 1,
+                    id: "a".into(),
+                    to_mailbox_id: "archive".into(),
+                },
+                QueuedMutation::MarkRead {
+                    op_id: 2,
+                    id: "a".into(),
+                },
+                QueuedMutation::SetFlagged {
+                    op_id: 3,
+                    id: "b".into(),
+                    flagged: true,
+                },
+            ],
+        };
+        let seq = queue_mutation(Some(&cache), &plan).unwrap();
+        let payload = cache.queued_operation(seq).unwrap();
+        cache.advance_queued_operation(seq, 1).unwrap();
+        assert_eq!(cache.queued_operation(seq).unwrap(), payload);
+        queue_mutation(
+            Some(&cache),
+            &QueuedMutation::MarkUnread {
+                op_id: 4,
+                id: "a".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(cache.queued_progress(seq).unwrap(), 0);
+        let plan = td_json::parse_slice(&cache.queued_operation(seq).unwrap()).unwrap();
+        let QueuedMutation::RuleActions { actions } = QueuedMutation::from_json(&plan).unwrap()
+        else {
+            panic!("plan")
+        };
+        assert!(matches!(actions.as_slice(), [QueuedMutation::SetFlagged { id, .. }] if id == "b"));
+        cache.advance_queued_operation(seq, 1).unwrap();
+        assert!(cache.remove_queued_operation(seq));
+        assert_eq!(cache.queued_progress(seq).unwrap(), 0);
+    }
 
     /// A lost send's record reads back as written, beside the draft and
     /// private; one that is not a record, too long, or not a regular

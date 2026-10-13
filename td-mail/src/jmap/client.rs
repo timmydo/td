@@ -9,6 +9,7 @@ use td_json::{json, Json, ObjectBuilder, ToJson};
 /// with full body values runs past ten megabytes routinely, which is why
 /// this client never had a cap of its own.
 const RESPONSE_LIMIT: Option<u64> = None;
+const FLAG_BATCH_MAX: usize = 256;
 
 /// The named diagnostic for a jail or a host with no fetch service, in the
 /// style APPLICATIONS.md §X asks for: what is absent, where it was looked
@@ -136,6 +137,7 @@ pub struct JmapClient {
     upload_url: Option<String>,
     /// The session's `maxSizeUpload`, when it names one.
     max_size_upload: Option<u64>,
+    max_objects_in_set: usize,
     /// Whether the session lists mail submission for the account.
     submission: bool,
 }
@@ -153,6 +155,7 @@ impl JmapClient {
             download_url: None,
             upload_url: None,
             max_size_upload: None,
+            max_objects_in_set: FLAG_BATCH_MAX,
             submission: false,
         }
     }
@@ -401,6 +404,10 @@ impl JmapClient {
             download_url: session.download_url.clone(),
             upload_url: session.upload_url.clone(),
             max_size_upload: session.max_size_upload,
+            max_objects_in_set: session
+                .max_objects_in_set
+                .unwrap_or(FLAG_BATCH_MAX as u64)
+                .clamp(1, FLAG_BATCH_MAX as u64) as usize,
             submission,
         };
 
@@ -922,16 +929,81 @@ impl JmapClient {
         Err(JmapError::Api("Unexpected response".to_string()))
     }
 
-    pub fn mark_emails_read(&self, ids: &[String]) -> Result<(), JmapError> {
-        if ids.is_empty() {
-            return Ok(());
+    fn validate_flag_response<'a>(
+        &self,
+        response: &'a JmapResponse,
+    ) -> Result<&'a Json, JmapError> {
+        let reply = response
+            .method_responses
+            .first()
+            .filter(|reply| reply.0 == "Email/set" && reply.2 == "0")
+            .ok_or_else(|| {
+                JmapError::Api(format!(
+                    "Unexpected response for Email/set: {:?}",
+                    response.method_responses.first()
+                ))
+            })?;
+        if reply.1.get("accountId").and_then(Json::as_str) != Some(self.account_id.as_str()) {
+            return Err(JmapError::Api(
+                "Email/set returned a missing, invalid, or different account".into(),
+            ));
         }
+        for name in ["updated", "notUpdated"] {
+            if reply
+                .1
+                .get(name)
+                .is_some_and(|value| !value.is_null() && value.as_object().is_none())
+            {
+                return Err(JmapError::Api(format!("Invalid Email/set {name}")));
+            }
+        }
+        Ok(&reply.1)
+    }
 
+    fn confirm_flag_updates<'a>(
+        &self,
+        response: &JmapResponse,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), JmapError> {
+        let reply = self.validate_flag_response(response)?;
+        Self::confirm_flag_objects(reply, ids)
+    }
+
+    fn confirm_flag_objects<'a>(
+        reply: &Json,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), JmapError> {
+        for id in ids {
+            if let Some(error) = reply.get("notUpdated").and_then(|value| value.get(id)) {
+                if error.get("type").and_then(Json::as_str) == Some("notFound") {
+                    continue;
+                }
+                return Err(JmapError::Api(format!("Email/set refused {id}: {error}")));
+            }
+            let confirmed = reply
+                .get("updated")
+                .and_then(|value| value.get(id))
+                .is_some_and(|value| value.is_null() || value.as_object().is_some());
+            if !confirmed {
+                return Err(JmapError::Api(format!("Email/set did not confirm {id}")));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_emails_read(&self, ids: &[String]) -> Result<(), JmapError> {
+        self.mark_emails_read_progress(ids, |_| Ok(()))
+    }
+
+    pub fn mark_emails_read_progress(
+        &self,
+        ids: &[String],
+        mut confirmed: impl FnMut(&[String]) -> Result<(), String>,
+    ) -> Result<(), JmapError> {
+        let mut refused = None;
         log_info!("[JMAP] Email/set marking {} emails as read", ids.len());
 
-        // Batch into chunks to avoid requestTooLarge errors from the server
-        const BATCH_SIZE: usize = 500;
-        for chunk in ids.chunks(BATCH_SIZE) {
+        for chunk in ids.chunks(self.max_objects_in_set) {
             let mut update = td_json::ObjectBuilder::with_capacity(chunk.len());
             for id in chunk {
                 update.insert(id.clone(), json!({ "keywords/$seen": true }));
@@ -952,17 +1024,20 @@ impl JmapClient {
 
             let response = self.call(request)?;
 
-            match response.method_responses.first() {
-                Some(method_response) if method_response.0 == "Email/set" => {}
-                _ => {
-                    return Err(JmapError::Api(
-                        "Unexpected response for Email/set".to_string(),
-                    ));
+            let reply = self.validate_flag_response(&response)?;
+            let mut completed = Vec::new();
+            for id in chunk {
+                match Self::confirm_flag_objects(reply, [id.as_str()]) {
+                    Ok(()) => completed.push(id.clone()),
+                    Err(error) => {
+                        refused.get_or_insert(error);
+                    }
                 }
             }
+            confirmed(&completed).map_err(JmapError::Api)?;
         }
 
-        Ok(())
+        refused.map_or(Ok(()), Err)
     }
 
     pub fn mark_email_read(&self, id: &str) -> Result<(), JmapError> {
@@ -986,23 +1061,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/set" {
-                if let Some(not_updated) = method_response.1.get("notUpdated") {
-                    if not_updated.get(id).is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to mark email as read: {:?}",
-                            not_updated
-                        )));
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        Err(JmapError::Api(
-            "Unexpected response for Email/set".to_string(),
-        ))
+        self.confirm_flag_updates(&response, [id])
     }
 
     pub fn mark_email_unread(&self, id: &str) -> Result<(), JmapError> {
@@ -1026,23 +1085,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/set" {
-                if let Some(not_updated) = method_response.1.get("notUpdated") {
-                    if not_updated.get(id).is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to mark email as unread: {:?}",
-                            not_updated
-                        )));
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        Err(JmapError::Api(
-            "Unexpected response for Email/set".to_string(),
-        ))
+        self.confirm_flag_updates(&response, [id])
     }
 
     pub fn set_email_flagged(&self, id: &str, flagged: bool) -> Result<(), JmapError> {
@@ -1070,23 +1113,7 @@ impl JmapClient {
 
         let response = self.call(request)?;
 
-        if let Some(method_response) = response.method_responses.first() {
-            if method_response.0 == "Email/set" {
-                if let Some(not_updated) = method_response.1.get("notUpdated") {
-                    if not_updated.get(id).is_some() {
-                        return Err(JmapError::Api(format!(
-                            "Failed to set email flagged: {:?}",
-                            not_updated
-                        )));
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        Err(JmapError::Api(
-            "Unexpected response for Email/set".to_string(),
-        ))
+        self.confirm_flag_updates(&response, [id])
     }
 
     pub fn move_email(&self, id: &str, to_mailbox_id: &str) -> Result<(), JmapError> {
@@ -1853,6 +1880,53 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_success_requires_every_requested_update() {
+        let client = JmapClient::unreachable_for_tests();
+        let response = |name: &str, call: &str, body| JmapResponse {
+            method_responses: vec![MethodResponse(name.into(), body, call.into())],
+            session_state: "state".into(),
+        };
+        let success =
+            json!({"accountId":"account", "updated":{"a":null,"b":{}}, "notUpdated":null});
+        assert!(client
+            .confirm_flag_updates(&response("Email/set", "0", success.clone()), ["a", "b"])
+            .is_ok());
+        assert!(client
+            .confirm_flag_updates(&response("Email/set", "other", success.clone()), ["a"])
+            .is_err());
+        assert!(client
+            .confirm_flag_updates(&response("error", "0", success), ["a"])
+            .is_err());
+        for body in [
+            json!({"accountId":"account", "updated":{"a":null}}),
+            json!({"accountId":"account", "updated":{"a":null,"b":null}, "notUpdated":{"b":{"type":"forbidden"}}}),
+            json!({"accountId":"account", "updated":{"a":null,"b":false}}),
+            json!({"accountId":"other", "updated":{"a":null,"b":null}}),
+            json!({"accountId":"account", "updated":null}),
+            json!({"accountId":"account", "updated":{"a":null,"b":null}, "notUpdated":[]}),
+            json!({"accountId":"account"}),
+        ] {
+            assert!(
+                client
+                    .confirm_flag_updates(&response("Email/set", "0", body.clone()), ["a", "b"])
+                    .is_err(),
+                "{body}"
+            );
+        }
+        assert!(client
+            .confirm_flag_updates(
+                &response(
+                    "Email/set",
+                    "0",
+                    json!({"accountId":"account", "notUpdated":{"a":{"type":"notFound"}}})
+                ),
+                ["a"]
+            )
+            .is_ok());
+        assert!(client.mark_emails_read(&[]).is_ok());
+    }
 
     #[test]
     fn read_rate_limit_delays_are_bounded_and_other_failures_are_not_replayed() {

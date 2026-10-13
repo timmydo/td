@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use td_json::ToJson;
 use td_kv::{Error as KvError, Key, Store};
 
-/// The five tables. `op_queue` is keyed by a big-endian `u64`, so iteration
+/// The six tables. `op_queue` is keyed by a big-endian `u64`, so iteration
 /// order is numeric order and replay is FIFO; the rest are keyed by text.
 const EMAILS: &str = "emails";
 const RULES_PROCESSED: &str = "rules_processed";
 const MAILBOX_INDEX: &str = "mailbox_index";
 const MAILBOXES: &str = "mailboxes";
 const OP_QUEUE: &str = "op_queue";
+const OP_PROGRESS: &str = "op_progress";
 
 /// The single row `mailboxes` holds.
 const MAILBOXES_ROW: &str = "mailboxes";
@@ -409,6 +410,14 @@ impl Cache {
     }
 
     pub fn enqueue_operation(&self, payload: &[u8]) -> Result<u64, String> {
+        self.enqueue_operation_replacing(payload, &[])
+    }
+
+    pub fn enqueue_operation_replacing(
+        &self,
+        payload: &[u8],
+        replacements: &[(u64, Option<Vec<u8>>)],
+    ) -> Result<u64, String> {
         let mut txn = self.store.write();
         // `last_key` is the greatest live key including this transaction's own
         // writes, so the sequence continues without a scan of the queue.
@@ -418,9 +427,55 @@ impl Cache {
             .and_then(Key::as_u64)
             .unwrap_or(0)
             .saturating_add(1);
+        for (old_seq, replacement) in replacements {
+            txn.remove(OP_PROGRESS, &Key::from_u64(*old_seq));
+            match replacement {
+                Some(bytes) => txn.insert(OP_QUEUE, &Key::from_u64(*old_seq), bytes),
+                None => {
+                    txn.remove(OP_QUEUE, &Key::from_u64(*old_seq));
+                }
+            }
+        }
         txn.insert(OP_QUEUE, &Key::from_u64(seq), payload);
         txn.commit().map_err(|e| format!("queue commit: {}", e))?;
         Ok(seq)
+    }
+
+    pub fn replace_queued_operation(&self, seq: u64, payload: &[u8]) -> Result<(), String> {
+        let mut txn = self.store.write();
+        txn.remove(OP_PROGRESS, &Key::from_u64(seq));
+        txn.insert(OP_QUEUE, &Key::from_u64(seq), payload);
+        txn.commit()
+            .map_err(|e| format!("queue progress commit: {e}"))
+    }
+
+    pub fn queued_progress(&self, seq: u64) -> Result<usize, String> {
+        let txn = self.store.read();
+        let Some(bytes) = txn
+            .table(OP_PROGRESS)
+            .and_then(|table| table.get(&Key::from_u64(seq)))
+        else {
+            return Ok(0);
+        };
+        Key::as_u64(bytes)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "invalid queued progress".into())
+    }
+
+    pub fn advance_queued_operation(&self, seq: u64, completed: usize) -> Result<(), String> {
+        let completed = u64::try_from(completed).map_err(|_| "queued progress overflow")?;
+        let mut txn = self.store.write();
+        txn.insert(OP_PROGRESS, &Key::from_u64(seq), &completed.to_be_bytes());
+        txn.commit()
+            .map_err(|e| format!("queue cursor commit: {e}"))
+    }
+
+    pub fn queued_operation(&self, seq: u64) -> Option<Vec<u8>> {
+        self.store
+            .read()
+            .table(OP_QUEUE)?
+            .get(&Key::from_u64(seq))
+            .map(<[u8]>::to_vec)
     }
 
     pub fn queued_operations(&self) -> Vec<(u64, Vec<u8>)> {
@@ -439,6 +494,7 @@ impl Cache {
 
     pub fn remove_queued_operation(&self, seq: u64) -> bool {
         let mut txn = self.store.write();
+        txn.remove(OP_PROGRESS, &Key::from_u64(seq));
         txn.remove(OP_QUEUE, &Key::from_u64(seq));
         txn.commit().is_ok()
     }

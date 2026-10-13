@@ -73,6 +73,9 @@ struct MockState {
     read_refusal: Option<(String, String)>,
     refuse_stored: bool,
     read_calls: Vec<Value>,
+    flag_refusal: Option<String>,
+    wrong_flag_account: bool,
+    update_calls: Vec<Value>,
     emails: HashMap<String, EmailRecord>,
     /// Every blob uploaded: its id, type and bytes.
     uploads: Vec<(String, String, Vec<u8>)>,
@@ -183,6 +186,9 @@ impl MockState {
             read_refusal: None,
             refuse_stored: false,
             read_calls: Vec::new(),
+            flag_refusal: None,
+            wrong_flag_account: false,
+            update_calls: Vec::new(),
             emails,
             uploads: Vec::new(),
             created: Vec::new(),
@@ -450,7 +456,14 @@ impl MockState {
             }
         }
         let mut response = ObjectBuilder::new()
-            .set("accountId", "account-001")
+            .set(
+                "accountId",
+                if self.wrong_flag_account {
+                    "wrong"
+                } else {
+                    "account-001"
+                },
+            )
             .set("oldState", "sstate-001")
             .set("newState", "sstate-002");
         let created = created.build();
@@ -594,7 +607,16 @@ impl MockState {
         }
 
         if let Some(update) = args.get("update").and_then(Value::as_object) {
+            self.update_calls.push(args.clone());
             for (id, patch) in update {
+                if self.flag_refusal.as_deref() == Some(id.as_str())
+                    && patch.as_object().is_some_and(|fields| {
+                        fields.iter().any(|(key, _)| key.starts_with("keywords/"))
+                    })
+                {
+                    not_updated.insert(id.clone(), json!({"type": "forbidden"}));
+                    continue;
+                }
                 let Some(email) = self.emails.get_mut(id) else {
                     not_updated.insert(id.clone(), json!({"type": "notFound"}));
                     continue;
@@ -616,7 +638,14 @@ impl MockState {
         }
 
         let mut resp = ObjectBuilder::new()
-            .set("accountId", "account-001")
+            .set(
+                "accountId",
+                if self.wrong_flag_account {
+                    "wrong"
+                } else {
+                    "account-001"
+                },
+            )
             .set("oldState", "estate-001")
             .set("newState", "estate-002");
         let created = created.build();
@@ -685,6 +714,7 @@ impl MockJmapServer {
             let mut email = seed.clone();
             email.id = format!("large-{index:04}");
             email.thread_id = "large-thread".into();
+            email.is_read = false;
             state.emails.insert(email.id.clone(), email);
         }
     }
@@ -732,6 +762,32 @@ impl MockJmapServer {
             .emails
             .get(id)
             .map(|e| (e.mailbox_id.clone(), e.is_read, e.is_draft))
+    }
+
+    #[allow(dead_code)]
+    pub fn move_test_email(&self, id: &str, mailbox: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .emails
+            .get_mut(id)
+            .unwrap()
+            .mailbox_id = mailbox.into();
+    }
+
+    #[allow(dead_code)]
+    pub fn wrong_flag_account(&self) {
+        self.state.lock().unwrap().wrong_flag_account = true;
+    }
+
+    #[allow(dead_code)]
+    pub fn refuse_flag(&self, id: Option<&str>) {
+        self.state.lock().unwrap().flag_refusal = id.map(str::to_owned);
+    }
+
+    #[allow(dead_code)]
+    pub fn update_calls(&self) -> Vec<Value> {
+        self.state.lock().unwrap().update_calls.clone()
     }
 
     fn serve(
@@ -908,7 +964,7 @@ impl MockJmapServer {
             "downloadUrl": format!("http://127.0.0.1:{}/download/{{accountId}}/{{blobId}}/{{name}}?type={{type}}", port),
             "uploadUrl": format!("http://127.0.0.1:{}/upload/{{accountId}}/", port),
             "capabilities": {
-                "urn:ietf:params:jmap:core": { "maxSizeUpload": 1000000 },
+                "urn:ietf:params:jmap:core": { "maxSizeUpload": 1000000, "maxObjectsInSet": 64 },
                 "urn:ietf:params:jmap:mail": {},
                 "urn:ietf:params:jmap:submission": { "maxDelayedSend": 0 }
             },

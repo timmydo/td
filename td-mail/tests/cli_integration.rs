@@ -1415,3 +1415,194 @@ fn offline_open_retains_cached_unreadable_metadata() {
     assert!(response["unreadable"].is_true());
     assert_eq!(response["blob_id"].as_str(), Some("blob-raw-email-001"));
 }
+
+#[test]
+fn flag_batches_obey_discovery_and_reach_every_message() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let marked = h.send(json!({"command":"mark_mailbox_read", "mailbox_id":"mbox-inbox"}));
+    assert!(marked["ok"].is_true(), "{marked}");
+    let calls = h.server().update_calls();
+    assert!(calls.len() > 1);
+    let mut ids = std::collections::HashSet::new();
+    for call in calls {
+        let updates = call["update"].as_object().unwrap();
+        assert!(!updates.is_empty() && updates.len() <= 64, "{call}");
+        for (id, patch) in updates {
+            assert!(ids.insert(id.clone()), "duplicate update {id}");
+            assert!(patch["keywords/$seen"].is_true());
+        }
+    }
+    for index in 0..300 {
+        let id = format!("large-{index:04}");
+        assert!(ids.contains(&id));
+        assert!(h.server().email_state(&id).unwrap().1);
+    }
+}
+
+#[test]
+fn refused_bulk_flags_remain_queued_across_restart() {
+    let mut h = CliHarness::start();
+    h.server().refuse_flag(Some("email-002"));
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    // An accepted local change may still be queued for remote application.
+    assert!(
+        h.send(json!({"command":"mark_mailbox_read", "mailbox_id":"mbox-inbox"}))["ok"].is_true()
+    );
+    assert!(!h.server().email_state("email-002").unwrap().1);
+    assert!(h.server().email_state("email-003").unwrap().1);
+    h.server().move_test_email("email-002", "mbox-archive");
+    h.server().seed_large_thread(1);
+    h.server().refuse_flag(None);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    // A subsequent command also fences the backend's reconnect replay.
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert!(h.server().email_state("email-002").unwrap().1);
+    assert!(!h.server().email_state("large-0000").unwrap().1);
+    let replay = h.server().update_calls().pop().unwrap();
+    assert_eq!(replay["update"].as_object().unwrap().len(), 1);
+}
+
+#[test]
+fn refused_batch_does_not_starve_later_batches_or_override_newer_flags() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    h.server().refuse_flag(Some("large-0000"));
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(
+        h.send(json!({"command":"mark_mailbox_read", "mailbox_id":"mbox-inbox"}))["ok"].is_true()
+    );
+    for index in 1..300 {
+        assert!(
+            h.server()
+                .email_state(&format!("large-{index:04}"))
+                .unwrap()
+                .1
+        );
+    }
+    assert!(!h.server().email_state("large-0000").unwrap().1);
+    h.server().refuse_flag(None);
+    assert!(h.send(json!({"command":"mark_unread", "id":"large-0000"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"mark_unread", "id":"large-0001"}))["ok"].is_true());
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert!(!h.server().email_state("large-0000").unwrap().1);
+    assert!(!h.server().email_state("large-0001").unwrap().1);
+}
+
+#[test]
+fn malformed_flag_response_stops_later_batches() {
+    let mut h = CliHarness::start();
+    h.server().seed_large_thread(300);
+    h.server().wrong_flag_account();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(
+        h.send(json!({"command":"mark_mailbox_read", "mailbox_id":"mbox-inbox"}))["ok"].is_true()
+    );
+    assert_eq!(h.server().update_calls().len(), 1);
+}
+
+#[test]
+fn replayed_rules_preserve_newer_queued_unread_choice() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    std::fs::write(
+        h._config_dir.path().join("rules.toml"),
+        r#"
+[[rule]]
+name = "read-all"
+[rule.match]
+header = "From"
+regex = ".*"
+[rule.actions]
+mark_read = true
+"#,
+    )
+    .unwrap();
+    {
+        let store =
+            td_kv::Store::open(&h._config_dir.path().join("cache/td-mail/test.tdkv")).unwrap();
+        let mut txn = store.write();
+        txn.insert(
+            "op_queue",
+            &td_kv::Key::from_u64(1),
+            br#"{"kind":"run_rules_for_mailbox","mailbox_id":"mbox-inbox"}"#,
+        );
+        txn.insert(
+            "op_queue",
+            &td_kv::Key::from_u64(2),
+            br#"{"kind":"mark_unread","op_id":1,"id":"email-002"}"#,
+        );
+        txn.commit().unwrap();
+    }
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert!(!h.server().email_state("email-002").unwrap().1);
+    assert!(h.server().email_state("email-003").unwrap().1);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert!(!h.server().email_state("email-002").unwrap().1);
+}
+
+#[test]
+fn replayed_rule_plan_retains_flag_after_a_successful_move() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    h.child.kill().unwrap();
+    h.child.wait().unwrap();
+    std::fs::write(
+        h._config_dir.path().join("rules.toml"),
+        r#"
+[[rule]]
+name = "move"
+continue_processing = true
+[rule.match]
+header = "From"
+regex = ".*"
+[rule.actions]
+move_to = "Archive"
+[[rule]]
+name = "read"
+[rule.match]
+header = "From"
+regex = ".*"
+[rule.actions]
+mark_read = true
+"#,
+    )
+    .unwrap();
+    {
+        let store =
+            td_kv::Store::open(&h._config_dir.path().join("cache/td-mail/test.tdkv")).unwrap();
+        let mut txn = store.write();
+        txn.insert(
+            "op_queue",
+            &td_kv::Key::from_u64(1),
+            br#"{"kind":"run_rules_for_mailbox","mailbox_id":"mbox-inbox"}"#,
+        );
+        txn.commit().unwrap();
+    }
+    h.server().refuse_flag(Some("email-002"));
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert_eq!(
+        h.server().email_state("email-002").unwrap().0,
+        "mbox-archive"
+    );
+    assert!(!h.server().email_state("email-002").unwrap().1);
+    h.server().refuse_flag(None);
+    h.restart();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    assert!(h.send(json!({"command":"list_mailboxes"}))["ok"].is_true());
+    assert!(h.server().email_state("email-002").unwrap().1);
+}

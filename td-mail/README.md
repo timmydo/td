@@ -462,3 +462,27 @@ GET discovery/downloads and explicit Mail read batches use this bound; mutation
 batches, transport failures and other statuses remain errors, as do 429 without
 a supported delay, 503 with an unsupported supplied delay, and continued pressure. Delays are synchronous; ordinary mailbox
 reads wait on the backend thread.
+
+Read/unread and star updates require an explicit success or `notFound` for
+every requested message before the client retires the queued change. Per-message refusals or
+missing outcomes keep it queued for reconnect replay. Earlier remote successes
+remain applied; retrying these flag assignments is idempotent. The existing
+optimistic local display and offline queue remain in effect.
+Mailbox-wide mark-read freezes message IDs before queueing (the cached IDs
+when offline, which may cover only part of the mailbox). An online ID-query
+failure returns an error before queueing, so the user can retry that action. Batch progress removes confirmed IDs durably; a per-message
+refusal does not prevent later batches from running. An explicit `notFound`
+resolves a flag assignment because the message is gone. New flag assignments
+atomically supersede older queued assignments to the same flag and message.
+Other refusals remain queued under the existing stop-on-failure replay policy.
+Legacy mailbox-wide entries freeze their selections before any reconnect
+replay effects; new seen assignments are rejected while such an entry still
+has no selection. Before replay effects, rules persist their concrete action list in the older
+parent queue entry. A separate durable cursor retires completed actions without rewriting the
+plan after every action, so a move cannot
+hide a later failed flag action and replay cannot supersede newer queued user
+choices. New flag choices also prune matching pending rule actions.
+Bulk mark-read uses the discovered `maxObjectsInSet`, capped at 256 messages
+per request (also the default when absent). Zero, negative, and non-integer
+limits refuse discovery. Other mutation flows keep their existing batching
+and result policy.
