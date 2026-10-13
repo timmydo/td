@@ -2527,6 +2527,160 @@ fn an_explore_sub_agent_reads_alone_on_its_own_model() {
     assert_eq!(h.mock.requests().len(), 3);
 }
 
+/// Explicit task choices reach the wire, including endpoint pricing, and
+/// leave the caller's model, effort and routing unchanged.
+#[test]
+fn a_task_selects_its_model_effort_and_routing() {
+    for agent in ["general", "explore"] {
+        let call = task_call("Review this commit.").replace(
+            "{\\\"prompt\\\": \\\"Review this commit.\\\"}",
+            &format!(
+                "{{\\\"prompt\\\": \\\"Review this commit.\\\", \\\"agent\\\": \\\"{agent}\\\", \\\"model\\\": \\\"anthropic/claude-sonnet-5.5\\\", \\\"effort\\\": \\\"xhigh\\\", \\\"routing\\\": \\\"nitro\\\"}}"
+            ),
+        );
+        let mut h = Harness::new_in(
+            &format!("task-choices-{agent}"),
+            Role::Conversation,
+            Some("template:sys"),
+            false,
+            vec![
+                call,
+                Reply::ok("endpoints-sonnet.json"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+            ],
+        );
+        h.setup(Client {
+            explore_model: Some("nobody/no-such-model".into()),
+            explore_routing: Some("floor".into()),
+            ..Client::default()
+        });
+        h.down(&Down::Choose {
+            model: Some("anthropic/claude-haiku-4.5".into()),
+            effort: Some("low".into()),
+        });
+        h.say("Review the change.");
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied");
+        let requests = h.mock.requests();
+        assert!(requests[1]
+            .url
+            .ends_with("/models/anthropic/claude-sonnet-5.5/endpoints"));
+        let sub = flat(&requests[2].text());
+        assert_eq!(sub["model"], "anthropic/claude-sonnet-5.5:nitro");
+        assert_eq!(sub["reasoning.effort"], "xhigh");
+        assert_eq!(sub["provider.max_price.prompt"], "6.000000");
+        let parent = flat(&requests[3].text());
+        assert_eq!(parent["model"], "anthropic/claude-haiku-4.5");
+        assert_eq!(parent["reasoning.effort"], "low");
+        assert!(!parent.contains_key("provider.max_price.prompt"));
+        let (_, report, error) = results(&events)
+            .into_iter()
+            .find(|(id, _, _)| id == "toolu_task_01")
+            .unwrap();
+        assert!(!error, "{report}");
+        assert!(report.starts_with("A sparse checkout"), "{report}");
+        let (conversation, _) = h.close();
+        let events = conversation.events();
+        let at: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.kind, Kind::Request { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        for (n, request) in [0, 2, 3].into_iter().enumerate() {
+            assert_eq!(
+                td_agent::client::body(events, at[n], conversation.prefix_file()).unwrap(),
+                requests[request].text()
+            );
+        }
+    }
+}
+
+/// Clearing a task's routing removes the inherited envelope only in that
+/// task; unsupported explicit effort is refused before endpoint lookup.
+#[test]
+fn task_routing_can_be_cleared_and_unsupported_effort_is_refused() {
+    let call = task_call("Review.").replace(
+        "{\\\"prompt\\\": \\\"Review.\\\"}",
+        "{\\\"prompt\\\": \\\"Review.\\\", \\\"agent\\\": \\\"explore\\\", \\\"routing\\\": \\\"balanced\\\"}",
+    );
+    let mut h = Harness::new_in(
+        "task-balanced",
+        Role::Conversation,
+        Some("template:sys"),
+        false,
+        vec![
+            Reply::ok("endpoints-sonnet.json"),
+            call,
+            Reply::sse("stream-sonnet.sse"),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&Down::Route {
+        routing: Some("nitro".into()),
+    });
+    h.say("Review the change.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied");
+    let requests = h.mock.requests();
+    let sub = flat(&requests[2].text());
+    assert_eq!(sub["model"], "anthropic/claude-sonnet-5.5");
+    assert!(!sub.contains_key("provider.max_price.prompt"));
+    assert_eq!(
+        flat(&requests[3].text())["model"],
+        "anthropic/claude-sonnet-5.5:nitro"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.ends_with("/endpoints"))
+            .count(),
+        1
+    );
+    let (_, report, error) = results(&events)
+        .into_iter()
+        .find(|(id, _, _)| id == "toolu_task_01")
+        .unwrap();
+    assert!(!error, "{report}");
+    h.close();
+
+    for effort in ["none", "xhigh"] {
+        let call = task_call("Review.").replace(
+            "{\\\"prompt\\\": \\\"Review.\\\"}",
+            &format!("{{\\\"prompt\\\": \\\"Review.\\\", \\\"model\\\": \\\"meta-llama/llama-4-small\\\", \\\"effort\\\": \\\"{effort}\\\", \\\"routing\\\": \\\"nitro\\\"}}"),
+        );
+        let mut h = Harness::new_in(
+            &format!("task-no-reasoning-{effort}"),
+            Role::Conversation,
+            Some("template:sys"),
+            false,
+            vec![
+                call,
+                Reply::sse("stream-sonnet.sse"),
+                Reply::ok("title.json"),
+            ],
+        );
+        h.setup(Client::default());
+        h.say("Review the change.");
+        let (events, outcome, _) = h.turn();
+        assert_eq!(outcome, "replied");
+        let (_, why, error) = results(&events)
+            .into_iter()
+            .find(|(id, _, _)| id == "toolu_task_01")
+            .unwrap();
+        assert!(
+            error && why.contains("takes no reasoning; omit `task.effort`"),
+            "{why}"
+        );
+        assert_eq!(h.mock.requests().len(), 3, "no endpoint or task request");
+        h.close();
+    }
+}
+
 /// A sub-agent whose next request a limit refuses is told, in a note its
 /// view alone carries, that its next is its last, and asked where the
 /// work stands; that request carries the note, the conversation's next

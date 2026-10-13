@@ -5581,7 +5581,11 @@ impl Session {
             // The template's standing decision: no card asks (DESIGN.md
             // §8, System view).
             Args::SystemStatus(ask) => Ok(crate::sysview::status(&ask)),
-            Args::Task { prompt, agent } => self.task(started, prompt, agent)?,
+            Args::Task {
+                prompt,
+                agent,
+                options,
+            } => self.task(started, prompt, agent, options)?,
             Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
             Args::GitPush {
                 worktree,

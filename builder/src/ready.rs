@@ -11,6 +11,9 @@ use std::process::{Command, ExitCode};
 
 use crate::affected;
 
+#[path = "../../td-review/src/reviewer.rs"]
+mod reviewer;
+
 const HELP: &str = "\
 usage: td-builder ready [options]
 
@@ -141,7 +144,13 @@ pub fn parse_record(message: &str) -> Record {
         match key.as_str() {
             "reviewed-by" => match value.split_once('/') {
                 Some((tool, model)) if !tool.trim().is_empty() && !model.trim().is_empty() => {
-                    let tool = tool.trim().to_string();
+                    let tool = match reviewer::slot(tool.trim(), model.trim()) {
+                        Ok(slot) => slot.to_string(),
+                        Err(why) => {
+                            rec.malformed.push(why);
+                            continue;
+                        }
+                    };
                     let model = model.trim().to_string();
                     if !rec.reviewers.iter().any(|(t, _)| *t == tool) {
                         rec.reviewers.push((tool, model));
@@ -1316,8 +1325,8 @@ Checks: affected-checks --committed-only (green)
     }
 
     /// The fixture two crates share: `td-builder ready` gates on the record and
-    /// td-review displays it, from separate implementations (neither crate may
-    /// depend on the other). Nothing but this makes them agree.
+    /// td-review displays it, from separate implementations that share only
+    /// transport normalization. This pins their remaining rules together.
     #[test]
     fn shared_fixture_cases() {
         let root = repo_root();

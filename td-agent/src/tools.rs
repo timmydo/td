@@ -107,6 +107,14 @@ pub enum SubAgent {
     Explore,
 }
 
+/// Per-call choices; absent fields retain the kind's configured defaults.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub routing: Option<String>,
+}
+
 impl SubAgent {
     pub const WORDS: &[&str] = &["general", "explore"];
 
@@ -630,7 +638,7 @@ pub(crate) fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Task => (
-            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. A general sub-agent has the workspace's file, shell and web tools, on this conversation's model, and its writes and commands wait for the person's approval as yours do. An explore sub-agent only reads and searches the workspace, with read_file, glob and grep, changes and runs nothing, and usually runs on a cheaper model the person configured: use it to find and understand code. Either runs within this turn, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use one for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
+            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. A general sub-agent has the workspace's file, shell and web tools, on this conversation's model by default, and its writes and commands wait for the person's approval as yours do. An explore sub-agent only reads and searches the workspace, with read_file, glob and grep, changes and runs nothing, and usually runs on a cheaper model the person configured: use it to find and understand code. Use an explore sub-agent with an explicit model and effort for an independent read-only code review. Optional model, effort and routing choices affect only this call. Either runs within this turn, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use one for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
             schema(
                 vec![
                     (
@@ -641,6 +649,9 @@ pub(crate) fn definition(tool: Tool) -> Json {
                         "agent",
                         one_of("Which sub-agent: general, with the workspace's tools, or explore, reading and searching alone; general when left out.", SubAgent::WORDS),
                     ),
+                    ("model", property("string", "Model id for this sub-agent only; overrides the conversation or configured explore model. Select the required reviewer explicitly for code reviews.")),
+                    ("effort", one_of("Reasoning effort for this sub-agent only; the conversation's when omitted. An explicit effort is refused if the selected model takes no reasoning.", &crate::config::EFFORTS)),
+                    ("routing", one_of("Routing for this sub-agent only; overrides inherited or configured explore routing. balanced clears any inherited routing override.", crate::config::ROUTINGS)),
                 ],
                 &["prompt"],
             ),
@@ -783,6 +794,7 @@ pub enum Args {
     Task {
         prompt: String,
         agent: SubAgent,
+        options: TaskOptions,
     },
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
@@ -1320,7 +1332,11 @@ pub fn parse_offered(
             }
         }
         Tool::Task => {
-            let m = members(tool_name, &value, &["prompt", "agent"])?;
+            let m = members(
+                tool_name,
+                &value,
+                &["prompt", "agent", "model", "effort", "routing"],
+            )?;
             let agent = match text(m, "agent")? {
                 None => SubAgent::General,
                 Some(word) => SubAgent::parse(word).ok_or_else(|| {
@@ -1343,6 +1359,20 @@ pub fn parse_offered(
             Args::Task {
                 prompt: prompt.to_string(),
                 agent,
+                options: TaskOptions {
+                    model: text(m, "model")?
+                        .map(|s| crate::config::model_id("task.model", s))
+                        .transpose()?,
+                    effort: text(m, "effort")?
+                        .map(|s| {
+                            crate::config::effort(s)
+                                .map_err(|why| why.replace("`reasoning_effort`", "`task.effort`"))
+                        })
+                        .transpose()?,
+                    routing: text(m, "routing")?
+                        .map(crate::config::routing)
+                        .transpose()?,
+                },
             }
         }
         Tool::SystemStatus => {
@@ -2307,6 +2337,7 @@ mod tests {
             Args::Task {
                 prompt: "Find it.".into(),
                 agent: SubAgent::General,
+                options: TaskOptions::default(),
             }
         );
         assert_eq!(
@@ -2320,6 +2351,7 @@ mod tests {
             Args::Task {
                 prompt: "x".into(),
                 agent: SubAgent::Explore,
+                options: TaskOptions::default(),
             }
         );
         assert!(parse_offered(
@@ -2349,6 +2381,36 @@ mod tests {
         assert!(parse_offered(Kit::Workspace, false, "task", &long).is_err());
         assert!(parse_offered(Kit::Task, false, "task", r#"{"prompt":"x"}"#).is_err());
         assert!(parse_offered(Kit::Task, false, "send_message", "{}").is_err());
+    }
+
+    #[test]
+    fn task_choices_are_validated_and_preserved() {
+        assert_eq!(
+            parse_offered(Kit::Workspace, false, "task", r#"{"prompt":"review","agent":"explore","model":"openai/gpt-6-sol","effort":"xhigh","routing":"balanced"}"#).unwrap(),
+            Args::Task {
+                prompt: "review".into(),
+                agent: SubAgent::Explore,
+                options: TaskOptions {
+                    model: Some("openai/gpt-6-sol".into()),
+                    effort: Some("xhigh".into()),
+                    routing: Some("balanced".into()),
+                },
+            }
+        );
+        for bad in [
+            r#"{"prompt":"x","model":""}"#,
+            r#"{"prompt":"x","model":"two words"}"#,
+            r#"{"prompt":"x","model":1}"#,
+            r#"{"prompt":"x","effort":"unbounded"}"#,
+            r#"{"prompt":"x","effort":false}"#,
+            r#"{"prompt":"x","routing":"arbitrary"}"#,
+            r#"{"prompt":"x","routing":1}"#,
+        ] {
+            assert!(
+                parse_offered(Kit::Workspace, false, "task", bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     /// `system_status` is offered only where the template turns the

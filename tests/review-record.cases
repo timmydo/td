@@ -325,3 +325,99 @@ Reviewed-by: codex/gpt-5.6-sol
 Reviewed-by: agy/gemini-3.1-pro
 Review-waiver: td-agent — down, approved by tester
 Checks: affected-checks --committed-only (green)
+
+case td-agent-panel-codex ready
+Use model-selected tasks
+
+Reviewed-by: td-agent-subagent/openai/gpt-6-sol
+Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-panel-claude ready
+Use model-selected tasks
+
+Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-mixed-panel ready
+Mixed native and task transports
+
+Reviewed-by: subagent/gpt-6-sol
+Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
+Reviewed-by: agy/gemini-3.8-flash-high
+Checks: green
+
+case td-agent-wrong-cross-family not-ready
+Wrong slot model
+
+Reviewed-by: td-agent-subagent/openai/gpt-6-sol
+Reviewed-by: td-agent-claude/openai/gpt-6.1-sol
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-wrong-gemini-family not-ready
+Wrong shared slot model
+
+Reviewed-by: td-agent-subagent/openai/gpt-6-sol
+Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-agy/openai/gpt-6.1-sol
+Checks: green
+
+case td-agent-own-cross-family not-ready
+Same family twice
+
+Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-claude/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-duplicate-primary-not-cross not-ready
+Two primary transports cannot replace the cross-model slot
+
+Reviewed-by: subagent/gpt-6-sol
+Reviewed-by: td-agent-subagent/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-unknown-transport not-ready
+Misspelled transport
+
+Reviewed-by: td-agent-subagent/openai/gpt-6-sol
+Reviewed-by: td-agent-claud/anthropic/claude-opus-5.5
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-primary-gemini-3.8-flash not-ready
+Primary reviewer outside roster
+
+Reviewed-by: td-agent-subagent/google/gemini-3.8-flash
+Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-primary-claude-haiku-4.5 not-ready
+Primary reviewer outside roster
+
+Reviewed-by: td-agent-subagent/anthropic/claude-haiku-4.5
+Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-primary-claude-sonnet-5.5 not-ready
+Primary reviewer outside roster
+
+Reviewed-by: td-agent-subagent/anthropic/claude-sonnet-5.5
+Reviewed-by: td-agent-codex/openai/gpt-6.1-sol
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green
+
+case td-agent-duplicate-primary-reversed-not-cross not-ready
+Task primary cannot be replaced by a native second primary
+
+Reviewed-by: td-agent-subagent/openai/gpt-6-sol
+Reviewed-by: subagent/opus-5.5
+Reviewed-by: td-agent-agy/google/gemini-3.8-flash
+Checks: green

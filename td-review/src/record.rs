@@ -4,15 +4,18 @@
 //! replays commits individually and a commit nobody reviewed must not be one of
 //! them.
 //!
-//! This is a SECOND implementation of that rule: td-review is outside the
-//! builder workspace and cannot depend on it. `tests/review-record.cases` is
-//! what keeps the two answering the same — both crates fail if a case there
-//! disagrees with them.
+//! The rule has two implementations: td-review is outside the builder
+//! workspace and cannot depend on it. They share transport normalization;
+//! `tests/review-record.cases` pins their remaining rules together. Both
+//! crates fail if a case disagrees with them.
+
+#[path = "reviewer.rs"]
+mod reviewer;
 
 /// The reviewers a record may name. Closed: a misspelt reviewer is a review
 /// nobody ran, and an open roster cannot tell those two apart.
 const SUBAGENT: &str = "subagent";
-const CLI_REVIEWERS: [&str; 3] = ["agy", "claude", "codex"];
+const CLI_REVIEWERS: &[&str] = &["agy", "claude", "codex"];
 /// The cross-model reviewer both acting-agent rosters name; the other is the
 /// model that is not acting, so "any two of three" would be laxer than AGENTS.md.
 const SHARED_CLI: &str = "agy";
@@ -141,7 +144,13 @@ pub fn parse(message: &str) -> Record {
         match key.as_str() {
             "reviewed-by" => match value.split_once('/') {
                 Some((tool, model)) if !tool.trim().is_empty() && !model.trim().is_empty() => {
-                    let tool = tool.trim().to_string();
+                    let tool = match reviewer::slot(tool.trim(), model.trim()) {
+                        Ok(slot) => slot.to_string(),
+                        Err(why) => {
+                            rec.malformed.push(why);
+                            continue;
+                        }
+                    };
                     let model = model.trim().to_string();
                     if !rec.reviewers.iter().any(|(t, _)| *t == tool) {
                         rec.reviewers.push((tool, model));
@@ -196,11 +205,11 @@ fn known_reviewer(name: &str) -> bool {
 /// does not recognise is one it cannot compare. Splitting on the first `-` was
 /// not enough: `claude-opus-4.8` and `opus-4.8` are the same model, and that is
 /// the spelling an agent naturally writes for its own subagent.
-const MODELS: [&str; 6] = ["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
+const MODELS: &[&str] = &["opus", "sonnet", "haiku", "fable", "gpt", "gemini"];
 
 fn family(model: &str) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
-    MODELS.into_iter().find(|m| {
+    MODELS.iter().copied().find(|m| {
         lower
             .split(|c: char| !c.is_ascii_alphanumeric())
             .any(|token| token == *m)

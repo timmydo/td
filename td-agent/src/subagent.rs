@@ -11,7 +11,7 @@ use super::{
 use crate::client::{self, Failure, Params};
 use crate::cost;
 use crate::store::{Basis, Effect, Kind, Purpose};
-use crate::tools::SubAgent;
+use crate::tools::{SubAgent, TaskOptions};
 
 /// The most requests one sub-agent makes, its last asking for its
 /// report.
@@ -30,6 +30,65 @@ const INTERRUPTED: &str = "the sub-agent was interrupted before it reported";
 const CALL_PAST_LAST: &str =
     "not run: the sub-agent's last request was for its report, and asked for no tool calls";
 
+#[derive(Debug, PartialEq, Eq)]
+struct Selection {
+    model: String,
+    effort: String,
+    routing: Option<String>,
+}
+
+fn selection(
+    model: &str,
+    effort: &str,
+    routing: Option<&str>,
+    client: &crate::config::Client,
+    agent: SubAgent,
+    options: &TaskOptions,
+) -> Selection {
+    let explore = agent == SubAgent::Explore;
+    Selection {
+        model: options
+            .model
+            .as_deref()
+            .or_else(|| explore.then_some(client.explore_model.as_deref()).flatten())
+            .unwrap_or(model)
+            .to_string(),
+        effort: options.effort.as_deref().unwrap_or(effort).to_string(),
+        routing: options
+            .routing
+            .as_deref()
+            .or_else(|| {
+                explore
+                    .then_some(client.explore_routing.as_deref())
+                    .flatten()
+            })
+            .or(routing)
+            .filter(|r| *r != crate::config::DEFAULT_ROUTING)
+            .map(str::to_string),
+    }
+}
+
+fn capabilities(
+    name: &str,
+    setting: &str,
+    model: Option<&crate::models::Model>,
+    explicit_effort: bool,
+) -> Result<(), String> {
+    if let Some(missing) =
+        model.and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
+    {
+        return Err(format!(
+            "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
+        ));
+    }
+    if explicit_effort && model.is_some_and(|m| !m.supports("reasoning")) {
+        return Err(format!(
+            "{name} takes no reasoning; omit `task.effort` or select a model that takes it"
+        ));
+    }
+    Ok(())
+}
+
 impl Session {
     /// Runs a sub-agent on `prompt` for the `task` call `started`: its
     /// final report, or why there is none. It keeps its own digests,
@@ -40,9 +99,10 @@ impl Session {
         started: u64,
         prompt: String,
         agent: SubAgent,
+        options: TaskOptions,
     ) -> Result<Result<String, String>, String> {
         let theirs = self.bench.swap_digests(BTreeMap::new());
-        let done = self.delegate(started, prompt, agent);
+        let done = self.delegate(started, prompt, agent, &options);
         self.bench.swap_digests(theirs);
         Ok(done?.map_err(|why| match agent {
             SubAgent::General => format!(
@@ -53,59 +113,76 @@ impl Session {
         }))
     }
 
-    /// What an explore sub-agent asks with: `explore_model` and
-    /// `explore_routing` where they are set, else the conversation's own,
-    /// checked as a turn's model is (DESIGN.md §12, `task`).
-    fn explorer(&mut self, asking: Asking) -> Result<Asking, String> {
-        let client = &asking.client;
-        let routing = client
-            .explore_routing
-            .clone()
-            .or_else(|| asking.routing.clone())
-            .filter(|r| r != crate::config::DEFAULT_ROUTING);
-        let Some(name) = client.explore_model.clone() else {
-            if routing == asking.routing {
-                return Ok(asking);
-            }
-            return self.explore_on(asking.name.clone(), "`explore_model`", routing, asking);
+    /// Resolve per-call choices without changing the caller's settings.
+    fn subagent_asking(
+        &mut self,
+        asking: Asking,
+        agent: SubAgent,
+        options: &TaskOptions,
+    ) -> Result<Asking, String> {
+        let selected = selection(
+            &asking.name,
+            &asking.reasoning_effort,
+            asking.routing.as_deref(),
+            &asking.client,
+            agent,
+            options,
+        );
+        if selected.model == asking.name
+            && selected.routing == asking.routing
+            && options.effort.is_none()
+        {
+            return Ok(asking);
+        }
+        let asking = Asking {
+            reasoning_effort: selected.effort,
+            ..asking
         };
-        self.explore_on(name, "`explore_model`", routing, asking)
+        let setting = if options.model.is_some() {
+            "`task.model`"
+        } else if agent == SubAgent::Explore && asking.client.explore_model.is_some() {
+            "`explore_model`"
+        } else {
+            "the conversation model"
+        };
+        self.subagent_on(
+            selected.model,
+            setting,
+            selected.routing,
+            asking,
+            options.effort.is_some(),
+        )
     }
 
     /// `asking` on model `name`, which `setting` names, and `routing`.
-    fn explore_on(
+    fn subagent_on(
         &mut self,
         name: String,
         setting: &str,
         routing: Option<String>,
         asking: Asking,
+        explicit_effort: bool,
     ) -> Result<Asking, String> {
         let client = asking.client.clone();
         let model = self.model(setting, &name, &client)?;
+        capabilities(&name, setting, model.as_ref(), explicit_effort)?;
         let model = match &routing {
             None => model,
             Some(routing) => {
-                let reasoning = model.as_ref().is_none_or(|m| m.supports("reasoning"));
-                // The conversation's hint names its own menu; this
-                // routing may be `explore_routing`'s.
+                let reasoning =
+                    explicit_effort || model.as_ref().is_none_or(|m| m.supports("reasoning"));
+                // Routing may be the call's choice rather than the caller's.
                 Some(
                     self.routed(&client, &name, routing, reasoning)
                         .map_err(|e| {
                             format!(
-                                "{e} (the explore sub-agent routes by `explore_routing` where it is set, else as the conversation does)"
+                                "{e} (the sub-agent uses its `task.routing` choice or its configured default)"
                             )
                         })?,
                 )
             }
         };
-        if let Some(missing) = model
-            .as_ref()
-            .and_then(|m| ["tools", "max_tokens"].into_iter().find(|p| !m.supports(p)))
-        {
-            return Err(format!(
-                "{name} takes no {missing} (the provider's models list gives it no `{missing}` parameter); set {setting} to a model that does"
-            ));
-        }
+        capabilities(&name, setting, model.as_ref(), explicit_effort)?;
         Ok(Asking {
             name,
             model,
@@ -125,6 +202,7 @@ impl Session {
         started: u64,
         prompt: String,
         agent: SubAgent,
+        options: &TaskOptions,
     ) -> Result<Result<String, String>, String> {
         let Some(turn) = self.current_turn() else {
             return Ok(Err("a sub-agent runs only within a turn".into()));
@@ -133,12 +211,9 @@ impl Session {
             Ok(asking) => asking,
             Err(why) => return Ok(Err(why)),
         };
-        let asking = match agent {
-            SubAgent::General => asking,
-            SubAgent::Explore => match self.explorer(asking) {
-                Ok(asking) => asking,
-                Err(why) => return Ok(Err(why)),
-            },
+        let asking = match self.subagent_asking(asking, agent, options) {
+            Ok(asking) => asking,
+            Err(why) => return Ok(Err(why)),
         };
         let Asking {
             key,
@@ -508,5 +583,124 @@ impl Session {
                 } => Some(e.seq),
                 _ => None,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn per_call_choices_override_defaults_without_changing_the_caller() {
+        let client = crate::config::Client {
+            explore_model: Some("configured/explorer".into()),
+            explore_routing: Some("cheapest".into()),
+            ..crate::config::Client::default()
+        };
+        let before = client.clone();
+        let general = selection(
+            "parent/model",
+            "medium",
+            Some("fastest"),
+            &client,
+            SubAgent::General,
+            &TaskOptions::default(),
+        );
+        assert_eq!(
+            general,
+            Selection {
+                model: "parent/model".into(),
+                effort: "medium".into(),
+                routing: Some("fastest".into()),
+            }
+        );
+        let explore = selection(
+            "parent/model",
+            "medium",
+            Some("fastest"),
+            &client,
+            SubAgent::Explore,
+            &TaskOptions::default(),
+        );
+        assert_eq!(explore.model, "configured/explorer");
+        assert_eq!(explore.routing.as_deref(), Some("cheapest"));
+        for agent in [SubAgent::General, SubAgent::Explore] {
+            let selected = selection(
+                "parent/model",
+                "medium",
+                Some("fastest"),
+                &client,
+                agent,
+                &TaskOptions {
+                    model: Some("reviewer/model".into()),
+                    effort: Some("xhigh".into()),
+                    routing: Some("balanced".into()),
+                },
+            );
+            assert_eq!(
+                selected,
+                Selection {
+                    model: "reviewer/model".into(),
+                    effort: "xhigh".into(),
+                    routing: None,
+                }
+            );
+        }
+        let model_only = selection(
+            "parent/model",
+            "medium",
+            Some("fastest"),
+            &client,
+            SubAgent::Explore,
+            &TaskOptions {
+                model: Some("reviewer/model".into()),
+                ..TaskOptions::default()
+            },
+        );
+        assert_eq!(model_only.effort, "medium");
+        assert_eq!(model_only.routing.as_deref(), Some("cheapest"));
+        assert_eq!(client, before);
+        let plain = selection(
+            "parent/model",
+            "high",
+            None,
+            &crate::config::Client::default(),
+            SubAgent::Explore,
+            &TaskOptions::default(),
+        );
+        assert_eq!(plain.model, "parent/model");
+        assert_eq!(plain.effort, "high");
+        assert_eq!(plain.routing, None);
+    }
+
+    #[test]
+    fn explicit_effort_is_not_silently_dropped_and_tools_are_required() {
+        let models = crate::models::Models::from_provider(
+            br#"{"data":[
+            {"id":"no-reasoning","supported_parameters":["tools","max_tokens"]},
+            {"id":"reasoning","supported_parameters":["tools","max_tokens","reasoning"]},
+            {"id":"no-tools","supported_parameters":["max_tokens","reasoning"]},
+            {"id":"no-max","supported_parameters":["tools","reasoning"]}
+        ]}"#,
+        )
+        .unwrap();
+        assert!(capabilities(
+            "no-reasoning",
+            "task.model",
+            models.find("no-reasoning"),
+            false
+        )
+        .is_ok());
+        assert!(capabilities(
+            "no-reasoning",
+            "task.model",
+            models.find("no-reasoning"),
+            true
+        )
+        .is_err());
+        assert!(capabilities("reasoning", "task.model", models.find("reasoning"), true).is_ok());
+        assert!(capabilities("no-tools", "task.model", models.find("no-tools"), true).is_err());
+        assert!(capabilities("no-max", "task.model", models.find("no-max"), true).is_err());
     }
 }

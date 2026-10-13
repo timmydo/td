@@ -1214,6 +1214,26 @@ fn ensure_recipe_eval_sentinel(base: &Path, bin: &str) -> Result<(), String> {
     crate::write_atomic(&sentinel, format!("{bin}\n").as_bytes())
 }
 
+fn builder_source_fingerprint(root: &Path) -> Result<String, String> {
+    let fp_roots: Vec<String> = [
+        "builder/src",
+        "builder/build.rs",
+        "builder/Cargo.toml",
+        "td-review/src/reviewer.rs",
+        "engine/src",
+        "engine/Cargo.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "seed/seed-digests.txt",
+        "seed/local-source-roster.txt",
+        "seed/bootstrap-root.txt",
+    ]
+    .iter()
+    .map(|p| root.join(p).to_string_lossy().into_owned())
+    .collect();
+    crate::tree_fingerprint(&fp_roots)
+}
+
 /// Produce a stage0 td-builder and PLACE it into a td-owned store under BASE
 /// using STAGE0'S OWN `store-add-builder` (stage0 places itself — no
 /// guix-built td-builder anywhere). Writes BASE/{store/<base>/…, builder.db,
@@ -1244,23 +1264,9 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     // through the workspace-root Cargo.toml/Cargo.lock (which also carry the
     // release profile + member set), so engine/src, engine/Cargo.toml, and both
     // workspace-root files are compile inputs and join the fingerprint too — else
-    // an engine edit leaves a stale placement in force.
-    let fp_roots: Vec<String> = [
-        "builder/src",
-        "builder/build.rs",
-        "builder/Cargo.toml",
-        "engine/src",
-        "engine/Cargo.toml",
-        "Cargo.toml",
-        "Cargo.lock",
-        "seed/seed-digests.txt",
-        "seed/local-source-roster.txt",
-        "seed/bootstrap-root.txt",
-    ]
-    .iter()
-    .map(|p| root.join(p).to_string_lossy().into_owned())
-    .collect();
-    let fp = crate::tree_fingerprint(&fp_roots)?;
+    // an engine edit leaves a stale placement in force. ready.rs also compiles
+    // td-review's shared reviewer transport parser.
+    let fp = builder_source_fingerprint(root)?;
     // The fingerprint keys on the builder SOURCE only. The musl static binary is
     // self-contained (its runtime closure is empty), so any conforming host
     // toolchain that builds this source yields an equivalent, correct builder —
@@ -2022,6 +2028,31 @@ mod tests {
         let gone = stage0_memo_hit(&meta, "fp1", &store, &db).unwrap_err();
         assert!(gone.contains("is missing"), "{gone}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn shared_reviewer_source_invalidates_builder_placement() {
+        let d = scratch("builder-reviewer-fingerprint");
+        for rel in [
+            "builder/src/main.rs",
+            "builder/build.rs",
+            "builder/Cargo.toml",
+            "engine/src/lib.rs",
+            "engine/Cargo.toml",
+            "Cargo.toml",
+            "Cargo.lock",
+            "seed/seed-digests.txt",
+            "seed/local-source-roster.txt",
+            "seed/bootstrap-root.txt",
+            "td-review/src/reviewer.rs",
+        ] {
+            let file = d.join(rel);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "old source").unwrap();
+        }
+        let before = builder_source_fingerprint(&d).unwrap();
+        std::fs::write(d.join("td-review/src/reviewer.rs"), "new rules").unwrap();
+        assert_ne!(before, builder_source_fingerprint(&d).unwrap());
     }
 
     /// The evaluator's fingerprint must follow `include_str!` OUT of recipes/:

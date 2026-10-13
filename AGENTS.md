@@ -335,18 +335,21 @@ boundaries are:
 # Code review
 
 - Each commit receives the required independent subagent and cross-model
-  reviews over its own diff. One panel cycle is scheduled per commit; later
-  passes are the review subagent alone, and re-running the panel needs a
-  named escalation trigger. Stop and ask when the passes stop converging.
+  reviews over its own diff. Model-selected td-agent subagents may fill the
+  reviewer slots; `DEVELOPMENT.md` defines their roster and record. One panel
+  cycle is scheduled per commit; later passes are the review subagent alone,
+  and re-running the panel needs a named escalation trigger. Stop and ask
+  when the passes stop converging.
 - The acting agent reconciles every finding and records its own summary,
   reviewer identities, and checks in the commit message.
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
 verifies that every touched path ends in `.md`. Other unavailable-reviewer
 waivers require a reason and the human approver named in the trailer. A
-cross-model CLI that refuses for spent quota is replaced, without a
-waiver, by a capped `td-agent review` of the same family, recorded with
-`Review-fallback:` (`DEVELOPMENT.md`, Quota fallback).
+cross-model CLI that refuses for spent quota may be replaced by a normal
+model-selected task review. The legacy capped `td-agent review` transport
+instead requires the same family and a `Review-fallback:` record
+(`DEVELOPMENT.md`, Quota fallback).
 
 Commit messages are the durable review record. Put rationale, design
 decisions, findings and dispositions, and verified-red evidence there. Hard

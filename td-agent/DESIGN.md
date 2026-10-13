@@ -5539,7 +5539,8 @@ directory and git tools, as far as the workspace has what they act on.
   bound into this workspace's later instances, admitted per §8 and decided
   per §11.
 - **`git_fetch`** and **`git_push`**: §9.
-- **`task {prompt, agent?}`**: hands a piece of work to a sub-agent, a
+- **`task {prompt, agent?, model?, effort?, routing?}`**: hands a piece
+  of work to a sub-agent, a
   general one or one that explores, in a conversation with a workspace
   (As built (`task`), below).
 
@@ -6178,7 +6179,8 @@ start's deadline and each listing's again, the turn's wait for its
 listing, and a call's bound for a server not yet begun each add the
 time it stopped since they began.
 
-**As built (`task`).** `task {prompt, agent?}` runs a sub-agent within
+**As built (`task`).** `task {prompt, agent?, model?, effort?, routing?}`
+runs a sub-agent within
 the caller's turn and answers the call with its final report. It is
 offered after the conversation tools to a conversation with a workspace;
 the prompt is required, at most 32 KiB, and `agent` is `general`, the
@@ -6205,13 +6207,26 @@ for each call. It keeps its own record of the digests a write must
 match, from none, and the caller's is put back after it: a write of the
 caller's still matches only the version the caller read or wrote, never
 one the sub-agent made since, and a process starting again takes up only
-those of the conversation's own calls. A general sub-agent runs on the
+those of the conversation's own calls. Without per-call choices, a
+general sub-agent runs on the
 conversation's model, effort and routing; an explore sub-agent on
 `explore_model` and `explore_routing` where they are set (§15), each
 else the conversation's, with the conversation's effort where its model
-takes one, the model checked against the models list and its price as a
-turn's is, and refused, the call answered with why, where it takes no
-tools or `max_tokens`. Each request is estimated from its own requests
+takes one. Optional `model`, `effort` and `routing` override those
+individual defaults for this call alone, for either kind. Model ids and
+choices are validated as configuration values; effort uses §15's
+reasoning efforts and routing §5's modes. Explicit `balanced` clears
+inherited or configured routing. The caller's model, settings, digests,
+approval policy and spending limits are unchanged. The selected model
+and its routing envelope are checked against the models list and price
+as a turn's are; no tools or `max_tokens` refuses the call. An explicit
+effort also refuses a model known to take no reasoning, rather than
+silently dropping the choice. Inherited effort retains the existing
+omission for a model that takes none. Use `explore` with explicit reviewer
+choices for an independent read-only code review; its prompt must supply
+the exact full commit, or a workspace path to it, and the review scope.
+It cannot run tests; the caller asks its report to state that limitation.
+Each request is estimated from its own requests
 alone (§14), reserved, limited by `max_cost_per_turn` and
 `max_cost_per_conversation` as the caller's turn's own, and counted in
 that turn; a request the provider rate-limits is asked again after its
@@ -6234,8 +6249,9 @@ it keeps room in the log for the calls of the caller's reply still
 to answer.
 
 Its records are the caller's log's (§6): a `task` event (the call, the
-sub-agent's kind, model, prefix and prompt), then `request` events of
-purpose `task` whose `prefix` names that event, their `assistant`
+sub-agent's kind, selected model, prefix and prompt), then `request`
+events of purpose `task` whose `prefix` names that event and whose bodies
+retain the effective effort and routing, their `assistant`
 replies, their calls' `tool_call` and `tool_result` events, and any
 `task_note` naming it. A
 sub-agent's request is rebuilt from those alone (`client::task_view`),
