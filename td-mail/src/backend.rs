@@ -1861,7 +1861,10 @@ fn backend_loop(
                 let _ = resp_tx.send(BackendResponse::Mailboxes(result));
             }
             BackendCommand::CreateMailbox { name } => {
-                let result = client.create_mailbox(&name).map_err(|e| e.to_string());
+                let result = client
+                    .create_mailbox(&name)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
                 if result.is_ok() {
                     if let Ok(mailboxes) = client.get_mailboxes() {
                         cached_mailboxes = mailboxes;
@@ -2666,14 +2669,49 @@ pub struct SentDraft {
     pub kept_in: String,
 }
 
+fn sending_mailbox(role: &str, mailboxes: &[Mailbox]) -> Result<Option<(String, String)>, String> {
+    if let Some(mailbox) = mailboxes
+        .iter()
+        .find(|mailbox| mailbox.role.as_deref() == Some(role))
+    {
+        return Ok(Some((mailbox.id.clone(), mailbox.name.clone())));
+    }
+    let mut named = mailboxes.iter().filter(|mailbox| {
+        mailbox.role.is_none()
+            && mailbox.parent_id.is_none()
+            && mailbox.name.eq_ignore_ascii_case(role)
+    });
+    let selected = named.next();
+    if named.next().is_some() {
+        return Err(format!(
+            "more than one root mailbox is named '{role}'; choose one destination before sending"
+        ));
+    }
+    Ok(selected.map(|mailbox| (mailbox.id.clone(), mailbox.name.clone())))
+}
+
+type SendingMailbox = Option<(String, String)>;
+fn sending_mailboxes(mailboxes: &[Mailbox]) -> Result<(SendingMailbox, SendingMailbox), String> {
+    let drafts = sending_mailbox("drafts", mailboxes);
+    let sent = sending_mailbox("sent", mailboxes);
+    if drafts.as_ref().is_ok_and(Option::is_some) || sent.as_ref().is_ok_and(Option::is_some) {
+        if let Err(error) = &sent {
+            log_warn!("[Backend] Sending into Drafts because Sent is ambiguous: {error}");
+        }
+        return Ok((drafts.ok().flatten(), sent.ok().flatten()));
+    }
+    Ok((drafts?, sent?))
+}
+
 /// Sends the retained draft at `path`: parsed as `submit::parse_draft`
 /// reads it, its From matched to one of the account's identities, its
 /// attachments uploaded, then created and submitted in one request, the
 /// server keeping the copy in the Sent mailbox (in Drafts until it goes,
-/// and there if the account has no Sent). Nothing on disk changes here.
+/// and there if the account has no Sent). Roles precede unique root names;
+/// a fresh send creates and confirms Sent when neither destination exists.
 ///
 /// Before the request goes, the attempt (the Message-ID it carries,
-/// when, and under which identity) is recorded beside the draft
+/// when, under which identity, and its filing folder IDs) is recorded beside the draft
 /// (`compose::lost_record_for`). A refusal the server answered removes
 /// the record; a send that went keeps it until the draft is retired
 /// (`compose::retire_draft` removes it), so td-mail ending before the
@@ -2715,12 +2753,7 @@ fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
     })?;
     // The record holds the identity's id as a line of its own: a JMAP Id,
     // letters, digits, `-` and `_`.
-    if identity.id.is_empty()
-        || !identity
-            .id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !crate::jmap::client::valid_id(&identity.id) {
         return Err(format!(
             "the server's identity id {:?} is not a JMAP Id, so nothing was sent",
             identity.id
@@ -2731,28 +2764,10 @@ fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
     // every later send.
     let retired = submit::sent_dir_for(path).is_some();
 
-    let mailboxes = client.get_mailboxes().map_err(|e| e.to_string())?;
-    let by_role = |role: &str| {
-        mailboxes
-            .iter()
-            .find(|m| m.role.as_deref() == Some(role))
-            .map(|m| (m.id.clone(), m.name.clone()))
-    };
-    let drafts = by_role("drafts");
-    let sent = by_role("sent");
-    let (create_in, create_in_name) = drafts.clone().or_else(|| sent.clone()).ok_or_else(|| {
-        "the account has neither a Drafts nor a Sent mailbox to keep the message in".to_string()
-    })?;
-
-    if let Some(lost) = read_lost(path)? {
-        let settled = settle_lost_send(
-            client,
-            &lost,
-            &create_in,
-            sent.as_ref().map(|(id, _)| id.as_str()),
-            &mailboxes,
-        )?;
-        // One that went keeps its record until the draft is retired.
+    let lost = read_lost(path)?;
+    let mut mailboxes = client.get_mailboxes().map_err(|e| e.to_string())?;
+    if let Some(lost) = lost {
+        let settled = settle_lost_send(client, &lost, &mailboxes, path)?;
         if let Some(sent) = settled {
             log_info!(
                 "[Backend] The lost send of {} went: email {} submission {}, kept in {}",
@@ -2771,6 +2786,30 @@ fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
 
     let ceiling = client.upload_ceiling();
     let read = submit::read_parts(&outgoing.parts, ceiling).map_err(|e| e.to_string())?;
+    let (drafts, mut sent) = sending_mailboxes(&mailboxes)?;
+    if drafts.is_none() && sent.is_none() {
+        let created = client
+            .create_mailbox("Sent")
+            .map_err(|e| format!("creating Sent: {e}"))?;
+        mailboxes = client
+            .get_mailboxes()
+            .map_err(|e| format!("confirming created Sent mailbox: {e}"))?;
+        sent = sending_mailbox("sent", &mailboxes)?;
+        if !sent.as_ref().is_some_and(|(id, _)| *id == created) {
+            return Err("the created Sent mailbox was not confirmed as a reusable sending destination by Mailbox/get".to_string());
+        }
+    }
+    let (create_in, create_in_name) =
+        drafts.as_ref().or(sent.as_ref()).cloned().ok_or_else(|| {
+            "the account has no confirmed Drafts or Sent mailbox to keep the message in".to_string()
+        })?;
+    for id in std::iter::once(create_in.as_str()).chain(sent.as_ref().map(|(id, _)| id.as_str())) {
+        if !crate::jmap::client::valid_id(id) {
+            return Err(
+                "the server's filing mailbox ID is not a JMAP Id, so nothing was sent".to_string(),
+            );
+        }
+    }
     let mut blob_ids = Vec::with_capacity(read.len());
     for (index, bytes) in &read {
         let part = outgoing
@@ -2790,6 +2829,8 @@ fn send_draft(client: &JmapClient, path: &Path) -> Result<SentDraft, String> {
         message_id,
         since: now,
         identity_id: identity.id.clone(),
+        create_in: Some(create_in.clone()),
+        sent: sent.as_ref().map(|(id, _)| id.clone()),
     };
     write_lost(path, &attempt).map_err(|e| {
         format!(
@@ -2859,12 +2900,14 @@ fn attach_file(
 
 /// A send whose answer was lost: the Message-ID the attempt carried,
 /// when it was made and the identity it was made under, so the server
-/// can be asked about it.
+/// can be asked about it, plus the original creation and filing folder IDs.
 #[derive(Debug, Clone, PartialEq)]
 struct LostSend {
     message_id: String,
     since: i64,
     identity_id: String,
+    create_in: Option<String>,
+    sent: Option<String>,
 }
 
 /// The most a lost send's record is read to.
@@ -2873,17 +2916,26 @@ const LOST_RECORD_BYTES: u64 = 4096;
 impl LostSend {
     /// The record as kept: a `key value` line each.
     fn to_record(&self) -> String {
-        format!(
+        let mut record = format!(
             "message-id {}\nsince {}\nidentity {}\n",
             self.message_id, self.since, self.identity_id
-        )
+        );
+        if let Some(id) = &self.create_in {
+            record.push_str(&format!("create-in {id}\n"));
+        }
+        if let Some(id) = &self.sent {
+            record.push_str(&format!("sent {id}\n"));
+        }
+        record
     }
 
-    /// A record read back; none when a line is not one of the three
+    /// Read current folder-pinned records and legacy three-key records.
+    /// None when a line is not one of the known
     /// keys with a value free of controls, or a key is missing or given
-    /// twice.
+    /// twice, or sent is present without create-in.
     fn from_record(text: &str) -> Option<Self> {
         let (mut message_id, mut since, mut identity_id) = (None, None, None);
+        let (mut create_in, mut sent) = (None, None);
         for line in text.lines() {
             let (key, value) = line.split_once(' ')?;
             if value.is_empty() || value.chars().any(char::is_control) {
@@ -2893,13 +2945,20 @@ impl LostSend {
                 "message-id" if message_id.is_none() => message_id = Some(value.to_string()),
                 "since" if since.is_none() => since = Some(value.parse().ok()?),
                 "identity" if identity_id.is_none() => identity_id = Some(value.to_string()),
+                "create-in" if create_in.is_none() => create_in = Some(value.to_string()),
+                "sent" if sent.is_none() => sent = Some(value.to_string()),
                 _ => return None,
             }
+        }
+        if sent.is_some() && create_in.is_none() {
+            return None;
         }
         Some(LostSend {
             message_id: message_id?,
             since: since?,
             identity_id: identity_id?,
+            create_in,
+            sent,
         })
     }
 }
@@ -2959,27 +3018,23 @@ fn clear_lost(path: &Path) {
     }
 }
 
-/// A send whose answer was lost, asked about. The identity's submissions
-/// around the attempt (a day of slack either side for the clocks; the
-/// match is by Message-ID, the window only bounds what is read) are
-/// read with the messages they sent, and the one carrying the attempt's
-/// Message-ID is the answer the lost reply would have carried, its
-/// filing read from the copy. With no such submission on record, the
-/// copies made in that window in the mailbox the send creates in and in
-/// Sent say: one carrying the id and no longer a draft where it was made
-/// (filed to Sent by a server that keeps no submissions) went, and is
-/// the answer; still a draft where it was made, it never went, so it is
-/// removed and `None` says to send afresh, as it does when no copy is
-/// there. Only those two mailboxes are read, so a copy delivered to this
-/// account is never touched. An error is the server not answering the
-/// question, which then stands.
+/// Resolve submission history first, then inspect only the original recorded
+/// creation/Sent IDs within the bounded time window. A non-draft copy settles;
+/// a draft in its creation folder is removed before retry. A draft outside
+/// that folder, a missing folder, or legacy IDs without a matching submission
+/// refuses automatic retry. Current roles and names cannot redirect recovery.
+/// Native td-mta submission history must durably preserve responsibility;
+/// a server discarding history cannot distinguish a refused send from a sent
+/// message whose filing failed and therefore left a draft behind.
 fn settle_lost_send(
     client: &JmapClient,
     lost: &LostSend,
-    create_in: &str,
-    sent: Option<&str>,
     mailboxes: &[Mailbox],
+    path: &Path,
 ) -> Result<Option<SentDraft>, String> {
+    let manual = |why: &str| {
+        format!("{why}; the earlier send record is at {}; verify delivery before removing it to send again", crate::compose::lost_record_for(path).display())
+    };
     let asking = |e: JmapError| format!("asking the server whether the last send went: {e}");
     const SLACK: i64 = 24 * 3600;
     let since = td_civil::format_rfc3339_utc(lost.since.saturating_sub(SLACK));
@@ -3034,6 +3089,15 @@ fn settle_lost_send(
         }
     }
 
+    let create_in = lost.create_in.as_deref().ok_or_else(|| {
+        manual("the earlier send has no recorded filing folders and no matching submission; automatic retry cannot establish its outcome")
+    })?;
+    let sent = lost.sent.as_deref();
+    for id in std::iter::once(create_in).chain(sent) {
+        if !mailboxes.iter().any(|mailbox| mailbox.id == id) {
+            return Err(manual(&format!("an earlier send's recorded folder is missing ({id}) and no matching submission establishes its outcome")));
+        }
+    }
     let still_draft = |copy: &Email| {
         copy.keywords.get("$draft").copied().unwrap_or(false)
             && copy.mailbox_ids.get(create_in).copied().unwrap_or(false)
@@ -3052,12 +3116,20 @@ fn settle_lost_send(
         }
         let emails = client.get_email_filing(&ids).map_err(asking)?;
         let copies: Vec<&Email> = emails.iter().filter(|email| carries(email)).collect();
-        if let Some(went) = copies.iter().find(|copy| !still_draft(copy)) {
+        if let Some(went) = copies
+            .iter()
+            .find(|copy| !copy.keywords.get("$draft").copied().unwrap_or(false))
+        {
             return Ok(Some(SentDraft {
                 email_id: went.id.clone(),
                 submission_id: "none on record".to_string(),
                 kept_in: filing(went),
             }));
+        }
+        if copies.iter().any(|copy| !still_draft(copy)) {
+            return Err(manual(
+                "the earlier send has an unresolved draft outside its recorded creation folder",
+            ));
         }
         if !copies.is_empty() {
             let ids: Vec<String> = copies.iter().map(|copy| copy.id.clone()).collect();
@@ -3852,6 +3924,8 @@ mod tests {
             message_id: "<a.b@example.com>".to_string(),
             since: 1_700_000_000,
             identity_id: "id-1".to_string(),
+            create_in: Some("drafts-1".to_string()),
+            sent: Some("sent-1".to_string()),
         };
         write_lost(&draft, &lost).unwrap();
         assert_eq!(
@@ -3863,6 +3937,9 @@ mod tests {
             "message-id <a@b>\nsince 1\n",
             "message-id <a@b>\nsince soon\nidentity i\n",
             "message-id <a@b>\nsince 1\nidentity i\nextra x\n",
+            "message-id <a@b>\nsince 1\nidentity i\nsent s\n",
+            "message-id <a@b>\nsince 1\nidentity i\ncreate-in d\ncreate-in x\n",
+            "message-id <a@b>\nsince 1\nidentity i\ncreate-in d\nsent s\nsent x\n",
             "message-id \nsince 1\nidentity i\n",
             "message-id <a@b>\nsince 1\nidentity i\nmessage-id <c@d>\n",
         ] {

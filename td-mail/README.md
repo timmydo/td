@@ -157,7 +157,17 @@ parts (`Email/set` creates it in the Drafts mailbox, `$draft` and
 `$seen`, in the same request as `EmailSubmission/set` sends it; on
 success the server drops `$draft` and moves it to the Sent mailbox; an
 account without a Sent mailbox keeps it in Drafts, one without Drafts
-creates it in Sent, one without either cannot send). A submission the
+creates it in Sent). Roles take precedence; otherwise td-mail uses a unique
+root folder named Drafts or Sent without a role, case-insensitively. If
+neither exists, a fresh send creates Sent and confirms it by listing the
+folders again and matching the returned ID to a reusable Sent destination
+before creating the message. Ambiguous names with no usable destination
+refuse the send; they do not cause another folder to be created.
+Retries check submission history first, then the folder IDs recorded for
+the original attempt. Renaming folders cannot redirect this check. A missing
+recorded folder, or a legacy record without folder IDs and without a matching
+submission, refuses automatic retry and names the record for manual recovery.
+Folder refusal leaves the local draft intact. A submission the
 server refuses, by a refusal or an error of its own, has the copy
 `Email/set` made removed again; a message sent but left a draft by
 the server, its filing refused, is reported so ("kept in Drafts, still

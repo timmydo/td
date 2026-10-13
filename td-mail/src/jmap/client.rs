@@ -142,6 +142,14 @@ pub struct JmapClient {
     submission: bool,
 }
 
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 255
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 #[cfg(test)]
 impl JmapClient {
     /// A client for a server that is not there, for the paths that need
@@ -506,7 +514,7 @@ impl JmapClient {
         Err(JmapError::Api("Unexpected response".to_string()))
     }
 
-    pub fn create_mailbox(&self, name: &str) -> Result<(), JmapError> {
+    pub fn create_mailbox(&self, name: &str) -> Result<String, JmapError> {
         log_info!("[JMAP] Mailbox/set creating mailbox: {}", name);
 
         let request = JmapRequest {
@@ -530,7 +538,7 @@ impl JmapClient {
         self.confirm_mailbox_creation(&response)
     }
 
-    fn confirm_mailbox_creation(&self, response: &JmapResponse) -> Result<(), JmapError> {
+    fn confirm_mailbox_creation(&self, response: &JmapResponse) -> Result<String, JmapError> {
         let reply = response
             .method_responses
             .first()
@@ -555,15 +563,15 @@ impl JmapClient {
                 return Err(JmapError::Api(format!("Mailbox creation refused: {error}")));
             }
         }
-        if reply
+        if let Some(id) = reply
             .1
             .get("created")
             .and_then(|value| value.get("newMailbox"))
             .and_then(|value| value.get("id"))
             .and_then(Json::as_str)
-            .is_some_and(|id| !id.is_empty())
+            .filter(|id| valid_id(id))
         {
-            Ok(())
+            Ok(id.to_string())
         } else {
             Err(JmapError::Api(
                 "Mailbox creation did not return a created mailbox ID".into(),
@@ -1983,6 +1991,8 @@ mod tests {
             json!({"created":{"newMailbox":{"id":"mailbox"}}}),
             json!({"accountId":"account", "created":{"newMailbox":{}}}),
             json!({"accountId":"account", "created":{"newMailbox":{"id":""}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{"id":"bad\nId"}}}),
+            json!({"accountId":"account", "created":{"newMailbox":{"id":"x".repeat(256)}}}),
             json!({"accountId":"account", "created":{"newMailbox":{"id":"mailbox"}}, "notCreated":{"newMailbox":{"type":"invalidProperties"}}}),
             json!({"accountId":"account", "created":{"newMailbox":{"id":"mailbox"}}, "notCreated":[]}),
             json!({"accountId":"account"}),

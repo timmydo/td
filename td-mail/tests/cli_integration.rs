@@ -1781,3 +1781,288 @@ fn legacy_thread_deletion_replay_obeys_set_limit_and_retires_intent() {
         .get(&td_kv::Key::from_u64(1))
         .is_none());
 }
+
+#[test]
+fn test_send_prepares_name_only_folders_and_preserves_refused_drafts() {
+    let named = |id: &str, name: &str| json!({"id":id,"name":name,"role":null,"parentId":null,"totalEmails":0,"unreadEmails":0,"sortOrder":0});
+    for (folders, refuse, expected_mailbox, expected_name, creates) in [
+        (
+            vec![named("plain-drafts", "Drafts"), named("plain-sent", "sEnT")],
+            false,
+            Some("plain-sent"),
+            "sEnT",
+            0,
+        ),
+        (
+            vec![named("plain-drafts", "Drafts")],
+            false,
+            Some("plain-drafts"),
+            "Drafts",
+            0,
+        ),
+        (
+            vec![named("plain-sent", "Sent")],
+            false,
+            Some("plain-sent"),
+            "Sent",
+            0,
+        ),
+        (
+            vec![
+                named("one", "Drafts"),
+                named("two", "drafts"),
+                json!({"id":"role-sent","name":"Role wins","role":"sent","parentId":null,"totalEmails":0,"unreadEmails":0,"sortOrder":0}),
+                named("plain-sent", "Sent"),
+            ],
+            false,
+            Some("role-sent"),
+            "Role wins",
+            0,
+        ),
+        (
+            vec![
+                named("plain-drafts", "Drafts"),
+                named("one", "Sent"),
+                named("two", "sent"),
+            ],
+            false,
+            Some("plain-drafts"),
+            "Drafts",
+            0,
+        ),
+        (vec![], false, Some("mbox-created-1"), "Sent", 1),
+        (vec![], true, None, "", 0),
+        (
+            vec![named("one", "Sent"), named("two", "sent")],
+            false,
+            None,
+            "",
+            0,
+        ),
+    ] {
+        let mut h = CliHarness::start();
+        h._server.sending_folders(folders, refuse);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        std::fs::write(&draft, "From: test@example.com\nTo: bob@example.com\nSubject: Folder preparation\n--text follows this line--\n\nHello.\n").unwrap();
+        let response = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        if let Some(mailbox) = expected_mailbox {
+            assert!(response["ok"].is_true(), "{response}");
+            assert_eq!(response["kept_in"].as_str(), Some(expected_name));
+            assert_eq!(
+                h._server.email_state("email-created-1"),
+                Some((mailbox.into(), true, false))
+            );
+            assert_eq!(h._server.submissions().len(), 1);
+        } else {
+            assert!(!response["ok"].is_true(), "{response}");
+            assert!(response["error"].as_str().unwrap().contains(if refuse {
+                "creating Sent"
+            } else {
+                "more than one root mailbox"
+            }));
+            assert!(h._server.created_emails().is_empty());
+            assert!(h._server.submissions().is_empty());
+            assert!(draft.exists());
+        }
+        assert_eq!(h._server.created_mailboxes().len(), creates);
+    }
+}
+
+#[test]
+fn test_lost_send_uses_submission_history_before_missing_folder_refusal() {
+    for forget in [false, true] {
+        let mut h = CliHarness::start();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        let marker = if forget { "[forget]" } else { "" };
+        std::fs::write(&draft, format!("From: test@example.com\nTo: bob@example.com\nSubject: [lose] {marker} Missing folders\n--text follows this line--\n\nHello.\n")).unwrap();
+        let first = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert!(!first["ok"].is_true(), "{first}");
+        h._server.sending_folders(vec![], false);
+        let retry = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert_eq!(retry["ok"].is_true(), !forget, "{retry}");
+        if forget {
+            assert!(retry["error"]
+                .as_str()
+                .unwrap()
+                .contains("recorded folder is missing"));
+        }
+        assert!(h._server.created_mailboxes().is_empty());
+        assert_eq!(h._server.created_emails().len(), 1);
+        assert!(draft.exists());
+    }
+}
+
+#[test]
+fn test_created_filing_folder_is_confirmed_by_returned_id() {
+    for mode in [1, 2] {
+        let mut h = CliHarness::start();
+        h._server.sending_folders(vec![], false);
+        h._server.mailbox_creation_mode(mode);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        std::fs::write(&draft, "From: test@example.com\nTo: bob@example.com\nSubject: Confirmation\n--text follows this line--\nHello.\n").unwrap();
+        let response = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert!(!response["ok"].is_true(), "{response}");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("not confirmed"));
+        assert!(h._server.created_emails().is_empty());
+        assert!(h._server.submissions().is_empty());
+        assert!(draft.exists());
+        assert_eq!(h._server.created_mailboxes(), vec!["Sent"]);
+    }
+}
+
+#[test]
+fn test_lost_send_keeps_original_folder_ids_when_names_change() {
+    for refused in [false, true] {
+        let mut h = CliHarness::start();
+        let folder = |id: &str, name: &str| json!({"id":id,"name":name,"role":null,"parentId":null,"totalEmails":0,"unreadEmails":0,"sortOrder":0});
+        h._server
+            .sending_folders(vec![folder("original", "Sent")], false);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        let to = if refused {
+            "nobody@refuse.invalid"
+        } else {
+            "bob@example.com"
+        };
+        std::fs::write(&draft, format!("From: test@example.com\nTo: {to}\nSubject: [lose] [forget] Original folders\n--text follows this line--\nHello.\n")).unwrap();
+        let first = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert!(!first["ok"].is_true(), "{first}");
+        h._server.sending_folders(
+            vec![
+                folder("original", "Renamed"),
+                folder("new-drafts", "Drafts"),
+                folder("new-sent", "Sent"),
+            ],
+            false,
+        );
+        let retry = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        if refused {
+            assert!(
+                !retry["ok"].is_true(),
+                "must not report an unsent draft as sent: {retry}"
+            );
+            assert!(h._server.submissions().is_empty());
+        } else {
+            assert!(retry["ok"].is_true(), "{retry}");
+            assert_eq!(retry["kept_in"].as_str(), Some("Renamed"));
+            assert_eq!(h._server.created_emails().len(), 1, "must not resend");
+        }
+        assert!(h._server.created_mailboxes().is_empty());
+    }
+}
+
+#[test]
+fn test_legacy_lost_send_never_guesses_original_folders() {
+    for forget in [false, true] {
+        let mut h = CliHarness::start();
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        let marker = if forget { "[forget]" } else { "" };
+        std::fs::write(&draft, format!("From: test@example.com\nTo: bob@example.com\nSubject: [lose] {marker} Legacy\n--text follows this line--\nHello.\n")).unwrap();
+        let first = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert!(!first["ok"].is_true());
+        let record = dir.path().join("message.eml.lost");
+        let lines = std::fs::read_to_string(&record).unwrap();
+        let legacy = lines
+            .lines()
+            .filter(|line| !line.starts_with("create-in ") && !line.starts_with("sent "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&record, legacy).unwrap();
+        let retry = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert_eq!(retry["ok"].is_true(), !forget, "{retry}");
+        if forget {
+            let error = retry["error"].as_str().unwrap();
+            assert!(error.contains("no recorded filing folders"));
+            assert!(error.contains(record.to_str().unwrap()));
+            assert!(record.exists());
+        }
+        assert_eq!(h._server.created_emails().len(), 1);
+    }
+}
+
+#[test]
+fn test_new_drafts_folder_cannot_make_unsent_copy_look_sent() {
+    let mut h = CliHarness::start();
+    let folder = |id: &str, name: &str| json!({"id":id,"name":name,"role":null,"parentId":null,"totalEmails":0,"unreadEmails":0,"sortOrder":0});
+    h._server
+        .sending_folders(vec![folder("original", "Sent")], false);
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let dir = testing::tempdir().unwrap();
+    let draft = dir.path().join("message.eml");
+    std::fs::write(&draft, "From: test@example.com\nTo: nobody@refuse.invalid\nSubject: [lose] Unsent\n--text follows this line--\nHello.\n").unwrap();
+    assert!(
+        !h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}))["ok"].is_true()
+    );
+    h._server.sending_folders(
+        vec![folder("original", "Sent"), folder("new-drafts", "Drafts")],
+        false,
+    );
+    let retry = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+    assert!(
+        !retry["ok"].is_true(),
+        "unsent copy reported as sent: {retry}"
+    );
+    assert!(retry["error"].as_str().unwrap().contains("forbiddenToSend"));
+    assert_eq!(h._server.email_state("email-created-1"), None);
+    assert!(h._server.submissions().is_empty());
+    assert!(draft.exists());
+}
+
+#[test]
+fn test_unresolved_draft_outside_recorded_creation_folder_stays_untouched() {
+    let mut h = CliHarness::start();
+    assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+    let dir = testing::tempdir().unwrap();
+    let draft = dir.path().join("message.eml");
+    std::fs::write(&draft, "From: test@example.com\nTo: nobody@refuse.invalid\nSubject: [lose] Moved draft\n--text follows this line--\nHello.\n").unwrap();
+    assert!(
+        !h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}))["ok"].is_true()
+    );
+    h._server.move_test_email("email-created-1", "mbox-sent");
+    let retry = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+    assert!(!retry["ok"].is_true(), "{retry}");
+    assert!(retry["error"]
+        .as_str()
+        .unwrap()
+        .contains("unresolved draft outside"));
+    assert_eq!(h._server.created_emails().len(), 1);
+    assert_eq!(
+        h._server.email_state("email-created-1"),
+        Some(("mbox-sent".into(), true, true))
+    );
+    assert!(dir.path().join("message.eml.lost").exists());
+}
+
+#[test]
+fn test_invalid_filing_id_refuses_before_sending_or_writing_a_record() {
+    for id in ["", "bad\nId", "invalid/id"] {
+        let mut h = CliHarness::start();
+        h._server.sending_folders(vec![json!({"id":id,"name":"Sent","role":"sent","parentId":null,"totalEmails":0,"unreadEmails":0,"sortOrder":0})], false);
+        assert!(h.send(json!({"command":"connect", "account":"test"}))["ok"].is_true());
+        let dir = testing::tempdir().unwrap();
+        let draft = dir.path().join("message.eml");
+        std::fs::write(&draft, "From: test@example.com\nTo: bob@example.com\nSubject: Invalid folder\n--text follows this line--\nHello.\n").unwrap();
+        let response = h.send(json!({"command":"send_draft", "path":draft.to_string_lossy()}));
+        assert!(!response["ok"].is_true(), "{response}");
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("filing mailbox ID is not a JMAP Id"));
+        assert!(h._server.created_emails().is_empty());
+        assert!(h._server.submissions().is_empty());
+        assert!(!dir.path().join("message.eml.lost").exists());
+    }
+}

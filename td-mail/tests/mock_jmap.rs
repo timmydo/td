@@ -70,6 +70,10 @@ impl EmailRecord {
 }
 
 struct MockState {
+    mailboxes: Vec<Value>,
+    mailbox_creates: Vec<String>,
+    mailbox_create_refused: bool,
+    mailbox_create_mode: u8,
     read_refusal: Option<(String, String)>,
     refuse_stored: bool,
     read_calls: Vec<Value>,
@@ -186,6 +190,54 @@ impl MockState {
         }
 
         Self {
+            mailboxes: json!([
+                {
+                    "id": "mbox-inbox",
+                    "name": "INBOX",
+                    "role": "inbox",
+                    "totalEmails": 4,
+                    "unreadEmails": 2,
+                    "sortOrder": 1
+                },
+                {
+                    "id": "mbox-archive",
+                    "name": "Archive",
+                    "role": "archive",
+                    "totalEmails": 1,
+                    "unreadEmails": 0,
+                    "sortOrder": 3
+                },
+                {
+                    "id": "mbox-trash",
+                    "name": "Trash",
+                    "role": "trash",
+                    "totalEmails": 0,
+                    "unreadEmails": 0,
+                    "sortOrder": 4
+                },
+                {
+                    "id": "mbox-drafts",
+                    "name": "Drafts",
+                    "role": "drafts",
+                    "totalEmails": 0,
+                    "unreadEmails": 0,
+                    "sortOrder": 5
+                },
+                {
+                    "id": "mbox-sent",
+                    "name": "Sent",
+                    "role": "sent",
+                    "totalEmails": 0,
+                    "unreadEmails": 0,
+                    "sortOrder": 6
+                }
+            ])
+            .as_array()
+            .unwrap()
+            .to_vec(),
+            mailbox_creates: Vec::new(),
+            mailbox_create_refused: false,
+            mailbox_create_mode: 0,
             read_refusal: None,
             refuse_stored: false,
             read_calls: Vec::new(),
@@ -767,6 +819,21 @@ impl MockJmapServer {
         self.state.lock().expect("state lock").uploads.clone()
     }
 
+    #[allow(dead_code)]
+    pub fn sending_folders(&self, mailboxes: Vec<Value>, refuse_create: bool) {
+        let mut guard = self.state.lock().unwrap();
+        guard.mailboxes = mailboxes;
+        guard.mailbox_create_refused = refuse_create;
+    }
+    /// 0 is normal, 1 renames/reparents the created folder, 2 hides it.
+    #[allow(dead_code)]
+    pub fn mailbox_creation_mode(&self, mode: u8) {
+        self.state.lock().unwrap().mailbox_create_mode = mode;
+    }
+    #[allow(dead_code)]
+    pub fn created_mailboxes(&self) -> Vec<String> {
+        self.state.lock().unwrap().mailbox_creates.clone()
+    }
     /// Every `Email/set` create so far: the id given and the object.
     #[allow(dead_code)]
     pub fn created_emails(&self) -> Vec<(String, Value)> {
@@ -1066,52 +1133,30 @@ impl MockJmapServer {
                     {
                         "accountId": "account-001",
                         "state": "state-001",
-                        "list": [
-                            {
-                                "id": "mbox-inbox",
-                                "name": "INBOX",
-                                "role": "inbox",
-                                "totalEmails": 4,
-                                "unreadEmails": 2,
-                                "sortOrder": 1
-                            },
-                            {
-                                "id": "mbox-archive",
-                                "name": "Archive",
-                                "role": "archive",
-                                "totalEmails": 1,
-                                "unreadEmails": 0,
-                                "sortOrder": 3
-                            },
-                            {
-                                "id": "mbox-trash",
-                                "name": "Trash",
-                                "role": "trash",
-                                "totalEmails": 0,
-                                "unreadEmails": 0,
-                                "sortOrder": 4
-                            },
-                            {
-                                "id": "mbox-drafts",
-                                "name": "Drafts",
-                                "role": "drafts",
-                                "totalEmails": 0,
-                                "unreadEmails": 0,
-                                "sortOrder": 5
-                            },
-                            {
-                                "id": "mbox-sent",
-                                "name": "Sent",
-                                "role": "sent",
-                                "totalEmails": 0,
-                                "unreadEmails": 0,
-                                "sortOrder": 6
-                            }
-                        ],
+                        "list": state.lock().unwrap().mailboxes.clone(),
                         "notFound": []
                     },
                     call_id
                 ]),
+                "Mailbox/set" => {
+                    let mut guard = state.lock().unwrap();
+                    if guard.mailbox_create_refused {
+                        json!(["error", {"type":"forbidden"}, call_id])
+                    } else {
+                        let name = args["create"]["newMailbox"]["name"].as_str().unwrap();
+                        let id = format!("mbox-created-{}", guard.mailbox_creates.len() + 1);
+                        guard.mailbox_creates.push(name.to_string());
+                        if guard.mailbox_create_mode != 2 {
+                            let (visible_name, parent) = if guard.mailbox_create_mode == 1 {
+                                ("Confirmed copy", Some("parent"))
+                            } else {
+                                (name, None)
+                            };
+                            guard.mailboxes.push(json!({"id":id,"name":visible_name,"role":null,"parentId":parent,"totalEmails":0,"unreadEmails":0,"sortOrder":0}));
+                        }
+                        json!(["Mailbox/set", {"accountId":"account-001", "created":{"newMailbox":{"id":id}}}, call_id])
+                    }
+                }
                 "Email/query" => {
                     let filter = args.get("filter").cloned().unwrap_or_else(|| json!({}));
                     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
