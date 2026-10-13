@@ -434,7 +434,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     let resource = Limits {
         message_bytes: 131072,
         event_streams: 1,
-        header_bytes: 32,
+        header_bytes: 512,
         ..Limits::default()
     }
     .plan()
@@ -478,6 +478,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     )
     .unwrap();
     let uploads = crate::https_upload::Service {
+        resources: &resource,
         coordinator: &coordinator,
         spool: &spool,
         account,
@@ -517,6 +518,17 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
     let handshakes = HandshakePool::new(2).unwrap();
     let ready = AtomicBool::new(false);
     let control = Control::default();
+    let encoded_attachment = "QUFB".repeat(30000);
+    let decoded_attachment = "AAA".repeat(30000);
+    let mime = concat!(
+        "Content-Type: multipart/mixed; boundary=x\r\n\r\n",
+        "--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=utf-8''report%20%E2%98%83.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nSGVsbG8=\r\n",
+        "--x\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nline=0Aend\r\n",
+        "--x\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--x--\r\n"
+    );
+    let mime = mime.replace("SGVsbG8=", &encoded_attachment);
+    let mime = mime.as_str();
+    let mime_length = format!("Content-Length: {}", mime.len());
     let mut published = Vec::new();
     let mut account_wire = [0; wire::IdKind::WIRE_BYTES];
     let account_wire = wire::encode_id(account, &mut account_wire).unwrap();
@@ -562,6 +574,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                     ("Content-Length: 65537", large.as_str(), large.as_str()),
                     ("Content-Length: 4", "body", "body"),
                     ("Content-Length: 0", "", ""),
+                    (mime_length.as_str(), mime, mime),
                     (
                         "Transfer-Encoding: chunked",
                         "2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
@@ -629,6 +642,38 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                     assert!(!headers.contains(&authorization));
                     download.abort();
                     std::thread::sleep(Duration::from_millis(20));
+                    if expected == mime {
+                        use crate::wire::{PartLocator, TransferEncoding};
+                        let encoded = mime.find(&encoded_attachment).unwrap() as u64;
+                        let qp = mime.find("line=0Aend").unwrap() as u64;
+                        let empty = mime.rfind("\r\n--x--").unwrap() as u64;
+                        let cases = [
+                            (encoded, encoded_attachment.len() as u64, TransferEncoding::Base64, 200, decoded_attachment.as_str()),
+                            (qp, 10, TransferEncoding::QuotedPrintable, 200, "line\nend"),
+                            (empty, 0, TransferEncoding::Identity, 200, ""),
+                            (encoded + 1, 7, TransferEncoding::Base64, 404, ""),
+                            (encoded, encoded_attachment.len() as u64, TransferEncoding::Identity, 404, ""),
+                            ((mime.find("\r\n\r\n").unwrap() + 4) as u64, (mime.len() - mime.find("\r\n\r\n").unwrap() - 4) as u64, TransferEncoding::Identity, 404, ""),
+                            (mime.len() as u64, 1, TransferEncoding::Identity, 404, ""),
+                        ];
+                        for (offset, length, encoding, expected_status, decoded) in cases {
+                            clock.1.fetch_add(2000, Ordering::Relaxed);
+                            let locator = PartLocator { parent: id, offset, length, encoding };
+                            let mut encoded_id = [0; PartLocator::WIRE_BYTES];
+                            let part_id = locator.encode(&mut encoded_id).unwrap();
+                            let mut download = client(address, &lease, clock.clone());
+                            let target = download_template.replace("{accountId}", account_wire).replace("{blobId}", part_id).replace("{name}", "part.bin").replace("{type}", "application%2Foctet-stream");
+                            send(&mut download, format!("GET {target} HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: Basic {authorization}\r\n\r\n", address.port()).as_bytes());
+                            let (status, headers, bytes) = full_reply(&mut download);
+                            assert_eq!(status, expected_status, "part {offset}/{length}: {bytes}");
+                            if status == 200 {
+                                assert_eq!(bytes, decoded);
+                                assert!(headers.contains(&format!("Content-Length: {}\r\n", decoded.len())));
+                            }
+                            download.abort();
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
                 }
                 for (method, target, length, status) in [
                     ("POST", format!("/jmap/upload/{account_wire}"), 131073, 413),
@@ -766,13 +811,13 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
         coordinator
             .used(crate::admission::quota::Kind::BodyBytes)
             .unwrap(),
-        65545
+        65545 + mime.len() as u64
     );
     assert_eq!(
         coordinator
             .used(crate::admission::quota::Kind::UploadBytes)
             .unwrap(),
-        65545
+        65545 + mime.len() as u64
     );
     drop(coordinator);
     let store = IndexStore::open(&mut root, clock, 2, until).unwrap();

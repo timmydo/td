@@ -2458,6 +2458,7 @@ fn chunked_https_quota_refusal_does_not_speculatively_evict() {
                 .plan(&admission)
                 .unwrap();
             let service = crate::https_upload::Service {
+                resources: &resources,
                 coordinator,
                 spool,
                 account: ACCOUNT,

@@ -5,7 +5,7 @@ use crate::{
     http_request::{decode_uri_component, QUANTUM},
     https_exchange::Sender,
     ids::{AccountId, BlobId, DeviceId},
-    ports::{Clock, Deadline, Error, Transport},
+    ports::{BlobReader, Clock, Deadline, Error, Transport},
     smtp_receiving::Control,
     store_fs::{BlobAuthorization, BlobReadRequest, StoreCoordinator},
     wire,
@@ -14,6 +14,7 @@ use crate::{
 pub struct Target {
     account: AccountId,
     blob: BlobId,
+    part: Option<wire::PartLocator>,
     name: [u8; 4096],
     name_len: usize,
     media: [u8; 1024],
@@ -36,13 +37,19 @@ impl Target {
             .map_err(|_| Error::Invalid)?
             .local()
             .ok_or(Error::NotFound)?;
-        let blob = wire::Id::parse(decode_uri_component(blob, &mut id)?)
+        let reference = wire::Id::parse(decode_uri_component(blob, &mut id)?)
             .map_err(|_| Error::Invalid)?
-            .local()
+            .blob()
             .ok_or(Error::NotFound)?;
+        let (blob, part) = match reference {
+            wire::BlobReference::File(blob) => (blob, None),
+            wire::BlobReference::Part(part) => (part.parent, Some(part)),
+            wire::BlobReference::Nested(_) => return Err(Error::NotFound),
+        };
         let mut out = Self {
             account,
             blob,
+            part,
             name: [0; 4096],
             name_len: 0,
             media: [0; 1024],
@@ -75,9 +82,16 @@ pub enum Failure {
     Started(Error),
 }
 
+pub(crate) struct Settings<'a> {
+    pub maximum: u64,
+    pub limits: &'a crate::limits::Limits,
+}
+#[path = "https_download_part.rs"]
+mod part;
+
 pub(crate) fn send<P: BlobAuthorization>(
     coordinator: &StoreCoordinator<'_, '_, P>,
-    maximum: u64,
+    settings: Settings<'_>,
     request: Request<'_>,
     transport: &mut dyn Transport,
     control: &Control,
@@ -88,16 +102,16 @@ pub(crate) fn send<P: BlobAuthorization>(
         .map_err(Failure::Before)?;
     let started_at = sender.last;
     let target = request.target;
-    let result = coordinator.with_authorized_blob(
+    let result = coordinator.with_authorized_blob_pin(
         &td_crypto::Provider,
         BlobReadRequest {
             account: target.account,
             device: request.device,
             id: target.blob,
-            maximum,
+            maximum: settings.maximum,
             deadline: request.deadline,
         },
-        |body| {
+        |body, work| {
             sender.check()?;
             sender.deadline = timers::deadline(
                 started_at,
@@ -107,6 +121,18 @@ pub(crate) fn send<P: BlobAuthorization>(
             )
             .map_err(|_| Error::Invalid)?
             .min(request.deadline);
+            let decoded = match target.part {
+                Some(locator) => Some(part::prepare(
+                    body,
+                    locator,
+                    settings.limits,
+                    work,
+                    clock,
+                    &mut sender,
+                )?),
+                None => None,
+            };
+            let length = decoded.as_ref().map_or(body.len(), |part| part.length);
             sender.check()?;
             sender.idle = timers::deadline(sender.last, timeouts.limits().response_idle_seconds)
                 .map_err(|_| Error::Invalid)?
@@ -125,7 +151,7 @@ pub(crate) fn send<P: BlobAuthorization>(
                         "Content-Disposition: attachment; filename*=UTF-8''"
                     ),
                     crate::https::http_date(clock.sample()?.utc_ms)?,
-                    body.len(),
+                    length,
                     media
                 ))
                 .map_err(|_| Error::Capacity)?;
@@ -137,6 +163,10 @@ pub(crate) fn send<P: BlobAuthorization>(
             header.append("\r\n\r\n").map_err(|_| Error::Capacity)?;
             let length = header.len();
             sender.write(buffer.get(..length).ok_or(Error::Invalid)?)?;
+            if let Some(part) = decoded {
+                part::send(body, part, work, clock, &mut sender, &mut buffer)?;
+                return sender.flush();
+            }
             let mut offset = 0u64;
             while offset < body.len() {
                 sender.check()?;

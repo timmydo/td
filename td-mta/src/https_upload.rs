@@ -89,6 +89,7 @@ pub struct Service<'s, 'r, 'l, P> {
     pub spool: &'s IngressSpool<'r>,
     pub account: AccountId,
     pub maximum: u64,
+    pub resources: &'s crate::limits::ResourcePlan,
     pub clock: &'s dyn Clock,
     pub timeouts: &'s TimeoutPlan,
 }
@@ -107,7 +108,10 @@ impl<P: UploadAuthorization + BlobAuthorization + Sync> Backend for Service<'_, 
         }
         crate::https_download::send(
             self.coordinator,
-            self.maximum,
+            crate::https_download::Settings {
+                maximum: self.maximum,
+                limits: self.resources.limits(),
+            },
             request,
             transport,
             control,

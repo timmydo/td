@@ -38,6 +38,18 @@ impl<P: BlobAuthorization> StoreCoordinator<'_, '_, P> {
         request: BlobReadRequest,
         read: impl FnOnce(&mut dyn BlobReader) -> Result<T, ports::Error>,
     ) -> Result<T, ports::Error> {
+        self.with_authorized_blob_pin(crypto, request, |body, _| read(body))
+    }
+
+    pub(crate) fn with_authorized_blob_pin<C: Crypto, T>(
+        &self,
+        crypto: &C,
+        request: BlobReadRequest,
+        read: impl FnOnce(
+            &mut crate::store_fs::PinnedBlob<'_, '_>,
+            &mut crate::admission::work::Meter,
+        ) -> Result<T, ports::Error>,
+    ) -> Result<T, ports::Error> {
         let mut last = self.store.clock.sample()?.monotonic;
         check_time(&self.store, request.deadline, &mut last)?;
         let guard =
@@ -95,7 +107,16 @@ impl<P: BlobAuthorization> StoreCoordinator<'_, '_, P> {
         }
         drop(guard);
         body.check_deadline()?;
-        let result = read(&mut body);
+        let mut work = crate::admission::work::Meter::new(
+            request.deadline,
+            crate::admission::work::Charge {
+                io_bytes: self.work.foreground_io_bytes,
+                records: self.work.foreground_records,
+                output_bytes: self.work.foreground_io_bytes,
+                ..Default::default()
+            },
+        );
+        let result = read(&mut body, &mut work);
         let checked = body.check_deadline();
         match result {
             Ok(value) => checked.map(|()| value),

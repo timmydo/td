@@ -4817,3 +4817,13 @@ CONFIG.md's resource validation uses this same combined plan; independent
 scalar maxima do not establish admission. Selection additionally retains up
 to 64 names (264 bytes each) and their parsed header properties, bounded by
 the worker's parser/conversion scratch partition.
+
+Direct-part downloads reuse the Email/get body-job reservation. They retain
+one admitted header arena with a lookahead byte per part and two final bytes,
+one Part and header View per admitted part, a 6 KiB input buffer, a 4 KiB
+counting window and the existing HTTP output window. Locator matching produces
+one temporary candidate at a time. No whole body or decoded attachment is
+retained. Parsing, matching, counting and replay share one foreground meter;
+the pinned native reader retains its independent storage work bound. Native
+HTTPS coverage includes a 120,000-byte encoded part near the fixture admission maximum,
+quoted-printable, empty parts and forged ranges/encoding/container requests.

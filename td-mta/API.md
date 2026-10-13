@@ -8773,3 +8773,24 @@ td-mail does not display that field. The single HTTPS body worker currently
 serializes API calls, uploads and downloads; a costly bounded read delays the
 others. Live client qualification must measure that behavior before making
 concurrency or large-mailbox claims.
+
+### Direct MIME-part HTTPS downloads
+
+The fixed body worker accepts the direct part locators emitted by Email/get.
+It authorizes and verifies their immutable parent under one account snapshot,
+reproduces the exact non-container descriptor with the existing MIME parser,
+then counts and streams transfer-decoded bytes with one original method work
+meter and deadline. Charset conversion and HTML processing never apply to
+these bytes. A forged in-range substring, wrong encoding, missing parent or
+unsupported nested locator is notFound. No response header is published until
+validation and decoded-length counting complete; a later I/O/deadline failure
+closes the started response. Raw whole-message downloads retain their route.
+
+The parent authorization guard is refreshed before callback admission; the
+existing rule lets an already-admitted bounded read finish after revocation.
+The native pin and original work meter remain live through parsing, counting
+and replay. Before headers, remaining method work must cover the measured
+decoder replay charge. Storage I/O and clock failure can still end a started
+response. The transfer deadline is based on parent size before parsing.
+Only td-mail's direct attachment path is activated here; no generic nested
+Email/parse download surface is added.

@@ -228,6 +228,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                 );
             }
             let upload_service = td_mta::https_upload::Service {
+                resources: plans.resources(),
                 coordinator: &coordinator,
                 spool: &spool,
                 account: records.routes().account(),
