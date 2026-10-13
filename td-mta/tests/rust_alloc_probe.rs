@@ -11840,6 +11840,136 @@ fn mime_base64() {
     assert_eq!(before, after, "MIME base64 allocated");
 }
 
+fn mime_base64_encode() {
+    use base64_encode::{Encoder, Error, Status};
+    use td_mime::{
+        time::{Deadline, Tick},
+        work::{Charge, Meter, Stop},
+    };
+    let before = COUNTERS.snapshot();
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 57,
+            records: 100,
+            output_bytes: 78,
+            unlinks: 0,
+        },
+    );
+    let mut encoder = Encoder::new(57, Tick(1), &mut meter).unwrap();
+    let input = [0; 57];
+    let mut position = 0;
+    let mut written = 0;
+    loop {
+        let mut byte = [0];
+        let step = encoder
+            .poll(
+                black_box(input.get(position..).unwrap()),
+                &mut byte,
+                Tick(1),
+                &mut meter,
+            )
+            .unwrap();
+        position += step.consumed;
+        if step.written != 0 {
+            assert_eq!(
+                byte[0],
+                if written < 76 {
+                    b'A'
+                } else if written == 76 {
+                    b'\r'
+                } else {
+                    b'\n'
+                }
+            );
+            written += 1;
+        }
+        if step.status == Status::Complete {
+            break;
+        }
+    }
+    encoder.finish(Tick(1), &mut meter).unwrap();
+    assert_eq!((position, written), (57, 78));
+    let capacity = Charge {
+        io_bytes: 58,
+        records: 256,
+        output_bytes: 84,
+        unlinks: 0,
+    };
+    let mut meter = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+    let mut encoder = Encoder::new(58, Tick(1), &mut meter).unwrap();
+    let input = [0; 58];
+    let mut position = 0;
+    let mut written = 0;
+    assert_eq!(
+        encoder
+            .poll(&[], &mut [0], Tick(1), &mut meter)
+            .unwrap()
+            .status,
+        Status::NeedInput
+    );
+    loop {
+        let end = (position + 1).min(input.len());
+        let mut byte = [0];
+        let step = encoder
+            .poll(
+                black_box(input.get(position..end).unwrap()),
+                &mut byte,
+                Tick(1),
+                &mut meter,
+            )
+            .unwrap();
+        position += step.consumed;
+        if step.written != 0 {
+            let expected = match written {
+                76 | 82 => b'\r',
+                77 | 83 => b'\n',
+                80 | 81 => b'=',
+                _ => b'A',
+            };
+            assert_eq!(byte[0], expected);
+            written += 1;
+        }
+        if step.status == Status::Complete {
+            break;
+        }
+    }
+    assert_eq!((position, written), (58, 84));
+    assert_eq!(
+        encoder
+            .poll(&[], &mut [], Tick(1), &mut meter)
+            .unwrap()
+            .status,
+        Status::Complete
+    );
+    encoder.finish(Tick(1), &mut meter).unwrap();
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            records: 0,
+            ..capacity
+        },
+    );
+    let mut encoder = Encoder::new(1, Tick(1), &mut meter).unwrap();
+    assert_eq!(
+        encoder.poll(b"f", &mut [0; 8], Tick(1), &mut meter),
+        Err(Error::Work(Stop::Records))
+    );
+    let mut replacement = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+    assert_eq!(
+        encoder.poll(&[], &mut [], Tick(1), &mut replacement),
+        Err(Error::Work(Stop::Records))
+    );
+    assert_eq!(replacement.remaining(), capacity);
+    assert_eq!(
+        encoder.finish(Tick(1), &mut replacement),
+        Err(Error::Work(Stop::Records))
+    );
+    let after = COUNTERS.snapshot();
+    assert!(!before.invalid && !after.invalid);
+    assert_eq!(before, after, "outgoing MIME base64 allocated");
+}
+
 fn pinned_source_binding() {
     use mime_response::pinned;
     let mut samples = [COUNTERS.snapshot(); 16];
@@ -12162,6 +12292,7 @@ fn main() {
         .is_some_and(|arg| arg == "--mime-only")
     {
         mime_base64();
+        mime_base64_encode();
         mime_qp();
         mime_qp_input();
         unicode_lookups();
@@ -12359,6 +12490,7 @@ fn main() {
     requested_source_bound_properties();
     retained_requested_source_bound_properties();
     mime_base64();
+    mime_base64_encode();
     mime_qp();
     mime_qp_input();
     unicode_lookups();

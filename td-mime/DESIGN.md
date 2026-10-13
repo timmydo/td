@@ -1,6 +1,7 @@
-# Shared MIME parsing
+# Shared MIME parsing and encoding
 
-`td-mime` owns byte-level MIME and mail-header interpretation. It uses std
+`td-mime` owns byte-level MIME interpretation, outgoing transfer encoding,
+and mail-header interpretation. It uses std
 and the local td-header, td-json and td-nfc primitives. It has no unsafe
 code, cryptographic backend, accounts, file access, network access or
 ambient clock. Cold corpus verification uses the engine SHA-256 source;
@@ -174,3 +175,23 @@ header prefixes only when selection proves the entire header section. They
 preserve the caller's Prefix/Eof label through all header replays; incomplete
 prefixes refuse during polling. No body bytes are needed for filenames, charset, content IDs,
 language or location. Whole-entity authorization remains external.
+
+The outgoing base64 encoder supports td-mail's bodies and uploaded
+attachments composed by td-mta. It streams one declared octet extent into
+caller-owned output,
+with at most 256 transitions per poll and fixed state. Lines contain at most
+76 encoded ASCII bytes and end with CRLF; nonempty final lines also end with
+CRLF. Empty input produces no bytes. Padding is canonical. The caller owns
+text newline canonicalization before encoding, immutable source identity,
+extent completeness and final publication; the encoder cannot authorize a
+blob or submit mail. Input beyond the declared extent remains unconsumed.
+Empty fragments request more bytes, never invent EOF.
+
+Construction binds the original move-stable Meter owner. Each poll, including
+cached completion, spends one record; each consumed source byte spends one
+I/O byte and each emitted byte spends one output byte. Refusals retire the
+encoder; replacing the meter refuses before debiting the replacement.
+Consuming finish freshly checks the original meter and requires complete
+output. The encoder has a compiled 80-byte ceiling and the mail allocation probe
+checks zero allocation. No MIME header generation or SMTP framing occurs.
+The wire encoding follows RFC 2045 section 6.8.

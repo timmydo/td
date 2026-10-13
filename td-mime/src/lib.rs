@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 pub mod attribute;
 pub mod base64;
+pub mod base64_encode;
 pub mod body_charset;
 pub mod body_lists;
 pub mod buffer;

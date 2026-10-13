@@ -6,6 +6,9 @@ pub mod attribute;
 #[path = "../../td-mime/src/base64.rs"]
 pub mod base64;
 #[allow(unused)]
+#[path = "../../td-mime/src/base64_encode.rs"]
+pub mod base64_encode;
+#[allow(unused)]
 #[path = "../../td-mime/src/body_charset.rs"]
 pub mod body_charset;
 #[allow(unused)]
