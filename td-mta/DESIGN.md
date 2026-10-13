@@ -4,7 +4,10 @@
 
 This is the normative target for a new service, not a claim that it exists.
 `IMPLEMENTATION.md` divides it into independently reviewable increments.
-An incomplete increment must not advertise capabilities it cannot provide.
+The only supported mail client is td-mail. CONFORMANCE.md defines the
+client compatibility scope and activation evidence; generic RFC completeness
+is not a milestone requirement. Expose only flows the service implements and
+return explicit errors for unsupported calls.
 The v1 release requires the acceptance evidence in section 15.
 
 The M01 library skeleton provides typed local IDs, configuration versioning and
@@ -99,9 +102,9 @@ runtime qualification. Supporting that host does not port the td system image.
 Included in v1:
 
 - SMTP reception, STARTTLS, durable local delivery, and explicit aliases.
-- JMAP Core, Mail, and Submission sufficient for their advertised contracts
-  and the existing td-mail client, including attachment upload/download,
-  MIME construction, text search, threading, and submission reconciliation.
+- JMAP Core, Mail, and Submission behavior used by td-mail, including
+  attachment upload/download, MIME construction, text search, threading,
+  and submission reconciliation.
 - Durable smart-host queue, retry, cancellation, and failure visibility.
 - HTTPS with per-device application passwords and automatic ACME renewal.
 - File configuration, inspectable mail storage, bounded rolling logs,
@@ -1899,8 +1902,8 @@ when its framing cannot be trusted.
 
 RFC 8620 and RFC 8621 define wire semantics. Maintain a capability/method/property
 coverage table with normative section references and local acceptance fixtures.
-Capability advertisement is a release gate: a td-mail-only happy path is not
-proof of conformance. Unsupported optional capabilities are omitted; unsupported
+Activation requires real td-mail workflow and refusal tests. This client
+compatibility profile makes no full RFC conformance claim. Unsupported
 methods/properties get the specified errors rather than fabricated empty success.
 Publish truthful resource limits and read-only identity properties. Include
 the standard session eventSourceUrl and a bounded authenticated event-source
@@ -1915,8 +1918,8 @@ object property or a validated selection, with caller-supplied account rights
 and same-view batch counts. API.md owns its snapshot, provisional-output and
 fixed-buffer contract. The retained dispatcher implements Mailbox/get,
 including result references, bounded enumeration and same-view counts. The
-live HTTPS capability preflight remains Core-only until the complete Mail
-surface satisfies the conformance gate.
+live HTTPS capability preflight remains Core-only until the supported
+td-mail reading flows pass their activation tests.
 
 The retained Mailbox/changes dispatcher validates scoped state and exact
 UnsignedInt limits, consumes one retained change-page cursor and encodes

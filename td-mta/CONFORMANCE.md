@@ -1,10 +1,25 @@
 # JMAP implementation inventory
 
-This inventory states the complete target obligations. The mailbox-access
-profile now advertises Core only: authenticated Session discovery, complete
+The supported client is td-mail. Its current call inventory below defines
+required JMAP behavior; generic client interoperability and unused RFC methods,
+properties and argument combinations are outside the implementation scope.
+The broader tables remain a protocol reference, not an implementation backlog
+or a gate on the td-mail milestone. Existing implemented behavior stays tested.
+
+The next milestone is real td-mail over real td-fetch and td-mta: authenticate,
+list mailboxes and messages, read plain and HTML mail, follow threads, and
+download original messages and attachments. Search, flags, moves, deletion and
+sending follow the client's actual calls; they need not block the initial
+read-mail fixture. Authorization, durable outcomes, bounded work and honest
+errors remain mandatory in every supported path. Do not report absent body
+content as successful empty data to make a client test pass.
+
+The mailbox-access profile now advertises Core only: authenticated Session
+discovery, complete
 bounded Core batches, upload/download, the single-account Blob/copy outcome,
 PushSubscription policy and EventSource are active. Mail and Submission
-remain unadvertised; their method tables are implementation obligations.
+remain unadvertised. Activation follows the supported td-mail workflow tests,
+not completion of every reference-table row.
 M22/M24 still own real-client and complete release coverage. API.md and
 QUEUE.md fix state/error and submission policies.
 [POLICY.md](POLICY.md) fixes interpretation, query and thread choices;
@@ -19,8 +34,9 @@ type does not permit hiding an unimplemented non-null case behind `null`.
 ## Capabilities and session
 
 V1 targets `urn:ietf:params:jmap:core`, `urn:ietf:params:jmap:mail` and
-`urn:ietf:params:jmap:submission`. Their full associated contracts gate
-advertisement. VacationResponse and vendor extensions are omitted. The Core
+`urn:ietf:params:jmap:submission` as the wire vocabulary used by td-mail.
+Enable each surface only with tested support for its intended td-mail flows;
+this is a td-mail compatibility profile, not a claim of full RFC conformance. VacationResponse and vendor extensions are omitted. The Core
 recommended minimum limits are recommendations; publish our actual bounded
 limits, including 32 MiB uploads and 256-object get/set windows.
 
@@ -38,7 +54,8 @@ limits, including 32 MiB uploads and 256-object get/set windows.
 POLICY.md pins supported collation/search behavior and parser/query limits;
 ADMISSION.md and RESOURCES.md bound storage, work and resident capacity.
 Unsupported optional behavior gets the standard error where permitted;
-mandatory properties/methods cannot disappear behind a client-only subset.
+unimplemented calls receive explicit errors. Unused generic behavior is not
+a release requirement for this client-specific profile.
 [WIRE.md](WIRE.md) fixes the wire-ID mapping: generated IDs use type letters
 plus canonical storage hex; MIME parts use distinct checked locators. The
 parser separately accepts the full generic RFC 8620 §1.2 Id grammar, so valid
@@ -47,8 +64,8 @@ provide endpoint or authorization evidence.
 
 ## Methods and HTTP endpoints
 
-All listed methods require their standard response members as well as the
-properties below. Shared `/get`, `/changes`, `/set`, `/copy`, `/query` and
+For implemented methods, preserve the wire response members and semantics
+used by td-mail. The full RFC method inventory below is reference material. Shared `/get`, `/changes`, `/set`, `/copy`, `/query` and
 `/queryChanges` arguments/results follow RFC 8620 §5, with each type's stated
 exceptions. Tests must cover omitted arguments, nonexistent IDs, invalid
 properties, conditional states, boundary limits and unknown account IDs.
@@ -149,8 +166,8 @@ spellings against immutable sendAt, without adding an object property. POLICY.md
 selects additional comparators and collation behavior, with standard
 `unsupportedFilter`/`unsupportedSort`
 errors (8620 §5.5). ReceivedAt ascending/descending with an ID tie break is
-also required by td-mail. Required standards behavior remains a release gate
-even where the current client does not exercise it.
+also required by td-mail. Comparators and query forms unused by td-mail do
+not gate the client milestone.
 
 ## Deliberate v1 interpretation limits
 
@@ -178,13 +195,13 @@ POLICY.md specifies these choices and their independent CASES.md oracles:
   accountNotFound; never invent a same-account successful copy or run an
   implicit destroy. Blob/copy's separate contract remains supported.
 
-These quality/resource choices do not omit mandatory method handlers. Read
-the exact policies before interpreting a missing optional feature as success.
+Read the exact policies before interpreting a missing feature as success.
+Unused methods in the reference inventory may remain unimplemented.
 
 ## Current td-mail call inventory
 
-Inspected at repository commit `51e843f78` (full baseline recorded in the M01
-commit). Paths below refer to the same checkout, not a frozen external client.
+Rechecked against `td-mail/src/jmap/client.rs` and `types.rs` at
+`2a8165330de469758b0771ca841a9fea5afafd58`. Paths below refer to the same checkout, not a frozen external client.
 Recheck them when implementing M14-M16 and M22.
 
 | Client source | Request/response behavior | Acceptance owner |
@@ -243,7 +260,8 @@ For each table row, the owning increment records the fixture/test and its
 positive, refusal and restart observations. CASES.md supplies a traceable case
 ID for each property group and exceptional wire mapping; later implementation
 must split grouped rows when their coverage differs. Capability enablement
-requires every mandatory row, not just the current client inventory. External
+requires the corresponding supported client flows, including refusal paths.
+Unused reference rows do not gate enablement. External
 push registration refusal, read-only identities and uncomputable query changes
 are real policy/error tests, never missing handlers disguised as conformance.
 
@@ -286,4 +304,4 @@ query state and result references into Mailbox/get. Its fixture includes a
 text limits, account/view pressure and execution expiry. This is worker-level
 evidence only: live discovery still advertises Core alone, and no td-mail
 interoperability result is claimed. Mail activation still requires the rest
-of this document's capability obligations.
+of the supported client-flow obligations above.

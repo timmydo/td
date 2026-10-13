@@ -10,6 +10,11 @@ their named milestone-specific evidence. Message/query tasks read `POLICY.md`,
 This plan
 describes future implementation; none of its tasks are complete merely because
 this file exists. Its scope is the personal service specified in the design.
+CONFORMANCE.md's td-mail call inventory bounds protocol work. Tasks below
+that list unused generic methods, property forms or argument combinations are
+reference backlog, not prerequisites for the client milestone. Prioritize
+connecting the implemented pieces to real td-mail receive/list/read/download
+fixtures before adding protocol breadth.
 
 Give a model one numbered task and its prerequisite commits, not the entire
 backlog as an instruction to implement everything. Each task produces one
@@ -3768,8 +3773,9 @@ socket-independent adapter with no live storage views. HTTPS scheduling,
 authenticated snapshot acquisition and lifetime/revocation enforcement remain
 required before the EventSource endpoint can activate.
 
-Mail capability activation additionally requires EmailDelivery state and
-push support; the current fixed EventSource roster does not provide it.
+EmailDelivery state and push support are outside the current td-mail read
+milestone; add them only if a supported client flow needs them. The current
+fixed EventSource roster does not provide them.
 
 The device registry now supplies current account/device activity to a guarded
 UploadAuthorization adapter. Admission is deadline-bounded and nonblocking;
