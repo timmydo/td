@@ -2389,3 +2389,27 @@ arguments still enforce ordinary argument validation and result-reference
 resolution. No second JSON tree or full composed-message buffer is created.
 Draft creation does not advertise Submission, authorize a sending identity,
 resolve creation IDs for later calls, or take responsibility for delivery.
+
+## Transmitted-copy header filtering
+
+The inert `transmitted_headers` worker removes root Bcc and Resent-Bcc fields,
+including folded continuations and duplicates, from a private outgoing copy.
+It accepts exactly a complete resident root-header section and CRLF separator,
+bounded by the configuration's 1 MiB header ceiling plus separator. The shared
+header scanner defines fields; all other header bytes and the separator are
+preserved. The caller separately streams the original immutable body without
+rewriting it. The locally stored draft retains its blind-recipient headers.
+
+No output is publishable until success. Invalid or incomplete extents,
+original work exhaustion, phase expiry, clock regression and sink failure
+refuse the operation, potentially after provisional output. Scanner turns,
+short name comparisons and at-most-4096-byte sink writes spend the original
+request meter under fresh monotonic checks. No message-sized buffer is built.
+This worker grants neither source custody nor envelope/sending authority;
+native queue admission, identity authorization and transactional publication
+remain required before responsibility exists.
+
+Outgoing header filtering requires CRLF-only line endings throughout the
+section, checked in charged 4096-byte chunks before emission. Bare CR or LF
+is refused rather than letting an incoming-parser/receiver difference hide
+a blind-recipient field in a preserved value.

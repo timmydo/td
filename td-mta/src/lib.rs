@@ -131,6 +131,7 @@ pub mod sync;
 pub mod tls_admission;
 pub mod tls_io;
 pub mod tls_policy;
+pub mod transmitted_headers;
 pub mod transport;
 pub use td_mime::unicode;
 pub mod wire;
