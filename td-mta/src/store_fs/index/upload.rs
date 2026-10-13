@@ -873,3 +873,7 @@ mod email_destroy;
 pub use email_destroy::{
     EmailDestroyCompletion, EmailDestroyRequest, EmailDestroyResult, MAX_EMAIL_DESTROYS,
 };
+
+#[path = "draft.rs"]
+mod draft;
+pub use draft::{DraftAuthorization, DraftCompletion, DraftRequest};

@@ -2896,3 +2896,33 @@ bytes plus operation framing are capped below the native 1-MiB transaction
 ceiling. Operation, encoded-byte, work and deadline exhaustion refuse the entire
 plan before writes. The HTTPS Email/set destroy adapter now invokes this coordinator after
 reserving its complete response.
+
+## Device plain-text draft transaction
+
+`StoreCoordinator::create_text_draft` reserves one body and blob before
+private composition. Each call publishes one Email in a single existing
+mailbox with `$draft` and `$seen`; it accepts no arbitrary keywords, import
+origin, attachment references or submission request. A failed composition
+releases its reservation and private spool. The request deadline may shorten but never extend
+the original work meter deadline; composition and native body copying
+consume that meter without renewal.
+
+Admission and publication separately authorize the account/device. The
+publication guard excludes revocation through commit. After staging, the
+coordinator rechecks epoch, mailbox existence, optional account state and
+ID collisions, then resolves thread anchors against that fresh snapshot.
+A new body, Email, optional Thread, membership, two keywords, own anchor
+and three object-history events commit atomically. The ordinary native
+publication settlement keeps known commit results even if later admission
+or staging cleanup fails, and stops writers on unresolved publication.
+The original stored body retains Bcc; a future submission must prepare a
+separate transmitted copy under QUEUE.md. This is a typed worker boundary,
+not an active HTTPS create adapter.
+
+New draft Email and Thread IDs must be absent from live rows and retained
+change history. The format-compatible history check walks the existing
+account/kind sequence index once, paying each examined row from the
+original work meter; exhausted work refuses creation. This is linear in
+retained kind history, not an ID-point lookup. Pruned history is outside
+this collision claim, matching QUEUE.md's random-ID policy. Composition
+enforces a shorter execution-phase deadline without renewing its meter.

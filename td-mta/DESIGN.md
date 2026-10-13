@@ -2311,3 +2311,32 @@ transaction remain the future creation adapter's responsibility.
 The native Rust allocation probe compiles the same composition source and
 checks complete Unicode/text output, size refusal and invalid-header refusal
 without allocation; caller-owned text and sink backing are outside it.
+
+## Native plain-text draft publication
+
+The worker-side `create_text_draft` coordinator stages a single composed
+message under body-byte/blob admission, then atomically publishes its Blob,
+JMAP-origin Email, one existing mailbox membership, `$draft` and `$seen`,
+thread anchor and Email/Thread/Mailbox history. The original request work
+meter and deadline cover composition and native planning. It authorizes
+the device at admission and again under a revocation-excluding guard through
+publication; no coordinator lock or policy guard spans composition.
+
+Publication rechecks the policy generation, account epoch, optional state
+precondition and mailbox. References, In-Reply-To and the supplied Message-ID select an
+existing immutable thread using the existing last-32 nearest-first rule;
+otherwise entropy supplies a new thread. Supplied visible metadata is
+validated by composition before it becomes an anchor. Bcc stays in the
+stored copy. Native transaction/accounting settlement preserves known
+commit outcomes, stops admission on uncertainty, and releases private
+staging and unused quota on refusal. The API caller must reserve its full
+response before entry. This typed worker does not expose Email/set creation,
+construct attachments, authorize sending or advertise Submission.
+
+New draft Email and Thread IDs must be absent from live rows and retained
+change history. The format-compatible history check walks the existing
+account/kind sequence index once, paying each examined row from the
+original work meter; exhausted work refuses creation. This is linear in
+retained kind history, not an ID-point lookup. Pruned history is outside
+this collision claim, matching QUEUE.md's random-ID policy. Composition
+enforces a shorter execution-phase deadline without renewing its meter.
