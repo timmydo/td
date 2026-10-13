@@ -495,6 +495,17 @@ impl<'a> Leases<'a> {
         self.quotas = next;
         Ok(())
     }
+    pub(crate) fn check_deleted_bodies(&self, bytes: u64, count: u64) -> Result<(), Error> {
+        self.healthy()?;
+        self.quotas.without_bodies(bytes, count)?;
+        Ok(())
+    }
+    /// Only a known committed deletion may release these retained body charges.
+    pub(crate) fn complete_deleted_bodies(&mut self, bytes: u64, count: u64) -> Result<(), Error> {
+        self.healthy()?;
+        self.quotas = self.quotas.without_bodies(bytes, count)?;
+        Ok(())
+    }
     pub(crate) fn check_expired_upload(
         &self,
         length: u64,

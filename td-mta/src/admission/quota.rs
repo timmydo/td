@@ -160,6 +160,12 @@ impl Quotas {
         self.pending = next;
         Ok(())
     }
+    pub(super) fn without_bodies(&self, bytes: u64, count: u64) -> Result<Self, Error> {
+        let mut next = self.clone();
+        next.used.subtract(Kind::BodyBytes, bytes)?;
+        next.used.subtract(Kind::BlobCount, count)?;
+        Ok(next)
+    }
     pub(super) fn without_expired_upload(
         &self,
         length: u64,

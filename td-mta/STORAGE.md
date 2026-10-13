@@ -2855,3 +2855,44 @@ Email updates. No authorization or work budget is refreshed by that helper.
 The authenticated HTTPS Mailbox/set adapter invokes this boundary after
 reserving its full method output. It exposes only the td-mail name-only
 root-folder profile; POLICY.md and ADMISSION.md own wire admission.
+
+## Device Email destruction foundation
+
+The coordinator accepts at most 256 distinct account-local Email IDs under the
+existing device Email-mutation authorization guard, held through COMMIT and
+quota settlement. It checks the original work meter, deadline and optional
+account epoch/sequence before planning. Missing Emails are per-object NotFound;
+no-op retries preserve the account sequence. Planned Destroyed outcomes are
+not durable unless the completion contains a known successful commit.
+
+One transaction removes each selected Email, its memberships, keywords and
+single header anchor. SMTP receipt children follow the existing native cascade.
+Affected Mailboxes receive Updated history; each deleted Email receives
+Destroyed history. Each affected Thread receives Updated history when a live
+Email remains, otherwise its row is removed with Destroyed history. Historical
+submission and import identifiers neither pin nor recreate deleted objects.
+
+Body retirement is account-local and deduplicated across the selected Emails.
+A body remains if any unselected Email, Submission or Lease owns it, including
+an expired lease awaiting its separate cleanup. Only last-owner bodies are
+removed in this same transaction; permanent Blob IDs remain reserved. BodyBytes
+and BlobCount charges are prechecked and released only after a known successful
+commit. Rejection retains them; an indeterminate result retains conservative
+usage and stops admission. Physical database/WAL accounting uses the ordinary
+commit settlement; logical deletion does not promise physical file shrinkage.
+
+Membership and keyword reads use 16-entry indexed windows. Anchor lookup admits
+two rows and refuses a duplicate. Thread/body Email-owner probes read at most
+257 indexed rows: at most 256 IDs can be selected, so any larger set necessarily
+contains a survivor. Selection is sorted for bounded binary searches. These
+reads and bounded planning share the original work meter and native snapshot
+VM allowance; no whole-account scan or body read is needed. Output capacity is
+the future wire adapter's responsibility before it invokes this coordinator.
+
+Planning uses one 64-KiB row buffer, bounded windows, up to 256 selected IDs and
+body/thread candidates, and two vectors reserving 4096 slots each with at most
+4096 deletion/history entries combined. Owned key
+bytes plus operation framing are capped below the native 1-MiB transaction
+ceiling. Operation, encoded-byte, work and deadline exhaustion refuse the entire
+plan before writes. The HTTPS Email/set destroy operation is not activated by
+this storage increment.

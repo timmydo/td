@@ -867,3 +867,9 @@ impl<P> StoreCoordinator<'_, '_, P> {
         Ok(completion.outcome())
     }
 }
+
+#[path = "email_destroy.rs"]
+mod email_destroy;
+pub use email_destroy::{
+    EmailDestroyCompletion, EmailDestroyRequest, EmailDestroyResult, MAX_EMAIL_DESTROYS,
+};

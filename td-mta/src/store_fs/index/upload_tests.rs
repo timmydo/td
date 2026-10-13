@@ -4053,3 +4053,771 @@ fn root_folder_exact_batch_and_utf8_byte_limits_are_accepted() {
         },
     );
 }
+
+fn seed_destroy_email(store: &IndexStore<'_>, retained_lease: bool, shared: bool) {
+    seed_flag_email(store);
+    let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+    let mut anchor = [0; 128];
+    let anchor_len = Key::ThreadAnchor("message@example.test", FLAG_EMAIL)
+        .encode(&mut anchor)
+        .unwrap();
+    let mut keyword = [0; 128];
+    let keyword_len = Key::Keyword(FLAG_EMAIL, "$seen")
+        .encode(&mut keyword)
+        .unwrap();
+    let other = crate::ids::EmailId::from_bytes([43; 16]);
+    let other_value = row_bytes(Row::Email(crate::format::row::EmailRow {
+        blob: SEED,
+        thread: crate::ids::ThreadId::from_bytes([42; 16]),
+        received_at: 1,
+        origin: crate::format::row::EmailOrigin::Jmap,
+    }));
+    let mut operations = vec![
+        Operation::put(Table::ThreadAnchors, &anchor[..anchor_len], &[]).unwrap(),
+        Operation::put(Table::Keywords, &keyword[..keyword_len], &[]).unwrap(),
+    ];
+    if !retained_lease {
+        operations.push(Operation::delete(Table::Leases, SEED.as_bytes()).unwrap());
+    }
+    if shared {
+        operations.push(Operation::put(Table::Emails, other.as_bytes(), &other_value).unwrap());
+    }
+    store
+        .commit(
+            &td_crypto::Provider,
+            CommitRequest {
+                account: ACCOUNT,
+                epoch: before.epoch,
+                expected: before.committed_sequence,
+                utc_ms: 0,
+                deadline: deadline(),
+            },
+            &operations,
+            &mut [],
+        )
+        .unwrap();
+}
+#[test]
+fn deletion_retires_last_owner_and_preserves_shared_bodies_and_leases() {
+    for retained_lease in [false, true] {
+        for shared in [false, true] {
+            fixture_config(
+                4,
+                100000,
+                |store| seed_destroy_email(store, retained_lease, shared),
+                |coordinator, _, _, _, _| {
+                    let missing = crate::ids::EmailId::from_bytes([99; 16]);
+                    let emails = [FLAG_EMAIL, missing];
+                    let request = EmailDestroyRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        emails: &emails,
+                        deadline: deadline(),
+                    };
+                    let before = coordinator
+                        .store
+                        .view(ACCOUNT, deadline())
+                        .unwrap()
+                        .identity();
+                    let complete = coordinator
+                        .destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000))
+                        .unwrap();
+                    let sequence = complete.outcome.unwrap();
+                    assert!(sequence > before.committed_sequence);
+                    assert_eq!(
+                        complete.results,
+                        [EmailDestroyResult::Destroyed, EmailDestroyResult::NotFound]
+                    );
+                    assert!(!complete.admission_stopped);
+                    let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+                    let mut scratch = [0; 128];
+                    for key in [
+                        Key::Email(FLAG_EMAIL),
+                        Key::Membership(FLAG_EMAIL, FLAG_MAILBOX),
+                        Key::Keyword(FLAG_EMAIL, "$seen"),
+                        Key::ThreadAnchor("message@example.test", FLAG_EMAIL),
+                    ] {
+                        assert!(view.get(key, &mut scratch).unwrap().is_none());
+                    }
+                    assert!(view
+                        .get(Key::Mailbox(FLAG_MAILBOX), &mut scratch)
+                        .unwrap()
+                        .is_some());
+                    assert_eq!(
+                        view.get(
+                            Key::Thread(crate::ids::ThreadId::from_bytes([42; 16])),
+                            &mut scratch
+                        )
+                        .unwrap()
+                        .is_some(),
+                        shared
+                    );
+                    assert_eq!(
+                        view.get(Key::Blob(SEED), &mut scratch).unwrap().is_some(),
+                        shared || retained_lease
+                    );
+                    assert_eq!(
+                        view.get(Key::Lease(SEED), &mut scratch).unwrap().is_some(),
+                        retained_lease
+                    );
+                    drop(view);
+                    assert_recount(coordinator);
+                    let retry = coordinator
+                        .destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000))
+                        .unwrap();
+                    assert_eq!(retry.outcome, Ok(sequence));
+                    assert_eq!(retry.results, [EmailDestroyResult::NotFound; 2]);
+                    if shared {
+                        let other = [crate::ids::EmailId::from_bytes([43; 16])];
+                        let result = coordinator
+                            .destroy_emails(
+                                &td_crypto::Provider,
+                                EmailDestroyRequest {
+                                    emails: &other,
+                                    ..request
+                                },
+                                &mut flag_meter(100000),
+                            )
+                            .unwrap();
+                        assert!(result.outcome.is_ok());
+                        let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+                        assert_eq!(
+                            view.get(Key::Blob(SEED), &mut scratch).unwrap().is_some(),
+                            retained_lease
+                        );
+                        assert!(view
+                            .get(
+                                Key::Thread(crate::ids::ThreadId::from_bytes([42; 16])),
+                                &mut scratch
+                            )
+                            .unwrap()
+                            .is_none());
+                        drop(view);
+                        assert_recount(coordinator);
+                    }
+                    None
+                },
+            );
+        }
+    }
+}
+#[test]
+fn deletion_refusals_preserve_rows_and_history() {
+    fixture_config(
+        4,
+        100000,
+        |store| seed_destroy_email(store, false, false),
+        |coordinator, _, clock, policy, _| {
+            let emails = [FLAG_EMAIL];
+            let request = EmailDestroyRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                emails: &emails,
+                deadline: deadline(),
+            };
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            assert!(matches!(
+                coordinator.destroy_emails(&td_crypto::Provider, request, &mut flag_meter(2)),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            assert!(matches!(
+                coordinator.destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        expected: Some((
+                            StoreEpoch::from_bytes([99; 16]),
+                            before.committed_sequence
+                        )),
+                        ..request
+                    },
+                    &mut flag_meter(100000)
+                ),
+                Err(UploadError::Store(ports::Error::Conflict))
+            ));
+            policy.lock().unwrap().allowed = false;
+            assert!(matches!(
+                coordinator.destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000)),
+                Err(UploadError::Store(ports::Error::Forbidden))
+            ));
+            policy.lock().unwrap().allowed = true;
+            let duplicates = [FLAG_EMAIL; 2];
+            assert!(matches!(
+                coordinator.destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        emails: &duplicates,
+                        ..request
+                    },
+                    &mut flag_meter(100000)
+                ),
+                Err(UploadError::Store(ports::Error::Invalid))
+            ));
+            clock.0.store(100, Ordering::Relaxed);
+            assert!(matches!(
+                coordinator.destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000)),
+                Err(UploadError::Store(ports::Error::Deadline))
+            ));
+            clock.0.store(1, Ordering::Relaxed);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity(), before);
+            assert!(view
+                .get(Key::Email(FLAG_EMAIL), &mut [0; 128])
+                .unwrap()
+                .is_some());
+            drop(view);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn deletion_guard_known_commit_and_uncertain_outcomes_keep_correct_quota() {
+    for deny in [false, true] {
+        fixture_config(
+            4,
+            100000,
+            |store| seed_destroy_email(store, false, false),
+            |coordinator, _, clock, policy, _| {
+                let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let check = observed.clone();
+                let shared = policy.clone();
+                let timer = clock.clone();
+                set_writer_authorizer(coordinator, move |context| {
+                    if matches!(context.action, AuthAction::Transaction { operation }
+                    if !matches!(operation, TransactionOperation::Begin | TransactionOperation::Rollback))
+                    {
+                        assert!(matches!(shared.try_lock(), Err(TryLockError::WouldBlock)));
+                        check.store(true, Ordering::Relaxed);
+                        if deny {
+                            return Authorization::Deny;
+                        }
+                        timer.0.store(100, Ordering::Relaxed);
+                    }
+                    Authorization::Allow
+                });
+                let request = EmailDestroyRequest {
+                    account: ACCOUNT,
+                    device: DEVICE,
+                    expected: None,
+                    emails: &[FLAG_EMAIL],
+                    deadline: deadline(),
+                };
+                let complete = coordinator
+                    .destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000))
+                    .unwrap();
+                assert!(observed.load(Ordering::Relaxed));
+                assert!(policy.try_lock().is_ok());
+                assert!(complete.admission_stopped);
+                assert_eq!(complete.results, [EmailDestroyResult::Destroyed]);
+                if deny {
+                    assert!(matches!(
+                        complete.outcome,
+                        Err(CommitError::Indeterminate(_))
+                    ));
+                    assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+                    assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
+                } else {
+                    assert!(complete.outcome.is_ok());
+                    assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+                    assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 0);
+                }
+                clock.0.store(1, Ordering::Relaxed);
+                assert!(matches!(
+                    coordinator.destroy_emails(
+                        &td_crypto::Provider,
+                        request,
+                        &mut flag_meter(100000)
+                    ),
+                    Err(UploadError::Store(ports::Error::WriterStopped))
+                ));
+                lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                    .unwrap()
+                    .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                    .unwrap();
+                None
+            },
+        );
+    }
+}
+
+#[test]
+fn deletion_batch_retires_shared_thread_once_and_records_all_object_changes() {
+    fixture_config(
+        4,
+        100000,
+        |store| seed_destroy_email(store, false, true),
+        |coordinator, _, _, _, _| {
+            let other = crate::ids::EmailId::from_bytes([43; 16]);
+            // Deliberately descending: ownership uses a separately sorted selection.
+            let emails = [other, FLAG_EMAIL];
+            let request = EmailDestroyRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                emails: &emails,
+                deadline: deadline(),
+            };
+            let complete = coordinator
+                .destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000))
+                .unwrap();
+            let sequence = complete.outcome.unwrap();
+            assert_eq!(complete.results, [EmailDestroyResult::Destroyed; 2]);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 0);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            for (kind, expected, action) in [
+                (ObjectType::Email, 2, ChangeAction::Destroyed),
+                (ObjectType::Thread, 1, ChangeAction::Destroyed),
+                (ObjectType::Mailbox, 1, ChangeAction::Updated),
+            ] {
+                let mut cursor = ChangeCursor {
+                    sequence: complete.before.committed_sequence,
+                    operation: u32::MAX,
+                };
+                let mut count = 0;
+                while let ChangeStep::Record(record) = view.next_change(cursor, kind).unwrap() {
+                    assert_eq!(record.change.action, action);
+                    assert_eq!(record.cursor.sequence, sequence);
+                    cursor = record.cursor;
+                    count += 1;
+                }
+                assert_eq!(count, expected);
+            }
+            drop(view);
+            assert_recount(coordinator);
+            let before = coordinator
+                .store
+                .usage_fence(deadline())
+                .unwrap()
+                .file_usage();
+            assert_eq!(
+                coordinator.used(Kind::DatabaseBytes).unwrap(),
+                before.database_bytes
+            );
+            assert_eq!(coordinator.used(Kind::WalBytes).unwrap(), before.wal_bytes);
+            None
+        },
+    );
+}
+
+#[test]
+fn deletion_request_bounds_refuse_before_effects() {
+    fixture_config(
+        4,
+        100000,
+        |store| seed_destroy_email(store, false, false),
+        |coordinator, _, _, _, _| {
+            let emails = [FLAG_EMAIL; MAX_EMAIL_DESTROYS + 1];
+            let request = EmailDestroyRequest {
+                account: ACCOUNT,
+                device: DEVICE,
+                expected: None,
+                emails: &emails,
+                deadline: deadline(),
+            };
+            assert!(matches!(
+                coordinator.destroy_emails(&td_crypto::Provider, request, &mut flag_meter(100000)),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            let short = crate::admission::work::Meter::new(
+                Deadline::after(Tick(0), 50).unwrap(),
+                crate::admission::work::Charge {
+                    records: 100000,
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(
+                coordinator.destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        emails: &[FLAG_EMAIL],
+                        ..request
+                    },
+                    &mut { short }
+                ),
+                Err(UploadError::Store(ports::Error::Invalid))
+            ));
+            None
+        },
+    );
+}
+
+#[test]
+fn deletion_preserves_submission_body_and_historical_message_identifiers() {
+    use crate::{
+        format::row::{FailureReason, NotificationState, RecipientState, SubmissionRow},
+        ids::{IdentityId, SubmissionId, ThreadId},
+    };
+    let submission = SubmissionId::from_bytes([61; 16]);
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            seed_destroy_email(store, false, false);
+            let mut recipient = super::super::recipient_tests::queued();
+            recipient.state = RecipientState::Canceled;
+            recipient.next_attempt_at = None;
+            recipient.reason = FailureReason::Canceled;
+            let value = row_bytes(Row::Submission(SubmissionRow {
+                email: FLAG_EMAIL,
+                thread: ThreadId::from_bytes([42; 16]),
+                identity: IdentityId::from_bytes([62; 16]),
+                transmitted_blob: SEED,
+                reverse_path: "",
+                send_at: 0,
+                expires_at: 432000000,
+                recipient_count: 1,
+                completed_at: Some(1),
+                notification: NotificationState::None,
+                notification_email: None,
+            }));
+            let recipient_value = row_bytes(Row::Recipient(recipient));
+            let mut recipient_key = [0; 20];
+            Key::Recipient(submission, 0)
+                .encode(&mut recipient_key)
+                .unwrap();
+            let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: ACCOUNT,
+                        epoch: before.epoch,
+                        expected: before.committed_sequence,
+                        utc_ms: 1,
+                        deadline: deadline(),
+                    },
+                    &[
+                        Operation::put(Table::Submissions, submission.as_bytes(), &value).unwrap(),
+                        Operation::put(Table::Recipients, &recipient_key, &recipient_value)
+                            .unwrap(),
+                    ],
+                    &mut [],
+                )
+                .unwrap();
+        },
+        |coordinator, _, _, _, _| {
+            let complete = coordinator
+                .destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        emails: &[FLAG_EMAIL],
+                        deadline: deadline(),
+                    },
+                    &mut flag_meter(100000),
+                )
+                .unwrap();
+            assert!(complete.outcome.is_ok());
+            assert!(!complete.admission_stopped);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            let mut bytes = [0; 128];
+            assert!(view
+                .get(Key::Email(FLAG_EMAIL), &mut bytes)
+                .unwrap()
+                .is_none());
+            assert!(view
+                .get(Key::Thread(ThreadId::from_bytes([42; 16])), &mut bytes)
+                .unwrap()
+                .is_none());
+            assert!(view.get(Key::Blob(SEED), &mut bytes).unwrap().is_some());
+            let (Row::Submission(row), _) = view
+                .get(Key::Submission(submission), &mut bytes)
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("submission");
+            };
+            assert_eq!(row.email, FLAG_EMAIL);
+            assert_eq!(row.thread, ThreadId::from_bytes([42; 16]));
+            assert_eq!(row.transmitted_blob, SEED);
+            drop(view);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn deletion_cascades_smtp_receipts_and_pages_memberships_and_keywords() {
+    use crate::format::row::{EmailOrigin, EmailRow, ReceiptRecipients, ReceiptTls, SmtpReceipt};
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            seed_destroy_email(store, false, false);
+            let mut recipients = [0; 128];
+            let recipients = ReceiptRecipients::encode(
+                &["one@example.test", "two@example.test"],
+                &mut recipients,
+            )
+            .unwrap();
+            let row = Row::Email(EmailRow {
+                blob: SEED,
+                thread: crate::ids::ThreadId::from_bytes([42; 16]),
+                received_at: 1,
+                origin: EmailOrigin::Smtp(SmtpReceipt {
+                    peer: "192.0.2.1".parse().unwrap(),
+                    gateway: None,
+                    tls: ReceiptTls::Tls13,
+                    ehlo: "sender.test",
+                    reverse_path: "",
+                    recipients,
+                }),
+            });
+            let mut value = [0; 512];
+            let length = row.encode(&mut value).unwrap();
+            let keys: Vec<_> = (0..40)
+                .map(|n| {
+                    let mut key = [0; 128];
+                    let length = Key::Keyword(FLAG_EMAIL, &format!("custom{n:03}"))
+                        .encode(&mut key)
+                        .unwrap();
+                    key[..length].to_vec()
+                })
+                .collect();
+            let boxes: Vec<_> = (70..87)
+                .map(|byte| MailboxId::from_bytes([byte; 16]))
+                .collect();
+            let values: Vec<_> = boxes
+                .iter()
+                .enumerate()
+                .map(|(n, _)| {
+                    row_bytes(Row::Mailbox(crate::format::row::MailboxRow {
+                        name: &format!("box{n}"),
+                        parent: None,
+                        role: None,
+                        sort_order: 0,
+                        subscribed: true,
+                    }))
+                })
+                .collect();
+            let memberships: Vec<_> = boxes
+                .iter()
+                .map(|mailbox| {
+                    let mut key = [0; 32];
+                    Key::Membership(FLAG_EMAIL, *mailbox)
+                        .encode(&mut key)
+                        .unwrap();
+                    key
+                })
+                .collect();
+            let mut operations =
+                vec![
+                    Operation::put(Table::Emails, FLAG_EMAIL.as_bytes(), &value[..length]).unwrap(),
+                ];
+            for key in &keys {
+                operations.push(Operation::put(Table::Keywords, key, &[]).unwrap());
+            }
+            for ((mailbox, value), membership) in boxes.iter().zip(&values).zip(&memberships) {
+                operations
+                    .push(Operation::put(Table::Mailboxes, mailbox.as_bytes(), value).unwrap());
+                operations.push(Operation::put(Table::Memberships, membership, &[]).unwrap());
+            }
+            let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+            store
+                .commit(
+                    &td_crypto::Provider,
+                    CommitRequest {
+                        account: ACCOUNT,
+                        epoch: before.epoch,
+                        expected: before.committed_sequence,
+                        utc_ms: 1,
+                        deadline: deadline(),
+                    },
+                    &operations,
+                    &mut [],
+                )
+                .unwrap();
+        },
+        |coordinator, _, _, _, _| {
+            let receipt_count = || {
+                let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+                view.read_snapshot(|native| {
+                    native.run(|db| {
+                        db.query_row("SELECT count(*) FROM smtp_receipt_recipients", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(sql)
+                    })
+                })
+                .unwrap()
+            };
+            assert_eq!(receipt_count(), 2);
+            let result = coordinator
+                .destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        emails: &[FLAG_EMAIL],
+                        deadline: deadline(),
+                    },
+                    &mut flag_meter(100000),
+                )
+                .unwrap();
+            assert!(result.outcome.is_ok());
+            assert_eq!(receipt_count(), 0);
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert!(view
+                .email_keywords(FLAG_EMAIL, None, 16)
+                .unwrap()
+                .values
+                .is_empty());
+            assert!(view
+                .email_mailboxes(FLAG_EMAIL, None, 16)
+                .unwrap()
+                .values
+                .is_empty());
+            drop(view);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn rejected_deletion_preserves_message_sequence_and_body_charges() {
+    fixture_config(
+        4,
+        100000,
+        |store| seed_destroy_email(store, false, false),
+        |coordinator, _, _, _, _| {
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            set_writer_authorizer(coordinator, |context| {
+                if matches!(context.action, AuthAction::Delete { table_name, .. } if table_name == "emails")
+                {
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            });
+            let result = coordinator
+                .destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        emails: &[FLAG_EMAIL],
+                        deadline: deadline(),
+                    },
+                    &mut flag_meter(100000),
+                )
+                .unwrap();
+            assert!(matches!(result.outcome, Err(CommitError::Rejected(_))));
+            assert!(!result.admission_stopped);
+            lock(&lock(&coordinator.store.writer).unwrap().native.connection)
+                .unwrap()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity(), before);
+            assert!(view
+                .get(Key::Email(FLAG_EMAIL), &mut [0; 128])
+                .unwrap()
+                .is_some());
+            drop(view);
+            assert_eq!(coordinator.used(Kind::BodyBytes).unwrap(), 4);
+            assert_eq!(coordinator.used(Kind::BlobCount).unwrap(), 1);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}
+
+#[test]
+fn deletion_plan_exhaustion_preserves_all_rows_and_history() {
+    fixture_config(
+        4,
+        100000,
+        |store| {
+            seed_destroy_email(store, false, false);
+            for batch in 0..16 {
+                let keys: Vec<_> = (0..256)
+                    .map(|n| {
+                        let mut bytes = [0; 128];
+                        let length =
+                            Key::Keyword(FLAG_EMAIL, &format!("custom{:04}", batch * 256 + n))
+                                .encode(&mut bytes)
+                                .unwrap();
+                        bytes[..length].to_vec()
+                    })
+                    .collect();
+                let operations: Vec<_> = keys
+                    .iter()
+                    .map(|key| Operation::put(Table::Keywords, key, &[]).unwrap())
+                    .collect();
+                let before = store.view(ACCOUNT, deadline()).unwrap().identity();
+                store
+                    .commit(
+                        &td_crypto::Provider,
+                        CommitRequest {
+                            account: ACCOUNT,
+                            epoch: before.epoch,
+                            expected: before.committed_sequence,
+                            utc_ms: 1,
+                            deadline: deadline(),
+                        },
+                        &operations,
+                        &mut [],
+                    )
+                    .unwrap();
+            }
+        },
+        |coordinator, _, _, _, _| {
+            let before = coordinator
+                .store
+                .view(ACCOUNT, deadline())
+                .unwrap()
+                .identity();
+            assert!(matches!(
+                coordinator.destroy_emails(
+                    &td_crypto::Provider,
+                    EmailDestroyRequest {
+                        account: ACCOUNT,
+                        device: DEVICE,
+                        expected: None,
+                        emails: &[FLAG_EMAIL],
+                        deadline: deadline(),
+                    },
+                    &mut flag_meter(100000)
+                ),
+                Err(UploadError::Store(ports::Error::Capacity))
+            ));
+            let mut view = coordinator.store.view(ACCOUNT, deadline()).unwrap();
+            assert_eq!(view.identity(), before);
+            assert!(view
+                .get(Key::Email(FLAG_EMAIL), &mut [0; 128])
+                .unwrap()
+                .is_some());
+            let count = view
+                .read_snapshot(|native| {
+                    native.run(|db| {
+                        db.query_row("SELECT count(*) FROM keywords", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .map_err(sql)
+                    })
+                })
+                .unwrap();
+            assert_eq!(count, 4097);
+            drop(view);
+            assert_recount(coordinator);
+            None
+        },
+    );
+}

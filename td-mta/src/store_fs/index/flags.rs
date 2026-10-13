@@ -8,8 +8,9 @@ use crate::{
 pub const MAX_EMAIL_UPDATES: usize = 256;
 const MEMBERSHIP_WINDOW: usize = 16;
 const FLAG_KEY_BYTES: usize = 16 + "$flagged".len();
-/// Separate permission from uploads and reads. A guard must exclude revocation
-/// through COMMIT, obey the deadline, and never call back into the coordinator.
+/// Email mutation permission, including deletion, separate from uploads and reads.
+/// A guard must exclude revocation through COMMIT, obey the deadline,
+/// and never call back into the coordinator.
 pub trait EmailUpdateAuthorization {
     type Guard<'a>: UploadGuard
     where
