@@ -878,7 +878,10 @@ pub fn glob(pattern: &str, base: &Path) -> Result<Globbed, String> {
 }
 
 /// The patterns a `{a,b}` group stands for, groups nested and in series.
-fn expand(pattern: &str) -> Result<Vec<String>, String> {
+pub(crate) fn expand(pattern: &str) -> Result<Vec<String>, String> {
+    if pattern.len() > MAX_PATTERN || pattern.bytes().filter(|b| *b == b'{').count() > MAX_GROUPS {
+        return Err("glob filter exceeds its pattern or brace-group limit".into());
+    }
     let Some(open) = pattern.find('{') else {
         return Ok(vec![pattern.to_string()]);
     };

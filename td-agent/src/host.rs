@@ -97,6 +97,8 @@ pub enum Call {
     ReviewShell {
         command: String,
         cargo_args: Option<Vec<String>>,
+        program: Option<String>,
+        build_env: Vec<(String, String)>,
         timeout_ms: Option<u64>,
         workdir: Option<String>,
         target_dir: String,
@@ -486,6 +488,8 @@ impl Call {
             Self::ReviewShell {
                 command,
                 cargo_args,
+                program,
+                build_env,
                 timeout_ms,
                 workdir,
                 target_dir,
@@ -498,6 +502,16 @@ impl Call {
                     cargo_args.as_ref().map_or(Json::Null, |args| {
                         Json::Arr(args.iter().cloned().map(Json::Str).collect())
                     }),
+                ),
+                ("program", opt_str(program.as_deref())),
+                (
+                    "build_env",
+                    Json::Obj(
+                        build_env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
+                            .collect(),
+                    ),
                 ),
                 ("timeout_ms", opt_num(*timeout_ms)),
                 ("workdir", opt_str(workdir.as_deref())),
@@ -616,6 +630,8 @@ impl Call {
                 },
                 timeout_ms: number("timeout_ms")?,
                 workdir: maybe("workdir")?,
+                program: maybe("program")?,
+                build_env: crate::review_native::decode_environment(args.get("build_env"))?,
                 target_dir: text("target_dir")?,
                 runner: maybe("runner")?,
                 cargo_home: maybe("cargo_home")?,

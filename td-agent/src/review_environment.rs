@@ -48,6 +48,7 @@ pub(crate) fn prepare(
     key_path: &Path,
     journal: &mut crate::review_log::Journal,
 ) -> Result<String, String> {
+    let native = crate::review_native::prepare(workspace, journal)?;
     let mut initial = workspace.sparse.clone();
     initial.insert(0, String::new());
     let mut pending: Vec<PathBuf> = initial
@@ -306,6 +307,7 @@ pub(crate) fn prepare(
         }
     }
     let summary = format!("Offline test preparation: {}. Path dependencies expanded within this commit; private Cargo home {}; vendor {}; runner {}. Metadata preflight checks dependency resolution, not compilation or tests. The runner is td-builder run-capped, wired into Cargo automatically; do not inspect its executable bytes or invoke it as a test suite. Use cargo_test for focused tests; if compilation reports a missing tracked source file, expand_sparse its directory and retry once.", if limitations.is_empty() { "selected inputs resolved".into() } else { limitations.join("\n") }, workspace.cargo_home.as_ref().map_or_else(|| "none".into(), |p| p.display().to_string()), workspace.vendor.as_ref().map_or_else(|| "none supplied".into(), |p| p.display().to_string()), workspace.runner.as_deref().unwrap_or("none supplied"));
+    let summary = format!("{native}\n{summary}");
     journal.text("test_environment", &summary)?;
     Ok(summary.chars().take(8192).collect())
 }

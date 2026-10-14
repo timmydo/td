@@ -1386,6 +1386,91 @@ fn review_grep_alternation_works_without_an_extended_flag() {
 }
 
 #[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host C/Rust toolchain"]
+fn native_preparation_links_plain_rust_without_agent_compiler_overrides() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "cargo_test",
+                Json::Obj(vec![("filter".into(), Json::Str("fixture_passes".into()))]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = fixture
+        .command(&mock, "0.02")
+        .env_remove("CC")
+        .env_remove("CXX")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert!(
+        requests[1]
+            .text()
+            .contains("Native C and Rust compile/link probes passed"),
+        "{}",
+        fixture.logs()[0]
+            .lines()
+            .filter(|l| l.contains("native_build_preflight"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(requests[2].text().contains("1 passed; 0 failed"));
+    let log = fixture.logs().remove(0);
+    let events: Vec<Json> = log.lines().map(|l| td_json::parse(l).unwrap()).collect();
+    let probes: Vec<_> = events
+        .iter()
+        .filter(|e| e.get("kind").and_then(Json::as_str) == Some("native_build_preflight"))
+        .collect();
+    assert_eq!(probes.len(), 2);
+    assert!(probes
+        .iter()
+        .all(|e| e.get_path(&["data", "available"]).and_then(Json::as_bool) == Some(true)));
+    assert!(events
+        .iter()
+        .any(|e| e.get("kind").and_then(Json::as_str) == Some("billing_key_sha256")));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn review_grep_brace_filters_match_files_instead_of_silently_missing_them() {
+    let fixture = Fixture::new();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "grep",
+                Json::Obj(vec![
+                    ("pattern".into(), Json::Str("ORIGINAL".into())),
+                    ("include".into(), Json::Str("{source-only,absent}".into())),
+                ]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(mock.requests()[2]
+        .text()
+        .contains("source-only:1:ORIGINAL REVIEWED"));
+    fixture.no_workspaces();
+}
+
+#[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn declared_sources_compile_and_failed_tests_keep_cargos_actual_status() {
     let mut fixture = Fixture::new();

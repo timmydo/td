@@ -15,6 +15,8 @@ const USAGE: &str = "usage: td-agent [--control-socket ABSOLUTE-PATH]\n\
 \x20      td-agent review --commit REV [--model opus-latest|gpt-sol-latest]\n\
 \x20                      [--max-cost USD] [--repo DIRECTORY]\n\
 \x20      td-agent review-log FILE\n\
+\x20      td-agent review-logs [DIRECTORY] [--day YYYY-MM-DD]\n\
+\x20                           [--key-fingerprint SHA256] [--billed-cost USD]\n\
 \x20      td-agent calibrate FIXTURES\n\
 \x20      td-agent --help\n\
 \n\
@@ -129,9 +131,19 @@ fn window(args: &[String]) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        == Some(std::ffi::OsStr::new("cc"))
+    {
+        eprintln!("cc: {}", td_agent::review_native::compiler_alias());
+        return ExitCode::FAILURE;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),
+        Some((first, rest)) if first == "review-logs" => td_agent::review_inventory::run(rest),
         Some((first, rest)) if first == "review-log" => td_agent::review_metrics::run(rest),
         Some((first, rest)) if first == "review" => td_agent::review::run(rest),
         Some((first, rest)) if first == "calibrate" => td_agent::calibrate::run(rest),

@@ -521,8 +521,8 @@ pub(crate) fn definition(tool: Tool) -> Json {
                 vec![
                     ("pattern", property("string", "The regular expression.")),
                     ("path", property("string", "The absolute file or directory to search; the working directory when left out.")),
-                    ("include", property("string", "Only files whose names match this glob.")),
-                    ("exclude", property("string", "No files whose names match this glob.")),
+                    ("include", property("string", "Only files whose names match this glob; supports *, ?, [...], and {a,b} alternatives (up to 64 expanded patterns).")),
+                    ("exclude", property("string", "No files whose names match this glob; supports the same brace alternatives as include.")),
                     ("extended", property("boolean", "Extended rather than basic expressions; false when left out.")),
                     ("ignore_case", property("boolean", "Match regardless of case; false when left out.")),
                     ("context", integer("Lines of context around each match.", 0, Some(u64::from(shell::MAX_CONTEXT)))),

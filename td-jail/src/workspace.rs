@@ -202,6 +202,8 @@ pub(crate) fn environment(home: &Path, path: &[PathBuf]) -> Vec<(OsString, OsStr
         search.push(directory.as_os_str());
         search.push(":");
     }
+    search.push(PROGRAM_DIR);
+    search.push(":");
     search.push(PATH);
     vec![
         ("HOME".into(), home.as_os_str().to_os_string()),
@@ -1512,14 +1514,16 @@ mod tests {
         let keys: Vec<_> = fixed.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);
         assert_eq!(fixed[0].1, "/s/home");
-        assert_eq!(fixed[2].1, PATH);
+        assert_eq!(fixed[2].1, OsString::from(format!("{PROGRAM_DIR}:{PATH}")));
         let searched = environment(
             Path::new("/s/home"),
             &["/gnu/store/x-profile/bin".into(), "/usr/local/sbin".into()],
         );
         assert_eq!(
             searched[2].1,
-            OsString::from(format!("/gnu/store/x-profile/bin:/usr/local/sbin:{PATH}"))
+            OsString::from(format!(
+                "/gnu/store/x-profile/bin:/usr/local/sbin:{PROGRAM_DIR}:{PATH}"
+            ))
         );
     }
 

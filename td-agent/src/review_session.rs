@@ -280,6 +280,7 @@ pub fn run(
         options.model.as_deref().unwrap_or(&client.model),
         key_path,
     )?;
+    journal.billing_key(key)?;
     let result = run_logged(options, client, key, key_path, &mut journal);
     let logged = journal.end(&result);
     crate::review_log::combine(result, logged)

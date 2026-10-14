@@ -27,6 +27,14 @@ pub(crate) fn combine(
 }
 
 impl Journal {
+    pub(crate) fn billing_key(&mut self, key: &crate::key::Secret) -> Result<(), String> {
+        let material = format!("td-agent review billing key v1\0{}", key.expose());
+        self.text(
+            "billing_key_sha256",
+            &crate::sha256::hex_digest(material.as_bytes()),
+        )
+    }
+
     pub(crate) fn create(
         options: &crate::review::Options,
         model: &str,

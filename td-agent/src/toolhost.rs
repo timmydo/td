@@ -583,10 +583,11 @@ fn act(
             }
             let mut process = if let Call::ReviewShell {
                 cargo_args: Some(args),
+                program,
                 ..
             } = call
             {
-                let mut process = std::process::Command::new("cargo");
+                let mut process = std::process::Command::new(program.as_deref().unwrap_or("cargo"));
                 process
                     .args(args)
                     .current_dir(&dir)
@@ -600,6 +601,7 @@ fn act(
                 target_dir,
                 runner,
                 cargo_home,
+                build_env,
                 ..
             } = call
             {
@@ -609,6 +611,7 @@ fn act(
                 let target = config.path(target_dir, "target_dir")?;
                 std::fs::create_dir_all(&target)
                     .map_err(|e| format!("{}: {e}", target.display()))?;
+                process.envs(build_env.iter().cloned());
                 process
                     .env("CARGO_TARGET_DIR", target)
                     .env("CARGO_NET_OFFLINE", REVIEW_CARGO_OFFLINE);
@@ -705,7 +708,7 @@ fn act(
                     .map_or_else(|| base.clone(), Path::to_path_buf)
             };
             let exit = shell::run(
-                grep.command(txt, &workdir),
+                grep.command(txt, &workdir)?,
                 shell::DEFAULT_TIMEOUT,
                 cancel,
                 sink,
@@ -1093,6 +1096,8 @@ mod tests {
         let id = client
             .call(Call::ReviewShell {
                 cargo_args: None,
+                program: None,
+                build_env: Vec::new(),
                 command: format!("head -c {expected} /dev/zero; printf '\\377'"),
                 timeout_ms: Some(30_000),
                 workdir: None,
@@ -1138,6 +1143,7 @@ mod tests {
         let mut output = Vec::new();
         let done = act(&Call::ReviewShell {
             cargo_args: None,
+            program: None, build_env: Vec::new(),
             command: "(i=0; while [ $i -lt 8 ]; do printf .; sleep 0.1; i=$((i+1)); done; printf TRAILING) & printf EARLY".into(),
             timeout_ms: Some(5_000), workdir: None,
             target_dir: dir.join("target").display().to_string(),

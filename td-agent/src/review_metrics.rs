@@ -132,6 +132,9 @@ impl Transport {
 
 pub fn summarize(input: impl Read) -> Result<Json, String> {
     let mut input = BufReader::new(input);
+    let mut start = Json::Null;
+    let mut start_ms = Json::Null;
+    let mut billing_key = Json::Null;
     let mut sequence = 0u64;
     let mut requests = 0u64;
     let mut transport = Transport::default();
@@ -209,6 +212,11 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             "start" if data.get("version").and_then(Json::as_u64) != Some(1) => {
                 return Err("unsupported review trace version".into())
             }
+            "start" => {
+                start = data.clone();
+                start_ms = event.get("time_ms").cloned().unwrap_or(Json::Null);
+            }
+            "billing_key_sha256" => billing_key = data.clone(),
             "budget_reservation" => {
                 reservation = data
                     .get("charged")
@@ -225,7 +233,7 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             "request_duration_ms" => {
                 duration_ms = duration_ms.saturating_add(data.as_u64().unwrap_or(0))
             }
-            "test_preflight" => {
+            "test_preflight" | "native_build_preflight" => {
                 preflight_failures = preflight_failures.saturating_add(u64::from(
                     data.get("available").and_then(Json::as_bool) == Some(false),
                 ))
@@ -326,6 +334,9 @@ pub fn summarize(input: impl Read) -> Result<Json, String> {
             == Some(true);
     Ok(Json::Obj(vec![
         ("metrics_version".into(), Json::from(2u64)),
+        ("start".into(), start),
+        ("start_time_ms".into(), start_ms),
+        ("billing_key_sha256".into(), billing_key),
         ("diagnostics".into(), analysis.json()),
         (
             "token_report_counts".into(),

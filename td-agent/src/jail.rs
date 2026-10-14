@@ -199,6 +199,18 @@ impl Policy {
 /// The spec's text: td-jail's exact, ordered keyfile, with `path` the
 /// directories put first on the instance's `PATH`.
 pub fn spec_text(programs: &Programs, policy: &Policy, path: &[PathBuf]) -> Result<String, String> {
+    spec_text_with(programs, policy, path, &[])
+}
+
+pub(crate) fn spec_text_with(
+    programs: &Programs,
+    policy: &Policy,
+    path: &[PathBuf],
+    extra: &[PathBuf],
+) -> Result<String, String> {
+    if extra.len() > 2 {
+        return Err("review preparation exceeds the jail's four-program limit".into());
+    }
     let mut text = String::from("format=1\n");
     let mut line = |key: &str, path: &Path| -> Result<(), String> {
         let value = path
@@ -213,6 +225,9 @@ pub fn spec_text(programs: &Programs, policy: &Policy, path: &[PathBuf]) -> Resu
     };
     line("entry", &programs.agent)?;
     line("program", &programs.txt)?;
+    for program in extra {
+        line("program", program)?;
+    }
     for directory in path {
         line("path", directory)?;
     }
@@ -267,6 +282,27 @@ fn write_spec(dir: &Path, text: &str) -> Result<PathBuf, String> {
 /// conversation launches from its main thread (§8).
 pub fn launch(programs: &Programs, policy: &Policy, spec_dir: &Path) -> Result<Client, String> {
     launch_linked(programs, policy, spec_dir, None)
+}
+
+pub(crate) fn launch_review(
+    programs: &Programs,
+    policy: &Policy,
+    spec_dir: &Path,
+    extra: &[PathBuf],
+) -> Result<Client, String> {
+    let policy = Policy {
+        home: private_dir(&policy.home)?,
+        ..policy.clone()
+    };
+    let spec = write_spec(
+        spec_dir,
+        &spec_text_with(programs, &policy, &host_path(), extra)?,
+    )?;
+    let launched = start(programs, &policy, &spec, None);
+    if launched.is_err() {
+        let _ = fs::remove_file(&spec);
+    }
+    launched
 }
 
 /// `launch`, the tool host serving the network proxy when `linked` is

@@ -294,7 +294,11 @@ ask/auto mode and its classifier. Its tools are `read_file`, `glob`, `grep`,
 bounded foreground `shell`, `cargo_test`, and `expand_sparse`. Review grep
 defaults to POSIX extended expressions (`|` means alternation); an explicit
 `extended:false` selects basic expressions. Other tool profiles retain their
-existing defaults. Source, private Git
+existing defaults. In every tool profile, grep include/exclude filename globs expand `{a,b}`
+alternatives, using the glob tool's bounded expansion (1024 bytes, 16 brace
+groups, at most 64 expanded patterns). Expansion becomes separate adjacent
+include/exclude options; td-txt's GNU-compatible filter semantics stay intact.
+Malformed or excessive expansions fail explicitly. Source, private Git
 metadata and borrowed objects, its alternates' included, are read-only
 in each fresh tool jail.
 Only scratch and the private home are writable. Scratch uses the existing
@@ -306,6 +310,43 @@ approval or credential tool. The classifier cannot grant a crossing in
 this profile. The host tool closure is the existing §8 closure; source
 dependencies or tools outside it remain unavailable. Tests requiring
 source writes or absent inputs must be reported as limitations.
+
+Repository reviews automatically prepare host native build tools before
+metadata or paid completions. The parent PATH's canonical system/profile
+directories remain inherited under §8. When they provide GCC or Clang but no
+`cc`, the controller copies td-agent as a private native `cc` forwarder
+(maximum 256 MiB, copied from `/proc/self/exe` even after replacement), outside every writable jail grant, and binds it read-only
+through the existing program channel. It records the selected compiler path and the alias hash;
+the alias execs the original compiler through its canonical parent, preserving
+executable-relative resources. A controller-only command variable selects it.
+Alias setup failures remain logged review limitations; log-write failures still
+stop the invocation. The alias is cleaned with the review workspace. No agent-set CC or source
+linker edit is needed, including for a plain rustc invocation. Existing cc
+commands retain priority. Compile/link compatibility is checked by probes, not assumed away.
+
+Only parent `CC`, `CXX`, `AR`, `CMAKE`, `C_INCLUDE_PATH`,
+`CPLUS_INCLUDE_PATH`, `CPATH`, `LIBRARY_PATH`, `PKG_CONFIG_PATH` and
+`PKG_CONFIG_LIBDIR` may reach review commands. The controller adds
+`TD_AGENT_REVIEW_COMPILER` for its cc forwarder; it is not inherited. Tool selectors must name one executable in a canonical mounted system
+directory, whose final resolved target also belongs to that closure. The
+invocation basename is retained: clang++ may link to clang but selects a
+different driver mode. Search lists must resolve
+entirely to absolute mounted system directories; each has at most 32 distinct
+paths and 8192 bytes. Empty values retain their meaning, including disabling pkg-config defaults.
+Empty elements mixed into nonempty lists are omitted with a notice rather
+than rebasing the parent working directory. Relative, missing or unmounted
+values are omitted and
+reported, not used to bind more host directories. Secrets, loader overrides,
+Cargo configuration and arbitrary flags are not imported. This typed environment is limited to review commands. The jail places its
+read-only admitted program directory after inherited path directories and
+before its ordinary system search paths.
+
+C (with a standard header) and Rust compile/link probes run in real jails,
+using scratch outputs and a 15-second deadline each, before the first paid
+completion. `native_tool_alias`, `native_build_environment` and
+`native_build_preflight` records retain preparation and results. Failures are
+explicit model-visible limitations, not test passes. These probes establish
+basic compilation/linking, not every package's required tool or library.
 
 Repository reviews prepare a private Cargo home, expand explicit relative
 path dependencies and non-wildcard workspace members from tracked manifests,
@@ -569,6 +610,23 @@ artifacts, not conversations or entries in the daily ledger. Full capture
 has no disk quota: retained traces can exhaust storage and the caller
 owns their removal. A write failure stops the invocation; it does not
 remove earlier diagnostic records.
+
+`td-agent review-logs [DIRECTORY] [--day YYYY-MM-DD] [--key-fingerprint
+SHA256] [--billed-cost USD]` inventories up to 4096 direct `.jsonl` files,
+including failed and interrupted runs. The default is the review trace
+directory. It reports model, revision, agent binary, key fingerprint,
+completion state and reported/accounted cost per run; malformed traces remain
+listed errors. `--day` selects the UTC start day. Billed cost requires that
+day and reports unexplained excess in either direction, in pico-dollars,
+without treating it as proof of lost logging or incorrect billing. It makes
+no provider request and never changes traces. Other clients/keys, directories,
+deleted logs, missing usage, interruptions and requests crossing midnight may
+explain differences; key and period coverage must be verified. Unknown legacy
+fingerprints and timestamps are counted, and a key filter cannot attribute them.
+Every new review logs a domain-separated SHA-256 fingerprint of its API key,
+never the key, so retained runs can be grouped across key rotations. This is
+private diagnostic attribution, not authentication. Single-file summaries
+also expose start metadata/time and the fingerprint; legacy absence stays null.
 
 The private run directory is below the key directory's `reviews/`, but
 neither that parent nor the key is mounted into a jail. The controller
@@ -3629,7 +3687,8 @@ Every instance has:
   variables of §10. `PATH` begins with the host's own `PATH`
   directories as they resolve, those inside a system tree the instance
   binds, each once and at most 16 (`jail::system_path`, td-jail's
-  `path` spec key); the rest is td-jail's fixed list. A store-based
+  `path` spec key); the admitted read-only programs follow, then td-jail's
+  fixed list. A store-based
   host's tools, in a profile under the home that no instance binds but
   resolving into its store, are so found by name: the model's `git
   commit` and `cargo build`. They are resolved at each launch, so a

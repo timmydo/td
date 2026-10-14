@@ -587,7 +587,7 @@ impl Grep {
     /// with the arguments mapped to its options, the
     /// pattern after `-e` and the paths after `--`, so neither is read as
     /// an option.
-    pub fn argv(&self) -> Vec<OsString> {
+    pub fn argv(&self) -> Result<Vec<OsString>, String> {
         let mut argv: Vec<OsString> = vec!["-r".into(), "-n".into(), "-H".into()];
         if self.extended {
             argv.push("-E".into());
@@ -599,21 +599,25 @@ impl Grep {
             argv.push(format!("-C{}", lines.min(MAX_CONTEXT)).into());
         }
         if let Some(include) = &self.include {
-            argv.push(format!("--include={include}").into());
+            for pattern in crate::files::expand(include)? {
+                argv.push(format!("--include={pattern}").into());
+            }
         }
         if let Some(exclude) = &self.exclude {
-            argv.push(format!("--exclude={exclude}").into());
+            for pattern in crate::files::expand(exclude)? {
+                argv.push(format!("--exclude={pattern}").into());
+            }
         }
         argv.push("-e".into());
         argv.push(self.pattern.clone().into());
         argv.push("--".into());
         argv.extend(self.paths.iter().map(|p| p.clone().into_os_string()));
-        argv
+        Ok(argv)
     }
 
     /// td-txt run as `grep`, which it dispatches on.
-    pub fn command(&self, txt: &Path, workdir: &Path) -> Command {
-        applet(txt, "grep", self.argv(), workdir)
+    pub fn command(&self, txt: &Path, workdir: &Path) -> Result<Command, String> {
+        Ok(applet(txt, "grep", self.argv()?, workdir))
     }
 
     /// The result as the model is given it: grep's exit status 1 is no
@@ -703,6 +707,30 @@ mod tests {
             &mut |_| {},
         )
         .unwrap()
+    }
+
+    #[test]
+    fn grep_expands_bounded_filename_alternatives() {
+        let grep = Grep {
+            include: Some("postgres_{probe,input}.rs".into()),
+            exclude: Some("{generated,old}.*".into()),
+            ..Grep::default()
+        };
+        let argv = grep.argv().unwrap();
+        for word in [
+            "--include=postgres_probe.rs",
+            "--include=postgres_input.rs",
+            "--exclude=generated.*",
+            "--exclude=old.*",
+        ] {
+            assert!(argv.contains(&OsString::from(word)));
+        }
+        assert!(Grep {
+            include: Some("{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}".into()),
+            ..Grep::default()
+        }
+        .argv()
+        .is_err());
     }
 
     #[test]
@@ -857,6 +885,7 @@ mod tests {
         };
         let argv: Vec<String> = grep
             .argv()
+            .unwrap()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -936,7 +965,7 @@ mod tests {
             ..Grep::default()
         };
         let exit = run(
-            grep.command(&stand_in, &dir),
+            grep.command(&stand_in, &dir).unwrap(),
             Duration::from_secs(10),
             &never,
             &mut |_| {},

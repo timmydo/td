@@ -20,7 +20,7 @@ const MAX_TOOL_REPLY: usize = 256 * 1024;
 const MAX_TREE_LIST: u64 = 16 * 1024 * 1024;
 
 pub struct Workspace {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     cleaned: bool,
     _lock: File,
     pub checkout: PathBuf,
@@ -34,6 +34,7 @@ pub struct Workspace {
     pub(crate) runner: Option<String>,
     pub(crate) cargo_home: Option<PathBuf>,
     programs: jail::Programs,
+    pub(crate) native: crate::review_native::Native,
     repository: PathBuf,
     objects: PathBuf,
     /// The object directories `objects` borrows through its alternates,
@@ -279,6 +280,7 @@ impl Workspace {
             vendor: None,
             runner: None,
             cargo_home: None,
+            native: crate::review_native::Native::default(),
             programs,
             git,
         };
@@ -387,10 +389,11 @@ impl Workspace {
         visible.extend([policy.home.clone(), self.root.clone(), self.objects.clone()]);
         visible.extend(self.borrowed.iter().cloned());
         journal.outside(&visible)?;
-        let spec = jail::spec_text(
+        let spec = jail::spec_text_with(
             &self.programs,
             &policy,
             &jail::system_path(std::env::var_os("PATH").as_deref()),
+            &self.native.aliases,
         )?;
         journal.text("jail_spec", &spec)
     }
@@ -533,6 +536,8 @@ impl Workspace {
             host::Call::ReviewShell {
                 command: String::new(),
                 cargo_args: Some(crate::review_cargo::arguments(arguments, &self.checkout)?),
+                program: None,
+                build_env: self.native.env.clone(),
                 timeout_ms: Some(MAX_SHELL_TIMEOUT_MS),
                 workdir: None,
                 runner: self.runner.clone(),
@@ -560,10 +565,34 @@ impl Workspace {
             host::Call::ReviewShell {
                 command: String::new(),
                 cargo_args: Some(args),
+                program: None,
+                build_env: self.native.env.clone(),
                 timeout_ms: Some(timeout_ms),
                 workdir: None,
                 runner: self.runner.clone(),
                 cargo_home: self.cargo_home.as_ref().map(|p| p.display().to_string()),
+                target_dir: self.scratch.join("target").display().to_string(),
+            },
+            log,
+        )
+    }
+
+    pub(crate) fn native_logged(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        log: impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<String, String> {
+        self.host_call_logged(
+            host::Call::ReviewShell {
+                command: String::new(),
+                cargo_args: Some(args),
+                program: Some(program.into()),
+                build_env: self.native.env.clone(),
+                timeout_ms: Some(15_000),
+                workdir: None,
+                runner: None,
+                cargo_home: None,
                 target_dir: self.scratch.join("target").display().to_string(),
             },
             log,
@@ -584,6 +613,8 @@ impl Workspace {
             call = host::Call::ReviewShell {
                 command,
                 cargo_args: None,
+                program: None,
+                build_env: self.native.env.clone(),
                 timeout_ms: Some(
                     timeout_ms
                         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
@@ -603,7 +634,12 @@ impl Workspace {
         if matches!(call, host::Call::Background { .. }) {
             return Err("background processes are unavailable in the review profile".into());
         }
-        let mut client = jail::launch(&self.programs, &self.policy(), &self.root.join("specs"))?;
+        let mut client = jail::launch_review(
+            &self.programs,
+            &self.policy(),
+            &self.root.join("specs"),
+            &self.native.aliases,
+        )?;
         let id = client.call(call)?;
         let deadline = Instant::now()
             .checked_add(TOOL_TIME)

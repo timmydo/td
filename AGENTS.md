@@ -295,6 +295,11 @@ Build the builder with:
 cargo build --release --manifest-path builder/Cargo.toml
 ```
 
+Host test and review preparation owns standard compiler commands, headers
+and libraries. A missing `cc` is an environment defect to fix there; agents
+should not repair it with per-test compiler overrides or target recipe inputs.
+See `DEVELOPMENT.md` and `td-agent/DESIGN.md` for host preparation.
+
 Recipes should test their realized output. For bounded preflight selection:
 
 ```text

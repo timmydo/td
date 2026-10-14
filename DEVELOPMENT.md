@@ -784,6 +784,21 @@ main checkout's config instead and execs the main checkout's builder, so a
 `cargo clean` there makes its tests fail with `No such file or directory`.
 Build the release binary in whichever checkout supplies the config.
 
+## Host compiler preparation for reviews
+
+Repository reviews inherit parent PATH directories that resolve into the
+jail's mounted system trees, including Guix/Nix profile directories. td-agent
+prepares a read-only `cc` alias from an available GCC or Clang when the profile
+provides no `cc`, and preserves validated parent compiler selections and
+header/library search directories at their canonical system-store paths.
+The reviewer does not set CC or rewrite the source's linker configuration.
+C and Rust compile/link probes run in the real review jail before paid
+completions. Missing tools or incompatible environments are logged limitations;
+metadata resolution alone is not evidence that native dependencies can build.
+This is host review preparation; the target artifact graph retains its own
+declared tool inputs. The exact inherited variables, bounds and trace records
+are specified in td-agent/DESIGN.md §2.
+
 ## Native compositor fixture builds
 
 A crate with `native-compositor-tests = true` may additionally declare one

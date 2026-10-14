@@ -674,6 +674,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         options.model.as_deref().unwrap_or(&config.client.model),
         &key_path,
     )?;
+    journal.billing_key(&key)?;
     let result = run_diff(&options, &mut config.client, &key, &mut journal);
     let logged = journal.end(&result);
     crate::review_log::combine(result, logged)

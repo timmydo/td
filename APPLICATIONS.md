@@ -3692,8 +3692,8 @@ stdout and checks it is a socket and that no terminal controls it, and
 the entry receives two clones as its standard input and output, with the
 null device as standard error. Its environment is exactly `HOME` (the
 spec's home), `LANG=C.UTF-8`, `PATH` (the spec's path directories, in
-order, then the ordinary directories, then a store-based host's system
-profile), `TERM=dumb` and `TMPDIR=/tmp`; it
+order, then the read-only admitted program directory, then the ordinary
+directories and a store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
 starts in the first worktree, else in the home. No cgroup is created and
 no data limit set: an instance keeps its launcher's cgroup and whatever
 limit it inherits, and says so with one named diagnostic,
