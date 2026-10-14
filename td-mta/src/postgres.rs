@@ -7,6 +7,7 @@ use std::{
 };
 use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
 
+mod configuration;
 mod material;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +69,9 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
     let command = args.next();
+    if let Some(operation) = command.as_deref().and_then(configuration::Operation::parse) {
+        return configuration::run(operation, args);
+    }
     if let Some(operation) = command.as_deref().and_then(material::Operation::parse) {
         return material::run(operation, args);
     }

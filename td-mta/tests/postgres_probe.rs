@@ -2131,8 +2131,90 @@ per_peer_limit = 1
         sql(&fixture, "SELECT count(*) FROM td_mta.config_versions"),
         "4"
     );
+    // Exercise the real owner commands through protected bootstrap/source files.
+    fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca = fixture.root.join("config-ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let connection = fixture.root.join("config-connection");
+    fs::write(
+        &connection,
+        format!(
+            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            std::str::from_utf8(PASSWORD).unwrap(),
+            fixture.port,
+            ca.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    let shared_file = fixture.root.join("config-shared");
+    let cloud_file = fixture.root.join("config-cloud");
+    let desktop_file = fixture.root.join("config-desktop");
+    fs::write(&shared_file, &shared).unwrap();
+    fs::write(&cloud_file, &cloud).unwrap();
+    fs::write(&desktop_file, &desktop).unwrap();
+    let command_version = versions::Version::from_bytes([16; 16]).to_string();
+    let invoke = |operation, shared_path: &std::path::Path, status| {
+        let epoch_text = epoch.to_string();
+        let mut args = vec![
+            "postgres",
+            operation,
+            "--connection-file",
+            connection.to_str().unwrap(),
+            "--epoch",
+            &epoch_text,
+            "--version",
+            &command_version,
+        ];
+        if operation == "config-import" {
+            args.extend([
+                "--shared-file",
+                shared_path.to_str().unwrap(),
+                "--instance",
+                "desktop",
+                "jmap",
+                desktop_file.to_str().unwrap(),
+                "--instance",
+                "cloud",
+                "receive,jmap",
+                cloud_file.to_str().unwrap(),
+            ]);
+        }
+        let output = command_output(&args, fixture.root.path(), status);
+        assert!(!output.contains(std::str::from_utf8(PASSWORD).unwrap()));
+        assert!(!output.contains(connection.to_str().unwrap()));
+        assert!(!output.contains("relay-user"));
+        output
+    };
+    assert!(invoke("config-check", &shared_file, 1).contains("configuration-missing"));
+    let imported = invoke("config-import", &shared_file, 0);
+    assert!(
+        imported.contains("\"profiles\":2,\"content_validated\":true,\"profile_activated\":false")
+    );
+    let expected_digest: String = candidate
+        .digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(imported.contains(&expected_digest));
+    assert!(invoke("config-import", &shared_file, 0).contains(&expected_digest));
+    assert!(invoke("config-check", &shared_file, 0).contains(&expected_digest));
+    fs::write(&desktop_file, format!("# changed\n{desktop}")).unwrap();
+    assert!(invoke("config-import", &shared_file, 1).contains("version-content-conflict"));
+    assert!(invoke("config-check", &shared_file, 0).contains(&expected_digest));
+    assert!(invoke("config-import", &connection, 1).contains("input-secret-alias"));
+    fs::write(
+        &shared_file,
+        vec![b'x'; configuration::MAX_SOURCE_BYTES + 1],
+    )
+    .unwrap();
+    assert!(invoke("config-import", &shared_file, 1).contains("capacity"));
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(invoke("config-check", &shared_file, 1).contains("input-private-mode"));
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
     // A valid digest is not permission to skip current material validation.
     sql(&fixture, "DELETE FROM td_mta.config_material_chunks WHERE material_id=decode(repeat('02',16),'hex'); DELETE FROM td_mta.config_materials WHERE id=decode(repeat('02',16),'hex')");
+    assert!(invoke("config-check", &shared_file, 1).contains("material-missing"));
     assert!(matches!(
         versions::read(&request, &trust, deadline(), epoch, version),
         Err(versions::Error::Validation(configuration::Error::Material(
@@ -2144,4 +2226,28 @@ per_peer_limit = 1
         versions::read(&request, &trust, deadline(), epoch, version).err(),
         Some(versions::Error::Integrity)
     );
+}
+
+#[test]
+fn configuration_commands_keep_versions_explicit_and_refusals_redacted() {
+    use td_mta::postgres_configuration_store::Version;
+    let root = TempDir::new("pg-config-arguments").unwrap();
+    let text = command_output(&["postgres", "config-version"], root.path(), 0);
+    let version = text
+        .split("\"version\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert_eq!(Version::parse(version).unwrap().to_string(), version);
+    for operation in ["config-version", "config-import", "config-check"] {
+        let text = command_output(
+            &["postgres", operation, "--password", "private-secret"],
+            root.path(),
+            2,
+        );
+        assert!(text.contains("invalid-arguments"));
+        assert!(!text.contains("private-secret"));
+    }
 }

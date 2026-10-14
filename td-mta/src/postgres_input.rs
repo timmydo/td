@@ -19,17 +19,24 @@ pub enum Error {
     Capacity,
     Specification(crate::postgres_bootstrap::Error),
     Trust,
+    Inventory,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl Error {
+    pub const fn code(self) -> &'static str {
+        match self {
             Self::Root => "postgres-bootstrap-root",
             Self::Input(error) => error.code(),
             Self::Read => "postgres-bootstrap-read",
             Self::Capacity => "postgres-bootstrap-capacity",
             Self::Specification(_) => "postgres-bootstrap-specification",
             Self::Trust => "postgres-bootstrap-trust",
-        })
+            Self::Inventory => "postgres-configuration-inventory",
+        }
+    }
+}
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
     }
 }
 impl std::error::Error for Error {}
@@ -103,6 +110,118 @@ impl MaterialInput {
     }
 }
 
+/// One explicit owner-side profile source; roles are structural declarations.
+pub struct SourceFile<'a> {
+    pub name: &'a str,
+    pub roles: crate::config::profile::Roles,
+    pub path: &'a str,
+}
+struct ProfileBytes {
+    name: String,
+    roles: crate::config::profile::Roles,
+    bytes: Vec<u8>,
+}
+/// Bounded protected sources, not a validated or published configuration.
+pub struct ConfigurationInput {
+    connection: Loaded,
+    shared: Vec<u8>,
+    profiles: Vec<ProfileBytes>,
+}
+impl ConfigurationInput {
+    pub fn open(
+        connection_file: &str,
+        shared_file: &str,
+        sources: &[SourceFile<'_>],
+    ) -> Result<Self, Error> {
+        use crate::{
+            config::values,
+            postgres_configuration::{MAX_PROFILES, MAX_SOURCE_BYTES},
+        };
+        if sources.is_empty() || sources.len() > MAX_PROFILES {
+            return Err(Error::Inventory);
+        }
+        let mut remaining = MAX_SOURCE_BYTES;
+        for (index, source) in sources.iter().enumerate() {
+            values::profile_name(source.name).map_err(|_| Error::Inventory)?;
+            if sources
+                .iter()
+                .take(index)
+                .any(|other| other.name == source.name)
+            {
+                return Err(Error::Inventory);
+            }
+            remaining = remaining
+                .checked_sub(source.name.len() + 1)
+                .ok_or(Error::Capacity)?;
+        }
+        let (connection, mut inputs) = Loaded::open_inputs(connection_file, "configuration")?;
+        let shared = read_source(
+            inputs
+                .open(shared_file, Role::Public)
+                .map_err(Error::Input)?,
+            remaining,
+        )?;
+        remaining = remaining.checked_sub(shared.len()).ok_or(Error::Capacity)?;
+        let mut profiles = Vec::new();
+        profiles
+            .try_reserve_exact(sources.len())
+            .map_err(|_| Error::Capacity)?;
+        for source in sources {
+            let bytes = read_source(
+                inputs
+                    .open(source.path, Role::Public)
+                    .map_err(Error::Input)?,
+                remaining,
+            )?;
+            remaining = remaining.checked_sub(bytes.len()).ok_or(Error::Capacity)?;
+            let mut name = String::new();
+            name.try_reserve_exact(source.name.len())
+                .map_err(|_| Error::Capacity)?;
+            name.push_str(source.name);
+            profiles.push(ProfileBytes {
+                name,
+                roles: source.roles,
+                bytes,
+            });
+        }
+        Ok(Self {
+            connection,
+            shared,
+            profiles,
+        })
+    }
+    pub fn connection(&self) -> &Loaded {
+        &self.connection
+    }
+    pub fn shared(&self) -> &[u8] {
+        &self.shared
+    }
+    pub fn profile_count(&self) -> usize {
+        self.profiles.len()
+    }
+    pub fn profile(&self, index: usize) -> Option<crate::postgres_configuration::Profile<'_>> {
+        self.profiles
+            .get(index)
+            .map(|profile| crate::postgres_configuration::Profile {
+                name: &profile.name,
+                roles: profile.roles,
+                source: &profile.bytes,
+            })
+    }
+}
+
+fn read_source(input: impl Read, maximum: usize) -> Result<Vec<u8>, Error> {
+    let bytes = read(input, maximum)?;
+    // Retained profiles share the source budget, not a maximum-sized buffer
+    // each. Compact fallibly while the bounded input buffer is still private.
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| Error::Capacity)?;
+    retained.extend_from_slice(&bytes);
+    Ok(retained)
+}
+
 fn decode(bytes: &[u8], profile: &str) -> Result<Bootstrap, Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::Specification(crate::postgres_bootstrap::Error::Specification))?;
@@ -143,6 +262,50 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     const URI: &str = "postgresql://user:secret@localhost/mail";
+
+    #[test]
+    fn small_sources_do_not_retain_the_unconsumed_source_allowance() {
+        let maximum = crate::postgres_configuration::MAX_SOURCE_BYTES;
+        let small = read_source(&b"version = 1"[..], maximum).unwrap();
+        assert_eq!(small, b"version = 1");
+        assert!(small.capacity() < maximum / 2);
+        assert_eq!(read_source(&b""[..], maximum).unwrap().capacity(), 0);
+        assert_eq!(read_source(&b"abcd"[..], 3), Err(Error::Capacity));
+    }
+
+    #[test]
+    fn configuration_inventory_refuses_before_opening_paths() {
+        use crate::config::profile::Roles;
+        let source = || SourceFile {
+            name: "desktop",
+            roles: Roles::from_bits(2).unwrap(),
+            path: "/missing/profile",
+        };
+        assert_eq!(
+            ConfigurationInput::open("/missing/connection", "/missing/shared", &[]).err(),
+            Some(Error::Inventory)
+        );
+        assert_eq!(
+            ConfigurationInput::open(
+                "/missing/connection",
+                "/missing/shared",
+                &[source(), source()]
+            )
+            .err(),
+            Some(Error::Inventory)
+        );
+        let mut bad = source();
+        bad.name = "Desktop";
+        assert_eq!(
+            ConfigurationInput::open("/missing/connection", "/missing/shared", &[bad]).err(),
+            Some(Error::Inventory)
+        );
+        let sources: Vec<_> = (0..17).map(|_| source()).collect();
+        assert_eq!(
+            ConfigurationInput::open("/missing/connection", "/missing/shared", &sources).err(),
+            Some(Error::Inventory)
+        );
+    }
 
     #[test]
     fn file_syntax_accepts_only_one_optional_line_ending() {

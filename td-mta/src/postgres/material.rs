@@ -149,7 +149,7 @@ pub(super) fn run(
         }
     }
 }
-fn classify(error: Error) -> AttemptError {
+pub(super) fn classify(error: Error) -> AttemptError {
     match error {
         Error::Schema(error) => error.into(),
         Error::Connection(postgres_probe::Error::Transport) => AttemptError::Transport,

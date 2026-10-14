@@ -1080,3 +1080,40 @@ SCRAM sequence remain unchanged, as do default, material and schema worker
 budgets. This is a finite cold operation, not persistent service transport
 or native-allocation qualification. Runtime privileges, activation and the
 atomic SQLite/file-authority replacement remain separate requirements.
+
+## 26. Operator configuration preparation
+
+`td-mta postgres config-version` generates a fresh ID to retain before any
+publication attempt. `config-import --connection-file PATH --epoch HEX
+--version HEX --shared-file PATH --instance NAME ROLES PATH` validates and
+publishes one immutable source version. Repeat --instance for every named
+profile, up to 16. ROLES is a comma-separated unique selection of receive,
+jmap and relay; it declares structural intent, not implemented capabilities.
+All profile sources refer to already imported immutable material IDs using
+section 22's reference syntax. No source version becomes active here.
+
+One protected input inventory binds the connection, database trust, shared
+source and all profile files to the bootstrap owner. Sources are public
+operator inputs under the existing stable trusted-namespace contract; they
+cannot alias the secret connection file, including through hard links.
+Inventory names/counts are checked before files are opened. Source/name bytes
+and inserted separators share the preparer's 2 MiB ceiling while loading;
+an extra byte or a later file exceeding the remaining allowance refuses.
+Sources are not printed. Complete candidate validation and publication share
+one absolute ten-second DNS/network deadline after cold file loading.
+
+`config-check --connection-file PATH --epoch HEX --version HEX` loads the
+exact stored version and repeats current material/provider validation. It
+needs no local source files and never falls back to them. Both commands emit
+bounded JSON with epoch, version, digest and profile count on success, and
+explicitly report profile_activated=false. Errors expose fixed categories,
+not paths, credentials, source values or provider text. Exit status is zero
+for success, one for validation/database/input refusal and two for arguments.
+Only definite transport refusal permits another resolved address, under the
+original deadline. Indeterminate publication stops and reports
+indeterminate-retain-version. Keep the same ID and source set, wait for the
+original operation to settle, then check/retry that retained version. A
+failed check (including changed or missing material) is not evidence that a
+previous publication rolled back. Never allocate another ID to hide an
+uncertain result. These owner commands do not supply runtime privileges,
+listener activation or PostgreSQL serving admission.
