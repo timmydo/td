@@ -115,6 +115,23 @@ pub(crate) fn with_mailbox_client<T>(
     )
 }
 
+// At most 256 Email rows and 257 distinct mailbox rows, with protocol overhead.
+pub(crate) fn with_mutation_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        128 * 1024,
+        Input::mutations(),
+        operation,
+    )
+}
+
 // Explicit owner DDL needs more command completions than a probe.
 pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,

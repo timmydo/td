@@ -38,6 +38,13 @@ impl Input {
         }
     }
 
+    pub(super) fn mutations() -> Self {
+        Self {
+            frames: 1024,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn body() -> Self {
         Self {
             bytes: 128 * 1024 * 1024,
@@ -221,6 +228,26 @@ mod tests {
             assert!(input.accept(&frame(b'D', &[0; 128 * 1024 - 4])).is_ok());
         }
         assert!(input.accept(&frame(b'D', &[0; 128 * 1024 - 4])).is_err());
+    }
+
+    #[test]
+    fn mutation_budget_is_finite_and_keeps_authentication_and_byte_limits() {
+        let mut input = Input::mutations();
+        for _ in 0..1024 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::mutations().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::mutations()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        let mut input = Input::mutations();
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        for _ in 0..7 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
     }
 
     #[test]

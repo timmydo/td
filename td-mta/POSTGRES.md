@@ -553,8 +553,8 @@ fixed; version 2 adds src/postgres_materials.sql and version 3 adds
 src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
 adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
 version 7 adds src/postgres_selection.sql, and version 8 adds
-src/postgres_flags.sql.
-New initialization applies all eight in
+src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
+New initialization applies all nine in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -572,7 +572,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the eight migrations and their ledger writes;
+permits 512 input frames for the nine migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -587,8 +587,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently nine rows); it requires
-exactly the eight ordered migration versions, their compiled DDL checksums and
+count plus one (currently ten rows); it requires
+exactly the nine ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -619,7 +619,7 @@ selection and flag receipt relations with an initially empty passive configurati
 pointer, but no runtime role or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 8, or reports an
+PATH` applies every missing migration through version 9, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -1319,7 +1319,8 @@ cutover work.
 
 Schema version 8 adds owner-private flag_receipts. The cold postgres_flags
 boundary assigns optional seen/starred values to one existing Email. It is
-not wired to production JMAP, and does not implement batching or mailbox moves.
+not wired to production JMAP. Section 33 adds separate batch entry points;
+mailbox moves remain unimplemented.
 Preparation binds an unpredictable operation ID and canonical digest to the
 profile binding, account, device, Email, optional expected sequence and flag
 assignments. The retained object contains no app password.
@@ -1346,3 +1347,38 @@ unbounded recovery promise. Runtime retention/retry policy and bulk JMAP
 mapping remain cutover work. All calls retain finite worker/deadline limits.
 An inspection that crosses its deadline refuses absence/errors, but preserves
 a confirmed historical receipt as known success.
+
+
+## 33. Bounded flag batches
+
+Schema 9 adds per-Email results to the shared flag receipt relation; prior
+single-Email receipts retain their digest and state and gain one Updated
+result. Existing DDL remains unchanged. The single-Email API preserves its
+request digest framing, missing-Email refusal and result shape.
+
+postgres_flags::prepare_batch accepts at most 256 unique Email IDs in request
+order, with optional seen/star assignments and one optional expected state.
+The batch has one retained random operation and a separate digest domain.
+inspect_batch and publish_batch return per-Email Updated or NotFound results
+in request order, plus the original and resulting account sequence. Empty
+batches, missing Emails and already-satisfied assignments do not advance the
+sequence; their result is still retained. State mismatch refuses the whole
+batch. Single and batch entry points reject each other's prepared operations.
+
+One transaction and the existing policy/account/device fences cover the whole
+batch. Set-oriented array queries load at most 256 Email rows and 257 distinct
+Mailbox rows including the overflow sentinel. At most 256 affected Mailboxes
+are admitted. Keyword writes and history use bounded arrays rather than a
+round trip per Email. A changed batch advances state exactly once. Each changed
+Email and each affected Mailbox receives one history entry, even when several
+Emails share a Mailbox; Thread history is unchanged. Receipt results, history,
+flags and state commit together. The 1024-receipt account limit covers both
+single and batch operations. Lost COMMIT recovery retains the full result.
+
+The closed mutation worker admits 1024 input frames, one MiB total input,
+128 KiB per frame and 128 KiB output. Both single-Email and batch publication
+use this worker. Other workers retain their own bounds;
+SCRAM qualification and the original ten-second maximum deadline are unchanged.
+The finite larger frame count covers the two result sets and protocol overhead.
+Production JMAP dispatch, mailbox moves and serving retention remain cutover
+work; this API is not a public authentication endpoint.
