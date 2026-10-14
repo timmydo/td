@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 1);
+    assert_eq!(receipt.version, 2);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -361,12 +361,15 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
     );
-    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2");
+    sql(
+        &fixture,
+        "UPDATE td_mta.schema_migrations SET version = 99 WHERE version = 2",
+    );
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()),
         Err(SchemaError::Version)
     );
-    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 1, checksum = pg_catalog.decode(pg_catalog.repeat('00',32), 'hex')");
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2, checksum = pg_catalog.decode(pg_catalog.repeat('00',32), 'hex') WHERE version = 99");
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()),
         Err(SchemaError::Version)
@@ -379,8 +382,8 @@ fn real_postgres_schema_commit_timeout_reports_uncertainty() {
     use td_mta::postgres_schema::{initialize, inspect, Error as SchemaError};
     let fixture = Fixture::new();
     let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    sql(&fixture, "CREATE FUNCTION public.delay_schema_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$;
-CREATE FUNCTION public.install_schema_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'CREATE CONSTRAINT TRIGGER td_delay AFTER INSERT ON td_mta.schema_migrations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_schema_commit()'; END $$;
+    sql(&fixture, "CREATE FUNCTION public.delay_schema_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version = 1 THEN PERFORM pg_catalog.pg_sleep(6); END IF; RETURN NEW; END $$;
+CREATE FUNCTION public.install_schema_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname = 'td_delay') THEN EXECUTE 'CREATE CONSTRAINT TRIGGER td_delay AFTER INSERT ON td_mta.schema_migrations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_schema_commit()'; END IF; END $$;
 CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.install_schema_delay()");
     assert_eq!(
         initialize(
@@ -408,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        1
+        2
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -533,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":1"));
+    assert!(initialized.contains("\"schema_version\":2"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -542,11 +545,18 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
         initialized.replace("postgres-schema-init", "postgres-schema-inspect"),
         inspected
     );
+    assert_eq!(
+        invoke("schema-upgrade", 0),
+        initialized.replace("postgres-schema-init", "postgres-schema-upgrade")
+    );
     assert!(invoke("schema-init", 1).contains("namespace-exists"));
     let mut held = hold_schema_lock(&fixture, false);
     assert!(invoke("schema-inspect", 1).contains("migration-busy"));
     wait_command(&mut held);
-    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2");
+    sql(
+        &fixture,
+        "UPDATE td_mta.schema_migrations SET version = 99 WHERE version = 2",
+    );
     assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(invoke("schema-init", 1).contains("input-private-mode"));
@@ -555,7 +565,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
 #[test]
 fn schema_commands_refuse_profiles_and_secret_arguments_without_echoing_them() {
     let root = TempDir::new("pg-schema-command-refusal").unwrap();
-    for operation in ["schema-init", "schema-inspect"] {
+    for operation in ["schema-init", "schema-inspect", "schema-upgrade"] {
         for flags in [
             vec!["--password", "private-secret"],
             vec![
@@ -653,4 +663,348 @@ fn real_postgres_requires_tls_scram_primary_settings_and_reconnects() {
         status
     );
     fixture.stop();
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
+    use td_crypto::Digest;
+    use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let ddl = include_str!("../src/postgres_schema.sql");
+    let mut hash = Provider.sha256().unwrap();
+    hash.update(ddl.as_bytes()).unwrap();
+    let digest: String = hash
+        .finish()
+        .unwrap()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    sql(&fixture, &format!("{ddl} INSERT INTO td_mta.schema_migrations VALUES (1, pg_catalog.decode('{digest}','hex'), pg_catalog.decode(pg_catalog.repeat('01',16),'hex'))"));
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Version)
+    );
+    sql(&fixture, "CREATE ROLE material_outsider; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO material_outsider");
+    assert_eq!(
+        upgrade(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Invalid)
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.schema_migrations"),
+        "1"
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'td_mta' AND c.relname = 'config_materials'"), "0");
+    sql(
+        &fixture,
+        "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM material_outsider",
+    );
+    let mut held = hold_schema_lock(&fixture, true);
+    assert_eq!(
+        upgrade(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Busy)
+    );
+    wait_command(&mut held);
+    let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
+    assert_eq!(receipt.version, 2);
+    assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
+    assert_eq!(
+        upgrade(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET store_epoch = pg_catalog.decode(pg_catalog.repeat('02',16),'hex') WHERE version = 2");
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Version)
+    );
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_materials_round_trip_bounds_immutability_and_integrity() {
+    use td_mta::{
+        ids::StoreEpoch,
+        postgres_materials::{self as materials, Kind, Version},
+        postgres_schema,
+    };
+    let mut fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    for kind in [
+        Kind::RelayPassword,
+        Kind::CertificateChain,
+        Kind::PrivateKey,
+        Kind::TrustBundle,
+        Kind::TextSignature,
+        Kind::HtmlSignature,
+    ] {
+        let bytes: Vec<u8> = (0..kind.max_bytes()).map(|i| (i % 251) as u8).collect();
+        let version = Version::from_bytes([kind as u8; 16]);
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            version,
+            kind,
+            &bytes,
+        )
+        .unwrap();
+        let value =
+            materials::read(&fixture.request(), &trust, deadline(), epoch, version, kind).unwrap();
+        assert_eq!(value.kind(), kind);
+        assert_eq!(value.bytes(), bytes);
+        assert_eq!(
+            materials::insert(
+                &fixture.request(),
+                &trust,
+                deadline(),
+                epoch,
+                version,
+                kind,
+                b"replacement"
+            ),
+            Err(materials::Error::Database)
+        );
+        assert!(matches!(
+            materials::read(
+                &fixture.request(),
+                &trust,
+                deadline(),
+                epoch,
+                version,
+                if kind == Kind::PrivateKey {
+                    Kind::TrustBundle
+                } else {
+                    Kind::PrivateKey
+                }
+            ),
+            Err(materials::Error::Kind)
+        ));
+        assert_eq!(
+            materials::read(&fixture.request(), &trust, deadline(), epoch, version, kind)
+                .unwrap()
+                .bytes(),
+            bytes
+        );
+    }
+    let empty = materials::fresh_version().unwrap();
+    materials::insert(
+        &fixture.request(),
+        &trust,
+        deadline(),
+        epoch,
+        empty,
+        Kind::TextSignature,
+        b"",
+    )
+    .unwrap();
+    assert!(materials::read(
+        &fixture.request(),
+        &trust,
+        deadline(),
+        epoch,
+        empty,
+        Kind::TextSignature
+    )
+    .unwrap()
+    .bytes()
+    .is_empty());
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            empty,
+            Kind::PrivateKey,
+            b""
+        ),
+        Err(materials::Error::Invalid)
+    );
+    let absent = materials::fresh_version().unwrap();
+    assert!(matches!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            absent,
+            Kind::PrivateKey
+        ),
+        Err(materials::Error::Missing)
+    ));
+    let stale = StoreEpoch::from_bytes([42; 16]);
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            stale,
+            absent,
+            Kind::PrivateKey,
+            b"private"
+        ),
+        Err(materials::Error::Epoch)
+    );
+    assert!(matches!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            stale,
+            empty,
+            Kind::TextSignature
+        ),
+        Err(materials::Error::Epoch)
+    ));
+    fixture.stop();
+    fixture.start(true, false);
+    let trust_version = Version::from_bytes([Kind::TrustBundle as u8; 16]);
+    assert_eq!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            trust_version,
+            Kind::TrustBundle
+        )
+        .unwrap()
+        .bytes()
+        .len(),
+        131072
+    );
+    sql(&fixture, "UPDATE td_mta.config_material_chunks SET bytes = pg_catalog.set_byte(bytes,0,255) WHERE material_id = pg_catalog.decode(pg_catalog.repeat('04',16),'hex') AND ordinal = 1");
+    assert!(matches!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            trust_version,
+            Kind::TrustBundle
+        ),
+        Err(materials::Error::Integrity)
+    ));
+    sql(&fixture, "DELETE FROM td_mta.config_material_chunks WHERE material_id = pg_catalog.decode(pg_catalog.repeat('02',16),'hex')");
+    assert!(matches!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            Version::from_bytes([2; 16]),
+            Kind::CertificateChain
+        ),
+        Err(materials::Error::Integrity)
+    ));
+    let mut held = hold_schema_lock(&fixture, false);
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            absent,
+            Kind::PrivateKey,
+            b"private"
+        ),
+        Err(materials::Error::Schema(postgres_schema::Error::Busy))
+    );
+    wait_command(&mut held);
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
+    use td_mta::{
+        postgres_materials::{self as materials, Kind, Version},
+        postgres_schema,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    sql(&fixture, "CREATE FUNCTION public.reject_second_chunk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ordinal = 1 THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_chunk BEFORE INSERT ON td_mta.config_material_chunks FOR EACH ROW EXECUTE FUNCTION public.reject_second_chunk()");
+    let failed = Version::from_bytes([7; 16]);
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            failed,
+            Kind::TrustBundle,
+            &vec![42; 131072]
+        ),
+        Err(materials::Error::Database)
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.config_material_chunks"
+        ),
+        "0"
+    );
+    sql(&fixture, "DROP TRIGGER reject_chunk ON td_mta.config_material_chunks; CREATE FUNCTION public.delay_material_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_material AFTER INSERT ON td_mta.config_materials DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_material_commit()");
+    let uncertain = Version::from_bytes([8; 16]);
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            epoch,
+            uncertain,
+            Kind::PrivateKey,
+            b"opaque private material"
+        ),
+        Err(materials::Error::Indeterminate)
+    );
+    let stop = Instant::now() + Duration::from_secs(8);
+    while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name = 'td-mta-postgres'") != "0" {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        materials::read(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            uncertain,
+            Kind::PrivateKey
+        )
+        .unwrap()
+        .bytes(),
+        b"opaque private material"
+    );
+    assert_eq!(
+        materials::insert(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            uncertain,
+            Kind::PrivateKey,
+            b"different"
+        ),
+        Err(materials::Error::Database)
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
+        "1"
+    );
 }

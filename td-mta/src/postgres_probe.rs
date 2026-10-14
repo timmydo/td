@@ -75,6 +75,26 @@ pub(crate) fn with_client<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
+    with_output_limit(request, trust, deadline, 64 * 1024, operation)
+}
+
+// One bounded configuration-material operation, at most 128 KiB in two chunks.
+pub(crate) fn with_material_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(request, trust, deadline, 256 * 1024, operation)
+}
+
+fn with_output_limit<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
     let allowance = remaining(deadline)?;
     if allowance > MAX_DURATION
         || request.server_name.is_empty()
@@ -117,6 +137,7 @@ pub(crate) fn with_client<T>(
         session,
         clock,
         cap,
+        output_limit,
     };
     let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
     let mut context = Context::from_waker(&waker);
@@ -188,6 +209,7 @@ struct Connector {
     session: TlsSession,
     clock: Arc<dyn Clock>,
     cap: Deadline,
+    output_limit: usize,
 }
 
 impl tls::TlsConnect<Io<TcpTransport>> for Connector {
@@ -213,7 +235,9 @@ impl tls::TlsConnect<Io<TcpTransport>> for Connector {
                 Err(_) => Poll::Ready(Err(refused())),
             })
             .await?;
-            Ok(Io::new(secure, true))
+            let mut io = Io::new(secure, true);
+            io.output_left = self.output_limit;
+            Ok(io)
         })
     }
 }

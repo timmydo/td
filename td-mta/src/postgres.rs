@@ -11,6 +11,7 @@ use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres
 enum Operation {
     Probe,
     Initialize,
+    Upgrade,
     Inspect,
 }
 impl Operation {
@@ -18,6 +19,7 @@ impl Operation {
         match value.to_str()? {
             "probe" => Some(Self::Probe),
             "schema-init" => Some(Self::Initialize),
+            "schema-upgrade" => Some(Self::Upgrade),
             "schema-inspect" => Some(Self::Inspect),
             _ => None,
         }
@@ -26,6 +28,7 @@ impl Operation {
         match self {
             Self::Probe => "postgres-probe",
             Self::Initialize => "postgres-schema-init",
+            Self::Upgrade => "postgres-schema-upgrade",
             Self::Inspect => "postgres-schema-inspect",
         }
     }
@@ -131,6 +134,9 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
             Operation::Initialize => {
                 postgres_schema::initialize(&request, &loaded.trust, deadline).map(Outcome::Schema)
             }
+            Operation::Upgrade => {
+                postgres_schema::upgrade(&request, &loaded.trust, deadline).map(Outcome::Schema)
+            }
             Operation::Inspect => {
                 postgres_schema::inspect(&request, &loaded.trust, deadline).map(Outcome::Schema)
             }
@@ -195,7 +201,7 @@ mod tests {
     }
     #[test]
     fn schema_operations_do_not_take_a_profile() {
-        for operation in ["schema-init", "schema-inspect"] {
+        for operation in ["schema-init", "schema-inspect", "schema-upgrade"] {
             assert!(parse(&[operation, "--connection-file", "/private/db"]).is_some());
             assert!(parse(&[
                 operation,

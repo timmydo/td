@@ -531,11 +531,12 @@ restart/reconnect and connection-file mode refusal.
 ## 13. Prepared schema ledger
 
 `postgres_schema::initialize` is an explicit schema-owner operation used by
-section 14's preparation command; no serving path calls it. Its current server contract is
-PostgreSQL major 17, qualified locally on 17.10. Other majors refuse until
-separately qualified. It creates only the first preparation ledger, not a
-complete mail/configuration schema or runtime role. Serving still cannot
-select PostgreSQL. The owner credential is separate from the future runtime
+section 14's preparation command; no serving path calls it. Its current
+server contract is PostgreSQL major 17, qualified locally on 17.10. Other
+majors refuse until separately qualified. It creates the preparation ledger
+and section 16's configuration-material tables, not a complete
+mail/configuration schema or runtime role. Serving still cannot select
+PostgreSQL. The owner credential is separate from the future runtime
 credential; no owner credential is installed into a serving pool here.
 
 The operation verifies the same writable-primary/durability settings as the
@@ -543,56 +544,74 @@ probe, begins one transaction, sets synchronous_commit=on, and takes an
 exclusive transaction-level try-lock on the bigint migration key
 0x74646d7461000001. Conflict returns Busy without waiting. It refuses any
 existing td_mta namespace, even an empty one. The committed SQL in
-src/postgres_schema.sql creates that schema and its schema_migrations ledger.
-Version 1 records the exact DDL's SHA-256 and a fresh 128-bit store epoch in
-one row with fixed length constraints. PUBLIC grants are revoked; inherited
-schema/table grants to other roles refuse initialization and roll back.
-Explicit runtime grants and application tables are later preparation work.
+src/postgres_schema.sql creates that schema and its schema_migrations
+ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
+store epoch in a ledger row. Version 1's committed SQL and checksum remain
+fixed; version 2 adds src/postgres_materials.sql. New initialization applies
+both in one transaction. PUBLIC grants are revoked; inherited
+schema/relation grants to other roles refuse initialization and roll back.
+Explicit runtime grants and mail/application configuration tables remain
+preparation work.
+
+`postgres_schema::upgrade` uses an explicit owner credential and the same
+exclusive transaction migration lock. It validates all existing checksums
+and the common epoch before applying the missing version-2 migration. A
+compatible current ledger returns its receipt without another write.
+Unknown, missing, changed or inconsistent ledger history refuses. Migration
+preserves the epoch and commits the DDL and ledger row together. A failed
+migration rolls back, leaving version 1 intact; that old version cannot
+serve version-2 operations. Post-COMMIT uncertainty has the same no-replay
+rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte/frame caps. Fixed SQL and typed
 parameters are private to the crate; arbitrary driver execution is not a
-public API. Errors before COMMIT drop the session and leave no committed
-namespace. Once COMMIT may have been sent, a lost response or deadline is
-Indeterminate, never a safe-to-retry refusal. A known successful commit
-retains its receipt even if completing that poll crosses the deadline.
-There is no automatic replay or uncertainty resolver in this preparation
-API. An operator must resolve database state before another initialization.
+public API. Initialization errors before COMMIT drop the session and leave
+no committed namespace; migration errors preserve the previous schema. Once
+COMMIT may have been sent, a lost response or deadline is Indeterminate,
+never a safe-to-retry refusal. A known successful commit retains its receipt
+even if completing that poll crosses the deadline. There is no automatic
+replay or uncertainty resolver in this preparation API. An operator must
+resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
-try-lock before reading the ledger. It requires exactly one bounded row,
-version 1, the compiled DDL checksum and a 16-byte epoch, and checks its final
-deadline before returning. It closes the session and lock before returning;
-the receipt grants no authority for later SQL on another connection. This
-checks the recorded ledger, not every catalog object or evidence against a
-malicious schema owner. The future serving connection must retain its own
-shared lock throughout its lifetime and validate the complete serving schema.
+try-lock before reading the ledger. It reads at most three rows and requires
+exactly the two ordered migration versions, their compiled DDL checksums and
+one common 16-byte epoch. It checks its final deadline before returning. It
+closes the session and lock before returning; the receipt grants no
+authority for later SQL on another connection. This checks the recorded
+ledger, not every catalog object or evidence against a malicious schema
+owner. The future serving connection must retain its own shared lock
+throughout its lifetime and validate the complete serving schema.
 
 The real PostgreSQL schema fixture checks existing-namespace refusal,
-rollback after inherited-grant refusal, shared/exclusive migration conflicts,
-initialization/inspection, restart persistence and version/checksum refusal.
-A second fixture delays COMMIT with a disposable deferred trigger, observes
-Indeterminate at the client deadline, then inspects the committed ledger
-after the original session ends and verifies that another initialization
-refuses. A database commit can outlive the client deadline and disconnect;
-the configured statement timeout does not establish rollback. Neither fixture
-uses an existing database. They require the section 8 tools, including psql.
-The advisory-lock lifetime/conflict behavior follows PostgreSQL's
-[advisory-lock functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS).
+rollback after inherited-grant refusal, shared/exclusive migration
+conflicts, initialization/inspection, restart persistence and
+version/checksum refusal. A second fixture delays COMMIT with a disposable
+deferred trigger, observes Indeterminate at the client deadline, then
+inspects the committed ledger after the original session ends and verifies
+that another initialization refuses. A database commit can outlive the
+client deadline and disconnect; the configured statement timeout does not
+establish rollback. Neither fixture uses an existing database. They require
+the section 8 tools, including psql. The advisory-lock lifetime/conflict
+behavior follows PostgreSQL's [advisory-lock
+functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS).
 
 ## 14. Operator schema preparation
 
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
 section 13's preparation ledger using a separately provisioned schema-owner
 login. It refuses every existing td_mta namespace. It creates no mail store,
-application configuration, runtime role or listener. The matching
-`td-mta postgres schema-inspect --connection-file PATH` checks the ledger
-under its shared migration lock. Neither command takes a profile: the
+application configuration, runtime role or listener. The matching `td-mta
+postgres schema-inspect --connection-file PATH` checks the ledger under its
+shared migration lock. `td-mta postgres schema-upgrade --connection-file
+PATH` applies the known owner migration from version 1 to 2, or reports an
+already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
-Both commands use the same protected bootstrap, verified TLS/SCRAM, fresh
-bounded DNS lookup and shared ten-second network deadline as the probe.
-They try another resolved address only on a definite transport refusal before
+These commands use the same protected bootstrap, verified TLS/SCRAM, fresh
+bounded DNS lookup and shared ten-second network deadline as the probe. They
+try another resolved address only on a definite transport refusal before
 COMMIT; the schema worker converts every connection loss after COMMIT may
 have been sent to Indeterminate. No schema error, migration conflict or
 uncertain commit is retried. Exit codes remain zero for success, one for
@@ -601,15 +620,16 @@ never enter the fixed JSON diagnostics.
 
 Success returns schema_version and store_epoch with ledger_checked true,
 serving_schema_checked false and profile_checked false. An
-indeterminate-do-not-retry result means the original backend may still commit;
-wait for that operation to settle and inspect database state before another
-explicit initialization. An immediate missing-ledger inspection is not proof
-of rollback. A failed stdout write can also lose a successful receipt; do
-not interpret a missing command response as permission to replay.
+indeterminate-do-not-retry result means the original backend may still
+commit; wait for that operation to settle and inspect database state before
+another explicit initialization. An immediate missing-ledger inspection is
+not proof of rollback. A failed stdout write can also lose a successful
+receipt; do not interpret a missing command response as permission to
+replay.
 
 These commands qualify only the preparation ledger, not complete schema
-integrity or operational mail service. Future application schema migrations
-and profile publication remain separate explicit operations.
+integrity or operational mail service. Future mail schema migrations and
+profile publication remain separate explicit operations.
 
 ## 15. Prepared instance role validation
 
@@ -619,15 +639,77 @@ refuse decoding. These values are structural declarations, never proof of
 runtime support or authorization. No database profile is stored or activated
 by this preparation API.
 
-`config::listener::Builder::finish_for_roles` requires SMTP listeners exactly
-when receiving is selected and HTTPS listeners exactly when JMAP is selected.
-A relay-only profile has no inbound listeners; HTTP-01 requires receiving or
-JMAP. Each profile retains the existing listener syntax, duplicate/bind
-checks and aggregate SMTP session limits. A disabled role cannot be enabled
-by merely adding its listener. Sticky builder failures remain terminal.
+`config::listener::Builder::finish_for_roles` requires SMTP listeners
+exactly when receiving is selected and HTTPS listeners exactly when JMAP is
+selected. A relay-only profile has no inbound listeners; HTTP-01 requires
+receiving or JMAP. Each profile retains the existing listener syntax,
+duplicate/bind checks and aggregate SMTP session limits. A disabled role
+cannot be enabled by merely adding its listener. Sticky builder failures
+remain terminal.
 
-The existing file configuration still uses `finish`, requiring both receiving
-and JMAP as before. The new entry point is not wired into it or serving.
-Future database generation validation must bind these role selections to
-account, certificate, routing and resource references, verify implemented
-capabilities, and validate the entire generation before publication.
+The existing file configuration still uses `finish`, requiring both
+receiving and JMAP as before. The new entry point is not wired into it or
+serving. Future database generation validation must bind these role
+selections to account, certificate, routing and resource references, verify
+implemented capabilities, and validate the entire generation before
+publication.
+
+## 16. Prepared versioned configuration material
+
+Schema version 2 adds owner-private config_materials manifests and
+config_material_chunks. `postgres_materials::insert` appends one explicit
+128-bit version and its immutable raw bytes in one durable transaction.
+`fresh_version` supplies random identifiers; a duplicate primary key refuses
+without replacing bytes. The caller retains its version before entry so a
+lost commit receipt does not force another identity. There is no update,
+delete, activation or public administration endpoint here. No service path
+consumes these records yet.
+
+The closed kinds and raw input ceilings are relay password (1026 bytes),
+certificate chain (64 KiB), private key (16 KiB), explicit trust bundle (128
+KiB), and text/HTML signature (16 KiB each). Only signatures may be empty.
+These match existing raw input limits, including optional password line
+endings. Storage validates size and kind, not text/PEM syntax, key validity,
+certificate names or cross-references. Complete generation admission must
+still run those checks before selecting a value. A stored reference cannot
+substitute one kind for another.
+
+Each manifest stores kind, length, SHA-256 and chunk count; each chunk holds
+at most 64 KiB with an ordinal. Reads select one exact version and expected
+kind under a read-only repeatable-read snapshot. The worker requires exact
+contiguous ordinals, full non-final chunks, exact total length/count and a
+matching digest before exposing any bytes. It reads at most two manifest
+rows and three chunk rows to detect unexpected extras. SQL constraints bound
+individual rows; the typed writer/read verifier establish aggregate shape.
+
+Every operation qualifies the primary and obtains the shared session schema
+lock, validates the complete current ledger and checks the caller's expected
+store epoch on that same connection. It retains the session through all SQL
+and byte verification. Writes use synchronous_commit=on; the manifest and
+chunks commit together. Failures before COMMIT roll back. Once COMMIT may
+have been sent, a lost response is Indeterminate. After the original backend
+settles, read the retained version and compare the intended bytes; absence
+while that backend may still commit is not proof of rollback. There is no
+automatic replay, uncertainty resolver or permission to pick a fresh version
+and duplicate an uncertain write.
+
+Material operations retain the ten-second worker deadline, five-second
+statement timeout, one-second lock timeout, 128-KiB backend-frame bound,
+128-frame count and one-MiB input cap. Their post-TLS output cap is 256 KiB
+to carry a maximal trust bundle plus fixed SQL/authentication overhead;
+probe and schema operations retain 64 KiB. Each operation owns a cold,
+fallibly reserved copy of at most 128 KiB; driver encodings/row buffers and
+TLS/provider allocations are additional bounded inputs, not a complete RSS
+qualification. The returned Material owner intentionally has no Debug
+implementation, and errors contain no input bytes or SQL/provider
+diagnostics. Dropping memory does not claim secure erasure. Database owners,
+backups and authorized processes remain inside the service-secret trust
+boundary of section 2; these values confer no td human login or elevation
+authority.
+
+Real PostgreSQL fixtures cover version-1 migration with preserved epoch,
+rollback after inherited grants, migration-lock refusal, all raw input
+limits, empty signatures, duplicate immutability, kind/epoch refusal,
+restart persistence, chunk corruption/missing data, mid-write rollback and
+lost-COMMIT resolution using the original version. They use only disposable
+local clusters and do not qualify Azure/RDS or configuration activation.

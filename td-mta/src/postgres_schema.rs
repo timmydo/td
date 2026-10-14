@@ -13,8 +13,11 @@ use std::{
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
-const DDL: &str = include_str!("postgres_schema.sql");
-const VERSION: i32 = 1;
+const MIGRATIONS: &[&str] = &[
+    include_str!("postgres_schema.sql"),
+    include_str!("postgres_materials.sql"),
+];
+const VERSION: u32 = 2;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,
@@ -25,8 +28,7 @@ const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace,
     LATERAL pg_catalog.aclexplode(COALESCE(c.relacl,
         pg_catalog.acldefault('r', c.relowner))) a
-    WHERE n.nspname = 'td_mta' AND c.relname = 'schema_migrations'
-        AND a.grantee <> c.relowner
+    WHERE n.nspname = 'td_mta' AND a.grantee <> c.relowner
 )";
 // Shared by every future serving connection and explicit schema operation.
 pub const MIGRATION_KEY: i64 = 0x7464_6d74_6100_0001;
@@ -51,17 +53,40 @@ pub struct Receipt {
 }
 
 /// Requires an explicit schema-owner credential. Refuses any existing td_mta
-/// namespace, even an empty one. This ledger alone is not a serving schema.
+/// namespace, even an empty one. This remains a preparation schema.
 pub fn initialize(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Receipt, Error> {
-    let checksum = checksum()?;
     let mut epoch = [0; 16];
     SystemEntropy::try_new()
         .and_then(|mut entropy| entropy.fill(&mut epoch))
         .map_err(|_| Error::Crypto)?;
+    write_schema(
+        request,
+        trust,
+        deadline,
+        Some(StoreEpoch::from_bytes(epoch)),
+    )
+}
+
+/// Explicit owner migration. Validate every prior checksum before any DDL.
+/// A current compatible ledger returns its receipt without another write.
+pub fn upgrade(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+) -> Result<Receipt, Error> {
+    write_schema(request, trust, deadline, None)
+}
+
+fn write_schema(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    fresh_epoch: Option<StoreEpoch>,
+) -> Result<Receipt, Error> {
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_client(request, trust, deadline, move |client| {
@@ -83,30 +108,44 @@ pub fn initialize(
             if !locked {
                 return Err(Error::Busy);
             }
-            let exists: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta')", &[])
-            .await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
-            if exists {
-                return Err(Error::Exists);
-            }
-            client
-                .batch_execute(DDL)
-                .await
-                .map_err(|_| Error::Database)?;
-            // Refuse inherited default ACLs granting another role access. The
-            // runtime role and its narrowly scoped grants are not installed yet.
-            let private: bool = client
-                .query_one(PRIVATE_ACL, &[])
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Invalid)?;
-            if !private {
-                return Err(Error::Invalid);
-            }
-            let rows = client.execute("INSERT INTO td_mta.schema_migrations (version, checksum, store_epoch) VALUES ($1, $2, $3)", &[&VERSION, &checksum.as_slice(), &epoch.as_slice()])
-            .await.map_err(|_| Error::Database)?;
-            if rows != 1 {
-                return Err(Error::Invalid);
+            let (start, epoch) = if let Some(epoch) = fresh_epoch {
+                let exists: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta')", &[])
+                    .await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Invalid)?;
+                if exists {
+                    return Err(Error::Exists);
+                }
+                (0, epoch)
+            } else {
+                let receipt = ledger(client, false).await?;
+                if receipt.version == VERSION {
+                    return Ok(receipt);
+                }
+                (
+                    usize::try_from(receipt.version).map_err(|_| Error::Version)?,
+                    receipt.store_epoch,
+                )
+            };
+            for (index, ddl) in MIGRATIONS.iter().enumerate().skip(start) {
+                let version = i32::try_from(index + 1).map_err(|_| Error::Version)?;
+                let checksum = checksum(ddl)?;
+                client
+                    .batch_execute(ddl)
+                    .await
+                    .map_err(|_| Error::Database)?;
+                let private: bool = client
+                    .query_one(PRIVATE_ACL, &[])
+                    .await
+                    .map_err(|_| Error::Database)?
+                    .try_get(0)
+                    .map_err(|_| Error::Invalid)?;
+                if !private {
+                    return Err(Error::Invalid);
+                }
+                let rows = client.execute("INSERT INTO td_mta.schema_migrations (version, checksum, store_epoch) VALUES ($1, $2, $3)", &[&version, &checksum.as_slice(), &epoch.as_bytes().as_slice()])
+                    .await.map_err(|_| Error::Database)?;
+                if rows != 1 {
+                    return Err(Error::Invalid);
+                }
             }
             marker.store(true, Ordering::Relaxed);
             client
@@ -114,70 +153,85 @@ pub fn initialize(
                 .await
                 .map_err(|_| Error::Indeterminate)?;
             Ok(Receipt {
-                version: VERSION as u32,
-                store_epoch: StoreEpoch::from_bytes(epoch),
+                version: VERSION,
+                store_epoch: epoch,
             })
         })
     });
     match result {
+        Ok(Ok(_)) if !attempted.load(Ordering::Relaxed) && Instant::now() >= deadline => {
+            Err(Error::Connection(postgres_probe::Error::Deadline))
+        }
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),
         Err(error) => Err(Error::Connection(error)),
     }
 }
 
-/// Inspect one ledger while retaining a shared session-level migration lock.
-/// The connection and lock close before this returns; it grants no authority
-/// to perform later application SQL on another connection.
+/// Inspect the complete ledger under a shared session migration lock. The
+/// connection closes before return; its receipt grants no later SQL authority.
 pub fn inspect(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Receipt, Error> {
-    let checksum = checksum()?;
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
-        Box::pin(async move {
-            version(client).await?;
-            let locked: bool = client
-                .query_one(
-                    "SELECT pg_catalog.pg_try_advisory_lock_shared($1)",
-                    &[&MIGRATION_KEY],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Invalid)?;
-            if !locked {
-                return Err(Error::Busy);
-            }
-            let rows = client
-                .query(
-                    "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations LIMIT 2",
-                    &[],
-                )
-                .await
-                .map_err(|_| Error::Database)?;
-            if rows.len() != 1 {
-                return Err(Error::Invalid);
-            }
-            let row = rows.first().ok_or(Error::Invalid)?;
-            let version: i32 = row.try_get(0).map_err(|_| Error::Invalid)?;
-            let stored: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
-            let epoch: &[u8] = row.try_get(2).map_err(|_| Error::Invalid)?;
-            if version != VERSION || stored != checksum {
-                return Err(Error::Version);
-            }
-            Ok(Receipt {
-                version: VERSION as u32,
-                store_epoch: StoreEpoch::from_bytes(epoch.try_into().map_err(|_| Error::Invalid)?),
-            })
-        })
+    let result = postgres_probe::with_client(request, trust, deadline, |client| {
+        Box::pin(lock_and_inspect(client))
     })
     .map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     result
+}
+
+/// The caller must retain this same session through all application SQL.
+pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    version(client).await?;
+    let locked: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_try_advisory_lock_shared($1)",
+            &[&MIGRATION_KEY],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Invalid)?;
+    if !locked {
+        return Err(Error::Busy);
+    }
+    ledger(client, true).await
+}
+
+async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
+    let rows = client.query(
+        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT 3", &[])
+        .await.map_err(|_| Error::Database)?;
+    if rows.is_empty()
+        || rows.len() > MIGRATIONS.len()
+        || (require_current && rows.len() != MIGRATIONS.len())
+    {
+        return Err(Error::Version);
+    }
+    let mut epoch = None;
+    for (index, row) in rows.iter().enumerate() {
+        let version: i32 = row.try_get(0).map_err(|_| Error::Invalid)?;
+        let stored: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
+        let raw: &[u8] = row.try_get(2).map_err(|_| Error::Invalid)?;
+        let current = StoreEpoch::from_bytes(raw.try_into().map_err(|_| Error::Invalid)?);
+        let ddl = MIGRATIONS.get(index).ok_or(Error::Version)?;
+        if version != i32::try_from(index + 1).map_err(|_| Error::Version)?
+            || stored != checksum(ddl)?
+            || epoch.is_some_and(|prior| prior != current)
+        {
+            return Err(Error::Version);
+        }
+        epoch = Some(current);
+    }
+    Ok(Receipt {
+        version: u32::try_from(rows.len()).map_err(|_| Error::Version)?,
+        store_epoch: epoch.ok_or(Error::Invalid)?,
+    })
 }
 
 async fn version(client: &Client) -> Result<(), Error> {
@@ -190,8 +244,8 @@ async fn version(client: &Client) -> Result<(), Error> {
     Ok(())
 }
 
-fn checksum() -> Result<[u8; 32], Error> {
+fn checksum(ddl: &str) -> Result<[u8; 32], Error> {
     let mut digest = Provider.sha256().map_err(|_| Error::Crypto)?;
-    digest.update(DDL.as_bytes()).map_err(|_| Error::Crypto)?;
+    digest.update(ddl.as_bytes()).map_err(|_| Error::Crypto)?;
     digest.finish().map_err(|_| Error::Crypto)
 }
