@@ -391,9 +391,10 @@ The framing boundary follows the
 
 `postgres_bootstrap::Bootstrap::parse` is a pure parser for a protected
 connection specification and profile name. It performs no file access,
-environment lookup, DNS, connection or service activation. Reading protected
-inputs, resolving the writer and loading a database profile remain separate
-startup work. Never put its secret-bearing input in argv or diagnostics.
+environment lookup, DNS, connection or service activation. Sections 10 and 11
+provide separate resolver and protected-file workers; loading a database
+profile remains startup work. Never put its secret-bearing input in argv or
+diagnostics.
 Neither the parsed value nor the connection request implements Debug.
 
 The initial syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE`
@@ -456,3 +457,41 @@ binary and resolves localhost twice, without external DNS or an operator
 database. It requires the host name-service configuration; hermetic suites
 still run the resolver deadline/argument checks without that dependency. Cloud DNS
 failover and writer reconnection remain separate qualification work.
+
+## 11. Implemented protected bootstrap loading
+
+`postgres_input::Loaded::open` reads a connection file and constructs its
+TLS trust store without DNS, database access or service admission. It takes
+the file path and profile, never a password argument. No command selects it
+yet. The file's parent must satisfy the existing `PrivateRoot` contract:
+mode 0700, non-root owner, absolute normalized path within `MAX_ROOT_BYTES`,
+no symlinks and only root/owner ancestors without shared write permissions.
+The supervisor must run as that dedicated owner; std does not verify the
+process UID. Namespace writers and mount authority are trusted, paths remain
+stable, and checks do not defend against hostile pathname races. Opening
+this directory acquires no store lock and creates no local database.
+
+The existing `operator_files::Inputs` boundary checks the connection as a
+regular secret input (0400 or 0600) and binds all input ownership to that
+parent. The URI is at most 16 KiB, optionally followed by one LF or CRLF.
+Other whitespace, comments, extra lines and invalid UTF-8 refuse. The reader
+retains at most 16 KiB plus three bytes of source scratch before parsing;
+parsed credentials are separate bounded allocations. It makes no secure
+memory-erasure claim.
+
+An explicit sslrootcert is opened as a public input under the same owner
+and ancestor policy, including secret/public inode-alias refusal, and read
+with 128 KiB plus one byte of scratch. `TrustStore::from_pem` enforces its
+complete private-CA bundle contract. Explicit trust replaces public roots;
+missing, unreadable, oversized or invalid explicit trust never falls back.
+Without sslrootcert, only the facade's compiled public roots are loaded.
+Every failure is a fixed category, without file paths, file bytes or provider
+messages. Reads are bounded in bytes, not wall time: operator-provisioned
+regular files are cold trusted I/O, outside the network deadline.
+
+Unit tests cover line endings, decoding and bounded reads. The ignored
+`protected_files_enforce_modes_aliases_and_explicit_trust` host fixture
+requires a private TMPDIR under trusted ancestors and exercises actual file
+modes, symlinks, secret/public hard-link aliasing, trust replacement, missing
+trust and size refusal. It uses only a disposable TempDir and generated CA;
+ordinary sandbox tests do not assume host directory ownership.
