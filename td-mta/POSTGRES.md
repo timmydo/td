@@ -530,8 +530,8 @@ restart/reconnect and connection-file mode refusal.
 
 ## 13. Prepared schema ledger
 
-`postgres_schema::initialize` is an inert, explicit schema-owner operation;
-no command or serving path calls it. Its current server contract is
+`postgres_schema::initialize` is an explicit schema-owner operation used by
+section 14's preparation command; no serving path calls it. Its current server contract is
 PostgreSQL major 17, qualified locally on 17.10. Other majors refuse until
 separately qualified. It creates only the first preparation ledger, not a
 complete mail/configuration schema or runtime role. Serving still cannot
@@ -579,3 +579,34 @@ the configured statement timeout does not establish rollback. Neither fixture
 uses an existing database. They require the section 8 tools, including psql.
 The advisory-lock lifetime/conflict behavior follows PostgreSQL's
 [advisory-lock functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS).
+
+## 14. Operator schema preparation
+
+`td-mta postgres schema-init --connection-file PATH` explicitly initializes
+section 13's preparation ledger using a separately provisioned schema-owner
+login. It refuses every existing td_mta namespace. It creates no mail store,
+application configuration, runtime role or listener. The matching
+`td-mta postgres schema-inspect --connection-file PATH` checks the ledger
+under its shared migration lock. Neither command takes a profile: the
+namespace and epoch are deployment-wide.
+
+Both commands use the same protected bootstrap, verified TLS/SCRAM, fresh
+bounded DNS lookup and shared ten-second network deadline as the probe.
+They try another resolved address only on a definite transport refusal before
+COMMIT; the schema worker converts every connection loss after COMMIT may
+have been sent to Indeterminate. No schema error, migration conflict or
+uncertain commit is retried. Exit codes remain zero for success, one for
+failure and two for invalid arguments. Provider text and supplied arguments
+never enter the fixed JSON diagnostics.
+
+Success returns schema_version and store_epoch with ledger_checked true,
+serving_schema_checked false and profile_checked false. An
+indeterminate-do-not-retry result means the original backend may still commit;
+wait for that operation to settle and inspect database state before another
+explicit initialization. An immediate missing-ledger inspection is not proof
+of rollback. A failed stdout write can also lose a successful receipt; do
+not interpret a missing command response as permission to replay.
+
+These commands qualify only the preparation ledger, not complete schema
+integrity or operational mail service. Future application schema migrations
+and profile publication remain separate explicit operations.

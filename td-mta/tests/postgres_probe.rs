@@ -503,6 +503,84 @@ fn real_postgres_probe_command_loads_resolves_and_authenticates() {
     assert!(command_probe(&fixture, false).contains("input-private-mode"));
 }
 
+#[test]
+#[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
+fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca = fixture.root.join("ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let connection = fixture.root.join("connection");
+    let uri = format!(
+        "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+        std::str::from_utf8(PASSWORD).unwrap(),
+        fixture.port,
+        ca.display()
+    );
+    fs::write(&connection, uri).unwrap();
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    let invoke = |operation, status| {
+        command_output(
+            &[
+                "postgres",
+                operation,
+                "--connection-file",
+                connection.to_str().unwrap(),
+            ],
+            fixture.root.path(),
+            status,
+        )
+    };
+    assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
+    let initialized = invoke("schema-init", 0);
+    assert!(initialized.contains("\"schema_version\":1"));
+    assert!(initialized.contains(
+        "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
+    ));
+    let inspected = invoke("schema-inspect", 0);
+    assert_eq!(
+        initialized.replace("postgres-schema-init", "postgres-schema-inspect"),
+        inspected
+    );
+    assert!(invoke("schema-init", 1).contains("namespace-exists"));
+    let mut held = hold_schema_lock(&fixture, false);
+    assert!(invoke("schema-inspect", 1).contains("migration-busy"));
+    wait_command(&mut held);
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2");
+    assert!(invoke("schema-inspect", 1).contains("unsupported-version-or-checksum"));
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(invoke("schema-init", 1).contains("input-private-mode"));
+}
+
+#[test]
+fn schema_commands_refuse_profiles_and_secret_arguments_without_echoing_them() {
+    let root = TempDir::new("pg-schema-command-refusal").unwrap();
+    for operation in ["schema-init", "schema-inspect"] {
+        for flags in [
+            vec!["--password", "private-secret"],
+            vec![
+                "--connection-file",
+                "private-path",
+                "--profile",
+                "private-profile",
+            ],
+            vec![
+                "--connection-file",
+                "private-path",
+                "--connection-file",
+                "other-path",
+            ],
+        ] {
+            let mut args = vec!["postgres", operation];
+            args.extend(flags);
+            let text = command_output(&args, root.path(), 2);
+            assert!(text.contains("invalid-arguments"));
+            assert!(text.contains(&format!("postgres-{operation}")));
+            assert!(!text.contains("private-"));
+        }
+    }
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }

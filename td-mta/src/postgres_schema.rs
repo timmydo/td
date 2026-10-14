@@ -1,4 +1,4 @@
-//! Inert schema-ledger preparation. No command or serving path selects it.
+//! Explicit operator schema-ledger preparation; no serving path selects it.
 use crate::{
     ids::StoreEpoch,
     postgres_probe::{self, Request},
