@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 5);
+    assert_eq!(receipt.version, 6);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        5
+        6
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":5"));
+    assert!(initialized.contains("\"schema_version\":6"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 5);
+    assert_eq!(receipt.version, 6);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1209,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "22");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "23");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,7 +1303,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4] {
+    for previous_version in [2, 3, 4, 5] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1311,6 +1311,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_materials.sql"),
             include_str!("../src/postgres_mail.sql"),
             include_str!("../src/postgres_devices.sql"),
+            include_str!("../src/postgres_configuration.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1335,7 +1336,8 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         let obstruction = match previous_version {
             2 => "accounts",
             3 => "devices",
-            _ => "config_versions",
+            4 => "config_versions",
+            _ => "account_bootstraps",
         };
         sql(
             &fixture,
@@ -1351,7 +1353,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         );
         sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 5);
+        assert_eq!(receipt.version, 6);
         assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
         assert_eq!(
         sql(
@@ -2249,5 +2251,154 @@ fn configuration_commands_keep_versions_explicit_and_refusals_redacted() {
         );
         assert!(text.contains("invalid-arguments"));
         assert!(!text.contains("private-secret"));
+    }
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state() {
+    use td_mta::{
+        ids::{AccountId, StoreEpoch},
+        postgres_accounts as accounts, postgres_schema,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let request = fixture.request();
+    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let account = AccountId::from_bytes([1; 16]);
+    let creation = accounts::prepare(epoch, account).unwrap();
+    assert_eq!(creation.epoch(), epoch);
+    assert_eq!(creation.account(), account);
+    assert_eq!(
+        accounts::inspect(&request, &trust, deadline(), epoch, account),
+        Err(accounts::Error::Missing)
+    );
+    sql(&fixture, "ALTER ROLE td_probe SET default_transaction_isolation='repeatable read'; CREATE FUNCTION public.require_bootstrap_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'bootstrap settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_bootstrap_settings BEFORE INSERT ON td_mta.accounts FOR EACH ROW EXECUTE FUNCTION public.require_bootstrap_settings()");
+    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    assert_eq!(
+        accounts::inspect(&request, &trust, deadline(), epoch, account).unwrap(),
+        creation
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT encode(sequence,'hex'),encode(floor,'hex') FROM td_mta.accounts"
+        ),
+        "0000000000000001|0000000000000000"
+    );
+    assert_eq!(sql(&fixture, "SELECT encode(id,'hex'),name,parent_id IS NULL,role,sort_order,subscribed,encode(changed,'hex') FROM td_mta.mailboxes"), format!("{}|Inbox|t|inbox|0|1|0000000000000001", creation.inbox()));
+    assert_eq!(sql(&fixture, "SELECT encode(sequence,'hex'),operation,kind,action,encode(object,'hex') FROM td_mta.changes"), format!("0000000000000001|1|1|1|{}", creation.inbox()));
+    let other = accounts::prepare(epoch, account).unwrap();
+    assert_ne!(creation.inbox(), other.inbox());
+    assert_eq!(
+        accounts::publish(&request, &trust, deadline(), other),
+        Err(accounts::Error::Conflict)
+    );
+    sql(&fixture, "UPDATE td_mta.accounts SET sequence=decode(repeat('ff',8),'hex'); UPDATE td_mta.mailboxes SET name='Renamed Inbox'");
+    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        "ffffffffffffffff"
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT name FROM td_mta.mailboxes"),
+        "Renamed Inbox"
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.changes"), "1");
+    let wrong_epoch = accounts::prepare(
+        StoreEpoch::from_bytes([99; 16]),
+        AccountId::from_bytes([2; 16]),
+    )
+    .unwrap();
+    assert_eq!(
+        accounts::publish(&request, &trust, deadline(), wrong_epoch),
+        Err(accounts::Error::Epoch)
+    );
+    // An unreceipted owner-created account is not silently reset or repaired.
+    sql(&fixture, "DROP TRIGGER require_bootstrap_settings ON td_mta.accounts; INSERT INTO td_mta.accounts VALUES (decode(repeat('02',16),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'))");
+    let existing = accounts::prepare(epoch, AccountId::from_bytes([2; 16])).unwrap();
+    assert_eq!(
+        accounts::publish(&request, &trust, deadline(), existing),
+        Err(accounts::Error::Exists)
+    );
+    // Failure after account and Inbox inserts must remove every provisional row.
+    sql(&fixture, "CREATE FUNCTION public.reject_bootstrap_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_bootstrap_receipt BEFORE INSERT ON td_mta.account_bootstraps FOR EACH ROW EXECUTE FUNCTION public.reject_bootstrap_receipt()");
+    let failed = accounts::prepare(epoch, AccountId::from_bytes([3; 16])).unwrap();
+    assert_eq!(
+        accounts::publish(&request, &trust, deadline(), failed),
+        Err(accounts::Error::Database)
+    );
+    for table in ["accounts", "mailboxes", "changes", "account_bootstraps"] {
+        let column = if table == "accounts" { "id" } else { "account" };
+        assert_eq!(sql(&fixture, &format!("SELECT count(*) FROM td_mta.{table} WHERE {column}=decode(repeat('03',16),'hex')")), "0");
+    }
+    sql(&fixture, "DROP TRIGGER reject_bootstrap_receipt ON td_mta.account_bootstraps; CREATE FUNCTION public.delay_bootstrap_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_bootstrap AFTER INSERT ON td_mta.account_bootstraps DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_bootstrap_commit()");
+    let uncertain = accounts::prepare(epoch, AccountId::from_bytes([4; 16])).unwrap();
+    assert_eq!(
+        accounts::publish(
+            &request,
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            uncertain
+        ),
+        Err(accounts::Error::Indeterminate)
+    );
+    let stop = Instant::now() + Duration::from_secs(8);
+    while sql(
+        &fixture,
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'",
+    ) != "0"
+    {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        accounts::inspect(&request, &trust, deadline(), epoch, uncertain.account()).unwrap(),
+        uncertain
+    );
+    accounts::publish(&request, &trust, deadline(), uncertain).unwrap();
+    sql(
+        &fixture,
+        "DROP TRIGGER delay_bootstrap ON td_mta.account_bootstraps",
+    );
+    let raced_account = AccountId::from_bytes([5; 16]);
+    let first = accounts::prepare(epoch, raced_account).unwrap();
+    let second = accounts::prepare(epoch, raced_account).unwrap();
+    let (one, two) = thread::scope(|scope| {
+        let one = scope.spawn(|| accounts::publish(&request, &trust, deadline(), first));
+        let two = scope.spawn(|| accounts::publish(&request, &trust, deadline(), second));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_ne!(one.is_ok(), two.is_ok());
+    let (winner, loser, refused) = if one.is_ok() {
+        (first, second, two)
+    } else {
+        (second, first, one)
+    };
+    assert!(matches!(
+        refused,
+        Err(accounts::Error::Conflict | accounts::Error::Database)
+    ));
+    assert_eq!(
+        accounts::inspect(&request, &trust, deadline(), epoch, raced_account).unwrap(),
+        winner
+    );
+    accounts::publish(&request, &trust, deadline(), winner).unwrap();
+    assert_eq!(
+        accounts::publish(&request, &trust, deadline(), loser),
+        Err(accounts::Error::Conflict)
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.accounts"), "4");
+    for table in ["mailboxes", "changes", "account_bootstraps"] {
+        assert_eq!(
+            sql(&fixture, &format!("SELECT count(*) FROM td_mta.{table}")),
+            "3"
+        );
     }
 }

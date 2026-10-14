@@ -46,6 +46,14 @@ pub struct MailboxRow<'a> {
     pub sort_order: u32,
     pub subscribed: bool,
 }
+/// Initial mailbox content shared by durable account bootstraps.
+pub const INITIAL_INBOX: MailboxRow<'static> = MailboxRow {
+    name: "Inbox",
+    parent: None,
+    role: Some("inbox"),
+    sort_order: 0,
+    subscribed: true,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiptRecipients<'a> {
     encoded: &'a [u8],

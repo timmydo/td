@@ -114,6 +114,7 @@ pub mod observability;
 pub mod operator_files;
 pub mod ownership;
 pub mod ports;
+pub mod postgres_accounts;
 pub mod postgres_bootstrap;
 pub mod postgres_input;
 pub mod postgres_materials;

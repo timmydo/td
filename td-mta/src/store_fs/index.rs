@@ -5,7 +5,7 @@ use crate::{
         self,
         key::Key,
         operation::{Operation, Value},
-        row::Row,
+        row::{Row, INITIAL_INBOX as INBOX},
         ObjectType, Sequence, Table,
     },
     ids::{AccountId, BlobId, MailboxId, StoreEpoch},
@@ -1893,14 +1893,6 @@ fn bootstrap_inbox(
     };
     record_change(db, account, first, 1, change)
 }
-
-const INBOX: format::row::MailboxRow<'static> = format::row::MailboxRow {
-    name: "Inbox",
-    parent: None,
-    role: Some("inbox"),
-    sort_order: 0,
-    subscribed: true,
-};
 
 fn change_key(change: Change) -> Result<Key<'static>, ports::Error> {
     use crate::ids::{EmailId, SubmissionId, ThreadId};

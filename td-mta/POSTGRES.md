@@ -534,7 +534,8 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and sections 16, 19, 21 and 25's material/mail/device/configuration tables,
+and sections 16, 19, 21, 25 and 27's material/mail/device/configuration and
+account-bootstrap tables,
 not a complete
 serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
@@ -550,7 +551,8 @@ ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
 store epoch in a ledger row. Version 1's committed SQL and checksum remain
 fixed; version 2 adds src/postgres_materials.sql and version 3 adds
 src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
-adds src/postgres_configuration.sql. New initialization applies all five in
+adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql.
+New initialization applies all six in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and active configuration selection remain
@@ -568,7 +570,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 256 input frames for the five migrations and their ledger writes;
+permits 256 input frames for the six migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -583,8 +585,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently six rows); it requires
-exactly the five ordered migration versions, their compiled DDL checksums and
+count plus one (currently seven rows); it requires
+exactly the six ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -610,11 +612,12 @@ functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADV
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
 section 13's preparation ledger using a separately provisioned schema-owner
 login. It refuses every existing td_mta namespace. It creates the prepared
-material, mail, device and immutable configuration relations, but no active
-configuration pointer, runtime role or listener. The matching `td-mta
+material, mail, device, immutable configuration and account-bootstrap
+receipt relations, but no active configuration pointer, runtime role or
+listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 5, or reports an
+PATH` applies every missing migration through version 6, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -1117,3 +1120,41 @@ failed check (including changed or missing material) is not evidence that a
 previous publication rolled back. Never allocate another ID to hide an
 uncertain result. These owner commands do not supply runtime privileges,
 listener activation or PostgreSQL serving admission.
+
+## 27. Durable account bootstrap
+
+Schema version 6 adds owner-private account_bootstraps receipts. The inert
+postgres_accounts boundary prepares one retained epoch/account/Inbox tuple,
+then atomically inserts account sequence one and floor zero, the shared
+INITIAL_INBOX contents, its Mailbox Created history at sequence one/operation
+one, and the receipt. The default row is shared with the existing SQLite
+bootstrap so both produce the same logical initial state. No existing
+account is reset, populated from configuration or granted serving authority.
+
+Publication holds the shared migration lock and verifies the epoch before
+one explicit READ COMMITTED transaction with synchronous commit enabled and
+a ten-second idle-transaction timeout. Insertion of the account primary key
+serializes competing creations. A matching receipt resolves the retained
+creation without touching later sequence, mailbox or history changes. A
+different Inbox conflicts; an existing account without a receipt refuses
+rather than attempting repair. The receipt binds account/Inbox for that
+epoch and remains for the account's lifetime, independent of current mailbox
+contents and retained history. It deliberately has no mailbox foreign key.
+Account retirement/receipt removal is not implemented by this boundary.
+
+As with device/configuration publication, an error after COMMIT may have
+been handed off is Indeterminate. Keep the original Creation, let the
+original attempt settle, then inspect/retry that same tuple. Inspection
+uses one finite primary read-only REPEATABLE READ snapshot; absence while
+the original is still running cannot settle uncertainty. Inspection checks
+its final deadline before returning. A retried publication that finds a
+matching retained receipt succeeds even if its last poll crosses the local
+deadline.
+
+These explicit owner operations neither activate account policy nor bypass
+future account limits, authorization, quota or mutation fences. Configuration
+activation must separately bind its declared accounts to existing prepared
+accounts before serving. Existing unreceipted accounts are not adopted, and
+this is not a SQLite or Stalwart migration interface. The real PostgreSQL
+fixture checks exact initial rows, idempotency after later changes, conflicts,
+rollback after partial writes, uncertain commits and competing bootstraps.
