@@ -400,7 +400,8 @@ message.
   feature disabled. PostgreSQL admission prepares the replacement described
   in `td-mta/POSTGRES.md`; SQLite remains active until atomic cutover. Its
   exact manifest, lock and active features are pinned in the same policy.
-  Its lock includes these closures. All eight
+  Its lock includes these closures and the std-only `td-fs` test helper.
+  All nine
   local manifests and locks are pinned. No other roster crate may depend
   on `td-crypto` or `td-mta`, directly or transitively; `td-header`,
   `td-civil`, `td-html`, `td-json`, `td-mime` and `td-nfc` remain

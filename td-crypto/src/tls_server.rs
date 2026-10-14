@@ -192,6 +192,7 @@ fn build(
     native.alpn_protocols = match protocol {
         TlsProtocol::Http1 => vec![b"http/1.1".to_vec()],
         TlsProtocol::Smtp => Vec::new(),
+        TlsProtocol::Postgres => return Err(TlsError::Invalid),
     };
     native.key_log = Arc::new(rustls::NoKeyLog);
     native.enable_secret_extraction = false;

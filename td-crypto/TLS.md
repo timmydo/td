@@ -206,6 +206,10 @@ HTTP/1.1 clients offer only `http/1.1` ALPN, and HTTPS servers select only
 it; absence is accepted for HTTP/1.1 compatibility. Refuse a negotiated
 unknown protocol. SMTP configurations offer/select no ALPN. The facade
 receives a fixed td-owned protocol selector, never an arbitrary ALPN list.
+The outbound Postgres selector also offers no ALPN: its caller first
+requires PostgreSQL's SSLRequest upgrade, then verifies the server with
+the ordinary client policy. Direct TLS with PostgreSQL ALPN is not enabled.
+ServerConfig refuses the Postgres selector; td does not serve PostgreSQL.
 No h2 engine or ACME TLS-ALPN-01 protocol is implied.
 
 A td-owned shared Send + Sync clock trait returns optional UTC seconds since

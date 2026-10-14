@@ -324,7 +324,7 @@ pub(crate) mod tests {
                     if usize::from(forced) != index {
                         continue;
                     }
-                } else if after.is_some_and(|prior| prior >= identifier.as_bytes()) {
+                } else if after.is_some_and(|prior| prior >= identifier.as_bytes().as_slice()) {
                     continue;
                 }
                 let len = Key::Mailbox(identifier).encode(key).unwrap();

@@ -15,6 +15,8 @@ use std::sync::Arc;
 pub enum TlsProtocol {
     Http1,
     Smtp,
+    /// Outbound PostgreSQL after SSLRequest; direct-TLS ALPN is not enabled.
+    Postgres,
 }
 
 /// Opaque immutable outbound TLS policy. Construction performs no I/O and does
@@ -67,7 +69,7 @@ fn build(
             .with_no_client_auth();
     native.alpn_protocols = match protocol {
         TlsProtocol::Http1 => vec![b"http/1.1".to_vec()],
-        TlsProtocol::Smtp => Vec::new(),
+        TlsProtocol::Smtp | TlsProtocol::Postgres => Vec::new(),
     };
     native.check_selected_alpn = true;
     native.enable_sni = true;

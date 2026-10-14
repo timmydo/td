@@ -79,9 +79,9 @@ checkout's root `.cargo/config.toml` is required. Ancestor
 `.cargo/config.toml` files are accepted only when each matches that same
 compiled pin, allowing nested worktrees to use their own runner. Legacy
 `.cargo/config` files remain refused at every level. Automatic build.rs
-files are refused for all eight local source packages: td-civil,
-td-crypto, td-header, td-html, td-json, td-mime, td-nfc and td-mta. Their exact manifests and locks are
-pinned; td-civil, td-header, td-html, td-json, td-mime and td-nfc remain std-only roster
+files are refused for all nine local source packages: td-civil,
+td-crypto, td-fs, td-header, td-html, td-json, td-mime, td-nfc and td-mta. Their exact manifests and locks are
+pinned; td-civil, td-fs, td-header, td-html, td-json, td-mime and td-nfc remain std-only roster
 crates. The Cargo config pin contains only target runner settings, for
 which Cargo selects the deepest definition. Any future pin change must
 recheck ancestor merging and relative path behavior; identical files with
@@ -684,7 +684,8 @@ equivalent APIs.
 ### Outbound configuration and shared clock
 
 `ClientConfig::new` constructs one immutable outbound configuration from an
-admitted TrustStore, shared ClockHandle and TlsProtocol (Http1 or Smtp). Its
+admitted TrustStore, shared ClockHandle and TlsProtocol (Http1, Smtp or
+client-only Postgres). Its
 public API contains no backend types. Construction checks time once, copies
 exactly the supplied anchors into the private verifier, and publishes no
 configuration on failure. An explicit private store completely replaces the
@@ -694,7 +695,8 @@ alone authenticates no peer and exposes no session operations.
 
 The configuration uses the explicit algorithm provider, TLS 1.3 followed by
 1.2, mandatory TLS 1.2 EMS, outbound SNI and selected-ALPN checking. Http1
-supplies only http/1.1; Smtp supplies no ALPN. Client resumption, early data,
+supplies only http/1.1; Smtp and Postgres supply no ALPN. Postgres follows
+the classic SSLRequest upgrade, not direct TLS. Client resumption, early data,
 key logging, secret extraction, ticket requests and both certificate
 compression lists/cache are explicitly disabled. The non-ECH builder path
 is used. The pinned fragmenter subtracts five header bytes from its explicit
@@ -825,7 +827,8 @@ Set the explicit TLS versions/provider, server cipher-order preference, TLS
 1.2 EMS and 16384-byte plaintext fragment limit. Disable session storage,
 stateless tickets, initial and requested TLS 1.3 tickets, early and half-RTT
 data, key logging, secret extraction, certificate compression lists/cache.
-Http1 selects only http/1.1, accepting absence; Smtp selects no ALPN. Native
+Http1 selects only http/1.1, accepting absence; Smtp selects no ALPN.
+ServerConfig refuses the client-only Postgres selector. Native
 configuration/verifier/ticket/routing types remain private and their Debug
 output discloses no keys, certificate bytes, names or callback state.
 

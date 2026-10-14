@@ -7,6 +7,7 @@ use std::path::Path;
 pub(crate) const LOCAL_SOURCES: &[&str] = &[
     "td-civil",
     "td-crypto",
+    "td-fs",
     "td-header",
     "td-html",
     "td-json",
@@ -29,7 +30,8 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "a2fb9003b30df71f55554148fae0de373f232071fb457839bbe8bedd12711d2f",
+        "td-mta" => "9336bb259abb880758f60432bb149a2eb87f6b18d6a0ffdd81ca74207a317214",
+        "td-fs" => "1ac91f7a8baf01070f9f51fbf6f625b637e96894174dda1dc4c1ce0e9b6ef401",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
@@ -48,7 +50,8 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "cc17bb352f7c6e93f1dc925b7b38454f42c11edae411650f0e0b1cfc8be73312",
+        "td-mta" => "483fd0add9ad3c51057753234b788423d3616eaf89ef988ffe5e77aba60ccb10",
+        "td-fs" => "d907e7d97198344c058b8403d2a07c08174081bcd8af0f4d9e276c0131766fe2",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
@@ -388,6 +391,7 @@ mod tests {
         let root = root();
         for name in [
             "td-civil",
+            "td-fs",
             "td-header",
             "td-html",
             "td-json",

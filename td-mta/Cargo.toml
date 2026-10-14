@@ -23,6 +23,9 @@ td-json = { path = "../td-json" }
 td-mime = { path = "../td-mime" }
 td-nfc = { path = "../td-nfc" }
 
+[dev-dependencies]
+td-fs = { path = "../td-fs" }
+
 [[test]]
 name = "rust_alloc_probe"
 harness = false

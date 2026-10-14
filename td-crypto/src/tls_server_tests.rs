@@ -198,7 +198,7 @@ fn server_configuration_bounds_bindings_roles_and_private_trust() {
         ),
         Err(TlsError::Invalid)
     ));
-    for protocol in [TlsProtocol::Http1, TlsProtocol::Smtp] {
+    for protocol in [TlsProtocol::Http1, TlsProtocol::Smtp, TlsProtocol::Postgres] {
         for selection in [
             IdentitySelection::RequiredName,
             IdentitySelection::DefaultIdentity,

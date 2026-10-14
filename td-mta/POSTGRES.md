@@ -27,7 +27,7 @@ installation. The user approved tokio-postgres and its transitive dependencies. 
 initial admission pins 0.7.18 with default features disabled: no Tokio runtime
 or network/time driver is selected. The lock includes private SCRAM crypto
 and string preparation; TLS remains the td-crypto boundary. This increment
-prepares sources only, with no database connector or selectable backend.
+provides the inert connection probe in section 8, with no selectable backend.
 No server package is admitted here; source-build rules still apply.
 
 ## 1. Bootstrap and profiles
@@ -325,3 +325,63 @@ increments rather than implying this contract already supplies them.
 - [Azure PostgreSQL high availability](https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-high-availability)
 - [RDS PostgreSQL TLS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL.Concepts.General.SSL.html)
 - [RDS failover and endpoint changes](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZ.Failover.html)
+
+## 8. Implemented connection probe
+
+`postgres_probe::probe` is an inert worker entry point, not service startup
+or a storage backend. Its caller supplies an admitted resolved address,
+server DNS name, borrowed credentials, trust store and absolute Instant
+deadline at most ten seconds away. It does not resolve DNS, read a connection
+file, load a profile, migrate a schema or retry. User/database names are
+nonempty, NUL-free and at most 256 bytes; passwords are 1..4096 bytes.
+The TLS facade validates the at-most-253-byte server name before dialing.
+
+One worker drives connect and a fixed query through tokio-postgres with
+TLS required. The driver sends SSLRequest; td-crypto's outbound Postgres
+selector verifies the certificate chain and server name before startup
+credentials enter the stream. There is no plaintext fallback, direct-TLS
+ALPN, client certificate or channel-binding claim. The plaintext framing
+guard requires the SASL challenge/final/OK sequence and refuses MD5,
+cleartext-password, trust and other authentication methods. The pinned
+driver selects SCRAM-SHA-256 and verifies its server signature; its
+100,000-iteration ceiling bounds the server-directed password work.
+
+The private async adapter is used only by this periodically polled worker,
+which parks at most one millisecond between turns. It uses no Tokio runtime,
+network/time driver, background task or concurrent query. Driver channel
+wakeups unpark that same thread. All loop turns and final success check the
+original deadline; TCP connect and TLS retain finite bounds. Native crypto
+work remains subject to TLS.md's between-call deadline limitations.
+
+Before driver intake, cap backend frames at 128 KiB including their length
+word, 128 frames and one MiB total for the entire connection. Fragmented
+headers and authentication codes retain nine bytes of framing state. A
+refusal aborts the transport. Plaintext output has a 64 KiB connection cap;
+TLS retains its existing two wire buffers. These are input/work bounds, not
+a whole-process RSS qualification or a serving pool reservation. The future
+storage worker must define operation-specific budgets and pool accounting.
+
+The sole query uses pg_catalog-qualified functions to inspect server version,
+recovery/read-only state, fsync and full_page_writes. It refuses recovery,
+read-only sessions or disabled durability settings and returns only the
+numeric version. Startup options fix search_path, a five-second statement
+timeout and a one-second lock timeout. Success drops the connection; no mail
+or configuration is written. This does not validate a schema, enforce a
+supported-version range, or establish replication/failover durability.
+Provider diagnostics and credentials never enter the fixed error enum.
+The worker drives `poll_message` and drops asynchronous notices without
+invoking the driver Future implementation, which logs raw server text.
+
+The ignored `postgres_probe` integration fixture requires an explicitly
+provided independently installed PostgreSQL bin directory through
+`TD_MTA_TEST_POSTGRES_BIN`. It initializes only a new private disposable
+cluster, creates its own test certificate and password, and checks verified
+TLS/SCRAM, wrong name/trust/password, expired deadline, TLS refusal,
+cleartext/trust authentication refusal, read-only refusal and reconnect after
+server restart. It never connects to
+an operator's existing database. This is host qualification, not a shipped
+server package or evidence for Azure/RDS. Framing refusal tests run offline
+in the ordinary unit suite.
+The ordinary suite also checks expiry while a peer stalls SSLRequest.
+The framing boundary follows the
+[PostgreSQL message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html).

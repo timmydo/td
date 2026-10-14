@@ -574,15 +574,20 @@ mod crypto_boundary_tests {
         let manifest = include_str!("../Cargo.toml");
         let mut inside = false;
         let mut dependencies = Vec::new();
+        let mut development = false;
+        let mut test_dependencies = Vec::new();
         for line in manifest.lines().map(str::trim) {
             if line.starts_with('[') {
-                assert!(!line.contains("dev-dependencies"));
+                development = line == "[dev-dependencies]";
                 assert!(!line.contains("build-dependencies"));
                 inside = line == "[dependencies]";
             } else if inside && !line.is_empty() && !line.starts_with('#') {
                 dependencies.push(line);
+            } else if development && !line.is_empty() && !line.starts_with('#') {
+                test_dependencies.push(line);
             }
         }
+        assert_eq!(test_dependencies, [r#"td-fs = { path = "../td-fs" }"#]);
         assert_eq!(
             dependencies,
             [

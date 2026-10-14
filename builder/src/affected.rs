@@ -5289,7 +5289,8 @@ const HOST_ONLY_ENGINE_SOURCES: &[&str] = &["builder/src/ready.rs"];
 /// leaves the list in the landing that makes a recipe name it; a crate that
 /// gains a reader is no longer alone after reader closure, so it takes the
 /// whole list without the list changing. td-mta reads td-civil, td-crypto, td-header,
-/// td-html, td-json, td-mime and td-nfc directly, and td-mail through its native
+/// td-html, td-json, td-mime and td-nfc directly, td-fs for fixtures,
+/// and td-mail through its native
 /// read fixture. td-agent left the
 /// list with its packaging (td-agent/DESIGN.md §17).
 const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
@@ -5297,6 +5298,7 @@ const WORKSPACE_EXEMPT: &[(&str, &[&str])] = &[(
     &[
         "td-civil",
         "td-crypto",
+        "td-fs",
         "td-header",
         "td-html",
         "td-json",
@@ -10190,6 +10192,7 @@ mod tests {
             "td-mta",
             "td-civil",
             "td-crypto",
+            "td-fs",
             "td-header",
             "td-html",
             "td-json",
@@ -11508,17 +11511,16 @@ mod tests {
         let admitted = include_str!("../../td-mta/Cargo.toml");
         let (paths, dev_paths) = manifest_path_dependencies("td-mta", admitted).unwrap();
         assert!(paths.iter().all(|name| name.starts_with("td-")));
-        assert!(dev_paths.is_empty());
+        assert_eq!(dev_paths, ["td-fs"]);
         for line in crate::crypto_policy::POSTGRES_DEPENDENCIES {
             assert!(admitted.lines().any(|candidate| candidate == *line));
             let manifest = format!("[dependencies]\n{line}\n");
             for name in ["td-aa", "td-crypto"] {
                 assert!(manifest_path_dependencies(name, &manifest).is_err());
             }
-            let dev = format!(
-                "{}\n[dev-dependencies]\n{line}\n",
-                admitted.replace(line, "")
-            );
+            let dev = admitted
+                .replace(line, "")
+                .replace("[dev-dependencies]", &format!("[dev-dependencies]\n{line}"));
             assert!(manifest_path_dependencies("td-mta", &dev).is_err());
             let changed = admitted.replace(
                 line,
