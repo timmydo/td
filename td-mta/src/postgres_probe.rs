@@ -132,6 +132,23 @@ pub(crate) fn with_mutation_client<T>(
     )
 }
 
+// One immutable upload: at most 512 chunks in batches of eight.
+pub(crate) fn with_upload_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        40 * 1024 * 1024,
+        Input::mutations(),
+        operation,
+    )
+}
+
 // Explicit owner DDL needs more command completions than a probe.
 pub(crate) fn with_schema_client<T>(
     request: &Request<'_>,

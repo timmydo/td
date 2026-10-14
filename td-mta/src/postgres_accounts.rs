@@ -112,6 +112,16 @@ pub fn publish(
             if inserted != 1 {
                 return Err(Error::Integrity);
             }
+            let changed = client
+                .execute(
+                    "INSERT INTO td_mta.account_usage VALUES($1,0,0,0,0,0)",
+                    &[&account],
+                )
+                .await
+                .map_err(|_| Error::Database)?;
+            if changed != 1 {
+                return Err(Error::Integrity);
+            }
             let parent = INITIAL_INBOX
                 .parent
                 .as_ref()

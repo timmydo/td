@@ -554,7 +554,8 @@ src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
 adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
 version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
-New initialization applies all nine in
+Version 10 adds src/postgres_uploads.sql.
+New initialization applies all ten in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -572,7 +573,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the nine migrations and their ledger writes;
+permits 512 input frames for the ten migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -587,8 +588,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently ten rows); it requires
-exactly the nine ordered migration versions, their compiled DDL checksums and
+count plus one (currently eleven rows); it requires
+exactly the ten ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -1405,3 +1406,53 @@ reservations against the selected limits before accepting more work.
 This closes conflicting instance policy before shared accounting is activated.
 It does not yet implement database quota counters, reservations, publication,
 reclamation or serving. Those remain prerequisites for the atomic cutover.
+
+## 35. Retained upload publication and shared usage
+
+Schema version 10 adds `account_usage` and `upload_receipts`. Migration derives
+one usage row per account from existing bodies, leases and submissions in the
+same transaction as its ledger entry. Expired leases and completed submissions
+remain charged while retained; a body shared by submissions is charged once
+for queue bytes. New account bootstrap writes an all-zero usage row atomically.
+Every future body/reference mutation must adjust these counters under the
+account lock in the same transaction. Owner-side direct SQL is outside this
+application-maintained accounting contract.
+
+`postgres_uploads` is a cold, bounded publication API for completed upload
+bytes. Preparation checks the selected profile's message ceiling (at most
+32 MiB), copies and hashes the body, allocates one Blob ID and operation ID,
+and binds the request digest to the epoch, account, configuration selection,
+profile, device, Blob ID, exact length/digest and configured upload lifetime.
+Clones share the single immutable body allocation. The preparation deadline is
+at most ten seconds. No password is retained or body exposed through Debug.
+This owner API does not admit remote ingress or reserve runtime memory slots.
+
+Publication qualifies a primary, holds the schema migration lock, then takes
+selection FOR SHARE and account FOR UPDATE in that order. It rechecks the
+selected generation/version and current device credentials, enforces all five
+shared quotas, and publishes body manifest/chunks, a Both-use upload lease,
+quota charges, the next full-u64 account sequence and the retained outcome in
+one synchronous transaction. It creates no Email or Thread. Blob IDs remain
+permanently reserved. Chunks are at most 64 KiB, sent in batches of eight;
+no database parameter carries a whole maximum-size message. The closed upload
+worker admits 40 MiB output and the mutation worker's one MiB/1024-frame input
+budget, including the same authentication/per-frame checks. Its original
+ten-second deadline covers the complete publication operation.
+
+Lease creation and expiry use the database clock and the profile's configured
+upload expiry interval. Receipts retain Blob ID, length, timestamps and old/new
+state. Inspection takes account FOR SHARE before reading, excluding an earlier
+publication still committing. Repeated publication resolves the same operation
+before new policy/device admission; a matching historical receipt is known
+success, not current permission to download or import. A mismatched digest or
+malformed receipt refuses. Lost COMMIT response is Indeterminate: retain the
+same prepared upload and inspect/retry it after the original settles. The
+1024-receipt account bound is preparation-only until runtime retention and
+retry lifetimes are defined together.
+
+Body and upload byte charges and the blob count advance atomically, with no
+process-local fallback. Lowered limits refuse additional publication when any
+current usage exceeds its cap. Logical counters do not reserve server disk.
+Runtime ingress reservations, cleanup with fenced reclaim, upload download
+access, Email import, SMTP publication and serving activation remain cutover
+work. This API does not make the SQLite/file-backed server use PostgreSQL.

@@ -76,6 +76,7 @@ object_ids!(
     DeviceId,
     DeviceOperationId,
     FlagOperationId,
+    UploadOperationId,
     StoreEpoch,
     MaterialVersion,
     ConfigurationVersion,

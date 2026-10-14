@@ -114,7 +114,10 @@ impl Fixture {
             .stderr(log)
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // initdb synchronizes a fresh cluster; concurrent host builds can
+        // delay that filesystem work without changing any client deadline.
+        let seconds = if program == "initdb" { 60 } else { 20 };
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success(), "{program}: {:?}", status.code());
@@ -334,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 9);
+    assert_eq!(receipt.version, 10);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        9
+        10
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":9"));
+    assert!(initialized.contains("\"schema_version\":10"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 9);
+    assert_eq!(receipt.version, 10);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "26");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "28");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1315,6 +1318,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_accounts.sql"),
             include_str!("../src/postgres_selection.sql"),
             include_str!("../src/postgres_flags.sql"),
+            include_str!("../src/postgres_flag_batches.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1336,12 +1340,16 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             inspect(&fixture.request(), &trust, deadline()),
             Err(SchemaError::Version)
         );
+        if previous_version == 9 {
+            sql(&fixture,"INSERT INTO td_mta.accounts VALUES(decode(repeat('7e',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.blob_ids SELECT decode(repeat('7e',16),'hex'),decode(repeat(n,16),'hex') FROM unnest(ARRAY['01','02']) n; INSERT INTO td_mta.blobs SELECT account,id,CASE WHEN id=decode(repeat('01',16),'hex') THEN 3 ELSE 0 END,decode(repeat('00',32),'hex'),0,decode('0000000000000001','hex'),CASE WHEN id=decode(repeat('01',16),'hex') THEN 1 ELSE 0 END FROM td_mta.blob_ids; INSERT INTO td_mta.blob_chunks VALUES(decode(repeat('7e',16),'hex'),decode(repeat('01',16),'hex'),0,decode('616263','hex')); INSERT INTO td_mta.leases VALUES(decode(repeat('7e',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('01',16),'hex'),0,3,decode('0000000000000001','hex')); INSERT INTO td_mta.submissions SELECT account,id,id,id,id,decode(repeat('01',16),'hex'),'a@example.test',0,1,1,NULL,0,NULL,decode('0000000000000001','hex') FROM td_mta.blob_ids; INSERT INTO td_mta.recipients(account,submission_id,ordinal,address,state,uncertain,attempt_count,phase,reason,diagnostic,changed) SELECT account,id,0,'a@example.test',1,0,0,0,0,'',changed FROM td_mta.submissions");
+        }
         let obstruction = match previous_version {
             2 => "accounts",
             3 => "devices",
             4 => "config_versions",
             5 => "account_bootstraps",
             6 => "config_selection",
+            9 => "account_usage",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1368,8 +1376,17 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         } else {
             sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         }
+        if previous_version == 9 {
+            sql(
+                &fixture,
+                "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC",
+            );
+        }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 9);
+        assert_eq!(receipt.version, 10);
+        if previous_version == 9 {
+            assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"3|2|3|3|2");
+        }
         if previous_version == 8 {
             assert_eq!(sql(&fixture, "SELECT encode(results,'hex'),encode(old_sequence,'hex'),encode(new_sequence,'hex') FROM td_mta.flag_receipts"), "01|0000000000000001|0000000000000001");
         }
@@ -1851,6 +1868,16 @@ certificate = "public"
 #[test]
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
 fn real_postgres_configuration_validates_all_profiles_and_binds_canonical_sources() {
+    exercise_configuration(false);
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_uploads_publish_chunks_quotas_and_retained_outcomes() {
+    exercise_configuration(true);
+}
+
+fn exercise_configuration(uploads: bool) {
     use td_mta::{
         config::profile::Roles,
         postgres_configuration::{self as configuration, Profile},
@@ -2378,7 +2405,11 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
         if name == "desktop" {
-            exercise_flags(&fixture, &request, &trust, prepared.binding());
+            if uploads {
+                exercise_uploads(&fixture, &request, &trust, prepared.binding());
+            } else {
+                exercise_flags(&fixture, &request, &trust, prepared.binding());
+            }
         }
         let (_, configuration, policies) = prepared.into_parts();
         assert_eq!(
@@ -3741,5 +3772,224 @@ fn exercise_flag_batches(
     assert_eq!(
         flags::inspect_batch(request, trust, deadline(), &empty),
         Err(flags::Error::Integrity)
+    );
+}
+
+fn exercise_uploads(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_crypto::Digest;
+    use td_mta::{postgres_devices as devices, postgres_uploads as uploads};
+    let account = binding.account();
+    let creation =
+        devices::prepare_creation(binding.epoch(), account, "upload fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let device = creation.device_id();
+    let password = creation.password();
+    let prepare = |bytes: &[u8]| uploads::prepare(binding, device, bytes, deadline()).unwrap();
+    let publish =
+        |upload: &uploads::Upload| uploads::publish(request, trust, deadline(), upload, password);
+    assert_eq!(binding.upload_maximum(), uploads::MAX_BYTES);
+    assert_eq!(binding.upload_expiry_seconds(), 86400);
+    assert!(matches!(
+        uploads::prepare(
+            binding,
+            device,
+            &vec![0; uploads::MAX_BYTES + 1],
+            deadline()
+        ),
+        Err(uploads::Error::Capacity)
+    ));
+    assert!(matches!(
+        uploads::prepare(binding, device, b"x", Instant::now()),
+        Err(uploads::Error::Connection(
+            td_mta::postgres_probe::Error::Deadline
+        ))
+    ));
+    let first = prepare(b"");
+    assert_eq!(
+        uploads::inspect(request, trust, deadline(), &first).unwrap(),
+        None
+    );
+    assert_eq!(
+        uploads::publish(request, trust, deadline(), &first, b"invalid"),
+        Err(uploads::Error::Unauthenticated)
+    );
+    let first_outcome = publish(&first).unwrap();
+    assert_eq!(first_outcome.old_sequence, 1);
+    assert_eq!(first_outcome.new_sequence, 2);
+    assert_eq!(publish(&first).unwrap(), first_outcome);
+    let mut total = 0usize;
+    let mut sequence = 2;
+    for length in [1, 65536, 65537, uploads::MAX_BYTES] {
+        let bytes = vec![0x42; length];
+        let upload = prepare(&bytes);
+        let mut digest = Provider.sha256().unwrap();
+        digest.update(&bytes).unwrap();
+        let digest = digest
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let start = Instant::now();
+        let outcome = publish(&upload).unwrap();
+        eprintln!("upload length={length}: committed at {:?}", start.elapsed());
+        assert_eq!(outcome.old_sequence, sequence);
+        sequence += 1;
+        assert_eq!(outcome.new_sequence, sequence);
+        assert_eq!(outcome.blob, upload.blob());
+        assert_eq!(sql(fixture,&format!("SELECT encode(digest,'hex') FROM td_mta.blobs WHERE account=decode('{account}','hex') AND id=decode('{}','hex')",upload.blob())),digest);
+        assert_eq!(outcome.length, length as u64);
+        assert_eq!(outcome.expires_at - outcome.created_at, 86400000);
+        assert_eq!(publish(&upload).unwrap(), outcome);
+        assert_eq!(sql(fixture,&format!("SELECT count(*),coalesce(sum(octet_length(bytes)),0),coalesce(bool_and(bytes=decode(repeat('42',octet_length(bytes)),'hex')),true) FROM td_mta.blob_chunks WHERE account=decode('{account}','hex') AND blob_id=decode('{}','hex')",upload.blob())),format!("{}|{length}|t",length.div_ceil(65536)));
+        total += length;
+    }
+    assert_eq!(sql(fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),format!("{total}|5|{total}|0|0"));
+    let tiny = prepare(b"x");
+    let restore = format!("UPDATE td_mta.account_usage SET body_bytes=(SELECT coalesce(sum(length),0) FROM td_mta.blobs),blob_count=(SELECT count(*) FROM td_mta.blobs),upload_bytes=(SELECT coalesce(sum(length),0) FROM td_mta.blobs),queue_bytes=0,queue_submissions=0 WHERE account=decode('{account}','hex')");
+    let caps = binding.quotas();
+    for assignments in [
+        format!("body_bytes={}", caps.body_bytes),
+        format!("blob_count={}", caps.blob_count),
+        format!(
+            "body_bytes={},upload_bytes={}",
+            caps.upload_bytes, caps.upload_bytes
+        ),
+        format!(
+            "body_bytes={},queue_bytes={}",
+            caps.queue_bytes + 1,
+            caps.queue_bytes + 1
+        ),
+        format!("queue_submissions={}", caps.queue_submissions + 1),
+    ] {
+        sql(
+            fixture,
+            &format!("UPDATE td_mta.account_usage SET {assignments}"),
+        );
+        assert_eq!(publish(&tiny), Err(uploads::Error::Quota));
+        assert_eq!(
+            uploads::inspect(request, trust, deadline(), &tiny).unwrap(),
+            None
+        );
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blobs"), "5");
+        sql(fixture, &restore);
+    }
+    sql(fixture,"CREATE FUNCTION public.reject_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject upload'; END $$; CREATE TRIGGER reject_upload BEFORE INSERT ON td_mta.upload_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_upload()");
+    assert_eq!(publish(&tiny), Err(uploads::Error::Database));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT body_bytes,blob_count,upload_bytes FROM td_mta.account_usage"
+        ),
+        format!("{total}|5|{total}")
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_ids"), "5");
+    sql(
+        fixture,
+        "DROP TRIGGER reject_upload ON td_mta.upload_receipts",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
+    assert_eq!(publish(&tiny), Err(uploads::Error::Policy));
+    assert_eq!(publish(&first).unwrap(), first_outcome);
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    sql(fixture,"CREATE FUNCTION public.delay_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_upload()");
+    assert_eq!(
+        uploads::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_secs(2),
+            &tiny,
+            password
+        ),
+        Err(uploads::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_upload ON td_mta.upload_receipts",
+    );
+    let recovered = uploads::inspect(request, trust, deadline(), &tiny)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.old_sequence, sequence);
+    sequence += 1;
+    assert_eq!(recovered.new_sequence, sequence);
+    assert_eq!(publish(&tiny).unwrap(), recovered);
+    total += 1;
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.account_usage SET blob_count={}",
+            caps.blob_count - 1
+        ),
+    );
+    let a = prepare(b"a");
+    let b = prepare(b"b");
+    let outcomes = thread::scope(|scope| {
+        let a = scope.spawn(|| publish(&a));
+        let b = scope.spawn(|| publish(&b));
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == Err(uploads::Error::Quota))
+            .count(),
+        1
+    );
+    sequence += 1;
+    total += 1;
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT body_bytes,blob_count,upload_bytes FROM td_mta.account_usage"
+        ),
+        format!("{total}|{}|{total}", caps.blob_count)
+    );
+    sql(fixture, &restore);
+    let capacity = prepare(b"capacity");
+    sql(fixture,&format!("INSERT INTO td_mta.upload_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',16),'hex'),0,0,1,decode('0000000000000000','hex'),decode('0000000000000001','hex') FROM generate_series(1,1024) n"));
+    assert_eq!(publish(&capacity), Err(uploads::Error::Capacity));
+    assert_eq!(publish(&first).unwrap(), first_outcome);
+    sql(
+        fixture,
+        "DELETE FROM td_mta.upload_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')",
+    );
+    assert_eq!(publish(&capacity), Err(uploads::Error::Capacity));
+    assert_eq!(publish(&first).unwrap(), first_outcome);
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.accounts SET sequence=decode('{sequence:016x}','hex')"),
+    );
+    let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(publish(&capacity), Err(uploads::Error::Unauthenticated));
+    assert_eq!(publish(&first).unwrap(), first_outcome);
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.upload_receipts SET length=1 WHERE operation=decode('{}','hex')",
+            first.operation()
+        ),
+    );
+    assert_eq!(
+        uploads::inspect(request, trust, deadline(), &first),
+        Err(uploads::Error::Integrity)
     );
 }

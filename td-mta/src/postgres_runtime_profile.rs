@@ -36,6 +36,8 @@ pub struct Binding {
     profile: String,
     roles: Roles,
     quotas: configuration::SharedQuotas,
+    upload_maximum: usize,
+    upload_expiry_seconds: usize,
 }
 impl Binding {
     pub fn epoch(&self) -> StoreEpoch {
@@ -49,6 +51,12 @@ impl Binding {
     }
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+    pub fn upload_maximum(&self) -> usize {
+        self.upload_maximum
+    }
+    pub fn upload_expiry_seconds(&self) -> usize {
+        self.upload_expiry_seconds
     }
     pub fn quotas(&self) -> configuration::SharedQuotas {
         self.quotas
@@ -145,6 +153,9 @@ pub fn load(
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
     let quotas = candidate.quotas();
+    let limits = configuration.candidate().resources().resources().limits();
+    let upload_maximum = limits.message_bytes;
+    let upload_expiry_seconds = limits.upload_expiry_seconds;
     drop(candidate);
     if selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
         != Some(selected)
@@ -162,6 +173,8 @@ pub fn load(
             profile: name,
             roles,
             quotas,
+            upload_maximum,
+            upload_expiry_seconds,
         },
         configuration,
         policies,

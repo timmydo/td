@@ -207,3 +207,4 @@ pub mod postgres_configuration;
 pub mod postgres_configuration_store;
 pub mod postgres_devices;
 pub mod postgres_flags;
+pub mod postgres_uploads;
