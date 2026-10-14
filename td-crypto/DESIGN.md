@@ -33,6 +33,7 @@ td-mta (library and packaging executable)
   -> td-mime (std-only MIME/header/charset/Unicode implementation)
   -> td-nfc (std-only bounded canonical composition)
   -> rusqlite (private bundled SQLite body/metadata backend)
+  -> tokio-postgres (private replacement preparation, runtime disabled)
   -> td-crypto (td-owned API and private backend)
        -> rustls + aws-lc-rs + reviewed root data
 ```
@@ -44,10 +45,20 @@ and other std-only roster crates cannot inherit its external closure.
 
 The mail crate also has the explicitly approved private rusqlite 0.40.2
 closure with bundled SQLite 3.53.2. td-crypto does not consume SQLite.
-The common offline vendor uses the td-mta lock's union of crypto and SQLite
-sources, checking every archive checksum; td-crypto's selected 19-package
-normal/build graph is unchanged. Mail adds exactly seven selected packages,
-listed in DEPENDENCIES.md, with no other roster consumer. The exact direct
+The mail lock also admits the user-approved tokio-postgres 0.7.18 closure
+with default features disabled, preparing the POSTGRES.md replacement. Its
+SCRAM authentication uses private hmac/sha2, stringprep and rand; md-5 also
+compiles in the upstream protocol crate, but no database authentication is
+activated by dependency admission. Future connection policy must refuse
+legacy authentication. These implementations stay inside the private mail
+driver and do not widen this crate's API or TLS provider. Tokio supplies I/O
+traits and synchronization only; its runtime/net/time features are absent.
+No other roster consumer is admitted.
+The common offline vendor uses the td-mta lock's union of crypto, SQLite and
+PostgreSQL sources, checking every archive checksum; td-crypto's selected 19-package
+normal/build graph is unchanged. Mail adds 61 selected packages beyond the crypto graph: seven for SQLite
+and 54 for PostgreSQL, listed in DEPENDENCIES.md, with no other roster
+consumer. The exact direct
 manifest and active graph are pinned alongside the existing crypto policy.
 Mail's STORAGE.md owns native SQL, limits, filesystem and recovery semantics.
 The shared host and portable drivers force bundled linking and reviewed

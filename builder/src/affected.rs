@@ -4455,7 +4455,9 @@ fn manifest_path_dependencies(
         };
         if !is_dev
             && ((name == "td-crypto" && crate::crypto_policy::DEPENDENCIES.contains(&line))
-                || (name == "td-mta" && line == crate::crypto_policy::SQLITE_DEPENDENCY))
+                || (name == "td-mta"
+                    && (line == crate::crypto_policy::SQLITE_DEPENDENCY
+                        || crate::crypto_policy::POSTGRES_DEPENDENCIES.contains(&line))))
         {
             continue;
         }
@@ -11499,6 +11501,31 @@ mod tests {
             assert_dependency_free(&root, "td-review/nope.lock", &own(&[])).is_err(),
             "an unreadable lock reds rather than passing"
         );
+    }
+
+    #[test]
+    fn postgres_dependencies_are_private_production_pins() {
+        let admitted = include_str!("../../td-mta/Cargo.toml");
+        let (paths, dev_paths) = manifest_path_dependencies("td-mta", admitted).unwrap();
+        assert!(paths.iter().all(|name| name.starts_with("td-")));
+        assert!(dev_paths.is_empty());
+        for line in crate::crypto_policy::POSTGRES_DEPENDENCIES {
+            assert!(admitted.lines().any(|candidate| candidate == *line));
+            let manifest = format!("[dependencies]\n{line}\n");
+            for name in ["td-aa", "td-crypto"] {
+                assert!(manifest_path_dependencies(name, &manifest).is_err());
+            }
+            let dev = format!(
+                "{}\n[dev-dependencies]\n{line}\n",
+                admitted.replace(line, "")
+            );
+            assert!(manifest_path_dependencies("td-mta", &dev).is_err());
+            let changed = admitted.replace(
+                line,
+                &line.replace("default-features = false", "default-features = true"),
+            );
+            assert!(manifest_path_dependencies("td-mta", &changed).is_err());
+        }
     }
 
     /// The manifest grammar admits exactly one spelling of a sibling path

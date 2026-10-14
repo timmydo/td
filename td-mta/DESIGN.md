@@ -188,7 +188,11 @@ Its direct
 dependencies are the local `td-civil`, `td-crypto`, `td-header`, `td-html`,
 `td-json`, `td-mime`
 and `td-nfc` crates, plus the approved private rusqlite dependency with
-bundled SQLite. Application protocols, configuration and scheduling use std
+bundled SQLite and the approved private tokio-postgres 0.7.18 closure
+with default features disabled. PostgreSQL is dependency preparation only;
+POSTGRES.md owns activation and atomic SQLite removal. Its private SCRAM
+cryptography/Unicode preparation do not replace td-crypto or td-mime.
+Application protocols, configuration and scheduling use std
 plus the local libraries; store_fs/index.rs alone owns native SQL. There is
 no separate runtime package or td-net helper executable.
 `td-crypto/DESIGN.md` owns the shared crypto/TLS API and private backend; `td-crypto/TLS.md`

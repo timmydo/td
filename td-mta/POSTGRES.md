@@ -23,8 +23,12 @@ Flexible Server and Amazon RDS for PostgreSQL. Aurora and database proxies
 need separate qualification; AWS support does not imply every PostgreSQL-
 compatible offering. Installation/supervision of a local PostgreSQL server is
 a later convenience. It is not a prerequisite for connecting to an existing
-installation. No server package or driver dependency is admitted by this
-prose: repository dependency approval and source-build rules still apply.
+installation. The user approved tokio-postgres and its transitive dependencies. The
+initial admission pins 0.7.18 with default features disabled: no Tokio runtime
+or network/time driver is selected. The lock includes private SCRAM crypto
+and string preparation; TLS remains the td-crypto boundary. This increment
+prepares sources only, with no database connector or selectable backend.
+No server package is admitted here; source-build rules still apply.
 
 ## 1. Bootstrap and profiles
 

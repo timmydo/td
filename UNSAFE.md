@@ -3464,6 +3464,17 @@ extension loading, fixed native heap/allocation limits and closed queries
 are specified in td-mta/STORAGE.md. This named backend admission does not
 permit new owned unsafe code or qualify native heap/stack/RSS by itself.
 
+The user-approved private tokio-postgres 0.7.18 closure also contains
+upstream unsafe and platform FFI, including its buffer, synchronization,
+entropy and operating-system support crates. Exact manifests, lock and
+active features are pinned by builder/src/crypto_policy.rs; the inventory
+is in td-crypto/DEPENDENCIES.md. Tokio runtime, network and time drivers
+are disabled. This inert dependency admission adds no td-owned unsafe,
+FFI, scoped allowance or syscall, and no PostgreSQL connector is active.
+Future safe adapters must retain the bounded I/O and authentication
+boundary in td-mta/POSTGRES.md; this admission does not permit new owned
+unsafe code or establish runtime resource qualification.
+
 ## 23. `td-open` — one descriptor to the portal
 
 td-open, the `$BROWSER`/`$OPENER` helper the mail and news packages ship

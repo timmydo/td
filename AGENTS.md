@@ -395,7 +395,10 @@ message.
   locks, root Cargo configuration and active features are pinned in `builder/src/crypto_policy.rs`.
   `td-mta` depends directly on local `td-crypto` and std-only `td-civil`, `td-header`
   plus `td-html`, `td-json`, `td-mime` and `td-nfc`, and the approved private
-  `rusqlite` 0.40.2 closure with source-built bundled SQLite 3.53.2. Its
+  `rusqlite` 0.40.2 closure with source-built bundled SQLite 3.53.2, plus
+  the approved private `tokio-postgres` 0.7.18 closure with its runtime
+  feature disabled. PostgreSQL admission prepares the replacement described
+  in `td-mta/POSTGRES.md`; SQLite remains active until atomic cutover. Its
   exact manifest, lock and active features are pinned in the same policy.
   Its lock includes these closures. All eight
   local manifests and locks are pinned. No other roster crate may depend
@@ -404,7 +407,7 @@ message.
   ordinary std-only shared crates.
   `td-crypto/DESIGN.md` owns offline preparation and crypto confinement;
   `td-mta/STORAGE.md` owns the private SQLite boundary. No other roster
-  crate may consume the SQLite closure, directly or transitively.
+  crate may consume the SQLite or PostgreSQL closure, directly or transitively.
   Any new external dependency needs principle-2 sign-off.
 - A new standalone crate joins the gate by EXISTING: `builder/src/affected.rs`
   discovers every `td-*/Cargo.toml` at the repo root and derives both the

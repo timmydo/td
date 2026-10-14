@@ -586,6 +586,8 @@ mod crypto_boundary_tests {
         assert_eq!(
             dependencies,
             [
+                r#"tokio = { version = "=1.53.3", default-features = false, features = ["io-util"] }"#,
+                r#"tokio-postgres = { version = "=0.7.18", default-features = false }"#,
                 r#"rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "bundled", "hooks", "limits"] }"#,
                 r#"td-civil = { path = "../td-civil" }"#,
                 r#"td-crypto = { path = "../td-crypto" }"#,

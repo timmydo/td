@@ -29,7 +29,7 @@ pub(crate) fn manifest_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "434e8c6ab3f8d304ce8c090478324e4e1398e39561395b0c7a59bf4cdc20b1ca",
         "td-crypto" => "7ca2d70176ddb80083ff07de51465e8194fd01e4e4d435201444f11ed997c308",
-        "td-mta" => "fb79b34dae21851d655d2af81c8707ccbc42d7a4fd151fec33f8f488c616ea02",
+        "td-mta" => "a2fb9003b30df71f55554148fae0de373f232071fb457839bbe8bedd12711d2f",
         "td-header" => "4e8dd9a6be096e9ffa65cbb26e71a8f3ec8a9c32c9d83211a1c490a43508aac9",
         "td-html" => "e4c924efdc7deab65fcc5cfa64bd5349935d5f3094e4310125ddb173af0b1c14",
         "td-json" => "2793cd9cd8ffc7bac436069324b42b503f7f3114418fc95f558fb0831060e8b3",
@@ -48,7 +48,7 @@ pub(crate) fn lock_pin(name: &str, text: &str) -> Result<(), String> {
     let expected = match name {
         "td-civil" => "d05684e2af245c0a796e154148ced1bc85ea08d9f31799d65a4fe1a62b7fc66a",
         "td-crypto" => "499bfd9b6780ca6cc7df5c928a16d7397c43b61bbde1d164d532c494c530514b",
-        "td-mta" => "5e12979dcf853770f93a7c0470ceab7432e2103e7fb9309089dcb5d595555dc6",
+        "td-mta" => "cc17bb352f7c6e93f1dc925b7b38454f42c11edae411650f0e0b1cfc8be73312",
         "td-header" => "2862fd9186d5cdef3d645af0b43dee9f77ba51beee5d98219e5aae30db11eabc",
         "td-html" => "5bc92c6117fc17c612004a1b025a6ad42171c3d185d9af7eb47dd13a9168e8e3",
         "td-json" => "679f89cdafa0f8457884ba0d0f0c197814d2b13e4f6ece4557575c9bdfe3848c",
@@ -169,6 +169,62 @@ smallvec v1.16.2|
 vcpkg v0.2.15|
 ";
 
+const POSTGRES_ACTIVE: &str = "async-trait v0.1.92 (proc-macro)|
+base64 v0.22.1|alloc,default,std
+block-buffer v0.12.1|
+byteorder v1.5.0|default,std
+bytes v1.12.1|default,std
+cfg-if v1.0.5|
+chacha20 v0.10.2|rng
+cmov v0.5.4|
+const-oid v0.10.2|
+cpufeatures v0.3.1|
+crypto-common v0.2.2|
+ctutils v0.4.3|
+digest v0.11.3|alloc,block-api,default,mac,oid
+fallible-iterator v0.2.0|default,std
+futures-channel v0.3.34|alloc,default,futures-sink,sink,std
+futures-core v0.3.34|alloc,default,std
+futures-sink v0.3.34|alloc,default,std
+futures-task v0.3.34|
+futures-util v0.3.34|futures-sink,sink
+getrandom v0.4.3|std,sys_rng
+hmac v0.13.0|
+hybrid-array v0.4.15|
+lock_api v0.4.14|atomic_usize,default
+log v0.4.34|
+md-5 v0.11.0|alloc,default,oid
+memchr v2.8.3|alloc,default,std
+parking_lot v0.12.5|default
+parking_lot_core v0.9.12|
+percent-encoding v2.3.2|alloc,default,std
+phf v0.13.1|default,std
+phf_shared v0.13.1|std
+pin-project-lite v0.2.17|
+postgres-protocol v0.6.12|default
+postgres-types v0.2.14|
+proc-macro2 v1.0.107|default,proc-macro
+quote v1.0.47|default,proc-macro
+rand v0.10.3|alloc,default,std,std_rng,sys_rng,thread_rng
+rand_core v0.10.1|
+scopeguard v1.2.0|
+sha2 v0.11.1|alloc,default,oid
+siphasher v1.0.4|default,std
+socket2 v0.6.5|all
+stringprep v0.1.5|
+syn v3.0.9|clone-impls,full,parsing,printing,proc-macro,visit-mut
+tinyvec v1.13.3|alloc,default
+tokio v1.53.3|bytes,default,io-util,sync
+tokio-postgres v0.7.18|
+tokio-util v0.7.20|codec,default,libc
+typenum v1.20.1|const-generics
+unicode-bidi v0.3.18|default,hardcoded-data,std
+unicode-ident v1.0.27|
+unicode-normalization v0.1.25|default,std
+unicode-properties v0.1.4|default,emoji,general-category
+whoami v2.1.3|default,std,wasi-wasite,wasm-web
+";
+
 pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), String> {
     if !admitted(name) {
         return Err(format!(
@@ -179,6 +235,7 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
     let mut local = vec!["td-crypto"];
     if name == "td-mta" {
         expected.extend(SQLITE_ACTIVE.lines().map(str::to_owned));
+        expected.extend(POSTGRES_ACTIVE.lines().map(str::to_owned));
         local.extend([
             "td-civil",
             "td-header",
@@ -209,6 +266,11 @@ pub(crate) fn active_graph(root: &Path, name: &str, output: &str) -> Result<(), 
 }
 
 pub(crate) const SQLITE_DEPENDENCY: &str = "rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"blob\", \"bundled\", \"hooks\", \"limits\"] }";
+
+pub(crate) const POSTGRES_DEPENDENCIES: &[&str] = &[
+    "tokio-postgres = { version = \"=0.7.18\", default-features = false }",
+    "tokio = { version = \"=1.53.3\", default-features = false, features = [\"io-util\"] }",
+];
 
 #[cfg(test)]
 mod tests {
@@ -413,7 +475,7 @@ mod tests {
         let nfc = root.join("td-nfc").canonicalize().unwrap();
         let mime = root.join("td-mime").canonicalize().unwrap();
         let mailgraph = format!(
-            "{graph}{SQLITE_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
+            "{graph}{SQLITE_ACTIVE}{POSTGRES_ACTIVE}td-civil v0.1.0 ({})|\ntd-mta v0.1.0 ({})|\ntd-json v0.1.0 ({})|\ntd-header v0.1.0 ({})|\ntd-html v0.1.0 ({})|\ntd-nfc v0.1.0 ({})|\ntd-mime v0.1.0 ({})|\n",
             civil.display(),
             mail.display(),
             json.display(),
@@ -429,11 +491,18 @@ mod tests {
         )
         .is_err());
         assert!(active_graph(&root, "td-mta", &mailgraph).is_ok());
+        assert!(active_graph(&root, "td-crypto", &format!("{graph}{POSTGRES_ACTIVE}")).is_err());
+        assert!(active_graph(&root, "td-other", &mailgraph).is_err());
         for bad in [
             mailgraph.replace("rusqlite v0.40.2|blob,bundled,hooks,limits,modern_sqlite", "rusqlite v0.40.2|blob,bundled,hooks,limits,load_extension,modern_sqlite"),
             mailgraph.replace("libsqlite3-sys v0.38.2|bundled,bundled_bindings,cc,default,min_sqlite_version_3_34_1,pkg-config,vcpkg", "libsqlite3-sys v0.38.2|default,pkg-config,vcpkg"),
             mailgraph.replace("rusqlite v0.40.2", "rusqlite v0.40.1"),
             mailgraph.replace("smallvec v1.16.2|\n", ""),
+            mailgraph.replace("tokio-postgres v0.7.18|\n", ""),
+            mailgraph.replace("tokio-postgres v0.7.18|", "tokio-postgres v0.7.18|default,runtime"),
+            mailgraph.replace("tokio v1.53.3|bytes,default,io-util,sync", "tokio v1.53.3|bytes,default,io-util,net,rt,sync,time"),
+            mailgraph.replace("postgres-protocol v0.6.12|default", "postgres-protocol v0.6.11|default"),
+            format!("{mailgraph}postgres-native-tls v0.5.0|\n"),
         ] {
             assert!(active_graph(&root, "td-mta", &bad).is_err());
         }
