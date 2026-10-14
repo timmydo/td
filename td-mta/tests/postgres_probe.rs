@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 6);
+    assert_eq!(receipt.version, 7);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        6
+        7
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":6"));
+    assert!(initialized.contains("\"schema_version\":7"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 6);
+    assert_eq!(receipt.version, 7);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1209,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "23");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "25");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,7 +1303,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5] {
+    for previous_version in [2, 3, 4, 5, 6] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1312,6 +1312,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_mail.sql"),
             include_str!("../src/postgres_devices.sql"),
             include_str!("../src/postgres_configuration.sql"),
+            include_str!("../src/postgres_accounts.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1337,7 +1338,8 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             2 => "accounts",
             3 => "devices",
             4 => "config_versions",
-            _ => "account_bootstraps",
+            5 => "account_bootstraps",
+            _ => "config_selection",
         };
         sql(
             &fixture,
@@ -1353,7 +1355,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         );
         sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 6);
+        assert_eq!(receipt.version, 7);
         assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
         assert_eq!(
         sql(
@@ -2214,9 +2216,175 @@ per_peer_limit = 1
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(invoke("config-check", &shared_file, 1).contains("input-private-mode"));
     fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    use td_mta::postgres_selection as selection;
+    assert!(selection::read(&request, &trust, deadline(), epoch)
+        .unwrap()
+        .is_none());
+    let first = selection::prepare(epoch, 0, version, &candidate).unwrap();
+    assert_eq!(
+        selection::inspect(&request, &trust, deadline(), first).unwrap(),
+        None
+    );
+    // Receipt resolution must wait for a publication holding the policy row.
+    use std::io::Write;
+    let mut blocker = ProbeChild(
+        sql_command(&fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    writeln!(
+        input,
+        "BEGIN; SELECT singleton FROM td_mta.config_selection WHERE singleton=true FOR UPDATE;"
+    )
+    .unwrap();
+    let stop = deadline();
+    while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-schema-fixture' AND state='idle in transaction' AND query LIKE '%FROM td_mta.config_selection%'") != "1" {
+        assert!(Instant::now() < stop, "selection writer did not acquire barrier");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        selection::inspect(&request, &trust, deadline(), first),
+        Err(selection::Error::Database)
+    );
+    writeln!(input, "COMMIT;").unwrap();
+    drop(input);
+    wait_command(&mut blocker);
+    let selected = selection::publish(&request, &trust, deadline(), first).unwrap();
+    assert_eq!(selected.generation, 1);
+    assert_eq!(selected.version, version);
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selected
+    );
+    let (observed, loaded) = selection::read(&request, &trust, deadline(), epoch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, selected);
+    assert_eq!(loaded.digest(), candidate.digest());
+    let stale = selection::prepare(epoch, 0, version, &candidate).unwrap();
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), stale),
+        Err(selection::Error::Conflict)
+    );
+    let next = selection::prepare(epoch, 1, version, &candidate).unwrap();
+    let contender = selection::prepare(epoch, 1, version, &candidate).unwrap();
+    let results = thread::scope(|scope| {
+        let a = scope.spawn(|| selection::publish(&request, &trust, deadline(), next));
+        let b = scope.spawn(|| selection::publish(&request, &trust, deadline(), contender));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_ne!(results.0.is_ok(), results.1.is_ok());
+    assert!(matches!(
+        results.0,
+        Ok(_) | Err(selection::Error::Conflict) | Err(selection::Error::Database)
+    ));
+    assert!(matches!(
+        results.1,
+        Ok(_) | Err(selection::Error::Conflict) | Err(selection::Error::Database)
+    ));
+    assert_eq!(
+        selection::read(&request, &trust, deadline(), epoch)
+            .unwrap()
+            .unwrap()
+            .0
+            .generation,
+        2
+    );
+    // A historical receipt is not overwritten by a later selected generation.
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selected
+    );
+    sql(&fixture, "CREATE FUNCTION public.delay_selection_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_selection AFTER INSERT ON td_mta.config_selection_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_selection_commit()");
+    let uncertain = selection::prepare(epoch, 2, version, &candidate).unwrap();
+    assert_eq!(
+        selection::publish(
+            &request,
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            uncertain
+        ),
+        Err(selection::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(5));
+    sql(
+        &fixture,
+        "DROP TRIGGER delay_selection ON td_mta.config_selection_receipts",
+    );
+    let landed = selection::inspect(&request, &trust, deadline(), uncertain)
+        .unwrap()
+        .unwrap();
+    assert_eq!(landed.generation, 3);
+    let settled = selection::publish(&request, &trust, deadline(), uncertain).unwrap();
+    assert_eq!(settled, landed);
+    assert_eq!(settled.generation, 3);
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.config_selection_receipts"
+        ),
+        "3"
+    );
+    // A failed receipt insertion must roll back the pointer as well.
+    sql(&fixture, "CREATE FUNCTION public.reject_selection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_selection BEFORE INSERT ON td_mta.config_selection_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_selection()");
+    let refused = selection::prepare(epoch, 3, version, &candidate).unwrap();
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), refused),
+        Err(selection::Error::Database)
+    );
+    assert_eq!(
+        selection::read(&request, &trust, deadline(), epoch)
+            .unwrap()
+            .unwrap()
+            .0,
+        settled
+    );
+    sql(
+        &fixture,
+        "DROP TRIGGER reject_selection ON td_mta.config_selection_receipts",
+    );
+    assert_eq!(
+        selection::prepare(epoch, u64::MAX, version, &candidate).err(),
+        Some(selection::Error::Capacity)
+    );
+    let mismatched = selection::prepare(epoch, 3, version, &changed).unwrap();
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), mismatched),
+        Err(selection::Error::Conflict)
+    );
+    sql(&fixture, &format!("INSERT INTO td_mta.config_selection_receipts SELECT decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),pg_catalog.int8send(n),decode('{version}','hex') FROM generate_series(4::bigint,1024::bigint) n"));
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), refused),
+        Err(selection::Error::Capacity)
+    );
+    assert_eq!(
+        selection::read(&request, &trust, deadline(), epoch)
+            .unwrap()
+            .unwrap()
+            .0,
+        settled
+    );
+    sql(&fixture, "DELETE FROM td_mta.config_selection_receipts WHERE generation > decode('0000000000000003','hex')");
     // A valid digest is not permission to skip current material validation.
     sql(&fixture, "DELETE FROM td_mta.config_material_chunks WHERE material_id=decode(repeat('02',16),'hex'); DELETE FROM td_mta.config_materials WHERE id=decode(repeat('02',16),'hex')");
     assert!(invoke("config-check", &shared_file, 1).contains("material-missing"));
+    assert!(matches!(
+        selection::publish(&request, &trust, deadline(), refused),
+        Err(selection::Error::Configuration(_))
+    ));
+    assert_eq!(
+        selection::inspect(&request, &trust, deadline(), first).unwrap(),
+        Some(selected)
+    );
+    assert_eq!(
+        selection::publish(&request, &trust, deadline(), first).unwrap(),
+        selected
+    );
+
     assert!(matches!(
         versions::read(&request, &trust, deadline(), epoch, version),
         Err(versions::Error::Validation(configuration::Error::Material(

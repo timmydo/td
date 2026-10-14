@@ -124,6 +124,7 @@ pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_resolver;
 pub mod postgres_schema;
+pub mod postgres_selection;
 pub mod preview_json;
 pub mod property_selection;
 pub mod recipient_sweep;

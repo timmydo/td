@@ -26,7 +26,7 @@ impl Input {
 
     pub(super) fn schema() -> Self {
         Self {
-            frames: 256,
+            frames: 512,
             ..Self::new()
         }
     }
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn schema_command_budget_is_finite_and_keeps_other_input_limits() {
         let mut input = Input::schema();
-        for _ in 0..256 {
+        for _ in 0..512 {
             assert!(input.accept(&frame(b'N', b"\0")).is_ok());
         }
         assert!(input.accept(&frame(b'N', b"\0")).is_err());

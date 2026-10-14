@@ -534,8 +534,8 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and sections 16, 19, 21, 25 and 27's material/mail/device/configuration and
-account-bootstrap tables,
+and sections 16, 19, 21, 25, 27 and 30's material/mail/device/configuration,
+account-bootstrap and passive selection tables,
 not a complete
 serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
@@ -551,12 +551,13 @@ ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
 store epoch in a ledger row. Version 1's committed SQL and checksum remain
 fixed; version 2 adds src/postgres_materials.sql and version 3 adds
 src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
-adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql.
-New initialization applies all six in
+adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
+and version 7 adds src/postgres_selection.sql.
+New initialization applies all seven in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
-Explicit runtime grants and active configuration selection remain
-preparation work.
+Explicit runtime grants and configuration-driven service admission remain
+cutover work.
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
 exclusive transaction migration lock. It validates all existing checksums
@@ -570,7 +571,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 256 input frames for the six migrations and their ledger writes;
+permits 512 input frames for the seven migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -585,8 +586,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently seven rows); it requires
-exactly the six ordered migration versions, their compiled DDL checksums and
+count plus one (currently eight rows); it requires
+exactly the seven ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -612,12 +613,12 @@ functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADV
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
 section 13's preparation ledger using a separately provisioned schema-owner
 login. It refuses every existing td_mta namespace. It creates the prepared
-material, mail, device, immutable configuration and account-bootstrap
-receipt relations, but no active configuration pointer, runtime role or
-listener. The matching `td-mta
+material, mail, device, immutable configuration, account-bootstrap and
+selection receipt relations with an initially empty passive configuration
+pointer, but no runtime role or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 6, or reports an
+PATH` applies every missing migration through version 7, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -1236,3 +1237,50 @@ connection setup and query polling, without extending any allowance. Database qu
 failures report I/O failure; corruption remains a row-shape or digest failure.
 This is a finite cold operation, not a reusable pool or
 an assertion that future HTTP transfer limits are already qualified.
+
+## 30. Retained configuration selection
+
+Schema seven adds a singleton `config_selection` row and immutable
+`config_selection_receipts`. The initial row has generation zero and no
+version. `postgres_selection` supplies owner-side preparation, publication,
+receipt inspection and selected-source reads. This is still inert storage
+preparation: it opens no listener and supplies no runtime policy, role or
+device authorization. Production startup and policy fencing remain cutover
+work.
+
+A retained change binds a random operation ID to the store epoch, expected
+full-u64 generation, immutable version ID and validated source digest.
+Publication first resolves an existing receipt under a shared singleton lock
+that excludes an earlier publication still committing, then rereads and revalidates
+all profiles and materials under its original absolute deadline. The write
+transaction locks the singleton before any future account/device locks,
+checks the receipt again after waiting, compares the generation and stored
+source digest, and increments the generation with checked arithmetic.
+Pointer and receipt commit together with explicit synchronous commit and
+read-committed isolation. Competing changes from the same generation cannot
+both publish. A failed candidate or definite rollback leaves the pointer
+unchanged.
+
+The original ten-second operation ceiling covers every connection, validation
+and transaction; none renews it. A lost COMMIT response is indeterminate.
+Keep the exact retained change and resolve/retry it, never generate another
+ID from an absence observation. Lock/connection failures while resolving
+leave any previous uncertainty outstanding; they are not proof of rollback.
+The shared resolution lock is released before material validation. Historical
+receipts resolve their original
+selection even after subsequent changes or material expiry; receipt success
+does not assert that version is still selected. At most 1024 receipts can be
+published, checked under the same singleton lock. There is no receipt expiry
+or pruning API yet; capacity refusal preserves existing outcomes. This finite
+preparation limit needs an explicit retention/retry policy before runtime
+administration activation. Changes currently survive only in the caller’s
+retained typed object; a durable encoding is required before administration
+can recover that object across process restart.
+
+Selected-source reads capture a passive generation/version, then verify the
+immutable source bytes and all profiles/materials. A concurrent publication
+can supersede that generation before return. Consumers must fence current
+policy at runtime admission/publication rather than treat the returned
+candidate as authority. Store-epoch checks apply to each connection, including
+receipt resolution after restore. Schema migration keeps earlier checksums
+unchanged and initializes selection without choosing an existing version.
