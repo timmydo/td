@@ -2435,3 +2435,34 @@ sink failures refuse completion; all emitted bytes remain private and must
 be discarded on failure. A successful copy supplies no sending identity,
 envelope authority, ingress slot or queue publication. Its consumer still
 owns those reservations and fresh authorization before accepting delivery.
+
+## Implicit submission envelopes
+
+The inert `submission_envelope` worker derives the implicit envelope used by
+`td-mail` from a complete immutable root-header section and the selected
+identity's configured mailbox. It requires exactly one single-address From
+matching that identity under `config::values::mailbox_key`: decoded local
+case is significant and only the domain is folded. An optional single Sender
+must also match that identity before supplying the reverse path. The current
+single-address identity policy cannot authorize another Sender header merely
+by substituting the envelope reverse path. Duplicate From/Sender fields or multiple addresses
+in either refuse. This supplies header evidence, not account, device or
+configuration-generation authority; the native publication consumer still
+holds the same source and freshly authorizes the selected identity.
+
+Recipients come from To/Cc/Bcc in source order. Shared address parsing supplies
+provisional extents, then each SMTP mailbox must independently pass the strict
+configuration syntax; raw recovery candidates, groups, address literals and
+international addresses refuse. No permissive display fallback grants sending
+authority. Equivalent quoted local spellings and domain case deduplicate while
+preserving the first address spelling and order. Reply-To and Resent fields do
+not add recipients. Explicit envelopes and SMTP parameters are outside this
+worker's interface.
+
+At most the configured 1..1000 unique recipients are retained. A fallibly
+reserved array plus sorted indices bounds retention and comparisons; insertion
+movement and canonicalization spend the original work meter. Header scanning,
+CRLF validation, address parsing and comparisons use fresh monotonic checks
+under a phase that cannot extend the meter deadline. No envelope escapes an
+invalid header, exhausted budget, deadline or clock failure. The transmitted
+copy and all queue rows still require separate admission and atomic publication.

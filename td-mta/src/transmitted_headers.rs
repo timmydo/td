@@ -27,35 +27,6 @@ impl<F: FnMut(&[u8]) -> Result<(), Error>, C: FnMut() -> Result<Time, Error>> Ou
         self.meter.charge(now, charge).map_err(work)?;
         Ok(now)
     }
-    fn line_endings(&mut self) -> Result<(), Error> {
-        let mut cr = false;
-        for chunk in self.bytes.chunks(4096) {
-            self.check(Charge {
-                io_bytes: chunk.len() as u64,
-                records: 1,
-                ..Charge::default()
-            })?;
-            for &byte in chunk {
-                if cr {
-                    if byte != b'\n' {
-                        return Err(Error::Invalid);
-                    }
-                    cr = false;
-                } else {
-                    match byte {
-                        b'\r' => cr = true,
-                        b'\n' => return Err(Error::Invalid),
-                        _ => (),
-                    }
-                }
-            }
-            self.check(Charge::default())?;
-        }
-        if cr {
-            return Err(Error::Invalid);
-        }
-        Ok(())
-    }
     fn field(&mut self, start: usize, end: usize, skip: bool) -> Result<(), Error> {
         if skip {
             self.check(Charge::default())?;
@@ -79,6 +50,39 @@ impl<F: FnMut(&[u8]) -> Result<(), Error>, C: FnMut() -> Result<Time, Error>> Ou
         Ok(())
     }
 }
+pub(crate) fn line_endings(
+    bytes: &[u8],
+    mut check: impl FnMut(Charge) -> Result<(), Error>,
+) -> Result<bool, Error> {
+    let mut cr = false;
+    for chunk in bytes.chunks(4096) {
+        check(Charge {
+            io_bytes: chunk.len() as u64,
+            records: 1,
+            ..Charge::default()
+        })?;
+        for &byte in chunk {
+            if cr {
+                if byte != b'\n' {
+                    return Ok(false);
+                }
+                cr = false;
+            } else {
+                match byte {
+                    b'\r' => cr = true,
+                    b'\n' => return Ok(false),
+                    _ => (),
+                }
+            }
+        }
+        check(Charge::default())?;
+    }
+    if cr {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 fn work(stop: Stop) -> Error {
     if stop == Stop::Deadline {
         Error::Deadline
@@ -126,7 +130,9 @@ pub(crate) fn write_checked(
         sink,
         written: 0,
     };
-    output.line_endings()?;
+    if !line_endings(headers, |charge| output.check(charge).map(|_| ()))? {
+        return Err(Error::Invalid);
+    }
     let mut scanner = Scanner::new(0, crate::limits::MIB as u64);
     let mut consumed = 0usize;
     let mut pending = None::<(usize, bool)>;
