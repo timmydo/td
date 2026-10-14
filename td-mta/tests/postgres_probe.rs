@@ -208,6 +208,101 @@ impl Drop for Fixture {
     }
 }
 
+struct ProbeChild(Child);
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn command_probe(fixture: &Fixture, expected: bool) -> String {
+    let connection = fixture.root.join("connection");
+    command_output(
+        &[
+            "postgres",
+            "probe",
+            "--connection-file",
+            connection.to_str().unwrap(),
+            "--profile",
+            "desktop",
+        ],
+        fixture.root.path(),
+        if expected { 0 } else { 1 },
+    )
+}
+
+fn command_output(arguments: &[&str], root: &std::path::Path, expected: i32) -> String {
+    let output_path = root.join("probe-output");
+    let output = File::create(&output_path).unwrap();
+    let mut child = ProbeChild(
+        Command::new(env!("CARGO_BIN_EXE_td-mta"))
+            .env_clear()
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    let stop = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(expected));
+            break;
+        }
+        assert!(Instant::now() < stop, "probe command timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(fs::metadata(&output_path).unwrap().len() < 1024);
+    let text = fs::read_to_string(output_path).unwrap();
+    assert!(!text.contains(std::str::from_utf8(PASSWORD).unwrap()));
+    assert!(!text.contains("postgresql://"));
+    text
+}
+
+#[test]
+fn command_refusals_have_fixed_output_without_argument_contents() {
+    let root = TempDir::new("pg-command-refusal").unwrap();
+    assert_eq!(command_output(&["postgres", "probe", "--password", "not-for-output"], root.path(), 2),
+        "{\"schema\":1,\"command\":\"postgres-probe\",\"status\":\"error\",\"stage\":\"arguments\",\"error\":\"invalid-arguments\"}\n");
+    assert_eq!(command_output(&["postgres", "probe", "--connection-file", "not-for-output", "--profile", "desktop"], root.path(), 1),
+        "{\"schema\":1,\"command\":\"postgres-probe\",\"status\":\"error\",\"stage\":\"bootstrap\",\"error\":\"postgres-bootstrap-root\"}\n");
+}
+
+#[test]
+#[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
+fn real_postgres_probe_command_loads_resolves_and_authenticates() {
+    let mut fixture = Fixture::new();
+    fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca = fixture.root.join("ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let path = fixture.root.join("connection");
+    let uri = format!(
+        "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+        std::str::from_utf8(PASSWORD).unwrap(),
+        fixture.port,
+        ca.display()
+    );
+    fs::write(&path, &uri).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = command_probe(&fixture, true);
+    assert!(output.contains("\"schema_checked\":false,\"profile_checked\":false"));
+    assert!(output.contains("\"server_version\":"));
+    let wrong = uri.replace(std::str::from_utf8(PASSWORD).unwrap(), "wrong-password");
+    fs::write(&path, wrong).unwrap();
+    assert!(command_probe(&fixture, false).contains("connection-or-authentication"));
+    fs::write(&path, &uri).unwrap();
+    fixture.stop();
+    fixture.start(true, true);
+    assert!(command_probe(&fixture, false).contains("primary-or-durability-settings"));
+    fixture.stop();
+    fixture.start(true, false);
+    assert!(command_probe(&fixture, true).contains("\"status\":\"ok\""));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(command_probe(&fixture, false).contains("input-private-mode"));
+}
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }

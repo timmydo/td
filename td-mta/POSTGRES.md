@@ -462,8 +462,9 @@ failover and writer reconnection remain separate qualification work.
 
 `postgres_input::Loaded::open` reads a connection file and constructs its
 TLS trust store without DNS, database access or service admission. It takes
-the file path and profile, never a password argument. No command selects it
-yet. The file's parent must satisfy the existing `PrivateRoot` contract:
+the file path and profile, never a password argument. The operator probe in
+section 12 selects it; serving does not. The file's parent must satisfy the
+existing `PrivateRoot` contract:
 mode 0700, non-root owner, absolute normalized path within `MAX_ROOT_BYTES`,
 no symlinks and only root/owner ancestors without shared write permissions.
 The supervisor must run as that dedicated owner; std does not verify the
@@ -495,3 +496,34 @@ requires a private TMPDIR under trusted ancestors and exercises actual file
 modes, symlinks, secret/public hard-link aliasing, trust replacement, missing
 trust and size refusal. It uses only a disposable TempDir and generated CA;
 ordinary sandbox tests do not assume host directory ownership.
+
+
+## 12. Operator PostgreSQL probe
+
+`td-mta postgres probe --connection-file PATH --profile NAME` runs the
+protected loader, owned resolver helper and TLS/SCRAM probe together. Run
+as the connection directory's dedicated owner. It writes one bounded JSON
+result to stdout and exits zero on success, one on qualification failure,
+or two for invalid arguments. Passwords/URIs are file contents, never required
+arguments. Diagnostics include no input path, endpoint, credentials or raw
+provider text. The selected profile is syntax-checked only; it is not loaded
+from the database.
+
+After cold file loading, DNS receives at most five seconds and the whole
+network operation receives ten seconds. Resolved addresses are attempted
+in order with the same absolute deadline. Only TCP/transport refusal permits
+another address; authentication, TLS-policy, settings or deadline errors
+stop the operation. No attempt renews its budget. As in section 8, driver
+connection/authentication failures are deliberately coarse. A slow first
+address may exhaust the budget before later addresses can be attempted.
+
+Success reports the server version and explicitly sets schema_checked and
+profile_checked false. It proves only the section 8 connection/settings
+checks at that instant, not service readiness, replication durability or
+cloud failover qualification. It writes no mail/configuration, installs no
+schema and never opens serving listeners. The separate ignored
+`real_postgres_probe_command_loads_resolves_and_authenticates` fixture
+requires the section 8 PostgreSQL tools plus a private TMPDIR under trusted
+ancestors. It uses a fresh disposable database and tests the actual command,
+private trust, localhost resolution, wrong credentials, read-only refusal,
+restart/reconnect and connection-file mode refusal.
