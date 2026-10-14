@@ -425,7 +425,8 @@ milliseconds, not a five-millisecond network timeout.
 | Operation | Default timing policy |
 | --- | --- |
 | TLS handshake | 10 seconds total |
-| Configured-name DNS lookup | 5 seconds total across UDP/TCP/CNAME work |
+| Mail-routing configured-name DNS lookup | 5 seconds total across UDP/TCP/CNAME work |
+| PostgreSQL writer-name lookup | 5 seconds total in the disposable helper; POSTGRES.md section 10 |
 | TCP dial | 10 seconds total across returned addresses |
 | HTTP headers | 15 seconds idle, 30 seconds total |
 | HTTP request/upload body | 15 seconds idle; total derived from admitted bytes below |

@@ -710,6 +710,12 @@ fn run() -> io::Result<ExitCode> {
     let mut args = std::env::args_os();
     let _ = args.next();
     let first = args.next();
+    if first.as_deref() == Some(OsStr::new("--internal-postgres-resolve")) {
+        if args.next().is_some() {
+            return Ok(ExitCode::from(2));
+        }
+        td_mta::postgres_resolver::run_helper_and_exit();
+    }
     if first.as_deref() == Some(OsStr::new("device")) {
         return device::run(args);
     }

@@ -419,3 +419,40 @@ without controls, at most 4096 bytes. Profiles are 1..64 ASCII letters,
 digits, dots, underscores or hyphens, starting with a letter or digit.
 All parse failures return fixed categories without the input or credentials.
 This decoder does not claim cloud connectivity or a supported schema.
+
+## 10. Implemented resolver worker
+
+`postgres_resolver::resolve` accepts the parsed bootstrap, the caller's
+trusted absolute td-mta executable path and an absolute deadline at most five seconds
+away. It starts that executable in private resolver mode with a cleared
+environment, hostname-only stdin, bounded stdout and discarded stderr.
+No connection URI, credentials, profile or trust bytes enter the child.
+Each invocation performs a fresh system resolver lookup; any system DNS
+cache retains its own TTL policy. This is not database connection retry or
+service activation.
+
+The child uses the platform resolver and may consult trusted host resolver
+configuration. Blocking libc/NSS resolution stays outside service workers.
+The parent polls child completion, kills and reaps it on deadline or error,
+and admits only a complete versioned response with at most sixteen unique
+IP addresses and 1024 bytes. IPv6 scope IDs are unsupported. The child
+checks the same DNS-name policy as bootstrap and caps result traversal at
+128 addresses. It writes only after complete validation, within pipe
+capacity; no streaming partial result is accepted.
+
+Before reading stdin, the dedicated child starts a watchdog that exits its
+whole process after five seconds. This requests expiry after parent loss
+and during blocked input/read/lookup; native exit cleanup may delay it. The internal entry point always
+exits; it cannot leave a watchdog behind in a serving process. Ordinary
+shutdown still owns and reaps an in-flight helper. Native process creation,
+scheduling, kill/reaping, native exit cleanup and filesystem/libc calls retain the platform's
+between-call limitations; this is not a hard real-time or resolver RSS
+claim. The child uses no shell, external resolver program or new dependency.
+The eventual serving pool must separately bound concurrent resolutions.
+
+Unit process fixtures qualify parent cancellation and independent child
+expiry. An explicitly ignored host integration fixture invokes the built td-mta
+binary and resolves localhost twice, without external DNS or an operator
+database. It requires the host name-service configuration; hermetic suites
+still run the resolver deadline/argument checks without that dependency. Cloud DNS
+failover and writer reconnection remain separate qualification work.

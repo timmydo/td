@@ -80,30 +80,7 @@ impl Bootstrap {
         };
         // The TLS facade authenticates a DNS name, never an IP literal or
         // a URI-encoded host/socket path. Resolve this name again on reconnect.
-        if host.is_empty()
-            || host.len() > 253
-            || host.parse::<IpAddr>().is_ok()
-            || host
-                .rsplit('.')
-                .next()
-                .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
-            || host.split('.').all(numeric_label)
-            || !host.split('.').all(|label| {
-                !label.is_empty()
-                    && label.len() <= 63
-                    && label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                    && label
-                        .bytes()
-                        .next()
-                        .is_some_and(|b| b.is_ascii_alphanumeric())
-                    && label
-                        .bytes()
-                        .last()
-                        .is_some_and(|b| b.is_ascii_alphanumeric())
-            })
-        {
+        if !valid_host(host) {
             return Err(Error::Endpoint);
         }
         let mut root_certificate = None;
@@ -163,6 +140,32 @@ impl Bootstrap {
             password: &self.password,
         }
     }
+}
+
+pub(crate) fn valid_host(host: &str) -> bool {
+    !(host.is_empty()
+        || host.len() > 253
+        || host.parse::<IpAddr>().is_ok()
+        || host
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.bytes().all(|b| b.is_ascii_digit()))
+        || host.split('.').all(numeric_label)
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|b| b.is_ascii_alphanumeric())
+        }))
 }
 
 // Refuse decimal/octal/hex IPv4 shorthand independently of resolver behavior.

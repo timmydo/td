@@ -1336,6 +1336,11 @@ SMTP and JMAP so unauthenticated connections cannot starve an authenticated
 mail reader or health checks. Resolve configured outbound hostnames using a
 bounded std-only DNS adapter with explicit UDP/TCP deadlines and A/AAAA/CNAME
 limits; do not hide uninterruptible resolver work in unbounded threads.
+The PostgreSQL bootstrap/writer endpoint is a separate cold-path exception:
+POSTGRES.md section 10 uses a disposable, deadline-owned system-resolver
+process, with a five-second cap and fresh lookup on each call. It does not
+implement the mail-routing Resolver port or supply a TTL; trusted platform
+resolver configuration and cache policy apply within that child.
 Never perform recipient-MX lookups for outbound mail. Saturation produces SMTP
 temporary failure, HTTP/JMAP limit responses, or bounded retry, as appropriate.
 

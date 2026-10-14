@@ -116,6 +116,7 @@ pub mod ownership;
 pub mod ports;
 pub mod postgres_bootstrap;
 pub mod postgres_probe;
+pub mod postgres_resolver;
 pub mod preview_json;
 pub mod property_selection;
 pub mod recipient_sweep;
