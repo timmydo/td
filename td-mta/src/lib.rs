@@ -117,6 +117,7 @@ pub mod ports;
 pub mod postgres_accounts;
 pub mod postgres_bootstrap;
 pub mod postgres_input;
+pub mod postgres_mailboxes;
 pub mod postgres_materials;
 pub mod postgres_probe;
 pub mod postgres_profile_materials;

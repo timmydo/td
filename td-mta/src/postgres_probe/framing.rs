@@ -31,6 +31,13 @@ impl Input {
         }
     }
 
+    pub(super) fn mailboxes() -> Self {
+        Self {
+            frames: 512,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn configuration() -> Self {
         Self {
             bytes: 4 * 1024 * 1024,
@@ -167,6 +174,25 @@ mod tests {
         let mut input = Input::new();
         assert!(input.accept(&authenticated()).is_ok());
         assert!(input.accept(&frame(b'R', &10u32.to_be_bytes())).is_err());
+    }
+
+    #[test]
+    fn mailbox_budget_is_finite_and_keeps_authentication_and_frame_bounds() {
+        let mut input = Input::mailboxes();
+        for _ in 0..512 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::mailboxes().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::mailboxes()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        let mut input = Input::mailboxes();
+        for _ in 0..7 {
+            assert!(input.accept(&frame(b'D', &[0; 128 * 1024 - 4])).is_ok());
+        }
+        assert!(input.accept(&frame(b'D', &[0; 128 * 1024 - 4])).is_err());
     }
 
     #[test]

@@ -1158,3 +1158,34 @@ accounts before serving. Existing unreceipted accounts are not adopted, and
 this is not a SQLite or Stalwart migration interface. The real PostgreSQL
 fixture checks exact initial rows, idempotency after later changes, conflicts,
 rollback after partial writes, uncertain commits and competing bootstraps.
+
+## 28. Authenticated mailbox observations
+
+`postgres_mailboxes::list` is an inert worker-side storage operation, not a
+selected runtime backend. It takes the expected epoch/account and app password,
+verifies the primary/schema barrier, and begins one read-only repeatable-read
+transaction. The shared device verifier runs inside that transaction, before
+account state and mailbox contents are read. A revoked or wrong-account token
+returns no mailbox data. A revocation after snapshot admission may allow that
+bounded observation to finish; its returned device ID grants no later authority.
+Configuration/profile admission and runtime credentials remain cutover work.
+
+The result owns at most 256 mailbox rows, in binary ID order, with account
+sequence/floor and total/unread Email and Thread counts from the same snapshot.
+Unread excludes both seen and draft Emails; a Thread is unread when at least
+one member in that mailbox is unread. A closed query limits returned rows to
+257 to detect overflow without returning a partial listing. The mailbox-only
+transport allows 512 frames within the ordinary one MiB input and 128 KiB
+individual-frame ceilings; other operations retain their previous budgets.
+Database aggregate work is subject to the statement and whole-operation
+limits, not a promise of bounded server scan cardinality.
+
+Rows pass shared mailbox-format validation, sequence checks and bounded parent
+hierarchy validation. Count inputs must have valid referenced Emails/Threads
+and change positions no newer than the captured sequence. Missing/cyclic
+parents, future changes, invalid fields or capacity exhaustion fail the entire
+observation. Retained strings use fallible bounded allocation. The absolute
+caller deadline (at most ten seconds) covers connection, authentication, SQL
+and decoding, and is checked again before any result escapes. The connection
+and snapshot close before return; results cannot be extended into a later
+snapshot or used as a mutation authorization.

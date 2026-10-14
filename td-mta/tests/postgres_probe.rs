@@ -2402,3 +2402,206 @@ fn real_postgres_account_bootstrap_is_atomic_retained_and_preserves_later_state(
         );
     }
 }
+
+#[test]
+#[ignore = "requires TD_MTA_TEST_POSTGRES_BIN naming an independently installed PostgreSQL 17"]
+fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
+    use td_mta::{
+        ids::{AccountId, StoreEpoch},
+        postgres_accounts as accounts, postgres_devices as devices,
+        postgres_mailboxes as mailboxes, postgres_schema,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let request = fixture.request();
+    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let account = AccountId::from_bytes([1; 16]);
+    let creation = accounts::prepare(epoch, account).unwrap();
+    accounts::publish(&request, &trust, deadline(), creation).unwrap();
+    let device = devices::prepare_creation(epoch, account, "mailbox reader", 1).unwrap();
+    devices::publish_creation(&request, &trust, deadline(), &device).unwrap();
+    let read = || {
+        mailboxes::list(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            device.password(),
+        )
+    };
+    let first = read().unwrap();
+    assert_eq!(first.identity.committed_sequence.number(), 1);
+    assert_eq!(first.identity.history_floor.number(), 0);
+    assert_eq!(first.device, device.device_id());
+    assert_eq!(first.mailboxes.len(), 1);
+    assert_eq!(first.mailboxes[0].id, creation.inbox());
+    assert_eq!(first.mailboxes[0].name, "Inbox");
+    assert_eq!(first.mailboxes[0].counts.total_emails, 0);
+    assert_eq!(
+        mailboxes::list(&request, &trust, deadline(), epoch, account, b"bad"),
+        Err(mailboxes::Error::Unauthenticated)
+    );
+    assert_eq!(
+        mailboxes::list(
+            &request,
+            &trust,
+            deadline(),
+            StoreEpoch::from_bytes([8; 16]),
+            account,
+            device.password()
+        ),
+        Err(mailboxes::Error::Epoch)
+    );
+    let other = AccountId::from_bytes([2; 16]);
+    accounts::publish(
+        &request,
+        &trust,
+        deadline(),
+        accounts::prepare(epoch, other).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mailboxes::list(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            other,
+            device.password()
+        ),
+        Err(mailboxes::Error::Unauthenticated)
+    );
+    sql(&fixture, &format!("BEGIN;
+        INSERT INTO td_mta.blob_ids VALUES (decode('{account}','hex'),decode(repeat('03',16),'hex'));
+        INSERT INTO td_mta.blobs VALUES (decode('{account}','hex'),decode(repeat('03',16),'hex'),0,decode(repeat('00',32),'hex'),0,decode('0000000000000001','hex'),0);
+        INSERT INTO td_mta.threads SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode('0000000000000001','hex') FROM generate_series(1,2) n;
+        INSERT INTO td_mta.emails (account,id,blob_id,thread_id,received_at,origin,changed) SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('03',16),'hex'),decode(lpad(to_hex(CASE WHEN n<=3 THEN 1 ELSE 2 END),32,'0'),'hex'),0,2,decode('0000000000000001','hex') FROM generate_series(1,5) n;
+        INSERT INTO td_mta.memberships SELECT account,id,decode('{}','hex'),changed FROM td_mta.emails;
+        INSERT INTO td_mta.keywords SELECT account,id,CASE WHEN id=decode(lpad('3',32,'0'),'hex') THEN '$draft' ELSE '$seen' END,changed FROM td_mta.emails WHERE id IN (decode(lpad('1',32,'0'),'hex'),decode(lpad('3',32,'0'),'hex'),decode(lpad('4',32,'0'),'hex'));
+        COMMIT", creation.inbox()));
+    let listing = read().unwrap();
+    assert_eq!(
+        listing.mailboxes[0].counts,
+        mailboxes::Counts {
+            total_emails: 5,
+            unread_emails: 2,
+            total_threads: 2,
+            unread_threads: 2
+        }
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.memberships SET changed=decode('0000000000000002','hex')",
+    );
+    assert_eq!(read(), Err(mailboxes::Error::Integrity));
+    sql(&fixture, "UPDATE td_mta.memberships SET changed=decode('0000000000000001','hex'); UPDATE td_mta.mailboxes SET role='INVALID' WHERE role='inbox'");
+    assert_eq!(read(), Err(mailboxes::Error::Integrity));
+    sql(&fixture, "UPDATE td_mta.mailboxes SET role='inbox'; UPDATE td_mta.accounts SET sequence=decode(repeat('ff',8),'hex')");
+    assert_eq!(
+        read().unwrap().identity.committed_sequence.number(),
+        u64::MAX
+    );
+    sql(&fixture, &format!("UPDATE td_mta.accounts SET sequence=decode('0000000000000001','hex'); INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n+100),32,'0'),'hex'),repeat('x',1024),NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,255) n"));
+    assert_eq!(read().unwrap().mailboxes.len(), 256);
+    sql(&fixture, &format!("INSERT INTO td_mta.mailboxes VALUES (decode('{account}','hex'),decode(repeat('ee',16),'hex'),'overflow',NULL,NULL,0,1,decode('0000000000000001','hex'))"));
+    assert_eq!(read(), Err(mailboxes::Error::Capacity));
+    sql(&fixture, &format!("DELETE FROM td_mta.mailboxes WHERE account=decode('{account}','hex') AND id<>decode('{}','hex'); INSERT INTO td_mta.mailboxes VALUES (decode('{account}','hex'),decode(repeat('ee',16),'hex'),'child',decode('{}','hex'),NULL,0,1,decode('0000000000000001','hex')); UPDATE td_mta.mailboxes SET parent_id=decode(repeat('ee',16),'hex') WHERE account=decode('{account}','hex') AND id=decode('{}','hex')", creation.inbox(), creation.inbox(), creation.inbox()));
+    assert_eq!(read(), Err(mailboxes::Error::Integrity));
+    sql(&fixture, &format!("UPDATE td_mta.mailboxes SET parent_id=NULL WHERE account=decode('{account}','hex') AND id=decode('{}','hex')", creation.inbox()));
+    assert_eq!(read().unwrap().mailboxes.len(), 2);
+    let revoked = devices::prepare_revocation(epoch, account, device.device_id(), 2).unwrap();
+    devices::publish_revocation(&request, &trust, deadline(), &revoked).unwrap();
+    assert_eq!(read(), Err(mailboxes::Error::Unauthenticated));
+    assert_eq!(
+        mailboxes::list(
+            &request,
+            &trust,
+            Instant::now(),
+            epoch,
+            account,
+            device.password()
+        ),
+        Err(mailboxes::Error::Connection(Error::Deadline))
+    );
+
+    // Hold only the mailbox relation, so authentication/account state can finish.
+    // Release it after committing a revocation and a new state in that same writer.
+    use std::io::Write;
+    let admitted = devices::prepare_creation(epoch, account, "snapshot race", 3).unwrap();
+    devices::publish_creation(&request, &trust, deadline(), &admitted).unwrap();
+    let mut blocker = ProbeChild(
+        sql_command(&fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    writeln!(
+        input,
+        "BEGIN; LOCK TABLE td_mta.mailboxes IN ACCESS EXCLUSIVE MODE;"
+    )
+    .unwrap();
+    let stop = Instant::now() + Duration::from_secs(5);
+    while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_locks WHERE relation='td_mta.mailboxes'::regclass AND mode='AccessExclusiveLock' AND granted") != "1" {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::scope(|scope| {
+        let pending = scope.spawn(|| {
+            mailboxes::list(
+                &request,
+                &trust,
+                deadline(),
+                epoch,
+                account,
+                admitted.password(),
+            )
+        });
+        let stop = deadline();
+        while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'WITH selected%'") != "1" {
+            assert!(Instant::now() < stop, "mailbox observation did not reach barrier");
+            thread::sleep(Duration::from_millis(5));
+        }
+        writeln!(input, "UPDATE td_mta.devices SET revoked_at=4,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex') AND id=decode('{}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex') WHERE id=decode('{account}','hex'); UPDATE td_mta.mailboxes SET name='After snapshot',changed=decode('0000000000000002','hex') WHERE account=decode('{account}','hex'); COMMIT;", admitted.device_id()).unwrap();
+        drop(input);
+        wait_command(&mut blocker);
+        let old = pending.join().unwrap().unwrap();
+        assert_eq!(old.identity.committed_sequence.number(), 1);
+        assert!(old
+            .mailboxes
+            .iter()
+            .all(|mailbox| mailbox.changed == 1 && mailbox.name != "After snapshot"));
+    });
+    assert_eq!(
+        mailboxes::list(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            admitted.password()
+        ),
+        Err(mailboxes::Error::Unauthenticated)
+    );
+    let fresh = devices::prepare_creation(epoch, account, "after snapshot", 5).unwrap();
+    devices::publish_creation(&request, &trust, deadline(), &fresh).unwrap();
+    let new = mailboxes::list(
+        &request,
+        &trust,
+        deadline(),
+        epoch,
+        account,
+        fresh.password(),
+    )
+    .unwrap();
+    assert_eq!(new.identity.committed_sequence.number(), 2);
+    assert!(new
+        .mailboxes
+        .iter()
+        .all(|mailbox| mailbox.changed == 2 && mailbox.name == "After snapshot"));
+}

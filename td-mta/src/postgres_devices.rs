@@ -356,24 +356,43 @@ pub fn check(
             let receipt = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
             if receipt.store_epoch != epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
-            let rows = client.query("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
-                &[&account.as_bytes().as_slice(), &presented.id().as_bytes().as_slice()])
-                .await.map_err(|_| Error::Database)?;
-            if rows.len() > 1 { return Err(Error::Invalid); }
-            let (salt, expected, active) = if let Some(row) = rows.first() {
-                let salt: &[u8] = row.try_get(0).map_err(|_| Error::Invalid)?;
-                let expected: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
-                let revoked: Option<i64> = row.try_get(2).map_err(|_| Error::Invalid)?;
-                (salt.try_into().map_err(|_| Error::Invalid)?, expected.try_into().map_err(|_| Error::Invalid)?, revoked.is_none())
-            } else { ([0;32], [0;32], false) };
-            let matched = presented.matches(account, &salt, &expected).map_err(|_| Error::Crypto)?;
-            Ok((active && matched).then_some(presented.id()))
+            authenticate(client, account, presented).await
         })
     }).map_err(Error::Connection)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     result
+}
+
+// Caller owns an admitted primary transaction; never reuse the result outside it.
+pub(crate) async fn authenticate(
+    client: &Client,
+    account: AccountId,
+    presented: Presented,
+) -> Result<Option<DeviceId>, Error> {
+    let rows = client.query("SELECT salt,verifier,revoked_at FROM td_mta.devices WHERE account=$1 AND id=$2 LIMIT 2",
+                &[&account.as_bytes().as_slice(), &presented.id().as_bytes().as_slice()])
+                .await.map_err(|_| Error::Database)?;
+    if rows.len() > 1 {
+        return Err(Error::Invalid);
+    }
+    let (salt, expected, active) = if let Some(row) = rows.first() {
+        let salt: &[u8] = row.try_get(0).map_err(|_| Error::Invalid)?;
+        let expected: &[u8] = row.try_get(1).map_err(|_| Error::Invalid)?;
+        let revoked: Option<i64> = row.try_get(2).map_err(|_| Error::Invalid)?;
+        (
+            salt.try_into().map_err(|_| Error::Invalid)?,
+            expected.try_into().map_err(|_| Error::Invalid)?,
+            revoked.is_none(),
+        )
+    } else {
+        ([0; 32], [0; 32], false)
+    };
+    let matched = presented
+        .matches(account, &salt, &expected)
+        .map_err(|_| Error::Crypto)?;
+    Ok((active && matched).then_some(presented.id()))
 }
 
 fn hash(parts: &[&[u8]]) -> Result<[u8; 32], Error> {
