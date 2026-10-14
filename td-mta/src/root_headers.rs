@@ -280,17 +280,6 @@ impl<'p, 'v, 'c, 'b, 'w> Cursor<'p, 'v, 'c, 'b, 'w> {
             remaining,
         ))
     }
-    pub fn into_json<'h>(
-        self,
-        budget: &'h mut crate::nfc::HeaderBudget,
-        scratch: &'h mut crate::nfc::Scratch,
-        now: Tick,
-    ) -> Result<
-        crate::mime_response::root_header_json::Input<'p, 'v, 'c, 'b, 'w, 'h>,
-        crate::mime_response::root_header_json::Error,
-    > {
-        crate::mime_response::root_header_json::Input::new(self, budget, scratch, now)
-    }
     pub(crate) fn into_json_parts(
         mut self,
         now: Tick,

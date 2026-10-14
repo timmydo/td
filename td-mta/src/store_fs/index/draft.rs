@@ -43,10 +43,10 @@ pub struct DraftCompletion {
     pub cleanup_error: Option<ports::Error>,
 }
 // Bridge the composer's private time cursor back into publication checks.
-struct ComposeClock<'a> {
-    deadline: Deadline,
-    clock: &'a dyn Clock,
-    last: std::sync::atomic::AtomicU64,
+pub(super) struct ComposeClock<'a> {
+    pub(super) deadline: Deadline,
+    pub(super) clock: &'a dyn Clock,
+    pub(super) last: std::sync::atomic::AtomicU64,
 }
 impl Clock for ComposeClock<'_> {
     fn sample(&self) -> Result<Time, ports::Error> {
@@ -61,16 +61,16 @@ impl Clock for ComposeClock<'_> {
         Ok(time)
     }
 }
-struct Reservation<'c, 'r, 'a, P> {
-    coordinator: &'c StoreCoordinator<'r, 'a, P>,
-    lease: Option<LeaseId>,
+pub(super) struct Reservation<'c, 'r, 'a, P> {
+    pub(super) coordinator: &'c StoreCoordinator<'r, 'a, P>,
+    pub(super) lease: Option<LeaseId>,
 }
 impl<P> Drop for Reservation<'_, '_, '_, P> {
     fn drop(&mut self) {
         let _ = self.coordinator.cancel_job(self.lease.take());
     }
 }
-fn scratch() -> Result<Vec<u8>, ports::Error> {
+pub(super) fn scratch() -> Result<Vec<u8>, ports::Error> {
     let mut value = Vec::new();
     value
         .try_reserve_exact(format::MAX_VALUE_BYTES)
@@ -215,30 +215,6 @@ impl<P: DraftAuthorization> StoreCoordinator<'_, '_, P> {
             cleanup_error: input.discard().err(),
             ..result
         })
-    }
-
-    // Walk retained kind history once using its existing ordered index. Every
-    // row is prepaid; exhaustion refuses rather than accepting an unchecked ID.
-    fn used_identifier(
-        &self,
-        view: &mut IndexReadView<'_, '_>,
-        target: (ObjectType, &[u8; 16]),
-        deadline: Deadline,
-        last: &mut Tick,
-        meter: &mut Meter,
-    ) -> Result<bool, ports::Error> {
-        let (kind, id) = target;
-        let identity = view.identity();
-        view.read_snapshot(|native| native.run(|db| {
-            flags::charge(&self.store, deadline, last, meter, 1)?;
-            let mut statement = db.prepare("SELECT object FROM changes INDEXED BY changes_kind WHERE account=?1 AND kind=?2 AND sequence>?3 AND sequence<=?4 ORDER BY sequence,operation").map_err(sql)?;
-            let mut rows = statement.query(params![identity.account.as_bytes().as_slice(), kind.tag(), identity.history_floor.number().to_be_bytes().as_slice(), identity.committed_sequence.number().to_be_bytes().as_slice()]).map_err(sql)?;
-            loop {
-                flags::charge(&self.store, deadline, last, meter, 1)?;
-                let Some(row) = rows.next().map_err(sql)? else { return Ok(false) };
-                if fixed_blob::<16>(row, 0)? == *id { return Ok(true) }
-            }
-        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -467,6 +443,32 @@ impl<P: DraftAuthorization> StoreCoordinator<'_, '_, P> {
             admission_stopped: state.stopped,
             cleanup_error: None,
         })
+    }
+}
+
+impl<P> StoreCoordinator<'_, '_, P> {
+    // Walk retained kind history once using its existing ordered index. Every
+    // row is prepaid; exhaustion refuses rather than accepting an unchecked ID.
+    pub(super) fn used_identifier(
+        &self,
+        view: &mut IndexReadView<'_, '_>,
+        target: (ObjectType, &[u8; 16]),
+        deadline: Deadline,
+        last: &mut Tick,
+        meter: &mut Meter,
+    ) -> Result<bool, ports::Error> {
+        let (kind, id) = target;
+        let identity = view.identity();
+        view.read_snapshot(|native| native.run(|db| {
+            flags::charge(&self.store, deadline, last, meter, 1)?;
+            let mut statement = db.prepare("SELECT object FROM changes INDEXED BY changes_kind WHERE account=?1 AND kind=?2 AND sequence>?3 AND sequence<=?4 ORDER BY sequence,operation").map_err(sql)?;
+            let mut rows = statement.query(params![identity.account.as_bytes().as_slice(), kind.tag(), identity.history_floor.number().to_be_bytes().as_slice(), identity.committed_sequence.number().to_be_bytes().as_slice()]).map_err(sql)?;
+            loop {
+                flags::charge(&self.store, deadline, last, meter, 1)?;
+                let Some(row) = rows.next().map_err(sql)? else { return Ok(false) };
+                if fixed_blob::<16>(row, 0)? == *id { return Ok(true) }
+            }
+        }))
     }
 }
 

@@ -669,3 +669,26 @@ fn sqlite_body(mode: sqlite_body_scenario::Mode) {
     }
     println!("{scenario}-allocation-v1: native passed");
 }
+
+#[cfg(td_native_alloc_probe)]
+use td_mta::{header_select, mime_headers};
+
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/transmitted_headers.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod transmitted_headers;
+
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/transmitted_copy.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod transmitted_copy;
+
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/submission_envelope.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod submission_envelope;
+
+#[cfg(td_native_alloc_probe)]
+#[path = "../src/root_headers.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod root_headers;

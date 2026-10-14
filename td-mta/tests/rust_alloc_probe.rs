@@ -13023,3 +13023,15 @@ fn sqlite_body(mode: sqlite_body_scenario::Mode) {
     }
     println!("{scenario}-allocation-v1: rust passed");
 }
+
+#[path = "../src/transmitted_headers.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod transmitted_headers;
+
+#[path = "../src/transmitted_copy.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod transmitted_copy;
+
+#[path = "../src/submission_envelope.rs"]
+#[allow(unused)] // Keep the coordinator with its source-recompiled native pin and meter.
+mod submission_envelope;

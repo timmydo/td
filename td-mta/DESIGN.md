@@ -2466,3 +2466,33 @@ CRLF validation, address parsing and comparisons use fresh monotonic checks
 under a phase that cannot extend the meter deadline. No envelope escapes an
 invalid header, exhausted budget, deadline or clock failure. The transmitted
 copy and all queue rows still require separate admission and atomic publication.
+
+
+The inert native `StoreCoordinator::create_submission` worker freezes an
+immediate td-mail submission from one verified Email blob. Its trusted policy
+guard binds account, device, configuration generation and one configured
+identity address. Initial authorization selects the source; a fresh guard
+must match before publication and remains held through COMMIT. A changed
+source Email, store epoch or requested state refuses. No JMAP submission
+capability or SMTP worker is enabled by this entry point.
+
+The original meter covers whole-body integrity verification, root-header
+collection, implicit-envelope derivation, the Bcc-stripped private spool copy,
+row preparation and the native publication reread. One bounded header arena
+is shared by derivation and copying under the same retained native pin.
+Configured limits bound both the original message and outgoing copy, headers
+and at most 1000 unique recipients; original and phase deadlines never reset.
+No coordinator lock or authorization guard crosses body verification/copying.
+
+Logical body bytes, one blob, queue bytes and one submission are reserved
+before staging. The entire checked transaction fits the native operation and
+byte limits, and physical database/WAL space is reserved before publication.
+The new blob, immutable submission identity, all initially Queued recipients
+and the submission-created change commit together. Fresh UTC sendAt and
+checked five-day expiresAt are encoded before that transaction. Live and
+retained-history collision checks protect generated submission IDs; blobs
+use their live identity check. Known commits survive accounting or staging
+cleanup errors in the returned completion. Failures release private staging
+and reservations; indeterminate effects stop admission for recovery. The
+original Email, Bcc, mailbox membership and flags remain intact; the JMAP
+consumer owns later on-success Email/set hooks and response retention.

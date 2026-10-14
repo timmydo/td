@@ -877,3 +877,10 @@ pub use email_destroy::{
 #[path = "draft.rs"]
 mod draft;
 pub use draft::{DraftAuthorization, DraftCompletion, DraftRequest};
+
+#[path = "submission.rs"]
+mod submission;
+pub use submission::{
+    SubmissionAuthorization, SubmissionCompletion, SubmissionError, SubmissionGuard,
+    SubmissionRequest,
+};

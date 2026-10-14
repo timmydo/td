@@ -37,7 +37,7 @@ fn work(error: Stop) -> Error {
         Error::Capacity
     }
 }
-fn header(error: root_headers::Error) -> Error {
+pub(crate) fn header(error: root_headers::Error) -> Error {
     match error {
         root_headers::Error::Policy(error) => error,
         root_headers::Error::Work(error)
@@ -58,7 +58,7 @@ pub fn write(
     limits: Limits,
     clock: &dyn Clock,
     meter: &mut Meter,
-    mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
+    sink: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     if limits.header_bytes == 0
         || limits.header_bytes > crate::limits::MIB as u64
@@ -88,6 +88,34 @@ pub fn write(
         }
     }
     let view = cursor.finish(clock.sample()?.monotonic).map_err(header)?;
+    write_retained(source, view, limits, &clock, meter, sink)
+}
+/// Caller retains the same verified root-header view and source pin. This lets
+/// envelope validation and copying share one immutable header arena.
+pub(crate) fn write_retained(
+    source: &mut PinnedBlob<'_, '_>,
+    view: root_headers::View<'_>,
+    limits: Limits,
+    clock: &dyn Clock,
+    meter: &mut Meter,
+    mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<u64, Error> {
+    if view.base != 0
+        || view.end.body_start > source.len()
+        || view.end.body_start > limits.header_bytes.saturating_add(2)
+        || limits.header_bytes == 0
+        || limits.header_bytes > crate::limits::MIB as u64
+        || limits.message_bytes == 0
+        || meter.deadline() < limits.deadline.into()
+    {
+        return Err(Error::Invalid);
+    }
+    let clock = LiveClock {
+        source: clock,
+        deadline: limits.deadline,
+        last: AtomicU64::new(clock.sample()?.monotonic.0),
+    };
+    source.check_deadline()?;
     let mut offset = view.end.body_start;
     let end = usize::try_from(offset).map_err(|_| Error::Invalid)?;
     let section = view.bytes.get(..end).ok_or(Error::Invalid)?;

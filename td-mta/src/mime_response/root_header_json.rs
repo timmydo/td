@@ -306,6 +306,20 @@ impl Drop for Cursor<'_, '_, '_> {
         }
     }
 }
+impl<'p, 'v, 'c, 'b, 'w> crate::root_headers::Cursor<'p, 'v, 'c, 'b, 'w> {
+    pub fn into_json<'h>(
+        self,
+        budget: &'h mut crate::nfc::HeaderBudget,
+        scratch: &'h mut crate::nfc::Scratch,
+        now: Tick,
+    ) -> Result<
+        crate::mime_response::root_header_json::Input<'p, 'v, 'c, 'b, 'w, 'h>,
+        crate::mime_response::root_header_json::Error,
+    > {
+        crate::mime_response::root_header_json::Input::new(self, budget, scratch, now)
+    }
+}
+
 #[cfg(test)]
 #[path = "root_header_json/tests.rs"]
 mod tests;
