@@ -647,12 +647,31 @@ duplicate/bind checks and aggregate SMTP session limits. A disabled role
 cannot be enabled by merely adding its listener. Sticky builder failures
 remain terminal.
 
-The existing file configuration still uses `finish`, requiring both
-receiving and JMAP as before. The new entry point is not wired into it or
-serving. Future database generation validation must bind these role
-selections to account, certificate, routing and resource references, verify
-implemented capabilities, and validate the entire generation before
-publication.
+`config::load::read_profile` now carries explicit roles through whole-reader
+EOF, stanza finalization, listener validation and graph closure. Its
+PreparedProfile retains the selected roles and provides read-only candidate
+inspection or storage reclamation. It cannot be passed as the legacy Loaded
+input to text/provider materialization or serving. No command selects it.
+Its owner is included in the compile-time workspace-state bound; the existing
+portable stack fixture qualifies the legacy loader, not this new entry point.
+
+The input is an already composed selected profile, not a database generation
+format. It retains existing account, identity, route, resource and relay
+requirements. A nonreceiving profile requires explicit domain MX names but
+does not require local SMTP listeners for those shared names; a receiving
+profile retains the local-MX/direct-listener check. Policy serving remains
+part of the HTTPS/JMAP listener role: an enabled MTA-STS policy in a composed
+profile without that role refuses. Certificate consumers, names, origin
+ports, ACME HTTP-01 and all other reference checks remain enforced. A
+relay-only profile has no inbound listeners and must omit unused certificates.
+
+The existing file loader still requires both receiving and JMAP as before.
+Future database generation validation must distinguish shared policy from
+per-profile policy serving, compose each selected profile, validate global
+receiving/policy coverage across profiles, resolve versioned database
+materials, verify implemented capabilities, and validate the entire
+generation before publication. This selected-profile structural API does
+not prove those deployment-wide properties.
 
 ## 16. Prepared versioned configuration material
 

@@ -21,6 +21,7 @@ pub enum Code {
     OriginPort,
     Http01Required,
     StsPort,
+    StsListener,
     SniConflict,
     ExplicitMx,
     DirectMx,
@@ -40,6 +41,7 @@ impl Code {
             Self::OriginPort => "config_graph_origin_port",
             Self::Http01Required => "config_graph_http01_required",
             Self::StsPort => "config_graph_sts_port",
+            Self::StsListener => "config_graph_sts_listener",
             Self::SniConflict => "config_graph_sni_conflict",
             Self::ExplicitMx => "config_graph_explicit_mx",
             Self::DirectMx => "config_graph_direct_mx",
@@ -300,6 +302,7 @@ fn validate_links(
     origin: Origin<'_>,
     origin_at: Location,
     scratch: &mut [u8; values::MAX_CERTIFICATE_NAME_BYTES],
+    roles: super::profile::Roles,
 ) -> Result<(), Error> {
     let mut has_direct = false;
     let mut used = [false; certificate::MAX_PROFILES];
@@ -372,10 +375,13 @@ fn validate_links(
         }
         let local = d.mx_host.eq_ignore_ascii_case(hostname)
             || advertised_name(views, origin, d.mx_host, scratch)?;
-        if local && !matching_direct {
+        if roles.receive() && local && !matching_direct {
             return Err(err(Code::DirectMx, Some(d.location)));
         }
         if d.mode != policy::Mode::Off {
+            if !roles.jmap() {
+                return Err(err(Code::StsListener, Some(d.location)));
+            }
             if origin.port() != 443 {
                 return Err(conflict(Code::StsPort, d.location, origin_at));
             }
@@ -429,6 +435,23 @@ pub fn bind<'a>(
     origin_at: Location,
     inputs: Inputs<'a>,
 ) -> Result<Records<'a>, Error> {
+    bind_for_roles(
+        arena,
+        bindings,
+        origin,
+        origin_at,
+        inputs,
+        super::profile::Roles::LEGACY,
+    )
+}
+pub(crate) fn bind_for_roles<'a>(
+    arena: &mut text::Builder<'_>,
+    bindings: &'a mut [BindingSlot],
+    origin: Origin<'_>,
+    origin_at: Location,
+    inputs: Inputs<'a>,
+    roles: super::profile::Roles,
+) -> Result<Records<'a>, Error> {
     if bindings.is_empty() || bindings.len() > MAX_BINDINGS {
         return Err(err(Code::Capacity, None));
     }
@@ -438,6 +461,7 @@ pub fn bind<'a>(
         origin,
         origin_at,
         &mut scratch,
+        roles,
     )?;
     let mut origin_bytes = [0; MAX_CANONICAL_ORIGIN_BYTES];
     let mut output = TextBuffer::new(&mut origin_bytes);

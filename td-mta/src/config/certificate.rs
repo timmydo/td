@@ -284,10 +284,16 @@ impl<'a> Builder<'a> {
         })
     }
     pub fn finish(self) -> Result<Records<'a>, Error> {
+        self.finish_for_roles(super::profile::Roles::LEGACY)
+    }
+    pub(crate) fn finish_for_roles(
+        self,
+        roles: super::profile::Roles,
+    ) -> Result<Records<'a>, Error> {
         if let Some(e) = self.failure {
             return Err(e);
         }
-        if self.count == 0 {
+        if self.count == 0 && (roles.receive() || roles.jmap()) {
             return Err(err(Code::MissingProfiles, None));
         }
         let slots = self.slots.get(..self.count).ok_or_else(invariant)?;

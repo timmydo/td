@@ -51,12 +51,60 @@ pub fn read<R: io::Read + ?Sized>(
         .map(|candidate| Loaded { candidate })
 }
 
+/// Structurally checked selected-profile input, not a legacy serving input.
+/// Complete shared-generation and provider validation remain separate.
+/// It cannot be converted into the legacy serving loader's input:
+/// ```compile_fail,E0308
+/// use td_mta::config::load::{Loaded, PreparedProfile};
+/// fn legacy_input(profile: PreparedProfile) -> Loaded { profile }
+/// ```
+pub struct PreparedProfile {
+    loaded: Loaded,
+    roles: super::profile::Roles,
+}
+impl PreparedProfile {
+    pub fn candidate(&self) -> &storage::Candidate {
+        self.loaded.candidate()
+    }
+    pub fn roles(&self) -> super::profile::Roles {
+        self.roles
+    }
+    pub fn into_storage(self) -> storage::Storage {
+        self.loaded.into_storage()
+    }
+}
+impl fmt::Debug for PreparedProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedProfile(<redacted>)")
+    }
+}
+
+/// Read a complete composed profile through EOF with explicit instance roles.
+/// This cannot be passed to legacy materialization or service admission.
+#[allow(clippy::result_large_err)]
+pub fn read_profile<R: io::Read + ?Sized>(
+    storage: storage::Storage,
+    pending: &mut Pending,
+    scratch: &mut [u8],
+    reader: &mut R,
+    roles: super::profile::Roles,
+) -> Result<PreparedProfile, Failure> {
+    storage
+        .build_for_roles(pending, roles, |mut sink| {
+            stream::read(reader, scratch, |statement| sink.accept(statement)).map(|_| ())
+        })
+        .map(|candidate| PreparedProfile {
+            loaded: Loaded { candidate },
+            roles,
+        })
+}
+
 // Named state only; tests/config_stack.rs separately qualifies the portable
 // structural-loader stack. Future adapters/providers must qualify their frames.
 const WORKSPACE_STATE_BYTES: usize = std::mem::size_of::<Pending>()
     + std::mem::size_of::<dispatch::Builder<'static, 'static>>()
     + std::mem::size_of::<dispatch::Parsed<'static>>()
-    + std::mem::size_of::<Loaded>()
+    + std::mem::size_of::<PreparedProfile>()
     + std::mem::size_of::<Failure>()
     + std::mem::size_of::<stream::Summary>()
     + std::mem::size_of::<super::syntax::Framer<'static>>()
@@ -109,6 +157,123 @@ kind = "https"
 bind = "0.0.0.0:443"
 certificate = "public"
 "#;
+    fn profile_source(bits: u8) -> String {
+        let (shared, listeners) = SOURCE.split_once("[listener ").unwrap();
+        let (smtp, https) = listeners.split_once("[listener ").unwrap();
+        let mut source = shared.replace(
+            "[domain \"example.test\"]",
+            "[domain \"example.test\"]\nmx_host = \"mail.example.test\"",
+        );
+        if bits & 3 == 0 {
+            source = source.split_once("[certificate ").unwrap().0.to_string();
+        }
+        if bits & 1 != 0 {
+            source.push_str("[listener ");
+            source.push_str(smtp);
+        }
+        if bits & 2 != 0 {
+            source.push_str("[listener ");
+            source.push_str(https);
+        }
+        source
+    }
+    #[test]
+    fn composed_profiles_keep_roles_and_require_complete_valid_sources() {
+        let _lock = lock();
+        let mut pending = Pending::new();
+        let mut scratch = vec![0; stream::SCRATCH_BYTES];
+        let mut storage = Storage::try_new().unwrap();
+        for bits in 1..=7 {
+            let roles = super::super::profile::Roles::from_bits(bits).unwrap();
+            let source = profile_source(bits);
+            for chunk in [1, 31, stream::INPUT_BYTES] {
+                let mut input = reader(source.as_bytes(), chunk);
+                let loaded =
+                    read_profile(storage, &mut pending, &mut scratch, &mut input, roles).unwrap();
+                assert_eq!(loaded.roles(), roles);
+                assert_eq!(input.ends, 1);
+                assert!(loaded.candidate().identities().is_ok());
+                storage = loaded.into_storage();
+            }
+            let mut input = reader(source.as_bytes(), 17);
+            input.terminal = Some(io::ErrorKind::Other);
+            let failed =
+                read_profile(storage, &mut pending, &mut scratch, &mut input, roles).unwrap_err();
+            storage = failed.into_parts().0;
+            // A complete legacy configuration may not enable disabled listeners.
+            if bits & 3 != 3 {
+                let mut input = reader(SOURCE.as_bytes(), 31);
+                let failed = read_profile(storage, &mut pending, &mut scratch, &mut input, roles)
+                    .unwrap_err();
+                assert!(matches!(
+                    failed.error(),
+                    BuildError::Configuration(dispatch::Error {
+                        cause: dispatch::Cause::Listener(_),
+                        ..
+                    })
+                ));
+                storage = failed.into_parts().0;
+            }
+        }
+    }
+    #[test]
+    fn profile_graph_keeps_mx_certificate_and_sts_constraints() {
+        let _lock = lock();
+        let mut pending = Pending::new();
+        let mut scratch = vec![0; stream::SCRATCH_BYTES];
+        let mut storage = Storage::try_new().unwrap();
+        let jmap = super::super::profile::Roles::from_bits(2).unwrap();
+        let receive = super::super::profile::Roles::from_bits(1).unwrap();
+        let relay = super::super::profile::Roles::from_bits(4).unwrap();
+        let no_mx = profile_source(2).replace("mx_host = \"mail.example.test\"\n", "");
+        let unknown_certificate =
+            profile_source(2).replace("certificate = \"public\"", "certificate = \"missing\"");
+        let wrong_port = profile_source(2).replace("0.0.0.0:443", "0.0.0.0:8443");
+        let sts = profile_source(1).replace(
+            "[domain \"example.test\"]",
+            "[domain \"example.test\"]\nmta_sts = \"testing\"\nmta_sts_certificate = \"public\"",
+        );
+        let unused_certificate = format!(
+            "{}[certificate \"unused\"]\nmode = \"files\"\nchain_file = \"/chain\"\nkey_file = \"/key\"\n",
+            profile_source(4),
+        );
+        for (source, roles, code) in [
+            (no_mx, jmap, graph::Code::ExplicitMx),
+            (unknown_certificate, jmap, graph::Code::UnknownCertificate),
+            (wrong_port, jmap, graph::Code::OriginPort),
+            (sts, receive, graph::Code::StsListener),
+            (unused_certificate, relay, graph::Code::UnusedCertificate),
+        ] {
+            let mut input = reader(source.as_bytes(), 31);
+            let failed =
+                read_profile(storage, &mut pending, &mut scratch, &mut input, roles).unwrap_err();
+            match failed.error() {
+                BuildError::Configuration(dispatch::Error {
+                    cause: dispatch::Cause::Graph(error),
+                    ..
+                }) => assert_eq!(error.code, code),
+                error => panic!("unexpected failure: {error:?}"),
+            }
+            storage = failed.into_parts().0;
+        }
+        let unused_acme = format!(
+            "{}[acme]\ndirectory = \"https://ca.example.test/directory\"\ncontact = \"admin@example.test\"\nterms_accepted = true\n",
+            profile_source(4),
+        );
+        let mut input = reader(unused_acme.as_bytes(), 31);
+        let failed =
+            read_profile(storage, &mut pending, &mut scratch, &mut input, relay).unwrap_err();
+        assert!(
+            matches!(failed.error(), BuildError::Configuration(dispatch::Error {
+            cause: dispatch::Cause::Certificate(error), ..
+        }) if error.code == super::super::certificate::Code::UnusedAcme)
+        );
+        storage = failed.into_parts().0;
+        // Legacy EOF loading retains the requirement for both listener roles.
+        let source = profile_source(2);
+        let mut input = reader(source.as_bytes(), 31);
+        assert!(read(storage, &mut pending, &mut scratch, &mut input).is_err());
+    }
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         text::TEST_CONSTRUCTION_LOCK
             .lock()

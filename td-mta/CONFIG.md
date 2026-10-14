@@ -1,5 +1,10 @@
 # td-mta configuration
 
+The inert selected-profile structural loader is specified in
+[POSTGRES.md §15](POSTGRES.md#15-prepared-instance-role-validation).
+Its role-aware listener and local-MX rules apply only to PreparedProfile;
+the legacy file loader and serving contracts below retain their requirements.
+
 ## Scope
 
 This document owns configuration syntax and its bounded parsing helpers.

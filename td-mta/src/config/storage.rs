@@ -388,8 +388,17 @@ impl Storage {
     // Returning the preallocated owner avoids allocating error storage.
     #[allow(clippy::result_large_err)]
     pub fn build_stanzas<E>(
+        self,
+        pending: &mut Pending,
+        feed: impl FnOnce(Statements<'_, '_, '_>) -> Result<(), E>,
+    ) -> Result<Candidate, Failed<E>> {
+        self.build_for_roles(pending, super::profile::Roles::LEGACY, feed)
+    }
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn build_for_roles<E>(
         mut self,
         pending: &mut Pending,
+        roles: super::profile::Roles,
         feed: impl FnOnce(Statements<'_, '_, '_>) -> Result<(), E>,
     ) -> Result<Candidate, Failed<E>> {
         let result = (|| {
@@ -403,7 +412,7 @@ impl Storage {
                 });
             }
             builder
-                .finish_stanzas()
+                .finish_for_roles(roles)
                 .map(dispatch::Parsed::seal)
                 .map_err(BuildError::Configuration)
         })();

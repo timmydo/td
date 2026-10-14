@@ -491,7 +491,13 @@ impl<'a, 'w> Builder<'a, 'w> {
         }
     }
     /// Finalizes supplied statements only. This is never proof of reader EOF.
-    pub fn finish_stanzas(mut self) -> Result<Parsed<'a>, Error> {
+    pub fn finish_stanzas(self) -> Result<Parsed<'a>, Error> {
+        self.finish_for_roles(super::profile::Roles::LEGACY)
+    }
+    pub(crate) fn finish_for_roles(
+        mut self,
+        roles: super::profile::Roles,
+    ) -> Result<Parsed<'a>, Error> {
         if let Some(e) = self.failure {
             return Err(e);
         }
@@ -530,7 +536,7 @@ impl<'a, 'w> Builder<'a, 'w> {
         let certificates = self
             .targets
             .certificates
-            .finish()
+            .finish_for_roles(roles)
             .map_err(Error::from_certificate)?;
         let gateways = self
             .targets
@@ -540,9 +546,9 @@ impl<'a, 'w> Builder<'a, 'w> {
         let listeners = self
             .targets
             .listeners
-            .finish(resources.resources())
+            .finish_for_roles(resources.resources(), roles)
             .map_err(Error::from_listener)?;
-        let graph = graph::bind(
+        let graph = graph::bind_for_roles(
             &mut self.arena,
             self.targets.bindings,
             names.origin()?,
@@ -553,6 +559,7 @@ impl<'a, 'w> Builder<'a, 'w> {
                 gateways,
                 domains,
             },
+            roles,
         )
         .map_err(Error::from_graph)?;
         Ok(Parsed {
