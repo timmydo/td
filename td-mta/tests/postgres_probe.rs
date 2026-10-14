@@ -1868,16 +1868,28 @@ certificate = "public"
 #[test]
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
 fn real_postgres_configuration_validates_all_profiles_and_binds_canonical_sources() {
-    exercise_configuration(false);
+    exercise_configuration(ConfigurationExercise::Flags);
 }
 
 #[test]
 #[ignore = "real local PostgreSQL 17 tools, including psql, required"]
 fn real_postgres_uploads_publish_chunks_quotas_and_retained_outcomes() {
-    exercise_configuration(true);
+    exercise_configuration(ConfigurationExercise::Uploads);
 }
 
-fn exercise_configuration(uploads: bool) {
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_blob_downloads_enforce_device_leases_and_verify_snapshots() {
+    exercise_configuration(ConfigurationExercise::Downloads);
+}
+
+enum ConfigurationExercise {
+    Flags,
+    Uploads,
+    Downloads,
+}
+
+fn exercise_configuration(exercise: ConfigurationExercise) {
     use td_mta::{
         config::profile::Roles,
         postgres_configuration::{self as configuration, Profile},
@@ -2405,10 +2417,16 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
         if name == "desktop" {
-            if uploads {
-                exercise_uploads(&fixture, &request, &trust, prepared.binding());
-            } else {
-                exercise_flags(&fixture, &request, &trust, prepared.binding());
+            match exercise {
+                ConfigurationExercise::Flags => {
+                    exercise_flags(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Uploads => {
+                    exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Downloads => {
+                    exercise_downloads(&fixture, &request, &trust, prepared.binding())
+                }
             }
         }
         let (_, configuration, policies) = prepared.into_parts();
@@ -3772,6 +3790,223 @@ fn exercise_flag_batches(
     assert_eq!(
         flags::inspect_batch(request, trust, deadline(), &empty),
         Err(flags::Error::Integrity)
+    );
+}
+
+fn exercise_downloads(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        postgres_body as bodies, postgres_devices as devices, postgres_uploads as uploads,
+    };
+    let account = binding.account();
+    let owner = devices::prepare_creation(binding.epoch(), account, "download owner", 1).unwrap();
+    let other = devices::prepare_creation(binding.epoch(), account, "other device", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &owner).unwrap();
+    devices::publish_creation(request, trust, deadline(), &other).unwrap();
+    let upload = |bytes: &[u8]| {
+        let prepared = uploads::prepare(binding, owner.device_id(), bytes, deadline()).unwrap();
+        uploads::publish(request, trust, deadline(), &prepared, owner.password()).unwrap()
+    };
+    // Verification and replay share the same ten-second maximum as Email reads.
+    let read_deadline = || Instant::now() + Duration::from_secs(10);
+    let verify = |blob, maximum, password: &[u8]| {
+        bodies::with_blob(
+            request,
+            trust,
+            read_deadline(),
+            bodies::BlobRequest {
+                binding,
+                blob,
+                maximum,
+            },
+            password,
+            |metadata, body| {
+                assert_eq!(metadata.identity.account, account);
+                assert_eq!(metadata.identity.epoch, binding.epoch());
+                assert_eq!(metadata.blob, blob);
+                let mut buffer = [0; 65536];
+                let mut offset = 0;
+                while offset < body.len() {
+                    let count = body.read_at(offset, &mut buffer)?;
+                    assert!(count > 0);
+                    assert!(buffer[..count].iter().all(|byte| *byte == 0x42));
+                    offset += count as u64;
+                }
+                Ok(metadata.body.length)
+            },
+        )
+    };
+    let mut retained = None;
+    for length in [0, 65537, uploads::MAX_BYTES] {
+        let published = upload(&vec![0x42; length]);
+        let start = Instant::now();
+        assert_eq!(
+            verify(published.blob, length as u64, owner.password()).unwrap(),
+            length as u64
+        );
+        eprintln!(
+            "blob download length={length}: verified and replayed at {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            verify(published.blob, length as u64, other.password()),
+            Err(bodies::Error::Missing)
+        );
+        if length > 0 {
+            assert_eq!(
+                verify(published.blob, length as u64 - 1, owner.password()),
+                Err(bodies::Error::Capacity)
+            );
+        }
+        retained = Some(published);
+    }
+    let retained = retained.unwrap();
+    assert_eq!(
+        verify(retained.blob, bodies::MAX_BODY_BYTES, b"invalid"),
+        Err(bodies::Error::Unauthenticated)
+    );
+    assert_eq!(
+        verify(retained.blob, bodies::MAX_BODY_BYTES + 1, owner.password()),
+        Err(bodies::Error::Capacity)
+    );
+    assert_eq!(
+        verify(
+            td_mta::ids::BlobId::from_bytes([0; 16]),
+            1,
+            owner.password()
+        ),
+        Err(bodies::Error::Missing)
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
+    assert_eq!(
+        verify(retained.blob, bodies::MAX_BODY_BYTES, owner.password()),
+        Err(bodies::Error::Policy)
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    let small = upload(&vec![0x42; 1024 * 1024 + 1]);
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.leases SET expires_at=0 WHERE blob_id=decode('{}','hex')",
+            small.blob
+        ),
+    );
+    assert_eq!(
+        verify(small.blob, bodies::MAX_BODY_BYTES, owner.password()),
+        Err(bodies::Error::Missing)
+    );
+    // A live Email reference admits all current account devices despite expiry.
+    sql(fixture,&format!("INSERT INTO td_mta.threads VALUES(decode('{account}','hex'),decode(repeat('81',16),'hex'),decode('{:016x}','hex')); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES(decode('{account}','hex'),decode(repeat('82',16),'hex'),decode('{}','hex'),decode(repeat('81',16),'hex'),0,2,decode('{:016x}','hex'))",small.new_sequence,small.blob,small.new_sequence));
+    assert_eq!(
+        verify(small.blob, bodies::MAX_BODY_BYTES, other.password()).unwrap(),
+        small.length
+    );
+    // A retained transmission reference independently admits the same body.
+    sql(fixture,&format!("INSERT INTO td_mta.submissions(account,id,email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,recipient_count,notification,changed) VALUES(decode('{account}','hex'),decode(repeat('83',16),'hex'),decode(repeat('82',16),'hex'),decode(repeat('81',16),'hex'),decode(repeat('84',16),'hex'),decode('{}','hex'),'sender@example.test',0,1,1,0,decode('{:016x}','hex')); DELETE FROM td_mta.emails",small.blob,small.new_sequence));
+    assert_eq!(
+        verify(small.blob, bodies::MAX_BODY_BYTES, other.password()).unwrap(),
+        small.length
+    );
+    sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=decode(repeat('43',octet_length(bytes)),'hex') WHERE blob_id=decode('{}','hex') AND ordinal=0",small.blob));
+    assert_eq!(
+        bodies::with_blob(
+            request,
+            trust,
+            read_deadline(),
+            bodies::BlobRequest {
+                binding,
+                blob: small.blob,
+                maximum: bodies::MAX_BODY_BYTES
+            },
+            owner.password(),
+            |_, _| panic!("corrupt bytes reached callback")
+        ),
+        Err::<(), _>(bodies::Error::Read(td_mta::ports::Error::Corrupt))
+    );
+    sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=decode(repeat('42',octet_length(bytes)),'hex') WHERE blob_id=decode('{}','hex') AND ordinal=0",small.blob));
+    // An admitted callback keeps its snapshot across physical row retirement.
+    bodies::with_blob(request,trust,read_deadline(),bodies::BlobRequest { binding,blob:small.blob,maximum:bodies::MAX_BODY_BYTES },owner.password(),|_,body| {
+        sql(fixture,&format!("BEGIN; DELETE FROM td_mta.submissions; DELETE FROM td_mta.leases WHERE blob_id=decode('{}','hex'); DELETE FROM td_mta.blobs WHERE id=decode('{}','hex'); COMMIT",small.blob,small.blob));
+        let mut bytes=[0;32];
+        assert_eq!(body.read_at(0,&mut bytes)?,32);
+        assert_eq!(bytes,[0x42;32]);
+        Ok(())
+    }).unwrap();
+    assert_eq!(
+        verify(small.blob, bodies::MAX_BODY_BYTES, owner.password()),
+        Err(bodies::Error::Missing)
+    );
+    let revoked =
+        devices::prepare_revocation(binding.epoch(), account, owner.device_id(), 2).unwrap();
+    // Hold only the body relation: authentication establishes the old snapshot
+    // before the paused manifest query, then revocation commits independently.
+    use std::io::Write;
+    let mut blocker = ProbeChild(
+        sql_command(fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    input
+        .write_all(b"BEGIN; LOCK td_mta.blob_chunks IN ACCESS EXCLUSIVE MODE;\n")
+        .unwrap();
+    input.flush().unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while sql(fixture,"SELECT count(*) FROM pg_locks WHERE relation='td_mta.blob_chunks'::regclass AND mode='AccessExclusiveLock' AND granted")!="1" {
+        assert!(Instant::now()<until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let race_started = Instant::now();
+    thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            bodies::with_blob(
+                request,
+                trust,
+                read_deadline(),
+                bodies::BlobRequest {
+                    binding,
+                    blob: retained.blob,
+                    maximum: bodies::MAX_BODY_BYTES,
+                },
+                owner.password(),
+                |_, _| panic!("revoked snapshot reached callback"),
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while sql(fixture,"SELECT count(*) FROM pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'SELECT a.sequence,a.floor,b.length%'")!="1" {
+            assert!(Instant::now()<until);
+            thread::sleep(Duration::from_millis(10));
+        }
+        devices::publish_revocation(request, trust, deadline(), &revoked).unwrap();
+        input.write_all(b"COMMIT;\n\\q\n").unwrap();
+        input.flush().unwrap();
+        eprintln!(
+            "revocation barrier released after {:?} (including reader setup)",
+            race_started.elapsed()
+        );
+        assert_eq!(
+            reader.join().unwrap(),
+            Err::<(), _>(bodies::Error::Unauthenticated)
+        );
+    });
+    drop(input);
+    wait_command(&mut blocker);
+    assert_eq!(
+        verify(retained.blob, bodies::MAX_BODY_BYTES, owner.password()),
+        Err(bodies::Error::Unauthenticated)
     );
 }
 

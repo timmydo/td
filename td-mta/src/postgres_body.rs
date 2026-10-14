@@ -6,6 +6,7 @@ use crate::{
     ports::{self, BlobReader, ViewIdentity},
     postgres_devices,
     postgres_probe::{self, Request, Worker},
+    postgres_runtime_profile::Binding,
     postgres_schema,
 };
 use std::time::Instant;
@@ -21,6 +22,7 @@ pub enum Error {
     Schema(postgres_schema::Error),
     Credential(postgres_devices::Error),
     Epoch,
+    Policy,
     Unauthenticated,
     Missing,
     Integrity,
@@ -46,6 +48,19 @@ pub struct Metadata {
     pub thread: ThreadId,
     pub received_at: i64,
     pub body: BlobRow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobMetadata {
+    pub identity: ViewIdentity,
+    pub blob: BlobId,
+    pub body: BlobRow,
+}
+
+pub struct BlobRequest<'a> {
+    pub binding: &'a Binding,
+    pub blob: BlobId,
+    pub maximum: u64,
 }
 
 /// Read only a body referenced by the selected account's Email. Upload leases
@@ -75,7 +90,7 @@ pub fn with_email<T>(
             if rows.len() != 1 { return Err(Error::Integrity); }
             metadata(rows.first().ok_or(Error::Integrity)?, selected)
         })).map_err(Error::Connection)??;
-        let mut body = Body { worker, metadata, deadline, failed: None, cache: Vec::new(), cache_start: 0 };
+        let mut body = Body { worker, metadata: BlobMetadata { identity: metadata.identity, blob: metadata.blob, body: metadata.body }, deadline, failed: None, cache: Vec::new(), cache_start: 0 };
         body.verify().map_err(Error::Read)?;
         body.check().map_err(Error::Read)?;
         let result = read(metadata, &mut body);
@@ -83,6 +98,208 @@ pub fn with_email<T>(
         body.check().map_err(Error::Read)?;
         result.map_err(Error::Read)
     }).map_err(Error::Connection)?
+}
+
+/// Verify and replay one immutable snapshot. Account-owned Email/submission
+/// references admit any current account device; an otherwise unreferenced
+/// upload requires that device's unexpired lease. Reauthorize before callback
+/// admission; an admitted callback retains its original finite deadline.
+pub fn with_blob<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    selected: BlobRequest<'_>,
+    password: &[u8],
+    read: impl FnOnce(BlobMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    let binding = selected.binding;
+    if !binding.roles().jmap() {
+        return Err(Error::Policy);
+    }
+    if selected.maximum > MAX_BODY_BYTES {
+        return Err(Error::Capacity);
+    }
+    let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
+    let snapshot_binding = binding.clone();
+    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+        let (metadata, expires) = worker
+            .run(|client| {
+                Box::pin(blob_snapshot(
+                    client,
+                    snapshot_binding,
+                    selected.blob,
+                    selected.maximum,
+                    presented,
+                ))
+            })
+            .map_err(Error::Connection)??;
+        let mut body = Body {
+            worker,
+            metadata,
+            deadline,
+            failed: None,
+            cache: Vec::new(),
+            cache_start: 0,
+        };
+        body.verify().map_err(Error::Read)?;
+        // A new primary transaction sees revocations after the body snapshot.
+        let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
+        let binding = binding.clone();
+        postgres_probe::with_mailbox_client(request, trust, deadline, |client| {
+            Box::pin(reauthorize_blob(client, binding, presented, expires))
+        })
+        .map_err(Error::Connection)??;
+        body.check().map_err(Error::Read)?;
+        let result = read(metadata, &mut body);
+        body.check().map_err(Error::Read)?;
+        result.map_err(Error::Read)
+    })
+    .map_err(Error::Connection)?
+}
+
+async fn blob_snapshot(
+    client: &tokio_postgres::Client,
+    binding: Binding,
+    blob: BlobId,
+    maximum: u64,
+    presented: Presented,
+) -> Result<(BlobMetadata, Option<i64>), Error> {
+    let device = presented.id();
+    let schema = postgres_schema::lock_and_inspect(client)
+        .await
+        .map_err(Error::Schema)?;
+    if schema.store_epoch != binding.epoch() {
+        return Err(Error::Epoch);
+    }
+    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
+    check_selection(client, &binding, false).await?;
+    postgres_devices::authenticate(client, binding.account(), presented)
+        .await
+        .map_err(Error::Credential)?
+        .ok_or(Error::Unauthenticated)?;
+    let rows = client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),EXISTS(SELECT 1 FROM td_mta.emails e WHERE e.account=b.account AND e.blob_id=b.id) OR EXISTS(SELECT 1 FROM td_mta.submissions s WHERE s.account=b.account AND s.transmitted_blob_id=b.id),l.device_id,l.expires_at,l.changed,(extract(epoch FROM clock_timestamp())*1000)::bigint FROM td_mta.accounts a JOIN td_mta.blobs b ON b.account=a.id LEFT JOIN td_mta.leases l ON l.account=b.account AND l.blob_id=b.id WHERE a.id=$1 AND b.id=$2 LIMIT 2", &[&binding.account().as_bytes().as_slice(), &blob.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    if rows.is_empty() {
+        return Err(Error::Missing);
+    }
+    if rows.len() != 1 {
+        return Err(Error::Integrity);
+    }
+    let row = rows.first().ok_or(Error::Integrity)?;
+    let sequence = number(row, 0)?;
+    let floor = number(row, 1)?;
+    if floor > sequence || number(row, 6)? > sequence {
+        return Err(Error::Integrity);
+    }
+    let referenced: bool = row.try_get(8).map_err(|_| Error::Integrity)?;
+    let expires = if referenced {
+        None
+    } else {
+        let owner: Option<&[u8]> = row.try_get(9).map_err(|_| Error::Integrity)?;
+        let expires: Option<i64> = row.try_get(10).map_err(|_| Error::Integrity)?;
+        let now: i64 = row.try_get(12).map_err(|_| Error::Integrity)?;
+        if owner != Some(device.as_bytes().as_slice()) || expires.is_none_or(|expiry| expiry <= now)
+        {
+            return Err(Error::Missing);
+        }
+        if number(row, 11)? > sequence {
+            return Err(Error::Integrity);
+        }
+        expires
+    };
+    let length: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
+    let length = u64::try_from(length).map_err(|_| Error::Integrity)?;
+    if length > MAX_BODY_BYTES {
+        return Err(Error::Integrity);
+    }
+    if length > maximum {
+        return Err(Error::Capacity);
+    }
+    let digest: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
+    let chunks: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
+    let actual: i64 = row.try_get(7).map_err(|_| Error::Integrity)?;
+    if u64::try_from(chunks).ok() != Some(length.div_ceil(CHUNK)) || chunks != actual {
+        return Err(Error::Integrity);
+    }
+    Ok((
+        BlobMetadata {
+            identity: ViewIdentity {
+                account: binding.account(),
+                epoch: binding.epoch(),
+                committed_sequence: Sequence::from_u64(sequence),
+                history_floor: Sequence::from_u64(floor),
+            },
+            blob,
+            body: BlobRow {
+                length,
+                digest: digest.try_into().map_err(|_| Error::Integrity)?,
+                created_at: row.try_get(4).map_err(|_| Error::Integrity)?,
+            },
+        },
+        expires,
+    ))
+}
+
+async fn reauthorize_blob(
+    client: &tokio_postgres::Client,
+    binding: Binding,
+    presented: Presented,
+    expires: Option<i64>,
+) -> Result<(), Error> {
+    let schema = postgres_schema::lock_and_inspect(client)
+        .await
+        .map_err(Error::Schema)?;
+    if schema.store_epoch != binding.epoch() {
+        return Err(Error::Epoch);
+    }
+    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
+    check_selection(client, &binding, true).await?;
+    client
+        .query_one(
+            "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
+            &[&binding.account().as_bytes().as_slice()],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    postgres_devices::authenticate(client, binding.account(), presented)
+        .await
+        .map_err(Error::Credential)?
+        .ok_or(Error::Unauthenticated)?;
+    let now: i64 = client
+        .query_one(
+            "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            &[],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Integrity)?;
+    if expires.is_some_and(|expiry| expiry <= now) {
+        return Err(Error::Missing);
+    }
+    Ok(())
+}
+
+async fn check_selection(
+    client: &tokio_postgres::Client,
+    binding: &Binding,
+    locked: bool,
+) -> Result<(), Error> {
+    let query = if locked {
+        "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE"
+    } else {
+        "SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true"
+    };
+    let row = client
+        .query_one(query, &[])
+        .await
+        .map_err(|_| Error::Database)?;
+    let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
+    if number(&row, 0)? != binding.selection().generation
+        || version != Some(binding.selection().version.as_bytes().as_slice())
+    {
+        return Err(Error::Policy);
+    }
+    Ok(())
 }
 
 fn number(row: &tokio_postgres::Row, column: usize) -> Result<u64, Error> {
@@ -149,7 +366,7 @@ fn connection(error: postgres_probe::Error) -> ports::Error {
 
 struct Body<'a> {
     worker: &'a mut Worker,
-    metadata: Metadata,
+    metadata: BlobMetadata,
     deadline: Instant,
     failed: Option<ports::Error>,
     cache: Vec<tokio_postgres::Row>,

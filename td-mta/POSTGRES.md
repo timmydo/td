@@ -1453,6 +1453,31 @@ retry lifetimes are defined together.
 Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
 current usage exceeds its cap. Logical counters do not reserve server disk.
-Runtime ingress reservations, cleanup with fenced reclaim, upload download
-access, Email import, SMTP publication and serving activation remain cutover
-work. This API does not make the SQLite/file-backed server use PostgreSQL.
+Runtime ingress reservations, cleanup with fenced reclaim, HTTPS download
+dispatch, td-mail Email/set creation, SMTP publication and serving activation
+remain cutover work. This API does not make the SQLite/file-backed server use PostgreSQL.
+
+## 36. Authenticated blob downloads
+
+`postgres_body::with_blob` shares the Email reader's bounded chunk verifier
+and replay cache. Its read-only repeatable-read snapshot binds the account
+state, manifest, chunk count and bytes. It accepts a current JMAP profile and
+device credential. An Email or transmitted-submission reference in that
+account admits the body; otherwise the snapshot must contain an unexpired
+upload lease owned by that device. A Blob ID or upload receipt alone grants
+no access. Lease expiry uses the database clock.
+
+Before calling the consumer, the complete body must pass SHA-256 verification.
+A separate primary transaction then rechecks the store epoch, current profile
+selection and device credential under selection/account shared locks, in that
+order. It checks the retained upload expiry against current database time.
+Revocation or policy replacement during verification therefore refuses the
+callback. Once admitted, a callback can finish after revocation or retirement
+within its original deadline; it retains the verified snapshot throughout.
+No read retries onto a different snapshot after output begins.
+
+Both connections share the original at-most-ten-second operation deadline;
+each retains its existing finite frame and byte budgets. Callback errors,
+swallowed reader errors, expired deadlines and failed snapshot connections
+cannot become success. This cold boundary does not yet connect production
+HTTPS dispatch or replace runtime connection and worker admission.
