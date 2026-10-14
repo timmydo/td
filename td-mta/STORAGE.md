@@ -1,5 +1,10 @@
 # td-mta storage
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 This is the normative physical storage contract. [FORMAT.md](FORMAT.md)
 owns transient application key and row encodings; SQLite owns relational
 storage, pages, WAL, locking, transactions and crash recovery. [API.md](API.md)

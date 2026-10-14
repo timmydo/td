@@ -1,5 +1,10 @@
 # td-mta: personal mail service
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 ## 1. Status and scope
 
 This is the normative target for a new service, not a claim that it exists.

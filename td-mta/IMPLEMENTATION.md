@@ -1,5 +1,10 @@
 # td-mta implementation handoff
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 ## How to use this plan
 
 Read `DESIGN.md`, root `AGENTS.md`, and `DEVELOPMENT.md` before work.

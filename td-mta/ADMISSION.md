@@ -1,5 +1,10 @@
 # Disk admission, bounded work and request retention
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 This is the normative companion to RESOURCES.md, API.md and STORAGE.md.
 admission.rs validates an immutable disk/work plan without allocating pools
 or inspecting free space. Fixed logical leases and effect tickets provide

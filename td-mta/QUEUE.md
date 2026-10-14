@@ -1,5 +1,10 @@
 # Submission and relay contract
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 This document is normative for M16/M17 and administration. FORMAT.md owns
 bytes; this document owns allowed states and transitions. It does not enable
 a listener, queue worker or JMAP capability. All times in persisted rows are

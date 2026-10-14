@@ -1,5 +1,10 @@
 # Complete configuration schema
 
+[POSTGRES.md](POSTGRES.md) owns the agreed multi-instance PostgreSQL
+replacement target and atomic cutover boundary. Until that cutover, the
+SQLite/file-backed implementation and its contracts below remain active.
+PostgreSQL support and distributed delivery are not yet implemented.
+
 ## Status and ownership
 
 This document specifies the complete v1 operator schema to implement in
