@@ -75,6 +75,7 @@ object_ids!(
     IdentityId,
     DeviceId,
     StoreEpoch,
+    MaterialVersion,
     InstanceId,
     BootId
 );

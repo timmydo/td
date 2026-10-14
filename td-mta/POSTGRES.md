@@ -732,3 +732,51 @@ limits, empty signatures, duplicate immutability, kind/epoch refusal,
 restart persistence, chunk corruption/missing data, mid-write rollback and
 lost-COMMIT resolution using the original version. They use only disposable
 local clusters and do not qualify Azure/RDS or configuration activation.
+
+## 17. Operator material preparation
+
+`td-mta postgres material-version` generates one random canonical 128-bit
+version without opening files, contacting a database or reserving an ID.
+Retain it before importing. Explicit import and comparison use:
+
+```text
+td-mta postgres material-import --connection-file PATH --input-file PATH \
+    --kind KIND --epoch HEX --version HEX
+td-mta postgres material-check --connection-file PATH --input-file PATH \
+    --kind KIND --epoch HEX --version HEX
+```
+
+Both IDs must be exactly 32 lowercase hex characters. Obtain the epoch from
+schema-inspect. Kinds are relay-password, certificate-chain, private-key,
+trust-bundle, text-signature and html-signature. These owner-authorized
+preparation commands store or compare raw bytes only; they neither validate
+text/PEM contents nor activate a configuration. No profile selector applies.
+There is no secret-bearing argument or command that prints stored bytes.
+
+The protected loader opens connection, optional explicit database trust and
+material in one owner/inode inventory. Passwords and private keys require
+secret-file permissions; chains, trust and signatures use the public-input
+policy. Secret/public inode aliases refuse even across different paths.
+The connection directory's checked owner binds every input. Each input is
+read under its existing raw-byte ceiling before DNS; trusted regular-file
+I/O is bounded in bytes, not wall time. Raw material owners have no Debug
+representation; memory cleanup makes no secure-erasure claim.
+
+Network work shares the existing ten-second deadline and five-second DNS
+allowance, with address retry only for definite transport refusal before
+any possible COMMIT. Import appends the caller's retained version, refusing
+replacement. Check validates the stored manifest/chunks and compares exact
+bytes with the protected input, without outputting either value. A lost
+COMMIT response reports indeterminate-do-not-retry. Wait for the original
+backend to settle, then check that same epoch/version/kind/input. Missing
+while the original backend could still commit is not rollback evidence.
+Keep the intended input available until resolution; do not generate another
+version and replay. A lost stdout receipt likewise does not authorize replay.
+
+Success JSON echoes only canonical IDs and explicitly reports
+content_validated=false and profile_activated=false. Errors use fixed
+categories without supplied paths, bytes or provider text. Exit codes are
+zero for success, one for refusal/failure and two for invalid arguments.
+The local PostgreSQL fixture covers the actual CLI, maximum and empty inputs,
+protected modes and aliases, kind/epoch/mismatch refusal, duplicate
+immutability and delayed-COMMIT resolution by the retained version.

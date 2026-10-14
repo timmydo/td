@@ -7,6 +7,8 @@ use std::{
 };
 use td_mta::{postgres_input::Loaded, postgres_probe, postgres_resolver, postgres_schema};
 
+mod material;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
     Probe,
@@ -65,7 +67,11 @@ fn arguments(operation: Operation, mut args: impl Iterator<Item = OsString>) -> 
 }
 
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
-    let operation = args.next().as_deref().and_then(Operation::parse);
+    let command = args.next();
+    if let Some(operation) = command.as_deref().and_then(material::Operation::parse) {
+        return material::run(operation, args);
+    }
+    let operation = command.as_deref().and_then(Operation::parse);
     let Some(operation) = operation else {
         report_error("postgres", "arguments", "invalid-arguments")?;
         return Ok(ExitCode::from(2));
@@ -109,9 +115,46 @@ enum Outcome {
 }
 
 fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str, &'static str)> {
+    with_addresses(loaded, |request, deadline| {
+        match operation {
+            Operation::Probe => postgres_probe::probe(request, &loaded.trust, deadline)
+                .map(Outcome::Probe)
+                .map_err(postgres_schema::Error::Connection),
+            Operation::Initialize => {
+                postgres_schema::initialize(request, &loaded.trust, deadline).map(Outcome::Schema)
+            }
+            Operation::Upgrade => {
+                postgres_schema::upgrade(request, &loaded.trust, deadline).map(Outcome::Schema)
+            }
+            Operation::Inspect => {
+                postgres_schema::inspect(request, &loaded.trust, deadline).map(Outcome::Schema)
+            }
+        }
+        .map_err(AttemptError::from)
+    })
+}
+
+enum AttemptError {
+    Transport,
+    Failed(&'static str, &'static str),
+}
+impl From<postgres_schema::Error> for AttemptError {
+    fn from(error: postgres_schema::Error) -> Self {
+        if error == postgres_schema::Error::Connection(postgres_probe::Error::Transport) {
+            Self::Transport
+        } else {
+            let (stage, code) = classify(error);
+            Self::Failed(stage, code)
+        }
+    }
+}
+
+fn with_addresses<T>(
+    loaded: &Loaded,
+    mut operation: impl FnMut(&postgres_probe::Request<'_>, Instant) -> Result<T, AttemptError>,
+) -> Result<T, (&'static str, &'static str)> {
     let executable = std::env::current_exe().map_err(|_| ("resolver", "executable"))?;
-    // Bootstrap files are trusted cold I/O. DNS and every attempted address
-    // spend one subsequent network deadline; retries never renew it.
+    // Cold files precede one shared DNS/connection/operation deadline.
     let now = Instant::now();
     let deadline = now + Duration::from_secs(10);
     let addresses =
@@ -126,25 +169,10 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
                 )
             })?;
     for address in addresses {
-        let request = loaded.bootstrap.request(address);
-        let result = match operation {
-            Operation::Probe => postgres_probe::probe(&request, &loaded.trust, deadline)
-                .map(Outcome::Probe)
-                .map_err(postgres_schema::Error::Connection),
-            Operation::Initialize => {
-                postgres_schema::initialize(&request, &loaded.trust, deadline).map(Outcome::Schema)
-            }
-            Operation::Upgrade => {
-                postgres_schema::upgrade(&request, &loaded.trust, deadline).map(Outcome::Schema)
-            }
-            Operation::Inspect => {
-                postgres_schema::inspect(&request, &loaded.trust, deadline).map(Outcome::Schema)
-            }
-        };
-        match result {
-            Ok(status) => return Ok(status),
-            Err(postgres_schema::Error::Connection(postgres_probe::Error::Transport)) => continue,
-            Err(error) => return Err(classify(error)),
+        match operation(&loaded.bootstrap.request(address), deadline) {
+            Ok(value) => return Ok(value),
+            Err(AttemptError::Transport) => continue,
+            Err(AttemptError::Failed(stage, code)) => return Err((stage, code)),
         }
     }
     Err(exhausted(deadline))

@@ -40,16 +40,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Version([u8; 16]);
-impl Version {
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-    pub const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-}
+pub use crate::ids::MaterialVersion as Version;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -212,7 +203,7 @@ pub fn fresh_version() -> Result<Version, Error> {
     SystemEntropy::try_new()
         .and_then(|mut rng| rng.fill(&mut bytes))
         .map_err(|_| Error::Crypto)?;
-    Ok(Version(bytes))
+    Ok(Version::from_bytes(bytes))
 }
 
 fn hash(bytes: &[u8]) -> Result<[u8; 32], Error> {

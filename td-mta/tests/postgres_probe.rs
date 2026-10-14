@@ -1008,3 +1008,181 @@ fn real_postgres_materials_roll_back_chunks_and_preserve_uncertain_version() {
         "1"
     );
 }
+
+#[test]
+fn material_commands_keep_versions_explicit_and_refusals_redacted() {
+    use td_mta::postgres_materials::Version;
+    let root = TempDir::new("pg-material-arguments").unwrap();
+    let text = command_output(&["postgres", "material-version"], root.path(), 0);
+    let version = text
+        .split("\"version\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert_eq!(Version::parse(version).unwrap().to_string(), version);
+    for operation in ["material-version", "material-import", "material-check"] {
+        let output = command_output(
+            &["postgres", operation, "--password", "private-secret"],
+            root.path(),
+            2,
+        );
+        assert!(output.contains("invalid-arguments"));
+        assert!(!output.contains("private-secret"));
+    }
+}
+
+#[test]
+#[ignore = "real local PostgreSQL tools and private trusted TMPDIR required"]
+fn real_postgres_material_commands_import_verify_and_resolve_retained_version() {
+    use td_mta::{ids::StoreEpoch, postgres_schema};
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca = fixture.root.join("ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let connection = fixture.root.join("connection");
+    fs::write(
+        &connection,
+        format!(
+            "postgresql://td_probe:{}@localhost:{}/postgres?sslrootcert={}\n",
+            std::str::from_utf8(PASSWORD).unwrap(),
+            fixture.port,
+            ca.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let input = fixture.root.join("material");
+    fs::write(&input, b"private material bytes").unwrap();
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
+    let invoke = |operation, kind, path: &std::path::Path, epoch: StoreEpoch, version, status| {
+        let text = command_output(
+            &[
+                "postgres",
+                operation,
+                "--connection-file",
+                connection.to_str().unwrap(),
+                "--input-file",
+                path.to_str().unwrap(),
+                "--kind",
+                kind,
+                "--epoch",
+                &epoch.to_string(),
+                "--version",
+                version,
+            ],
+            fixture.root.path(),
+            status,
+        );
+        assert!(!text.contains("private material bytes"));
+        text
+    };
+    const VERSION: &str = "01010101010101010101010101010101";
+    let imported = invoke("material-import", "private-key", &input, epoch, VERSION, 0);
+    assert!(imported.contains("\"content_validated\":false,\"profile_activated\":false"));
+    assert!(invoke("material-check", "private-key", &input, epoch, VERSION, 0).contains(VERSION));
+    assert!(
+        invoke("material-import", "private-key", &input, epoch, VERSION, 1)
+            .contains("material-operation-failed")
+    );
+    fs::write(&input, b"different bytes").unwrap();
+    assert!(
+        invoke("material-check", "private-key", &input, epoch, VERSION, 1)
+            .contains("material-integrity-or-content-mismatch")
+    );
+    assert!(invoke(
+        "material-check",
+        "relay-password",
+        &input,
+        epoch,
+        VERSION,
+        1
+    )
+    .contains("material-kind-mismatch"));
+    assert!(invoke(
+        "material-check",
+        "private-key",
+        &input,
+        StoreEpoch::from_bytes([0; 16]),
+        VERSION,
+        1
+    )
+    .contains("store-epoch-mismatch"));
+    assert!(invoke(
+        "material-check",
+        "private-key",
+        &input,
+        epoch,
+        "02020202020202020202020202020202",
+        1
+    )
+    .contains("material-missing"));
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        invoke("material-import", "private-key", &input, epoch, VERSION, 1)
+            .contains("input-private-mode")
+    );
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(invoke(
+        "material-import",
+        "trust-bundle",
+        &connection,
+        epoch,
+        VERSION,
+        1
+    )
+    .contains("input-secret-alias"));
+    let alias = fixture.root.join("alias");
+    fs::hard_link(&connection, &alias).unwrap();
+    assert!(
+        invoke("material-import", "trust-bundle", &alias, epoch, VERSION, 1)
+            .contains("input-secret-alias")
+    );
+    fs::remove_file(&alias).unwrap();
+    fs::write(&input, vec![b'x'; 131072]).unwrap();
+    const TRUST: &str = "03030303030303030303030303030303";
+    invoke("material-import", "trust-bundle", &input, epoch, TRUST, 0);
+    invoke("material-check", "trust-bundle", &input, epoch, TRUST, 0);
+    fs::write(&input, vec![b'x'; 131073]).unwrap();
+    assert!(
+        invoke("material-import", "trust-bundle", &input, epoch, TRUST, 1)
+            .contains("postgres-bootstrap-capacity")
+    );
+    fs::write(&input, b"").unwrap();
+    const EMPTY: &str = "04040404040404040404040404040404";
+    invoke("material-import", "text-signature", &input, epoch, EMPTY, 0);
+    invoke("material-check", "text-signature", &input, epoch, EMPTY, 0);
+    assert!(
+        invoke("material-import", "private-key", &input, epoch, EMPTY, 1)
+            .contains("invalid-material")
+    );
+    // The ten-second client budget expires while the server commits. The
+    // caller already owns the identity and resolves it after backend exit.
+    sql(&fixture, "CREATE FUNCTION public.delay_material_command() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(12); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER material_command_delay AFTER INSERT ON td_mta.config_materials DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_material_command()");
+    fs::write(&input, b"private material bytes").unwrap();
+    const UNCERTAIN: &str = "05050505050505050505050505050505";
+    assert!(invoke(
+        "material-import",
+        "private-key",
+        &input,
+        epoch,
+        UNCERTAIN,
+        1
+    )
+    .contains("indeterminate-do-not-retry"));
+    let stop = Instant::now() + Duration::from_secs(8);
+    while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name = 'td-mta-postgres'") != "0" {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(50));
+    }
+    invoke("material-check", "private-key", &input, epoch, UNCERTAIN, 0);
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
+        "4"
+    );
+}

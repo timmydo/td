@@ -44,6 +44,9 @@ impl Loaded {
     /// directory. Deployment runs as its owner in a trusted stable namespace.
     /// No lock, local database or mail configuration is opened here.
     pub fn open(connection_file: &str, profile: &str) -> Result<Self, Error> {
+        Self::open_inputs(connection_file, profile).map(|(loaded, _)| loaded)
+    }
+    fn open_inputs(connection_file: &str, profile: &str) -> Result<(Self, Inputs), Error> {
         let parent = Path::new(connection_file)
             .parent()
             .and_then(Path::to_str)
@@ -65,7 +68,38 @@ impl Loaded {
             }
             None => TrustStore::public_roots().map_err(|_| Error::Trust)?,
         };
-        Ok(Self { bootstrap, trust })
+        Ok((Self { bootstrap, trust }, inputs))
+    }
+}
+
+/// Protected raw configuration input. Secret bytes have no Debug output.
+pub struct MaterialInput {
+    connection: Loaded,
+    bytes: Vec<u8>,
+}
+impl MaterialInput {
+    /// Bind connection, explicit trust and material to one owner/inode inventory.
+    /// Content validation and generation activation are separate operations.
+    pub fn open(
+        connection_file: &str,
+        material_file: &str,
+        kind: crate::postgres_materials::Kind,
+    ) -> Result<Self, Error> {
+        use crate::postgres_materials::Kind;
+        let (connection, mut inputs) = Loaded::open_inputs(connection_file, "material")?;
+        let role = match kind {
+            Kind::RelayPassword | Kind::PrivateKey => Role::Secret,
+            _ => Role::Public,
+        };
+        let file = inputs.open(material_file, role).map_err(Error::Input)?;
+        let bytes = read(file, kind.max_bytes())?;
+        Ok(Self { connection, bytes })
+    }
+    pub fn connection(&self) -> &Loaded {
+        &self.connection
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
