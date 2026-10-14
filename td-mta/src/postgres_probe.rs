@@ -75,7 +75,7 @@ pub(crate) fn with_client<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
-    with_output_limit(request, trust, deadline, 64 * 1024, false, operation)
+    with_output_limit(request, trust, deadline, 64 * 1024, Input::new(), operation)
 }
 
 // One bounded configuration-material operation, at most 128 KiB in two chunks.
@@ -85,7 +85,14 @@ pub(crate) fn with_material_client<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
-    with_output_limit(request, trust, deadline, 256 * 1024, false, operation)
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        256 * 1024,
+        Input::new(),
+        operation,
+    )
 }
 
 // Explicit owner DDL needs more command completions than a probe.
@@ -95,7 +102,31 @@ pub(crate) fn with_schema_client<T>(
     deadline: Instant,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
-    with_output_limit(request, trust, deadline, 64 * 1024, true, operation)
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        64 * 1024,
+        Input::schema(),
+        operation,
+    )
+}
+
+// One complete source candidate, bounded independently of material/probe work.
+pub(crate) fn with_configuration_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        4 * 1024 * 1024,
+        Input::configuration(),
+        operation,
+    )
 }
 
 fn with_output_limit<T>(
@@ -103,7 +134,7 @@ fn with_output_limit<T>(
     trust: &TrustStore,
     deadline: Instant,
     output_limit: usize,
-    schema: bool,
+    input: Input,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
     let allowance = remaining(deadline)?;
@@ -149,7 +180,7 @@ fn with_output_limit<T>(
         clock,
         cap,
         output_limit,
-        schema,
+        input,
     };
     let waker = Waker::from(Arc::new(WorkerWake(thread::current())));
     let mut context = Context::from_waker(&waker);
@@ -222,7 +253,7 @@ struct Connector {
     clock: Arc<dyn Clock>,
     cap: Deadline,
     output_limit: usize,
-    schema: bool,
+    input: Input,
 }
 
 impl tls::TlsConnect<Io<TcpTransport>> for Connector {
@@ -250,9 +281,7 @@ impl tls::TlsConnect<Io<TcpTransport>> for Connector {
             .await?;
             let mut io = Io::new(secure, true);
             io.output_left = self.output_limit;
-            if self.schema {
-                io.input = Some(Input::schema());
-            }
+            io.input = Some(self.input);
             Ok(io)
         })
     }

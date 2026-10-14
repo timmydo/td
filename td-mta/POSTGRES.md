@@ -534,7 +534,8 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and sections 16, 19 and 21's material/mail/device tables, not a complete
+and sections 16, 19, 21 and 25's material/mail/device/configuration tables,
+not a complete
 serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
 credential; no owner credential is installed into a serving pool here.
@@ -548,11 +549,11 @@ src/postgres_schema.sql creates that schema and its schema_migrations
 ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
 store epoch in a ledger row. Version 1's committed SQL and checksum remain
 fixed; version 2 adds src/postgres_materials.sql and version 3 adds
-src/postgres_mail.sql; version 4 adds src/postgres_devices.sql. New
-initialization applies all four in one
-transaction. PUBLIC grants are revoked; inherited
+src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
+adds src/postgres_configuration.sql. New initialization applies all five in
+one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
-Explicit runtime grants and application configuration tables remain
+Explicit runtime grants and active configuration selection remain
 preparation work.
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
@@ -567,7 +568,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 256 input frames for the four migrations and their ledger writes;
+permits 256 input frames for the five migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -582,8 +583,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently five rows); it requires
-exactly the four ordered migration versions, their compiled DDL checksums and
+count plus one (currently six rows); it requires
+exactly the five ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -609,11 +610,11 @@ functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADV
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
 section 13's preparation ledger using a separately provisioned schema-owner
 login. It refuses every existing td_mta namespace. It creates the prepared
-material and mail relations, but no application configuration, runtime role
-or listener. The matching `td-mta
+material, mail, device and immutable configuration relations, but no active
+configuration pointer, runtime role or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 4, or reports an
+PATH` applies every missing migration through version 5, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -1043,3 +1044,39 @@ time only: a later startup/load must revalidate current database material,
 certificate validity, schema/epoch and implemented-role admission. Database
 persistence and atomic generation activation remain separate boundaries.
 These cold input/count bounds are not native-allocation qualification.
+
+## 25. Immutable configuration source versions
+
+Schema version 5 appends owner-private config_versions and
+config_version_chunks tables. Earlier DDL/checksums remain unchanged.
+The postgres_configuration_store boundary accepts only a validated Candidate
+and a retained ConfigurationVersion ID. It serializes exactly the existing
+canonical digest input, including domain and epoch, into 64 KiB chunks.
+The 2 MiB source bound plus 1 KiB framing allowance permits at most 33 chunks.
+No resolved password, key or provider policy is serialized.
+
+Publication takes the shared schema lock, checks the epoch, and inserts the
+manifest/chunks in one explicit READ COMMITTED transaction with synchronous
+commit enabled and a ten-second idle-transaction timeout. The version's
+primary key serializes competing publishers. A retained ID with the same
+length, digest and chunk count resolves its durable receipt; differing bytes
+conflict. Any failure after COMMIT may have been handed off is Indeterminate.
+Keep the original ID and candidate; another failed attempt does not settle
+an earlier uncertain outcome. No active pointer or service admission changes.
+
+Reading uses one bounded primary REPEATABLE READ snapshot. It checks manifest
+bounds, exact chunk count/order/length, and the digest before decoding. The
+length-framed decoder rejects truncation, trailing bytes, noncanonical names,
+ordering, roles and source limits. After closing that snapshot it reruns the
+complete source preparer, including current material and provider checks,
+under the original absolute deadline. A stored digest is not permission to
+skip validation. Immutable material IDs and epoch checks bind those later
+reads; owner corruption fails closed. Successful publication receipts assume
+the owner preserves immutable rows and do not revalidate historical content.
+
+Only this closed configuration worker has 4 MiB aggregate input/output and
+512 input frames, enough for a full candidate. Per-frame 128 KiB and the
+SCRAM sequence remain unchanged, as do default, material and schema worker
+budgets. This is a finite cold operation, not persistent service transport
+or native-allocation qualification. Runtime privileges, activation and the
+atomic SQLite/file-authority replacement remain separate requirements.

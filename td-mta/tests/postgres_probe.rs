@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 4);
+    assert_eq!(receipt.version, 5);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        4
+        5
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":4"));
+    assert!(initialized.contains("\"schema_version\":5"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 4);
+    assert_eq!(receipt.version, 5);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1209,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "20");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "22");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,13 +1303,14 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3] {
+    for previous_version in [2, 3, 4] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
             include_str!("../src/postgres_schema.sql"),
             include_str!("../src/postgres_materials.sql"),
             include_str!("../src/postgres_mail.sql"),
+            include_str!("../src/postgres_devices.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1331,10 +1332,10 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             inspect(&fixture.request(), &trust, deadline()),
             Err(SchemaError::Version)
         );
-        let obstruction = if previous_version == 2 {
-            "accounts"
-        } else {
-            "devices"
+        let obstruction = match previous_version {
+            2 => "accounts",
+            3 => "devices",
+            _ => "config_versions",
         };
         sql(
             &fixture,
@@ -1350,7 +1351,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         );
         sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 4);
+        assert_eq!(receipt.version, 5);
         assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
         assert_eq!(
         sql(
@@ -1986,5 +1987,161 @@ per_peer_limit = 1
     assert_eq!(
         sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
         "6"
+    );
+    use td_mta::postgres_configuration_store as versions;
+    let version = versions::Version::from_bytes([11; 16]);
+    assert_eq!(
+        versions::read(&request, &trust, deadline(), epoch, version).err(),
+        Some(versions::Error::Missing)
+    );
+    sql(&fixture, "ALTER ROLE td_probe SET default_transaction_isolation = 'repeatable read'; CREATE FUNCTION public.require_config_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'config settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_config_settings BEFORE INSERT ON td_mta.config_versions FOR EACH ROW EXECUTE FUNCTION public.require_config_settings()");
+    versions::publish(&request, &trust, deadline(), version, &candidate).unwrap();
+    versions::publish(&request, &trust, deadline(), version, &candidate).unwrap();
+    assert_eq!(
+        versions::publish(&request, &trust, deadline(), version, &changed),
+        Err(versions::Error::Conflict)
+    );
+    let loaded = versions::read(&request, &trust, deadline(), epoch, version).unwrap();
+    assert_eq!(loaded.digest(), candidate.digest());
+    assert_eq!(loaded.shared(), candidate.shared());
+    assert_eq!(
+        loaded.profile(1).unwrap().source,
+        candidate.profile(1).unwrap().source
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_versions"),
+        "1"
+    );
+    // Exercise the complete 2 MiB source ceiling and all 33 wire chunks.
+    let mut large = desktop.clone();
+    let target = configuration::MAX_SOURCE_BYTES - shared.len() - two.name.len() - 1;
+    while large.len() < target {
+        let count = (target - large.len()).min(4096);
+        if count == 1 {
+            large.push('\n');
+        } else {
+            large.push('#');
+            large.extend(std::iter::repeat_n('x', count - 2));
+            large.push('\n');
+        }
+    }
+    let large = prepare(&[Profile {
+        source: large.as_bytes(),
+        ..two
+    }])
+    .unwrap();
+    let large_id = versions::Version::from_bytes([12; 16]);
+    versions::publish(&request, &trust, deadline(), large_id, &large).unwrap();
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT chunk_count FROM td_mta.config_versions WHERE id=decode(repeat('0c',16),'hex')"
+        ),
+        "33"
+    );
+    assert_eq!(
+        versions::read(&request, &trust, deadline(), epoch, large_id)
+            .unwrap()
+            .digest(),
+        large.digest()
+    );
+    // A mid-publication failure leaves neither manifest nor prefix chunks.
+    sql(&fixture, "CREATE FUNCTION public.reject_config_chunk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.ordinal = 1 THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_config_chunk BEFORE INSERT ON td_mta.config_version_chunks FOR EACH ROW EXECUTE FUNCTION public.reject_config_chunk()");
+    let failed = versions::Version::from_bytes([13; 16]);
+    assert_eq!(
+        versions::publish(&request, &trust, deadline(), failed, &large),
+        Err(versions::Error::Database)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.config_versions WHERE id=decode(repeat('0d',16),'hex')"
+        ),
+        "0"
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.config_version_chunks WHERE version_id=decode(repeat('0d',16),'hex')"), "0");
+    sql(&fixture, "DROP TRIGGER reject_config_chunk ON td_mta.config_version_chunks; CREATE FUNCTION public.delay_config_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_config AFTER INSERT ON td_mta.config_versions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_config_commit()");
+    let uncertain = versions::Version::from_bytes([14; 16]);
+    assert_eq!(
+        versions::publish(
+            &request,
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            uncertain,
+            &candidate
+        ),
+        Err(versions::Error::Indeterminate)
+    );
+    let stop = Instant::now() + Duration::from_secs(8);
+    while sql(
+        &fixture,
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'",
+    ) != "0"
+    {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(50));
+    }
+    versions::publish(&request, &trust, deadline(), uncertain, &candidate).unwrap();
+    assert_eq!(
+        versions::read(&request, &trust, deadline(), epoch, uncertain)
+            .unwrap()
+            .digest(),
+        candidate.digest()
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_versions"),
+        "3"
+    );
+    sql(
+        &fixture,
+        "DROP TRIGGER delay_config ON td_mta.config_versions",
+    );
+    // Competing different contents serialize on the retained version ID, even
+    // with the database role's default isolation set to REPEATABLE READ.
+    let raced = versions::Version::from_bytes([15; 16]);
+    let (first, second) = thread::scope(|scope| {
+        let first =
+            scope.spawn(|| versions::publish(&request, &trust, deadline(), raced, &candidate));
+        let second =
+            scope.spawn(|| versions::publish(&request, &trust, deadline(), raced, &changed));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(first.is_ok(), second.is_ok());
+    let (winner, loser, refused) = if first.is_ok() {
+        (&candidate, &changed, second)
+    } else {
+        (&changed, &candidate, first)
+    };
+    assert!(matches!(
+        refused,
+        Err(versions::Error::Conflict | versions::Error::Database)
+    ));
+    versions::publish(&request, &trust, deadline(), raced, winner).unwrap();
+    assert_eq!(
+        versions::publish(&request, &trust, deadline(), raced, loser),
+        Err(versions::Error::Conflict)
+    );
+    assert_eq!(
+        versions::read(&request, &trust, deadline(), epoch, raced)
+            .unwrap()
+            .digest(),
+        winner.digest()
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_versions"),
+        "4"
+    );
+    // A valid digest is not permission to skip current material validation.
+    sql(&fixture, "DELETE FROM td_mta.config_material_chunks WHERE material_id=decode(repeat('02',16),'hex'); DELETE FROM td_mta.config_materials WHERE id=decode(repeat('02',16),'hex')");
+    assert!(matches!(
+        versions::read(&request, &trust, deadline(), epoch, version),
+        Err(versions::Error::Validation(configuration::Error::Material(
+            _
+        )))
+    ));
+    sql(&fixture, "UPDATE td_mta.config_version_chunks SET bytes=pg_catalog.set_byte(bytes,0,0) WHERE version_id=decode(repeat('0b',16),'hex') AND ordinal=0");
+    assert_eq!(
+        versions::read(&request, &trust, deadline(), epoch, version).err(),
+        Some(versions::Error::Integrity)
     );
 }

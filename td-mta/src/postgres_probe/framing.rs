@@ -31,6 +31,14 @@ impl Input {
         }
     }
 
+    pub(super) fn configuration() -> Self {
+        Self {
+            bytes: 4 * 1024 * 1024,
+            frames: 512,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn accept(&mut self, input: &[u8]) -> Result<(), ()> {
         if self.failed {
             return Err(());
@@ -176,6 +184,27 @@ mod tests {
             assert!(input.accept(&large).is_ok());
         }
         assert!(input.accept(&large).is_err());
+    }
+
+    #[test]
+    fn configuration_budget_keeps_authentication_and_per_frame_limits() {
+        let mut input = Input::configuration();
+        for _ in 0..512 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::configuration().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::configuration()
+            .accept(&frame(b'D', &vec![0; 128 * 1024]))
+            .is_err());
+        let mut input = Input::configuration();
+        let large = frame(b'D', &vec![0; 128 * 1024 - 4]);
+        for _ in 0..31 {
+            assert!(input.accept(&large).is_ok());
+        }
+        assert!(input.accept(&large).is_err());
+        assert!(input.accept(&[]).is_err());
     }
 
     #[test]

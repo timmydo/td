@@ -210,17 +210,18 @@ pub fn prepare(
     Ok(candidate)
 }
 
-fn digest(candidate: &Candidate) -> Result<[u8; 32], Error> {
-    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
-    hash.update(b"td-mta PostgreSQL configuration sources v1\0")
-        .map_err(|_| Error::Crypto)?;
-    hash.update(candidate.epoch.as_bytes())
-        .map_err(|_| Error::Crypto)?;
+pub(crate) const DIGEST_DOMAIN: &[u8] = b"td-mta PostgreSQL configuration sources v1\0";
+
+pub(crate) fn visit_bytes(
+    candidate: &Candidate,
+    mut write: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    write(DIGEST_DOMAIN)?;
+    write(candidate.epoch.as_bytes())?;
     let mut field = |bytes: &[u8]| -> Result<(), Error> {
         let length = u64::try_from(bytes.len()).map_err(|_| Error::Capacity)?;
-        hash.update(&length.to_be_bytes())
-            .map_err(|_| Error::Crypto)?;
-        hash.update(bytes).map_err(|_| Error::Crypto)
+        write(&length.to_be_bytes())?;
+        write(bytes)
     };
     field(&candidate.shared)?;
     field(
@@ -233,6 +234,14 @@ fn digest(candidate: &Candidate) -> Result<[u8; 32], Error> {
         field(&[profile.roles.bits()])?;
         field(&profile.source)?;
     }
+    Ok(())
+}
+
+fn digest(candidate: &Candidate) -> Result<[u8; 32], Error> {
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    visit_bytes(candidate, |bytes| {
+        hash.update(bytes).map_err(|_| Error::Crypto)
+    })?;
     hash.finish().map_err(|_| Error::Crypto)
 }
 
