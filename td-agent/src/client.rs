@@ -767,9 +767,9 @@ pub fn body(events: &[Event], index: usize, prefix_file: &str) -> Result<String,
                 .ok_or_else(|| format!("request {} names no prefix {prefix}", event.seq))?;
             turn_body(head, prefix, &messages(before, timed(prefix)))
         }
-        // A review's requests are its own session log's, not this log's.
+        // A review's requests are its retained trace's, not this log's.
         Purpose::Review => Err(format!(
-            "request {} is a /review, run as td-agent review: its requests are in the session log its review names",
+            "request {} is a /review, run as td-agent review: its requests are in the retained trace its review names",
             event.seq
         )),
         // A sub-agent's: its own prefix and messages.

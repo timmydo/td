@@ -348,6 +348,10 @@ boundaries are:
   when the passes stop converging.
 - The acting agent reconciles every finding and records its own summary,
   concrete reviewer identities, and checks in the commit message.
+- Retained td-agent review traces are user-owned audit records, outside
+  disposable sessions. Preserve them during cleanup; delete them only at
+  the human's explicit request. `DEVELOPMENT.md` distinguishes their paths
+  from disposable reports and review workspaces.
 
 A documentation-only commit may use `Review-waiver: docs-only`; `ready`
 verifies that every touched path ends in `.md`. Other unavailable-reviewer

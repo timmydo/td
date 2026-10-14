@@ -75,8 +75,11 @@ defaults to 32768, cut to the model's limit. An incomplete review exits
 nonzero. The API key and fetch service are the configured td-agent ones.
 
 Full traces remain in $XDG_STATE_HOME/td-agent/reviews (or
-~/.local/state/td-agent/reviews). --log-dir selects a private directory;
-the JSONL path is printed to stderr. td-agent review-log FILE summarizes it.
+~/.local/state/td-agent/reviews), shared across worktrees and sessions.
+--log-dir selects private retained storage outside disposable session trees.
+The JSONL path is labelled retained trace on stderr. Preserve traces during
+session/scratch cleanup; delete them only at the human's explicit request.
+td-agent review-log FILE summarizes a retained trace.
 
 --routing selects balanced (default), cheapest, floor, fastest, nitro or
 latency. Provider and price filters restrict endpoints; floor/nitro enable

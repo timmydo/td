@@ -24,17 +24,13 @@ use crate::store::{Basis, Effect, Kind, Purpose, StateDir};
 /// for control characters, fits one log line (`store::MAX_LINE`).
 const MAX_REVIEW: u64 = 128 * 1024;
 
-/// The most of the review's standard error read for its session log's
+/// The most of the review's standard error read for its retained trace's
 /// line, and the most of its end a failure quotes.
 const MAX_STDERR_HEAD: usize = 64 * 1024;
 const STDERR_TAIL: usize = 2048;
 
 /// How often the wait for the review hears the window.
 const POLL: Duration = Duration::from_millis(200);
-
-/// The line `td-agent review` names its session log on, before it asks
-/// anything of a model.
-const SESSION_LOG: &str = "td-agent review: session log ";
 
 /// How a review's process ended.
 enum Ended {
@@ -172,8 +168,8 @@ impl Session {
         let identified =
             resolved.is_some() || !matches!(model.as_str(), "opus-latest" | "gpt-sol-latest");
         let model = resolved.unwrap_or(model);
-        let log = session_log(&ran.head)
-            .map(|path| format!("; its session log is {}", path.display()))
+        let log = retained_trace(&ran.head)
+            .map(|path| format!("; its retained trace is {}", path.display()))
             .unwrap_or_default();
         let review = String::from_utf8_lossy(&ran.review).trim().to_string();
         let spent = cost::show(charged);
@@ -374,21 +370,21 @@ fn head(revision: &str, commit: &str, model: &str, cap: u64) -> String {
         .to_string()
 }
 
-/// The session log the review's standard error named, if it began one.
-fn session_log(stderr: &str) -> Option<PathBuf> {
+/// The retained trace the review's standard error named, if it began one.
+fn retained_trace(stderr: &str) -> Option<PathBuf> {
     stderr
         .lines()
-        .find_map(|line| line.strip_prefix(SESSION_LOG))
+        .find_map(|line| line.strip_prefix(crate::review_log::TRACE_PATH_PREFIX))
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
 }
 
-/// What a review spent, as its session log says: nothing when it began
+/// What a review spent, as its retained trace says: nothing when it began
 /// no log, or a log that holds no request, since each request's body is
 /// logged before it is sent; what the log accounts otherwise; its cap
 /// when the log cannot be read.
 fn receipt(stderr: &str, cap: u64) -> ((u64, Basis), Option<String>) {
-    let Some(path) = session_log(stderr) else {
+    let Some(path) = retained_trace(stderr) else {
         return ((0, Basis::Nothing), None);
     };
     let summary = std::fs::File::open(&path)
@@ -429,7 +425,7 @@ fn read_bounded(input: impl Read) -> (Vec<u8>, bool) {
     (kept, dropped > 0)
 }
 
-/// The start of `input`, for the session log's line, and its end, for
+/// The start of `input`, for the retained trace's line, and its end, for
 /// why a review failed.
 fn read_ends(mut input: impl Read) -> (String, String) {
     let mut head: Vec<u8> = Vec::new();
@@ -521,38 +517,44 @@ mod tests {
         assert!(MAX_REVIEW.saturating_mul(6) + 64 * 1024 < crate::store::MAX_LINE as u64);
     }
 
-    /// A review that named no session log, or whose log holds no
+    /// A review that named no retained trace, or whose log holds no
     /// request, asked no model and costs nothing; one whose log cannot
     /// be read costs its cap; one that asked, what its log accounts.
     #[test]
-    fn a_review_is_charged_by_its_session_log() {
+    fn a_review_is_charged_by_its_retained_trace() {
         assert_eq!(charge("error: no API key\n", 9), (0, Basis::Nothing));
         assert_eq!(
-            session_log("td-agent review: session log /s/a.jsonl\nmore\n"),
+            retained_trace("td-agent review: retained trace /s/a.jsonl\nmore\n"),
             Some(PathBuf::from("/s/a.jsonl"))
         );
-        // A tool's name is no session log's line.
-        assert_eq!(session_log("td-agent review: tool session log /x\n"), None);
+        // A tool's name is no retained trace's line.
         assert_eq!(
-            session_log("td-agent review: session log rel.jsonl\n"),
+            retained_trace("td-agent review: tool retained trace /x\n"),
+            None
+        );
+        assert_eq!(
+            retained_trace("td-agent review: retained trace rel.jsonl\n"),
             None
         );
         assert_eq!(
             charge(
-                "td-agent review: session log /nonexistent/td-agent-review.jsonl\n",
+                "td-agent review: retained trace /nonexistent/td-agent-review.jsonl\n",
                 9
             ),
             (9, Basis::Reserved)
         );
-        let dir = std::env::temp_dir().join(format!(
-            "td-agent-reviewing-{}",
-            crate::store::random_hex(8).unwrap()
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let owned = td_fs::TempDir::new("td-agent-reviewing").unwrap();
+        let dir = owned.path();
         let line = |seq: u64, kind: &str, data: &str| {
             format!(r#"{{"sequence":{seq},"elapsed_ms":0,"kind":"{kind}","data":{data}}}"#)
         };
-        let named = |path: &Path| format!("{SESSION_LOG}{}\n", path.display());
+        let named = |path: &Path| {
+            format!(
+                "{}{}\n",
+                crate::review_log::TRACE_PATH_PREFIX,
+                path.display()
+            )
+        };
         // A review that failed before any request: nothing.
         let none = dir.join("none.jsonl");
         std::fs::write(&none, format!("{}\n", line(0, "start", r#"{"version":1}"#))).unwrap();
@@ -591,7 +593,6 @@ mod tests {
             receipt(&named(&concrete), 9).1.as_deref(),
             Some("anthropic/claude-opus-5.5")
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The review's output is bounded and the rest drained; standard
@@ -603,11 +604,11 @@ mod tests {
         assert_eq!((kept.len(), cut), (MAX_REVIEW as usize, true));
         let (kept, cut) = read_bounded(&b"fine"[..]);
         assert_eq!((kept.as_slice(), cut), (&b"fine"[..], false));
-        let mut errors = String::from("td-agent review: session log /s/a.jsonl\n");
+        let mut errors = String::from("td-agent review: retained trace /s/a.jsonl\n");
         errors.push_str(&"x".repeat(100_000));
         errors.push_str("\nthe end");
         let (head, tail) = read_ends(errors.as_bytes());
-        assert!(head.starts_with("td-agent review: session log /s/a.jsonl\n"));
+        assert!(head.starts_with("td-agent review: retained trace /s/a.jsonl\n"));
         assert_eq!(head.len(), MAX_STDERR_HEAD);
         assert!(tail.ends_with("\nthe end"));
         assert_eq!(tail.len(), STDERR_TAIL);

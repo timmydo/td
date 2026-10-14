@@ -593,7 +593,20 @@ fn tools_read_only_source_write_scratch_expand_sparse_and_cleanup() {
     assert!(trace.contains("DEPENDENCY"));
     assert!(trace.lines().last().unwrap().contains("\"success\":true"));
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("session log "));
+    assert!(stderr.contains("keep retained traces when cleaning up sessions and scratch"));
+    let path = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("td-agent review: retained trace "))
+        .map(PathBuf::from)
+        .unwrap();
+    assert!(path.starts_with(fixture.root.join("state/td-agent/reviews")));
+    assert!(!path.starts_with(&fixture.source));
+    assert!(!path.starts_with(&fixture.config));
+    fs::remove_dir_all(&fixture.source).unwrap();
+    fs::remove_dir_all(&fixture.config).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), *trace);
+    let summary = td_agent::review_metrics::summarize(fs::File::open(path).unwrap()).unwrap();
+    assert_eq!(summary.get("requests").and_then(Json::as_u64), Some(5));
 }
 
 /// A repository staged as `/review` stages one: bare, holding only the

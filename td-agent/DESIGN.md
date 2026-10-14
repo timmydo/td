@@ -238,7 +238,7 @@ contents as material under review rather than instructions. The report
 streams to stdout, and the served model, provider, tokens, cost and
 reservation to stderr. A filtered, empty, truncated or unfinished reply is
 not a review and exits nonzero. Rate-limit retries and reservations follow
-§5. The private session trace below remains after scratch cleanup.
+§5. The private retained review trace below remains after scratch cleanup.
 
 Both forms accept `--routing balanced|cheapest|floor|fastest|nitro|latency`.
 Balanced is OpenRouter's default; cheapest/fastest/latency set provider
@@ -512,7 +512,10 @@ parents. Repository reviews also require it to be outside the explicitly
 supplied source repository and every tree mounted in their review jail.
 Diff-only reviews consume text and have no source repository or jail. The trace is created after loading a valid
 configuration and key, before workspace setup or any model request, and
-its absolute path is printed on standard error. Files are exclusively
+its absolute path is printed on standard error as `td-agent review: retained
+trace PATH`, followed by a reminder to keep it during session/scratch cleanup.
+The directory is shared across worktrees and sessions; the random filename
+identifies a review, not a disposable directory. Files are exclusively
 created mode 0600 in a checked mode-0700 directory; no authorization
 headers or credential configuration are logged. These files contain
 source and provider-returned reasoning and must be treated as private.
@@ -607,8 +610,11 @@ process killed abruptly may leave an incomplete last line and no `end`
 record; the preceding complete lines remain inspectable. Traces survive
 workspace cleanup and are never automatically pruned. They are diagnostic
 artifacts, not conversations or entries in the daily ledger. Full capture
-has no disk quota: retained traces can exhaust storage and the caller
-owns their removal. A write failure stops the invocation; it does not
+has no disk quota: retained traces can exhaust storage. They are user-owned
+audit records: agents preserve them during report, session and worktree
+cleanup, and remove them only at the human's explicit request. An explicit
+`--log-dir` must likewise name retained storage outside disposable session
+trees. A write failure stops the invocation; it does not
 remove earlier diagnostic records.
 
 `td-agent review-logs [DIRECTORY] [--day YYYY-MM-DD] [--key-fingerprint
@@ -628,8 +634,11 @@ never the key, so retained runs can be grouped across key rotations. This is
 private diagnostic attribution, not authentication. Single-file summaries
 also expose start metadata/time and the fingerprint; legacy absence stays null.
 
-The private run directory is below the key directory's `reviews/`, but
-neither that parent nor the key is mounted into a jail. The controller
+The disposable private run directory is below the key directory's `reviews/`,
+a different tree from the state directory's retained traces. Removing a run
+directory never removes its trace. Neither the retained traces nor their
+parent are mounted into the review jail; neither the private run parent nor
+the key is mounted either. The controller
 holds an owner lock and serializes creation and cleanup with a sweep lock.
 Ordinary completion and errors remove the checkout, metadata, home and
 scratch. After abrupt process death, the next repository review collects
@@ -2116,7 +2125,7 @@ require usable endpoint metadata even without a per-turn limit. What it spends i
 is said on standard error, and the provider's own key limit is the
 bound across reviews. A `/review` differs: the
 conversation that ran it reserves its cap with the window and charges
-what its session log accounts (§15, As built (`/review`)).
+what its retained trace accounts (§15, As built (`/review`)).
 
 Repository reviews always require a listed, priced model supporting tools
 and `max_tokens`. `--max-cost USD` caps the whole invocation, defaulting to
@@ -7338,9 +7347,9 @@ interrupt, or the window closing, kills it, as does a failure to wait on
 it. If the conversation process itself is killed, the review is not: it
 runs on to its end, bounded by its own `--max-cost`, outside the
 window's ledger. Its output is kept up to 128 KiB, the rest read and
-dropped; of its standard error, its start, for the session log line it
+dropped; of its standard error, its start, for the retained-trace line it
 prints before asking any model, and its last 2 KiB. What it spent is
-what that session log accounts (`review-log`'s `accounted_cost`): none
+what that retained trace accounts (`review-log`'s `accounted_cost`): none
 when it named no log or its log holds no request, since each request's
 body is logged before it is sent; its cap when the log cannot say. The
 request is settled with that and the reservation released with it. A
@@ -7351,11 +7360,11 @@ after the received line, labelled td-agent's: a review of the revision
 by the model, which the person asked for, not the person's words, and
 asking nothing by itself. It starts no turn: the person's next message
 says what to do with it. The effect's `finished` says what the review
-came to, what it cost and where its session log is: a review, one that
+came to, what it cost and where its retained trace is: a review, one that
 could not be waited on, one that wrote nothing, a failure with its
 standard error's end, an interrupt, or why it did not run; the window
 shows one that did not review under "review". The Debug view says a
-review's request is its own session log's, not this log's to rebuild.
+review's request is its own retained trace's, not this log's to rebuild.
 
 ## 16. Prior art: opencode
 

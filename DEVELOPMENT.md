@@ -968,9 +968,20 @@ fallback protocol or separate CLI review step.
 
 Store reports under `.td-build-cache/agent-scratch/` in the owned worktree.
 Summarize their findings and dispositions in the commit, then delete owned
-reports and private review copies before finishing. Do not alter a reviewer's
-report to make it agree with the change. The acting agent reconciles each
-finding, fixes valid issues and explains rejected ones with evidence.
+stdout/stderr report captures and private review copies before finishing.
+The full JSONL traces are separate user-owned audit records, stored centrally
+in `$XDG_STATE_HOME/td-agent/reviews/` (otherwise
+`~/.local/state/td-agent/reviews/`), shared across worktrees and sessions.
+The command labels their paths `retained trace` and asks callers to keep them.
+Never follow those paths to delete traces as part of report, session or
+worktree cleanup. An explicit `--log-dir` must likewise name retained storage
+outside disposable session trees. td-agent itself removes its private run
+directories under the key directory's `reviews/`; those are workspaces, not
+the state directory's retained traces. See `td-agent/DESIGN.md` §2.
+
+Do not alter a reviewer's report to make it agree with the change. The acting
+agent reconciles each finding, fixes valid issues and explains rejected ones
+with evidence.
 
 Schedule one panel cycle per commit. After fixes, the review subagent alone
 confirms the resulting diff. Re-run the panel only for a named escalation:

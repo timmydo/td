@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use td_json::Json;
 
+pub(crate) const TRACE_PATH_PREFIX: &str = "td-agent review: retained trace ";
+
 pub(crate) struct Journal {
     file: File,
     directory: std::path::PathBuf,
@@ -175,7 +177,8 @@ impl Journal {
             .custom_flags(crate::store::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| format!("creating review log {}: {e}", path.display()))?;
-        eprintln!("td-agent review: session log {}", path.display());
+        eprintln!("{TRACE_PATH_PREFIX}{}", path.display());
+        eprintln!("td-agent review: keep retained traces when cleaning up sessions and scratch");
         File::open(&directory)
             .and_then(|parent| parent.sync_all())
             .map_err(|e| format!("syncing review log directory: {e}"))?;
@@ -301,7 +304,7 @@ impl Journal {
             .write_all(line.as_bytes())
             .and_then(|()| self.file.write_all(b"\n"))
             .and_then(|()| self.file.flush())
-            .map_err(|e| format!("writing review session log: {e}"))?;
+            .map_err(|e| format!("writing retained review trace: {e}"))?;
         self.sequence = self.sequence.saturating_add(1);
         Ok(())
     }
