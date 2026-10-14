@@ -74,6 +74,7 @@ object_ids!(
     AttemptId,
     IdentityId,
     DeviceId,
+    DeviceOperationId,
     StoreEpoch,
     MaterialVersion,
     InstanceId,

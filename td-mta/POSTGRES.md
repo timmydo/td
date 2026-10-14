@@ -534,7 +534,7 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and sections 16 and 19's material/mail tables, not a complete
+and sections 16, 19 and 21's material/mail/device tables, not a complete
 serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
 credential; no owner credential is installed into a serving pool here.
@@ -548,7 +548,8 @@ src/postgres_schema.sql creates that schema and its schema_migrations
 ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
 store epoch in a ledger row. Version 1's committed SQL and checksum remain
 fixed; version 2 adds src/postgres_materials.sql and version 3 adds
-src/postgres_mail.sql. New initialization applies all three in one
+src/postgres_mail.sql; version 4 adds src/postgres_devices.sql. New
+initialization applies all four in one
 transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and application configuration tables remain
@@ -566,7 +567,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 256 input frames for the three migrations and their ledger writes;
+permits 256 input frames for the four migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -581,8 +582,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently four rows); it requires
-exactly the three ordered migration versions, their compiled DDL checksums and
+count plus one (currently five rows); it requires
+exactly the four ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -612,7 +613,7 @@ material and mail relations, but no application configuration, runtime role
 or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 3, or reports an
+PATH` applies every missing migration through version 4, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -887,3 +888,70 @@ boundary. Password and decoded-secret owners retain their existing drop-time
 buffer clearing; this is not a whole-process memory-erasure claim. The hash
 domain, lowercase token encoding and account/ID/salt binding are unchanged,
 with a fixed golden vector and malformed-token/entropy-failure tests.
+
+## 21. Prepared PostgreSQL device registry
+
+Version 4 adds an owner-private devices table. The postgres_devices module
+provides explicit owner-side preparation and publication APIs, plus a cold
+credential check. No serving or command path calls them yet. Runtime device
+privileges, HTTP authentication and authorization inside admitted mail
+snapshots/transactions remain cutover work. The existing file registry
+remains production authority until then.
+
+Prepare Creation once before publishing: it owns the password separately
+from the ID, salt, verifier, label, timestamp and request digest. Only the
+verifier enters SQL. The device ID is the creation operation identity;
+its digest binds the epoch, account and complete creation request. An
+existing matching receipt confirms the original creation without another
+write, including if the device has since been revoked. A mismatched digest
+refuses. Creation retains the existing 256-device account ceiling, including
+revoked records. There is no delete/reuse API. Labels retain the existing
+UTF-8 byte/control-character rules. Audit timestamps are nonnegative signed
+64-bit UTC milliseconds; timestamp overflow refuses before database work.
+
+Prepare Revocation once with a random operation ID and a digest binding the
+epoch, account, device, operation and requested timestamp. First revocation
+stores that receipt with the revoked timestamp. The same operation confirms
+Recorded; conflicting reuse refuses. A different operation observing an
+already revoked device returns AlreadyRevoked without writing or replacing
+the original receipt. Revocation operation IDs are unique within an account. Neither
+preparation API contacts a database, and retained values do not implement
+on-disk recovery for an operator command. A lost process must not invent a
+replacement creation to resolve missing output; later administration must
+inspect/revoke an undisclosed credential instead.
+
+Every writer takes the shared session migration lock and validates primary,
+schema and expected epoch. It explicitly begins a read-committed,
+synchronous-commit transaction with a ten-second idle-transaction timeout
+and locks the account row before selecting or changing device rows. An
+inherited repeatable-read snapshot could otherwise retain a stale capacity
+count after waiting for that lock. Creation
+checks capacity while retaining that same fence. This serializes competing
+instances and supplies the future authorization-write fence: policy-aware
+mail mutations must take their configuration/policy locks first, then the
+account row, recheck current device/identity policy there, and retain the
+fence through COMMIT. Revocation does not alter the mail change sequence.
+No account lock spans peer I/O, and this module admits no mail operation.
+
+A possible COMMIT handoff followed by connection/deadline failure returns
+Indeterminate. Retain the original prepared value. Repeating it takes the
+same account lock and resolves its durable receipt, so it cannot race an
+unsettled original into a duplicate or replace a revoked credential. A
+definite failure of a retry does not settle the original uncertainty;
+retain that unresolved status until its receipt is observed. A
+known receipt is success even if the final local poll crosses the deadline.
+Receipts live with the bounded, undeleted device records; no shorter receipt
+expiry permits identity reuse. Account/schema restoration still requires a
+fresh epoch under the deployment-wide recovery barrier.
+
+check uses one fresh read-only repeatable-read primary snapshot and current
+revocation state, preserving dummy verifier work for unknown IDs. It closes
+that snapshot before return: a successful result grants no authority to a
+later mail read or write, and is never a credential cache. Future serving
+admission must perform credential/policy checks inside the same retained
+snapshot or publication transaction as its mail operation. A malformed token
+can be denied without database access; database failures never authenticate.
+Read snapshots also set the ten-second idle-transaction timeout.
+All operations retain the ten-second worker, statement/lock deadlines and
+128-frame/1 MiB input bounds. Provider errors and secret values remain
+redacted.

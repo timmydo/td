@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 3);
+    assert_eq!(receipt.version, 4);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        3
+        4
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":3"));
+    assert!(initialized.contains("\"schema_version\":4"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 3);
+    assert_eq!(receipt.version, 4);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1209,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "19");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "20");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,53 +1303,377 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    let fixture = Fixture::new();
-    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
-    for (index, ddl) in [
-        include_str!("../src/postgres_schema.sql"),
-        include_str!("../src/postgres_materials.sql"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let mut hash = Provider.sha256().unwrap();
-        hash.update(ddl.as_bytes()).unwrap();
-        let digest: String = hash
-            .finish()
-            .unwrap()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        sql(&fixture, &format!("{ddl} INSERT INTO td_mta.schema_migrations VALUES ({},decode('{digest}','hex'),decode(repeat('42',16),'hex'))", index + 1));
-    }
-    // Owner-inserted raw material remains byte-identical through migration.
-    sql(&fixture, "INSERT INTO td_mta.config_materials VALUES (decode(repeat('01',16),'hex'),5,0,decode(repeat('00',32),'hex'),0)");
-    assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()),
-        Err(SchemaError::Version)
-    );
-    sql(&fixture, "CREATE TABLE td_mta.accounts(obstruction bigint)");
-    assert_eq!(
-        upgrade(&fixture.request(), &trust, deadline()),
-        Err(SchemaError::Database)
-    );
-    assert_eq!(
-        sql(&fixture, "SELECT count(*) FROM td_mta.schema_migrations"),
-        "2"
-    );
-    sql(&fixture, "DROP TABLE td_mta.accounts");
-    let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 3);
-    assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
-    assert_eq!(
+    for previous_version in [2, 3] {
+        let fixture = Fixture::new();
+        let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+        for (index, ddl) in [
+            include_str!("../src/postgres_schema.sql"),
+            include_str!("../src/postgres_materials.sql"),
+            include_str!("../src/postgres_mail.sql"),
+        ]
+        .iter()
+        .take(previous_version)
+        .enumerate()
+        {
+            let mut hash = Provider.sha256().unwrap();
+            hash.update(ddl.as_bytes()).unwrap();
+            let digest: String = hash
+                .finish()
+                .unwrap()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            sql(&fixture, &format!("{ddl} INSERT INTO td_mta.schema_migrations VALUES ({},decode('{digest}','hex'),decode(repeat('42',16),'hex'))", index + 1));
+        }
+        // Owner-inserted raw material remains byte-identical through migration.
+        sql(&fixture, "INSERT INTO td_mta.config_materials VALUES (decode(repeat('01',16),'hex'),5,0,decode(repeat('00',32),'hex'),0)");
+        assert_eq!(
+            inspect(&fixture.request(), &trust, deadline()),
+            Err(SchemaError::Version)
+        );
+        let obstruction = if previous_version == 2 {
+            "accounts"
+        } else {
+            "devices"
+        };
+        sql(
+            &fixture,
+            &format!("CREATE TABLE td_mta.{obstruction}(obstruction bigint)"),
+        );
+        assert_eq!(
+            upgrade(&fixture.request(), &trust, deadline()),
+            Err(SchemaError::Database)
+        );
+        assert_eq!(
+            sql(&fixture, "SELECT count(*) FROM td_mta.schema_migrations"),
+            previous_version.to_string()
+        );
+        sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
+        let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
+        assert_eq!(receipt.version, 4);
+        assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
+        assert_eq!(
         sql(
             &fixture,
             "SELECT kind,length,chunk_count,encode(checksum,'hex') FROM td_mta.config_materials"
         ),
         format!("5|0|0|{}", "00".repeat(32))
     );
-    assert_eq!(
-        inspect(&fixture.request(), &trust, deadline()).unwrap(),
-        receipt
+        assert_eq!(
+            inspect(&fixture.request(), &trust, deadline()).unwrap(),
+            receipt
+        );
+    }
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_devices_use_current_primary_state_and_retained_receipts() {
+    use td_mta::{
+        ids::{AccountId, StoreEpoch},
+        postgres_devices as devices, postgres_schema,
+    };
+    let mut fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let account = AccountId::from_bytes([1; 16]);
+    let other = AccountId::from_bytes([2; 16]);
+    sql(&fixture, "INSERT INTO td_mta.accounts VALUES (decode(repeat('01',16),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex')),(decode(repeat('02',16),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'))");
+    sql(&fixture, "CREATE FUNCTION public.require_device_settings() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF current_setting('synchronous_commit') <> 'on' OR current_setting('idle_in_transaction_session_timeout') <> '10s' OR current_setting('transaction_isolation') <> 'read committed' THEN RAISE EXCEPTION 'device settings'; END IF; RETURN NEW; END $$; CREATE TRIGGER require_device_settings BEFORE INSERT OR UPDATE ON td_mta.devices FOR EACH ROW EXECUTE FUNCTION public.require_device_settings()");
+    // The database owner's default must not weaken write serialization.
+    sql(
+        &fixture,
+        "ALTER ROLE td_probe SET default_transaction_isolation='repeatable read'",
     );
+    let creation = devices::prepare_creation(epoch, account, "laptop α", 10).unwrap();
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(None)
+    );
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(Some(creation.device_id()))
+    );
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            other,
+            creation.password()
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            StoreEpoch::from_bytes([0; 16]),
+            account,
+            creation.password()
+        ),
+        Err(devices::Error::Epoch)
+    );
+    let mut wrong = creation.password().to_vec();
+    wrong[96] = if wrong[96] == b'0' { b'1' } else { b'0' };
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            &wrong
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            b"bad"
+        ),
+        Ok(None)
+    );
+    let revoke = devices::prepare_revocation(epoch, account, creation.device_id(), 20).unwrap();
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        Ok(devices::RevocationOutcome::Recorded)
+    );
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        Ok(devices::RevocationOutcome::Recorded)
+    );
+    let second = devices::prepare_revocation(epoch, account, creation.device_id(), 30).unwrap();
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &second),
+        Ok(devices::RevocationOutcome::AlreadyRevoked)
+    );
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(None)
+    );
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*),min(revoked_at) FROM td_mta.devices"
+        ),
+        "1|20"
+    );
+    fixture.stop();
+    assert!(devices::check(
+        &fixture.request(),
+        &trust,
+        deadline(),
+        epoch,
+        account,
+        creation.password()
+    )
+    .is_err());
+    fixture.start(true, false);
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(None)
+    );
+    sql(
+        &fixture,
+        "DROP TRIGGER require_device_settings ON td_mta.devices",
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.devices SET creation_digest=decode(repeat('00',32),'hex')",
+    );
+    assert_eq!(
+        devices::publish_creation(&fixture.request(), &trust, deadline(), &creation),
+        Err(devices::Error::Conflict)
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.devices SET revocation_digest=decode(repeat('00',32),'hex')",
+    );
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        Err(devices::Error::Conflict)
+    );
+    let missing =
+        devices::prepare_creation(epoch, AccountId::from_bytes([3; 16]), "missing", 1).unwrap();
+    assert_eq!(
+        devices::publish_creation(&fixture.request(), &trust, deadline(), &missing),
+        Err(devices::Error::Missing)
+    );
+    for label in ["", "bad\nlabel", &"é".repeat(65)] {
+        assert!(matches!(
+            devices::prepare_creation(epoch, account, label, 0),
+            Err(devices::Error::Invalid)
+        ));
+    }
+    assert!(matches!(
+        devices::prepare_creation(epoch, account, "overflow", u64::MAX),
+        Err(devices::Error::Invalid)
+    ));
+    // Competing independent connections cannot both consume the final slot.
+    sql(&fixture, "INSERT INTO td_mta.devices(account,id,salt,verifier,label,created_at,creation_digest) SELECT decode(repeat('01',16),'hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'fixture',0,decode(repeat('00',32),'hex') FROM generate_series(1,254) n");
+    let first = devices::prepare_creation(epoch, account, "first", 1).unwrap();
+    let second = devices::prepare_creation(epoch, account, "second", 1).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let results = thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            barrier.wait();
+            devices::publish_creation(&fixture.request(), &trust, deadline(), &first)
+        });
+        let two = scope.spawn(|| {
+            barrier.wait();
+            devices::publish_creation(&fixture.request(), &trust, deadline(), &second)
+        });
+        [one.join().unwrap(), two.join().unwrap()]
+    });
+    // A loaded host may exhaust the bounded account-lock wait. Retry the
+    // same retained operation after both initial writers have completed.
+    let results = results
+        .into_iter()
+        .zip([&first, &second])
+        .map(|(result, creation)| {
+            if result == Err(devices::Error::Database) {
+                devices::publish_creation(&fixture.request(), &trust, deadline(), creation)
+            } else {
+                result
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(devices::Error::Capacity))
+            .count(),
+        1
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "256");
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevocation() {
+    use td_mta::{ids::AccountId, postgres_devices as devices, postgres_schema};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let epoch = postgres_schema::initialize(&fixture.request(), &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let account = AccountId::from_bytes([1; 16]);
+    sql(&fixture, "INSERT INTO td_mta.accounts VALUES (decode(repeat('01',16),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'))");
+    sql(&fixture, "CREATE FUNCTION public.delay_device_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_device AFTER INSERT OR UPDATE ON td_mta.devices DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_device_commit()");
+    let creation = devices::prepare_creation(epoch, account, "retained", 1).unwrap();
+    assert_eq!(
+        devices::publish_creation(
+            &fixture.request(),
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            &creation
+        ),
+        Err(devices::Error::Indeterminate)
+    );
+    // A retry either waits behind the original fence or finds its receipt.
+    let retry = devices::publish_creation(&fixture.request(), &trust, deadline(), &creation);
+    assert!(matches!(retry, Ok(()) | Err(devices::Error::Database)));
+    let settled = || {
+        let stop = Instant::now() + Duration::from_secs(8);
+        while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'") != "0" {
+            assert!(Instant::now()<stop);
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    settled();
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "1");
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(Some(creation.device_id()))
+    );
+    let revoke = devices::prepare_revocation(epoch, account, creation.device_id(), 2).unwrap();
+    assert_eq!(
+        devices::publish_revocation(
+            &fixture.request(),
+            &trust,
+            Instant::now() + Duration::from_secs(2),
+            &revoke
+        ),
+        Err(devices::Error::Indeterminate)
+    );
+    settled();
+    assert_eq!(
+        devices::publish_revocation(&fixture.request(), &trust, deadline(), &revoke),
+        Ok(devices::RevocationOutcome::Recorded)
+    );
+    devices::publish_creation(&fixture.request(), &trust, deadline(), &creation).unwrap();
+    assert_eq!(
+        devices::check(
+            &fixture.request(),
+            &trust,
+            deadline(),
+            epoch,
+            account,
+            creation.password()
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*),min(revoked_at) FROM td_mta.devices"
+        ),
+        "1|2"
+    );
+    sql(&fixture, "DROP TRIGGER delay_device ON td_mta.devices; CREATE FUNCTION public.reject_device() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER reject_device BEFORE INSERT ON td_mta.devices FOR EACH ROW EXECUTE FUNCTION public.reject_device()");
+    let rejected = devices::prepare_creation(epoch, account, "rejected", 3).unwrap();
+    assert_eq!(
+        devices::publish_creation(&fixture.request(), &trust, deadline(), &rejected),
+        Err(devices::Error::Database)
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "1");
 }
