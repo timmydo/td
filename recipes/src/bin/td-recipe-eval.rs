@@ -904,3 +904,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../../td-fs/src/temp_dir.rs"]
+mod test_temp;

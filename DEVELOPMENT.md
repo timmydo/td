@@ -222,8 +222,19 @@ dir.
 ## Reclaiming the shared build cache
 
 The ladder work dir under `~/.td/build-daemon/ladder-shared-v1` keeps every
-output every worktree has built, and nothing reclaims it on its own. To drop
-what no build has used for a while and keep the rest warm:
+output every worktree has built. Normal builds, checks (including verdict
+memo hits) and boot preparation attempt automatic retention cleanup before
+taking the shared ladder lock. At most once an hour across all worktrees,
+it removes cache entries and memos unused for one day, preserving recent
+closures and the pinned seed store. It takes the ladder exclusively without
+waiting; a live build defers cleanup to a later invocation. Failed or deferred
+sweeps do not advance the shared completion stamp. Cleanup failures warn
+and leave the requested operation running; automatic reports go to stderr.
+No host scheduler is
+needed. This is retention, not a byte cap: recently used outputs can still
+fill the disk, and cleanup runs only when td is invoked.
+
+To inspect or run a different retention window explicitly:
 
 ```text
 td-recipe-eval gc-store --unused-for 14 --dry-run

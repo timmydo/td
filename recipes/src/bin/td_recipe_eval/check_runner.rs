@@ -130,6 +130,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // The verdict memo is consulted BEFORE the ladder lock: a memoized pass
     // needs nothing the lock guards, and not queueing behind another
     // worktree's climb is part of what it saves.
+    runner.maybe_gc_store();
     let components = runner.check_verdict_components(stem, index)?;
     let key = verdict_key_of(&components);
     let mut phases = CheckPhases {
@@ -437,7 +438,7 @@ pub fn gc_store_cli(args: &[String]) -> Result<(), String> {
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let runner = RecipeCheckRunner::new(root, &scratch_name("gc-store", &[]))?;
     let lock = lock_ladder(&runner.lock_path(), LadderLock::Exclusive)?;
-    runner.gc_store(&opts, &lock)
+    runner.gc_store(&opts, &lock, false)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2354,8 +2355,8 @@ fn ladder_lock_path(lw: &Path) -> PathBuf {
 /// interned seed inputs and #468 authenticates the seed db as a seed-only authority, so a
 /// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
 /// its own subtree so reuse never pollutes the seed authority. Shared across worktrees and
-/// content-addressed, so it is never wiped on a pin/patch change. Nothing reclaims it
-/// implicitly; the explicit `clear-store` resets the whole ladder, the explicit `gc-store`
+/// content-addressed, so it is never wiped on a pin/patch change. Normal builds and
+/// checks reclaim unused history at most hourly; the explicit `clear-store` resets the whole ladder, the explicit `gc-store`
 /// keeps the closure of what builds used within a window and drops the rest, and an opt-in
 /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` enables a coarse high-watermark eviction of the whole
 /// `build-cache/` (store + db + `db.receipts` sidecars — the coherent unit the builder writes).
@@ -3231,6 +3232,7 @@ fn ladder_lock_mode(cache_cap: Option<u64>) -> LadderLock {
 /// WHOLE run — setup included. One acquisition, so no window where the run
 /// holds nothing and a `clear-store` could wipe the tree out from under it.
 fn lock_ladder_for_run(runner: &RecipeCheckRunner) -> Result<File, String> {
+    runner.maybe_gc_store();
     lock_ladder_for_run_with_cache_cap(runner, explicit_ladder_cache_cap())
 }
 
@@ -3247,6 +3249,21 @@ fn lock_ladder_for_run_with_cache_cap(
     let held = lock_ladder(&runner.lock_path(), ladder_lock_mode(cache_cap))?;
     runner.setup_with_cache_cap(cache_cap)?;
     Ok(held)
+}
+
+/// At most one successful sweep per hour across all worktrees. A clock
+/// rollback makes maintenance due rather than postponing it indefinitely.
+fn automatic_gc_due(stamp: &Path) -> Result<bool, String> {
+    let modified = match fs::metadata(stamp) {
+        Ok(meta) => meta
+            .modified()
+            .map_err(|e| format!("mtime {}: {e}", stamp.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(format!("stat {}: {e}", stamp.display())),
+    };
+    Ok(modified
+        .elapsed()
+        .map_or(true, |age| age >= std::time::Duration::from_secs(3600)))
 }
 
 fn open_lock_file(path: &Path) -> Result<File, String> {
@@ -3704,7 +3721,19 @@ impl RecipeCheckRunner {
     /// if this process is killed under it — otherwise a killed `gc-store` would release
     /// the ladder to new builds while its child was still deleting trees they copy
     /// under no other lock. The child reads nothing from it; its roots go by file.
-    fn gc_store(&self, opts: &GcStoreArgs, ladder_lock: &File) -> Result<(), String> {
+    fn gc_store(
+        &self,
+        opts: &GcStoreArgs,
+        ladder_lock: &File,
+        automatic: bool,
+    ) -> Result<(), String> {
+        let report = |line: String| {
+            if automatic {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        };
         let window = std::time::Duration::from_secs(opts.unused_for_days.saturating_mul(86_400));
         let cutoff = std::time::SystemTime::now()
             .checked_sub(window)
@@ -3712,12 +3741,12 @@ impl RecipeCheckRunner {
         let build_run_memos = self.lw.join("build-run-memo");
         let check_memos = self.lw.join("check-memo");
         let roots = fresh_build_run_memo_roots(&build_run_memos, cutoff)?;
-        println!(
+        report(format!(
             "gc-store: keeping what was used in the last {} day(s); {} build-run memo \
              outputs are roots",
             opts.unused_for_days,
             roots.len()
-        );
+        ));
         // The roots travel by a file in this run's claimed scratch, the one place that
         // is ours to write under the shared ladder.
         fs::create_dir_all(&self.scratch)
@@ -3741,8 +3770,12 @@ impl RecipeCheckRunner {
         if opts.dry_run {
             cmd.arg("--dry-run");
         }
-        let report = command_output_reporting_stderr(&mut cmd, "store-gc-unused")?;
-        print!("{report}");
+        let child_report = command_output_reporting_stderr(&mut cmd, "store-gc-unused")?;
+        if automatic {
+            eprint!("{child_report}");
+        } else {
+            print!("{child_report}");
+        }
         let (maps, stale_maps) =
             reap_stale_records(&build_run_memos, ".map", cutoff, opts.dry_run)?;
         let (passes, stale_passes) =
@@ -3752,14 +3785,54 @@ impl RecipeCheckRunner {
         } else {
             "removed"
         };
-        println!(
+        report(format!(
             "gc-store: {maps} build-run memos, {stale_maps} unused {verb}; \
              {passes} check verdict memos, {stale_passes} unused {verb}"
-        );
+        ));
         if opts.dry_run {
             println!("gc-store: dry run — nothing changed");
         }
         Ok(())
+    }
+
+    /// Try maintenance before taking a build's shared lock; never queue behind
+    /// a live build, and never mark a failed or deferred sweep as completed.
+    fn maybe_gc_store(&self) {
+        if let Err(e) = self.try_gc_store() {
+            eprintln!("ladder: automatic cache cleanup failed; will retry: {e}");
+        }
+    }
+
+    fn try_gc_store(&self) -> Result<(), String> {
+        let stamp = self.lw.join("automatic-gc");
+        if !automatic_gc_due(&stamp)?
+            || !self
+                .build_cache_paths()
+                .0
+                .try_exists()
+                .map_err(|e| format!("stat build cache: {e}"))?
+        {
+            return Ok(());
+        }
+        let held = open_lock_file(&self.lock_path())?;
+        match held.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(e) => return Err(format!("lock ladder for automatic gc: {e}")),
+        }
+        if !automatic_gc_due(&stamp)? {
+            return Ok(());
+        }
+        eprintln!("ladder: automatic cache cleanup (one day of unused history)");
+        self.gc_store(
+            &GcStoreArgs {
+                unused_for_days: 1,
+                dry_run: false,
+            },
+            &held,
+            true,
+        )?;
+        fs::write(&stamp, b"").map_err(|e| format!("write {}: {e}", stamp.display()))
     }
 
     /// Every pin table's seed db on this ladder, and the bootstrap root's, sorted so a
@@ -3833,8 +3906,8 @@ impl RecipeCheckRunner {
     /// entrypoint; tests pass an explicit cap so they stay hermetic against the ambient
     /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` knob. `None` ⇒ no eviction at all (the default): an
     /// implicit default-cap eviction would itself be a surprise cold-climb, exactly what
-    /// dropping the auto-wipe avoids, so build-cache reclaim is opt-in via that env or the
-    /// explicit `clear-store`.
+    /// dropping the auto-wipe avoids, so whole-cache eviction remains opt-in.
+    /// Retention GC runs before the lock is acquired, separately from setup.
     fn setup_with_cache_cap(&self, cache_cap: Option<u64>) -> Result<(), String> {
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
@@ -4888,8 +4961,8 @@ impl RecipeCheckRunner {
         // worktrees and content-addressed, so a pin change is just a different-drv miss
         // (rebuild), never a wipe — divergent branches reuse each other's unchanged rungs.
         // The ONLY way to force a from-stage0 cold climb is the explicit `clear-store`, which
-        // resets the whole ladder; nothing reclaims the cache implicitly except an opt-in
-        // TD_CHECK_LADDER_CACHE_CAP_BYTES high-watermark eviction in setup().
+        // resets the whole ladder. Automatic GC retains one day of used closures; the
+        // optional TD_CHECK_LADDER_CACHE_CAP_BYTES cap evicts the entire build cache.
         // Concurrent writers to the cache are the ordinary case now that build-runs hold
         // the ladder SHARED; what keeps them apart is the builder's own per-store commit
         // lock, not this caller. The builder commits each rung ATOMICALLY (stage into a
@@ -7283,7 +7356,8 @@ fn dir_size_capped(path: &Path, cap: u64) -> u64 {
 
 /// High-watermark byte cap for the shared build-output cache, ONLY when the operator sets a
 /// positive `TD_CHECK_LADDER_CACHE_CAP_BYTES`. Unset/zero/garbage ⇒ `None` ⇒ setup() reclaims
-/// nothing: the ladder is reset only by the explicit `clear-store`, and a rare over-cap
+/// nothing here: retention GC runs before setup. The ladder is reset only by
+/// the explicit `clear-store`, and a rare over-cap
 /// eviction is opt-in for operators who want bounded auto-reclaim (an implicit default-cap
 /// eviction would itself be a surprise cold-climb). The `TD_CHECK_` prefix is load-bearing —
 /// the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_SUBST_*` / `TD_DAEMON_*`,
@@ -11039,6 +11113,8 @@ chmod 755 '{}'
             })
         }
         let mut current = "";
+        let mut opened_ladder = std::collections::BTreeSet::new();
+        let mut raw_exclusive = std::collections::BTreeSet::new();
         let mut exclusive = std::collections::BTreeSet::new();
         let mut through_run = std::collections::BTreeSet::new();
         let mut direct = std::collections::BTreeSet::new();
@@ -11063,6 +11139,12 @@ chmod 755 '{}'
             if let Some(name) = name {
                 current = name.split(['(', '<']).next().unwrap_or(name);
             }
+            if line.contains("open_lock_file(") && line.contains("lock_path()") {
+                opened_ladder.insert(current);
+            }
+            if line.contains(".try_lock()") || line.contains(".lock()") {
+                raw_exclusive.insert(current);
+            }
             if line.contains("LadderLock::Exclusive") {
                 exclusive.insert(current);
             }
@@ -11078,7 +11160,9 @@ chmod 755 '{}'
                 direct.insert(current);
             }
         }
+        exclusive.extend(opened_ladder.intersection(&raw_exclusive).copied());
         let whole_ladder: std::collections::BTreeSet<&str> = [
+            "try_gc_store",
             "clear_ladder",
             "verify_store_cli",
             "gc_store_cli",
@@ -11090,7 +11174,7 @@ chmod 755 '{}'
         .collect();
         assert_eq!(
             exclusive, whole_ladder,
-            "only a whole-ladder operation may spell LadderLock::Exclusive"
+            "only a whole-ladder operation may acquire the ladder exclusively"
         );
         for harness in [
             "qemu_kernel_cli",
@@ -11919,6 +12003,105 @@ chmod 755 '{}'
     fn parse_build_run_memo_rejects_a_traversal_basename() {
         let evil = "fingerprint deadbeef\nsystem-x86-64 ../../etc/passwd\n";
         assert_eq!(parse_build_run_memo(evil, "deadbeef"), None);
+    }
+
+    #[test]
+    fn automatic_gc_defers_for_readers_preserves_roots_and_throttles() {
+        let owned = crate::test_temp::TempDir::new("td-auto-gc").unwrap();
+        let lw = owned.join("ladder");
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let mut runner = shared_test_runner(&lw);
+        runner.root = repo.to_path_buf();
+        runner.tb = repo.join("target/release/td-builder");
+        assert!(is_executable(&runner.tb),
+            "build the required test runner first: cargo build --release --manifest-path builder/Cargo.toml");
+        let (store, _) = runner.build_cache_paths();
+        let dead = store.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dead-1.0");
+        let live = store.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-live-1.0");
+        fs::create_dir_all(&dead).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        let memo = lw.join("build-run-memo/test.abc.map");
+        fs::create_dir_all(memo.parent().unwrap()).unwrap();
+        fs::write(
+            &memo,
+            "fingerprint abc\ntest bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-live-1.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&runner.store).unwrap();
+        let seed = runner.store.join("seed-sentinel");
+        fs::write(&seed, b"seed").unwrap();
+        let stamp = lw.join("automatic-gc");
+
+        let reader = lock_ladder(&runner.lock_path(), LadderLock::Shared).unwrap();
+        runner.maybe_gc_store();
+        assert!(dead.exists(), "a live reader defers cleanup");
+        assert!(
+            !stamp.exists(),
+            "deferral must not suppress a later attempt"
+        );
+        drop(reader);
+        runner.maybe_gc_store();
+        assert!(!dead.exists());
+        assert!(live.exists(), "a recent memo roots its output");
+        assert!(memo.exists());
+        assert_eq!(fs::read(&seed).unwrap(), b"seed");
+        assert!(stamp.exists());
+
+        fs::create_dir_all(&dead).unwrap();
+        runner.maybe_gc_store();
+        assert!(dead.exists(), "a recent sweep throttles the next attempt");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        set_times(&stamp, old, old);
+        runner.maybe_gc_store();
+        assert!(
+            !dead.exists(),
+            "an expired sweep stamp permits cleanup again"
+        );
+        assert!(live.exists());
+    }
+
+    #[test]
+    fn automatic_gc_failure_leaves_retry_due_and_empty_cache_needs_no_sweep() {
+        let owned = crate::test_temp::TempDir::new("td-auto-gc-failure").unwrap();
+        let lw = owned.join("ladder");
+        let mut runner = shared_test_runner(&lw);
+        runner.root = owned.path().to_path_buf();
+        runner.tb = owned.join("missing-builder");
+        runner.maybe_gc_store();
+        assert!(!lw.join("automatic-gc").exists());
+        fs::create_dir_all(runner.build_cache_paths().0).unwrap();
+        assert!(runner.try_gc_store().is_err());
+        runner.maybe_gc_store();
+        assert!(!lw.join("automatic-gc").exists());
+        assert!(automatic_gc_due(&lw.join("automatic-gc")).unwrap());
+        let now = std::time::SystemTime::now();
+        let future = now + std::time::Duration::from_secs(7200);
+        fs::write(lw.join("automatic-gc"), b"").unwrap();
+        set_times(&lw.join("automatic-gc"), future, future);
+        assert!(automatic_gc_due(&lw.join("automatic-gc")).unwrap());
+    }
+
+    #[test]
+    fn automatic_gc_reports_use_stderr() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "check_runner::tests::automatic_gc_defers_for_readers_preserves_roots_and_throttles",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains("gc-store:"));
+        assert!(!stdout.contains("store-gc:"));
+        assert!(stderr.contains("gc-store: keeping"));
+        assert!(stderr.contains("store-gc: deleted"));
     }
 
     fn gc_args(args: &[&str]) -> Result<GcStoreArgs, String> {
