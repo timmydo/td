@@ -385,3 +385,37 @@ in the ordinary unit suite.
 The ordinary suite also checks expiry while a peer stalls SSLRequest.
 The framing boundary follows the
 [PostgreSQL message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html).
+
+
+## 9. Implemented bootstrap decoding
+
+`postgres_bootstrap::Bootstrap::parse` is a pure parser for a protected
+connection specification and profile name. It performs no file access,
+environment lookup, DNS, connection or service activation. Reading protected
+inputs, resolving the writer and loading a database profile remain separate
+startup work. Never put its secret-bearing input in argv or diagnostics.
+Neither the parsed value nor the connection request implements Debug.
+
+The initial syntax is one `postgresql://USER:PASSWORD@HOST[:PORT]/DATABASE`
+URI (`postgres://` is also accepted). Credentials and database are explicit;
+there are no environment defaults, password files, service-name expansion,
+multiple hosts or Unix-socket fallback. HOST is an ASCII DNS name, including
+localhost, authenticated by the TLS facade; literal IPs, numeric address
+shorthand, numeric final labels and encoded hosts are refused. The default port is 5432. Reconnect must resolve HOST again.
+
+The optional query accepts `sslmode=verify-full` and an absolute
+`sslrootcert` path, each at most once. Verification is mandatory even without
+sslmode. An absent root path means the public trust store; an explicit path
+replaces it. Unknown parameters, duplicate parameters and weaker TLS modes
+are refused, rather than forwarded to the driver. A root path here is only a
+name; its subsequent reader must enforce the protected-file policy.
+
+Input is at most 16 KiB of printable ASCII without whitespace or fragments.
+Percent escapes decode once, preserving literal plus signs. Encode URI
+separators in credentials/database and spaces or non-ASCII data. User and
+database are nonempty UTF-8 text without controls, at most 256 decoded bytes.
+Passwords are 1..4096 non-NUL decoded bytes; the trust path is nonempty UTF-8
+without controls, at most 4096 bytes. Profiles are 1..64 ASCII letters,
+digits, dots, underscores or hyphens, starting with a letter or digit.
+All parse failures return fixed categories without the input or credentials.
+This decoder does not claim cloud connectivity or a supported schema.
