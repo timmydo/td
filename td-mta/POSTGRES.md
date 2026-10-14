@@ -983,3 +983,30 @@ pointer, grant runtime database privileges or open service admission. The
 legacy filesystem loader remains production authority until the atomic
 cutover. Database version references are used only through this explicit
 prepared-profile adapter, never through the legacy serving path.
+
+## 23. Shared/profile source composition
+
+The inert config::composition boundary separates shared account, domain,
+alias, identity and identity-address stanzas from profile server, resolver,
+logging, relay, certificate/ACME, gateway/peer, listener and resource stanzas.
+The shared source owns the single version-1 root declaration. A profile must
+begin with a section and cannot add or override shared policy. Neither source
+may supply paths: host-local storage/runtime/log placement remains bootstrap
+input. This establishes source ownership, not implemented distributed route
+selection or database generation publication.
+
+Source checks both borrowed byte slices through the existing bounded syntax
+reader and refuses a combined size above the existing 2 MiB source ceiling,
+including its inserted LF. It copies no source bytes. Its composed reader
+adds that LF even when the shared source ends without a newline, so a final
+comment or assignment cannot consume the first profile section. Callers must
+then drive load::read_profile through EOF; that stage applies aggregate line
+limits and every existing field, role and structural reference check.
+Partition diagnostics identify the shared or profile input without values.
+
+Composition grants no material, complete-generation or serving authority.
+Every profile still needs the database material adapter, provider checks,
+generation-wide coverage and implemented-role admission before publication.
+The existing selected-profile restrictions on MTA-STS/local MX, managed ACME
+and unused certificates remain; composition does not weaken them to accept
+a cross-profile policy it cannot yet validate.
