@@ -108,6 +108,23 @@ fn run(
     enabled: bool,
     maximum: usize,
 ) -> td_json::Json {
+    let input = td_json::json!({"using":[CORE,MAIL],"methodCalls":[
+        ["Core/echo", {"draft":{"literal":true}}, "seed"],
+        ["Email/set", arguments, "create"],
+        ["Core/echo", {"after":true}, "last"]
+    ]})
+    .to_string();
+    let result = run_batch(&input, creator, enabled, maximum, 4096);
+    assert!(result["methodResponses"][2][1]["after"].is_true());
+    result
+}
+fn run_batch(
+    input: &str,
+    creator: &Creator,
+    enabled: bool,
+    maximum: usize,
+    width: usize,
+) -> td_json::Json {
     let fixture = Fixture::new();
     let mut root = fixture.locked();
     let files = Fixture::new();
@@ -150,14 +167,8 @@ fn run(
     )
     .unwrap();
     let retention = coordinator.retain_response(&spool, deadline()).unwrap();
-    let input = td_json::json!({"using":[CORE,MAIL],"methodCalls":[
-        ["Core/echo", {"draft":{"literal":true}}, "seed"],
-        ["Email/set", arguments, "create"],
-        ["Core/echo", {"after":true}, "last"]
-    ]})
-    .to_string();
     let request = dispatch::tests::request_with_capabilities(
-        &input,
+        input,
         Limits {
             objects_per_method: maximum,
             ..Limits::default()
@@ -181,7 +192,7 @@ fn run(
     encoder.begin_output().unwrap();
     let mut bytes = Vec::new();
     loop {
-        let mut chunk = [0; 4096];
+        let mut chunk = vec![0; width];
         let next = encoder.poll_output(&mut chunk).unwrap();
         bytes.extend_from_slice(&chunk[..next.written]);
         if next.complete {
@@ -189,9 +200,7 @@ fn run(
         }
     }
     encoder.finish().unwrap();
-    let result = td_json::parse_slice(&bytes).unwrap();
-    assert!(result["methodResponses"][2][1]["after"].is_true());
-    result
+    td_json::parse_slice(&bytes).unwrap()
 }
 fn input() -> td_json::Json {
     td_json::json!({"accountId":account(),"create":{"draft":{"literal":true}}})
@@ -351,6 +360,7 @@ fn insufficient_response_space_refuses_before_calling_the_creator() {
             retention: &mut retention,
             execution: Deadline::after(Tick(0), 90).unwrap(),
             optional_end: 1,
+            created: Default::default(),
             account: ACCOUNT,
             flags: Some((&creator, DEVICE)),
             mailboxes: None,
@@ -379,4 +389,44 @@ fn insufficient_response_space_refuses_before_calling_the_creator() {
         assert_eq!(creator.calls.load(Ordering::Relaxed), 0);
         assert_eq!(retention.len(), 0);
     });
+}
+
+#[test]
+fn created_ids_merge_seeds_and_success_but_preserve_prior_values_on_failure() {
+    for mode in [0, 1, 6, 7] {
+        let creator = Creator {
+            mode,
+            ..Creator::default()
+        };
+        let input =
+            td_json::json!({"using":[CORE,MAIL], "createdIds":{"draft":"prior","keep":"unchanged"},
+            "methodCalls":[["Email/set", input(), "create"]]})
+            .to_string();
+        let response = run_batch(&input, &creator, true, 256, 1);
+        let expected = if matches!(mode, 0 | 7) {
+            "e03030303030303030303030303030303"
+        } else {
+            "prior"
+        };
+        assert_eq!(response["createdIds"]["draft"].as_str(), Some(expected));
+        assert_eq!(response["createdIds"]["keep"].as_str(), Some("unchanged"));
+        assert_eq!(creator.calls.load(Ordering::Relaxed), 1);
+    }
+    for seed in [None, Some(td_json::json!({}))] {
+        let creator = Creator::default();
+        let mut request =
+            td_json::json!({"using":[CORE,MAIL],"methodCalls":[["Email/set",input(),"c"]]});
+        if let Some(seed) = seed {
+            request.insert("createdIds", seed);
+        }
+        let present = request.get("createdIds").is_some();
+        let response = run_batch(&request.to_string(), &creator, true, 256, 7);
+        assert_eq!(response.get("createdIds").is_some(), present);
+        if present {
+            assert_eq!(
+                response["createdIds"]["draft"].as_str(),
+                Some("e03030303030303030303030303030303")
+            );
+        }
+    }
 }

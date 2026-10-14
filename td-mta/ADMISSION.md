@@ -551,8 +551,9 @@ This is required even when the client does not ask to return createdIds.
 Use an exclusively created mode-0600 file in `tmp/requests/REQUEST/` for response
 JSON, response offsets and the creation-ID map. Names are server-owned and
 validated; no client string becomes a path. These are disposable private files,
-not metadata records or backups, and do not need fsync. Charge every byte before
-writing. Cleanup after completion/disconnect; abandoned files are discarded
+not metadata records or backups, and do not need fsync. The bounded td-mail
+creation overlay below is the explicit active-profile exception for creation
+map storage. Charge every file byte before writing. Cleanup after completion/disconnect; abandoned files are discarded
 under LOCK at startup. No response-sized heap tree or mailbox-sized map exists.
 
 Each HTTPS slot's existing 96 KiB scratch is partitioned into 16 KiB HTTP state,
@@ -876,8 +877,9 @@ Apply method count/type limits after resolution, before mutation.
 The creation-ID map includes the request's initial mappings and every successful
 creation in order, with normal RFC collision/lookup rules. Maintain bounded
 disk lookup/sort structures and charge their I/O; no full map is held in RAM.
-Use indexed lookup and a bounded append overlay, not a full linear map scan
-per reference; prove the largest admitted creation chain fits its work budget.
+The active td-mail creation-overlay exception below replaces the map storage
+rule until creation-reference dispatch is implemented. Use indexed lookup and
+a bounded append overlay, not a full linear map scan per reference; prove the largest admitted creation chain fits its work budget.
 Return createdIds only when it was present in the request, including its input
 mappings and new mappings. A failure/cancellation does not manufacture an ID
 for an uncommitted object. Creation references and result references are
@@ -1330,13 +1332,42 @@ requests. A request constructs its handle on that same worker only when a new
 ID is needed, before any commit; no bounded-latency or allocation-free native
 entropy claim is made. Shutdown joins this worker under the existing contract.
 
-The active td-mail folder profile returns created IDs in Mailbox/set only.
-It does not add them to the response-level createdIds map or resolve creation
-references; an input createdIds map retains the existing echo behavior. This
-is an explicit exception to the full creation profile above. The created
-objects contain only id; td-mail obtains defaults, counts and rights from its
-following Mailbox/get. Explicit extra properties, even default-valued ones,
-are refused by this name-only profile.
+The active td-mail folder profile records successful IDs in the bounded
+creation overlay below, shared with Email creation. It does not yet resolve
+creation references. The created objects contain only id; td-mail obtains
+defaults, counts and rights from its following Mailbox/get. Explicit extra
+properties, even default-valued ones, are refused by this name-only profile.
+
+## Active td-mail creation overlay
+
+This profile explicitly permits a resident overlay in place of the full
+creation-map disk contract above. It holds at most 64 distinct prepared keys
+across Email and Mailbox creation in one request, including refused keys.
+Each entry holds two fixed bounded ID buffers; a separate fixed 64-slot index
+keeps sorted lookup while prepared slot numbers remain stable. This is an
+additional bounded request heap allowance, separate from the fixed HTTPS
+scratch partition. Growth may temporarily hold the old and new entry arrays,
+so its payload peak is at most twice the 64-entry ceiling plus the index.
+It cannot grow with mailbox size or the initial creation map. Reservations
+charge each entry's resident metadata and worst-case output growth against
+the remaining response allowance before any mutation. Resource exhaustion
+returns responseCapacity before the adapter is invoked; a request may reach
+this resource ceiling before its maxObjectsInSet count. Earlier successes
+remain valid. Reusing a slot consumes no further map allocation or allowance.
+
+The initial map stays in the already admitted immutable request arena; no
+second resident copy or quadratic seeding pass exists. The final encoder
+linearly merges its sorted members with the overlay. Only known successful
+creations replace values; failed or indeterminate replacements keep an earlier
+successful or initial value. Empty prepared slots are never emitted. Both
+counting and output process one bounded pair per admitted turn. Return the
+merged createdIds only if the request supplied it, including an empty object.
+Failed new reservations remain charged until the batch ends; this conservative
+bound also prevents repeated failing methods from growing request memory.
+
+This exception qualifies recording and response emission, not indexed
+creation-reference lookup. That later dispatch must either prove its bounds
+for this profile or implement the full disk lookup contract before activation.
 
 ## td-mail permanent deletion admission
 

@@ -49,6 +49,7 @@ impl<P: MailboxAuthorization> MailboxMutator for StoreCoordinator<'_, '_, P> {
 struct Creation {
     key: Name,
     name: String,
+    slot: usize,
 }
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     pub(super) fn mailbox_set(
@@ -129,6 +130,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 }
                 // Empty is the native invalid-name marker, never a created folder.
                 creates.push(Creation {
+                    slot: 0,
                     key: item.key,
                     name,
                 });
@@ -139,6 +141,15 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             bound = bound
                 .checked_add(create.key.bytes().len() + 160)
                 .ok_or(Error::ResponseCapacity)?;
+        }
+        if bound as u64 > self.available()? {
+            return Err(Error::ResponseCapacity);
+        }
+        if creates.len() > crate::jmap_request::creation_ids::MAX_CREATED {
+            return Err(Error::ResponseCapacity);
+        }
+        for create in &mut creates {
+            create.slot = self.prepare_creation(create.key.bytes())?;
         }
         if bound as u64 > self.available()? {
             return Err(Error::ResponseCapacity);
@@ -216,6 +227,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     .map_err(|_| Error::State)?;
                 match result {
                     MailboxCreateResult::Created(id) => {
+                        self.created.created(create.slot, *id)?;
                         let mut bytes = [0; wire::IdKind::WIRE_BYTES];
                         let id = wire::encode_id(*id, &mut bytes).map_err(|_| Error::State)?;
                         out.format(format_args!("{{\"id\":\"{id}\"}}"))

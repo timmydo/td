@@ -32,6 +32,7 @@ enum Phase {
     State,
     CreatedPrefix,
     Created,
+    CreatedEntry,
     End,
     Done,
 }
@@ -54,6 +55,10 @@ pub struct Progress {
 /// refusal requires aborting the HTTP exchange, never emitting a second body.
 pub struct Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
     responses: &'q Responses,
+    created: Option<&'q super::creation_ids::CreationIds>,
+    created_entry: usize,
+    created_first: bool,
+    created_seed: Option<td_json::arena::Object<'q>>,
     state: &'state str,
     output_started: &'q mut bool,
     retention: &'q mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -78,12 +83,17 @@ impl<P> std::fmt::Debug for Encoder<'_, '_, '_, '_, '_, '_, '_, P> {
 impl<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> {
     pub(super) fn new(
         responses: &'q Responses,
+        created: Option<&'q super::creation_ids::CreationIds>,
         state: &'state str,
         retention: &'q mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
         output_started: &'q mut bool,
     ) -> Self {
         Self {
             responses,
+            created,
+            created_entry: 0,
+            created_first: true,
+            created_seed: None,
             state,
             retention,
             output_started,
@@ -126,6 +136,9 @@ impl<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a
         }
         self.phase = Phase::Head;
         self.entry = 0;
+        self.created_entry = 0;
+        self.created_first = true;
+        self.created_seed = None;
         self.literal_offset = 0;
         self.arguments_offset = 0;
         self.emitter = None;
@@ -225,6 +238,16 @@ impl<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a
             Phase::StatePrefix => self.literal(br#"],"sessionState":"#, Phase::State, output)?,
             Phase::State => self.state(output)?,
             Phase::CreatedPrefix => self.literal(br#","createdIds":"#, Phase::Created, output)?,
+            Phase::Created if self.created.is_some() => {
+                self.created_seed = self
+                    .responses
+                    .request()
+                    .view()
+                    .map_err(|_| Error::State)?
+                    .created_ids();
+                self.literal(b"{", Phase::CreatedEntry, output)?
+            }
+            Phase::CreatedEntry => self.creation_pair(output)?,
             Phase::Created => {
                 let token = self
                     .responses
@@ -243,6 +266,65 @@ impl<'q, 'state, 'c, 's, 'r, 'sr, 'a, P> Encoder<'q, 'state, 'c, 's, 'r, 'sr, 'a
             return Err(Error::State);
         }
         Ok(Progress { written, complete })
+    }
+    fn creation_pair(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        let map = self.created.ok_or(Error::State)?;
+        let overlay = map.entry(self.created_entry).map_err(|_| Error::State)?;
+        let mut seed = self.created_seed;
+        let initial = seed.as_mut().and_then(|items| items.next_bytes());
+        let (key, value, advance_seed, advance_map) = match (initial, overlay) {
+            (None, None) => return self.literal(b"}", Phase::End, output),
+            (Some((key, value)), None) => (
+                key,
+                value.as_string_bytes().ok_or(Error::State)?,
+                true,
+                false,
+            ),
+            (None, Some((key, value))) => (key, value, false, true),
+            (Some((key, value)), Some((new_key, new_value))) => match key.cmp(new_key) {
+                std::cmp::Ordering::Less => (
+                    key,
+                    value.as_string_bytes().ok_or(Error::State)?,
+                    true,
+                    false,
+                ),
+                std::cmp::Ordering::Greater => (new_key, new_value, false, true),
+                std::cmp::Ordering::Equal => (
+                    key,
+                    if new_value.is_empty() {
+                        value.as_string_bytes().ok_or(Error::State)?
+                    } else {
+                        new_value
+                    },
+                    true,
+                    true,
+                ),
+            },
+        };
+        let mut bytes = [0; 520];
+        let length = if value.is_empty() {
+            0
+        } else {
+            super::creation_ids::pair(key, value, self.created_first, &mut bytes)
+                .map_err(|_| Error::State)?
+        };
+        let written = self.literal(
+            bytes.get(..length).ok_or(Error::State)?,
+            Phase::CreatedEntry,
+            output,
+        )?;
+        if self.literal_offset == 0 {
+            if advance_seed {
+                self.created_seed = seed;
+            }
+            if advance_map {
+                self.created_entry += 1;
+            }
+            if length != 0 {
+                self.created_first = false;
+            }
+        }
+        Ok(written)
     }
     fn add(&mut self, bytes: u64) -> Result<(), Error> {
         let maximum = if self.output {
@@ -461,6 +543,17 @@ mod tests {
         }
     }
     #[test]
+    fn large_seed_maps_stream_without_a_second_map_or_quadratic_seeding() {
+        let entries = (0..2000)
+            .map(|n| format!("\"{n:04}\":\"v\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!(r#"{{"using":[],"methodCalls":[],"createdIds":{{{entries}}}}}"#);
+        let expected =
+            format!(r#"{{"methodResponses":[],"sessionState":"s","createdIds":{{{entries}}}}}"#);
+        assert_eq!(with_response(&input, "s", 4096), expected.as_bytes());
+    }
+    #[test]
     fn wrong_phase_and_fresh_output_admission_are_terminal() {
         resolution::tests::run(|coordinator, spool, _, clock| {
             let retention = coordinator
@@ -594,7 +687,8 @@ mod tests {
             {
                 // Exercise the encoder's own cap independently of preflight's
                 // stronger admission, which normally rules this input out.
-                let mut encoder = Encoder::new(&responses, &state, &mut retention, &mut started);
+                let mut encoder =
+                    Encoder::new(&responses, None, &state, &mut retention, &mut started);
                 let error = loop {
                     match encoder.count_step(&mut [0; 8192]) {
                         Ok(complete) => assert!(!complete),
@@ -605,7 +699,7 @@ mod tests {
                 assert_eq!(encoder.begin_output(), Err(error));
             }
             {
-                let mut encoder = Encoder::new(&responses, "s", &mut retention, &mut started);
+                let mut encoder = Encoder::new(&responses, None, "s", &mut retention, &mut started);
                 while !encoder.count_step(&mut [0; 64]).unwrap() {}
                 encoder.begin_output().unwrap();
                 assert!(!encoder.poll_output(&mut [0; 64]).unwrap().complete);

@@ -4,6 +4,7 @@ use std::fmt;
 use td_json::arena::{self, Object, ParseLimit, ParseLimits, Token, Value};
 
 pub(crate) mod children;
+mod creation_ids;
 pub mod dispatch;
 pub mod pointer;
 pub mod resolution;

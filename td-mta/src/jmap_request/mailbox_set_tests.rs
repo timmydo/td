@@ -88,7 +88,7 @@ fn run_profile(
     maximum: usize,
     writable: bool,
 ) -> td_json::Json {
-    let input = td_json::json!({"using":[CORE, MAIL],"methodCalls":[
+    let input = td_json::json!({"using":[CORE, MAIL],"createdIds":{},"methodCalls":[
         ["Mailbox/set", arguments, "create"], ["Core/echo", {"after":true}, "last"]
     ]})
     .to_string();
@@ -163,8 +163,10 @@ fn creation_preserves_creation_keys_and_returns_partial_results_and_mailbox_stat
     let result = &result[1];
     for name in ["archive", "unicode"] {
         assert!(result["created"][name]["id"].as_str().is_some());
+        assert_eq!(response["createdIds"][name], result["created"][name]["id"]);
     }
     for name in ["existing", "bad", "child", "defaultParent"] {
+        assert!(response["createdIds"].get(name).is_none());
         assert_eq!(
             result["notCreated"][name]["type"].as_str(),
             Some("invalidProperties")
@@ -330,4 +332,27 @@ fn creation_profile_state_forwarding_and_postcommit_failure_are_explicit() {
         result["methodResponses"][0][1]["type"].as_str(),
         Some("serverPartialFail")
     );
+}
+
+#[test]
+fn creation_overlay_limit_refuses_the_whole_call_before_effects() {
+    let mut creates = td_json::ObjectBuilder::new();
+    for index in 0..65 {
+        creates.insert(
+            format!("c{index:02}"),
+            td_json::json!({"name":format!("folder{index}")}),
+        );
+    }
+    let mutator = Mutator::default();
+    let response = run(
+        td_json::json!({"accountId":account(),"create":creates.build()}),
+        &mutator,
+        256,
+    );
+    assert_eq!(
+        response["methodResponses"][0][1]["description"].as_str(),
+        Some("responseCapacity")
+    );
+    assert!(mutator.names.borrow().is_empty());
+    assert_eq!(response["createdIds"], td_json::json!({}));
 }

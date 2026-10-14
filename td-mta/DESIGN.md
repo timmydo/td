@@ -2496,3 +2496,23 @@ cleanup errors in the returned completion. Failures release private staging
 and reservations; indeterminate effects stop admission for recovery. The
 original Email, Bcc, mailbox membership and flags remain intact; the JMAP
 consumer owns later on-success Email/set hooks and response retention.
+
+## Request-local creation map
+
+Authenticated Email and Mailbox creation retain successful creation IDs in
+one bounded request-local overlay. The original request arena retains the
+initial createdIds map. A reused key points to the latest successful creation
+across both types; refused and indeterminate creations preserve its previous
+mapping. The final encoder merges the sorted overlay with the original map
+in linear order, skipping empty reservations. It includes createdIds only
+when the request supplied it, including an empty object.
+
+ADMISSION.md's active-profile exception owns the aggregate overlay bound and
+resident-storage contract. Before creation, the dispatcher reserves each new
+slot and conservative response growth from its remaining allowance. Lookup
+uses a bounded binary index and the original meter under fresh admission.
+Known publication copies a bounded ID into the prepared stable slot without
+allocating or searching. Initial mappings need no second allocation or
+quadratic seed scan. Counting and output stream one bounded pair per turn.
+This profile records creation IDs but does not yet resolve #draft in
+EmailSubmission/set or advertise Submission capability.

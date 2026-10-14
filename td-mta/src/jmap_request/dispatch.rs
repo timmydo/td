@@ -69,10 +69,11 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Indexed complete arguments and their exclusively owned retention file.
-/// Initial createdIds and the captured Session state remain available for the
+/// Successful creation IDs and the captured Session state remain available for the
 /// final envelope writer. No API/Session or Core capability is activated here.
 pub struct Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
     responses: result_index::Responses,
+    created: super::creation_ids::CreationIds,
     state: &'state str,
     output_started: bool,
     retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -95,6 +96,7 @@ impl<'state, 'c, 's, 'r, 'sr, 'a, P> Completed<'state, 'c, 's, 'r, 'sr, 'a, P> {
         }
         Ok(super::wire::Encoder::new(
             &self.responses,
+            Some(&self.created),
             self.state,
             &mut self.retention,
             &mut self.output_started,
@@ -234,6 +236,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention: &mut retention,
         execution,
         optional_end,
+        created: Default::default(),
         account,
         flags,
         mailboxes,
@@ -298,8 +301,10 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
             .map_err(|_| Error::State)?;
     }
     worker.retention.admit_work_turn().map_err(Error::Storage)?;
+    let created = worker.created;
     Ok(Completed {
         responses,
+        created,
         state,
         output_started: false,
         retention,
@@ -320,6 +325,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     retention: &'io mut ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
     execution: ports::Deadline,
     optional_end: u64,
+    created: super::creation_ids::CreationIds,
     account: AccountId,
     flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
@@ -347,6 +353,27 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::ExecutionDeadline);
         }
         Ok(())
+    }
+    fn prepare_creation(&mut self, key: &[u8]) -> Result<usize, Error> {
+        self.check()?;
+        let mut remaining = self.available()?;
+        let slot = self.created.prepare(key, &mut remaining, || {
+            if self
+                .retention
+                .admit_before(self.execution)
+                .map_err(Error::Storage)?
+            {
+                Ok(())
+            } else {
+                Err(Error::ExecutionDeadline)
+            }
+        })?;
+        self.optional_end = self
+            .retention
+            .len()
+            .checked_add(remaining)
+            .ok_or(Error::State)?;
+        Ok(slot)
     }
     fn available(&self) -> Result<u64, Error> {
         self.optional_end
@@ -932,6 +959,7 @@ pub(super) mod tests {
                 retention: &mut retention,
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
+                created: Default::default(),
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,
@@ -1339,6 +1367,7 @@ pub(super) mod tests {
                 retention: &mut retention,
                 execution: Deadline::after(Tick(0), 50).unwrap(),
                 optional_end: 70000,
+                created: Default::default(),
                 account: AccountId::from_bytes([1; 16]),
                 flags: None,
                 mailboxes: None,

@@ -355,8 +355,8 @@ automatically retries mutation requests. Replay currently resumes on connect,
 backend start or cache reopen; a transient refusal can require reconnecting.
 
 The root-folder creation fixture qualifies only td-mail's name-only request
-and id-only created result. Newly created IDs do not enter the response-level
-createdIds map, and creation references are not resolved. Defaulted mailbox
+and id-only created result. Successful IDs also enter the request-local
+creation map; creation references are not yet resolved. Defaulted mailbox
 properties, counts and rights arrive through the following Mailbox/get.
 Explicit parentId (including null), role and other properties are refused.
 This is not a general JMAP Mailbox/set conformance claim.
@@ -385,7 +385,10 @@ policy fixtures pin the fresh live-device guard and revocation refusal.
 
 This qualifies plain-text draft storage through HTTPS, not the complete
 real td-mail send flow. That client also needs Submission capability,
-creation-ID resolution, submission history and success filing. Creation IDs
-are not yet added to the response envelope, attachments are refused, and
+creation-ID resolution, submission history and success filing. Successful
+Email and Mailbox creation IDs now merge into the response envelope when
+the request supplied createdIds. Dispatcher fixtures cover seed replacement,
+failed creations, partial folder results, omitted and empty maps, and narrow
+output chunks. Attachments are refused, and
 sending remains unavailable. The existing real td-mail read fixture runs
 unchanged beside this endpoint fixture.

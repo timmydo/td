@@ -74,6 +74,10 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if expected.is_some_and(|state| state != (before.epoch, before.committed_sequence)) {
             return Err(Error::StateMismatch);
         }
+        let creation = self.prepare_creation(key.as_bytes())?;
+        if bound as u64 > self.available()? {
+            return Err(Error::ResponseCapacity);
+        }
         let reserved = self
             .retention
             .reserve_mutation_output(bound)
@@ -143,6 +147,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             let mut out = TextBuffer::new(&mut output);
             out.format(format_args!("{{\"accountId\":\"{account}\",\"oldState\":\"{old}\",\"newState\":\"{new}\",\"updated\":null,\"notUpdated\":null,\"destroyed\":null,\"notDestroyed\":null")).map_err(|_| Error::State)?;
             if let Some(complete) = created {
+                self.created.created(creation, complete.email)?;
                 let mut email = [0; wire::IdKind::WIRE_BYTES];
                 let mut blob = [0; wire::IdKind::WIRE_BYTES];
                 let mut thread = [0; wire::IdKind::WIRE_BYTES];
