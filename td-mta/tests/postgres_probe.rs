@@ -216,6 +216,206 @@ impl Drop for ProbeChild {
     }
 }
 
+fn sql_command(fixture: &Fixture) -> Command {
+    let ca = fixture.root.join("sql-ca.pem");
+    if !ca.exists() {
+        fs::write(&ca, &fixture.ca).unwrap();
+    }
+    let mut command = fixture.command("psql");
+    command
+        .env("PGPASSWORD", std::str::from_utf8(PASSWORD).unwrap())
+        .env("PGSSLMODE", "verify-full")
+        .env("PGSSLROOTCERT", ca)
+        .env("PGAPPNAME", "td-mta-schema-fixture")
+        .args([
+            "-X",
+            "-A",
+            "-t",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-h",
+            "localhost",
+            "-U",
+            "td_probe",
+            "-d",
+            "postgres",
+            "-p",
+        ])
+        .arg(fixture.port.to_string());
+    command
+}
+
+fn wait_command(child: &mut ProbeChild) {
+    let stop = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            return;
+        }
+        assert!(Instant::now() < stop, "SQL fixture command timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn sql(fixture: &Fixture, query: &str) -> String {
+    let path = fixture.root.join("sql-result");
+    let output = File::create(&path).unwrap();
+    let mut child = ProbeChild(
+        sql_command(fixture)
+            .args(["-c", query])
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap(),
+    );
+    wait_command(&mut child);
+    assert!(fs::metadata(&path).unwrap().len() < 4096);
+    fs::read_to_string(path).unwrap().trim().to_owned()
+}
+
+fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
+    let function = if shared {
+        "pg_advisory_lock_shared"
+    } else {
+        "pg_advisory_lock"
+    };
+    let query = format!(
+        "SELECT pg_catalog.{function}({}::bigint)",
+        td_mta::postgres_schema::MIGRATION_KEY
+    );
+    let mut child = ProbeChild(
+        sql_command(fixture)
+            .args(["-c", &query, "-c", "SELECT pg_catalog.pg_sleep(3)"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let stop = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(child.0.try_wait().unwrap().is_none());
+        if sql(fixture, "SELECT count(*) FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON l.pid = a.pid WHERE a.application_name = 'td-mta-schema-fixture' AND l.locktype = 'advisory' AND l.granted") == "1" { return child; }
+        assert!(Instant::now() < stop, "schema lock was not acquired");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_schema_initialization_is_atomic_and_locked() {
+    use td_mta::postgres_schema::{initialize, inspect, Error as SchemaError};
+    let mut fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    sql(&fixture, "CREATE SCHEMA td_mta");
+    assert_eq!(
+        initialize(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Exists)
+    );
+    sql(&fixture, "DROP SCHEMA td_mta; CREATE ROLE outsider; ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO outsider");
+    assert_eq!(
+        initialize(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Invalid)
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta'"
+        ),
+        "0"
+    );
+    sql(
+        &fixture,
+        "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM outsider",
+    );
+    let mut shared = hold_schema_lock(&fixture, true);
+    assert_eq!(
+        initialize(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Busy)
+    );
+    wait_command(&mut shared);
+    let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
+    assert_eq!(receipt.version, 1);
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    assert_eq!(
+        initialize(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Exists)
+    );
+    let mut shared = hold_schema_lock(&fixture, true);
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    wait_command(&mut shared);
+    let mut exclusive = hold_schema_lock(&fixture, false);
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Busy)
+    );
+    wait_command(&mut exclusive);
+    fixture.stop();
+    fixture.start(true, false);
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
+    );
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 2");
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Version)
+    );
+    sql(&fixture, "UPDATE td_mta.schema_migrations SET version = 1, checksum = pg_catalog.decode(pg_catalog.repeat('00',32), 'hex')");
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Version)
+    );
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_schema_commit_timeout_reports_uncertainty() {
+    use td_mta::postgres_schema::{initialize, inspect, Error as SchemaError};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    sql(&fixture, "CREATE FUNCTION public.delay_schema_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(6); RETURN NEW; END $$;
+CREATE FUNCTION public.install_schema_delay() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'CREATE CONSTRAINT TRIGGER td_delay AFTER INSERT ON td_mta.schema_migrations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_schema_commit()'; END $$;
+CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION public.install_schema_delay()");
+    assert_eq!(
+        initialize(
+            &fixture.request(),
+            &trust,
+            Instant::now() + Duration::from_secs(2)
+        ),
+        Err(SchemaError::Indeterminate)
+    );
+    // COMMIT can finish after the client deadline/disconnect. Wait for the
+    // original session to end, then inspect rather than assuming rollback.
+    let stop = Instant::now() + Duration::from_secs(8);
+    while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name = 'td-mta-postgres'") != "0" {
+        assert!(Instant::now() < stop);
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = 'td_mta'"
+        ),
+        "1"
+    );
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline())
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(
+        initialize(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Exists)
+    );
+}
+
 fn command_probe(fixture: &Fixture, expected: bool) -> String {
     let connection = fixture.root.join("connection");
     command_output(

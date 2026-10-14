@@ -71,9 +71,9 @@ Use an application-owned schema with parameterized, closed SQL behind typed
 storage interfaces. Runtime credentials receive the required data privileges,
 not schema ownership or DDL privileges. Explicit initialization/migration uses
 a separate owner credential, an exclusive database migration lock, and a
-version/checksum ledger. Initialize only an empty application namespace;
-never replace an existing store. Incompatible upgrades require all instances
-to drain and stop; no mixed-version deployment is promised initially. Every
+version/checksum ledger. Initialize only when the application namespace is
+absent; refuse even an existing empty namespace and never replace a store.
+Incompatible upgrades require all instances to drain and stop; no mixed-version deployment is promised initially. Every
 serving database connection must acquire a shared session-level advisory
 lock on the fixed migration key before checking schema compatibility, and
 retain it until closure. The migrator takes the conflicting exclusive lock
@@ -527,3 +527,55 @@ requires the section 8 PostgreSQL tools plus a private TMPDIR under trusted
 ancestors. It uses a fresh disposable database and tests the actual command,
 private trust, localhost resolution, wrong credentials, read-only refusal,
 restart/reconnect and connection-file mode refusal.
+
+## 13. Prepared schema ledger
+
+`postgres_schema::initialize` is an inert, explicit schema-owner operation;
+no command or serving path calls it. Its current server contract is
+PostgreSQL major 17, qualified locally on 17.10. Other majors refuse until
+separately qualified. It creates only the first preparation ledger, not a
+complete mail/configuration schema or runtime role. Serving still cannot
+select PostgreSQL. The owner credential is separate from the future runtime
+credential; no owner credential is installed into a serving pool here.
+
+The operation verifies the same writable-primary/durability settings as the
+probe, begins one transaction, sets synchronous_commit=on, and takes an
+exclusive transaction-level try-lock on the bigint migration key
+0x74646d7461000001. Conflict returns Busy without waiting. It refuses any
+existing td_mta namespace, even an empty one. The committed SQL in
+src/postgres_schema.sql creates that schema and its schema_migrations ledger.
+Version 1 records the exact DDL's SHA-256 and a fresh 128-bit store epoch in
+one row with fixed length constraints. PUBLIC grants are revoked; inherited
+schema/table grants to other roles refuse initialization and roll back.
+Explicit runtime grants and application tables are later preparation work.
+
+The client shares the original ten-second worker limit, configured
+statement/lock timeouts and protocol byte/frame caps. Fixed SQL and typed
+parameters are private to the crate; arbitrary driver execution is not a
+public API. Errors before COMMIT drop the session and leave no committed
+namespace. Once COMMIT may have been sent, a lost response or deadline is
+Indeterminate, never a safe-to-retry refusal. A known successful commit
+retains its receipt even if completing that poll crosses the deadline.
+There is no automatic replay or uncertainty resolver in this preparation
+API. An operator must resolve database state before another initialization.
+
+`postgres_schema::inspect` takes the conflicting shared session-level
+try-lock before reading the ledger. It requires exactly one bounded row,
+version 1, the compiled DDL checksum and a 16-byte epoch, and checks its final
+deadline before returning. It closes the session and lock before returning;
+the receipt grants no authority for later SQL on another connection. This
+checks the recorded ledger, not every catalog object or evidence against a
+malicious schema owner. The future serving connection must retain its own
+shared lock throughout its lifetime and validate the complete serving schema.
+
+The real PostgreSQL schema fixture checks existing-namespace refusal,
+rollback after inherited-grant refusal, shared/exclusive migration conflicts,
+initialization/inspection, restart persistence and version/checksum refusal.
+A second fixture delays COMMIT with a disposable deferred trigger, observes
+Indeterminate at the client deadline, then inspects the committed ledger
+after the original session ends and verifies that another initialization
+refuses. A database commit can outlive the client deadline and disconnect;
+the configured statement timeout does not establish rollback. Neither fixture
+uses an existing database. They require the section 8 tools, including psql.
+The advisory-lock lifetime/conflict behavior follows PostgreSQL's
+[advisory-lock functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS).

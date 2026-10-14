@@ -62,6 +62,19 @@ pub fn probe(
     trust: &TrustStore,
     deadline: Instant,
 ) -> Result<Status, Error> {
+    let status = with_client(request, trust, deadline, |client| Box::pin(qualify(client)))??;
+    remaining(deadline)?;
+    Ok(status)
+}
+
+// Only closed, bounded operations in this crate may use the driver. A known
+// mutation outcome must survive a deadline crossed while completing its poll.
+pub(crate) fn with_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
     let allowance = remaining(deadline)?;
     if allowance > MAX_DURATION
         || request.server_name.is_empty()
@@ -95,7 +108,7 @@ pub fn probe(
         .user(request.user)
         .dbname(request.database)
         .password(request.password)
-        .application_name("td-mta-probe")
+        .application_name("td-mta-postgres")
         .options("-c statement_timeout=5000 -c lock_timeout=1000 -c search_path=pg_catalog")
         .ssl_mode(SslMode::Require)
         .ssl_negotiation(SslNegotiation::Postgres)
@@ -116,19 +129,25 @@ pub fn probe(
         thread::park_timeout(Duration::from_millis(1));
     };
     let mut connection = pin!(connection);
-    let mut query = pin!(client.simple_query(QUERY));
-    let messages = loop {
+    let mut operation = operation(&client);
+    loop {
         remaining(deadline)?;
-        if let Poll::Ready(result) = query.as_mut().poll(&mut context) {
-            break result.map_err(|_| Error::Database)?;
+        if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
+            return Ok(result);
         }
         match connection.as_mut().poll_message(&mut context) {
             Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => return Err(Error::Database),
         }
         thread::park_timeout(Duration::from_millis(1));
-    };
-    remaining(deadline)?;
+    }
+}
+
+pub(crate) async fn qualify(client: &tokio_postgres::Client) -> Result<Status, Error> {
+    let messages = client
+        .simple_query(QUERY)
+        .await
+        .map_err(|_| Error::Database)?;
     let mut status = None;
     for message in messages {
         if let SimpleQueryMessage::Row(row) = message {
@@ -144,7 +163,6 @@ pub fn probe(
             status = Some(Status { server_version });
         }
     }
-    remaining(deadline)?;
     status.ok_or(Error::Settings)
 }
 
