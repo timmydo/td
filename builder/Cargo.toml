@@ -39,3 +39,7 @@ indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 # NOTE: no [profile.release] here — release profile settings are only honoured
 # at the workspace root (../Cargo.toml) for a member crate; a member's own
 # [profile.*] section is ignored by cargo.
+
+# Tracked build inputs not represented by Cargo dependency edges.
+[package.metadata.review]
+source-inputs = ["../seed", "../td-fs", "../td-review"]

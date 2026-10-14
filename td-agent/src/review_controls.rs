@@ -30,6 +30,13 @@ impl Controls {
     pub fn arguments(&mut self, name: &str, arguments: &str) -> Result<(String, u64), String> {
         self.calls = self.calls.saturating_add(1);
         let mut value = td_json::parse(arguments).map_err(|e| e.to_string())?;
+        if name == "grep" {
+            if let Json::Obj(fields) = &mut value {
+                if !fields.iter().any(|(key, _)| key == "extended") {
+                    fields.push(("extended".into(), Json::Bool(true)));
+                }
+            }
+        }
         if name == "read_file" {
             if let Json::Obj(fields) = &mut value {
                 for (name, default) in [("limit", 128u64), ("offset", 1u64)] {
@@ -98,6 +105,70 @@ impl Controls {
         self.delivered = self.delivered.saturating_add(text.len());
         text
     }
+
+    /// Source windows keep consecutive complete lines, unlike process output.
+    pub fn display_read(
+        &mut self,
+        full: &str,
+        path: Option<&std::path::Path>,
+        repeats: u64,
+    ) -> String {
+        let limit = self.output_limit.min(self.remaining());
+        let repeat = repeat_notice(repeats);
+        if full.len().saturating_add(repeat.len()) <= limit {
+            return self.display(full, path, repeats);
+        }
+        let mut text = String::new();
+        let mut next = None;
+        for line in full.split_inclusive('\n') {
+            let Some(number) = line
+                .split_once('\t')
+                .and_then(|(n, _)| n.trim().parse::<u64>().ok())
+            else {
+                break;
+            };
+            let notice = read_notice(number.saturating_add(1), false, path, &repeat);
+            if text
+                .len()
+                .saturating_add(line.len())
+                .saturating_add(notice.len())
+                > limit
+            {
+                next = Some(number);
+                break;
+            }
+            text.push_str(line);
+            next = Some(number.saturating_add(1));
+        }
+        // A first line too large for the allowance must never be skipped.
+        let notice = next.map_or_else(
+            || "[Harness: read result does not fit; tool context low.]".into(),
+            |n| read_notice(n, text.is_empty(), path, &repeat),
+        );
+        if text.len().saturating_add(notice.len()) <= limit {
+            text.push_str(&notice);
+            self.delivered = self.delivered.saturating_add(text.len());
+            text
+        } else {
+            self.display(
+                "[Harness: tool context low; finalize with limitations.]",
+                None,
+                repeats,
+            )
+        }
+    }
+}
+
+fn read_notice(next: u64, empty: bool, path: Option<&std::path::Path>, repeat: &str) -> String {
+    let action = if empty {
+        format!("line {next} exceeds this view's allowance; no lines skipped. Use shell to inspect a smaller section of that line")
+    } else {
+        format!("source window shortened; read on with offset {next}")
+    };
+    let artifact = path.map_or(String::new(), |p| {
+        format!(". Full retained result for searching: {}", p.display())
+    });
+    format!("[Harness: {action}{artifact}.]\n{repeat}")
 }
 
 fn repeat_notice(repeats: u64) -> String {
@@ -120,6 +191,68 @@ fn boundary(text: &str, limit: usize) -> usize {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn review_search_defaults_to_extended_but_keeps_explicit_basic() {
+        let mut controls = Controls::new(&Default::default());
+        let (args, _) = controls.arguments("grep", r#"{"pattern":"a|b"}"#).unwrap();
+        assert_eq!(
+            td_json::parse(&args).unwrap().get("extended"),
+            Some(&Json::Bool(true))
+        );
+        let (args, _) = controls
+            .arguments("grep", r#"{"pattern":"a|b","extended":false}"#)
+            .unwrap();
+        assert_eq!(
+            td_json::parse(&args).unwrap().get("extended"),
+            Some(&Json::Bool(false))
+        );
+    }
+
+    #[test]
+    fn source_pagination_has_no_middle_gap_and_names_the_first_unshown_line() {
+        let mut controls = Controls::new(&crate::review::Options {
+            tool_output_bytes: Some(1024),
+            ..Default::default()
+        });
+        let full = (129..180)
+            .map(|n| format!("{n:6}\t{}\n", "例🐈".repeat(10)))
+            .collect::<String>();
+        let text = controls.display_read(&full, None, 1);
+        assert!(text.len() <= 1024);
+        assert!(!text.contains("omitted"));
+        let last = text
+            .lines()
+            .filter_map(|s| {
+                s.split_once('\t')
+                    .and_then(|(n, _)| n.trim().parse::<u64>().ok())
+            })
+            .next_back()
+            .unwrap();
+        assert!(text.contains(&format!("read on with offset {}", last + 1)));
+        assert!(!text.contains(&format!("{}\t", last + 1)));
+        assert!(text.starts_with("   129\t"));
+        let first = controls.delivered;
+        let tail = controls.display_read(&full, None, 1);
+        assert_eq!(controls.delivered, first + tail.len());
+    }
+
+    #[test]
+    fn oversized_first_line_names_the_artifact_without_skipping_or_finalizing() {
+        let mut controls = Controls::new(&crate::review::Options {
+            tool_output_bytes: Some(1024),
+            ..Default::default()
+        });
+        let text = controls.display_read(
+            &format!("    19\t{}\n", "x".repeat(2000)),
+            Some(std::path::Path::new("/scratch/full")),
+            1,
+        );
+        assert!(text.contains("line 19") && text.contains("/scratch/full"));
+        assert!(text.contains("no lines skipped") && text.contains("Use shell"));
+        assert!(!text.contains("finalize") && !text.contains("offset 20"));
+        assert!(text.len() <= 1024);
+    }
 
     #[test]
     fn unicode_and_notices_share_per_call_and_total_limits() {

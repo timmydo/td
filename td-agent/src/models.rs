@@ -121,7 +121,7 @@ pub struct Models {
 }
 
 /// The price fields td-agent reads, as the list names them.
-const PRICES: [&str; 6] = [
+const PRICES: &[&str] = &[
     "prompt",
     "completion",
     "request",
@@ -414,6 +414,25 @@ impl Models {
             })
     }
 
+    /// Unknown bare names get a qualified hint only when it is unambiguous.
+    pub(crate) fn missing_model_message(&self, id: &str, setting: &str) -> String {
+        let mut message =
+            format!("{id} is not in the provider's models list; set {setting} to one that is");
+        if !id.contains('/') {
+            let mut matching = self
+                .models
+                .iter()
+                .filter(|m| m.id.rsplit_once('/').is_some_and(|(_, tail)| tail == id));
+            if let Some(first) = matching.next() {
+                if matching.next().is_none() && crate::config::model_id("model", &first.id).is_ok()
+                {
+                    message.push_str(&format!("; use the full provider model id `{}`", first.id));
+                }
+            }
+        }
+        message
+    }
+
     pub fn find(&self, id: &str) -> Option<&Model> {
         self.models.iter().find(|m| m.id == id)
     }
@@ -476,6 +495,21 @@ impl Credit {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn missing_bare_model_names_suggest_only_an_unambiguous_qualified_id() {
+        let list = Models::from_provider(br#"{"data":[{"id":"openai/gpt-6.1-sol"},{"id":"anthropic/shared"},{"id":"other/shared"}]}"#).unwrap();
+        let message = list.missing_model_message("gpt-6.1-sol", "`task.model`");
+        assert!(message.contains("use the full provider model id `openai/gpt-6.1-sol`"));
+        assert!(message.contains("set `task.model`"));
+        for id in ["shared", "missing", "wrong/gpt-6.1-sol"] {
+            assert!(!list
+                .missing_model_message(id, "`task.model`")
+                .contains("use the full provider model id"));
+        }
+        assert!(list.find("openai/gpt-6.1-sol").is_some());
+        assert!(list.find("gpt-6.1-sol").is_none());
+    }
 
     #[test]
     fn review_aliases_select_numeric_frontier_releases_only() {

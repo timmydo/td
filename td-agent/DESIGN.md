@@ -291,7 +291,10 @@ this way (§15).
 
 This is a separate review capability profile, independent of conversation
 ask/auto mode and its classifier. Its tools are `read_file`, `glob`, `grep`,
-bounded foreground `shell`, and `expand_sparse`. Source, private Git
+bounded foreground `shell`, `cargo_test`, and `expand_sparse`. Review grep
+defaults to POSIX extended expressions (`|` means alternation); an explicit
+`extended:false` selects basic expressions. Other tool profiles retain their
+existing defaults. Source, private Git
 metadata and borrowed objects, its alternates' included, are read-only
 in each fresh tool jail.
 Only scratch and the private home are writable. Scratch uses the existing
@@ -322,12 +325,60 @@ receive the copied `run-capped` runner through a
 typed environment override. These inputs do not widen the tool capability
 profile. Preflight output and the prepared sparse/input environment are logged.
 
+Tracked manifests may declare `source-inputs = ["../seed", ...]` under
+`[package.metadata.review]` for source and build data outside Cargo dependency
+edges. Entries resolve relative to the manifest, must name tracked directories
+inside the reviewed repository, and are bounded by the 128-path sparse limit.
+The controller expands them at the same pinned commit, never from the caller's
+working tree. Malformed, missing or unexpandable declarations are explicit
+review limitations, so the reviewer can diagnose defects in the declarations.
+td-builder declares its seed, td-fs and td-review reads; td-ui
+declares its shared td-compositor modules; td-agent declares shared engine
+source. Metadata preflight proves resolution, not compilation. If an explicitly
+supplied vendor does not resolve a selected manifest's locked dependencies,
+the invocation fails with an actionable diagnostic before any model completion
+when Cargo reports a missing package in the directory source. Other preflight
+failures, including lock-file defects and timeouts, remain limitations.
+Without an explicit vendor, missing external inputs remain review limitations.
+
+`cargo_test` accepts a manifest path, one optional test-name filter, `lib`,
+one integration-test target, and `no_run`. It executes Cargo directly with
+`test --offline --locked`, in the same jail and private Cargo/target environment,
+with the same 600-second ceiling and raw output retention as review shell.
+It accepts no arbitrary Cargo flags, configuration overrides or shell syntax.
+The actual Cargo exit status feeds tool metrics even when output is shortened.
+The prompt explains that the copied td-builder is the automatic `run-capped`
+runner, not an independently runnable test suite. Arbitrary shell pipelines
+still report the shell's exit status, not every pipeline member's.
+
+Before the first completion, the controller reads the complete root AGENTS.md
+and any AGENTS.md on ancestors of changed files and initially prepared sparse
+directories from the reviewed Git commit. Missing files are absent guidance;
+symlink/non-regular guidance is refused. A recursive Git listing (bounded to
+16 MiB) discovers existing guidance;
+the 128-file limit counts supplied files rather than absent candidate paths.
+Complete content is bounded to 1 MiB; exceeding either refuses the review rather
+than silently cutting instructions. The `review_instructions` event records
+the commit and each supplied path, full text and SHA-256. These files are quoted
+as project review conventions in the first user message beside the full diff,
+not as permission to add capabilities or perform another task. That message is
+retained verbatim through pruning and compaction. Newly inspected directories
+can have additional guidance, which the reviewer must read along with routed
+design documents. Instruction delivery is evidence of supplied context, not
+proof that the model followed it.
+
 Tool results default to 8192 UTF-8 bytes per call and 512 KiB cumulatively.
 `--tool-output-bytes` and `--tool-context-bytes` select limits between 1024
 bytes and 64 KiB / 8 MiB respectively. Limits count result content bytes,
 including harness notices, not tokens or JSON framing; the complete serialized
 request remains bounded separately below. Read windows default to 128 lines.
-Shortening preserves the head and a larger tail, including failure summaries.
+Shortening of command/search results preserves the head and a larger tail,
+including failure summaries. Source read windows instead retain consecutive
+complete numbered lines and name the first unshown line as the next offset;
+they never hide a middle range and advance past it. If the first line cannot
+fit, the notice names it and suggests a smaller shell inspection without
+skipping it or claiming context exhaustion. Shortened windows name their
+retained artifact for searches. All notices share the tool byte allowance.
 Each controller result is retained in scratch for narrower reads
 and searches, with its path in the notice, and whole in the trace. Existing
 controller output bounds still apply; raw command bytes are captured before
@@ -6223,7 +6274,12 @@ as a turn's are; no tools or `max_tokens` refuses the call. An explicit
 effort also refuses a model known to take no reasoning, rather than
 silently dropping the choice. Inherited effort retains the existing
 omission for a model that takes none. Use `explore` with explicit reviewer
-choices for an independent read-only code review; its prompt must supply
+choices for an independent read-only code review. Supply the full model ID
+as listed by the provider, for example `openai/gpt-6.1-sol` rather than
+`gpt-6.1-sol`; the task schema names this requirement. An unknown bare name
+gets an exact qualified-ID hint only when the cached models list has one
+unambiguous suffix match. No model is silently substituted, and ambiguous
+names receive no guessed provider. Its prompt must supply
 the exact full commit, or a workspace path to it, and the review scope.
 It cannot run tests; the caller asks its report to state that limitation.
 Each request is estimated from its own requests

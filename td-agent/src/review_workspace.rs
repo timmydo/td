@@ -17,6 +17,7 @@ pub(crate) const TOOL_TIME: Duration =
     Duration::from_millis(MAX_SHELL_TIMEOUT_MS + 60_000 + 10_000);
 const MAX_PATHS: usize = 128;
 const MAX_TOOL_REPLY: usize = 256 * 1024;
+const MAX_TREE_LIST: u64 = 16 * 1024 * 1024;
 
 pub struct Workspace {
     root: PathBuf,
@@ -28,6 +29,7 @@ pub struct Workspace {
     pub subject: String,
     pub diff: String,
     pub sparse: Vec<String>,
+    pub(crate) changed: Vec<String>,
     pub(crate) vendor: Option<PathBuf>,
     pub(crate) runner: Option<String>,
     pub(crate) cargo_home: Option<PathBuf>,
@@ -171,6 +173,7 @@ fn command(git: &Path, dir: &Path) -> Command {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .arg("--no-pager");
     for setting in [
         "core.hooksPath=/dev/null",
@@ -272,6 +275,7 @@ impl Workspace {
             subject: String::new(),
             diff: String::new(),
             sparse: Vec::new(),
+            changed: Vec::new(),
             vendor: None,
             runner: None,
             cargo_home: None,
@@ -316,6 +320,11 @@ impl Workspace {
                 ]),
             review::MAX_INPUT,
         )?;
+        result.changed = paths
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         let mut selected: BTreeSet<String> = sparse.iter().cloned().collect();
         for path in paths.split('\0').filter(|s| !s.is_empty()) {
             if let Some((first, _)) = path.split_once('/') {
@@ -424,6 +433,62 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn tracked_guidance(&self, path: &Path) -> Result<Option<String>, String> {
+        let path_text = path.to_str().ok_or("AGENTS.md path is not UTF-8")?;
+        let tree = said(
+            command(&self.git, &self.root)
+                .env("GIT_DIR", &self.repository)
+                .args(["ls-tree", "-z", &self.commit, "--", path_text]),
+            8192,
+        )?;
+        if tree.is_empty() {
+            return Ok(None);
+        }
+        if !tree.starts_with("100644 blob ") && !tree.starts_with("100755 blob ") {
+            return Err(format!(
+                "{path_text} must be a regular tracked instruction file"
+            ));
+        }
+        self.tracked_text(path)
+    }
+
+    pub(crate) fn guidance_paths(&self) -> Result<Vec<PathBuf>, String> {
+        let paths = git::run(
+            command(&self.git, &self.root)
+                .env("GIT_DIR", &self.repository)
+                .args(["ls-tree", "-r", "-t", "--name-only", "-z", &self.commit]),
+            MAX_TREE_LIST,
+            GIT_TIME,
+        )
+        .map_err(|e| e.to_string())?;
+        use std::os::unix::ffi::OsStringExt;
+        Ok(paths
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| PathBuf::from(std::ffi::OsString::from_vec(s.to_vec())))
+            .filter(|p| p.file_name() == Some(std::ffi::OsStr::new("AGENTS.md")))
+            .collect())
+    }
+
+    pub(crate) fn require_directory(&self, path: &Path) -> Result<(), String> {
+        let path = path
+            .to_str()
+            .ok_or("review source-input path is not UTF-8")?;
+        let tree = said(
+            command(&self.git, &self.root)
+                .env("GIT_DIR", &self.repository)
+                .args(["ls-tree", "-z", &self.commit, "--", path]),
+            8192,
+        )?;
+        if !tree.starts_with("040000 tree ") {
+            return Err(format!(
+                "review source-input {path} is not a tracked directory at {}",
+                self.commit
+            ));
+        }
+        Ok(())
+    }
+
     pub fn expand(&mut self, paths: &[String]) -> Result<String, String> {
         let selected: BTreeSet<String> = self.sparse.iter().chain(paths).cloned().collect();
         if selected.len() > MAX_PATHS {
@@ -464,11 +529,52 @@ impl Workspace {
         arguments: &str,
         mut log: impl FnMut(&str, &[u8]) -> Result<(), String>,
     ) -> Result<String, String> {
-        let tools::Args::Host { mut call, .. } =
-            tools::parse_in(tools::Kit::Review, name, arguments)?
-        else {
-            return Err("this tool is unavailable in the review profile".into());
+        let call = if name == "cargo_test" {
+            host::Call::ReviewShell {
+                command: String::new(),
+                cargo_args: Some(crate::review_cargo::arguments(arguments, &self.checkout)?),
+                timeout_ms: Some(MAX_SHELL_TIMEOUT_MS),
+                workdir: None,
+                runner: self.runner.clone(),
+                cargo_home: self.cargo_home.as_ref().map(|p| p.display().to_string()),
+                target_dir: self.scratch.join("target").display().to_string(),
+            }
+        } else {
+            let tools::Args::Host { call, .. } =
+                tools::parse_in(tools::Kit::Review, name, arguments)?
+            else {
+                return Err("this tool is unavailable in the review profile".into());
+            };
+            call
         };
+        self.host_call_logged(call, &mut log)
+    }
+
+    pub(crate) fn cargo_logged(
+        &self,
+        args: Vec<String>,
+        timeout_ms: u64,
+        log: impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<String, String> {
+        self.host_call_logged(
+            host::Call::ReviewShell {
+                command: String::new(),
+                cargo_args: Some(args),
+                timeout_ms: Some(timeout_ms),
+                workdir: None,
+                runner: self.runner.clone(),
+                cargo_home: self.cargo_home.as_ref().map(|p| p.display().to_string()),
+                target_dir: self.scratch.join("target").display().to_string(),
+            },
+            log,
+        )
+    }
+
+    fn host_call_logged(
+        &self,
+        mut call: host::Call,
+        mut log: impl FnMut(&str, &[u8]) -> Result<(), String>,
+    ) -> Result<String, String> {
         if let host::Call::Shell {
             command,
             timeout_ms,
@@ -477,6 +583,7 @@ impl Workspace {
         {
             call = host::Call::ReviewShell {
                 command,
+                cargo_args: None,
                 timeout_ms: Some(
                     timeout_ms
                         .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)

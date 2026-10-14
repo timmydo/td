@@ -62,6 +62,9 @@ the trace. A concrete model id is also accepted. All reviews use high effort.
 Changed top-level directories are included automatically; --sparse adds
 directories, and the reviewer may widen the checkout. Tools default to 8192
 UTF-8 bytes per result and 512 KiB total; full results remain in the trace.
+Full applicable AGENTS.md files are seeded from the reviewed commit. Review
+grep defaults to extended regex; cargo_test preserves Cargo exit status.
+Manifests may declare source-inputs under [package.metadata.review].
 --vendor mounts explicit offline Cargo sources read-only. --test-runner
 copies a compatible td-builder into scratch; otherwise a source
  target/release/td-builder is used when present.

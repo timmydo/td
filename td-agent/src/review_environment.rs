@@ -99,6 +99,46 @@ pub(crate) fn prepare(
                 }
             }
         }
+        if let Some(inputs) = parsed
+            .get("package")
+            .and_then(|v| v.get("metadata"))
+            .and_then(|v| v.get("review"))
+            .and_then(|v| v.get("source-inputs"))
+        {
+            let expanded = (|| -> Result<(), String> {
+                let inputs = inputs
+                    .as_arr()
+                    .ok_or("review source-inputs must be a list")?;
+                if inputs.len() > 128 {
+                    return Err("too many review source-inputs".into());
+                }
+                for input in inputs {
+                    let input = input
+                        .as_str()
+                        .ok_or("review source-inputs must contain strings")?;
+                    let base = manifest.parent().unwrap_or(Path::new(""));
+                    let path = relative(base, input)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .ok_or(
+                            "review source-inputs must name directories within the repository",
+                        )?;
+                    workspace.require_directory(&path)?;
+                    let text = path
+                        .to_str()
+                        .ok_or("review source-input path is not UTF-8")?
+                        .to_string();
+                    workspace.expand(&[text])?;
+                }
+                Ok(())
+            })();
+            if let Err(why) = expanded {
+                limitations.push(format!(
+                    "{}: review source-input preparation unavailable: {why}",
+                    manifest.display()
+                ));
+            }
+        }
+
         paths(&parsed, &mut dependencies);
         let base = manifest.parent().unwrap_or(Path::new(""));
         for dependency in dependencies {
@@ -217,18 +257,18 @@ pub(crate) fn prepare(
         }
         // Metadata resolves locked dependencies but never executes build scripts.
         let path = workspace.checkout.join(&manifest);
-        let command = format!(
-            "cargo metadata --offline --locked --format-version 1 --manifest-path {}",
-            shell_quote(&path.display().to_string())
-        );
         let started = std::time::Instant::now();
-        let result = workspace.call_logged(
-            "shell",
-            &Json::Obj(vec![
-                ("command".into(), Json::Str(command)),
-                ("timeout_ms".into(), Json::from(15_000u64)),
-            ])
-            .to_string(),
+        let result = workspace.cargo_logged(
+            vec![
+                "metadata".into(),
+                "--offline".into(),
+                "--locked".into(),
+                "--format-version".into(),
+                "1".into(),
+                "--manifest-path".into(),
+                path.display().to_string(),
+            ],
+            15_000,
             |kind, bytes| {
                 if kind == "tool_output_bytes_hex" {
                     journal.raw("preflight_output_bytes_hex", bytes)
@@ -255,6 +295,9 @@ pub(crate) fn prepare(
             ]),
         )?;
         if !available {
+            if options.vendor.is_some() && missing_vendor_package(&text) {
+                return Err(format!("explicit review vendor inputs do not resolve {}: {}. Prepare the complete locked vendor closure, then retry; no model completion requested", manifest.display(), text.chars().take(1500).collect::<String>()));
+            }
             limitations.push(format!(
                 "{}: {}",
                 manifest.display(),
@@ -262,9 +305,15 @@ pub(crate) fn prepare(
             ));
         }
     }
-    let summary = format!("Offline test preparation: {}. Path dependencies expanded within this commit; private Cargo home {}; vendor {}; runner {}. Metadata preflight checks inputs, not tests.", if limitations.is_empty() { "selected inputs resolved".into() } else { limitations.join("\n") }, workspace.cargo_home.as_ref().map_or_else(|| "none".into(), |p| p.display().to_string()), workspace.vendor.as_ref().map_or_else(|| "none supplied".into(), |p| p.display().to_string()), workspace.runner.as_deref().unwrap_or("none supplied"));
+    let summary = format!("Offline test preparation: {}. Path dependencies expanded within this commit; private Cargo home {}; vendor {}; runner {}. Metadata preflight checks dependency resolution, not compilation or tests. The runner is td-builder run-capped, wired into Cargo automatically; do not inspect its executable bytes or invoke it as a test suite. Use cargo_test for focused tests; if compilation reports a missing tracked source file, expand_sparse its directory and retry once.", if limitations.is_empty() { "selected inputs resolved".into() } else { limitations.join("\n") }, workspace.cargo_home.as_ref().map_or_else(|| "none".into(), |p| p.display().to_string()), workspace.vendor.as_ref().map_or_else(|| "none supplied".into(), |p| p.display().to_string()), workspace.runner.as_deref().unwrap_or("none supplied"));
     journal.text("test_environment", &summary)?;
     Ok(summary.chars().take(8192).collect())
+}
+
+fn missing_vendor_package(text: &str) -> bool {
+    text.starts_with("[exit status 101]\n")
+        && text.contains("no matching package named")
+        && text.contains("location searched: directory source")
 }
 
 fn stage_runner(
@@ -311,10 +360,6 @@ fn stage_runner(
     Ok(hash)
 }
 
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +371,13 @@ mod tests {
         );
         assert!(relative(Path::new("td-json"), "../../secret").is_none());
         assert!(relative(Path::new(""), "/home/secret").is_none());
+    }
+
+    #[test]
+    fn only_missing_directory_source_packages_trigger_vendor_refusal() {
+        assert!(missing_vendor_package("[exit status 101]\nerror: no matching package named `x` found\nlocation searched: directory source `/vendor`"));
+        for text in ["[exit status 101]\nerror: lock file needs to be updated", "[timed out after 15000 ms]\n", "Tool refused or failed: spawning cargo", "[exit status 101]\nerror: no matching package named `x` found\nlocation searched: crates.io index"] {
+            assert!(!missing_vendor_package(text));
+        }
     }
 }

@@ -1582,10 +1582,8 @@ impl Session {
     fn model(&self, key: &str, model: &str, client: &Client) -> Result<Option<Model>, String> {
         let models = Models::load(&self.state)?;
         let entry = models.as_ref().and_then(|m| m.find(model)).cloned();
-        if models.is_some() && entry.is_none() {
-            return Err(format!(
-                "{model} is not in the provider's models list; set {key} to one that is"
-            ));
+        if let Some(list) = models.as_ref().filter(|_| entry.is_none()) {
+            return Err(list.missing_model_message(model, key));
         }
         if client.limits.any() && entry.as_ref().and_then(|m| m.pricing).is_none() {
             let why = if models.is_none() {

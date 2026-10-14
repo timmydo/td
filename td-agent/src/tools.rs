@@ -638,7 +638,7 @@ pub(crate) fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::Task => (
-            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. A general sub-agent has the workspace's file, shell and web tools, on this conversation's model by default, and its writes and commands wait for the person's approval as yours do. An explore sub-agent only reads and searches the workspace, with read_file, glob and grep, changes and runs nothing, and usually runs on a cheaper model the person configured: use it to find and understand code. Use an explore sub-agent with an explicit model and effort for an independent read-only code review. Optional model, effort and routing choices affect only this call. Either runs within this turn, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use one for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
+            "Hand a self-contained piece of work to a sub-agent and wait for its report. The sub-agent works in this workspace and sees nothing of this conversation but the prompt: say everything it needs, the goal, what you already know, the paths, and what its report should hold. A general sub-agent has the workspace's file, shell and web tools, on this conversation's model by default, and its writes and commands wait for the person's approval as yours do. An explore sub-agent only reads and searches the workspace, with read_file, glob and grep, changes and runs nothing, and usually runs on a cheaper model the person configured: use it to find and understand code. Use an explore sub-agent with an explicit full provider model id (for example openai/gpt-6.1-sol) and effort for an independent read-only code review. Optional model, effort and routing choices affect only this call. Either runs within this turn, its spending counted against this turn's limits, and its final reply is this call's result; it cannot ask you or the person anything. Use one for work whose intermediate steps you do not need in your own context, such as a broad search; not for one quick read.".to_string(),
             schema(
                 vec![
                     (
@@ -649,7 +649,7 @@ pub(crate) fn definition(tool: Tool) -> Json {
                         "agent",
                         one_of("Which sub-agent: general, with the workspace's tools, or explore, reading and searching alone; general when left out.", SubAgent::WORDS),
                     ),
-                    ("model", property("string", "Model id for this sub-agent only; overrides the conversation or configured explore model. Select the required reviewer explicitly for code reviews.")),
+                    ("model", property("string", "Full model id exactly as listed by the provider, including its namespace: for example openai/gpt-6.1-sol, not gpt-6.1-sol, or anthropic/claude-opus-5.5. Overrides the conversation or configured explore model for this call only. Select the required reviewer explicitly for code reviews.")),
                     ("effort", one_of("Reasoning effort for this sub-agent only; the conversation's when omitted. An explicit effort is refused if the selected model takes no reasoning.", &crate::config::EFFORTS)),
                     ("routing", one_of("Routing for this sub-agent only; overrides inherited or configured explore routing. balanced clears any inherited routing override.", crate::config::ROUTINGS)),
                 ],
@@ -2386,12 +2386,12 @@ mod tests {
     #[test]
     fn task_choices_are_validated_and_preserved() {
         assert_eq!(
-            parse_offered(Kit::Workspace, false, "task", r#"{"prompt":"review","agent":"explore","model":"openai/gpt-6-sol","effort":"xhigh","routing":"balanced"}"#).unwrap(),
+            parse_offered(Kit::Workspace, false, "task", r#"{"prompt":"review","agent":"explore","model":"openai/gpt-6.1-sol","effort":"xhigh","routing":"balanced"}"#).unwrap(),
             Args::Task {
                 prompt: "review".into(),
                 agent: SubAgent::Explore,
                 options: TaskOptions {
-                    model: Some("openai/gpt-6-sol".into()),
+                    model: Some("openai/gpt-6.1-sol".into()),
                     effort: Some("xhigh".into()),
                     routing: Some("balanced".into()),
                 },

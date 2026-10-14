@@ -66,3 +66,7 @@ td-ui = { path = "../td-ui" }
 
 [dev-dependencies]
 td-test-compositor = { path = "../td-test-compositor" }
+
+# Tracked build inputs not represented by Cargo dependency edges.
+[package.metadata.review]
+source-inputs = ["../engine"]

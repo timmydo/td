@@ -93,8 +93,10 @@ pub enum Call {
         workdir: Option<String>,
     },
     /// The review controller's command, with a private Cargo output path.
+    /// `cargo_args` selects direct Cargo execution rather than a shell.
     ReviewShell {
         command: String,
+        cargo_args: Option<Vec<String>>,
         timeout_ms: Option<u64>,
         workdir: Option<String>,
         target_dir: String,
@@ -483,6 +485,7 @@ impl Call {
             ]),
             Self::ReviewShell {
                 command,
+                cargo_args,
                 timeout_ms,
                 workdir,
                 target_dir,
@@ -490,6 +493,12 @@ impl Call {
                 cargo_home,
             } => member(vec![
                 ("command", Json::Str(command.clone())),
+                (
+                    "cargo_args",
+                    cargo_args.as_ref().map_or(Json::Null, |args| {
+                        Json::Arr(args.iter().cloned().map(Json::Str).collect())
+                    }),
+                ),
                 ("timeout_ms", opt_num(*timeout_ms)),
                 ("workdir", opt_str(workdir.as_deref())),
                 ("target_dir", Json::Str(target_dir.clone())),
@@ -583,6 +592,28 @@ impl Call {
         Ok(match tool {
             "review_shell" => Self::ReviewShell {
                 command: text("command")?,
+                cargo_args: match args.get("cargo_args") {
+                    None | Some(Json::Null) => None,
+                    Some(value) => {
+                        let words = value
+                            .as_arr()
+                            .ok_or("review cargo arguments are not a list")?;
+                        if words.len() > 32 {
+                            return Err("too many review cargo arguments".into());
+                        }
+                        Some(
+                            words
+                                .iter()
+                                .map(|v| {
+                                    v.as_str()
+                                        .filter(|s| s.len() <= 4096 && !s.contains('\0'))
+                                        .map(str::to_string)
+                                        .ok_or_else(|| "invalid review cargo argument".to_string())
+                                })
+                                .collect::<Result<_, _>>()?,
+                        )
+                    }
+                },
                 timeout_ms: number("timeout_ms")?,
                 workdir: maybe("workdir")?,
                 target_dir: text("target_dir")?,

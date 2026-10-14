@@ -581,7 +581,21 @@ fn act(
             if !dir.is_dir() {
                 return Err(format!("`workdir` {} is not a directory", dir.display()));
             }
-            let mut process = shell::shell(command, &dir, config.proxy);
+            let mut process = if let Call::ReviewShell {
+                cargo_args: Some(args),
+                ..
+            } = call
+            {
+                let mut process = std::process::Command::new("cargo");
+                process
+                    .args(args)
+                    .current_dir(&dir)
+                    .env_clear()
+                    .envs(shell::environment());
+                process
+            } else {
+                shell::shell(command, &dir, config.proxy)
+            };
             if let Call::ReviewShell {
                 target_dir,
                 runner,
@@ -1078,6 +1092,7 @@ mod tests {
         let expected = 16 * 1024 * 1024;
         let id = client
             .call(Call::ReviewShell {
+                cargo_args: None,
                 command: format!("head -c {expected} /dev/zero; printf '\\377'"),
                 timeout_ms: Some(30_000),
                 workdir: None,
@@ -1122,6 +1137,7 @@ mod tests {
         };
         let mut output = Vec::new();
         let done = act(&Call::ReviewShell {
+            cargo_args: None,
             command: "(i=0; while [ $i -lt 8 ]; do printf .; sleep 0.1; i=$((i+1)); done; printf TRAILING) & printf EARLY".into(),
             timeout_ms: Some(5_000), workdir: None,
             target_dir: dir.join("target").display().to_string(),

@@ -25,6 +25,7 @@ const MODEL: &str = "meta-llama/llama-4-small";
 const PROGRAM: &str = env!("CARGO_BIN_EXE_td-agent");
 
 struct Fixture {
+    _owned: td_fs::TempDir,
     root: PathBuf,
     source: PathBuf,
     config: PathBuf,
@@ -33,13 +34,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "review-{}",
-            td_agent::store::random_hex(8).unwrap()
-        ));
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        DirBuilder::new().mode(0o700).create(&root).unwrap();
-        let root = fs::canonicalize(root).unwrap();
+        Self::with_unrelated_filename(false)
+    }
+
+    fn with_unrelated_filename(non_utf8: bool) -> Self {
+        let owned = td_fs::TempDir::new("r").unwrap();
+        let root = fs::canonicalize(owned.path()).unwrap();
         let source = root.join("input");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("source-only"), "ORIGINAL\n").unwrap();
@@ -56,6 +56,14 @@ impl Fixture {
         .unwrap();
         fs::create_dir(source.join("dep")).unwrap();
         fs::write(source.join("dep/data"), "DEPENDENCY\n").unwrap();
+        if non_utf8 {
+            use std::os::unix::ffi::OsStringExt;
+            fs::write(
+                source.join(std::ffi::OsString::from_vec(b"unrelated-\xff".to_vec())),
+                "OTHER_BYTES\n",
+            )
+            .unwrap();
+        }
         let git = |args: &[&str]| {
             let out = Command::new("git")
                 .current_dir(&source)
@@ -92,6 +100,7 @@ impl Fixture {
         fs::write(&key, "sk-or-v1-fixture-not-a-real-key\n").unwrap();
         fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
         Self {
+            _owned: owned,
             root,
             source,
             config,
@@ -157,12 +166,6 @@ impl Fixture {
             None,
             "stop",
         )
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = td_agent::workspace::remove_tree(&self.root);
     }
 }
 
@@ -278,7 +281,7 @@ fn local_commit_review_resolves_frontier_aliases_at_high_effort() {
             }
         };
         let mock = MockFetch::start(
-            &fixture.root.join("runtime"),
+            &fixture.root.join("run"),
             vec![replace(models()), replace(fixture.final_reply())],
         );
         let template = fixture.command(&mock, "0.02");
@@ -333,7 +336,7 @@ fn local_commit_review_resolves_frontier_aliases_at_high_effort() {
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn missing_frontier_model_refuses_before_completion_and_cleans_up() {
     let fixture = Fixture::new();
-    let mock = MockFetch::start(&fixture.root.join("runtime"), vec![models()]);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
     let template = fixture.command(&mock, "0.02");
     let mut command = Command::new(PROGRAM);
     command
@@ -369,7 +372,7 @@ fn configured_frontier_alias_cannot_bypass_resolution_without_a_turn_limit() {
     .unwrap();
     let input = fixture.root.join("commit.txt");
     fs::write(&input, "commit 1234567890\n\n    fixture review\n").unwrap();
-    let mock = MockFetch::start(&fixture.root.join("runtime"), vec![models()]);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
     let template = fixture.command(&mock, "0.02");
     let mut command = Command::new(PROGRAM);
     command.args(["review"]).arg(input).stdin(Stdio::null());
@@ -1296,6 +1299,251 @@ fn amend_fixture(fixture: &mut Fixture) {
 
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn full_instructions_are_commit_pinned_and_survive_followup_requests() {
+    let mut fixture = Fixture::new();
+    let guidance = format!(
+        "ROOT_START\n{}ROOT_END\n",
+        "complete repository convention\n".repeat(400)
+    );
+    fs::write(fixture.source.join("AGENTS.md"), &guidance).unwrap();
+    fs::write(fixture.source.join("dep/AGENTS.md"), "NESTED_GUIDANCE\n").unwrap();
+    fs::write(fixture.source.join("dep/data"), "CHANGED\n").unwrap();
+    amend_fixture(&mut fixture);
+    fs::write(fixture.source.join("AGENTS.md"), "HOST_TAMPERED\n").unwrap();
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool(
+                "shell",
+                Json::Obj(vec![("command".into(), Json::Str("printf STEP".into()))]),
+            ),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.05");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    let first = td_json::parse(&requests[1].text()).unwrap();
+    let next = td_json::parse(&requests[2].text()).unwrap();
+    let content = first.get("messages").unwrap().as_arr().unwrap()[1]
+        .get("content")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert!(content.contains("ROOT_END") && content.contains("NESTED_GUIDANCE"));
+    assert!(!content.contains("HOST_TAMPERED"));
+    assert_eq!(
+        first.get("messages").unwrap().as_arr().unwrap()[1],
+        next.get("messages").unwrap().as_arr().unwrap()[1]
+    );
+    let logs = fixture.logs();
+    let event = logs[0]
+        .lines()
+        .map(|l| td_json::parse(l).unwrap())
+        .find(|e| e.get("kind").and_then(Json::as_str) == Some("review_instructions"))
+        .unwrap();
+    let files = event
+        .get_path(&["data", "files"])
+        .unwrap()
+        .as_arr()
+        .unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        files[0].get("text").and_then(Json::as_str),
+        Some(guidance.as_str())
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn review_grep_alternation_works_without_an_extended_flag() {
+    let fixture = Fixture::new();
+    let args = Json::Obj(vec![(
+        "pattern".into(),
+        Json::Str("ORIGINAL|REVIEWED".into()),
+    )]);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), tool("grep", args), fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert!(requests[2]
+        .text()
+        .contains("source-only:1:ORIGINAL REVIEWED"));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn declared_sources_compile_and_failed_tests_keep_cargos_actual_status() {
+    let mut fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+    manifest.push_str("\n[package.metadata.review]\nsource-inputs = [\"dep\"]\n");
+    fs::write(fixture.source.join("Cargo.toml"), manifest).unwrap();
+    fs::write(
+        fixture.source.join("fixture.rs"),
+        "#[test]\nfn fails() { assert_eq!(include_str!(\"dep/data\"), \"WRONG\"); }\n",
+    )
+    .unwrap();
+    fs::create_dir(fixture.source.join(".cargo")).unwrap();
+    fs::write(
+        fixture.source.join(".cargo/config.toml"),
+        "[target.x86_64-unknown-linux-gnu]\nlinker = \"gcc\"\n",
+    )
+    .unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![
+            models(),
+            tool("cargo_test", Json::Obj(Vec::new())),
+            fixture.final_reply(),
+        ],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let requests = mock.requests();
+    assert!(
+        requests[2].text().contains("[exit status 101]"),
+        "{}",
+        requests[2].text()
+    );
+    assert!(requests[2].text().contains("0 passed; 1 failed"));
+    let logs = fixture.logs();
+    let metrics = td_agent::review_metrics::summarize(logs[0].as_bytes()).unwrap();
+    assert_eq!(
+        metrics.get("nonzero_tool_exits").and_then(Json::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        metrics.get("unsuccessful_processes").and_then(Json::as_u64),
+        Some(1)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn incomplete_explicit_vendor_stops_before_a_model_completion() {
+    let mut fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+    manifest.push_str("\n[dependencies]\nmissing-fixture = \"=1.0.0\"\n");
+    fs::write(fixture.source.join("Cargo.toml"), manifest).unwrap();
+    amend_fixture(&mut fixture);
+    let vendor = fixture.root.join("vendor");
+    fs::create_dir(&vendor).unwrap();
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
+    let result = fixture
+        .command(&mock, "0.02")
+        .arg("--vendor")
+        .arg(vendor)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("Prepare the complete locked vendor closure"));
+    assert_eq!(mock.requests().len(), 1);
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn malformed_source_inputs_remain_reviewable_limitations() {
+    let mut fixture = Fixture::new();
+    let mut manifest = fs::read_to_string(fixture.source.join("Cargo.toml")).unwrap();
+    manifest.push_str("\n[package.metadata.review]\nsource-inputs = [\"missing-directory\"]\n");
+    fs::write(fixture.source.join("Cargo.toml"), manifest).unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(mock.requests()[1]
+        .text()
+        .contains("review source-input preparation unavailable"));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn full_seeded_instructions_are_sized_before_any_paid_completion() {
+    let mut fixture = Fixture::new();
+    fs::write(
+        fixture.source.join("AGENTS.md"),
+        "complete convention\n".repeat(1000),
+    )
+    .unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
+    let result = fixture
+        .command(&mock, "0.02")
+        .args(["--context-tokens", "1024"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("minimum useful completion tokens"));
+    assert_eq!(mock.requests().len(), 1);
+    assert!(fixture.logs()[0].contains("review_instructions"));
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn unrelated_non_utf8_filenames_do_not_prevent_guidance_discovery() {
+    let fixture = Fixture::with_unrelated_filename(true);
+    let mock = MockFetch::start(
+        &fixture.root.join("run"),
+        vec![models(), fixture.final_reply()],
+    );
+    let result = run(&fixture, &mock, "0.02");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn tracked_guidance_directories_are_refused_before_completion() {
+    let mut fixture = Fixture::new();
+    fs::create_dir(fixture.source.join("AGENTS.md")).unwrap();
+    fs::write(fixture.source.join("AGENTS.md/data"), "NOT_INSTRUCTIONS\n").unwrap();
+    amend_fixture(&mut fixture);
+    let mock = MockFetch::start(&fixture.root.join("run"), vec![models()]);
+    let result = run(&fixture, &mock, "0.02");
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("must be a regular tracked instruction file"));
+    assert_eq!(mock.requests().len(), 1);
+    fixture.no_workspaces();
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
 fn explicit_runner_overrides_an_absent_repository_runner() {
     let mut fixture = Fixture::new();
     fs::create_dir(fixture.source.join(".cargo")).unwrap();
@@ -1724,7 +1972,7 @@ fn oversized_compaction_input_is_bounded_before_the_summary_request() {
         let mut value = td_json::parse_slice(body).unwrap();
         if let Some(Json::Obj(fields)) = value.get_mut("usage") {
             if let Some((_, slot)) = fields.iter_mut().find(|(k, _)| k == "prompt_tokens") {
-                *slot = Json::from(12000u64);
+                *slot = Json::from(14000u64);
             }
         }
         let choices = match value.get_mut("choices").unwrap() {
@@ -1757,7 +2005,7 @@ fn oversized_compaction_input_is_bounded_before_the_summary_request() {
     );
     let result = fixture
         .command(&mock, "0.02")
-        .args(["--context-tokens", "14000"])
+        .args(["--context-tokens", "16000"])
         .output()
         .unwrap();
     assert!(
@@ -1768,7 +2016,7 @@ fn oversized_compaction_input_is_bounded_before_the_summary_request() {
     let requests = mock.requests();
     assert_eq!(requests.len(), 5);
     let summary = td_json::parse(&requests[3].text()).unwrap();
-    assert!(summary.get("max_tokens").unwrap().as_u64().unwrap() <= 1400);
+    assert!(summary.get("max_tokens").unwrap().as_u64().unwrap() <= 1600);
     assert!(requests[3]
         .text()
         .contains("write a concise handoff summary"));
