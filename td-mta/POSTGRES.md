@@ -955,3 +955,31 @@ Read snapshots also set the ten-second idle-transaction timeout.
 All operations retain the ten-second worker, statement/lock deadlines and
 128-frame/1 MiB input bounds. Provider errors and secret values remain
 redacted.
+
+## 22. Selected-profile database material adapter
+
+The inert postgres_profile_materials loader connects the selected-profile
+text and TLS consumers to immutable PostgreSQL material versions. The
+existing selected-profile grammar still calls these references file paths;
+this adapter accepts only `/postgres-material/` followed by one canonical
+32-character lowercase version ID. It performs no filesystem opening, URI
+resolution, alias lookup or fallback. Text and TLS target kinds determine the
+expected stored kind; sharing a version between incompatible roles refuses.
+Every read checks the configured epoch, primary, schema, complete chunks and
+digest before returning owned bytes to the existing decoder or TLS provider.
+
+Use one loader for the text and TLS stages of one selected profile. All reads
+share its original absolute deadline, at most 256 requests and an 8 MiB
+aggregate reservation charged at each requested kind's maximum raw length.
+Failure poisons the loader. These are cold-operation bounds, not aggregate
+native-allocation qualification. The adapter does not cache versions or
+weaken the material reader's per-connection limits. It provides no stronger
+secret-memory erasure guarantee than the existing material consumer.
+
+Managed ACME requests have no explicit immutable version and refuse here;
+future ACME publication must supply its own fenced database mapping. The
+adapter does not admit a complete shared/profile generation, select an active
+pointer, grant runtime database privileges or open service admission. The
+legacy filesystem loader remains production authority until the atomic
+cutover. Database version references are used only through this explicit
+prepared-profile adapter, never through the legacy serving path.

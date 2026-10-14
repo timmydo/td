@@ -118,6 +118,7 @@ pub mod postgres_bootstrap;
 pub mod postgres_input;
 pub mod postgres_materials;
 pub mod postgres_probe;
+pub mod postgres_profile_materials;
 pub mod postgres_resolver;
 pub mod postgres_schema;
 pub mod preview_json;

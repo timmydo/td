@@ -1677,3 +1677,151 @@ fn real_postgres_device_commit_uncertainty_resolves_without_duplicate_or_unrevoc
     );
     assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.devices"), "1");
 }
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_profile_materials_decode_text_and_compile_tls_without_files() {
+    use std::sync::Arc;
+    use td_mta::{
+        clock::{RuntimeClock, TlsClockSource},
+        config::{load, materialize, profile::Roles, stanza::Pending, storage::Storage, stream},
+        generations::GenerationSet,
+        postgres_materials::{self as materials, Kind, Version},
+        postgres_profile_materials::Loader,
+        postgres_schema,
+        tls_policy::TlsPolicies,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let request = fixture.request();
+    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let chain = fs::read(fixture.root.join("server.crt")).unwrap();
+    let key = fs::read(fixture.root.join("server.key")).unwrap();
+    for (n, kind, bytes) in [
+        (1, Kind::RelayPassword, b"database-password\n".as_slice()),
+        (2, Kind::CertificateChain, chain.as_slice()),
+        (3, Kind::PrivateKey, key.as_slice()),
+        (4, Kind::TrustBundle, fixture.ca.as_slice()),
+        (5, Kind::TextSignature, b"signature\r\n".as_slice()),
+    ] {
+        materials::insert(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            Version::from_bytes([n; 16]),
+            kind,
+            bytes,
+        )
+        .unwrap();
+    }
+    let source = format!(
+        r#"version = 1
+[server]
+hostname = "localhost"
+jmap_origin = "https://localhost"
+[account "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+username = "user"
+[domain "example.test"]
+mx_host = "localhost"
+[alias "main@example.test"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[identity "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+email = "main@example.test"
+text_signature_file = "/postgres-material/{signature}"
+[resolver "primary"]
+address = "127.0.0.1:53"
+[relay]
+host = "localhost"
+port = 465
+username = "relay-user"
+password_file = "/postgres-material/{password}"
+ca_file = "/postgres-material/{ca}"
+[certificate "public"]
+mode = "files"
+chain_file = "/postgres-material/{chain}"
+key_file = "/postgres-material/{key}"
+[listener "https"]
+kind = "https"
+bind = "127.0.0.1:443"
+certificate = "public"
+"#,
+        password = Version::from_bytes([1; 16]),
+        chain = Version::from_bytes([2; 16]),
+        key = Version::from_bytes([3; 16]),
+        ca = Version::from_bytes([4; 16]),
+        signature = Version::from_bytes([5; 16])
+    );
+    let mut scratch = vec![0; stream::SCRATCH_BYTES];
+    let parse = |source: &str, scratch: &mut [u8]| {
+        load::read_profile(
+            Storage::try_new().unwrap(),
+            &mut Pending::new(),
+            scratch,
+            &mut source.as_bytes(),
+            Roles::from_bits(2).unwrap(),
+        )
+        .unwrap()
+    };
+    let profile = parse(&source, &mut scratch);
+    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    let resolved = materialize::read_profile_text(profile, &mut scratch, |reference| {
+        loader.open_input(reference)
+    })
+    .unwrap();
+    assert_eq!(resolved.relay_password().unwrap(), "database-password");
+    assert_eq!(
+        resolved.signatures(0).unwrap().unwrap().text,
+        "signature\r\n"
+    );
+    let set = GenerationSet::at_startup();
+    let clock = Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(Arc::new(
+        RuntimeClock::new(),
+    ))));
+    let prepared =
+        TlsPolicies::prepare_profile(set.reserve().unwrap(), &resolved, clock, |reference| {
+            loader
+                .open_tls(reference)
+                .map_err(|_| td_mta::ports::Error::Invalid)
+        })
+        .unwrap();
+    drop(prepared);
+    // Kind-confused references cannot reinterpret public bytes as a secret.
+    let wrong = source.replace(
+        &Version::from_bytes([1; 16]).to_string(),
+        &Version::from_bytes([2; 16]).to_string(),
+    );
+    let profile = parse(&wrong, &mut scratch);
+    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    let failure = materialize::read_profile_text(profile, &mut scratch, |reference| {
+        loader.open_input(reference)
+    })
+    .unwrap_err();
+    assert!(matches!(
+        failure.error(),
+        materialize::Error::Input(td_mta::postgres_profile_materials::Error::Database(
+            materials::Error::Kind
+        ))
+    ));
+    let profile = parse(&source, &mut scratch);
+    assert!(
+        materialize::read_profile_text(profile, &mut scratch, |reference| loader
+            .open_input(reference))
+        .is_err()
+    );
+    // A valid profile cannot fall back to a real existing local file.
+    let local = source.replace(
+        &format!("/postgres-material/{}", Version::from_bytes([1; 16])),
+        fixture.root.join("password").to_str().unwrap(),
+    );
+    let profile = parse(&local, &mut scratch);
+    let mut loader = Loader::new(&request, &trust, epoch, deadline());
+    assert!(
+        materialize::read_profile_text(profile, &mut scratch, |reference| loader
+            .open_input(reference))
+        .is_err()
+    );
+}
