@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 2);
+    assert_eq!(receipt.version, 3);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        2
+        3
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":2"));
+    assert!(initialized.contains("\"schema_version\":3"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 2);
+    assert_eq!(receipt.version, 3);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1184,5 +1184,172 @@ fn real_postgres_material_commands_import_verify_and_resolve_retained_version() 
     assert_eq!(
         sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
         "4"
+    );
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_mail_schema_bounds_references_and_rollback() {
+    use td_mta::postgres_schema;
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    postgres_schema::initialize(&fixture.request(), &trust, deadline()).unwrap();
+    sql(&fixture, "CREATE DATABASE non_utf8 TEMPLATE template0 ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'");
+    let mut non_utf8 = fixture.request();
+    non_utf8.database = "non_utf8";
+    assert_eq!(
+        postgres_schema::initialize(&non_utf8, &trust, deadline()),
+        Err(postgres_schema::Error::Version)
+    );
+    let a = "decode(repeat('01',16),'hex')";
+    let b = "decode(repeat('02',16),'hex')";
+    let zero = "decode(repeat('00',8),'hex')";
+    let high = "decode('8000000000000000','hex')";
+    let max = "decode(repeat('ff',8),'hex')";
+    let digest = "decode(repeat('00',32),'hex')";
+    sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "19");
+    // Each expected refusal rolls back its own subtransaction. An unexpected
+    // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
+    let refuse = |statement: String, state: &str| {
+        sql(&fixture, &format!("DO $$ BEGIN BEGIN {statement}; SET CONSTRAINTS ALL IMMEDIATE; RAISE EXCEPTION 'unexpected success'; EXCEPTION WHEN SQLSTATE '{state}' THEN NULL; END; END $$"));
+    };
+    refuse(
+        format!("UPDATE td_mta.accounts SET sequence={zero} WHERE id={a}"),
+        "23514",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blobs VALUES ({b},{a},0,{digest},0,{zero},0)"),
+        "23503",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blobs VALUES ({a},{a},33554433,{digest},0,{zero},513)"),
+        "23514",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blobs VALUES ({a},{a},65537,{digest},0,{zero},1)"),
+        "23514",
+    );
+    sql(&fixture, &format!("INSERT INTO td_mta.blobs VALUES ({a},{a},33554432,{digest},0,{zero},512),({a},{b},0,{digest},0,{zero},0)"));
+    sql(&fixture, &format!("INSERT INTO td_mta.blob_chunks SELECT {a},{a},n,decode(repeat('42',65536),'hex') FROM generate_series(0,511) n"));
+    assert_eq!(sql(&fixture, "SELECT count(*),sum(octet_length(bytes)),max(octet_length(bytes)) FROM td_mta.blob_chunks"), "512|33554432|65536");
+    refuse(
+        format!("INSERT INTO td_mta.blob_chunks VALUES ({a},{b},512,decode('42','hex'))"),
+        "23514",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blob_chunks VALUES ({a},{b},0,decode('','hex'))"),
+        "23514",
+    );
+    refuse(
+        format!(
+            "INSERT INTO td_mta.blob_chunks VALUES ({a},{b},0,decode(repeat('42',65537),'hex'))"
+        ),
+        "23514",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blob_chunks VALUES ({b},{a},0,decode('42','hex'))"),
+        "23503",
+    );
+    refuse(
+        format!("INSERT INTO td_mta.blob_chunks VALUES ({a},{a},0,decode('42','hex'))"),
+        "23505",
+    );
+    // Build children before parents, then force all deferred checks.
+    sql(&fixture, &format!("BEGIN; INSERT INTO td_mta.memberships VALUES ({a},{a},{a},{zero}); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES ({a},{a},{a},{a},0,2,{zero}); INSERT INTO td_mta.mailboxes VALUES ({a},{a},'Inbox',NULL,'inbox',0,1,{zero}); INSERT INTO td_mta.threads VALUES ({a},{a},{zero}); SET CONSTRAINTS ALL IMMEDIATE; COMMIT"));
+    refuse(
+        format!("INSERT INTO td_mta.memberships VALUES ({b},{a},{a},{zero})"),
+        "23503",
+    );
+    refuse(format!("INSERT INTO td_mta.mailboxes VALUES ({b},{b},'bad',NULL,NULL,0,1,{zero}); INSERT INTO td_mta.memberships VALUES ({b},{b},{b},{zero})"), "23503");
+    assert_eq!(
+        sql(
+            &fixture,
+            &format!("SELECT count(*) FROM td_mta.mailboxes WHERE account={b}")
+        ),
+        "0"
+    );
+    refuse(
+        format!("INSERT INTO td_mta.keywords VALUES ({a},{a},repeat('é',128),{zero})"),
+        "23514",
+    );
+    sql(&fixture, &format!("INSERT INTO td_mta.keywords VALUES ({a},{a},'é',{zero}),({a},{a},'z',{zero}),({a},{a},'A',{zero})"));
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT string_agg(keyword,',' ORDER BY keyword) FROM td_mta.keywords"
+        ),
+        "A,z,é"
+    );
+    refuse(
+        format!("DELETE FROM td_mta.blobs WHERE account={a} AND id={a}"),
+        "23503",
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.blob_chunks"),
+        "512"
+    );
+    sql(&fixture, "BEGIN; DELETE FROM td_mta.keywords; DELETE FROM td_mta.memberships; DELETE FROM td_mta.emails; DELETE FROM td_mta.blobs; COMMIT");
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.blob_chunks"),
+        "0"
+    );
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM td_mta.blob_ids"), "2");
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
+    use td_crypto::Digest;
+    use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    for (index, ddl) in [
+        include_str!("../src/postgres_schema.sql"),
+        include_str!("../src/postgres_materials.sql"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut hash = Provider.sha256().unwrap();
+        hash.update(ddl.as_bytes()).unwrap();
+        let digest: String = hash
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sql(&fixture, &format!("{ddl} INSERT INTO td_mta.schema_migrations VALUES ({},decode('{digest}','hex'),decode(repeat('42',16),'hex'))", index + 1));
+    }
+    // Owner-inserted raw material remains byte-identical through migration.
+    sql(&fixture, "INSERT INTO td_mta.config_materials VALUES (decode(repeat('01',16),'hex'),5,0,decode(repeat('00',32),'hex'),0)");
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Version)
+    );
+    sql(&fixture, "CREATE TABLE td_mta.accounts(obstruction bigint)");
+    assert_eq!(
+        upgrade(&fixture.request(), &trust, deadline()),
+        Err(SchemaError::Database)
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.schema_migrations"),
+        "2"
+    );
+    sql(&fixture, "DROP TABLE td_mta.accounts");
+    let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
+    assert_eq!(receipt.version, 3);
+    assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT kind,length,chunk_count,encode(checksum,'hex') FROM td_mta.config_materials"
+        ),
+        format!("5|0|0|{}", "00".repeat(32))
+    );
+    assert_eq!(
+        inspect(&fixture.request(), &trust, deadline()).unwrap(),
+        receipt
     );
 }

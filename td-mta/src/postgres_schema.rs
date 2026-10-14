@@ -16,8 +16,9 @@ use tokio_postgres::Client;
 const MIGRATIONS: &[&str] = &[
     include_str!("postgres_schema.sql"),
     include_str!("postgres_materials.sql"),
+    include_str!("postgres_mail.sql"),
 ];
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,
@@ -89,7 +90,7 @@ fn write_schema(
 ) -> Result<Receipt, Error> {
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_schema_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             version(client).await?;
             client
@@ -204,8 +205,10 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
 }
 
 async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
+    let limit = MIGRATIONS.len().checked_add(1).ok_or(Error::Version)?;
+    let limit = i64::try_from(limit).map_err(|_| Error::Version)?;
     let rows = client.query(
-        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT 3", &[])
+        "SELECT version, checksum, store_epoch FROM td_mta.schema_migrations ORDER BY version LIMIT $1", &[&limit])
         .await.map_err(|_| Error::Database)?;
     if rows.is_empty()
         || rows.len() > MIGRATIONS.len()
@@ -239,6 +242,15 @@ async fn version(client: &Client) -> Result<(), Error> {
         .await
         .map_err(Error::Connection)?;
     if status.server_version / 10_000 != 17 {
+        return Err(Error::Version);
+    }
+    let encoding: String = client
+        .query_one("SELECT pg_catalog.current_setting('server_encoding')", &[])
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Invalid)?;
+    if encoding != "UTF8" {
         return Err(Error::Version);
     }
     Ok(())

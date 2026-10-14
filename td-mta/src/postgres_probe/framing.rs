@@ -24,6 +24,13 @@ impl Input {
         }
     }
 
+    pub(super) fn schema() -> Self {
+        Self {
+            frames: 256,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn accept(&mut self, input: &[u8]) -> Result<(), ()> {
         if self.failed {
             return Err(());
@@ -152,6 +159,23 @@ mod tests {
         let mut input = Input::new();
         assert!(input.accept(&authenticated()).is_ok());
         assert!(input.accept(&frame(b'R', &10u32.to_be_bytes())).is_err());
+    }
+
+    #[test]
+    fn schema_command_budget_is_finite_and_keeps_other_input_limits() {
+        let mut input = Input::schema();
+        for _ in 0..256 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::schema().accept(&frame(b'Z', b"I")).is_err());
+        let mut input = Input::schema();
+        let large = frame(b'D', &vec![0; 128 * 1024 - 4]);
+        for _ in 0..7 {
+            assert!(input.accept(&large).is_ok());
+        }
+        assert!(input.accept(&large).is_err());
     }
 
     #[test]

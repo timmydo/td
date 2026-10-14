@@ -534,8 +534,8 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and section 16's configuration-material tables, not a complete
-mail/configuration schema or runtime role. Serving still cannot select
+and sections 16 and 19's material/mail tables, not a complete
+serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
 credential; no owner credential is installed into a serving pool here.
 
@@ -547,24 +547,29 @@ existing td_mta namespace, even an empty one. The committed SQL in
 src/postgres_schema.sql creates that schema and its schema_migrations
 ledger. Each migration records its exact DDL's SHA-256 and the same 128-bit
 store epoch in a ledger row. Version 1's committed SQL and checksum remain
-fixed; version 2 adds src/postgres_materials.sql. New initialization applies
-both in one transaction. PUBLIC grants are revoked; inherited
+fixed; version 2 adds src/postgres_materials.sql and version 3 adds
+src/postgres_mail.sql. New initialization applies all three in one
+transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
-Explicit runtime grants and mail/application configuration tables remain
+Explicit runtime grants and application configuration tables remain
 preparation work.
 
 `postgres_schema::upgrade` uses an explicit owner credential and the same
 exclusive transaction migration lock. It validates all existing checksums
-and the common epoch before applying the missing version-2 migration. A
+and the common epoch before applying every missing migration. A
 compatible current ledger returns its receipt without another write.
 Unknown, missing, changed or inconsistent ledger history refuses. Migration
 preserves the epoch and commits the DDL and ledger row together. A failed
-migration rolls back, leaving version 1 intact; that old version cannot
-serve version-2 operations. Post-COMMIT uncertainty has the same no-replay
+migration rolls back, leaving the prior version intact; an old version
+cannot serve current operations. Post-COMMIT uncertainty has the same no-replay
 rule as initialization.
 
 The client shares the original ten-second worker limit, configured
-statement/lock timeouts and protocol byte/frame caps. Fixed SQL and typed
+statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
+permits 256 input frames for the three migrations and their ledger writes;
+probe, inspection and material operations retain 128. The per-frame 128 KiB
+and total 1 MiB input bounds, 64 KiB schema output bound, authentication
+checks and terminal budget refusal are unchanged. Fixed SQL and typed
 parameters are private to the crate; arbitrary driver execution is not a
 public API. Initialization errors before COMMIT drop the session and leave
 no committed namespace; migration errors preserve the previous schema. Once
@@ -575,8 +580,9 @@ replay or uncertainty resolver in this preparation API. An operator must
 resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
-try-lock before reading the ledger. It reads at most three rows and requires
-exactly the two ordered migration versions, their compiled DDL checksums and
+try-lock before reading the ledger. Its bound is the compiled migration
+count plus one (currently four rows); it requires
+exactly the three ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -601,11 +607,12 @@ functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADV
 
 `td-mta postgres schema-init --connection-file PATH` explicitly initializes
 section 13's preparation ledger using a separately provisioned schema-owner
-login. It refuses every existing td_mta namespace. It creates no mail store,
-application configuration, runtime role or listener. The matching `td-mta
+login. It refuses every existing td_mta namespace. It creates the prepared
+material and mail relations, but no application configuration, runtime role
+or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies the known owner migration from version 1 to 2, or reports an
+PATH` applies every missing migration through version 3, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -628,8 +635,8 @@ receipt; do not interpret a missing command response as permission to
 replay.
 
 These commands qualify only the preparation ledger, not complete schema
-integrity or operational mail service. Future mail schema migrations and
-profile publication remain separate explicit operations.
+integrity or operational mail service. Further schema migrations require
+explicit owner upgrade; profile publication remains separate work.
 
 ## 15. Prepared instance role validation
 
@@ -812,3 +819,51 @@ Host tests cover every role combination, malformed text, failed readers,
 wrong certificate names, invalid PEM and reservation recovery. They do not
 extend the existing portable-stack or aggregate native-memory qualification
 to these new entry points.
+
+## 19. Prepared mail relations
+
+Schema version 3 adds explicit mail relations, with no serving adapter or
+mail write command yet. Existing SQLite tables remain production authority
+until the atomic cutover. Schema initialization, inspection and upgrade now
+and material operations require a UTF8 database (a different encoding
+reports the fixed
+unsupported-version-or-checksum refusal); text columns use the built-in C collation so byte
+ordering does not depend on the installation's locale. Versions 1 and 2's
+SQL and checksums are unchanged. Upgrade from either preserves the epoch
+and existing material rows in the same transaction as version 3's DDL.
+
+The account row holds the committed sequence and retained history floor as
+fixed eight-byte big-endian values, preserving the full unsigned range and
+lexicographic order. The floor cannot exceed the sequence. Future mutations
+must lock this row and allocate their sequence transactionally; there is no
+SQL sequence. Blob IDs remain reserved separately from live manifests.
+Manifests contain length, SHA-256, creation time, changed sequence and exact
+ceiling-divided chunk count. Bodies have no whole-message column. Chunk rows
+are account/blob scoped, ordinals 0 through 511, and one through 65,536 bytes.
+Empty blobs have zero chunks; manifests retain the 32 MiB ceiling. Deleting
+a manifest cascades its chunks but retains its reserved ID.
+
+The remaining relations preserve mailbox, immutable thread assignment,
+message receipt provenance, membership, keyword, thread anchor, submission,
+recipient, upload lease, import marker and change-history shapes. Foreign
+keys include account identity; historical submission/import
+identities intentionally do not require live objects. Text bounds measure
+UTF-8 bytes. Existing deferred references permit one transaction to build a
+complete graph, and native indexes support account-scoped keyset reads.
+All tables are ordinary logged tables. Existing owner-only migration ACL
+checks also cover these tables and indexes.
+
+These are row-shape and reference constraints, not a complete publication
+validator. Future typed transactions must verify contiguous chunks, exact
+length and digest, mailbox graphs, immutable fields, recipient/receipt
+coverage, retained history, authorization, quotas and operation receipts
+before COMMIT. Upload leases are not delivery ownership: distributed route
+and attempt fences, policy/device/configuration tables, runtime privileges,
+and connection pools remain separate work before serving activation. No
+SQLite data migration or Stalwart importer is introduced.
+
+Disposable PostgreSQL tests exercise initial creation and upgrades, logged
+relations, body bounds, deferred same-account references, empty/maximum
+manifests, unsigned sequence ordering, bytewise text ordering, failed graph
+rollback, chunk cascade and retained blob IDs. They do not claim the future
+publication checks or cloud-provider qualification.
