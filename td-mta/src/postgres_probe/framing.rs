@@ -38,6 +38,14 @@ impl Input {
         }
     }
 
+    pub(super) fn body() -> Self {
+        Self {
+            bytes: 128 * 1024 * 1024,
+            frames: 8192,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn configuration() -> Self {
         Self {
             bytes: 4 * 1024 * 1024,
@@ -174,6 +182,26 @@ mod tests {
         let mut input = Input::new();
         assert!(input.accept(&authenticated()).is_ok());
         assert!(input.accept(&frame(b'R', &10u32.to_be_bytes())).is_err());
+    }
+
+    #[test]
+    fn body_budget_is_finite_and_preserves_frame_and_authentication_limits() {
+        let mut input = Input::body();
+        for _ in 0..8192 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::body().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::body()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        let mut input = Input::body();
+        for _ in 0..1023 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
     }
 
     #[test]

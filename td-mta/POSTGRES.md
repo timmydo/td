@@ -1189,3 +1189,50 @@ caller deadline (at most ten seconds) covers connection, authentication, SQL
 and decoding, and is checked again before any result escapes. The connection
 and snapshot close before return; results cannot be extended into a later
 snapshot or used as a mutation authorization.
+
+## 29. Verified Email body snapshots
+
+`postgres_body::with_email` prepares the message-reading boundary without
+selecting a production backend. Its expected epoch, account and Email ID do
+not grant authority: it verifies the primary/schema barrier and app password
+inside one read-only repeatable-read transaction before resolving that Email's
+body. Only an Email in that account admits a body; upload leases and standalone
+transmission blobs remain outside this operation. Configuration/role admission
+and bounded runtime pools are still cutover work.
+
+Before callback admission it validates the captured account sequence/floor,
+Email/Thread/Blob references and change positions, length and chunk count. It
+reads contiguous 64 KiB chunks in batches of at most eight, checks exact lengths
+and ordinals, and verifies the entire SHA-256 before admitting the callback.
+Later reads rely on PostgreSQL preserving those bytes in the same snapshot;
+chunks are not independently hashed again on replay. Storage/server corruption
+after verification is outside that guarantee. Empty bodies still require the
+correct empty digest. The caller
+may impose a smaller size ceiling within the existing 32 MiB maximum.
+
+The synchronous BlobReader callback retains that exact database snapshot and
+migration lock. Reads reuse at most eight cached chunk rows, so small MIME
+reads do not refetch a whole database chunk every time. Cache misses use the
+same connection and snapshot; there is no reconnect or replacement view.
+Invalid reads, database failure and expiry are sticky, including when a
+callback attempts to swallow the error. The original deadline covers setup,
+verification, callback work and final return. As with the current verified
+blob callback, callers must bound their own CPU and I/O by that deadline.
+
+A private connection worker can drive successive closed queries synchronously;
+it never replenishes deadlines or transport budgets between queries. Existing
+probe/material/configuration/schema/mailbox operations retain their original
+budgets and mutation-outcome semantics. Body operations have a 128 MiB total
+input budget, 8192 frames, 512 KiB output and the unchanged 128 KiB individual
+frame/authentication limits. The total includes initial verification and later
+reads, so sufficiently many cache misses refuse rather than consume unlimited
+wire or driver memory. Cache-hit and callback-return checks drain available
+connection messages without a SQL round trip and retain terminal failures; a
+queued notice cannot conceal a subsequent connection error. The worker tracks
+actual socket byte progress beneath TLS: consuming an encrypted header can
+return Pending before yielding plaintext, so it retries immediately after
+that progress and parks only when the socket made none. The same rule drives
+connection setup and query polling, without extending any allowance. Database query
+failures report I/O failure; corruption remains a row-shape or digest failure.
+This is a finite cold operation, not a reusable pool or
+an assertion that future HTTP transfer limits are already qualified.

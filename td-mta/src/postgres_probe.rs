@@ -10,7 +10,10 @@ use std::{
     io,
     net::{SocketAddr, TcpStream},
     pin::{pin, Pin},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll, Wake, Waker},
     thread,
     time::{Duration, Instant},
@@ -154,6 +157,29 @@ fn with_output_limit<T>(
     input: Input,
     operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
 ) -> Result<T, Error> {
+    let mut worker = connect_worker(request, trust, deadline, output_limit, input)?;
+    worker.run(operation)
+}
+
+// A single snapshot may need several synchronous reads through BlobReader.
+// Budgets and deadlines belong to the connection and are never replenished.
+pub(crate) fn with_body_worker<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl FnOnce(&mut Worker) -> T,
+) -> Result<T, Error> {
+    let mut worker = connect_worker(request, trust, deadline, 512 * 1024, Input::body())?;
+    Ok(operation(&mut worker))
+}
+
+fn connect_worker(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+) -> Result<Worker, Error> {
     let allowance = remaining(deadline)?;
     if allowance > MAX_DURATION
         || request.server_name.is_empty()
@@ -180,7 +206,11 @@ fn with_output_limit<T>(
     let session = TlsSession::client(policy, request.server_name).map_err(|_| Error::Tls)?;
     let socket = TcpStream::connect_timeout(&request.address, remaining(deadline)?)
         .map_err(|_| Error::Transport)?;
-    let transport = TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?;
+    let activity = Arc::new(AtomicBool::new(false));
+    let transport = Network {
+        transport: TcpTransport::from_stream(socket).map_err(|_| Error::Transport)?,
+        activity: activity.clone(),
+    };
     let mut config = Config::new();
     config
         .host(request.server_name)
@@ -204,23 +234,89 @@ fn with_output_limit<T>(
     let mut connect = pin!(config.connect_raw(Io::new(transport, false), connector));
     let (client, connection) = loop {
         remaining(deadline)?;
+        activity.store(false, Ordering::Relaxed);
         if let Poll::Ready(result) = connect.as_mut().poll(&mut context) {
             break result.map_err(|_| Error::Database)?;
         }
-        thread::park_timeout(Duration::from_millis(1));
+        if !activity.load(Ordering::Relaxed) {
+            thread::park_timeout(Duration::from_millis(1));
+        }
     };
-    let mut connection = pin!(connection);
-    let mut operation = operation(&client);
-    loop {
-        remaining(deadline)?;
-        if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
-            return Ok(result);
+    Ok(Worker {
+        client,
+        connection: Box::pin(connection),
+        deadline,
+        waker,
+        failed: None,
+        activity,
+    })
+}
+
+pub(crate) struct Worker {
+    client: tokio_postgres::Client,
+    connection: Pin<Box<tokio_postgres::Connection<Io<Network>, Io<Secure>>>>,
+    deadline: Instant,
+    waker: Waker,
+    failed: Option<Error>,
+    activity: Arc<AtomicBool>,
+}
+impl Worker {
+    // No query or round trip: drain available asynchronous messages so an idle
+    // cached read cannot hide a terminal connection error behind a notice.
+    pub(crate) fn check(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
         }
-        match connection.as_mut().poll_message(&mut context) {
-            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
-            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => return Err(Error::Database),
+        let mut context = Context::from_waker(&self.waker);
+        loop {
+            if let Err(error) = remaining(self.deadline) {
+                self.failed = Some(error);
+                return Err(error);
+            }
+            self.activity.store(false, Ordering::Relaxed);
+            match self.connection.as_mut().poll_message(&mut context) {
+                Poll::Pending if !self.activity.load(Ordering::Relaxed) => return Ok(()),
+                Poll::Pending => {}
+                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    self.failed = Some(Error::Database);
+                    return Err(Error::Database);
+                }
+            }
         }
-        thread::park_timeout(Duration::from_millis(1));
+    }
+
+    pub(crate) fn run<T>(
+        &mut self,
+        operation: impl for<'a> FnOnce(
+            &'a tokio_postgres::Client,
+        ) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+    ) -> Result<T, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let mut context = Context::from_waker(&self.waker);
+        let mut operation = operation(&self.client);
+        loop {
+            if let Err(error) = remaining(self.deadline) {
+                self.failed = Some(error);
+                return Err(error);
+            }
+            self.activity.store(false, Ordering::Relaxed);
+            if let Poll::Ready(result) = operation.as_mut().poll(&mut context) {
+                return Ok(result);
+            }
+            match self.connection.as_mut().poll_message(&mut context) {
+                Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    self.failed = Some(Error::Database);
+                    return Err(Error::Database);
+                }
+            }
+            if !self.activity.load(Ordering::Relaxed) {
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -264,7 +360,44 @@ impl Wake for WorkerWake {
     }
 }
 
-type Secure = TlsIo<TcpTransport, Box<[u8; TLS_WIRE_BYTES]>>;
+// TLS can consume an encrypted header and report no plaintext yet. Track
+// actual socket progress below it so the worker does not sleep on that work.
+struct Network {
+    transport: TcpTransport,
+    activity: Arc<AtomicBool>,
+}
+impl Network {
+    fn progress(
+        &self,
+        result: Result<IoProgress, crate::ports::Error>,
+    ) -> Result<IoProgress, crate::ports::Error> {
+        if matches!(result, Ok(IoProgress::Bytes(count)) if count > 0) {
+            self.activity.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+}
+impl Transport for Network {
+    fn read(&mut self, output: &mut [u8]) -> Result<IoProgress, crate::ports::Error> {
+        let result = self.transport.read(output);
+        self.progress(result)
+    }
+    fn write(&mut self, input: &[u8]) -> Result<IoProgress, crate::ports::Error> {
+        let result = self.transport.write(input);
+        self.progress(result)
+    }
+    fn flush(&mut self) -> Result<FlushProgress, crate::ports::Error> {
+        self.transport.flush()
+    }
+    fn close(&mut self) -> Result<FlushProgress, crate::ports::Error> {
+        self.transport.close()
+    }
+    fn abort(&mut self) {
+        self.transport.abort();
+    }
+}
+
+type Secure = TlsIo<Network, Box<[u8; TLS_WIRE_BYTES]>>;
 struct Connector {
     session: TlsSession,
     clock: Arc<dyn Clock>,
@@ -273,12 +406,12 @@ struct Connector {
     input: Input,
 }
 
-impl tls::TlsConnect<Io<TcpTransport>> for Connector {
+impl tls::TlsConnect<Io<Network>> for Connector {
     type Stream = Io<Secure>;
     type Error = io::Error;
     type Future = Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>>;
 
-    fn connect(self, raw: Io<TcpTransport>) -> Self::Future {
+    fn connect(self, raw: Io<Network>) -> Self::Future {
         Box::pin(async move {
             let mut secure = TlsIo::new(
                 raw.transport,
@@ -409,6 +542,41 @@ use framing::Input;
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn socket_activity_distinguishes_progress_from_idle_polling() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let activity = Arc::new(AtomicBool::new(false));
+        let mut network = Network {
+            transport: TcpTransport::from_stream(socket).unwrap(),
+            activity: activity.clone(),
+        };
+        let mut byte = [0];
+        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
+        assert_eq!(network.flush(), Ok(FlushProgress::Complete));
+        assert!(!activity.load(Ordering::Relaxed));
+        peer.write_all(b"x").unwrap();
+        let stop = Instant::now() + Duration::from_secs(1);
+        while network.read(&mut byte).unwrap() == IoProgress::Pending {
+            assert!(!activity.load(Ordering::Relaxed));
+            assert!(Instant::now() < stop);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(byte, *b"x");
+        assert!(activity.load(Ordering::Relaxed));
+        activity.store(false, Ordering::Relaxed);
+        assert_eq!(network.write(b"y"), Ok(IoProgress::Bytes(1)));
+        assert!(activity.load(Ordering::Relaxed));
+        peer.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"y");
+        activity.store(false, Ordering::Relaxed);
+        assert_eq!(network.read(&mut byte), Ok(IoProgress::Pending));
+        assert!(!activity.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn stalled_ssl_upgrade_obeys_original_worker_deadline() {

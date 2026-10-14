@@ -2605,3 +2605,383 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
         .iter()
         .all(|mailbox| mailbox.changed == 2 && mailbox.name == "After snapshot"));
 }
+
+#[test]
+#[ignore = "requires TD_MTA_TEST_POSTGRES_BIN naming an independently installed PostgreSQL 17"]
+fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
+    use td_crypto::Digest;
+    use td_mta::{
+        ids::{AccountId, EmailId, StoreEpoch},
+        ports::{self, BlobReader},
+        postgres_accounts as accounts, postgres_body as body, postgres_devices as devices,
+        postgres_schema,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let request = fixture.request();
+    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let account = AccountId::from_bytes([1; 16]);
+    accounts::publish(
+        &request,
+        &trust,
+        deadline(),
+        accounts::prepare(epoch, account).unwrap(),
+    )
+    .unwrap();
+    let device = devices::prepare_creation(epoch, account, "body reader", 1).unwrap();
+    devices::publish_creation(&request, &trust, deadline(), &device).unwrap();
+    let email = EmailId::from_bytes([2; 16]);
+    let selected = body::ReadRequest {
+        epoch,
+        account,
+        email,
+        maximum: body::MAX_BODY_BYTES,
+    };
+    let check = |length: usize| {
+        let mut hash = Provider.sha256().unwrap();
+        for n in 0..length.div_ceil(65536) {
+            let bytes = vec![b'A' + (n % 26) as u8; (length - n * 65536).min(65536)];
+            hash.update(&bytes).unwrap();
+        }
+        let digest = hash
+            .finish()
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        sql(&fixture, &format!("BEGIN; DELETE FROM td_mta.emails; DELETE FROM td_mta.blobs; DELETE FROM td_mta.blob_ids; DELETE FROM td_mta.threads;
+            INSERT INTO td_mta.blob_ids VALUES (decode('{account}','hex'),decode(repeat('03',16),'hex'));
+            INSERT INTO td_mta.blobs VALUES (decode('{account}','hex'),decode(repeat('03',16),'hex'),{length},decode('{digest}','hex'),7,decode('0000000000000001','hex'),({length}+65535)/65536);
+            INSERT INTO td_mta.blob_chunks SELECT decode('{account}','hex'),decode(repeat('03',16),'hex'),n,convert_to(repeat(chr(65+(n%26)),LEAST(65536,{length}-n*65536)),'UTF8') FROM generate_series(0,({length}+65535)/65536-1) n;
+            INSERT INTO td_mta.threads VALUES (decode('{account}','hex'),decode(repeat('04',16),'hex'),decode('0000000000000001','hex'));
+            INSERT INTO td_mta.emails (account,id,blob_id,thread_id,received_at,origin,changed) VALUES (decode('{account}','hex'),decode('{email}','hex'),decode(repeat('03',16),'hex'),decode(repeat('04',16),'hex'),9,2,decode('0000000000000001','hex')); COMMIT"));
+        let started = Instant::now();
+        let result = body::with_email(
+            &request,
+            &trust,
+            Instant::now() + Duration::from_secs(10),
+            selected,
+            device.password(),
+            |metadata, reader| {
+                eprintln!("body length={length}: verified at {:?}", started.elapsed());
+                assert_eq!(metadata.identity.committed_sequence.number(), 1);
+                assert_eq!(metadata.email, email);
+                assert_eq!(metadata.received_at, 9);
+                assert_eq!(metadata.body.created_at, 7);
+                assert_eq!(reader.len(), length as u64);
+                let mut output = [0; 4096];
+                let mut position = 0;
+                while position < reader.len() {
+                    let count = reader.read_at(position, &mut output)?;
+                    assert!(count > 0);
+                    for (offset, &byte) in output[..count].iter().enumerate() {
+                        assert_eq!(
+                            byte,
+                            b'A' + (((position + offset as u64) / 65536) % 26) as u8
+                        );
+                    }
+                    position += count as u64;
+                }
+                assert_eq!(reader.read_at(reader.len(), &mut output)?, 0);
+                for offset in [0, 65535, 65536, 7 * 65536 + 65535, 8 * 65536, 16 * 65536] {
+                    if offset < reader.len() {
+                        let count = reader.read_at(offset, &mut output)?;
+                        for (at, &byte) in output[..count].iter().enumerate() {
+                            assert_eq!(byte, b'A' + (((offset + at as u64) / 65536) % 26) as u8);
+                        }
+                    }
+                }
+                Ok(position)
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "body length={length} failed after {:?}: {error:?}",
+                started.elapsed()
+            )
+        });
+        eprintln!("body length={length}: complete at {:?}", started.elapsed());
+        assert_eq!(result, length as u64);
+    };
+    for length in [
+        0,
+        65535,
+        65536,
+        65537,
+        body::MAX_BODY_BYTES as usize,
+        17 * 65536 + 13,
+    ] {
+        check(length);
+    }
+    let unused = |_: body::Metadata, _: &mut dyn BlobReader| -> Result<(), ports::Error> {
+        panic!("unverified or unauthorized callback");
+    };
+    assert_eq!(
+        body::with_email(&request, &trust, deadline(), selected, b"bad", unused),
+        Err(body::Error::Unauthenticated)
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            body::ReadRequest {
+                epoch: StoreEpoch::from_bytes([9; 16]),
+                ..selected
+            },
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Epoch)
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            body::ReadRequest {
+                email: EmailId::from_bytes([9; 16]),
+                ..selected
+            },
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Missing)
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            body::ReadRequest {
+                maximum: 1,
+                ..selected
+            },
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Capacity)
+    );
+    let other = AccountId::from_bytes([8; 16]);
+    accounts::publish(
+        &request,
+        &trust,
+        deadline(),
+        accounts::prepare(epoch, other).unwrap(),
+    )
+    .unwrap();
+    let other_device = devices::prepare_creation(epoch, other, "other body reader", 1).unwrap();
+    devices::publish_creation(&request, &trust, deadline(), &other_device).unwrap();
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            body::ReadRequest {
+                account: other,
+                ..selected
+            },
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Unauthenticated)
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            body::ReadRequest {
+                account: other,
+                ..selected
+            },
+            other_device.password(),
+            unused
+        ),
+        Err(body::Error::Missing)
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.blobs SET changed=decode('0000000000000002','hex')",
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Integrity)
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.blobs SET changed=decode('0000000000000001','hex')",
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0",
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Read(ports::Error::Corrupt))
+    );
+    sql(&fixture, "UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('A',65536),'UTF8') WHERE ordinal=0; DELETE FROM td_mta.blob_chunks WHERE ordinal=1");
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Integrity)
+    );
+    check(17 * 65536 + 13);
+    sql(
+        &fixture,
+        "UPDATE td_mta.blob_chunks SET ordinal=100 WHERE ordinal=1",
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Read(ports::Error::Corrupt))
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.blob_chunks SET ordinal=1 WHERE ordinal=100",
+    );
+    let disconnected = ports::Error::Io {
+        kind: std::io::ErrorKind::ConnectionAborted,
+        os_code: None,
+    };
+    let terminate = || {
+        assert_eq!(sql(&fixture, "SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND state='idle in transaction'"), "t");
+        let stop = deadline();
+        while sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'") != "0" {
+            assert!(Instant::now() < stop, "body backend did not terminate");
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let broken = body::with_email(
+        &request,
+        &trust,
+        deadline(),
+        selected,
+        device.password(),
+        |_, reader| {
+            terminate();
+            let mut byte = [0];
+            let failure = reader.read_at(0, &mut byte).unwrap_err();
+            assert_eq!(reader.read_at(0, &mut byte), Err(failure));
+            Ok(())
+        },
+    );
+    assert_eq!(broken, Err(body::Error::Read(disconnected)));
+    check(65537);
+    // Both chunks remain cached after verification: no query can detect loss.
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            |_, reader| {
+                terminate();
+                let mut byte = [0];
+                assert_eq!(reader.read_at(0, &mut byte), Err(disconnected));
+                assert_eq!(reader.read_at(0, &mut byte), Err(disconnected));
+                Ok(())
+            }
+        ),
+        Err(body::Error::Read(disconnected))
+    );
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            |_, _| {
+                terminate();
+                Ok(())
+            }
+        ),
+        Err(body::Error::Read(disconnected))
+    );
+    check(17 * 65536 + 13);
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            |_, reader| {
+                let mut byte = [0];
+                assert_eq!(
+                    reader.read_at(reader.len() + 1, &mut byte),
+                    Err(ports::Error::Invalid)
+                );
+                assert_eq!(reader.read_at(0, &mut byte), Err(ports::Error::Invalid));
+                Ok(())
+            }
+        ),
+        Err(body::Error::Read(ports::Error::Invalid))
+    );
+    let end = Instant::now() + Duration::from_secs(3);
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            end,
+            selected,
+            device.password(),
+            |_, _| {
+                thread::sleep(
+                    end.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+                );
+                Ok(())
+            }
+        ),
+        Err(body::Error::Read(ports::Error::Deadline))
+    );
+    body::with_email(&request, &trust, deadline(), selected, device.password(), |_, reader| {
+        assert_eq!(sql(&fixture, &format!("SELECT pg_try_advisory_lock({}::bigint)", postgres_schema::MIGRATION_KEY)), "f");
+        sql(&fixture, &format!("UPDATE td_mta.devices SET revoked_at=4,revocation_id=decode(repeat('dd',16),'hex'),revocation_digest=decode(repeat('00',32),'hex') WHERE account=decode('{account}','hex'); UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('Z',65536),'UTF8') WHERE ordinal=0"));
+        let mut bytes = [0;100];
+        assert_eq!(reader.read_at(0, &mut bytes)?, 100);
+        assert_eq!(bytes, [b'A';100]);
+        Ok(())
+    }).unwrap();
+    assert_eq!(
+        body::with_email(
+            &request,
+            &trust,
+            deadline(),
+            selected,
+            device.password(),
+            unused
+        ),
+        Err(body::Error::Unauthenticated)
+    );
+}
