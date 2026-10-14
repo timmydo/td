@@ -195,6 +195,8 @@ mod sqlite_body_scenario;
 #[path = "support/sqlite_stack_scenario.rs"]
 mod sqlite_stack_scenario;
 pub use td_mta::smtp_wire;
+#[path = "../src/device_credentials.rs"]
+mod device_credentials;
 #[path = "../src/smtp_session.rs"]
 #[allow(unused)] // Keep the receiving context with the recompiled storage core.
 mod smtp_session;

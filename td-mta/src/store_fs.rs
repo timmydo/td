@@ -9,7 +9,10 @@ use std::{
 
 #[path = "store_fs/devices.rs"]
 mod devices;
-pub use devices::{DeviceError, DevicePassword, DeviceStore, DEVICE_CAPACITY, DEVICE_LABEL_BYTES};
+pub use crate::device_credentials::{
+    DeviceError, DevicePassword, DEVICE_CAPACITY, DEVICE_LABEL_BYTES,
+};
+pub use devices::DeviceStore;
 
 #[path = "store_fs/index.rs"]
 mod index;

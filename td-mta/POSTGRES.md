@@ -822,15 +822,15 @@ to these new entry points.
 
 ## 19. Prepared mail relations
 
-Schema version 3 adds explicit mail relations, with no serving adapter or
-mail write command yet. Existing SQLite tables remain production authority
-until the atomic cutover. Schema initialization, inspection and upgrade now
-and material operations require a UTF8 database (a different encoding
-reports the fixed
-unsupported-version-or-checksum refusal); text columns use the built-in C collation so byte
-ordering does not depend on the installation's locale. Versions 1 and 2's
-SQL and checksums are unchanged. Upgrade from either preserves the epoch
-and existing material rows in the same transaction as version 3's DDL.
+Schema version 3 adds explicit mail relations, with no serving adapter
+or mail write command yet. Existing SQLite tables remain production
+authority until the atomic cutover. Schema initialization, inspection,
+upgrade and material operations now require a UTF8 database (a different
+encoding reports the fixed unsupported-version-or-checksum refusal);
+text columns use the built-in C collation so byte ordering does not
+depend on the installation's locale. Versions 1 and 2's SQL and
+checksums are unchanged. Upgrade from either preserves the epoch and
+existing material rows in the same transaction as version 3's DDL.
 
 The account row holds the committed sequence and retained history floor as
 fixed eight-byte big-endian values, preserving the full unsigned range and
@@ -867,3 +867,23 @@ relations, body bounds, deferred same-account references, empty/maximum
 manifests, unsigned sequence ordering, bytewise text ordering, failed graph
 rollback, chunk cascade and retained blob IDs. They do not claim the future
 publication checks or cloud-provider qualification.
+
+## 20. Shared app-password credentials
+
+The private device_credentials module owns the existing v1 app-password
+format and salted verifier construction for reuse by the PostgreSQL device
+adapter. The current file registry now calls that same implementation;
+there is no second verifier format or new authentication authority.
+DeviceStore's public password/error types and limits remain re-exported
+from store_fs. Registry publication, duplicate-ID refusal, capacity,
+revocation and current-policy locking remain at the storage boundary.
+
+Generation yields an opaque password separately from ID, salt and verifier.
+Parsing yields a private, non-Debug presented credential so a future database
+lookup can select its ID before comparing the account-bound verifier. A
+successful comparison alone grants no authority: callers must still check
+current account/device policy and revocation at the transaction/snapshot
+boundary. Password and decoded-secret owners retain their existing drop-time
+buffer clearing; this is not a whole-process memory-erasure claim. The hash
+domain, lowercase token encoding and account/ID/salt binding are unchanged,
+with a fixed golden vector and malformed-token/entropy-failure tests.

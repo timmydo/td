@@ -11,60 +11,13 @@ use std::{
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider};
 
-pub const DEVICE_CAPACITY: usize = 256;
-pub const DEVICE_LABEL_BYTES: usize = 128;
+use super::{DeviceError, DevicePassword, DEVICE_CAPACITY};
+#[cfg(test)]
+use crate::device_credentials::DEVICE_LABEL_BYTES;
+use crate::device_credentials::{self, valid_label, Presented};
 const FILE_BYTES: usize = 65536;
 const MAGIC: &[u8; 8] = b"TDDEV001";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeviceError {
-    Invalid,
-    Capacity,
-    NotFound,
-    Unavailable,
-}
-impl std::fmt::Display for DeviceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Invalid => "invalid device record",
-            Self::Capacity => "device capacity exhausted",
-            Self::NotFound => "device not found",
-            Self::Unavailable => "device registry unavailable",
-        })
-    }
-}
-impl std::error::Error for DeviceError {}
-impl From<io::Error> for DeviceError {
-    fn from(_: io::Error) -> Self {
-        Self::Unavailable
-    }
-}
-impl From<td_crypto::Error> for DeviceError {
-    fn from(_: td_crypto::Error) -> Self {
-        Self::Unavailable
-    }
-}
-
-/// Deliberately neither Debug nor Clone. Explicit exposure is for the local receipt.
-pub struct DevicePassword([u8; 97]);
-impl DevicePassword {
-    pub fn expose(&self) -> &[u8] {
-        &self.0
-    }
-}
-impl Drop for DevicePassword {
-    fn drop(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
-    }
-}
-struct Secret([u8; 32]);
-impl Drop for Secret {
-    fn drop(&mut self) {
-        self.0.fill(0);
-        std::hint::black_box(&mut self.0);
-    }
-}
 #[derive(Clone)]
 struct Record {
     id: DeviceId,
@@ -212,40 +165,10 @@ impl<'r> DeviceStore<'r> {
         if self.records.len() >= DEVICE_CAPACITY {
             return Err(DeviceError::Capacity);
         }
-        let mut id = [0; 16];
-        let mut salt = [0; 32];
-        let mut secret = Secret([0; 32]);
-        entropy.fill(&mut id)?;
-        entropy.fill(&mut salt)?;
-        entropy.fill(&mut secret.0)?;
-        let id = DeviceId::from_bytes(id);
+        let (credential, password) = device_credentials::generate(self.account, entropy)?;
+        let device_credentials::Credential { id, salt, verifier } = credential;
         if self.records.iter().any(|record| record.id == id) {
             return Err(DeviceError::Unavailable);
-        }
-        let verifier = verify_hash(self.account, id, &salt, &secret.0)?;
-        let mut password = DevicePassword([0; 97]);
-        for (out, byte) in password
-            .0
-            .get_mut(..32)
-            .ok_or(DeviceError::Invalid)?
-            .as_chunks_mut::<2>()
-            .0
-            .iter_mut()
-            .zip(id.as_bytes())
-        {
-            out.copy_from_slice(&hex(*byte));
-        }
-        *password.0.get_mut(32).ok_or(DeviceError::Invalid)? = b'.';
-        for (out, byte) in password
-            .0
-            .get_mut(33..)
-            .ok_or(DeviceError::Invalid)?
-            .as_chunks_mut::<2>()
-            .0
-            .iter_mut()
-            .zip(&secret.0)
-        {
-            out.copy_from_slice(&hex(*byte));
         }
         self.records.push(Record {
             id,
@@ -288,41 +211,14 @@ impl<'r> DeviceStore<'r> {
     /// Authentication is a current observation, never permanent connection authority.
     pub fn authenticate(&self, password: &[u8]) -> Result<Option<DeviceId>, DeviceError> {
         self.available()?;
-        if password.len() != 97 || password.get(32) != Some(&b'.') {
+        let Some(presented) = Presented::parse(password) else {
             return Ok(None);
-        }
-        let id = match password
-            .get(..32)
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .and_then(|text| DeviceId::parse(text).ok())
-        {
-            Some(id) => id,
-            None => return Ok(None),
         };
-        let mut secret = Secret([0; 32]);
-        for (out, pair) in secret.0.iter_mut().zip(
-            password
-                .get(33..)
-                .ok_or(DeviceError::Invalid)?
-                .as_chunks::<2>()
-                .0
-                .iter(),
-        ) {
-            let Some(value) = pair
-                .first()
-                .and_then(|b| unhex(*b))
-                .zip(pair.get(1).and_then(|b| unhex(*b)))
-                .map(|(hi, lo)| hi * 16 + lo)
-            else {
-                return Ok(None);
-            };
-            *out = value;
-        }
+        let id = presented.id();
         let record = self.records.iter().find(|record| record.id == id);
         let salt = record.map(|record| record.salt).unwrap_or([0; 32]);
         let expected = record.map(|record| record.verifier).unwrap_or([0; 32]);
-        let actual = verify_hash(self.account, id, &salt, &secret.0)?;
-        let equal = Provider.equal_digest(&actual, &expected);
+        let equal = presented.matches(self.account, &salt, &expected)?;
         Ok(record
             .filter(|record| record.revoked.is_none() && equal)
             .map(|record| record.id))
@@ -334,47 +230,6 @@ impl<'r> DeviceStore<'r> {
             Err(DeviceError::Unavailable)
         }
     }
-}
-fn hex(byte: u8) -> [u8; 2] {
-    fn digit(n: u8) -> u8 {
-        if n < 10 {
-            b'0' + n
-        } else {
-            b'a' + n - 10
-        }
-    }
-    [digit(byte >> 4), digit(byte & 15)]
-}
-fn unhex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-fn valid_label(label: &str) -> Result<(), DeviceError> {
-    if label.is_empty() || label.len() > DEVICE_LABEL_BYTES || label.chars().any(char::is_control) {
-        return Err(DeviceError::Invalid);
-    }
-    Ok(())
-}
-fn verify_hash(
-    account: AccountId,
-    id: DeviceId,
-    salt: &[u8; 32],
-    secret: &[u8; 32],
-) -> Result<[u8; 32], DeviceError> {
-    let mut digest = Provider.sha256()?;
-    for bytes in [
-        b"td-mta device verifier v1\0".as_slice(),
-        account.as_bytes(),
-        id.as_bytes(),
-        salt,
-        secret,
-    ] {
-        digest.update(bytes)?;
-    }
-    Ok(digest.finish()?)
 }
 fn checksum(bytes: &[u8]) -> Result<[u8; 32], DeviceError> {
     let mut digest = Provider.sha256()?;
