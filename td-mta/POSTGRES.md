@@ -1382,3 +1382,26 @@ SCRAM qualification and the original ten-second maximum deadline are unchanged.
 The finite larger frame count covers the two result sets and protocol overhead.
 Production JMAP dispatch, mailbox moves and serving retention remain cutover
 work; this API is not a public authentication endpoint.
+
+## 34. Shared logical quota policy
+
+Every profile in a complete PostgreSQL configuration candidate must agree on
+five logical account limits: `disk.body_bytes`, `disk.blob_count`,
+`limits.upload_disk_bytes`, `limits.queue_disk_bytes` and
+`limits.queue_submissions`. Defaults participate in the comparison. A mismatch
+refuses the whole candidate, including when reading a retained version or
+preparing a selected runtime profile. These remain existing profile fields;
+operators changing a shared limit update all profiles in the same version.
+Other process-local resource settings may differ between profiles.
+
+The candidate and selected-profile binding expose the validated common limits
+as passive values. Canonical source bytes already bind every explicit setting,
+so neither the version encoding nor the schema changes. A historical selection
+receipt remains historical success; it does not bypass revalidation for new
+runtime preparation. Lowering limits is configuration policy, not deletion or
+capacity reclamation. Runtime admission must compare durable usage and pending
+reservations against the selected limits before accepting more work.
+
+This closes conflicting instance policy before shared accounting is activated.
+It does not yet implement database quota counters, reservations, publication,
+reclamation or serving. Those remain prerequisites for the atomic cutover.

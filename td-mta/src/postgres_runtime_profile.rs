@@ -35,6 +35,7 @@ pub struct Binding {
     account: AccountId,
     profile: String,
     roles: Roles,
+    quotas: configuration::SharedQuotas,
 }
 impl Binding {
     pub fn epoch(&self) -> StoreEpoch {
@@ -48,6 +49,9 @@ impl Binding {
     }
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+    pub fn quotas(&self) -> configuration::SharedQuotas {
+        self.quotas
     }
     pub fn roles(&self) -> Roles {
         self.roles
@@ -140,6 +144,7 @@ pub fn load(
     postgres_accounts::inspect(request, trust, deadline, epoch, account)
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
+    let quotas = candidate.quotas();
     drop(candidate);
     if selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
         != Some(selected)
@@ -156,6 +161,7 @@ pub fn load(
             account,
             profile: name,
             roles,
+            quotas,
         },
         configuration,
         policies,

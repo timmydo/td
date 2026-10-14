@@ -19,6 +19,7 @@ pub enum Error {
     Capacity,
     Name,
     DuplicateProfile,
+    SharedQuotas,
     Composition(composition::Error),
     Profile,
     Text,
@@ -36,6 +37,28 @@ pub struct Profile<'a> {
     pub source: &'a [u8],
 }
 
+/// Account-wide limits derived from every validated profile. These values are
+/// policy observations, not reservations or permission to publish a mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedQuotas {
+    pub body_bytes: u64,
+    pub blob_count: u64,
+    pub upload_bytes: u64,
+    pub queue_bytes: u64,
+    pub queue_submissions: u64,
+}
+impl SharedQuotas {
+    fn from_plan(plan: &crate::admission::Plan) -> Self {
+        Self {
+            body_bytes: plan.disk().body_bytes,
+            blob_count: plan.disk().blob_count,
+            upload_bytes: plan.upload_bytes(),
+            queue_bytes: plan.queue_bytes(),
+            queue_submissions: plan.queue_submissions(),
+        }
+    }
+}
+
 struct OwnedProfile {
     name: String,
     roles: Roles,
@@ -47,9 +70,9 @@ struct OwnedProfile {
 /// preparation time only; startup must revalidate before service admission.
 /// This cannot be forged from raw source bytes:
 /// ```compile_fail,E0451
-/// use td_mta::{ids::StoreEpoch, postgres_configuration::Candidate};
-/// fn forge(epoch: StoreEpoch) -> Candidate {
-///     Candidate { epoch, shared: Vec::new(), profiles: Vec::new(), digest: [0; 32] }
+/// use td_mta::{ids::StoreEpoch, postgres_configuration::{Candidate, SharedQuotas}};
+/// fn forge(epoch: StoreEpoch, quotas: SharedQuotas) -> Candidate {
+///     Candidate { epoch, shared: Vec::new(), profiles: Vec::new(), digest: [0; 32], quotas }
 /// }
 /// ```
 pub struct Candidate {
@@ -57,6 +80,7 @@ pub struct Candidate {
     shared: Vec<u8>,
     profiles: Vec<OwnedProfile>,
     digest: [u8; 32],
+    quotas: SharedQuotas,
 }
 impl Candidate {
     pub fn epoch(&self) -> StoreEpoch {
@@ -64,6 +88,9 @@ impl Candidate {
     }
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+    pub fn quotas(&self) -> SharedQuotas {
+        self.quotas
     }
     pub fn shared(&self) -> &[u8] {
         &self.shared
@@ -137,16 +164,11 @@ pub fn prepare(
             }
         }
     }
-    let mut candidate = Candidate {
-        epoch,
-        shared: copy(shared)?,
-        profiles: Vec::new(),
-        digest: [0; 32],
-    };
-    candidate
-        .profiles
+    let mut profiles = Vec::new();
+    profiles
         .try_reserve_exact(ordered.len())
         .map_err(|_| Error::Capacity)?;
+    let mut quotas = None;
     let mut scratch = Vec::new();
     scratch
         .try_reserve_exact(stream::SCRATCH_BYTES)
@@ -178,15 +200,27 @@ pub fn prepare(
             set.reserve().map_err(|_| Error::Provider)?,
         )?;
         drop(policies);
+        let current = SharedQuotas::from_plan(resolved.candidate().resources().admission());
+        if quotas.is_some_and(|expected| expected != current) {
+            return Err(Error::SharedQuotas);
+        }
+        quotas = Some(current);
         storage = resolved.into_storage();
         let name = String::from_utf8(copy(profile.name.as_bytes())?).map_err(|_| Error::Name)?;
-        candidate.profiles.push(OwnedProfile {
+        profiles.push(OwnedProfile {
             name,
             roles: profile.roles,
             source: copy(profile.source)?,
         });
     }
     drop(storage);
+    let mut candidate = Candidate {
+        epoch,
+        shared: copy(shared)?,
+        profiles,
+        digest: [0; 32],
+        quotas: quotas.ok_or(Error::Profile)?,
+    };
     candidate.digest = digest(&candidate)?;
     if Instant::now() >= deadline {
         return Err(Error::Deadline);

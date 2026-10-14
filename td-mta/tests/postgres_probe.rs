@@ -1963,6 +1963,51 @@ per_peer_limit = 1
     assert_eq!(candidate.profile(0).unwrap().roles.bits(), 3);
     assert!(candidate.profile(2).is_none());
     assert_eq!(candidate.digest(), prepare(&[one, two]).unwrap().digest());
+    assert_eq!(
+        candidate.quotas(),
+        configuration::SharedQuotas {
+            body_bytes: 4 * 1024 * 1024 * 1024,
+            blob_count: 250000,
+            upload_bytes: 128 * 1024 * 1024,
+            queue_bytes: 256 * 1024 * 1024,
+            queue_submissions: 1000,
+        }
+    );
+    for override_source in [
+        "[disk]\nbody_bytes=2147483648\n",
+        "[disk]\nblob_count=200000\n",
+        "[limits]\nupload_disk_bytes=268435456\n",
+        "[limits]\nqueue_disk_bytes=536870912\n",
+        "[limits]\nqueue_submissions=2000\n",
+    ] {
+        let altered = format!("{desktop}{override_source}");
+        let changed_profile = Profile {
+            source: altered.as_bytes(),
+            ..two
+        };
+        assert_eq!(
+            prepare(&[one, changed_profile]).err(),
+            Some(configuration::Error::SharedQuotas)
+        );
+        assert_ne!(
+            prepare(&[changed_profile]).unwrap().quotas(),
+            candidate.quotas()
+        );
+    }
+    let local = format!("{desktop}[disk]\ncache_bytes=67108864\n[work]\nrequest_seconds=600\n");
+    assert_eq!(
+        prepare(&[
+            one,
+            Profile {
+                source: local.as_bytes(),
+                ..two
+            }
+        ])
+        .unwrap()
+        .quotas(),
+        candidate.quotas()
+    );
+
     let changed = format!("# candidate revision\n{desktop}");
     let changed = prepare(&[
         one,
@@ -2025,6 +2070,7 @@ per_peer_limit = 1
     let loaded = versions::read(&request, &trust, deadline(), epoch, version).unwrap();
     assert_eq!(loaded.digest(), candidate.digest());
     assert_eq!(loaded.shared(), candidate.shared());
+    assert_eq!(loaded.quotas(), candidate.quotas());
     assert_eq!(
         loaded.profile(1).unwrap().source,
         candidate.profile(1).unwrap().source
@@ -2329,6 +2375,7 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().account(), account);
         assert_eq!(prepared.binding().profile(), name);
         assert_eq!(prepared.binding().roles().bits(), roles);
+        assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
         if name == "desktop" {
             exercise_flags(&fixture, &request, &trust, prepared.binding());
