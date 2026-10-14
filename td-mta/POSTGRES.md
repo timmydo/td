@@ -534,8 +534,8 @@ restart/reconnect and connection-file mode refusal.
 section 14's preparation command; no serving path calls it. Its current
 server contract is PostgreSQL major 17, qualified locally on 17.10. Other
 majors refuse until separately qualified. It creates the preparation ledger
-and sections 16, 19, 21, 25, 27 and 30's material/mail/device/configuration,
-account-bootstrap and passive selection tables,
+and sections 16, 19, 21, 25, 27, 30 and 32's material/mail/device/configuration,
+account-bootstrap, passive selection and flag receipt tables,
 not a complete
 serving schema or runtime role. Serving still cannot select
 PostgreSQL. The owner credential is separate from the future runtime
@@ -552,8 +552,9 @@ store epoch in a ledger row. Version 1's committed SQL and checksum remain
 fixed; version 2 adds src/postgres_materials.sql and version 3 adds
 src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
 adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
-and version 7 adds src/postgres_selection.sql.
-New initialization applies all seven in
+version 7 adds src/postgres_selection.sql, and version 8 adds
+src/postgres_flags.sql.
+New initialization applies all eight in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -571,7 +572,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the seven migrations and their ledger writes;
+permits 512 input frames for the eight migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -586,8 +587,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently eight rows); it requires
-exactly the seven ordered migration versions, their compiled DDL checksums and
+count plus one (currently nine rows); it requires
+exactly the eight ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -614,11 +615,11 @@ functions](https://www.postgresql.org/docs/17/functions-admin.html#FUNCTIONS-ADV
 section 13's preparation ledger using a separately provisioned schema-owner
 login. It refuses every existing td_mta namespace. It creates the prepared
 material, mail, device, immutable configuration, account-bootstrap and
-selection receipt relations with an initially empty passive configuration
+selection and flag receipt relations with an initially empty passive configuration
 pointer, but no runtime role or listener. The matching `td-mta
 postgres schema-inspect --connection-file PATH` checks the ledger under its
 shared migration lock. `td-mta postgres schema-upgrade --connection-file
-PATH` applies every missing migration through version 7, or reports an
+PATH` applies every missing migration through version 8, or reports an
 already current ledger. None of these commands takes a profile: the
 namespace and epoch are deployment-wide.
 
@@ -1312,3 +1313,36 @@ The source candidate is discarded before the final check; retained text and
 TLS objects belong to the caller's cold control worker. Reusable connection
 pools, publication, live refresh and full resource qualification remain
 cutover work.
+
+
+## 32. Retained single-Email flag writes
+
+Schema version 8 adds owner-private flag_receipts. The cold postgres_flags
+boundary assigns optional seen/starred values to one existing Email. It is
+not wired to production JMAP, and does not implement batching or mailbox moves.
+Preparation binds an unpredictable operation ID and canonical digest to the
+profile binding, account, device, Email, optional expected sequence and flag
+assignments. The retained object contains no app password.
+
+Fresh writes take the shared migration lock, then a shared configuration
+selection row lock, then the account write lock, and authenticate the device
+inside that read-committed transaction. Selection generation/version and JMAP
+role must still match the prepared profile. Account locking also serializes
+revocation. The expected state is compared under the same lock. Changed flags,
+Email history, Mailbox history for seen changes (including drafts), account
+sequence and receipt commit atomically with synchronous_commit=on. Star-only
+changes do not change Mailbox or Thread history. No-ops retain a receipt without
+advancing sequence. Full unsigned 64-bit state is preserved; overflow refuses.
+At most 256 memberships are admitted for a seen change.
+
+Owner-side receipt inspection takes an account shared lock before looking for
+the result, excluding an earlier writer's still-pending COMMIT. Historical
+receipts resolve even after policy changes or revocation; this does not
+authorize another mutation. The API is not a client authentication endpoint.
+A missing receipt never authorizes a new operation identity after uncertainty.
+COMMIT loss returns Indeterminate and requires retaining the original Change.
+At 1024 receipts per account fresh operations refuse; there is no pruning or
+unbounded recovery promise. Runtime retention/retry policy and bulk JMAP
+mapping remain cutover work. All calls retain finite worker/deadline limits.
+An inspection that crosses its deadline refuses absence/errors, but preserves
+a confirmed historical receipt as known success.

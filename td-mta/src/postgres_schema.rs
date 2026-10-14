@@ -21,8 +21,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_configuration.sql"),
     include_str!("postgres_accounts.sql"),
     include_str!("postgres_selection.sql"),
+    include_str!("postgres_flags.sql"),
 ];
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,

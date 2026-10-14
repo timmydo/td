@@ -334,7 +334,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 7);
+    assert_eq!(receipt.version, 8);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -411,7 +411,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        7
+        8
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -536,7 +536,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":7"));
+    assert!(initialized.contains("\"schema_version\":8"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -707,7 +707,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 7);
+    assert_eq!(receipt.version, 8);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1209,7 +1209,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "25");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "26");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1303,7 +1303,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6] {
+    for previous_version in [2, 3, 4, 5, 6, 7] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1313,6 +1313,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_devices.sql"),
             include_str!("../src/postgres_configuration.sql"),
             include_str!("../src/postgres_accounts.sql"),
+            include_str!("../src/postgres_selection.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1339,7 +1340,8 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             3 => "devices",
             4 => "config_versions",
             5 => "account_bootstraps",
-            _ => "config_selection",
+            6 => "config_selection",
+            _ => "flag_receipts",
         };
         sql(
             &fixture,
@@ -1355,7 +1357,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
         );
         sql(&fixture, &format!("DROP TABLE td_mta.{obstruction}"));
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 7);
+        assert_eq!(receipt.version, 8);
         assert_eq!(receipt.store_epoch.as_bytes(), &[0x42; 16]);
         assert_eq!(
         sql(
@@ -2313,6 +2315,9 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().profile(), name);
         assert_eq!(prepared.binding().roles().bits(), roles);
         assert_eq!(prepared.configuration().roles().bits(), roles);
+        if name == "desktop" {
+            exercise_flags(&fixture, &request, &trust, prepared.binding());
+        }
         let (_, configuration, policies) = prepared.into_parts();
         assert_eq!(
             configuration
@@ -3280,4 +3285,204 @@ fn real_postgres_email_bodies_are_verified_bounded_and_snapshot_pinned() {
         ),
         Err(body::Error::Unauthenticated)
     );
+}
+
+fn exercise_flags(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{ids::EmailId, postgres_devices as devices, postgres_flags as flags};
+    let account = binding.account();
+    let email = EmailId::from_bytes([0xe1; 16]);
+    let creation = devices::prepare_creation(binding.epoch(), account, "flag fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let device = creation.device_id();
+    let password = creation.password();
+    sql(fixture, &format!("BEGIN; INSERT INTO td_mta.blob_ids VALUES(decode('{account}','hex'),decode('{email}','hex')); INSERT INTO td_mta.blobs VALUES(decode('{account}','hex'),decode('{email}','hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,decode('0000000000000001','hex'),0); INSERT INTO td_mta.threads VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('0000000000000001','hex')); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE account=decode('{account}','hex'); COMMIT"));
+    let prepare = |expected, seen, starred| {
+        flags::prepare(binding, device, email, expected, seen, starred).unwrap()
+    };
+    let publish =
+        |change: &flags::Change| flags::publish(request, trust, deadline(), change, password);
+    let first = prepare(Some(1), Some(true), Some(true));
+    assert_eq!(
+        flags::inspect(request, trust, deadline(), &first).unwrap(),
+        None
+    );
+    let first_result = publish(&first).unwrap();
+    assert_eq!(
+        first_result,
+        flags::Outcome {
+            old_sequence: 1,
+            new_sequence: 2
+        }
+    );
+    assert_eq!(publish(&first).unwrap(), first_result);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "2");
+    assert_eq!(sql(fixture, "SELECT kind FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex') ORDER BY operation"), "3\n1");
+    let listing = td_mta::postgres_mailboxes::list(
+        request,
+        trust,
+        deadline(),
+        binding.epoch(),
+        account,
+        password,
+    )
+    .unwrap();
+    assert_eq!(listing.mailboxes[0].counts.unread_emails, 0);
+    let noop = prepare(Some(2), Some(true), Some(true));
+    assert_eq!(
+        publish(&noop).unwrap(),
+        flags::Outcome {
+            old_sequence: 2,
+            new_sequence: 2
+        }
+    );
+    let stale = prepare(Some(1), Some(false), None);
+    assert_eq!(publish(&stale), Err(flags::Error::State));
+    let star = prepare(Some(2), None, Some(false));
+    assert_eq!(publish(&star).unwrap().new_sequence, 3);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT kind FROM td_mta.changes WHERE sequence=decode('0000000000000003','hex')"
+        ),
+        "3"
+    );
+    let unread = prepare(Some(3), Some(false), None);
+    assert_eq!(publish(&unread).unwrap().new_sequence, 4);
+    let listing = td_mta::postgres_mailboxes::list(
+        request,
+        trust,
+        deadline(),
+        binding.epoch(),
+        account,
+        password,
+    )
+    .unwrap();
+    assert_eq!(listing.mailboxes[0].counts.unread_emails, 1);
+    let missing = flags::prepare(
+        binding,
+        device,
+        EmailId::from_bytes([0xee; 16]),
+        None,
+        Some(true),
+        None,
+    )
+    .unwrap();
+    assert_eq!(publish(&missing), Err(flags::Error::Missing));
+    let fresh = prepare(None, Some(true), None);
+    assert_eq!(
+        flags::publish(request, trust, deadline(), &fresh, b"invalid"),
+        Err(flags::Error::Unauthenticated)
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
+    assert_eq!(publish(&fresh), Err(flags::Error::Policy));
+    assert_eq!(publish(&first).unwrap(), first_result);
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    sql(fixture, "CREATE FUNCTION public.reject_flags() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_flags BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_flags()");
+    assert_eq!(publish(&fresh), Err(flags::Error::Database));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        "0000000000000004"
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "0");
+    sql(fixture, "DROP TRIGGER reject_flags ON td_mta.flag_receipts");
+    sql(fixture, "CREATE FUNCTION public.delay_flags() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_flags AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_flags()");
+    assert_eq!(
+        flags::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_secs(2),
+            &fresh,
+            password
+        ),
+        Err(flags::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(fixture, "DROP TRIGGER delay_flags ON td_mta.flag_receipts");
+    assert_eq!(
+        flags::inspect(request, trust, deadline(), &fresh)
+            .unwrap()
+            .unwrap()
+            .new_sequence,
+        5
+    );
+    assert_eq!(publish(&fresh).unwrap().new_sequence, 5);
+    let left = prepare(Some(5), None, Some(true));
+    let right = prepare(Some(5), Some(false), None);
+    let (left_result, right_result) = thread::scope(|scope| {
+        let left = scope.spawn(|| publish(&left));
+        let right = scope.spawn(|| publish(&right));
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(left_result.is_ok()) + usize::from(right_result.is_ok()),
+        1
+    );
+    let loser = if left_result.is_err() {
+        left_result
+    } else {
+        right_result
+    };
+    assert!(matches!(
+        loser,
+        Err(flags::Error::State | flags::Error::Database)
+    ));
+    sql(fixture, &format!("INSERT INTO td_mta.flag_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode('0000000000000001','hex'),decode('0000000000000001','hex') FROM generate_series(1,1024) n"));
+    assert_eq!(
+        publish(&prepare(None, Some(true), None)),
+        Err(flags::Error::Capacity)
+    );
+    assert_eq!(publish(&first).unwrap(), first_result);
+    sql(
+        fixture,
+        "DELETE FROM td_mta.flag_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+    );
+    sql(fixture, &format!("INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),'extra',NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,256) n; INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE name='extra'"));
+    let seen = sql(
+        fixture,
+        "SELECT count(*) FROM td_mta.keywords WHERE keyword='$seen'",
+    ) == "1";
+    assert_eq!(
+        publish(&prepare(None, Some(!seen), None)),
+        Err(flags::Error::Capacity)
+    );
+    sql(fixture, "DELETE FROM td_mta.memberships WHERE mailbox_id IN (SELECT id FROM td_mta.mailboxes WHERE name='extra'); DELETE FROM td_mta.mailboxes WHERE name='extra'");
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET sequence=decode('fffffffffffffffe','hex')",
+    );
+    let high = prepare(Some(u64::MAX - 1), Some(true), Some(false));
+    // Ensure the high-sequence assignment changes a keyword whichever race won.
+    sql(fixture, &format!("DELETE FROM td_mta.keywords WHERE account=decode('{account}','hex') AND keyword='$seen'"));
+    assert_eq!(publish(&high).unwrap().new_sequence, u64::MAX);
+    assert_eq!(
+        publish(&prepare(None, Some(false), None)),
+        Err(flags::Error::Capacity)
+    );
+    assert_eq!(
+        publish(&prepare(None, Some(true), None))
+            .unwrap()
+            .new_sequence,
+        u64::MAX
+    );
+    let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(
+        publish(&prepare(None, Some(false), None)),
+        Err(flags::Error::Unauthenticated)
+    );
+    assert_eq!(publish(&first).unwrap(), first_result);
 }
