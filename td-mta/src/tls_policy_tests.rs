@@ -214,6 +214,110 @@ fn buffers() -> (Box<[u8; TLS_WIRE_BYTES]>, Box<[u8; TLS_WIRE_BYTES]>) {
     )
 }
 
+fn resolved_profile(bits: u8) -> materialize::ResolvedProfile {
+    let _lock = text::TEST_CONSTRUCTION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let roles = crate::config::profile::Roles::from_bits(bits).unwrap();
+    let mut source = if bits & 3 == 0 {
+        PREFIX.split_once("[certificate ").unwrap().0.to_owned()
+    } else {
+        PREFIX.to_owned()
+    };
+    source = source.replace(
+        "[domain \"example.test\"]",
+        "[domain \"example.test\"]\nmx_host = \"localhost\"",
+    );
+    if roles.receive() {
+        source.push_str(SMTP);
+    }
+    if roles.jmap() {
+        source.push_str(HTTPS);
+    }
+    let mut scratch = vec![0; stream::SCRATCH_BYTES];
+    let loaded = load::read_profile(
+        storage::Storage::try_new().unwrap(),
+        &mut stanza::Pending::new(),
+        &mut scratch,
+        &mut Cursor::new(source),
+        roles,
+    )
+    .unwrap();
+    materialize::read_profile_text(loaded, &mut scratch, |_| {
+        Ok::<_, Error>(Cursor::new(b"password\n"))
+    })
+    .unwrap()
+}
+
+#[test]
+fn selected_profiles_compile_only_selected_inbound_tls_roles() {
+    let _serial = serial();
+    let material = Material::new();
+    for bits in 1..=7 {
+        let profile = resolved_profile(bits);
+        assert_eq!(profile.roles().bits(), bits);
+        let mut set = GenerationSet::at_startup();
+        let prepared = TlsPolicies::prepare_profile(
+            set.reserve().unwrap(),
+            &profile,
+            material.clock.clone(),
+            |request| material.open(request),
+        )
+        .unwrap();
+        drop(set.publish(prepared).unwrap());
+        let lease = set.current().unwrap();
+        assert_eq!(lease.value().coverage(), PolicyCoverage::Complete);
+        assert_eq!(
+            lease.value().len(),
+            1 + usize::from(bits & 1 != 0) + usize::from(bits & 2 != 0)
+        );
+        assert_eq!(
+            TlsPolicies::listener(&lease, "smtp").is_ok(),
+            profile.roles().receive()
+        );
+        assert_eq!(
+            TlsPolicies::listener(&lease, "https").is_ok(),
+            profile.roles().jmap()
+        );
+        assert!(TlsPolicies::relay(&lease).is_ok());
+        assert_eq!(profile.relay_password().unwrap(), "password");
+    }
+}
+
+#[test]
+fn selected_profile_provider_failure_does_not_publish_or_consume_a_generation_slot() {
+    let _serial = serial();
+    let material = Material::new();
+    let wrong_name = Material::with_names(&["wrong.example.test"]);
+    let profile = resolved_profile(2);
+    let mut set = GenerationSet::at_startup();
+    assert!(TlsPolicies::prepare_profile(
+        set.reserve().unwrap(),
+        &profile,
+        wrong_name.clock.clone(),
+        |request| wrong_name.open(request),
+    )
+    .is_err());
+    assert!(set.current().is_none());
+    assert!(TlsPolicies::prepare_profile(
+        set.reserve().unwrap(),
+        &profile,
+        material.clock.clone(),
+        |_request| Ok(Cursor::new(b"invalid PEM".as_slice())),
+    )
+    .is_err());
+    assert!(set.current().is_none());
+    let prepared = TlsPolicies::prepare_profile(
+        set.reserve().unwrap(),
+        &profile,
+        material.clock.clone(),
+        |request| material.open(request),
+    )
+    .unwrap();
+    drop(set.publish(prepared).unwrap());
+    assert_eq!(set.current().unwrap().value().len(), 2);
+}
+
 #[test]
 fn compiled_policy_roles_bind_names_trust_and_generation_ids() {
     compiled_policy_roles_with(|pending| {

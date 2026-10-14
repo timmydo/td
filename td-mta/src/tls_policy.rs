@@ -186,6 +186,24 @@ impl TlsPolicies {
         )
     }
 
+    /// Compile TLS material for a structurally closed selected profile.
+    /// The profile wrapper retains roles; compiling client policy does not
+    /// enable a relay worker or admit a database configuration generation.
+    pub fn prepare_profile<R: Read>(
+        reserved: GenerationConstruction<Self>,
+        configuration: &crate::config::materialize::ResolvedProfile,
+        clock: Arc<ClockHandle>,
+        open: impl FnMut(MaterialRequest<'_>) -> Result<R, Error>,
+    ) -> Result<PreparedGeneration<Self>, Error> {
+        Self::prepare_coverage(
+            reserved,
+            configuration.resolved_text(),
+            clock,
+            open,
+            PolicyCoverage::Complete,
+        )
+    }
+
     /// Explicit startup/recovery stage: compile relay and optional ACME trust
     /// without opening any server identity or gateway material. No server role
     /// is admitted. Use the same generation domain as subsequent complete tables.

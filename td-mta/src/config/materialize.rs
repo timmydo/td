@@ -97,6 +97,52 @@ impl ResolvedText {
         self.candidate.into_storage()
     }
 }
+/// Selected-profile text with the same bounded decoding as legacy inputs.
+/// No conversion to the legacy owned ResolvedText admission input is exposed.
+/// ```compile_fail,E0308
+/// use td_mta::config::materialize::{ResolvedProfile, ResolvedText};
+/// fn legacy_input(profile: ResolvedProfile) -> ResolvedText { profile }
+/// ```
+pub struct ResolvedProfile {
+    text: ResolvedText,
+    roles: super::profile::Roles,
+}
+impl ResolvedProfile {
+    pub fn candidate(&self) -> &storage::Candidate {
+        self.text.candidate()
+    }
+    pub fn roles(&self) -> super::profile::Roles {
+        self.roles
+    }
+    pub fn relay_password(&self) -> Result<&str, text::Code> {
+        self.text.relay_password()
+    }
+    pub fn signatures(&self, index: usize) -> Result<Option<Signatures<'_>>, text::Code> {
+        self.text.signatures(index)
+    }
+    pub fn allocated_bytes(&self) -> Result<usize, storage::Error> {
+        self.text
+            .allocated_bytes()?
+            .checked_sub(std::mem::size_of::<ResolvedText>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(storage::Error {
+                code: storage::Code::Layout,
+                region: storage::Region::Global,
+            })
+    }
+    pub fn into_storage(self) -> storage::Storage {
+        self.text.into_storage()
+    }
+    pub(crate) fn resolved_text(&self) -> &ResolvedText {
+        &self.text
+    }
+}
+impl fmt::Debug for ResolvedProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ResolvedProfile(<redacted>)")
+    }
+}
+
 pub struct Signatures<'a> {
     pub text: &'a str,
     pub html: &'a str,
@@ -127,9 +173,30 @@ impl Drop for ClearScratch<'_> {
 pub fn read_text<R: io::Read, E>(
     loaded: load::Loaded,
     scratch: &mut [u8],
+    open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
+) -> Result<ResolvedText, Failure<E>> {
+    read_candidate(loaded.into_candidate(), scratch, open)
+}
+
+/// Decode selected-profile signatures/password without losing its role set.
+/// The opener owns trusted, bounded input access; this is not database
+/// provenance, complete generation validation or service admission.
+#[allow(clippy::result_large_err)]
+pub fn read_profile_text<R: io::Read, E>(
+    loaded: load::PreparedProfile,
+    scratch: &mut [u8],
+    open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
+) -> Result<ResolvedProfile, Failure<E>> {
+    let (candidate, roles) = loaded.into_parts();
+    read_candidate(candidate, scratch, open).map(|text| ResolvedProfile { text, roles })
+}
+
+#[allow(clippy::result_large_err)]
+fn read_candidate<R: io::Read, E>(
+    mut candidate: storage::Candidate,
+    scratch: &mut [u8],
     mut open: impl FnMut(inputs::Reference<'_>) -> Result<R, E>,
 ) -> Result<ResolvedText, Failure<E>> {
-    let mut candidate = loaded.into_candidate();
     let mut active_target = None;
     let result = (|| {
         let scratch = ClearScratch(
@@ -258,6 +325,67 @@ certificate = "public"
     fn with_signatures() -> String {
         BASE.replace("[resolver \"primary\"]", "text_signature_file = \"/text\"\nhtml_signature_file = \"/html\"\n[resolver \"primary\"]")
     }
+    #[test]
+    fn selected_profile_text_preserves_roles_and_rejects_invalid_or_failed_inputs() {
+        let _lock = lock();
+        let mut scratch = vec![0; stream::SCRATCH_BYTES];
+        let mut storage = storage::Storage::try_new().unwrap();
+        let source = with_signatures().replace(
+            "[domain \"example.test\"]",
+            "[domain \"example.test\"]\nmx_host = \"mail.example.test\"",
+        );
+        let source = source.split_once("[certificate ").unwrap().0;
+        let roles = super::super::profile::Roles::from_bits(4).unwrap();
+        for mode in 0..3 {
+            let loaded = load::read_profile(
+                storage,
+                &mut Pending::new(),
+                &mut scratch,
+                &mut source.as_bytes(),
+                roles,
+            )
+            .unwrap();
+            let resolved = read_profile_text(loaded, &mut scratch, |reference| {
+                let bytes: &[u8] = match reference.target() {
+                    inputs::Target::RelayPassword if mode == 1 => b"bad\npassword",
+                    inputs::Target::RelayPassword if mode == 2 => return Err(()),
+                    inputs::Target::RelayPassword => b"password\r\n",
+                    inputs::Target::TextSignature(_) => b"text\n",
+                    inputs::Target::HtmlSignature(_) => b"<p>html</p>",
+                    _ => panic!("opened provider material during text decoding"),
+                };
+                Ok(bytes)
+            });
+            if mode == 0 {
+                let value = resolved.unwrap();
+                assert_eq!(value.roles(), roles);
+                assert_eq!(value.relay_password().unwrap(), "password");
+                let signatures = value.signatures(0).unwrap().unwrap();
+                assert_eq!(signatures.text, "text\n");
+                assert_eq!(signatures.html, "<p>html</p>");
+                assert_eq!(format!("{value:?}"), "ResolvedProfile(<redacted>)");
+                assert_eq!(value.candidate().identities().unwrap().len(), 1);
+                assert!(value.allocated_bytes().unwrap() <= 1024 * 1024);
+                storage = value.into_storage();
+            } else {
+                let failed = resolved.unwrap_err();
+                assert_eq!(failed.target(), Some(inputs::Target::RelayPassword));
+                if mode == 1 {
+                    assert!(matches!(
+                        failed.error(),
+                        Error::Content(material::Error::Password)
+                    ));
+                } else {
+                    assert!(matches!(failed.error(), Error::Input(())));
+                }
+                storage = failed.into_parts().0;
+            }
+            assert!(scratch[..material::SIGNATURE_SCRATCH_BYTES]
+                .iter()
+                .all(|&byte| byte == 0));
+        }
+    }
+
     #[test]
     fn exact_bytes_defaults_and_provider_inputs_stay_separate() {
         let _lock = lock();

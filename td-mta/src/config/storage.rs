@@ -435,6 +435,8 @@ const _: [(); 1] = [(); (size_of::<graph::Header>() <= 1024) as usize];
 const _: [(); 1] = [(); (size_of::<identities::Header>() <= 128) as usize];
 const _: [(); 1] =
     [(); (size_of::<super::materialize::ResolvedText>() <= GLOBAL_BYTES + PLANS_BYTES) as usize];
+const _: [(); 1] =
+    [(); (size_of::<super::materialize::ResolvedProfile>() <= GLOBAL_BYTES + PLANS_BYTES) as usize];
 impl Candidate {
     pub(super) fn signatures_complete(&self) -> Result<(), text::Code> {
         self.header

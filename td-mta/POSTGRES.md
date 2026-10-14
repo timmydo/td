@@ -652,6 +652,7 @@ EOF, stanza finalization, listener validation and graph closure. Its
 PreparedProfile retains the selected roles and provides read-only candidate
 inspection or storage reclamation. It cannot be passed as the legacy Loaded
 input to text/provider materialization or serving. No command selects it.
+The separate selected-profile content path is specified in section 18.
 Its owner is included in the compile-time workspace-state bound; the existing
 portable stack fixture qualifies the legacy loader, not this new entry point.
 
@@ -780,3 +781,34 @@ zero for success, one for refusal/failure and two for invalid arguments.
 The local PostgreSQL fixture covers the actual CLI, maximum and empty inputs,
 protected modes and aliases, kind/epoch/mismatch refusal, duplicate
 immutability and delayed-COMMIT resolution by the retained version.
+
+## 18. Prepared profile content validation
+
+`config::materialize::read_profile_text` consumes PreparedProfile and decodes
+its relay password and signatures through the same bounded decoder as the
+legacy loader. It preserves the explicit role set in ResolvedProfile.
+Failures return reusable storage without validated headers; decoder scratch
+is cleared under the existing hygiene contract. The wrapper has redacted
+Debug output and no conversion into the legacy owned ResolvedText admission
+input. Its owner size remains inside the existing configuration-state bound;
+allocated_bytes accounts for that owner plus the existing backing regions,
+not provider memory or total process RSS.
+
+`TlsPolicies::prepare_profile` compiles the profile's TLS material through
+the existing provider validator: selected inbound identities, required
+certificate names, relay trust and optional ACME/gateway material. A
+relay-only profile compiles no inbound identity. Client policy preparation
+does not enable relay delivery on a profile whose relay role is disabled.
+Provider failure drops the uncommitted construction reservation and cannot
+publish a new generation. Existing callers and legacy preparation retain
+their own input types and behavior.
+
+These APIs accept trusted reader callbacks, not database references or
+filesystem trust proofs. The future database generation loader must resolve
+exact immutable material versions, bound aggregate work, validate the whole
+shared/profile generation and admit implemented runtime capabilities before
+publication. No serving path or operator command selects these APIs here.
+Host tests cover every role combination, malformed text, failed readers,
+wrong certificate names, invalid PEM and reservation recovery. They do not
+extend the existing portable-stack or aggregate native-memory qualification
+to these new entry points.
