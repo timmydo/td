@@ -2,21 +2,21 @@
 use crate::{
     admission::work::{Charge, Meter, Stop},
     mime_headers::{Scanner, Status},
-    ports::{Clock, Deadline, Error, Tick},
+    ports::{Clock, Deadline, Error, Tick, Time},
 };
 
-struct Output<'a, F> {
+struct Output<'a, F, C> {
     bytes: &'a [u8],
-    clock: &'a dyn Clock,
+    sample: C,
     deadline: Deadline,
     last: Tick,
     meter: &'a mut Meter,
     sink: F,
     written: u64,
 }
-impl<F: FnMut(&[u8]) -> Result<(), Error>> Output<'_, F> {
+impl<F: FnMut(&[u8]) -> Result<(), Error>, C: FnMut() -> Result<Time, Error>> Output<'_, F, C> {
     fn check(&mut self, charge: Charge) -> Result<Tick, Error> {
-        let now = self.clock.sample()?.monotonic;
+        let now = (self.sample)()?.monotonic;
         if now < self.last {
             return Err(Error::Invalid);
         }
@@ -102,14 +102,26 @@ pub fn write(
     meter: &mut Meter,
     sink: impl FnMut(&[u8]) -> Result<(), Error>,
 ) -> Result<u64, Error> {
+    write_checked(headers, || clock.sample(), deadline, meter, sink)
+}
+
+// A synchronous sample can retain native custody without requiring the pin to
+// implement the process-wide Clock trait's Send + Sync contract.
+pub(crate) fn write_checked(
+    headers: &[u8],
+    mut sample: impl FnMut() -> Result<Time, Error>,
+    deadline: Deadline,
+    meter: &mut Meter,
+    sink: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<u64, Error> {
     if headers.len() > crate::limits::MIB + 2 || meter.deadline() < deadline.into() {
         return Err(Error::Invalid);
     }
     let mut output = Output {
         bytes: headers,
-        clock,
+        last: sample()?.monotonic,
+        sample,
         deadline,
-        last: clock.sample()?.monotonic,
         meter,
         sink,
         written: 0,

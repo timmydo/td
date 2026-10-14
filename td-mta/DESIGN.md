@@ -2413,3 +2413,25 @@ Outgoing header filtering requires CRLF-only line endings throughout the
 section, checked in charged 4096-byte chunks before emission. Bare CR or LF
 is refused rather than letting an incoming-parser/receiver difference hide
 a blind-recipient field in a preserved value.
+
+## Verified native transmitted copies
+
+`transmitted_copy::write` retains the caller's verified native blob pin while
+collecting bounded root headers, applying blind-recipient filtering and
+streaming the remaining immutable body in at most 4096-byte chunks. Header
+scratch belongs to the caller; no full-message buffer or new work allowance
+is created. The configured header and transmitted-size ceilings, original
+meter, native snapshot deadline and a non-extending execution phase cover
+copying. Every header-filter clock sample also checks the retained native pin,
+so header scanning and emission cannot outlive its original snapshot deadline
+even when the caller supplies a longer phase. Native integrity verification
+precedes entry under its own funding.
+
+The filter changes only complete root Bcc/Resent-Bcc fields. The body is copied
+byte for byte, including a body prefix already read while finding the header
+boundary. That prefix is reread from the same immutable pin and charged again.
+Clock regression, expiry, work or size exhaustion, missing native bytes and
+sink failures refuse completion; all emitted bytes remain private and must
+be discarded on failure. A successful copy supplies no sending identity,
+envelope authority, ingress slot or queue publication. Its consumer still
+owns those reservations and fresh authorization before accepting delivery.
