@@ -52,7 +52,7 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.pg_is_in_recovery()::pg_catalog.text, \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
-const MAX_DURATION: Duration = Duration::from_secs(10);
+pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
 
 /// Connect, authenticate, inspect primary/durability settings, and close.
 /// One bounded worker owns every future; no Tokio runtime or background task.

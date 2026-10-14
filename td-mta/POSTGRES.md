@@ -1010,3 +1010,36 @@ generation-wide coverage and implemented-role admission before publication.
 The existing selected-profile restrictions on MTA-STS/local MX, managed ACME
 and unused certificates remain; composition does not weaken them to accept
 a cross-profile policy it cannot yet validate.
+
+## 24. Complete source candidate validation
+
+The inert postgres_configuration preparer checks one shared source and
+1–16 named profiles before producing an owned Candidate. Profile names use
+the existing lowercase ASCII identifier grammar and must be unique. Their
+canonical order is bytewise name order. The total shared/profile source,
+profile-name bytes and composition separators cannot exceed 2 MiB.
+
+For every profile, preparation composes the same shared policy, drives the
+structural loader through EOF with its explicit roles, resolves text inputs
+from the expected PostgreSQL epoch, and compiles every configured TLS policy
+through the provider. One absolute deadline covers the whole operation,
+including its database reads, within the existing ten-second cold-worker
+ceiling. Each profile retains the material adapter's request/byte bounds.
+Failure returns no candidate. The shared source partition prevents profiles
+from replacing account, domain, alias or identity policy; existing per-profile
+MX/STS/role rules remain unchanged. This does not expand implemented runtime
+roles or supply the outstanding distributed ACME/route policy.
+
+Candidate retains raw sources and material references, never resolved
+password/key bytes or compiled TLS policies. Its SHA-256 digest binds the
+expected epoch, shared source, profile count and every canonical name, role
+set and profile source using fixed-width length framing. There is no Debug
+or automatic serialization of its source bytes. Explicit borrowed access is
+for the future owner-side database publisher and loader.
+
+No configuration row, active pointer, device policy or listener changes here.
+The candidate is not serving authority and its checks describe preparation
+time only: a later startup/load must revalidate current database material,
+certificate validity, schema/epoch and implemented-role admission. Database
+persistence and atomic generation activation remain separate boundaries.
+These cold input/count bounds are not native-allocation qualification.

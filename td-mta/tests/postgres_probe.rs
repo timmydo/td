@@ -1825,3 +1825,166 @@ certificate = "public"
         .is_err()
     );
 }
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_configuration_validates_all_profiles_and_binds_canonical_sources() {
+    use td_mta::{
+        config::profile::Roles,
+        postgres_configuration::{self as configuration, Profile},
+        postgres_materials::{self as materials, Kind, Version},
+        postgres_schema,
+    };
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let request = fixture.request();
+    let epoch = postgres_schema::initialize(&request, &trust, deadline())
+        .unwrap()
+        .store_epoch;
+    let chain = fs::read(fixture.root.join("server.crt")).unwrap();
+    let key = fs::read(fixture.root.join("server.key")).unwrap();
+    for (n, kind, bytes) in [
+        (1, Kind::RelayPassword, b"database-password\n".as_slice()),
+        (2, Kind::CertificateChain, chain.as_slice()),
+        (3, Kind::PrivateKey, key.as_slice()),
+        (4, Kind::TrustBundle, fixture.ca.as_slice()),
+        (5, Kind::TextSignature, b"signature\r\n".as_slice()),
+        (6, Kind::CertificateChain, b"invalid-certificate".as_slice()),
+    ] {
+        materials::insert(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            Version::from_bytes([n; 16]),
+            kind,
+            bytes,
+        )
+        .unwrap();
+    }
+    let shared = format!(
+        r#"version = 1
+[account "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+username = "user"
+[domain "example.test"]
+mx_host = "localhost"
+[alias "main@example.test"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[identity "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+account = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+email = "main@example.test"
+text_signature_file = "/postgres-material/{}"
+"#,
+        Version::from_bytes([5; 16])
+    );
+    let desktop = format!(
+        r#"[server]
+hostname = "localhost"
+jmap_origin = "https://localhost"
+[resolver "primary"]
+address = "127.0.0.1:53"
+[relay]
+host = "localhost"
+port = 465
+username = "relay-user"
+password_file = "/postgres-material/{password}"
+ca_file = "/postgres-material/{ca}"
+[certificate "public"]
+mode = "files"
+chain_file = "/postgres-material/{chain}"
+key_file = "/postgres-material/{key}"
+[listener "https"]
+kind = "https"
+bind = "127.0.0.1:443"
+certificate = "public"
+"#,
+        password = Version::from_bytes([1; 16]),
+        chain = Version::from_bytes([2; 16]),
+        key = Version::from_bytes([3; 16]),
+        ca = Version::from_bytes([4; 16])
+    );
+    let cloud = desktop.clone()
+        + r#"[listener "smtp"]
+kind = "direct_smtp"
+bind = "0.0.0.0:25"
+server_name = "localhost"
+certificate = "public"
+session_limit = 1
+per_peer_limit = 1
+"#;
+    let one = Profile {
+        name: "cloud",
+        roles: Roles::from_bits(3).unwrap(),
+        source: cloud.as_bytes(),
+    };
+    let two = Profile {
+        name: "desktop",
+        roles: Roles::from_bits(2).unwrap(),
+        source: desktop.as_bytes(),
+    };
+    let prepare = |profiles: &[Profile<'_>]| {
+        configuration::prepare(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            shared.as_bytes(),
+            profiles,
+        )
+    };
+    let candidate = prepare(&[two, one]).unwrap();
+    assert_eq!(candidate.epoch(), epoch);
+    assert_eq!(candidate.shared(), shared.as_bytes());
+    assert_eq!(candidate.profile_count(), 2);
+    assert_eq!(candidate.profile(0).unwrap().name, "cloud");
+    assert_eq!(candidate.profile(1).unwrap().name, "desktop");
+    assert_eq!(candidate.profile(0).unwrap().roles.bits(), 3);
+    assert!(candidate.profile(2).is_none());
+    assert_eq!(candidate.digest(), prepare(&[one, two]).unwrap().digest());
+    let changed = format!("# candidate revision\n{desktop}");
+    let changed = prepare(&[
+        one,
+        Profile {
+            source: changed.as_bytes(),
+            ..two
+        },
+    ])
+    .unwrap();
+    assert_ne!(candidate.digest(), changed.digest());
+    let bad = desktop.replace(
+        &Version::from_bytes([2; 16]).to_string(),
+        &Version::from_bytes([6; 16]).to_string(),
+    );
+    assert_eq!(
+        prepare(&[
+            one,
+            Profile {
+                source: bad.as_bytes(),
+                ..two
+            }
+        ])
+        .err(),
+        Some(configuration::Error::Provider)
+    );
+    let missing = desktop.replace(
+        &Version::from_bytes([2; 16]).to_string(),
+        &Version::from_bytes([7; 16]).to_string(),
+    );
+    assert_eq!(
+        prepare(&[
+            one,
+            Profile {
+                source: missing.as_bytes(),
+                ..two
+            }
+        ])
+        .err(),
+        Some(configuration::Error::Material(
+            td_mta::postgres_profile_materials::Error::Database(materials::Error::Missing)
+        ))
+    );
+    assert_eq!(
+        sql(&fixture, "SELECT count(*) FROM td_mta.config_materials"),
+        "6"
+    );
+}
