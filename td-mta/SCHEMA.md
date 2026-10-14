@@ -489,8 +489,10 @@ Gateway TLS identity. It still obeys local-recipient and resource limits.
 Require 1..16 `[listener "NAME"]` stanzas with required `kind` and `bind`.
 Kinds are `direct_smtp`, `gateway_smtp`, `https`, `http01` and
 `loopback_smtp_fixture`. At least one SMTP role and one HTTPS listener are
-required. No SMTP submission, implicit inbound submission, IMAP or POP role
-exists in this schema.
+required by this file schema. POSTGRES.md section 15 describes a separate
+role-selection preparation API; no new file stanza or serving mode selects
+it. No SMTP submission, implicit inbound submission, IMAP or POP role exists
+in this schema.
 
 | Field | Applicability |
 | --- | --- |

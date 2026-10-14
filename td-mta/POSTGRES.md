@@ -610,3 +610,24 @@ not interpret a missing command response as permission to replay.
 These commands qualify only the preparation ledger, not complete schema
 integrity or operational mail service. Future application schema migrations
 and profile publication remain separate explicit operations.
+
+## 15. Prepared instance role validation
+
+`config::profile::Roles` provides the closed, nonempty role set for future
+profile rows: receiving is bit 1, JMAP bit 2 and relay bit 4. Unknown bits
+refuse decoding. These values are structural declarations, never proof of
+runtime support or authorization. No database profile is stored or activated
+by this preparation API.
+
+`config::listener::Builder::finish_for_roles` requires SMTP listeners exactly
+when receiving is selected and HTTPS listeners exactly when JMAP is selected.
+A relay-only profile has no inbound listeners; HTTP-01 requires receiving or
+JMAP. Each profile retains the existing listener syntax, duplicate/bind
+checks and aggregate SMTP session limits. A disabled role cannot be enabled
+by merely adding its listener. Sticky builder failures remain terminal.
+
+The existing file configuration still uses `finish`, requiring both receiving
+and JMAP as before. The new entry point is not wired into it or serving.
+Future database generation validation must bind these role selections to
+account, certificate, routing and resource references, verify implemented
+capabilities, and validate the entire generation before publication.

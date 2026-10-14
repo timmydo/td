@@ -963,8 +963,10 @@ opened here.
 SMTP roles require nonzero session and per-peer counts; per-peer cannot
 exceed the listener session limit. Checked integer conversion prevents
 truncation. Finalization checks each against the supplied checked
-ResourcePlan, sums all SMTP session limits within the global pool, and
-requires at least one SMTP and one HTTPS listener. A sum overrun reports
+ResourcePlan and sums all SMTP session limits within the global pool. The
+file-configuration `finish` path requires at least one SMTP and one HTTPS
+listener. The separate, inert `finish_for_roles` preparation API follows
+POSTGRES.md section 15's exact selected-role requirements. A sum overrun reports
 SessionLimit and the first listener whose addition exceeded the pool. The
 explicit loopback fixture counts toward both the SMTP role requirement and
 the shared pool; SMTP plus HTTP-01 still fails the HTTPS requirement.

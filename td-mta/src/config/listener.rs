@@ -67,6 +67,7 @@ pub enum Code {
     BindConflict,
     MissingSmtp,
     MissingHttps,
+    DisabledRole,
     SessionBudget,
     Text,
     Invariant,
@@ -88,6 +89,7 @@ impl Code {
             Self::BindConflict => "config_listener_bind_conflict",
             Self::MissingSmtp => "config_listener_missing_smtp",
             Self::MissingHttps => "config_listener_missing_https",
+            Self::DisabledRole => "config_listener_disabled_role",
             Self::SessionBudget => "config_listener_session_budget",
             Self::Text => "config_listener_text",
             Self::Invariant => "config_listener_invariant",
@@ -344,6 +346,16 @@ impl<'a> Builder<'a> {
         Ok(())
     }
     pub fn finish(self, plan: &ResourcePlan) -> Result<Records<'a>, Error> {
+        self.finish_for_roles(plan, super::profile::Roles::LEGACY)
+    }
+
+    /// Structural profile validation only. It neither admits runtime roles
+    /// nor verifies certificates, account references or a whole generation.
+    pub fn finish_for_roles(
+        self,
+        plan: &ResourcePlan,
+        roles: super::profile::Roles,
+    ) -> Result<Records<'a>, Error> {
         if let Some(e) = self.failure {
             return Err(e);
         }
@@ -352,6 +364,14 @@ impl<'a> Builder<'a> {
         let mut has_smtp = false;
         let mut has_https = false;
         for slot in slots {
+            let enabled = match slot.kind {
+                Kind::Https => roles.jmap(),
+                Kind::Http01 => roles.receive() || roles.jmap(),
+                Kind::DirectSmtp | Kind::GatewaySmtp | Kind::LoopbackSmtpFixture => roles.receive(),
+            };
+            if !enabled {
+                return Err(err(Code::DisabledRole, None, slot.location));
+            }
             has_https |= slot.kind == Kind::Https;
             if slot.kind.is_smtp() {
                 has_smtp = true;
@@ -377,10 +397,10 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        if !has_smtp {
+        if roles.receive() && !has_smtp {
             return Err(err(Code::MissingSmtp, None, None));
         }
-        if !has_https {
+        if roles.jmap() && !has_https {
             return Err(err(Code::MissingHttps, None, None));
         }
         Ok(Records {
@@ -802,6 +822,81 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.to_string(),"config_listener_duplicate for name at line 4, byte column 3 (previously configured at line 2, byte column 3)");
     }
+    #[test]
+    fn profile_listener_sets_match_selected_roles_without_implicit_services() {
+        let _lock = lock();
+        let plan = Limits::default().plan().unwrap();
+        for bits in 1..=7 {
+            let roles = super::super::profile::Roles::from_bits(bits).unwrap();
+            for listeners in 0..4 {
+                let mut storage = Storage::new();
+                let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+                let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+                if listeners & 1 != 0 {
+                    builder
+                        .listener(
+                            &mut arena,
+                            "smtp",
+                            input(Kind::DirectSmtp, "127.0.0.1:25"),
+                            at(1),
+                        )
+                        .unwrap();
+                }
+                if listeners & 2 != 0 {
+                    builder
+                        .listener(
+                            &mut arena,
+                            "https",
+                            input(Kind::Https, "127.0.0.1:443"),
+                            at(2),
+                        )
+                        .unwrap();
+                }
+                let result = builder.finish_for_roles(&plan, roles);
+                assert_eq!(
+                    result.is_ok(),
+                    listeners == bits & 3,
+                    "roles {bits}, listeners {listeners}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relay_only_profile_refuses_challenge_listener_and_keeps_sticky_errors() {
+        let _lock = lock();
+        let plan = Limits::default().plan().unwrap();
+        let roles = super::super::profile::Roles::from_bits(4).unwrap();
+        let mut storage = Storage::new();
+        let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+        let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+        builder
+            .listener(
+                &mut arena,
+                "challenge",
+                input(Kind::Http01, "127.0.0.1:80"),
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(
+            builder.finish_for_roles(&plan, roles).unwrap_err().code,
+            Code::DisabledRole
+        );
+
+        let mut storage = Storage::new();
+        let mut arena = text::Builder::new(&mut storage.bytes).unwrap();
+        let mut builder = Builder::new(&arena, &mut storage.slots).unwrap();
+        let error = builder
+            .listener(
+                &mut arena,
+                "smtp",
+                input(Kind::DirectSmtp, "invalid"),
+                at(2),
+            )
+            .unwrap_err();
+        assert_eq!(builder.finish_for_roles(&plan, roles).unwrap_err(), error);
+    }
+
     #[test]
     fn mandatory_roles_and_global_pool_budgets_are_checked_at_finish() {
         let _lock = lock();
