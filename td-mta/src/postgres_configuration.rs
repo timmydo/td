@@ -2,7 +2,7 @@
 use crate::{
     clock::{RuntimeClock, TlsClockSource},
     config::{composition, load, materialize, profile::Roles, stanza, storage, stream, values},
-    generations::GenerationSet,
+    generations::{GenerationConstruction, GenerationSet, PreparedGeneration},
     ids::StoreEpoch,
     postgres_probe::Request,
     postgres_profile_materials::{self, Loader},
@@ -161,38 +161,22 @@ pub fn prepare(
         if Instant::now() >= deadline {
             return Err(Error::Deadline);
         }
-        let source = composition::Source::new(shared, profile.source, &mut scratch)
-            .map_err(Error::Composition)?;
-        let prepared = load::read_profile(
+        let set = GenerationSet::at_startup();
+        let (resolved, policies) = resolve_profile(
+            ProfileInput {
+                request,
+                trust,
+                deadline,
+                epoch,
+                shared,
+                profile,
+                clock: clock.clone(),
+            },
             storage,
             &mut pending,
             &mut scratch,
-            &mut source.reader(),
-            profile.roles,
-        )
-        .map_err(|_| Error::Profile)?;
-        let mut loader = Loader::new(request, trust, epoch, deadline);
-        let resolved = materialize::read_profile_text(prepared, &mut scratch, |reference| {
-            loader.open_input(reference)
-        })
-        .map_err(|failure| match failure.error() {
-            materialize::Error::Input(error) => Error::Material(*error),
-            _ => Error::Text,
-        })?;
-        let set = GenerationSet::at_startup();
-        let mut material_error = None;
-        let policies = TlsPolicies::prepare_profile(
             set.reserve().map_err(|_| Error::Provider)?,
-            &resolved,
-            clock.clone(),
-            |reference| {
-                loader.open_tls(reference).map_err(|error| {
-                    material_error = Some(error);
-                    crate::ports::Error::Invalid
-                })
-            },
-        )
-        .map_err(|_| material_error.map_or(Error::Provider, Error::Material))?;
+        )?;
         drop(policies);
         storage = resolved.into_storage();
         let name = String::from_utf8(copy(profile.name.as_bytes())?).map_err(|_| Error::Name)?;
@@ -208,6 +192,65 @@ pub fn prepare(
         return Err(Error::Deadline);
     }
     Ok(candidate)
+}
+
+pub(crate) struct ProfileInput<'a, 'r> {
+    pub request: &'a Request<'r>,
+    pub trust: &'a TrustStore,
+    pub deadline: Instant,
+    pub epoch: StoreEpoch,
+    pub shared: &'a [u8],
+    pub profile: Profile<'a>,
+    pub clock: Arc<ClockHandle>,
+}
+
+// Candidate validation and runtime preparation use exactly the same source,
+// material and TLS path. The caller owns the generation reservation.
+pub(crate) fn resolve_profile(
+    input: ProfileInput<'_, '_>,
+    storage: storage::Storage,
+    pending: &mut stanza::Pending,
+    scratch: &mut [u8],
+    reserved: GenerationConstruction<TlsPolicies>,
+) -> Result<
+    (
+        materialize::ResolvedProfile,
+        PreparedGeneration<TlsPolicies>,
+    ),
+    Error,
+> {
+    if Instant::now() >= input.deadline {
+        return Err(Error::Deadline);
+    }
+    let source = composition::Source::new(input.shared, input.profile.source, scratch)
+        .map_err(Error::Composition)?;
+    let prepared = load::read_profile(
+        storage,
+        pending,
+        scratch,
+        &mut source.reader(),
+        input.profile.roles,
+    )
+    .map_err(|_| Error::Profile)?;
+    let mut loader = Loader::new(input.request, input.trust, input.epoch, input.deadline);
+    let resolved =
+        materialize::read_profile_text(prepared, scratch, |reference| loader.open_input(reference))
+            .map_err(|failure| match failure.error() {
+                materialize::Error::Input(error) => Error::Material(*error),
+                _ => Error::Text,
+            })?;
+    let mut material_error = None;
+    let policies = TlsPolicies::prepare_profile(reserved, &resolved, input.clock, |reference| {
+        loader.open_tls(reference).map_err(|error| {
+            material_error = Some(error);
+            crate::ports::Error::Invalid
+        })
+    })
+    .map_err(|_| material_error.map_or(Error::Provider, Error::Material))?;
+    if Instant::now() >= input.deadline {
+        return Err(Error::Deadline);
+    }
+    Ok((resolved, policies))
 }
 
 pub(crate) const DIGEST_DOMAIN: &[u8] = b"td-mta PostgreSQL configuration sources v1\0";

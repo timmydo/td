@@ -1284,3 +1284,31 @@ policy at runtime admission/publication rather than treat the returned
 candidate as authority. Store-epoch checks apply to each connection, including
 receipt resolution after restore. Schema migration keeps earlier checksums
 unchanged and initializes selection without choosing an existing version.
+
+## 31. Selected-profile runtime preparation
+
+`postgres_runtime_profile::load` is a cold bridge from selected database
+sources to an owned resolved profile and caller-reserved TLS generation.
+It retains a passive binding of epoch, selection generation/version, account,
+profile name and roles. It does not open listeners, publish a runtime
+configuration, enable relay/ACME workers or provide device authorization.
+No conversion to the legacy file-serving input is introduced.
+
+Loading captures the selected version and revalidates every profile/material,
+then resolves the requested profile using the exact same composition, text
+material and TLS preparation path as candidate validation. It requires the
+configured account's durable bootstrap receipt. All material comes from the
+database under the original deadline; there is no filesystem fallback.
+The caller's TLS generation reservation remains in its original domain and
+is released on failure. The returned resolved text contains secrets and has
+no diagnostic dump; its explicit binding contains only passive identifiers.
+
+Before returning, a final primary observation rejects a selection already
+superseded during preparation. This does not freeze future changes: runtime
+startup/publication must still fence policy afresh and admit only implemented
+roles. The original at-most-ten-second deadline covers source verification,
+repeated profile preparation, account inspection and final observation.
+The source candidate is discarded before the final check; retained text and
+TLS objects belong to the caller's cold control worker. Reusable connection
+pools, publication, live refresh and full resource qualification remain
+cutover work.

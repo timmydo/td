@@ -249,16 +249,26 @@ pub fn read(
     deadline: Instant,
     epoch: StoreEpoch,
 ) -> Result<Option<(Selection, Candidate)>, Error> {
-    let selected = postgres_probe::with_client(request, trust, deadline, move |client| Box::pin(async move {
-        let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
-        if schema.store_epoch != epoch { return Err(Error::Epoch); }
-        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).await.map_err(|_| Error::Database)?;
-        selection(&row)
-    })).map_err(Error::Connection)??;
+    let selected = observe(request, trust, deadline, epoch)?;
     let Some(selected) = selected else {
         return Ok(None);
     };
     let candidate = versions::read(request, trust, deadline, epoch, selected.version)
         .map_err(Error::Configuration)?;
     Ok(Some((selected, candidate)))
+}
+
+/// One passive primary observation; never a runtime policy guard.
+pub(crate) fn observe(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    epoch: StoreEpoch,
+) -> Result<Option<Selection>, Error> {
+    postgres_probe::with_client(request, trust, deadline, move |client| Box::pin(async move {
+        let schema = postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
+        if schema.store_epoch != epoch { return Err(Error::Epoch); }
+        let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true", &[]).await.map_err(|_| Error::Database)?;
+        selection(&row)
+    })).map_err(Error::Connection)?
 }

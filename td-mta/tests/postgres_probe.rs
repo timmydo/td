@@ -2220,6 +2220,23 @@ per_peer_limit = 1
     assert!(selection::read(&request, &trust, deadline(), epoch)
         .unwrap()
         .is_none());
+    use td_mta::{
+        generations::GenerationSet, postgres_runtime_profile as runtime, tls_policy::TlsPolicies,
+    };
+    let empty_domain = GenerationSet::<TlsPolicies>::at_startup();
+    assert_eq!(
+        runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            "desktop",
+            empty_domain.reserve().unwrap()
+        )
+        .err(),
+        Some(runtime::Error::Unselected)
+    );
+    assert_eq!(empty_domain.available(), 2);
     let first = selection::prepare(epoch, 0, version, &candidate).unwrap();
     assert_eq!(
         selection::inspect(&request, &trust, deadline(), first).unwrap(),
@@ -2256,6 +2273,104 @@ per_peer_limit = 1
     let selected = selection::publish(&request, &trust, deadline(), first).unwrap();
     assert_eq!(selected.generation, 1);
     assert_eq!(selected.version, version);
+    assert_eq!(
+        runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            "desktop",
+            empty_domain.reserve().unwrap()
+        )
+        .err(),
+        Some(runtime::Error::Bootstrap(
+            td_mta::postgres_accounts::Error::Missing
+        ))
+    );
+    assert_eq!(empty_domain.available(), 2);
+    let account = td_mta::ids::AccountId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    td_mta::postgres_accounts::publish(
+        &request,
+        &trust,
+        deadline(),
+        td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
+    )
+    .unwrap();
+    for (name, roles) in [("desktop", 2), ("cloud", 3)] {
+        let mut domain = GenerationSet::<TlsPolicies>::at_startup();
+        let prepared = runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            name,
+            domain.reserve().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prepared.binding().epoch(), epoch);
+        assert_eq!(prepared.binding().selection(), selected);
+        assert_eq!(prepared.binding().account(), account);
+        assert_eq!(prepared.binding().profile(), name);
+        assert_eq!(prepared.binding().roles().bits(), roles);
+        assert_eq!(prepared.configuration().roles().bits(), roles);
+        let (_, configuration, policies) = prepared.into_parts();
+        assert_eq!(
+            configuration
+                .candidate()
+                .identities()
+                .unwrap()
+                .account()
+                .unwrap()
+                .id,
+            account
+        );
+        drop(domain.publish(policies).unwrap());
+        let active = domain.current().unwrap();
+        let https = TlsPolicies::listener(&active, "https").unwrap();
+        assert_eq!(
+            TlsPolicies::role(&active, https).unwrap(),
+            td_mta::tls_policy::PolicyRole::Https
+        );
+        assert_eq!(TlsPolicies::listener(&active, "smtp").is_ok(), roles == 3);
+    }
+    assert_eq!(
+        runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            "missing",
+            empty_domain.reserve().unwrap()
+        )
+        .err(),
+        Some(runtime::Error::MissingProfile)
+    );
+    assert_eq!(
+        runtime::load(
+            &request,
+            &trust,
+            Instant::now(),
+            epoch,
+            "desktop",
+            empty_domain.reserve().unwrap()
+        )
+        .err(),
+        Some(runtime::Error::Deadline)
+    );
+    assert_eq!(
+        runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            "Desktop",
+            empty_domain.reserve().unwrap()
+        )
+        .err(),
+        Some(runtime::Error::Name)
+    );
+    assert_eq!(empty_domain.available(), 2);
+
     assert_eq!(
         selection::publish(&request, &trust, deadline(), first).unwrap(),
         selected
@@ -2372,6 +2487,19 @@ per_peer_limit = 1
     // A valid digest is not permission to skip current material validation.
     sql(&fixture, "DELETE FROM td_mta.config_material_chunks WHERE material_id=decode(repeat('02',16),'hex'); DELETE FROM td_mta.config_materials WHERE id=decode(repeat('02',16),'hex')");
     assert!(invoke("config-check", &shared_file, 1).contains("material-missing"));
+    assert!(matches!(
+        runtime::load(
+            &request,
+            &trust,
+            deadline(),
+            epoch,
+            "desktop",
+            empty_domain.reserve().unwrap()
+        ),
+        Err(runtime::Error::Selection(_))
+    ));
+    assert_eq!(empty_domain.available(), 2);
+
     assert!(matches!(
         selection::publish(&request, &trust, deadline(), refused),
         Err(selection::Error::Configuration(_))

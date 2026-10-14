@@ -123,6 +123,7 @@ pub mod postgres_materials;
 pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_resolver;
+pub mod postgres_runtime_profile;
 pub mod postgres_schema;
 pub mod postgres_selection;
 pub mod preview_json;
