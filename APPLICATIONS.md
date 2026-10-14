@@ -3548,6 +3548,7 @@ no one else can write, at most 64 KiB, and an exact, ordered keyfile:
 format=1
 entry=/absolute/td-agent
 program=/absolute/td-txt
+alias=cc /gnu/store/...-gcc/bin/gcc
 path=/gnu/store/...-profile/bin
 home=/absolute/private/home
 worktree=/absolute/worktree
@@ -3558,7 +3559,7 @@ write=/absolute/shared/read-write
 ```
 
 `entry` and `home` appear once; `program` (with `entry`, at most four)
-and `path` (at most 16) repeat, as do `worktree`, `checkout`,
+and `alias` (at most 64) and `path` (at most 16) repeat, as do `worktree`, `checkout`,
 `repository`, `read` and `write`, at most 32 of these in all; keys
 appear in that order. Admission is §C's filesystem-grant source checks
 with the kind's own departures:
@@ -3666,6 +3667,28 @@ as planned, proved by a write that fails with `EROFS` or succeeds; that
 a repository holds no mount but its chain's; and that no mount exists
 the plan did not make.
 
+A workspace spec may name up to 64 `alias=NAME /canonical/source` entries
+between `program` and `path`. Names are ASCII command names (letters, digits,
+`-_.+`, at most 64 bytes, excluding `.` and `..`), unique within the spec.
+Each source is a canonical executable regular file in an already-bound system
+tree. The jail creates these symlinks under `/opt/workspace/path` in its
+read-only root. Stage 2 admits the sources again and checks the exact alias
+names and link targets before executing the entry. No host directory is
+mounted for aliases.
+
+The launcher discovers aliases from parent PATH directories outside those
+system trees using `engine/src/host_path.rs`: only symlinks whose first
+executable match in the parent PATH is that symlink, resolving into the
+existing system closure. Discovery is bounded to 64 PATH directories (only absolute directories supply aliases),
+4096 entries per outside directory and 64 aliases. More than 64 PATH
+directories omits alias discovery; excess directory entries and aliases are
+omitted, and directory-entry errors skipped, without disabling launches.
+The first-match check conservatively uses executable mode bits: an earlier
+file the caller cannot execute can cause an alias to be omitted. Ordinary private scripts
+and links to executables outside the system closure remain unavailable.
+This preserves a user's `~/.local/bin/cc -> gcc` just like any other admitted
+command alias; the jail does not choose compiler fallbacks.
+
 The instance always isolates the network, with loopback up, and keeps
 §C's user, mount, PID and UTS namespaces, but maps the caller to itself
 rather than to uid 1000, so a worktree keeps its owner and git's
@@ -3691,9 +3714,9 @@ as its
 stdout and checks it is a socket and that no terminal controls it, and
 the entry receives two clones as its standard input and output, with the
 null device as standard error. Its environment is exactly `HOME` (the
-spec's home), `LANG=C.UTF-8`, `PATH` (the spec's path directories, in
-order, then the read-only admitted program directory, then the ordinary
-directories and a store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
+spec's home), `LANG=C.UTF-8`, `PATH` (the read-only alias directory, then
+the spec's path directories in order, then the read-only admitted program
+directory, then the ordinary directories and a store-based host's system profile), `TERM=dumb` and `TMPDIR=/tmp`; it
 starts in the first worktree, else in the home. No cgroup is created and
 no data limit set: an instance keeps its launcher's cgroup and whatever
 limit it inherits, and says so with one named diagnostic,

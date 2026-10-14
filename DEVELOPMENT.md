@@ -787,17 +787,27 @@ Build the release binary in whichever checkout supplies the config.
 ## Host compiler preparation for reviews
 
 Repository reviews inherit parent PATH directories that resolve into the
-jail's mounted system trees, including Guix/Nix profile directories. td-agent
-prepares a read-only `cc` alias from an available GCC or Clang when the profile
-provides no `cc`, and preserves validated parent compiler selections and
-header/library search directories at their canonical system-store paths.
-The reviewer does not set CC or rewrite the source's linker configuration.
-C and Rust compile/link probes run in the real review jail before paid
-completions. Missing tools or incompatible environments are logged limitations;
-metadata resolution alone is not evidence that native dependencies can build.
-This is host review preparation; the target artifact graph retains its own
-declared tool inputs. The exact inherited variables, bounds and trace records
-are specified in td-agent/DESIGN.md §2.
+jail's mounted system trees, including Guix/Nix profile directories. Symlinks
+in other PATH directories also survive when their executable targets are in
+those trees and the symlink is the parent PATH's first match for that command.
+The jail exposes these aliases through a read-only directory; it does not
+mount the user's private bin directory or copy executables.
+
+Provide ordinary host compiler commands before launching a review. If the
+host provides `gcc` but lacks `cc`, a `~/.local/bin/cc` symlink to the current
+profile's `gcc` is sufficient; similarly `c++` may point to `g++`. Prefer the
+stable profile path over a store generation that garbage collection can
+remove. PATH-based host control-plane provisioning retains that tool PATH so
+binutils need not live beside a compiler alias. An explicit `TD_CC_HOME`
+still restricts provisioning to that toolchain's `bin` directory. The reviewer
+does not set CC or rewrite linker configuration, and
+td-agent has no private compiler forwarder. The controller preserves validated
+parent compiler selections and header/library search paths. C and Rust
+compile/link probes run in the real review jail before paid completions.
+Missing tools or incompatible environments are logged limitations; metadata
+resolution alone does not prove that native dependencies can build.
+The target artifact graph retains its own declared tool inputs. See
+`APPLICATIONS.md` §C and `td-agent/DESIGN.md` §2 for the exact boundaries.
 
 ## Native compositor fixture builds
 

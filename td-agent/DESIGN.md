@@ -311,24 +311,23 @@ this profile. The host tool closure is the existing §8 closure; source
 dependencies or tools outside it remain unavailable. Tests requiring
 source writes or absent inputs must be reported as limitations.
 
-Repository reviews automatically prepare host native build tools before
+Repository reviews validate the inherited host build environment before
 metadata or paid completions. The parent PATH's canonical system/profile
-directories remain inherited under §8. When they provide GCC or Clang but no
-`cc`, the controller copies td-agent as a private native `cc` forwarder
-(maximum 256 MiB, copied from `/proc/self/exe` even after replacement), outside every writable jail grant, and binds it read-only
-through the existing program channel. It records the selected compiler path and the alias hash;
-the alias execs the original compiler through its canonical parent, preserving
-executable-relative resources. A controller-only command variable selects it.
-Alias setup failures remain logged review limitations; log-write failures still
-stop the invocation. The alias is cleaned with the review workspace. No agent-set CC or source
-linker edit is needed, including for a plain rustc invocation. Existing cc
-commands retain priority. Compile/link compatibility is checked by probes, not assumed away.
+directories remain inherited under §8. Generic PATH aliases to executables
+in that closure are preserved by the workspace jail (APPLICATIONS.md §C),
+including a host-provided `~/.local/bin/cc` symlink. Standard compiler commands
+are the host's responsibility. td-agent creates no compiler executable,
+special argv[0] mode or dispatch variable. No agent-set CC or source linker
+edit is needed when the host supplies ordinary compiler commands, including
+for plain rustc. Compile/link compatibility is checked by probes.
 
 Only parent `CC`, `CXX`, `AR`, `CMAKE`, `C_INCLUDE_PATH`,
 `CPLUS_INCLUDE_PATH`, `CPATH`, `LIBRARY_PATH`, `PKG_CONFIG_PATH` and
-`PKG_CONFIG_LIBDIR` may reach review commands. The controller adds
-`TD_AGENT_REVIEW_COMPILER` for its cc forwarder; it is not inherited. Tool selectors must name one executable in a canonical mounted system
-directory, whose final resolved target also belongs to that closure. The
+`PKG_CONFIG_LIBDIR` may reach review commands. Tool selectors must name
+one executable in a canonical mounted system directory, whose final resolved
+target also belongs to that closure. A bare selector first matches admitted
+parent PATH aliases and names the generated `/opt/workspace/path/NAME` link,
+so selecting `CC=cc` agrees with invoking `cc` directly. The
 invocation basename is retained: clang++ may link to clang but selects a
 different driver mode. Search lists must resolve
 entirely to absolute mounted system directories; each has at most 32 distinct
@@ -337,14 +336,15 @@ Empty elements mixed into nonempty lists are omitted with a notice rather
 than rebasing the parent working directory. Relative, missing or unmounted
 values are omitted and
 reported, not used to bind more host directories. Secrets, loader overrides,
-Cargo configuration and arbitrary flags are not imported. This typed environment is limited to review commands. The jail places its
-read-only admitted program directory after inherited path directories and
-before its ordinary system search paths.
+Cargo configuration and arbitrary flags are not imported. This typed environment is limited to review commands. The jail places its read-only PATH alias directory first, followed by
+inherited path directories, its admitted program directory and ordinary
+system search paths.
 
 C (with a standard header) and Rust compile/link probes run in real jails,
 using scratch outputs and a 15-second deadline each, before the first paid
-completion. `native_tool_alias`, `native_build_environment` and
-`native_build_preflight` records retain preparation and results. Failures are
+completion. `native_build_environment` and `native_build_preflight` records
+retain validation and results. Older traces may retain `native_tool_alias`
+records from the retired review-specific compiler forwarder. Failures are
 explicit model-visible limitations, not test passes. These probes establish
 basic compilation/linking, not every package's required tool or library.
 

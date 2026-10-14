@@ -26,6 +26,7 @@ use crate::authority::{
 pub(crate) const WORKSPACE_ARG: &str = "--workspace";
 /// Where the spec's programs are bound, each under its own file name.
 pub(crate) const PROGRAM_DIR: &str = "/opt/workspace/bin";
+pub(crate) const ALIAS_DIR: &str = "/opt/workspace/path";
 /// The entry's `PATH`, after the spec's own directories, and its
 /// `TMPDIR` and `LANG`; `HOME` is the spec's home. The system profiles
 /// of store-based hosts (Guix, NixOS) follow the ordinary directories;
@@ -170,6 +171,7 @@ pub(crate) struct WorkspacePlan {
     /// Directories of the bound system trees put first on the entry's
     /// `PATH`, in order.
     pub(crate) path: Vec<PathBuf>,
+    pub(crate) aliases: Vec<crate::host_path::Alias>,
     /// Read-write, not executable.
     pub(crate) home: FilesystemGrant,
     /// Read-write and executable: what the tools build and run. A
@@ -198,6 +200,8 @@ impl WorkspacePlan {
 /// The entry's whole environment: `path` first on its `PATH`.
 pub(crate) fn environment(home: &Path, path: &[PathBuf]) -> Vec<(OsString, OsString)> {
     let mut search = OsString::new();
+    search.push(ALIAS_DIR);
+    search.push(":");
     for directory in path {
         search.push(directory.as_os_str());
         search.push(":");
@@ -233,6 +237,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
     programs: Vec<PathBuf>,
+    aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
@@ -253,6 +258,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
     const ORDER: &[&str] = &[
         "entry",
         "program",
+        "alias",
         "path",
         "home",
         "worktree",
@@ -280,6 +286,19 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             )));
         }
         last = rank;
+        if key == "alias" {
+            let (name, source) = value
+                .split_once(' ')
+                .ok_or_else(|| invalid("workspace alias needs a name and source"))?;
+            if !crate::host_path::valid_name(name) {
+                return Err(invalid("workspace alias has an invalid command name"));
+            }
+            spec.aliases.push(crate::host_path::Alias {
+                name: name.into(),
+                source: spec_path(key, source)?,
+            });
+            continue;
+        }
         let path = spec_path(key, value)?;
         match key {
             "entry" => {
@@ -301,6 +320,9 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         return Err(invalid("workspace spec names no entry"));
     }
     spec.home = home.ok_or_else(|| invalid("workspace spec names no home"))?;
+    if spec.aliases.len() > crate::host_path::MAX_ALIASES {
+        return Err(invalid("workspace spec names more than 64 PATH aliases"));
+    }
     if spec.path.len() > MAX_PATH_DIRECTORIES {
         return Err(invalid(format!(
             "workspace spec names more than {MAX_PATH_DIRECTORIES} path directories"
@@ -434,6 +456,13 @@ fn admit(
     arguments: Vec<OsString>,
     reserved: &[&str],
 ) -> io::Result<WorkspacePlan> {
+    let mut alias_names = std::collections::BTreeSet::new();
+    for alias in &spec.aliases {
+        if !alias_names.insert(alias.name.clone()) {
+            return Err(invalid("workspace PATH alias is named twice"));
+        }
+        admit_alias(alias)?;
+    }
     let mut programs: Vec<Program> = Vec::new();
     for source in spec.programs {
         let program = admit_program(&source)?;
@@ -629,6 +658,7 @@ fn admit(
         gid,
         programs,
         path,
+        aliases: spec.aliases,
         home,
         worktrees,
         repositories,
@@ -636,6 +666,25 @@ fn admit(
         shared,
         arguments,
     })
+}
+
+pub(crate) fn admit_alias(alias: &crate::host_path::Alias) -> io::Result<()> {
+    if !crate::host_path::valid_name(&alias.name)
+        || !alias.source.is_absolute()
+        || !SYSTEM_TREES
+            .iter()
+            .any(|tree| path_is_same_or_child(&alias.source, &Path::new("/").join(tree)))
+        || fs::canonicalize(&alias.source)? != alias.source
+    {
+        return Err(invalid(
+            "workspace PATH alias source is outside the bound tool closure",
+        ));
+    }
+    let meta = fs::symlink_metadata(&alias.source)?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(invalid("workspace PATH alias source is not executable"));
+    }
+    Ok(())
 }
 
 /// A `path` directory: named as one may be, and a directory there as it
@@ -1016,6 +1065,35 @@ mod tests {
     }
 
     #[test]
+    fn path_alias_specs_are_bounded_and_cannot_name_private_executables() {
+        let spec = parse_spec("format=1\nentry=/a\nalias=cc /usr/bin/gcc\nhome=/h\n").unwrap();
+        assert_eq!(
+            spec.aliases,
+            vec![crate::host_path::Alias {
+                name: "cc".into(),
+                source: "/usr/bin/gcc".into()
+            }]
+        );
+        for line in [
+            "alias=../cc /usr/bin/gcc",
+            "alias=cc gcc",
+            "alias=cc",
+            "alias=.. /usr/bin/gcc",
+        ] {
+            assert!(parse_spec(&format!("format=1\nentry=/a\n{line}\nhome=/h\n")).is_err());
+        }
+        let many: String = (0..=crate::host_path::MAX_ALIASES)
+            .map(|n| format!("alias=a{n} /usr/bin/gcc\n"))
+            .collect();
+        assert!(parse_spec(&format!("format=1\nentry=/a\n{many}home=/h\n")).is_err());
+        assert!(admit_alias(&crate::host_path::Alias {
+            name: "cc".into(),
+            source: "/home/private/compiler".into()
+        })
+        .is_err());
+    }
+
+    #[test]
     fn the_spec_is_an_exact_ordered_keyfile() {
         let spec = parse_spec(
             "format=1\nentry=/w/bin/td-agent\nprogram=/w/bin/td-txt\nhome=/s/home\n\
@@ -1166,6 +1244,7 @@ mod tests {
         let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
+            aliases: Vec::new(),
             path: Vec::new(),
             home: home.to_path_buf(),
             worktrees: worktrees.iter().map(|path| path.to_path_buf()).collect(),
@@ -1514,7 +1593,10 @@ mod tests {
         let keys: Vec<_> = fixed.iter().map(|(key, _)| key.clone()).collect();
         assert_eq!(keys, ["HOME", "LANG", "PATH", "TERM", "TMPDIR"]);
         assert_eq!(fixed[0].1, "/s/home");
-        assert_eq!(fixed[2].1, OsString::from(format!("{PROGRAM_DIR}:{PATH}")));
+        assert_eq!(
+            fixed[2].1,
+            OsString::from(format!("{ALIAS_DIR}:{PROGRAM_DIR}:{PATH}"))
+        );
         let searched = environment(
             Path::new("/s/home"),
             &["/gnu/store/x-profile/bin".into(), "/usr/local/sbin".into()],
@@ -1522,7 +1604,7 @@ mod tests {
         assert_eq!(
             searched[2].1,
             OsString::from(format!(
-                "/gnu/store/x-profile/bin:/usr/local/sbin:{PROGRAM_DIR}:{PATH}"
+                "{ALIAS_DIR}:/gnu/store/x-profile/bin:/usr/local/sbin:{PROGRAM_DIR}:{PATH}"
             ))
         );
     }

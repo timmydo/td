@@ -131,15 +131,6 @@ fn window(args: &[String]) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    if std::env::args_os()
-        .next()
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).file_name())
-        == Some(std::ffi::OsStr::new("cc"))
-    {
-        eprintln!("cc: {}", td_agent::review_native::compiler_alias());
-        return ExitCode::FAILURE;
-    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((first, rest)) if first == "conversation" => conversation(rest),

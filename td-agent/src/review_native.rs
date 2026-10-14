@@ -1,8 +1,7 @@
 //! Host review build tools, prepared before paid completions.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use td_json::Json;
 
@@ -15,12 +14,9 @@ const PATH_VARS: &[&str] = &[
     "PKG_CONFIG_LIBDIR",
 ];
 const TOOL_VARS: &[&str] = &["CC", "CXX", "AR", "CMAKE"];
-const MAX_PROGRAM: u64 = 256 * 1024 * 1024;
-const COMPILER: &str = "TD_AGENT_REVIEW_COMPILER";
 
 #[derive(Default)]
 pub(crate) struct Native {
-    pub aliases: Vec<PathBuf>,
     pub env: Vec<(String, String)>,
 }
 
@@ -46,12 +42,19 @@ fn executable(path: &Path) -> Option<PathBuf> {
         .then_some(named)
 }
 
-fn find(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
+fn find(
+    name: &str,
+    directories: &[PathBuf],
+    aliases: &[crate::host_path::Alias],
+) -> Option<PathBuf> {
     if Path::new(name).is_absolute() {
         return executable(Path::new(name));
     }
     if name.contains('/') {
         return None;
+    }
+    if aliases.iter().any(|alias| alias.name == name) {
+        return Some(Path::new(crate::jail::ALIAS_DIR).join(name));
     }
     directories
         .iter()
@@ -92,15 +95,12 @@ pub(crate) fn decode_environment(value: Option<&Json>) -> Result<Vec<(String, St
     let Json::Obj(fields) = value else {
         return Err("review build environment must be an object".into());
     };
-    if fields.len() > PATH_VARS.len() + TOOL_VARS.len() + 1 {
+    if fields.len() > PATH_VARS.len() + TOOL_VARS.len() {
         return Err("too many review build variables".into());
     }
     let mut out = Vec::new();
     for (key, value) in fields {
-        if !PATH_VARS.contains(&key.as_str())
-            && !TOOL_VARS.contains(&key.as_str())
-            && key != COMPILER
-        {
+        if !PATH_VARS.contains(&key.as_str()) && !TOOL_VARS.contains(&key.as_str()) {
             return Err(format!("review build environment cannot override {key}"));
         }
         let text = value
@@ -110,27 +110,6 @@ pub(crate) fn decode_environment(value: Option<&Json>) -> Result<Vec<(String, St
         out.push((key.clone(), text.into()));
     }
     Ok(out)
-}
-
-fn alias(target: &Path) -> Result<(), String> {
-    // The running image remains readable after atomic replacement/unlink.
-    let input = File::open("/proc/self/exe").map_err(|e| e.to_string())?;
-    if input.metadata().map_err(|e| e.to_string())?.len() > MAX_PROGRAM {
-        return Err("review compiler exceeds 256 MiB".into());
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o500)
-        .custom_flags(crate::store::O_NOFOLLOW)
-        .open(target)
-        .map_err(|e| e.to_string())?;
-    let count =
-        std::io::copy(&mut input.take(MAX_PROGRAM + 1), &mut output).map_err(|e| e.to_string())?;
-    if count > MAX_PROGRAM {
-        return Err("review compiler grew past 256 MiB".into());
-    }
-    fs::set_permissions(target, fs::Permissions::from_mode(0o500)).map_err(|e| e.to_string())
 }
 
 pub(crate) fn prepare(
@@ -145,6 +124,7 @@ pub(crate) fn prepare(
             directories.push(directory);
         }
     }
+    let aliases = crate::jail::host_aliases();
     let mut limitations = Vec::new();
     for key in PATH_VARS {
         if let Some(value) = std::env::var_os(key) {
@@ -163,7 +143,7 @@ pub(crate) fn prepare(
     }
     for key in TOOL_VARS {
         if let Some(value) = std::env::var_os(key) {
-            if let Some(path) = value.to_str().and_then(|v| find(v, &directories)) {
+            if let Some(path) = value.to_str().and_then(|v| find(v, &directories, &aliases)) {
                 workspace
                     .native
                     .env
@@ -172,35 +152,6 @@ pub(crate) fn prepare(
                 limitations.push(format!(
                     "{key} omitted: not one executable in the mounted host tool closure"
                 ));
-            }
-        }
-    }
-    if find("cc", &directories).is_none() {
-        if let Some(source) = ["gcc", "clang"].iter().find_map(|c| find(c, &directories)) {
-            let tools = workspace.root.join("native-tools");
-            let target = tools.join("cc");
-            let staged = (|| -> Result<String, String> {
-                fs::create_dir(&tools).map_err(|e| e.to_string())?;
-                alias(&target)?;
-                crate::sha256::sha256_file(&target).map_err(|e| e.to_string())
-            })();
-            match staged {
-                Ok(hash) => {
-                    workspace
-                        .native
-                        .env
-                        .push((COMPILER.into(), source.display().to_string()));
-                    workspace.native.aliases.push(target);
-                    journal.event(
-                        "native_tool_alias",
-                        Json::Obj(vec![
-                            ("name".into(), Json::Str("cc".into())),
-                            ("source".into(), Json::Str(source.display().to_string())),
-                            ("sha256".into(), Json::Str(hash)),
-                        ]),
-                    )?;
-                }
-                Err(why) => limitations.push(format!("cc alias preparation unavailable: {why}")),
             }
         }
     }
@@ -273,25 +224,10 @@ pub(crate) fn prepare(
         }
     }
     Ok(if limitations.is_empty() {
-        "Native C and Rust compile/link probes passed; compiler aliases and validated parent build paths are prepared automatically.".into()
+        "Native C and Rust compile/link probes passed; standard compiler commands and validated parent build paths are available.".into()
     } else {
         format!("Native build limitations: {}", limitations.join("\n"))
     })
-}
-
-/// The read-only cc program forwards to the original compiler, preserving
-/// the driver's executable-relative resource discovery.
-pub fn compiler_alias() -> std::io::Error {
-    use std::os::unix::process::CommandExt;
-    let Some(program) = std::env::var_os(COMPILER).and_then(|p| executable(Path::new(&p))) else {
-        return std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "review compiler was not prepared",
-        );
-    };
-    std::process::Command::new(program)
-        .args(std::env::args_os().skip(1))
-        .exec()
 }
 
 #[cfg(test)]
@@ -342,6 +278,7 @@ mod tests {
             "CARGO_NET_OFFLINE",
             "OPENROUTER_API_KEY",
             "RUSTFLAGS",
+            "TD_AGENT_REVIEW_COMPILER",
         ] {
             assert!(decode_environment(Some(&Json::Obj(vec![(
                 key.into(),

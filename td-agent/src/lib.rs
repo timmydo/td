@@ -53,6 +53,8 @@ pub mod frame;
 pub mod git;
 pub mod history;
 pub mod host;
+#[path = "../../engine/src/host_path.rs"]
+pub mod host_path;
 pub mod jail;
 pub mod key;
 pub mod keydialog;

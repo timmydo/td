@@ -389,12 +389,7 @@ impl Workspace {
         visible.extend([policy.home.clone(), self.root.clone(), self.objects.clone()]);
         visible.extend(self.borrowed.iter().cloned());
         journal.outside(&visible)?;
-        let spec = jail::spec_text_with(
-            &self.programs,
-            &policy,
-            &jail::system_path(std::env::var_os("PATH").as_deref()),
-            &self.native.aliases,
-        )?;
+        let spec = jail::host_spec_text(&self.programs, &policy)?;
         journal.text("jail_spec", &spec)
     }
 
@@ -634,12 +629,7 @@ impl Workspace {
         if matches!(call, host::Call::Background { .. }) {
             return Err("background processes are unavailable in the review profile".into());
         }
-        let mut client = jail::launch_review(
-            &self.programs,
-            &self.policy(),
-            &self.root.join("specs"),
-            &self.native.aliases,
-        )?;
+        let mut client = jail::launch(&self.programs, &self.policy(), &self.root.join("specs"))?;
         let id = client.call(call)?;
         let deadline = Instant::now()
             .checked_add(TOOL_TIME)

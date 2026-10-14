@@ -16,6 +16,9 @@ mod authority;
 mod bus;
 mod cgroup;
 mod firefox;
+#[allow(dead_code, reason = "shared PATH alias discovery and wire contract")]
+#[cfg_attr(not(feature = "target-recipe"), path = "../../engine/src/host_path.rs")]
+mod host_path;
 #[allow(dead_code)]
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[cfg_attr(

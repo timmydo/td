@@ -31,6 +31,7 @@ pub const JAIL_VAR: &str = "TD_AGENT_JAIL";
 pub const TXT_VAR: &str = "TD_AGENT_TXT";
 /// Where td-jail binds the spec's programs, each under its file name.
 const PROGRAM_DIR: &str = "/opt/workspace/bin";
+pub(crate) const ALIAS_DIR: &str = "/opt/workspace/path";
 /// The most of td-jail's own diagnostics kept for a report.
 const DIAGNOSTIC_KEEP: usize = 4096;
 /// The most a maintenance instance's answer may be.
@@ -53,12 +54,6 @@ pub(crate) const SYSTEM_TREES: &[&str] = &[
 
 /// The most `PATH` directories named to td-jail, which refuses more.
 const MAX_PATH_DIRECTORIES: usize = 16;
-
-/// This process's `PATH` as `system_path` keeps it, resolved at each
-/// launch, so a profile changed or collected since is followed.
-fn host_path() -> Vec<PathBuf> {
-    system_path(std::env::var_os("PATH").as_deref())
-}
 
 /// `path`'s directories as they resolve, those inside a tree every
 /// instance binds, each once, in order, at most `MAX_PATH_DIRECTORIES`:
@@ -199,17 +194,33 @@ impl Policy {
 /// The spec's text: td-jail's exact, ordered keyfile, with `path` the
 /// directories put first on the instance's `PATH`.
 pub fn spec_text(programs: &Programs, policy: &Policy, path: &[PathBuf]) -> Result<String, String> {
-    spec_text_with(programs, policy, path, &[])
+    spec_text_with_aliases(programs, policy, path, &[])
 }
 
-pub(crate) fn spec_text_with(
+pub(crate) fn host_aliases() -> Vec<crate::host_path::Alias> {
+    crate::host_path::aliases(std::env::var_os("PATH").as_deref(), |source| {
+        SYSTEM_TREES.iter().any(|tree| source.starts_with(tree))
+    })
+}
+
+pub(crate) fn host_spec_text(programs: &Programs, policy: &Policy) -> Result<String, String> {
+    let path = std::env::var_os("PATH");
+    spec_text_with_aliases(
+        programs,
+        policy,
+        &system_path(path.as_deref()),
+        &host_aliases(),
+    )
+}
+
+fn spec_text_with_aliases(
     programs: &Programs,
     policy: &Policy,
     path: &[PathBuf],
-    extra: &[PathBuf],
+    aliases: &[crate::host_path::Alias],
 ) -> Result<String, String> {
-    if extra.len() > 2 {
-        return Err("review preparation exceeds the jail's four-program limit".into());
+    if aliases.len() > crate::host_path::MAX_ALIASES {
+        return Err("too many PATH aliases".into());
     }
     let mut text = String::from("format=1\n");
     let mut line = |key: &str, path: &Path| -> Result<(), String> {
@@ -217,16 +228,25 @@ pub(crate) fn spec_text_with(
             .to_str()
             .filter(|value| path.is_absolute() && !value.contains(['\n', '\r', '\0']))
             .ok_or_else(|| format!("{} cannot be named to the jail", path.display()))?;
-        text.push_str(key);
-        text.push('=');
+        if let Some(name) = key.strip_prefix("alias=") {
+            text.push_str("alias=");
+            text.push_str(name);
+            text.push(' ');
+        } else {
+            text.push_str(key);
+            text.push('=');
+        }
         text.push_str(value);
         text.push('\n');
         Ok(())
     };
     line("entry", &programs.agent)?;
     line("program", &programs.txt)?;
-    for program in extra {
-        line("program", program)?;
+    for alias in aliases {
+        if !crate::host_path::valid_name(&alias.name) {
+            return Err("invalid PATH alias name".into());
+        }
+        line(&format!("alias={}", alias.name), &alias.source)?;
     }
     for directory in path {
         line("path", directory)?;
@@ -284,27 +304,6 @@ pub fn launch(programs: &Programs, policy: &Policy, spec_dir: &Path) -> Result<C
     launch_linked(programs, policy, spec_dir, None)
 }
 
-pub(crate) fn launch_review(
-    programs: &Programs,
-    policy: &Policy,
-    spec_dir: &Path,
-    extra: &[PathBuf],
-) -> Result<Client, String> {
-    let policy = Policy {
-        home: private_dir(&policy.home)?,
-        ..policy.clone()
-    };
-    let spec = write_spec(
-        spec_dir,
-        &spec_text_with(programs, &policy, &host_path(), extra)?,
-    )?;
-    let launched = start(programs, &policy, &spec, None);
-    if launched.is_err() {
-        let _ = fs::remove_file(&spec);
-    }
-    launched
-}
-
 /// `launch`, the tool host serving the network proxy when `linked` is
 /// given, whose links it judges and opens (DESIGN.md §10).
 pub fn launch_linked(
@@ -317,7 +316,7 @@ pub fn launch_linked(
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
-    let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
+    let spec = write_spec(spec_dir, &host_spec_text(programs, &policy)?)?;
     let launched = start(programs, &policy, &spec, linked);
     if launched.is_err() {
         let _ = fs::remove_file(&spec);
@@ -395,7 +394,7 @@ pub fn maintain(
         home: private_dir(&policy.home)?,
         ..policy.clone()
     };
-    let spec = write_spec(spec_dir, &spec_text(programs, &policy, &host_path())?)?;
+    let spec = write_spec(spec_dir, &host_spec_text(programs, &policy)?)?;
     let answered = run_maintenance(programs, &spec, task, time, &mut |ours, deadline| {
         raw_answer(ours, deadline, time)
     });
@@ -421,7 +420,7 @@ pub fn export(
         ..policy.clone()
     };
     // Checked before the file is made, so no failure leaves it.
-    let text = spec_text(programs, &policy, &host_path())?;
+    let text = host_spec_text(programs, &policy)?;
     // Made here, new, so a file that was there is neither written over
     // nor removed.
     let mut file = fs::OpenOptions::new()
@@ -771,6 +770,74 @@ impl Tail {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn path_aliases_preserve_first_matches_without_importing_private_tools() {
+        let owned = td_fs::TempDir::new("td-path-aliases").unwrap();
+        let root = fs::canonicalize(owned.path()).unwrap();
+        let system = root.join("system");
+        let local = root.join("local");
+        let earlier = root.join("earlier");
+        for dir in [&system, &local, &earlier] {
+            fs::create_dir(dir).unwrap();
+        }
+        let executable = |path: &Path| {
+            fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(&system.join("driver"));
+        executable(&earlier.join("shadowed"));
+        executable(&local.join("private-script"));
+        std::os::unix::fs::symlink(system.join("driver"), local.join("cc")).unwrap();
+        std::os::unix::fs::symlink(system.join("driver"), local.join("shadowed")).unwrap();
+        std::os::unix::fs::symlink(local.join("private-script"), local.join("outside")).unwrap();
+        std::os::unix::fs::symlink(system.join("missing"), local.join("broken")).unwrap();
+        let path = std::env::join_paths([&earlier, &local, &system]).unwrap();
+        let aliases = crate::host_path::aliases(Some(&path), |path| path.starts_with(&system));
+        assert_eq!(
+            aliases,
+            vec![crate::host_path::Alias {
+                name: "cc".into(),
+                source: system.join("driver")
+            }]
+        );
+        let policy = Policy {
+            home: root.join("home"),
+            ..Policy::default()
+        };
+        let text = spec_text_with_aliases(&programs(), &policy, &[], &aliases).unwrap();
+        assert!(text.contains(&format!(
+            "program=/w/target/td-txt\nalias=cc {}\nhome=",
+            system.join("driver").display()
+        )));
+        for name in ["", ".", "..", "../cc", "a b", "a:b", "a\ncc"] {
+            assert!(!crate::host_path::valid_name(name));
+        }
+    }
+
+    #[test]
+    fn alias_limits_do_not_disable_workspace_launches() {
+        let owned = td_fs::TempDir::new("td-path-alias-limits").unwrap();
+        let root = fs::canonicalize(owned.path()).unwrap();
+        let system = root.join("system");
+        let local = root.join("local");
+        fs::create_dir(&system).unwrap();
+        fs::create_dir(&local).unwrap();
+        let source = system.join("driver");
+        fs::write(&source, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        for n in 0..=crate::host_path::MAX_ALIASES {
+            std::os::unix::fs::symlink(&source, local.join(format!("alias{n}"))).unwrap();
+        }
+        let path = std::env::join_paths([&local, &system]).unwrap();
+        let aliases = crate::host_path::aliases(Some(&path), |path| path.starts_with(&system));
+        assert_eq!(aliases.len(), crate::host_path::MAX_ALIASES);
+        let long_path = std::env::join_paths(std::iter::repeat_n(&local, 65)).unwrap();
+        assert!(
+            crate::host_path::aliases(Some(&long_path), |path| path.starts_with(&system))
+                .is_empty()
+        );
+    }
 
     fn programs() -> Programs {
         Programs {

@@ -1401,7 +1401,33 @@ fn review_grep_alternation_works_without_an_extended_flag() {
 #[test]
 #[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host C/Rust toolchain"]
 fn native_preparation_links_plain_rust_without_agent_compiler_overrides() {
+    native_preparation_with_selectors(false);
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL, TD_AGENT_TXT and a host C/Rust toolchain"]
+fn native_preparation_preserves_inherited_bare_tool_selectors() {
+    native_preparation_with_selectors(true);
+}
+
+fn native_preparation_with_selectors(inherit_selectors: bool) {
     let fixture = Fixture::new();
+    let host_bin = fixture.root.join("host-bin");
+    fs::create_dir(&host_bin).unwrap();
+    let parent_path = std::env::var_os("PATH").unwrap();
+    let system = td_agent::jail::system_path(Some(&parent_path));
+    for (name, driver) in [("cc", "gcc"), ("c++", "g++"), ("review-cat", "cat")] {
+        let source = system
+            .iter()
+            .map(|dir| dir.join(driver))
+            .find(|path| path.is_file())
+            .unwrap();
+        std::os::unix::fs::symlink(fs::canonicalize(source).unwrap(), host_bin.join(name)).unwrap();
+    }
+    let inherited_path = std::env::join_paths(
+        std::iter::once(host_bin.clone()).chain(std::env::split_paths(&parent_path)),
+    )
+    .unwrap();
     let mock = MockFetch::start(
         &fixture.root.join("run"),
         vec![
@@ -1410,15 +1436,24 @@ fn native_preparation_links_plain_rust_without_agent_compiler_overrides() {
                 "cargo_test",
                 Json::Obj(vec![("filter".into(), Json::Str("fixture_passes".into()))]),
             ),
+            tool(
+                "shell",
+                Json::Obj(vec![(
+                    "command".into(),
+                    Json::Str("set -eu; if [ -n \"${CC:-}\" ]; then test \"$CC\" = /opt/workspace/path/cc; test \"$CXX\" = /opt/workspace/path/c++; fi; mkdir -p \"$CARGO_TARGET_DIR\"; printf '%s\\n' '#include <vector>' 'int main() { std::vector<int> v{1,2}; return v.size() != 2; }' > \"$CARGO_TARGET_DIR/native.cpp\"; c++ \"$CARGO_TARGET_DIR/native.cpp\" -o \"$CARGO_TARGET_DIR/native-cpp\"; \"$CARGO_TARGET_DIR/native-cpp\"; echo CXX_OK; review-cat /opt/workspace/path/../does-not-exist 2>/dev/null && exit 1; printf ALIAS_OK | review-cat; if rm /opt/workspace/path/cc; then echo TOOLCHAIN_WRITABLE; exit 1; else echo TOOLCHAIN_READ_ONLY; fi".into()),
+                )]),
+            ),
             fixture.final_reply(),
         ],
     );
-    let result = fixture
-        .command(&mock, "0.02")
-        .env_remove("CC")
-        .env_remove("CXX")
-        .output()
-        .unwrap();
+    let mut command = fixture.command(&mock, "0.02");
+    command.env("PATH", inherited_path);
+    if inherit_selectors {
+        command.env("CC", "cc").env("CXX", "c++");
+    } else {
+        command.env_remove("CC").env_remove("CXX");
+    }
+    let result = command.output().unwrap();
     assert!(
         result.status.success(),
         "{}",
@@ -1437,8 +1472,31 @@ fn native_preparation_links_plain_rust_without_agent_compiler_overrides() {
             .join("\n")
     );
     assert!(requests[2].text().contains("1 passed; 0 failed"));
+    assert!(requests[3].text().contains("CXX_OK"));
+    assert!(requests[3].text().contains("ALIAS_OK"));
+    assert!(fixture.logs()[0].contains("alias=review-cat "));
+    assert!(requests[3].text().contains("TOOLCHAIN_READ_ONLY"));
+    assert!(requests[3].text().contains("Read-only file system"));
     let log = fixture.logs().remove(0);
     let events: Vec<Json> = log.lines().map(|l| td_json::parse(l).unwrap()).collect();
+    if inherit_selectors {
+        let environment = events
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(Json::as_str) == Some("native_build_environment")
+            })
+            .unwrap();
+        assert_eq!(
+            environment.get_path(&["data", "CC"]).and_then(Json::as_str),
+            Some("/opt/workspace/path/cc")
+        );
+        assert_eq!(
+            environment
+                .get_path(&["data", "CXX"])
+                .and_then(Json::as_str),
+            Some("/opt/workspace/path/c++")
+        );
+    }
     let probes: Vec<_> = events
         .iter()
         .filter(|e| e.get("kind").and_then(Json::as_str) == Some("native_build_preflight"))
@@ -1450,6 +1508,8 @@ fn native_preparation_links_plain_rust_without_agent_compiler_overrides() {
     assert!(events
         .iter()
         .any(|e| e.get("kind").and_then(Json::as_str) == Some("billing_key_sha256")));
+    assert!(!log.contains("TD_AGENT_REVIEW_COMPILER"));
+    assert!(!log.contains("native_tool_alias"));
     fixture.no_workspaces();
 }
 

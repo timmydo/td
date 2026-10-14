@@ -53,6 +53,7 @@ const STAGE2_ARGUMENTS_ARG: &str = "--arguments";
 const STAGE2_WORKSPACE_ARG: &str = "--workspace";
 const STAGE2_PROGRAMS_ARG: &str = "--programs";
 const STAGE2_PATH_ARG: &str = "--path";
+const STAGE2_ALIASES_ARG: &str = "--path-aliases";
 const STAGE2_HOME_ARG: &str = "--home";
 const STAGE2_WORKTREES_ARG: &str = "--worktrees";
 const STAGE2_REPOSITORIES_ARG: &str = "--repositories";
@@ -424,6 +425,7 @@ pub enum Stage2Action {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Workspace {
     programs: Vec<String>,
+    aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
     home: PathBuf,
     worktrees: Vec<PathBuf>,
@@ -6561,6 +6563,12 @@ fn stage2_workspace_arguments(
             .iter()
             .map(|program| OsString::from(&program.name)),
     );
+    stage2.push(OsString::from(STAGE2_ALIASES_ARG));
+    stage2.push(OsString::from(plan.aliases.len().to_string()));
+    for alias in &plan.aliases {
+        stage2.push(OsString::from(&alias.name));
+        stage2.push(alias.source.as_os_str().to_os_string());
+    }
     stage2.push(OsString::from(STAGE2_PATH_ARG));
     stage2.push(OsString::from(plan.path.len().to_string()));
     stage2.extend(
@@ -6642,6 +6650,26 @@ where
             return Err(usage_error());
         }
         programs.push(name);
+    }
+    expect(STAGE2_ALIASES_ARG, args)?;
+    let count = parse_count(args.next(), "PATH alias count")?;
+    if count > crate::host_path::MAX_ALIASES {
+        return Err(usage_error());
+    }
+    let mut aliases: Vec<crate::host_path::Alias> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = args
+            .next()
+            .ok_or_else(usage_error)?
+            .into_string()
+            .map_err(|_| usage_error())?;
+        let source = tree(args.next())?;
+        let alias = crate::host_path::Alias { name, source };
+        workspace::admit_alias(&alias)?;
+        if aliases.iter().any(|known| known.name == alias.name) {
+            return Err(usage_error());
+        }
+        aliases.push(alias);
     }
     expect(STAGE2_PATH_ARG, args)?;
     let count = parse_count(args.next(), "path count")?;
@@ -6745,6 +6773,7 @@ where
     expect(STAGE2_ARGUMENTS_ARG, args)?;
     let plan = Stage2Workspace {
         programs,
+        aliases,
         path,
         home,
         worktrees,
@@ -6814,6 +6843,14 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         }
     }
     create_dir(&format!("{NEW_ROOT}{}", workspace::PROGRAM_DIR), 0o755)?;
+    create_dir(&format!("{NEW_ROOT}{}", workspace::ALIAS_DIR), 0o755)?;
+    for alias in &plan.aliases {
+        workspace::admit_alias(alias)?;
+        symlink(
+            &alias.source,
+            format!("{NEW_ROOT}{}/{}", workspace::ALIAS_DIR, alias.name),
+        )?;
+    }
     let dev = prepare_base_mounts(identity, false, true)?;
     for name in workspace::SYSTEM_TREES {
         bind_system_tree(name)?;
@@ -7113,7 +7150,22 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
         }
     }
     require_names("/opt", &["workspace"])?;
-    require_names("/opt/workspace", &["bin"])?;
+    require_names("/opt/workspace", &["bin", "path"])?;
+    let alias_names: Vec<&str> = plan
+        .aliases
+        .iter()
+        .map(|alias| alias.name.as_str())
+        .collect();
+    require_names(workspace::ALIAS_DIR, &alias_names)?;
+    for alias in &plan.aliases {
+        workspace::admit_alias(alias)?;
+        let target = Path::new(workspace::ALIAS_DIR).join(&alias.name);
+        if fs::read_link(&target)? != alias.source {
+            return Err(io::Error::other(
+                "workspace PATH alias is not its planned target",
+            ));
+        }
+    }
     let names: Vec<&str> = plan.programs.iter().map(String::as_str).collect();
     require_names(workspace::PROGRAM_DIR, &names)?;
     for name in &names {
@@ -7504,6 +7556,7 @@ mod tests {
         };
         let plan = Stage2Workspace {
             programs: vec!["a".into()],
+            aliases: Vec::new(),
             path: Vec::new(),
             home: "/h".into(),
             worktrees: Vec::new(),
@@ -7567,6 +7620,7 @@ mod tests {
                     inode: 4,
                 },
             ],
+            aliases: Vec::new(),
             path: vec!["/gnu/store/x-profile/bin".into()],
             home: grant("/s/home", false),
             worktrees: vec![grant("/w/a", false)],
@@ -7643,42 +7697,42 @@ mod tests {
         const NONE: &str = "--repositories 0 --git-chain 0";
         for bad in [
             // A working directory that is not the first worktree.
-            format!("--programs 1 a --path 0 --home /h --worktrees 1 /w {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 1 /w {NONE} --shared 0 --working-directory /h --arguments"),
             // Overlapping trees.
-            format!("--programs 1 a --path 0 --home /h --worktrees 1 /h/w {NONE} --shared 0 --working-directory /h/w --arguments"),
-            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 2 /d ro /d/e rw --working-directory /h --arguments"),
-            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /h/r --git-chain 0 --shared 0 --working-directory /h --arguments".into(),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 1 /h/w {NONE} --shared 0 --working-directory /h/w --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 {NONE} --shared 2 /d ro /d/e rw --working-directory /h --arguments"),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 1 /h/r --git-chain 0 --shared 0 --working-directory /h --arguments".into(),
             // A chain link outside every repository and worktree, at a
             // top, twice, or a writable file; in a worktree, anything
             // but its `.git` file, read-only.
-            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /h/x ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/x ro file --shared 0 --working-directory /w --arguments".into(),
-            "--programs 1 a --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/.git ro dir --shared 0 --working-directory /w --arguments".into(),
-            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 2 /r/x ro dir /r/x ro dir --shared 0 --working-directory /h --arguments".into(),
-            "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r/x rw file --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /h/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/x ro file --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 1 /w --repositories 0 --git-chain 1 /w/.git ro dir --shared 0 --working-directory /w --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 2 /r/x ro dir /r/x ro dir --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 1 /r --git-chain 1 /r/x rw file --shared 0 --working-directory /h --arguments".into(),
             // A program name that is a path.
-            format!("--programs 1 ../a --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 0 --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 1 /d rx --working-directory /h --arguments"),
-            format!("--programs 1 a --path 0 --home h --worktrees 0 {NONE} --shared 0 --working-directory h --arguments"),
-            format!("--programs 1 a --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h"),
+            format!("--programs 1 ../a --path-aliases 0 --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 0 --path-aliases 0 --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 {NONE} --shared 1 /d rx --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home h --worktrees 0 {NONE} --shared 0 --working-directory h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h"),
             // A path directory outside the bound trees, of a bad name or
             // twice; and the shape before `--path`.
-            format!("--programs 1 a --path 1 /home/u/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 1 a --path 1 /usr/a:b --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 1 a --path 2 /usr/bin /usr/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
-            format!("--programs 1 a --path 17 {} --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments", (0..17).map(|n| format!("/usr/{n}")).collect::<Vec<_>>().join(" ")),
+            format!("--programs 1 a --path-aliases 0 --path 1 /home/u/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 1 /usr/a:b --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 2 /usr/bin /usr/bin --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
+            format!("--programs 1 a --path-aliases 0 --path 17 {} --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments", (0..17).map(|n| format!("/usr/{n}")).collect::<Vec<_>>().join(" ")),
             format!("--programs 1 a --home /h --worktrees 0 {NONE} --shared 0 --working-directory /h --arguments"),
             // The old shape, without repositories or a chain.
-            "--programs 1 a --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
+            "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
                 parse_stage2_workspace(&mut words(&bad).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good = "--programs 1 a --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
+        let good = "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
     }
     use crate::authority::{

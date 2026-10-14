@@ -559,7 +559,8 @@ pub(crate) fn provision_cc(env: &ProvisionEnv) -> Result<String, ProvisionErr> {
                     d.display()
                 )));
             }
-            return Ok(d.to_string_lossy().into_owned());
+            // A user compiler alias does not identify the binutils directory.
+            return Ok(env.search_path.clone());
         }
     }
 
@@ -1796,6 +1797,22 @@ mod tests {
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn host_cc_alias_keeps_binutils_from_the_parent_path() {
+        let owned = crate::test_temp::TempDir::new("host-cc-alias").unwrap();
+        let local = owned.path().join("local");
+        let tools = owned.path().join("tools");
+        std::fs::create_dir(&local).unwrap();
+        exec_file(&tools.join("gcc"));
+        exec_file(&tools.join("ar"));
+        std::os::unix::fs::symlink(tools.join("gcc"), local.join("cc")).unwrap();
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", local.display(), tools.display());
+        let path = provision_cc(&env).unwrap();
+        assert_eq!(find_in_path(&path, "cc"), Some(local.join("cc")));
+        assert_eq!(find_in_path(&path, "ar"), Some(tools.join("ar")));
     }
 
     #[test]

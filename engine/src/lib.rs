@@ -70,6 +70,7 @@ pub mod exit;
 pub mod fat;
 pub mod gpt;
 pub mod gzip;
+pub mod host_path;
 pub mod iso9660;
 pub mod json;
 pub mod local_source;
