@@ -18,6 +18,42 @@ impl Drop for Credentials {
         std::hint::black_box(&mut self.0);
     }
 }
+/// Presented bytes only, never proof of an active device or account access.
+/// Keep on the bounded request worker and discard when that request finishes.
+/// Deliberately neither Debug nor Clone; Drop clears the decoded buffer.
+pub struct BasicCredentials {
+    decoded: Credentials,
+    password: std::ops::Range<usize>,
+}
+impl BasicCredentials {
+    /// Borrow only for fresh storage authentication or publication fencing.
+    pub fn password(&self) -> &[u8] {
+        self.decoded.0.get(self.password.clone()).unwrap_or(&[])
+    }
+}
+
+/// Parse only after the actual TLS handshake, configured-origin checks and
+/// attempt admission. The caller must authenticate these bytes against its
+/// storage backend; successful parsing grants no authority.
+pub fn parse_basic(username: &str, header: Option<&str>) -> Option<BasicCredentials> {
+    let (scheme, token) = header?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let token = token.trim_start_matches(' ').as_bytes();
+    let mut credentials = Credentials([0; DECODED]);
+    let length = decode(token, &mut credentials.0)?;
+    let decoded = credentials.0.get(..length)?;
+    let colon = decoded.iter().position(|byte| *byte == b':')?;
+    if decoded.get(..colon) != Some(username.as_bytes()) {
+        return None;
+    }
+    Some(BasicCredentials {
+        decoded: credentials,
+        password: colon + 1..length,
+    })
+}
+
 /// Call only after the actual TLS handshake and configured-origin checks.
 /// This observation is not a mutation guard or permanent connection authority.
 pub fn basic(
@@ -25,27 +61,10 @@ pub fn basic(
     username: &str,
     header: Option<&str>,
 ) -> Result<Option<DeviceId>, DeviceError> {
-    let Some((scheme, token)) = header.and_then(|header| header.split_once(' ')) else {
-        return Ok(None);
-    };
-    if !scheme.eq_ignore_ascii_case("Basic") {
-        return Ok(None);
+    match parse_basic(username, header) {
+        Some(credentials) => store.authenticate(credentials.password()),
+        None => Ok(None),
     }
-    let token = token.trim_start_matches(' ').as_bytes();
-    let mut credentials = Credentials([0; DECODED]);
-    let Some(length) = decode(token, &mut credentials.0) else {
-        return Ok(None);
-    };
-    let Some(decoded) = credentials.0.get(..length) else {
-        return Ok(None);
-    };
-    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
-        return Ok(None);
-    };
-    if decoded.get(..colon) != Some(username.as_bytes()) {
-        return Ok(None);
-    }
-    store.authenticate(decoded.get(colon + 1..).ok_or(DeviceError::Invalid)?)
 }
 
 /// Binds upload commits and blob-read admission to the live device registry. Callers may
@@ -485,6 +504,38 @@ mod tests {
             absent.authorize_blob(account, device, deadline),
             Err(Error::Forbidden)
         ));
+    }
+    #[test]
+    fn parsed_credentials_are_owned_bounded_and_not_authentication() {
+        let header = String::from("bAsIc   dTpw");
+        let credentials = parse_basic("u", Some(&header));
+        drop(header);
+        assert_eq!(
+            credentials.as_ref().map(BasicCredentials::password),
+            Some(&b"p"[..])
+        );
+        // Empty and malformed app passwords still require backend checking;
+        // parsing must not turn their syntax into authentication evidence.
+        assert_eq!(
+            parse_basic("u", Some("Basic dTo="))
+                .as_ref()
+                .map(BasicCredentials::password),
+            Some(&b""[..])
+        );
+        for header in [
+            None,
+            Some("Bearer dTpw"),
+            Some("Basic dQ=="),
+            Some("Basic dTp="),
+            Some("Basic dTpw\n"),
+            Some("Basic dTpw "),
+        ] {
+            assert!(parse_basic("u", header).is_none());
+        }
+        assert!(parse_basic("other", Some("Basic dTpw")).is_none());
+        assert!(parse_basic("U", Some("Basic dTpw")).is_none());
+        let oversized = format!("Basic {}", "dTpw".repeat(DECODED));
+        assert!(parse_basic("u", Some(&oversized)).is_none());
     }
     #[test]
     fn canonical_basic_base64_only() {

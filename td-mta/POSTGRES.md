@@ -2060,3 +2060,21 @@ No runtime pool, listener or automatic retry is activated by this increment.
 The real PostgreSQL fixture loads both profiles and exercises read/unread/star
 mutations, batch receipts and lost-COMMIT handling through the dedicated
 runtime login; privilege changes are refused on the next connection.
+
+## 57. Request credential ownership
+
+`http_auth::parse_basic` separates bounded HTTP Basic decoding and exact
+configured-username matching from storage authentication. Its owned
+`BasicCredentials` retains at most 352 decoded bytes, has no Debug or Clone
+implementation, and clears its decoded buffer on drop. It contains presented
+bytes only, not a device ID, cached verifier result or authorization grant.
+The existing local `basic` adapter uses this same parser and still checks the
+local registry before returning a device ID.
+
+At PostgreSQL cutover the bounded HTTPS request worker may retain this owner
+for that request only, borrowing its password for fresh primary snapshot and
+publication checks. It must not cache the owner across requests or replace
+those checks with the result of earlier authentication. TLS, configured-origin
+and attempt admission precede parsing. Invalid password syntax still goes to
+the backend's credential check; HTTP decoding is not app-password validation.
+No PostgreSQL listener or alternative production backend is activated here.
