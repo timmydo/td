@@ -147,7 +147,7 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
     )
 }
 /// Prepared singleton Email/set. Refuse mixed requests before any effect;
-/// this path has no native read adapter or draft/deletion implementation.
+/// this path has no native read adapter or draft implementation.
 pub fn run_with_postgres_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,

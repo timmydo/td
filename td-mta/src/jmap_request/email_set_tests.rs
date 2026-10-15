@@ -5,7 +5,7 @@ use crate::{
     ids::{AccountId, DeviceId, StoreEpoch},
     jmap_request::{dispatch, resolution, response, CORE, MAIL},
     limits::Limits,
-    ports::{Deadline, Tick, ViewIdentity},
+    ports::{Deadline, Tick},
     wire,
 };
 use std::cell::RefCell;
@@ -69,12 +69,8 @@ impl EmailMutator for Flags {
             return Err(ports::Error::Conflict.into());
         }
         Ok(EmailDestroyCompletion {
-            before: ViewIdentity {
-                account: ACCOUNT,
-                epoch: StoreEpoch::from_bytes([7; 16]),
-                committed_sequence: Sequence::from_u64(3),
-                history_floor: Sequence::default(),
-            },
+            before_epoch: StoreEpoch::from_bytes([7; 16]),
+            before_sequence: Sequence::from_u64(3),
             outcome: self.commit_error.map_or(Ok(Sequence::from_u64(4)), Err),
             results: if self.broken {
                 Vec::new()

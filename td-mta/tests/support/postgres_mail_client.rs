@@ -160,6 +160,7 @@ pub(super) fn exercise(
     )
     .unwrap();
     postgres_receiving::publish(request, trust, deadline(), &delivery).unwrap();
+    let cloud_binding = cloud.binding().clone();
     drop(cloud);
     let runtime = fixture.root.join("real-client");
     fs::create_dir(&runtime).unwrap();
@@ -325,6 +326,25 @@ pub(super) fn exercise(
                 assert_eq!(listing["emails"][0]["id"], email["id"]);
                 assert_eq!(listing["emails"][0]["blob_id"], email["blob_id"]);
             }
+            let usage_before = sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage");
+            let extra = postgres_receiving::prepare(&cloud_binding, &postgres_receiving::Message {
+                bytes: message.as_bytes(), hostname: "localhost", extended: true, header_bytes: 65536,
+                received_at: 1_700_000_000_000,
+                receipt: SmtpReceipt { peer: "192.0.2.1".parse().unwrap(), tls: ReceiptTls::Tls13, gateway: None,
+                    ehlo: "sender.example.test", reverse_path: "sender@example.test", recipients },
+            }, deadline()).unwrap();
+            postgres_receiving::publish(request, trust, deadline(), &extra).unwrap();
+            let mut extra_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+            let extra_wire = td_mta::wire::encode_id(extra.email(), &mut extra_wire).unwrap();
+            let listing = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire, "limit":50}));
+            assert_eq!(listing["emails"].as_array().unwrap().len(), 2, "{listing}");
+            let deleted = client.ask(json!({"command":"destroy", "id":extra_wire}));
+            assert!(deleted["results"][0]["ok"].is_true(), "{deleted}");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "1");
+            assert_eq!(sql(fixture, "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage"), usage_before);
+            let listing = client.ask(json!({"command":"query_emails", "mailbox_id":inbox_wire, "limit":50}));
+            assert_eq!(listing["emails"].as_array().unwrap().len(), 1, "{listing}");
+            assert_eq!(listing["emails"][0]["id"], email["id"]);
             assert_eq!(pending.operation().unwrap(), None);
             sql(fixture, "CREATE FUNCTION public.refuse_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit uncertainty'; END $$; CREATE CONSTRAINT TRIGGER refuse_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refuse_client_commit()");
             let uncertain = client.ask(json!({"command":"flag", "id":email["id"]}));
@@ -444,6 +464,59 @@ pub(super) fn exercise(
     assert!(settled.outcome.state.new_sequence > settled.outcome.state.old_sequence);
     assert_eq!(confirmed.operation().unwrap(), None);
     drop((first, second));
+    sql(fixture, "CREATE FUNCTION public.delay_destroy_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_destroy_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_destroy_commit()");
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
+    let mut meter = td_mta::admission::work::Meter::new(
+        until,
+        td_mta::admission::work::Charge {
+            records: 10000,
+            ..Default::default()
+        },
+    );
+    let completion = td_mta::jmap_request::dispatch::EmailMutator::destroy(
+        &updates,
+        td_mta::store_fs::EmailDestroyRequest {
+            account: binding.account(),
+            device: device.device_id(),
+            expected: None,
+            emails: &[email],
+            deadline: until,
+        },
+        &mut meter,
+    )
+    .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        Err(td_mta::ports::CommitFailure::Indeterminate(_))
+    ));
+    let operation = confirmed.operation().unwrap().unwrap();
+    thread::sleep(Duration::from_secs(5));
+    sql(fixture, "DROP TRIGGER delay_destroy_commit ON td_mta.flag_receipts; DROP FUNCTION public.delay_destroy_commit()");
+    let settled = confirmed
+        .settle(
+            &loaded,
+            executable,
+            &settlement_slots,
+            &clock,
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(
+        settled.outcome.results,
+        [td_mta::postgres_email_set::UpdateResult::Destroyed]
+    );
+    assert_eq!(confirmed.operation().unwrap(), None);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT body_bytes||':'||blob_count FROM td_mta.account_usage"
+        ),
+        "0:0"
+    );
+
     assert_eq!(responses.used().unwrap(), 0);
     assert!(!responses.admission_stopped());
 }

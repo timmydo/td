@@ -96,9 +96,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             }
             let old = DataState {
                 account: self.account,
-                epoch: complete.before.epoch,
+                epoch: complete.before_epoch,
                 kind: DataType::Email,
-                sequence: complete.before.committed_sequence,
+                sequence: complete.before_sequence,
             };
             let new = DataState { sequence, ..old };
             let mut before = [0; DataState::WIRE_BYTES];

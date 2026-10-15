@@ -4379,7 +4379,7 @@ fn deletion_batch_retires_shared_thread_once_and_records_all_object_changes() {
                 (ObjectType::Mailbox, 1, ChangeAction::Updated),
             ] {
                 let mut cursor = ChangeCursor {
-                    sequence: complete.before.committed_sequence,
+                    sequence: complete.before_sequence,
                     operation: u32::MAX,
                 };
                 let mut count = 0;

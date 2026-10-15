@@ -2492,8 +2492,8 @@ It closes its authenticated read snapshot before mutation and reserves a
 connection slot before fresh DNS. Runtime connections check the selected
 profile, account, device secret and optional Email state under transaction
 locks. Read-only batches retain their existing single snapshot. Mixed batches
-cannot invoke this mutation adapter. Draft creation and deletion remain
-outside this prepared endpoint; §80 connects mailbox moves.
+cannot invoke this mutation adapter. Draft creation remains outside this
+prepared endpoint; §80 connects mailbox moves and §81 connects deletion.
 
 One process-lifetime Pending owner serializes flag mutations without waiting.
 An uncertain COMMIT retains the exact Change and refuses new flag writes
@@ -2546,3 +2546,27 @@ requests without new retry identities. The real-client fixture prepares an
 Archive folder through the existing storage helper, moves Inbox to Archive
 and back, checks database membership and unchanged flags, and queries the
 same Email/body ID after each move. This does not activate production serving.
+
+
+## 81. Prepared Email deletion
+
+The singleton Email/set endpoint connects td-mail's destroy action to the
+existing PostgreSQL deletion transaction. It retains distinct update and
+deletion operation types through publication and receipt settlement; a
+historical receipt resolves only its original operation. Both share the same
+nonwaiting mutation owner and connection admission. Authentication, selected
+profile, expected state, per-object absence, history, last-owner body removal
+and quota release remain governed by the existing transaction.
+
+Both protocol completions carry only the original epoch/sequence, without a
+fabricated read history floor. Typed output vectors reserve their bounded
+capacity before effects. Deletion prepays work for bounded keyword,
+membership, Thread-owner and blob-owner observations, validates result kinds
+before releasing the pending operation, and preserves known COMMIT results
+through late local expiry.
+
+The real td-mail fixture delivers a second message and permanently deletes it,
+checks authoritative Email and quota state, and confirms the first message
+still reads and downloads. A delayed deletion COMMIT is settled through its
+original receipt and releases the final body quota. Draft creation and
+production PostgreSQL activation remain separate.

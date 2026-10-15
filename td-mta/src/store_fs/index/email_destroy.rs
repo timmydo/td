@@ -19,7 +19,8 @@ pub enum EmailDestroyResult {
 #[derive(Debug)]
 #[must_use = "only a known commit makes the planned deletions durable"]
 pub struct EmailDestroyCompletion {
-    pub before: ViewIdentity,
+    pub before_epoch: StoreEpoch,
+    pub before_sequence: Sequence,
     pub outcome: Result<Sequence, CommitError>,
     /// Planned per-object outcomes; durable only when outcome is Ok.
     pub results: Vec<EmailDestroyResult>,
@@ -327,7 +328,8 @@ impl<P: EmailUpdateAuthorization> StoreCoordinator<'_, '_, P> {
         }
         drop(guard);
         Ok(EmailDestroyCompletion {
-            before,
+            before_epoch: before.epoch,
+            before_sequence: before.committed_sequence,
             outcome,
             results,
             admission_stopped: state.stopped,
