@@ -337,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 15);
+    assert_eq!(receipt.version, 16);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -414,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        15
+        16
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -539,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":15"));
+    assert!(initialized.contains("\"schema_version\":16"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -710,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 15);
+    assert_eq!(receipt.version, 16);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1212,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "33");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "35");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1306,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1324,6 +1324,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_mailbox_create.sql"),
             include_str!("../src/postgres_receiving.sql"),
             include_str!("../src/postgres_submissions.sql"),
+            include_str!("../src/postgres_submission_routes.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1360,6 +1361,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             12 => "receiving_receipts",
             13 => "submission_receipts",
             14 => "submission_routes",
+            15 => "route_owners",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1393,7 +1395,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 15);
+        assert_eq!(receipt.version, 16);
         assert_eq!(
             sql(&fixture, "SELECT count(*) FROM td_mta.submission_routes"),
             "0"
@@ -6474,6 +6476,7 @@ fn exercise_submission_publication(
     )
     .unwrap();
     assert!(relay.binding().serves_route(first.route()));
+    exercise_route_owners(fixture, request, trust, relay.binding(), binding);
     assert_eq!(
         delivery_body::with_submission(
             request,
@@ -6912,4 +6915,194 @@ fn exercise_submission_publication(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{}','hex') AND state=1",a.submission)),"2");
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
     read_outgoing().unwrap();
+}
+
+fn exercise_route_owners(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    relay: &td_mta::postgres_runtime_profile::Binding,
+    jmap: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{ids::BootId, postgres_route_owners as owners};
+    let boot = BootId::from_bytes([1; 16]);
+    assert!(matches!(
+        owners::prepare(jmap, boot),
+        Err(owners::Error::Policy)
+    ));
+    let first = owners::prepare(relay, boot).unwrap();
+    assert_eq!(
+        owners::inspect(request, trust, deadline(), &first).unwrap(),
+        None
+    );
+    let (one, two) = thread::scope(|scope| {
+        let one = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
+        let two = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
+        (one.join().unwrap().unwrap(), two.join().unwrap().unwrap())
+    });
+    assert_eq!(one, two);
+    assert_eq!(one.generation, 1);
+    assert_eq!(one.expires_at - one.claimed_at, owners::LEASE_MS);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.route_owner_receipts"),
+        "1"
+    );
+    // Stage a receipt appearing after inspection while policy changes.
+    use std::io::Write;
+    let mut blocker = ProbeChild(
+        sql_command(fixture)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = blocker.0.stdin.take().unwrap();
+    writeln!(input, "CREATE TEMP TABLE saved_owner_receipt AS SELECT * FROM td_mta.route_owner_receipts WHERE operation=decode('{}','hex'); DELETE FROM td_mta.route_owner_receipts WHERE operation=decode('{}','hex'); BEGIN; SELECT singleton FROM td_mta.config_selection WHERE singleton=true FOR UPDATE;", first.operation(), first.operation()).unwrap();
+    let stop = deadline();
+    while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-schema-fixture' AND state='idle in transaction' AND query LIKE '%FROM td_mta.config_selection%'") != "1" {
+        assert!(Instant::now() < stop, "owner replay barrier not held");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::scope(|scope| {
+        let pending = scope.spawn(|| owners::acquire(request, trust, deadline(), &first));
+        let stop = deadline();
+        while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND wait_event_type='Lock' AND query LIKE 'SELECT generation,version_id FROM td_mta.config_selection%'") != "1" {
+            assert!(Instant::now() < stop, "owner replay did not reach barrier");
+            thread::sleep(Duration::from_millis(5));
+        }
+        writeln!(input, "INSERT INTO td_mta.route_owner_receipts SELECT * FROM saved_owner_receipt; UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex'); COMMIT;").unwrap();
+        drop(input);
+        wait_command(&mut blocker);
+        assert_eq!(pending.join().unwrap().unwrap(), one);
+    });
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex')",
+            relay.selection().generation
+        ),
+    );
+    let second = owners::prepare(relay, BootId::from_bytes([2; 16])).unwrap();
+    assert_eq!(
+        owners::acquire(request, trust, deadline(), &second),
+        Err(owners::Error::Busy)
+    );
+    assert_eq!(
+        owners::observe(request, trust, deadline(), &first, one.generation).unwrap(),
+        one.expires_at
+    );
+    let renewed = owners::renew(request, trust, deadline(), &first, one.generation).unwrap();
+    assert!(renewed >= one.expires_at);
+    assert_eq!(
+        owners::observe(request, trust, deadline(), &first, one.generation).unwrap(),
+        renewed
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(
+        owners::renew(request, trust, deadline(), &first, one.generation),
+        Err(owners::Error::Policy)
+    );
+    assert_eq!(
+        owners::acquire(request, trust, deadline(), &first).unwrap(),
+        one
+    );
+    owners::release(request, trust, deadline(), &first, one.generation).unwrap();
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex')",
+            relay.selection().generation
+        ),
+    );
+    assert_eq!(
+        owners::observe(request, trust, deadline(), &first, one.generation),
+        Err(owners::Error::Stale)
+    );
+    let next = owners::acquire(request, trust, deadline(), &second).unwrap();
+    assert_eq!(next.generation, 2);
+    assert_eq!(
+        owners::renew(request, trust, deadline(), &first, one.generation),
+        Err(owners::Error::Stale)
+    );
+    assert_eq!(
+        owners::release(request, trust, deadline(), &first, one.generation),
+        Err(owners::Error::Stale)
+    );
+    let clock = sql(fixture, "SELECT last_clock FROM td_mta.route_owners");
+    sql(
+        fixture,
+        "UPDATE td_mta.route_owners SET last_clock=last_clock+60000,expires_at=expires_at+60000",
+    );
+    assert_eq!(
+        owners::renew(request, trust, deadline(), &second, next.generation),
+        Err(owners::Error::Clock)
+    );
+    sql(fixture,&format!("UPDATE td_mta.route_owners SET last_clock={clock},expires_at={clock}+1; SELECT pg_sleep(0.02)"));
+    assert_eq!(
+        owners::renew(request, trust, deadline(), &second, next.generation),
+        Err(owners::Error::Stale)
+    );
+    let third = owners::prepare(relay, BootId::from_bytes([3; 16])).unwrap();
+    let takeover = owners::acquire(request, trust, deadline(), &third).unwrap();
+    assert_eq!(takeover.generation, 3);
+    assert_eq!(
+        owners::release(request, trust, deadline(), &second, next.generation),
+        Err(owners::Error::Stale)
+    );
+    owners::release(request, trust, deadline(), &third, takeover.generation).unwrap();
+    sql(fixture,"CREATE FUNCTION public.delay_owner() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owner AFTER INSERT ON td_mta.route_owner_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owner()");
+    let uncertain = owners::prepare(relay, boot).unwrap();
+    assert_eq!(
+        owners::acquire(
+            request,
+            trust,
+            Instant::now() + Duration::from_millis(1500),
+            &uncertain
+        ),
+        Err(owners::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    let recovered = owners::inspect(request, trust, deadline(), &uncertain)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.generation, 4);
+    assert_eq!(
+        owners::acquire(request, trust, deadline(), &uncertain).unwrap(),
+        recovered
+    );
+    owners::release(request, trust, deadline(), &uncertain, recovered.generation).unwrap();
+    sql(
+        fixture,
+        "DROP TRIGGER delay_owner ON td_mta.route_owner_receipts",
+    );
+    let pending = owners::prepare(relay, boot).unwrap();
+    sql(
+        fixture,
+        "UPDATE td_mta.route_owners SET generation=decode(repeat('ff',8),'hex')",
+    );
+    assert_eq!(
+        owners::acquire(request, trust, deadline(), &pending),
+        Err(owners::Error::Capacity)
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.route_owners SET generation=decode('0000000000000004','hex')",
+    );
+    sql(fixture,"INSERT INTO td_mta.route_owner_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),generation,claimed_at,expires_at FROM (SELECT * FROM td_mta.route_owner_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
+    assert_eq!(
+        owners::acquire(request, trust, deadline(), &pending),
+        Err(owners::Error::Capacity)
+    );
+    sql(fixture,"DELETE FROM td_mta.route_owner_receipts WHERE request_digest=decode(repeat('00',32),'hex')");
+    let last = owners::acquire(request, trust, deadline(), &pending).unwrap();
+    assert_eq!(last.generation, 5);
+    owners::release(request, trust, deadline(), &pending, last.generation).unwrap();
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.route_owners"),
+        "1"
+    );
 }

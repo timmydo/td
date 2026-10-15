@@ -575,8 +575,9 @@ src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
 Version 10 adds src/postgres_uploads.sql; version 11 adds
 src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
 src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql;
-version 15 adds src/postgres_submission_routes.sql.
-New initialization applies all fifteen in
+version 15 adds src/postgres_submission_routes.sql; version 16 adds
+src/postgres_route_owners.sql.
+New initialization applies all sixteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1885,3 +1886,35 @@ credential and selected relay profile authorize this internal read. A read
 is passive evidence, including after a policy change during its snapshot; it
 grants no attempt ownership or right to transmit. Fenced claim and phase
 publication remain required before SMTP work.
+
+## 52. Inert route-owner coordination
+
+Schema version 16 introduces `route_owners` and retained
+`route_owner_receipts`. `postgres_route_owners` coordinates one owner per
+account and route name, even across destination changes. Fresh claims
+require a selected relay role. Acquisition locks configuration, account and
+route in that order, rejects an unexpired owner, and increments a nonzero
+64-bit fencing generation without wrapping. A retained random operation and
+digest make uncertain acquisition inspectable and replayable without a new
+claim. The serialized receipt recheck precedes current-policy rejection,
+so a concurrently committed acquisition remains resolvable after selection
+changes. Route rows and acquisition receipts each have a 1024-per-account cap.
+
+A fixed 30-second database-time lease binds the process boot identity, claim
+operation, route destination and generation. Renewal checks every field,
+current selected policy and unexpired ownership under lock. Release compares
+the same owner and fence but can clear an expired lease or removed policy;
+its caller must first close its SMTP transport. Release retains the fencing
+counter. Historical acquisition receipts are never live authority: `observe`
+checks current policy, identity, fence and database expiry. Unknown renewal
+or release responses remain indeterminate; fresh primary observation resolves
+whether that owner remains live. Internal coordination does not advance JMAP
+state or mutate recipient responsibility.
+
+Database time earlier than the last recorded owner clock refuses. This is a
+local row check, not complete failover/clock-jump qualification. Runtime
+heartbeat scheduling, monotonic transport deadlines and conservative clock
+validation remain activation work. No lease enables SMTP by itself; atomic
+recipient Prepared publication and every subsequent phase still need the
+same route-owner fence. Takeover recovery must preserve AcceptancePossible
+uncertainty before any replacement attempt. These workers remain inert.
