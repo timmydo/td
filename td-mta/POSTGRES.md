@@ -1765,3 +1765,31 @@ account publisher and uses the retained operation/digest; known success stays
 success after policy replacement. This is internal delivery recovery, not
 cross-session SMTP deduplication. Runtime connection/gateway authorization,
 ingress reservations, retention/reclamation and activation remain cutover work.
+
+## 47. Verified submission input preparation
+
+The inert postgres_submission_input worker freezes td-mail's implicit
+envelope and outgoing copy from one authenticated, verified Email snapshot.
+It selects the sending mailbox only through the immutable profile binding,
+checks optional account state, and retains the original Email/blob/thread
+identity. No database write, queue reservation or SMTP responsibility occurs.
+
+A single original deadline and work meter cover header collection, envelope
+derivation and transmitted copying; the whole-body integrity pass is prepaid
+before the reader starts. Shared MIME scanning locates the bounded root header
+section. Existing submission_envelope and transmitted_headers enforce the
+configured author identity and recipient ceiling and strip root Bcc/Resent-Bcc.
+All remaining body bytes are copied without interpretation. Reads and copying
+use 4096-byte turns; header scratch is at most the configured header ceiling
+plus two separator bytes. The retained copy is at most 32 MiB and clones
+share it; at most 1000 copied recipient mailboxes are retained. Original
+stored bytes remain unchanged.
+
+The result contains passive policy/source evidence and no password or live
+snapshot. It grants no continuing device authority. Future publication must
+recheck the source identity, optional state, selected generation and device
+under the account transaction, enforce shared quotas, and atomically publish
+the outgoing blob, submission, recipients, history and operation receipt.
+Deletion, revocation or a configuration change after preparation can therefore
+refuse publication. Runtime memory admission and atomic enqueueing remain
+separate work.

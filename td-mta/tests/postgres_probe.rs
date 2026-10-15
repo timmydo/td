@@ -1938,6 +1938,7 @@ fn real_postgres_deletion_releases_last_owner_bodies_and_retains_outcomes() {
 }
 
 enum ConfigurationExercise {
+    SubmissionInput,
     Receiving,
     Deletion,
     Moves,
@@ -2504,6 +2505,9 @@ per_peer_limit = 1
         assert!(!format!("{:?}", prepared.binding()).contains("main@example.test"));
         if name == "desktop" {
             match exercise {
+                ConfigurationExercise::SubmissionInput => {
+                    exercise_submission_input(&fixture, &request, &trust, prepared.binding())
+                }
                 ConfigurationExercise::Receiving => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
@@ -6097,4 +6101,196 @@ fn exercise_receiving(
         fixture,
         "DELETE FROM td_mta.receiving_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
     );
+}
+
+#[test]
+#[ignore = "requires local PostgreSQL binaries"]
+fn real_postgres_submission_input_freezes_verified_bytes_and_identity_envelope() {
+    exercise_configuration(ConfigurationExercise::SubmissionInput);
+}
+
+fn exercise_submission_input(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        compose_text::{Address, Message},
+        ids::{IdentityId, MailboxId},
+        postgres_devices as devices, postgres_drafts as drafts, postgres_submission_input as input,
+    };
+    let creation = devices::prepare_creation(
+        binding.epoch(),
+        binding.account(),
+        "submission input fixture",
+        1,
+    )
+    .unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let mailbox = MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
+    ))
+    .unwrap();
+    let identity = IdentityId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let visible = [Address {
+        name: "",
+        email: "one@example.test",
+    }];
+    let blind = [Address {
+        name: "",
+        email: "hidden@example.test",
+    }];
+    let message = Message {
+        from: Address {
+            name: "Sender",
+            email: "main@example.test",
+        },
+        to: &visible,
+        cc: &[],
+        bcc: &blind,
+        reply_to: &[],
+        subject: "outgoing",
+        message_id: "outgoing@example.test",
+        in_reply_to: &[],
+        references: &[],
+        sent_at_ms: 0,
+        text: "body
+text",
+    };
+    let draft = drafts::prepare(
+        drafts::DraftRequest {
+            binding,
+            device: creation.device_id(),
+            mailbox,
+            expected: Some(1),
+        },
+        &message,
+        deadline(),
+    )
+    .unwrap();
+    let published = drafts::publish(request, trust, deadline(), &draft, password).unwrap();
+    let prepare = |identity, expected, password| {
+        input::prepare(
+            request,
+            trust,
+            deadline(),
+            input::Input {
+                binding,
+                email: published.email,
+                identity,
+                expected,
+            },
+            password,
+        )
+    };
+    assert_eq!(
+        prepare(identity, Some(1), password).err(),
+        Some(input::Error::State)
+    );
+    assert_eq!(
+        prepare(IdentityId::from_bytes([0xef; 16]), None, password).err(),
+        Some(input::Error::Identity)
+    );
+    assert_eq!(
+        prepare(identity, None, b"bad").err(),
+        Some(input::Error::Unauthenticated)
+    );
+    let prepared = prepare(identity, Some(2), password).unwrap();
+    assert_eq!(prepared.binding(), binding);
+    assert_eq!(prepared.device(), creation.device_id());
+    assert_eq!(prepared.identity(), identity);
+    assert_eq!(prepared.expected(), Some(2));
+    assert_eq!(prepared.source().email, published.email);
+    assert_eq!(prepared.source().blob, published.blob);
+    assert_eq!(prepared.reverse_path(), "main@example.test");
+    assert_eq!(
+        prepared.recipients().collect::<Vec<_>>(),
+        ["one@example.test", "hidden@example.test"]
+    );
+    assert!(!String::from_utf8_lossy(prepared.bytes()).contains("hidden@example.test"));
+    assert!(!format!("{prepared:?}").contains("main@example.test"));
+    let original = td_mta::postgres_body::with_email(
+        request,
+        trust,
+        deadline(),
+        td_mta::postgres_body::ReadRequest {
+            epoch: binding.epoch(),
+            account: binding.account(),
+            email: published.email,
+            maximum: 32 * 1024 * 1024,
+        },
+        password,
+        |metadata, reader| {
+            let mut bytes = vec![0; metadata.body.length as usize];
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let count = reader.read_at(offset as u64, &mut bytes[offset..])?;
+                assert_ne!(count, 0);
+                offset += count;
+            }
+            Ok(bytes)
+        },
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&original).contains("hidden@example.test"));
+    let body_start = |bytes: &[u8]| {
+        bytes
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4
+    };
+    assert_eq!(
+        &original[body_start(&original)..],
+        &prepared.bytes()[body_start(prepared.bytes())..]
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "0");
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT queue_bytes||','||queue_submissions FROM td_mta.account_usage"
+        ),
+        "0,0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        "0000000000000002"
+    );
+    let retained = prepared.clone();
+    drop(prepared);
+    assert_eq!(retained.recipients().len(), 2);
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(
+        prepare(identity, None, password).err(),
+        Some(input::Error::Read(td_mta::postgres_read::Error::Policy))
+    );
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex')",
+            binding.selection().generation
+        ),
+    );
+    let revoke =
+        devices::prepare_revocation(binding.epoch(), binding.account(), creation.device_id(), 1)
+            .unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(
+        prepare(identity, None, password).err(),
+        Some(input::Error::Read(
+            td_mta::postgres_read::Error::Unauthenticated
+        ))
+    );
+    assert!(retained
+        .bytes()
+        .ends_with(&original[body_start(&original)..]));
 }
