@@ -1707,6 +1707,42 @@ impl JmapClient {
         Ok(submissions)
     }
 
+    /// Complete the recorded folder's bounded recovery window before absence
+    /// can authorize a retry. Ordinary mailbox browsing may remain paginated.
+    pub fn filing_between(
+        &self,
+        mailbox: &str,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<Email>, JmapError> {
+        let mut ids = Vec::new();
+        let mut state = None;
+        let mut total = None;
+        loop {
+            let response = self.call(JmapRequest {
+                using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                method_calls: vec![MethodCall(
+                    "Email/query",
+                    json!({
+                        "accountId": self.account_id,
+                        "filter": {"operator":"AND", "conditions":[
+                            {"inMailbox":mailbox}, {"after":since}, {"before":until}
+                        ]},
+                        "sort":[{"property":"receivedAt", "isAscending":false}],
+                        "collapseThreads":false,
+                        "position":ids.len(), "limit":256, "calculateTotal":true
+                    }),
+                    "0".into(),
+                )],
+            })?;
+            let body = self.reconciliation_response(&response, "Email/query")?;
+            if reconciliation_page(body, &mut ids, &mut state, &mut total)? {
+                break;
+            }
+        }
+        self.get_email_filing(&ids)
+    }
+
     /// The messages' filing: keywords, mailboxes and Message-IDs.
     pub fn get_email_filing(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
         if ids.len() > RECONCILIATION_MAX || ids.iter().any(|id| !valid_id(id)) {

@@ -1096,6 +1096,7 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
     );
     let created = h.server().created_emails();
     let sent_before = h.server().submissions().len();
+    let draft_copy = h.server().pad_filing_page_with_draft_copy();
     let resp = h.send(json!({"command": "send_draft", "path": forgotten.to_string_lossy()}));
     assert!(resp["ok"].is_true(), "{resp}");
     assert_eq!(text(&resp["submission_id"]), "none on record");
@@ -1110,6 +1111,10 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         "created once"
     );
     assert_eq!(h.server().submissions().len(), sent_before, "sent once");
+    assert!(
+        h.server().email_state(&draft_copy).is_some(),
+        "the draft is not destroyed before finding the sent copy"
+    );
     assert!(!forgotten.exists(), "retired");
     assert!(
         !drafts.join("td-mail-draft-9-13.eml.lost").exists(),

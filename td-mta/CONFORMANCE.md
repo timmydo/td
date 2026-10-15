@@ -254,8 +254,10 @@ get batches. Missing, malformed, duplicate or changing results preserve an
 unknown send outcome. Filing reads use 50-ID batches and require complete
 coverage. The client mock lost-reply fixture places the sought submission
 beyond 300 preceding matches. M16/M22 must repeat this against real td-mta
-before activation. The fallback Drafts/Sent Email/query path still reads one
-100-ID page and also needs complete pagination before absence is meaningful.
+before activation. The fallback Drafts/Sent Email/query path uses the same complete bounded
+pagination and gathers both recorded folders before considering draft
+destruction. Its lost-reply fixture places a sent copy behind 300 newer
+messages while a matching draft remains in the recorded Drafts folder.
 
 POLICY.md adds a third client acceptance gap: Email/get's method-level failure
 on one opaque message must not hide a whole listing. M14/M22 add bounded

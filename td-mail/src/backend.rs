@@ -3106,41 +3106,41 @@ fn settle_lost_send(
     if let Some(sent) = sent.filter(|sent| *sent != create_in) {
         looked_in.push(sent);
     }
+    let mut emails = Vec::new();
     for mailbox in looked_in {
-        let ids = client
-            .query_emails(mailbox, 100, 0, None, Some(&since), Some(&until))
-            .map_err(asking)?
-            .ids;
-        if ids.is_empty() {
-            continue;
-        }
-        let emails = client.get_email_filing(&ids).map_err(asking)?;
-        let copies: Vec<&Email> = emails.iter().filter(|email| carries(email)).collect();
-        if let Some(went) = copies
-            .iter()
-            .find(|copy| !copy.keywords.get("$draft").copied().unwrap_or(false))
-        {
-            return Ok(Some(SentDraft {
-                email_id: went.id.clone(),
-                submission_id: "none on record".to_string(),
-                kept_in: filing(went),
-            }));
-        }
-        if copies.iter().any(|copy| !still_draft(copy)) {
-            return Err(manual(
-                "the earlier send has an unresolved draft outside its recorded creation folder",
-            ));
-        }
-        if !copies.is_empty() {
-            let ids: Vec<String> = copies.iter().map(|copy| copy.id.clone()).collect();
-            client.destroy_emails(&ids).map_err(|e| {
-                format!(
-                    "the copy the server made of the unsent draft, {}, could not be removed: {e}",
-                    ids.join(", ")
-                )
-            })?;
-            return Ok(None);
-        }
+        emails.extend(
+            client
+                .filing_between(mailbox, &since, &until)
+                .map_err(asking)?,
+        );
+    }
+    let copies: Vec<&Email> = emails.iter().filter(|email| carries(email)).collect();
+    if let Some(went) = copies
+        .iter()
+        .find(|copy| !copy.keywords.get("$draft").copied().unwrap_or(false))
+    {
+        return Ok(Some(SentDraft {
+            email_id: went.id.clone(),
+            submission_id: "none on record".to_string(),
+            kept_in: filing(went),
+        }));
+    }
+    if copies.iter().any(|copy| !still_draft(copy)) {
+        return Err(manual(
+            "the earlier send has an unresolved draft outside its recorded creation folder",
+        ));
+    }
+    if !copies.is_empty() {
+        let ids: std::collections::BTreeSet<String> =
+            copies.iter().map(|copy| copy.id.clone()).collect();
+        let ids: Vec<String> = ids.into_iter().collect();
+        client.destroy_emails(&ids).map_err(|e| {
+            format!(
+                "the copy the server made of the unsent draft, {}, could not be removed: {e}",
+                ids.join(", ")
+            )
+        })?;
+        return Ok(None);
     }
     Ok(None)
 }

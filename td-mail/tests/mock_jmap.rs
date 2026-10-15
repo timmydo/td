@@ -873,6 +873,27 @@ impl MockJmapServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn pad_filing_page_with_draft_copy(&self) -> String {
+        let mut guard = self.state.lock().expect("state lock");
+        let email = guard.created.last().expect("created").0.clone();
+        let template = guard.emails.get(&email).expect("stored email").clone();
+        for n in 0..300 {
+            let mut copy = template.clone();
+            copy.id = format!("filing-history-{n}");
+            copy.message_id = Some(format!("<filing-history-{n}@example.com>"));
+            copy.received_at = td_civil::format_rfc3339_utc(td_civil::now_unix() + 1);
+            guard.emails.insert(copy.id.clone(), copy);
+        }
+        let mut draft = template;
+        draft.id = "reconciliation-draft-copy".into();
+        draft.mailbox_id = "mbox-drafts".into();
+        draft.is_draft = true;
+        let id = draft.id.clone();
+        guard.emails.insert(id.clone(), draft);
+        id
+    }
+
     /// A stored message's mailbox and keywords, for what a send left.
     #[allow(dead_code)]
     pub fn email_state(&self, id: &str) -> Option<(String, bool, bool)> {
@@ -1189,9 +1210,14 @@ impl MockJmapServer {
                     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                     let position =
                         args.get("position").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let ids = {
+                    let (ids, total) = {
                         let guard = state.lock().expect("state lock");
-                        guard.query_email_ids(&filter, limit, position)
+                        let ids = guard.query_email_ids(&filter, limit, position);
+                        let total = args
+                            .get("calculateTotal")
+                            .is_some_and(Value::is_true)
+                            .then(|| guard.query_email_ids(&filter, usize::MAX, 0).len());
+                        (ids, total)
                     };
                     json!([
                         "Email/query",
@@ -1200,7 +1226,7 @@ impl MockJmapServer {
                             "queryState": "qstate-001",
                             "ids": ids,
                             "position": position,
-                            "total": null
+                            "total": total
                         },
                         call_id
                     ])
