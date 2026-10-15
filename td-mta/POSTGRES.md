@@ -2142,3 +2142,36 @@ without allowing owner credentials through the runtime constructor. The real
 read fixture checks exhaustion before a second connection, server-side closure
 on drop, slot recovery after failed authentication and owner-mode refusal.
 No serving listener is activated by these ownership changes.
+
+## 61. Verified body custody for existing MIME readers
+
+`Snapshot::with_pinned_body` lends the existing opaque `PinnedBlob` to a
+bounded callback only after PostgreSQL's full length/chunk/digest check.
+It retains the same snapshot worker, body manifest, Blob ID and original
+finite deadline. The internal source boundary is crate-private; external
+callers cannot turn an arbitrary `BlobReader` or passive metadata into a pin.
+Reads and explicit freshness checks preserve sticky failures, and callback
+completion checks the pin again. No callback result grants output after
+expiry, connection loss or a swallowed pin failure.
+
+`postgres_body::with_pinned_blob` provides the same custody for downloads.
+It retains the existing account-reference/upload-lease authorization and
+fresh primary reauthorization after verification, before lending the pin.
+The compatibility `with_blob` entry delegates to it. The download fixture
+checks pin identity/digest alongside its original empty, multi-chunk and
+maximum-body replay and cross-device/revocation refusals.
+
+The shared pin still lives at its existing `store_fs` API path during
+preparation, so root-header, MIME structure, body-value and attachment
+readers need no parser changes or replacement authority interface. Its local
+variant retains the same incremental SQLite handle, verification clock and
+drop custody. The PostgreSQL variant borrows the verified chunk reader;
+it adds no body copy, renewed work meter or deadline. Both representations
+are preparation plumbing, not a selectable production backend. The atomic
+cutover removes the local variant and relocates the surviving boundary.
+
+The real read fixture collects root headers through the existing MIME
+reader after another connection deletes the source Email/body. It checks
+pin identity/digest, original body bytes, sticky expiry even when swallowed
+by the callback, and refusal to grant a pin for corrupt bytes. The existing
+MIME/allocation fixtures continue to qualify the local representation.

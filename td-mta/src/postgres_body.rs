@@ -111,6 +111,15 @@ pub(crate) fn with_verified_body<T>(
     deadline: Instant,
     read: impl FnOnce(&mut dyn BlobReader) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
+    with_verified_pin(worker, metadata, deadline, |pin| read(pin))
+}
+
+pub(crate) fn with_verified_pin<T>(
+    worker: &mut Worker,
+    metadata: BlobMetadata,
+    deadline: Instant,
+    read: impl FnOnce(&mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
     let mut body = Body {
         worker,
         metadata,
@@ -120,9 +129,11 @@ pub(crate) fn with_verified_body<T>(
         cache_start: 0,
     };
     body.verify().map_err(Error::Read)?;
-    body.check().map_err(Error::Read)?;
-    let result = read(&mut body);
-    body.check().map_err(Error::Read)?;
+    let mut pin =
+        crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
+            .map_err(Error::Read)?;
+    let result = read(&mut pin);
+    pin.check_deadline().map_err(Error::Read)?;
     result.map_err(Error::Read)
 }
 
@@ -137,6 +148,26 @@ pub fn with_blob<T>(
     selected: BlobRequest<'_>,
     password: &[u8],
     read: impl FnOnce(BlobMetadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    with_pinned_blob(
+        request,
+        trust,
+        deadline,
+        selected,
+        password,
+        |metadata, pin| read(metadata, pin),
+    )
+}
+
+/// Download custody for the existing MIME-part readers. Fresh primary
+/// reauthorization still follows verification and precedes the callback.
+pub fn with_pinned_blob<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    selected: BlobRequest<'_>,
+    password: &[u8],
+    read: impl FnOnce(BlobMetadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
 ) -> Result<T, Error> {
     let binding = selected.binding;
     if !binding.roles().jmap() {
@@ -175,9 +206,11 @@ pub fn with_blob<T>(
             Box::pin(reauthorize_blob(client, binding, presented, expires))
         })
         .map_err(Error::Connection)??;
-        body.check().map_err(Error::Read)?;
-        let result = read(metadata, &mut body);
-        body.check().map_err(Error::Read)?;
+        let mut pin =
+            crate::store_fs::PinnedBlob::from_verified(&mut body, metadata.blob, metadata.body)
+                .map_err(Error::Read)?;
+        let result = read(metadata, &mut pin);
+        pin.check_deadline().map_err(Error::Read)?;
         result.map_err(Error::Read)
     })
     .map_err(Error::Connection)?
@@ -509,5 +542,11 @@ impl BlobReader for Body<'_> {
             self.failed = Some(error);
         }
         result
+    }
+}
+
+impl crate::store_fs::VerifiedSource for Body<'_> {
+    fn check(&mut self) -> Result<(), ports::Error> {
+        Body::check(self)
     }
 }

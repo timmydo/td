@@ -91,6 +91,7 @@ fn cleanup_temporary(
 
 #[cfg(test)]
 pub use pinned::with_pinned_fixture;
+pub(crate) use pinned::VerifiedSource;
 pub use pinned::{PinnedBlob, PinnedBlobInput};
 
 #[path = "store_fs/spool.rs"]

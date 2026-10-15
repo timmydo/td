@@ -587,7 +587,7 @@ body; already captured views remain usable. ViewIdentity contains account,
 epoch, committed sequence and history floor. SQL columns are decoded into
 caller buffers, without loading a mailbox into RAM.
 
-A verified body input and completed PinnedBlob borrow the live view and retain
+The local verified body input and completed PinnedBlob borrow the live view and retain
 one read-only incremental BLOB handle from input construction through final
 random reads. Opening checks its actual byte length; streaming checks the
 complete digest before issuing a completed pin. The handle and view preserve

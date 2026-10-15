@@ -4265,7 +4265,8 @@ fn exercise_downloads(
     binding: &td_mta::postgres_runtime_profile::Binding,
 ) {
     use td_mta::{
-        postgres_body as bodies, postgres_devices as devices, postgres_uploads as uploads,
+        ports::BlobReader, postgres_body as bodies, postgres_devices as devices,
+        postgres_uploads as uploads,
     };
     let account = binding.account();
     let owner = devices::prepare_creation(binding.epoch(), account, "download owner", 1).unwrap();
@@ -4279,7 +4280,7 @@ fn exercise_downloads(
     // Verification and replay share the same ten-second maximum as Email reads.
     let read_deadline = || Instant::now() + Duration::from_secs(10);
     let verify = |blob, maximum, password: &[u8]| {
-        bodies::with_blob(
+        bodies::with_pinned_blob(
             request,
             trust,
             read_deadline(),
@@ -4293,6 +4294,9 @@ fn exercise_downloads(
                 assert_eq!(metadata.identity.account, account);
                 assert_eq!(metadata.identity.epoch, binding.epoch());
                 assert_eq!(metadata.blob, blob);
+                assert_eq!(body.id(), blob);
+                assert_eq!(body.digest(), &metadata.body.digest);
+                body.check_deadline()?;
                 let mut buffer = [0; 65536];
                 let mut offset = 0;
                 while offset < body.len() {
@@ -5058,6 +5062,7 @@ fn exercise_read(
     use td_mta::{
         compose_text::{Address, Message},
         ids::{EmailId, MailboxId},
+        ports::BlobReader,
         postgres_body, postgres_devices as devices, postgres_drafts as drafts,
         postgres_read as read,
     };
@@ -5260,7 +5265,20 @@ fn exercise_read(
         sql(fixture,&format!("INSERT INTO td_mta.keywords VALUES(decode('{account}','hex'),decode('{}','hex'),'new',decode('0000000000000004','hex')); UPDATE td_mta.accounts SET sequence=decode('0000000000000004','hex')",first.email));
         assert_eq!(view.keywords(first.email,None,256)?.values,vec!["$draft","$seen"]);
         sql(fixture,&format!("BEGIN; DELETE FROM td_mta.memberships WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.keywords WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.thread_anchors WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.emails WHERE id=decode('{}','hex'); DELETE FROM td_mta.blobs WHERE id=decode('{}','hex'); DELETE FROM td_mta.threads WHERE id=decode('{}','hex'); COMMIT",first.email,first.email,first.email,first.email,first.blob,first.thread));
-        let bytes=view.with_body(first.email,|metadata,body| {
+        let bytes=view.with_pinned_body(first.email,|metadata,body| {
+            use td_mta::{admission::work::{Charge, Meter}, ports::{Deadline, Tick}, root_headers};
+            assert_eq!(body.id(), metadata.blob);
+            assert_eq!(body.digest(), &metadata.body.digest);
+            assert!(!body.is_failed());
+            body.check_deadline()?;
+            let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), Charge {
+                io_bytes: 65536, records: 65536, output_bytes: 65536, unlinks: 0,
+            });
+            let mut headers = vec![0; 65536];
+            let mut reader = root_headers::Cursor::new(body, 65534, &mut headers, &mut work, Tick(1)).unwrap();
+            while reader.poll(Tick(1)).unwrap() != root_headers::Status::Complete {}
+            let headers = reader.finish(Tick(1)).unwrap();
+            assert!(std::str::from_utf8(headers.bytes).unwrap().contains("Content-Transfer-Encoding: base64"));
             assert_eq!(metadata.identity.committed_sequence.number(),3);
             let mut bytes=vec![0;metadata.body.length as usize];
             let mut position=0;
@@ -5315,10 +5333,29 @@ fn exercise_read(
         Ok(())
     });
     assert_eq!(invalid, Err(read::Error::Invalid));
+    let expires = Instant::now() + Duration::from_secs(3);
+    let expired_pin = read::with_snapshot(request, trust, expires, binding, password, |view| {
+        view.with_pinned_body(second.email, |_, pin| {
+            thread::sleep(expires.saturating_duration_since(Instant::now()));
+            assert_eq!(pin.check_deadline(), Err(td_mta::ports::Error::Deadline));
+            assert!(pin.is_failed());
+            assert_eq!(
+                pin.read_at(0, &mut [0; 1]),
+                Err(td_mta::ports::Error::Deadline)
+            );
+            Ok(())
+        })
+    });
+    assert_eq!(
+        expired_pin,
+        Err(read::Error::Body(postgres_body::Error::Read(
+            td_mta::ports::Error::Deadline
+        )))
+    );
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,0) WHERE blob_id=decode('{}','hex')",second.blob));
     let corrupt = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
         let error = view
-            .with_body::<()>(second.email, |_, _| -> Result<(), td_mta::ports::Error> {
+            .with_pinned_body::<()>(second.email, |_, _| -> Result<(), td_mta::ports::Error> {
                 panic!("corrupt body admitted")
             })
             .unwrap_err();

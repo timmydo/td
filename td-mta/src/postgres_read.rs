@@ -293,11 +293,20 @@ impl Snapshot<'_> {
         email: EmailId,
         read: impl FnOnce(Metadata, &mut dyn BlobReader) -> Result<T, ports::Error>,
     ) -> Result<T, Error> {
+        self.with_pinned_body(email, |metadata, pin| read(metadata, pin))
+    }
+    /// Retains a fully verified body for existing bounded MIME readers.
+    /// The pin cannot escape this callback or renew its snapshot deadline.
+    pub fn with_pinned_body<T>(
+        &mut self,
+        email: EmailId,
+        read: impl FnOnce(Metadata, &mut crate::store_fs::PinnedBlob<'_, '_>) -> Result<T, ports::Error>,
+    ) -> Result<T, Error> {
         let metadata = self
             .email(email)?
             .ok_or(Error::Body(postgres_body::Error::Missing));
         let metadata = self.retain(metadata)?;
-        let result = postgres_body::with_verified_body(
+        let result = postgres_body::with_verified_pin(
             &mut self.worker,
             BlobMetadata {
                 identity: metadata.identity,

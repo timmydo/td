@@ -1,4 +1,4 @@
-//! Snapshot-bound verification and bounded random reads of immutable SQLite bodies.
+//! Snapshot-bound verification and bounded random reads of immutable bodies.
 use super::{index::BodyRead, IndexReadView};
 use crate::{
     format::{
@@ -141,20 +141,35 @@ impl<'a, 'c, C: Crypto> PinnedBlobInput<'a, 'c, C> {
             Ok(())
         })?;
         Ok(PinnedBlob {
-            body: self.body,
+            source: Source::Sqlite {
+                body: self.body,
+                clock: self.clock,
+            },
             id: self.id,
             row: self.row,
-            clock: self.clock,
             failed: None,
         })
     }
 }
-/// One verified immutable body. Its borrow retains the pooled SQLite snapshot.
+/// Internal adapters grant this boundary only after whole-body verification.
+/// The source retains the original immutable snapshot and finite deadline;
+/// checks and reads must preserve sticky connection/snapshot failures.
+pub(crate) trait VerifiedSource: BlobReader {
+    fn check(&mut self) -> Result<(), PolicyError>;
+}
+enum Source<'a, 'c> {
+    Sqlite {
+        body: BodyRead<'a>,
+        clock: VerifyClock<'c>,
+    },
+    Borrowed(&'a mut dyn VerifiedSource),
+}
+/// One verified immutable body retaining its original snapshot custody.
+/// Construction is private to the verified storage adapters.
 pub struct PinnedBlob<'a, 'c> {
-    body: BodyRead<'a>,
+    source: Source<'a, 'c>,
     id: BlobId,
     row: BlobRow,
-    clock: VerifyClock<'c>,
     failed: Option<PolicyError>,
 }
 // Drop checking keeps the snapshot loan until this owner (or its MIME owner)
@@ -162,7 +177,23 @@ pub struct PinnedBlob<'a, 'c> {
 impl Drop for PinnedBlob<'_, '_> {
     fn drop(&mut self) {}
 }
-impl PinnedBlob<'_, '_> {
+impl<'a> PinnedBlob<'a, '_> {
+    pub(crate) fn from_verified(
+        source: &'a mut dyn VerifiedSource,
+        id: BlobId,
+        row: BlobRow,
+    ) -> Result<Self, PolicyError> {
+        source.check()?;
+        if source.len() != row.length {
+            return Err(PolicyError::Corrupt);
+        }
+        Ok(Self {
+            source: Source::Borrowed(source),
+            id,
+            row,
+            failed: None,
+        })
+    }
     pub fn id(&self) -> BlobId {
         self.id
     }
@@ -176,7 +207,10 @@ impl PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, &self.body, || Ok(()));
+        let result = match &mut self.source {
+            Source::Sqlite { body, clock } => checked(clock, body, || Ok(())),
+            Source::Borrowed(source) => source.check(),
+        };
         if let Err(error) = result {
             self.failed = Some(error);
         }
@@ -191,9 +225,17 @@ impl BlobReader for PinnedBlob<'_, '_> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = checked(&self.clock, &self.body, || {
-            self.body.read_body(offset, output)
-        });
+        let result = match &mut self.source {
+            Source::Sqlite { body, clock } => {
+                checked(clock, body, || body.read_body(offset, output))
+            }
+            Source::Borrowed(source) => (|| {
+                source.check()?;
+                let result = source.read_at(offset, output);
+                let after = source.check();
+                result.and_then(|count| after.map(|()| count))
+            })(),
+        };
         if let Err(error) = result {
             self.failed = Some(error);
         }
@@ -275,7 +317,13 @@ pub fn with_pinned_fixture(bytes: &[u8], clock: &dyn Clock, run: impl FnOnce(Pin
         assert_ne!(input.read(&mut scratch).unwrap(), 0);
     }
     let mut pin = input.finish().unwrap();
-    pin.clock = VerifyClock {
+    let Source::Sqlite {
+        clock: retained, ..
+    } = &mut pin.source
+    else {
+        panic!("local fixture returned a borrowed pin");
+    };
+    *retained = VerifyClock {
         source: clock,
         deadline,
         last: AtomicU64::new(1),
@@ -296,6 +344,7 @@ mod owner_size_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 pub(in crate::store_fs) mod snapshot_tests {
     use super::*;
     pub(in crate::store_fs) fn input_body<'b, 'a, C: Crypto>(
@@ -304,6 +353,9 @@ pub(in crate::store_fs) mod snapshot_tests {
         &input.body
     }
     pub(in crate::store_fs) fn pin_body<'b, 'a>(pin: &'b PinnedBlob<'a, '_>) -> &'b BodyRead<'a> {
-        &pin.body
+        match &pin.source {
+            Source::Sqlite { body, .. } => body,
+            Source::Borrowed(_) => panic!("local fixture returned a borrowed pin"),
+        }
     }
 }
