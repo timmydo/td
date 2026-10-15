@@ -93,13 +93,6 @@ pub fn prepare(
     input: Input<'_>,
     password: &[u8],
 ) -> Result<Prepared, Error> {
-    let device = Presented::parse(password)
-        .ok_or(Error::Unauthenticated)?
-        .id();
-    let identity = input
-        .binding
-        .identity_email(input.identity)
-        .ok_or(Error::Identity)?;
     let left = deadline
         .checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
@@ -122,6 +115,62 @@ pub fn prepare(
             ..Charge::default()
         },
     );
+    prepare_with_meter(
+        request, trust, deadline, input, password, &mut meter, &clock,
+    )
+}
+
+struct PreparationClock<'a> {
+    clock: &'a RuntimeClock,
+    deadline: Instant,
+}
+impl Clock for PreparationClock<'_> {
+    fn sample(&self) -> Result<ports::Time, ports::Error> {
+        if Instant::now() >= self.deadline {
+            return Err(ports::Error::Deadline);
+        }
+        self.clock.sample()
+    }
+}
+
+/// Freeze using the original request work allowance. The caller still admits
+/// database capacity and retained body memory before entering this helper.
+pub fn prepare_with_meter(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    input: Input<'_>,
+    password: &[u8],
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Prepared, Error> {
+    let device = Presented::parse(password)
+        .ok_or(Error::Unauthenticated)?
+        .id();
+    let identity = input
+        .binding
+        .identity_email(input.identity)
+        .ok_or(Error::Identity)?;
+    let original =
+        Deadline::after(ports::Tick(0), meter.deadline().tick().0).map_err(Error::Work)?;
+    let deadline = deadline.min(clock.deadline_instant(original).map_err(Error::Work)?);
+    if deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
+        .is_none()
+    {
+        return Err(Error::Work(ports::Error::Deadline));
+    }
+    let clock = PreparationClock { clock, deadline };
+    charge(
+        &clock,
+        meter,
+        Charge {
+            records: 1,
+            ..Charge::default()
+        },
+    )?;
+    let maximum = input.binding.upload_maximum().min(32 * 1024 * 1024);
     let result =
         postgres_read::with_snapshot(request, trust, deadline, input.binding, password, |view| {
             if input
@@ -139,7 +188,7 @@ pub fn prepare(
             // Fund the reader's whole-body integrity pass before it starts.
             if let Err(error) = charge(
                 &clock,
-                &mut meter,
+                meter,
                 Charge {
                     io_bytes: metadata.body.length,
                     records: metadata.body.length.div_ceil(65536),
@@ -156,7 +205,7 @@ pub fn prepare(
                     input.binding.recipient_maximum(),
                     maximum,
                     &clock,
-                    &mut meter,
+                    meter,
                 )
                 .map(|output| {
                     Prepared(Arc::new(Data {

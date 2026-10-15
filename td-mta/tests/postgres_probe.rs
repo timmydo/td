@@ -7945,7 +7945,95 @@ text",
         prepare(identity, None, b"bad").err(),
         Some(input::Error::Unauthenticated)
     );
-    let prepared = prepare(identity, Some(2), password).unwrap();
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline},
+    };
+    let clock = RuntimeClock::new();
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let selection = || input::Input {
+        binding,
+        email: published.email,
+        identity,
+        expected: Some(2),
+    };
+    let mut exhausted = Meter::new(until, Charge::default());
+    assert!(matches!(
+        input::prepare_with_meter(
+            request,
+            trust,
+            deadline(),
+            selection(),
+            password,
+            &mut exhausted,
+            &clock
+        ),
+        Err(input::Error::Work(td_mta::ports::Error::Capacity))
+    ));
+    assert!(exhausted.stopped().is_some());
+    let capacity = Charge {
+        io_bytes: 65536,
+        records: 10000,
+        output_bytes: 65536,
+        ..Default::default()
+    };
+    let mut expired = Meter::new(
+        Deadline::after(clock.sample().unwrap().monotonic, 0).unwrap(),
+        capacity,
+    );
+    assert!(matches!(
+        input::prepare_with_meter(
+            request,
+            trust,
+            deadline(),
+            selection(),
+            password,
+            &mut expired,
+            &clock
+        ),
+        Err(input::Error::Work(td_mta::ports::Error::Deadline))
+    ));
+    let mut meter = Meter::new(until, capacity);
+    meter
+        .charge(
+            clock.sample().unwrap().monotonic,
+            Charge {
+                records: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let before = meter.remaining();
+    assert!(matches!(
+        input::prepare_with_meter(
+            request,
+            trust,
+            Instant::now(),
+            selection(),
+            password,
+            &mut meter,
+            &clock
+        ),
+        Err(input::Error::Work(td_mta::ports::Error::Deadline))
+    ));
+    let prepared = input::prepare_with_meter(
+        request,
+        trust,
+        deadline(),
+        selection(),
+        password,
+        &mut meter,
+        &clock,
+    )
+    .unwrap();
+    let after = meter.remaining();
+    assert!(
+        after.io_bytes < before.io_bytes
+            && after.records < before.records
+            && after.output_bytes < before.output_bytes
+    );
+
     assert_eq!(prepared.binding(), binding);
     assert_eq!(prepared.device(), creation.device_id());
     assert_eq!(prepared.identity(), identity);

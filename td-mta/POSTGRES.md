@@ -2639,3 +2639,21 @@ receipt; absence or error preserves the owner. It does not publish again.
 The HTTP fixture creates and retrieves a draft, refuses a stale state without
 effects, downloads its immutable message and settles a delayed commit. This
 activates no production service, attachment upload or submission capability.
+
+
+## 85. Caller-funded submission input
+
+Submission input preparation can borrow the original HTTP work meter and
+runtime clock. Before database entry it charges admission work and tightens
+the SQL deadline to the earlier caller or original meter deadline. The same
+allowance covers body verification, headers, implicit-envelope derivation,
+blind-recipient filtering and the retained outgoing copy. A phase clock keeps
+local processing inside the SQL preparation deadline, without extending the
+original meter. The cold convenience entry point delegates to this path.
+
+The returned input still records the submitting profile's route and grants no
+queue or delivery responsibility. Connection and retained-memory admission,
+publication work, fresh device authorization and receipt ownership remain the
+runtime caller's obligations. The local PostgreSQL fixture verifies exhausted
+work and both deadline refusals, then checks caller-funded input through the
+existing privacy, source-state, route and queue-publication evidence.
