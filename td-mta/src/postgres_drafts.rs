@@ -108,18 +108,8 @@ pub fn prepare(
     message: &Message<'_>,
     deadline: Instant,
 ) -> Result<Draft, Error> {
-    let binding = request.binding;
-    if !binding.roles().jmap() {
-        return Err(Error::Policy);
-    }
-    let left = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
-        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
-    let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
-    if message.text.len() > maximum {
-        return Err(Error::Capacity);
-    }
+    let left = preparation_time(request.binding, message, deadline)?;
+    let maximum = request.binding.upload_maximum().min(32 * 1024 * 1024);
     let clock = RuntimeClock::new();
     let now = clock.sample().map_err(Error::Compose)?;
     let cap = Deadline::after(
@@ -127,7 +117,7 @@ pub fn prepare(
         u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
     )
     .map_err(Error::Compose)?;
-    let work = binding.work();
+    let work = request.binding.work();
     let mut meter = Meter::new(
         cap,
         Charge {
@@ -137,8 +127,72 @@ pub fn prepare(
             ..Charge::default()
         },
     );
+    prepare_with_meter(request, message, deadline, &mut meter, &clock)
+}
+
+fn preparation_time(
+    binding: &Binding,
+    message: &Message<'_>,
+    deadline: Instant,
+) -> Result<std::time::Duration, Error> {
+    if !binding.roles().jmap() {
+        return Err(Error::Policy);
+    }
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
+        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
+    if message.text.len() > binding.upload_maximum().min(32 * 1024 * 1024) {
+        return Err(Error::Capacity);
+    }
+    Ok(left)
+}
+struct PreparationClock<'a> {
+    clock: &'a RuntimeClock,
+    deadline: Instant,
+}
+impl Clock for PreparationClock<'_> {
+    fn sample(&self) -> Result<ports::Time, ports::Error> {
+        if Instant::now() >= self.deadline {
+            return Err(ports::Error::Deadline);
+        }
+        self.clock.sample()
+    }
+}
+fn charge(clock: &impl Clock, meter: &mut Meter, bytes: usize) -> Result<(), Error> {
+    meter
+        .charge(
+            clock.sample().map_err(Error::Compose)?.monotonic,
+            Charge {
+                io_bytes: bytes as u64,
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(|error| {
+            Error::Compose(match error {
+                crate::admission::work::Stop::Deadline => ports::Error::Deadline,
+                _ => ports::Error::Capacity,
+            })
+        })
+}
+
+/// Compose and retain under the caller's original work allowance. This still
+/// requires external memory admission and grants no publication authority.
+pub fn prepare_with_meter(
+    request: DraftRequest<'_>,
+    message: &Message<'_>,
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Draft, Error> {
+    preparation_time(request.binding, message, deadline)?;
+    let binding = request.binding;
+    let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
+    let clock = PreparationClock { clock, deadline };
+    charge(&clock, meter, 0)?;
     let mut bytes = Vec::new();
-    let length = compose_text::compose(message, maximum as u64, &clock, &mut meter, |part| {
+    let length = compose_text::compose(message, maximum as u64, &clock, meter, |part| {
         bytes
             .try_reserve(part.len())
             .map_err(|_| ports::Error::Capacity)?;
@@ -151,6 +205,7 @@ pub fn prepare(
     }
     let mut digest = Provider.sha256().map_err(|_| Error::Crypto)?;
     for chunk in bytes.chunks(publication::CHUNK) {
+        charge(&clock, meter, chunk.len())?;
         if Instant::now() >= deadline {
             return Err(Error::Connection(postgres_probe::Error::Deadline));
         }
@@ -168,6 +223,7 @@ pub fn prepare(
         .copied()
         .chain(std::iter::once(message.message_id))
     {
+        charge(&clock, meter, id.len())?;
         anchors.push(copy(id)?);
     }
     let mut ids = [[0; 16]; 4];
@@ -195,12 +251,14 @@ pub fn prepare(
         &request.expected.unwrap_or(0).to_be_bytes(),
         binding.profile().as_bytes(),
     ] {
+        charge(&clock, meter, part.len())?;
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
     if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
+    charge(&clock, meter, message.message_id.len())?;
     Ok(Draft {
         binding: binding.clone(),
         device: request.device,

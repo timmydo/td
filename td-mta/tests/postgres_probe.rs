@@ -4782,7 +4782,82 @@ fn exercise_drafts(
     };
     let publish =
         |draft: &drafts::Draft| drafts::publish(request, trust, deadline(), draft, password);
-    let first = prepare(&message("first@example.test", &[]), Some(1));
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline},
+    };
+    let clock = RuntimeClock::new();
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let input = message("first@example.test", &[]);
+    let draft_request = || drafts::DraftRequest {
+        binding,
+        device,
+        mailbox,
+        expected: Some(1),
+    };
+    for budget in [
+        Charge::default(),
+        Charge {
+            io_bytes: 65536,
+            records: 10000,
+            output_bytes: 1,
+            ..Default::default()
+        },
+    ] {
+        let mut exhausted = Meter::new(until, budget);
+        assert!(matches!(
+            drafts::prepare_with_meter(draft_request(), &input, deadline(), &mut exhausted, &clock),
+            Err(drafts::Error::Compose(td_mta::ports::Error::Capacity))
+        ));
+        assert!(exhausted.stopped().is_some());
+    }
+    let mut expired = Meter::new(
+        Deadline::after(clock.sample().unwrap().monotonic, 0).unwrap(),
+        Charge {
+            io_bytes: 65536,
+            records: 10000,
+            output_bytes: 65536,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        drafts::prepare_with_meter(draft_request(), &input, deadline(), &mut expired, &clock),
+        Err(drafts::Error::Compose(td_mta::ports::Error::Deadline))
+    ));
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "0");
+    let mut meter = Meter::new(
+        until,
+        Charge {
+            io_bytes: 65536,
+            records: 10000,
+            output_bytes: 65536,
+            ..Default::default()
+        },
+    );
+    meter
+        .charge(
+            clock.sample().unwrap().monotonic,
+            Charge {
+                records: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let before = meter.remaining();
+    assert!(matches!(
+        drafts::prepare_with_meter(draft_request(), &input, Instant::now(), &mut meter, &clock),
+        Err(drafts::Error::Connection(Error::Deadline))
+    ));
+    let first = drafts::prepare_with_meter(draft_request(), &input, deadline(), &mut meter, &clock)
+        .unwrap();
+    let after = meter.remaining();
+    assert!(
+        after.records < before.records
+            && after.io_bytes < before.io_bytes
+            && after.output_bytes < before.output_bytes
+    );
+
     assert_eq!(
         drafts::inspect(request, trust, deadline(), &first).unwrap(),
         None

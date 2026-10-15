@@ -2595,3 +2595,22 @@ fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
 its duplicate, lists it and moves mail through it. A delayed creation COMMIT
 proves exact receipt settlement and one durable folder. Hierarchy, renaming
 and folder deletion remain outside this td-mail milestone.
+
+
+## 83. Caller-funded draft preparation
+
+The retained plain-text draft helper has an entry point that borrows the
+original work meter and runtime clock. Composition, body hashing, retained
+thread anchors and request hashing spend that same allowance; no preparation
+step renews an exhausted budget. A clock wrapper checks the shorter absolute
+preparation deadline on every composition turn. Both entry points retain the
+ten-second phase and selected message-size ceilings. The cold convenience
+entry point constructs its own configured allowance and delegates to the same
+implementation.
+
+The caller still owns memory admission for the bounded retained body, fresh
+device authorization and publication capacity. This helper does not activate
+HTTP creation. The PostgreSQL draft fixture checks exhausted record/output
+budgets and expired original/phase deadlines refuse before publication, then
+publishes a caller-funded draft through the existing receipt, body, thread and
+history checks.
