@@ -933,10 +933,31 @@ fn test_send_draft_submits_through_jmap_and_retires_the_draft() {
         Some(("mbox-sent".to_string(), true, false)),
         "the server sent it and filed it"
     );
+    h.server().pad_submission_page();
     // td-mail ended and started again still asks before sending.
     h.restart();
     let resp = h.send(json!({"command": "connect", "account": "test"}));
     assert!(resp["ok"].is_true(), "connect failed: {}", resp);
+    for field in ["messageId", "keywords", "mailboxIds"] {
+        h.server().omit_filing_field(Some(field));
+        let refused = h.send(json!({"command": "send_draft", "path": lost.to_string_lossy()}));
+        assert!(!refused["ok"].is_true(), "{refused}");
+        assert!(
+            text(&refused["error"]).contains("outcome remains unknown"),
+            "{refused}"
+        );
+        assert!(
+            lost.exists() && record.exists(),
+            "uncertainty survives {field}"
+        );
+        assert_eq!(h.server().submissions().len(), sent_before, "no retry");
+        assert_eq!(
+            h.server().created_emails().len(),
+            created.len(),
+            "no replacement"
+        );
+    }
+    h.server().omit_filing_field(None);
     let resp = h.send(json!({"command": "send_draft", "path": lost.to_string_lossy()}));
     assert!(resp["ok"].is_true(), "{}", resp);
     assert_eq!(text(&resp["email_id"]), lost_id);

@@ -74,6 +74,7 @@ struct MockState {
     mailbox_creates: Vec<String>,
     mailbox_create_refused: bool,
     mailbox_create_mode: u8,
+    omit_filing_field: Option<String>,
     read_refusal: Option<(String, String)>,
     refuse_stored: bool,
     read_calls: Vec<Value>,
@@ -238,6 +239,7 @@ impl MockState {
             mailbox_creates: Vec::new(),
             mailbox_create_refused: false,
             mailbox_create_mode: 0,
+            omit_filing_field: None,
             read_refusal: None,
             refuse_stored: false,
             read_calls: Vec::new(),
@@ -846,6 +848,31 @@ impl MockJmapServer {
         self.state.lock().expect("state lock").submissions.clone()
     }
 
+    #[allow(dead_code)]
+    pub fn omit_filing_field(&self, field: Option<&str>) {
+        self.state.lock().expect("state lock").omit_filing_field = field.map(str::to_string);
+    }
+
+    /// Put the latest submission beyond a full query page, retaining its
+    /// time window and using another stored message for the preceding rows.
+    #[allow(dead_code)]
+    pub fn pad_submission_page(&self) {
+        let mut guard = self.state.lock().expect("state lock");
+        let (_, _, when) = guard.submission_emails.last().expect("submission").clone();
+        let email = guard.created.first().expect("earlier email").0.clone();
+        let template = guard.emails.get(&email).expect("stored email").clone();
+        for n in 0..300 {
+            let mut copy = template.clone();
+            copy.id = format!("historical-email-{n}");
+            copy.message_id = Some(format!("<historical-{n}@example.com>"));
+            guard.submission_emails.insert(
+                0,
+                (format!("historical-{n}"), copy.id.clone(), when.clone()),
+            );
+            guard.emails.insert(copy.id.clone(), copy);
+        }
+    }
+
     /// A stored message's mailbox and keywords, for what a send left.
     #[allow(dead_code)]
     pub fn email_state(&self, id: &str) -> Option<(String, bool, bool)> {
@@ -1247,6 +1274,13 @@ impl MockJmapServer {
                                 }
                             }
                         }
+                        if let Some(field) = state.lock().unwrap().omit_filing_field.as_deref() {
+                            for value in &mut list {
+                                if let Value::Obj(fields) = value {
+                                    fields.retain(|(key, _)| key != field);
+                                }
+                            }
+                        }
                         json!([
                             "Email/get",
                             {
@@ -1345,14 +1379,23 @@ impl MockJmapServer {
                             .map(|(id, _, _)| id.clone())
                             .collect()
                     };
+                    let total = ids.len();
+                    let position =
+                        args.get("position").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let limit = args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(256)
+                        .min(256) as usize;
+                    let ids: Vec<String> = ids.into_iter().skip(position).take(limit).collect();
                     json!([
                         "EmailSubmission/query",
                         {
                             "accountId": "account-001",
                             "queryState": "sqstate-001",
                             "ids": ids,
-                            "position": 0,
-                            "total": ids.len()
+                            "position": position,
+                            "total": total
                         },
                         call_id
                     ])

@@ -248,12 +248,14 @@ batches of 50. The real-server fixture must still prove a thread larger than
 256 messages. Audit other client get/set batches against the advertised
 256-object limit before activating those flows.
 
-`submissions_between` omits query `limit`/`position`/`calculateTotal` and reads
-only one submission page. M16/M22 must make lost-response reconciliation page
-through the complete bounded time window, with bounded get batches and query
-state handling, before absence is meaningful. An omitted match must not become
-evidence that a send never happened. Include a fixture with more than 256
-matching submissions and the sought submission beyond the first page.
+`submissions_between` completes a bounded window of at most 4096 submissions
+using explicit 256-ID query pages, stable query state and totals, and 50-ID
+get batches. Missing, malformed, duplicate or changing results preserve an
+unknown send outcome. Filing reads use 50-ID batches and require complete
+coverage. The client mock lost-reply fixture places the sought submission
+beyond 300 preceding matches. M16/M22 must repeat this against real td-mta
+before activation. The fallback Drafts/Sent Email/query path still reads one
+100-ID page and also needs complete pagination before absence is meaningful.
 
 POLICY.md adds a third client acceptance gap: Email/get's method-level failure
 on one opaque message must not hide a whole listing. M14/M22 add bounded

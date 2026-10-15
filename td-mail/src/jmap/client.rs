@@ -11,6 +11,124 @@ use td_json::{json, Json, ObjectBuilder, ToJson};
 const RESPONSE_LIMIT: Option<u64> = None;
 const FLAG_BATCH_MAX: usize = 256;
 
+// An oversized or incomplete reconciliation remains uncertain; it never
+// authorizes another send. Each get stays below td-mta's object limit.
+const RECONCILIATION_MAX: usize = 4096;
+
+fn reconciliation_incomplete() -> JmapError {
+    JmapError::Api(
+        "incomplete or changing submission reconciliation; send outcome remains unknown".into(),
+    )
+}
+
+fn reconciliation_page(
+    body: &Json,
+    ids: &mut Vec<String>,
+    state: &mut Option<String>,
+    total: &mut Option<u64>,
+) -> Result<bool, JmapError> {
+    let next_state = body
+        .get("queryState")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 256)
+        .ok_or_else(reconciliation_incomplete)?;
+    let next_total = body
+        .get("total")
+        .and_then(Json::as_u64)
+        .filter(|n| *n <= RECONCILIATION_MAX as u64)
+        .ok_or_else(reconciliation_incomplete)?;
+    let page = body
+        .get("ids")
+        .and_then(Json::as_array)
+        .ok_or_else(reconciliation_incomplete)?;
+    if body.get("position").and_then(Json::as_u64) != Some(ids.len() as u64)
+        || state.as_deref().is_some_and(|s| s != next_state)
+        || total.is_some_and(|n| n != next_total)
+        || page.len() > 256
+        || ids.len() + page.len() > next_total as usize
+        || (page.is_empty() && ids.len() < next_total as usize)
+    {
+        return Err(reconciliation_incomplete());
+    }
+    for id in page {
+        let id = id
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or_else(reconciliation_incomplete)?;
+        if ids.iter().any(|previous| previous == id) {
+            return Err(reconciliation_incomplete());
+        }
+        ids.push(id.into());
+    }
+    *state = Some(next_state.into());
+    *total = Some(next_total);
+    Ok(ids.len() == next_total as usize)
+}
+
+fn reconciliation_filing_fields(body: &Json) -> Result<(), JmapError> {
+    let list = body
+        .get("list")
+        .and_then(Json::as_array)
+        .ok_or_else(reconciliation_incomplete)?;
+    for email in list {
+        for field in ["keywords", "mailboxIds"] {
+            let flags = email
+                .get(field)
+                .and_then(Json::as_object)
+                .ok_or_else(reconciliation_incomplete)?;
+            if flags.iter().any(|(_, value)| value.as_bool() != Some(true)) {
+                return Err(reconciliation_incomplete());
+            }
+        }
+        let message_id = email
+            .get("messageId")
+            .ok_or_else(reconciliation_incomplete)?;
+        if !message_id.is_null()
+            && !message_id
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(|id| id.as_str().is_some()))
+        {
+            return Err(reconciliation_incomplete());
+        }
+    }
+    Ok(())
+}
+
+fn reconciliation_submissions(
+    body: &Json,
+    ids: &[String],
+) -> Result<Vec<(String, String)>, JmapError> {
+    let list = body
+        .get("list")
+        .and_then(Json::as_array)
+        .ok_or_else(reconciliation_incomplete)?;
+    let missing = body
+        .get("notFound")
+        .and_then(Json::as_array)
+        .ok_or_else(reconciliation_incomplete)?;
+    if !missing.is_empty() || list.len() != ids.len() {
+        return Err(reconciliation_incomplete());
+    }
+    let mut remaining: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut submissions = Vec::new();
+    for item in list {
+        let id = item
+            .get("id")
+            .and_then(Json::as_str)
+            .ok_or_else(reconciliation_incomplete)?;
+        let email = item
+            .get("emailId")
+            .and_then(Json::as_str)
+            .filter(|id| valid_id(id))
+            .ok_or_else(reconciliation_incomplete)?;
+        if !remaining.remove(id) {
+            return Err(reconciliation_incomplete());
+        }
+        submissions.push((id.into(), email.into()));
+    }
+    Ok(submissions)
+}
+
 /// The named diagnostic for a jail or a host with no fetch service, in the
 /// style APPLICATIONS.md §X asks for: what is absent, where it was looked
 /// for, and what would answer it.
@@ -1548,105 +1666,102 @@ impl JmapClient {
             "urn:ietf:params:jmap:core",
             "urn:ietf:params:jmap:submission",
         ];
-        let request = JmapRequest {
-            using: using.clone(),
-            method_calls: vec![MethodCall(
-                "EmailSubmission/query",
-                json!({
-                    "accountId": self.account_id,
-                    "filter": { "identityIds": [identity_id], "after": since, "before": until }
-                }),
-                "0".to_string(),
-            )],
-        };
-        let response = self.call(request)?;
-        let Some(method_response) = response.method_responses.first() else {
-            return Err(JmapError::Api(
-                "Empty response for EmailSubmission/query".to_string(),
-            ));
-        };
-        if method_response.0 != "EmailSubmission/query" {
-            return Err(Self::method_error("EmailSubmission/query", method_response));
+        let mut ids = Vec::new();
+        let mut state = None;
+        let mut total = None;
+        loop {
+            let response = self.call(JmapRequest {
+                using: using.clone(),
+                method_calls: vec![MethodCall(
+                    "EmailSubmission/query",
+                    json!({
+                        "accountId": self.account_id,
+                        "filter": {"identityIds": [identity_id], "after": since, "before": until},
+                        "position": ids.len(), "limit": 256, "calculateTotal": true,
+                        "sort": [{"property": "sendAt", "isAscending": true}]
+                    }),
+                    "0".into(),
+                )],
+            })?;
+            let body = self.reconciliation_response(&response, "EmailSubmission/query")?;
+            if reconciliation_page(body, &mut ids, &mut state, &mut total)? {
+                break;
+            }
         }
-        let ids: Vec<String> = method_response
-            .1
-            .get("ids")
-            .and_then(|ids| ids.as_array())
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| id.as_str())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        let mut submissions = Vec::new();
+        for batch in ids.chunks(50) {
+            let response = self.call(JmapRequest {
+                using: using.clone(),
+                method_calls: vec![MethodCall(
+                    "EmailSubmission/get",
+                    json!({
+                        "accountId": self.account_id, "ids": batch,
+                        "properties": ["id", "emailId"]
+                    }),
+                    "0".into(),
+                )],
+            })?;
+            let body = self.reconciliation_response(&response, "EmailSubmission/get")?;
+            submissions.extend(reconciliation_submissions(body, batch)?);
         }
-        let request = JmapRequest {
-            using,
-            method_calls: vec![MethodCall(
-                "EmailSubmission/get",
-                json!({
-                    "accountId": self.account_id,
-                    "ids": ids,
-                    "properties": ["id", "emailId"]
-                }),
-                "0".to_string(),
-            )],
-        };
-        let response = self.call(request)?;
-        let Some(method_response) = response.method_responses.first() else {
-            return Err(JmapError::Api(
-                "Empty response for EmailSubmission/get".to_string(),
-            ));
-        };
-        if method_response.0 != "EmailSubmission/get" {
-            return Err(Self::method_error("EmailSubmission/get", method_response));
-        }
-        Ok(method_response
-            .1
-            .get("list")
-            .and_then(|list| list.as_array())
-            .map(|list| {
-                list.iter()
-                    .filter_map(|submission| {
-                        let id = submission.get("id")?.as_str()?;
-                        let email_id = submission.get("emailId")?.as_str()?;
-                        Some((id.to_string(), email_id.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(submissions)
     }
 
     /// The messages' filing: keywords, mailboxes and Message-IDs.
     pub fn get_email_filing(&self, ids: &[String]) -> Result<Vec<Email>, JmapError> {
-        if ids.is_empty() {
-            return Ok(vec![]);
+        if ids.len() > RECONCILIATION_MAX || ids.iter().any(|id| !valid_id(id)) {
+            return Err(reconciliation_incomplete());
         }
-        log_info!("[JMAP] Email/get filing for {} email IDs", ids.len());
-        let request = JmapRequest {
-            using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
-            method_calls: vec![MethodCall(
-                "Email/get",
-                json!({
-                    "accountId": self.account_id,
-                    "ids": ids,
-                    "properties": ["id", "keywords", "mailboxIds", "messageId"]
-                }),
-                "0".to_string(),
-            )],
-        };
-        let response = self.call(request)?;
-        let Some(method_response) = response.method_responses.first() else {
-            return Err(JmapError::Api("Empty response for Email/get".to_string()));
-        };
-        if method_response.0 != "Email/get" {
-            return Err(Self::method_error("Email/get", method_response));
+        let ids: std::collections::BTreeSet<&String> = ids.iter().collect();
+        let ids: Vec<&String> = ids.into_iter().collect();
+        let mut emails = Vec::new();
+        for batch in ids.chunks(50) {
+            let response = self.call(JmapRequest {
+                using: vec!["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                method_calls: vec![MethodCall(
+                    "Email/get",
+                    json!({
+                        "accountId": self.account_id, "ids": batch,
+                        "properties": ["id", "keywords", "mailboxIds", "messageId"]
+                    }),
+                    "0".into(),
+                )],
+            })?;
+            let body = self.reconciliation_response(&response, "Email/get")?;
+            reconciliation_filing_fields(body)?;
+            let result = EmailGetResponse::from_json(body).map_err(JmapError::Parse)?;
+            let mut remaining: std::collections::BTreeSet<&str> =
+                batch.iter().map(|id| id.as_str()).collect();
+            if !result.not_found.is_empty() || result.list.len() != batch.len() {
+                return Err(reconciliation_incomplete());
+            }
+            for email in result.list {
+                if !remaining.remove(email.id.as_str()) {
+                    return Err(reconciliation_incomplete());
+                }
+                emails.push(email);
+            }
         }
-        let email_response =
-            EmailGetResponse::from_json(&method_response.1).map_err(JmapError::Parse)?;
-        Ok(email_response.list)
+        Ok(emails)
+    }
+
+    fn reconciliation_response<'a>(
+        &self,
+        response: &'a JmapResponse,
+        method: &str,
+    ) -> Result<&'a Json, JmapError> {
+        let [response] = response.method_responses.as_slice() else {
+            return Err(reconciliation_incomplete());
+        };
+        if response.0 != method {
+            return Err(Self::method_error(method, response));
+        }
+        if response.2 != "0"
+            || response.1.get("accountId").and_then(Json::as_str) != Some(self.account_id.as_str())
+        {
+            return Err(reconciliation_incomplete());
+        }
+        Ok(&response.1)
     }
 
     /// A method-level `error` response, or a response of the wrong name,
@@ -1928,6 +2043,75 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_filing_requires_requested_properties() {
+        for good in [
+            json!({"list":[{"keywords":{}, "mailboxIds":{"inbox":true}, "messageId":null}]}),
+            json!({"list":[{"keywords":{"$draft":true}, "mailboxIds":{"inbox":true}, "messageId":["id@example.com"]}]}),
+        ] {
+            assert!(reconciliation_filing_fields(&good).is_ok());
+        }
+        for bad in [
+            json!({"list":[{"keywords":{}, "mailboxIds":{}}]}),
+            json!({"list":[{"keywords":{}, "messageId":null}]}),
+            json!({"list":[{"mailboxIds":{}, "messageId":null}]}),
+            json!({"list":[{"keywords":{}, "mailboxIds":{}, "messageId":[false]}]}),
+            json!({"list":[{"keywords":{"$draft":false}, "mailboxIds":{}, "messageId":null}]}),
+        ] {
+            assert!(reconciliation_filing_fields(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn reconciliation_requires_complete_stable_pages_and_gets() {
+        let mut ids = Vec::new();
+        let mut state = None;
+        let mut total = None;
+        let first: Vec<String> = (0..256).map(|n| format!("s{n}")).collect();
+        assert!(!reconciliation_page(
+            &json!({"queryState":"a", "position":0, "total":257, "ids":first}),
+            &mut ids,
+            &mut state,
+            &mut total
+        )
+        .unwrap());
+        for bad in [
+            json!({"queryState":"b", "position":256, "total":257, "ids":["last"]}),
+            json!({"queryState":"a", "position":0, "total":257, "ids":["last"]}),
+            json!({"queryState":"a", "position":256, "total":258, "ids":["last"]}),
+            json!({"queryState":"a", "position":256, "total":257, "ids":[]}),
+            json!({"queryState":"a", "position":256, "total":257, "ids":["s0"]}),
+            json!({"queryState":"a", "position":256, "total":257, "ids":[null]}),
+        ] {
+            assert!(
+                reconciliation_page(&bad, &mut ids.clone(), &mut state.clone(), &mut total)
+                    .is_err()
+            );
+        }
+        assert!(reconciliation_page(
+            &json!({"queryState":"a", "position":256, "total":257, "ids":["last"]}),
+            &mut ids,
+            &mut state,
+            &mut total
+        )
+        .unwrap());
+        assert_eq!(ids.last().map(String::as_str), Some("last"));
+        let wanted = vec!["last".into()];
+        assert!(reconciliation_submissions(
+            &json!({"list":[{"id":"last","emailId":"email"}],"notFound":[]}),
+            &wanted
+        )
+        .is_ok());
+        for bad in [
+            json!({}),
+            json!({"list":[],"notFound":["last"]}),
+            json!({"list":[{"id":"other","emailId":"email"}],"notFound":[]}),
+            json!({"list":[{"id":"last"}],"notFound":[]}),
+        ] {
+            assert!(reconciliation_submissions(&bad, &wanted).is_err());
+        }
+    }
 
     #[test]
     fn destruction_requires_typed_confirmation_for_every_requested_id() {
