@@ -2220,7 +2220,14 @@ fn real_postgres_http_upload_owner_retains_and_settles() {
     exercise_configuration(ConfigurationExercise::HttpUploads);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_owner_retains_and_settles() {
+    exercise_configuration(ConfigurationExercise::ReceivingOwner);
+}
+
 enum ConfigurationExercise {
+    ReceivingOwner,
     HttpUploads,
     HttpDrafts,
     Client,
@@ -2831,6 +2838,7 @@ per_peer_limit = 1
             | ConfigurationExercise::Read
             | ConfigurationExercise::HttpDrafts
             | ConfigurationExercise::HttpUploads
+            | ConfigurationExercise::ReceivingOwner
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -2901,7 +2909,7 @@ per_peer_limit = 1
                 ConfigurationExercise::SubmissionInput => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), false)
                 }
-                ConfigurationExercise::Receiving => {}
+                ConfigurationExercise::Receiving | ConfigurationExercise::ReceivingOwner => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -2945,6 +2953,9 @@ per_peer_limit = 1
         }
         if name == "cloud" && matches!(exercise, ConfigurationExercise::Receiving) {
             exercise_receiving(&fixture, &request, &trust, prepared.binding());
+        }
+        if name == "cloud" && matches!(exercise, ConfigurationExercise::ReceivingOwner) {
+            exercise_smtp_receiving_owner(&fixture, prepared.binding());
         }
         let (binding, configuration, policies) = prepared.into_parts();
         assert_eq!(
@@ -10992,5 +11003,167 @@ fn exercise_http_upload_owner(
     assert_eq!(
         sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
         "2"
+    );
+}
+
+fn exercise_smtp_receiving_owner(
+    fixture: &Fixture,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
+        ports::{Clock, Deadline, Error},
+        postgres_read::ReadSlots,
+        postgres_receiving as changes, postgres_smtp_receiving as owner,
+    };
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let clock = RuntimeClock::new();
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let meter = || {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes: 1024 * 1024,
+                output_bytes: 1024 * 1024,
+                records: 4096,
+                ..Charge::default()
+            },
+        )
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let settlement = ReadSlots::new(1).unwrap();
+    let pending = owner::Pending::default();
+    let worker = owner::Receiving {
+        loaded: &loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &pending,
+    };
+    let mut recipient_bytes = [0; 1024];
+    let recipients =
+        ReceiptRecipients::encode(&["alice@example.test"], &mut recipient_bytes).unwrap();
+    let message = changes::Message {
+        bytes: b"Subject: retained receiving\r\n\r\nbody\r\n",
+        receipt: SmtpReceipt {
+            peer: "192.0.2.1".parse().unwrap(),
+            gateway: None,
+            tls: ReceiptTls::Tls13,
+            ehlo: "sender.example.test",
+            reverse_path: "sender@example.test",
+            recipients,
+        },
+        hostname: "mail.example.test",
+        extended: true,
+        header_bytes: binding.header_maximum(),
+        received_at: 1_700_000_000_000,
+    };
+    let mut exhausted = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut exhausted),
+        Err(owner::Error::Admission(Error::Capacity))
+    );
+    assert!(exhausted.stopped().is_some());
+    assert_eq!(pending.operation().unwrap(), None);
+    let first = worker
+        .create(&message, until(10_000), &mut meter())
+        .unwrap();
+    assert!(first.length > message.bytes.len() as u64);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "1"
+    );
+    sql(fixture, "CREATE FUNCTION public.reject_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject receiving'; END $$; CREATE TRIGGER reject_owned_receiving BEFORE INSERT ON td_mta.receiving_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Database))
+    );
+    assert_eq!(pending.operation().unwrap(), None);
+    sql(fixture, "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts; CREATE FUNCTION public.delay_owned_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_receiving()");
+    assert_eq!(
+        worker.create(&message, until(3000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    let operation = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Admission(Error::Busy))
+    );
+    assert_eq!(pending.operation().unwrap(), Some(operation));
+    thread::sleep(Duration::from_secs(5));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_owned_receiving ON td_mta.receiving_receipts",
+    );
+    let settled = pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(settled.outcome.length, first.length);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "2"
+    );
+    sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_receiving()");
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    let absent = pending.operation().unwrap().unwrap();
+    assert!(pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .is_none());
+    assert_eq!(pending.operation().unwrap(), Some(absent));
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Admission(Error::Busy))
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER reject_owned_receiving ON td_mta.receiving_receipts",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    let fresh = owner::Pending::default();
+    let worker = owner::Receiving {
+        pending: &fresh,
+        ..worker
+    };
+    assert_eq!(
+        worker.create(&message, until(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Policy))
+    );
+    assert_eq!(fresh.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "2"
+    );
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex')",
+            binding.selection().generation
+        ),
     );
 }

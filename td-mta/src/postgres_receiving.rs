@@ -74,6 +74,9 @@ impl Delivery {
     pub fn blob(&self) -> BlobId {
         self.blob
     }
+    pub fn length(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 fn copy(value: &str) -> Result<String, Error> {
     let mut text = String::new();

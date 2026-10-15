@@ -2995,3 +2995,29 @@ retries. The caller still owns body and scratch memory admission, gateway and
 recipient authority, publication and durable uncertain-operation custody.
 The real PostgreSQL receiving fixture exercises shared-meter exhaustion,
 expiry and successful publication with unchanged provenance and threading.
+
+
+## 104. Fixed-worker receiving publication ownership
+
+`postgres_smtp_receiving` publishes completed, caller-admitted DATA with one
+retained operation and the original work meter. It validates the receiving
+profile and configured header/recipient bounds, reserves a foreground
+connection before resolution, and uses runtime-qualified primary connections.
+A ten-second phase and original deadline cover preparation and publication;
+publication is prepaid using the final filtered body's extent and recipient
+count. Known outcomes
+survive later time/accounting refusal. Connection failures before publication
+may try the next bounded resolved address; unknown COMMIT is never replayed.
+
+The fixed owner retains uncertain Delivery bytes, IDs and provenance and
+refuses another preparation. Settlement uses separate connection capacity and
+fresh resolution, excludes the old publisher through the account lock and
+clears only a confirmed receipt. An absent receipt or failed observation keeps
+the operation fenced. Passive SMTP receipt facts confer no peer, gateway or
+recipient authority: the trusted connection owner still owes those checks.
+
+This remains prepared integration. SMTP ingress/transport wiring, durable
+restart custody, maintenance and production backend cutover are not activated.
+The PostgreSQL runtime-role fixture covers known success, rollback, delayed
+COMMIT, refusal while pending, historical settlement, absent-receipt retention
+and stale-policy refusal.
