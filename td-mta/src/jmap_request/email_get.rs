@@ -255,6 +255,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     View::Postgres(view) => {
                         let page = view.query(crate::postgres_read::EmailQuery {
                             scope: crate::postgres_read::EmailScope::All,
+                            after: None,
+                            before: None,
                             ascending: true,
                             position: 0,
                             limit: limits.objects_per_method,

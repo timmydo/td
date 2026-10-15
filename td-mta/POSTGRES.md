@@ -2835,3 +2835,20 @@ and support result references into subsequent explicit Submission/get calls.
 The original snapshot, SQL deadline and response meter cover every page;
 publication checks the snapshot again. This preparation does not advertise
 Submission or activate sending, generic query filters or queryChanges.
+
+## 95. Prepared Email reconciliation windows
+
+PostgreSQL Email/query supports td-mail's fallback filing search: inMailbox,
+after and before in one condition or a flat AND of conditions. Date bounds
+are strict UTC whole-second values, inclusive after and exclusive before
+against receivedAt. Repeated date bounds intersect; foreign mailbox IDs and
+empty time windows match nothing. Distinct local mailbox conditions refuse rather
+than guessing their multi-membership intersection. Unknown filters, nested
+operators and non-AND operators refuse; malformed shapes and dates refuse.
+The active SQLite dispatcher retains its mailbox-only filter support.
+
+The same snapshot filters both the optional total and ordered page, preserving
+account isolation, receivedAt/EmailId ordering, lookahead and the original
+SQL deadline. The date decoder is shared with submission queries, including
+its numeric-position checks. This is an inert PostgreSQL read preparation;
+it does not enable Submission or the production backend cutover.

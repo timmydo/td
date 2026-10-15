@@ -5365,11 +5365,17 @@ fn exercise_read_dispatch(
         ["Identity/get",{{"accountId":"{account}"}},"o"],
         ["Identity/get",{{"accountId":"{account}","ids":["ibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ifefefefefefefefefefefefefefefefe"]}},"p"],
         ["Identity/get",{{"accountId":"{account}","#ids":{{"resultOf":"o","name":"Identity/get","path":"/list/*/id"}}}},"q"],
-        ["Identity/get",{{"accountId":"afefefefefefefefefefefefefefefefe"}},"r"]
+        ["Identity/get",{{"accountId":"afefefefefefefefefefefefefefefefe"}},"r"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND","conditions":[{{"inMailbox":"{mailbox}"}},{{"after":"1900-01-01T00:00:00Z"}},{{"before":"9999-01-01T00:00:00Z"}}]}},"sort":[{{"property":"receivedAt","isAscending":false}}],"collapseThreads":false,"limit":1,"position":1,"calculateTotal":true}},"w1"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"after":"9999-01-01T00:00:00Z","before":"1900-01-01T00:00:00Z"}},"calculateTotal":true}},"w2"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND","conditions":[{{"inMailbox":"{mailbox}"}},{{"inMailbox":"{missing}"}}]}},"calculateTotal":true}},"w3"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"after":"2024-01-01T00:00:0 Z"}}}},"w4"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"OR","conditions":[]}}}},"w5"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"operator":"AND"}}}},"w6"]
     ]}}"##
     );
     let limits = Limits {
-        json_methods: 18,
+        json_methods: 24,
         ..Limits::default()
     };
     let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
@@ -5476,7 +5482,7 @@ fn exercise_read_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 18);
+    assert_eq!(complete.responses().len(), 24);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -5513,7 +5519,7 @@ fn exercise_read_dispatch(
         r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[]}},"h""#
     )));
     assert_eq!(output.matches(r#"["Email/get","#).count(), 4);
-    assert_eq!(output.matches(r#"["Email/query","#).count(), 3);
+    assert_eq!(output.matches(r#"["Email/query","#).count(), 5);
     assert!(output.contains(&format!(r#""position":0,"total":2,"ids":["{low}"]}},"j""#)));
     assert!(output.contains(&format!(r#""list":[{{"id":"{low}"}}],"notFound":[]}},"k""#)));
     assert!(output.contains(&format!(r#""position":1,"ids":["{high}"]}},"l""#)));
@@ -5539,6 +5545,29 @@ fn exercise_read_dispatch(
     );
     assert!(output.contains(r#""notFound":["ifefefefefefefefefefefefefefefefe"]},"p""#));
     assert!(output.contains(r#"["error",{"type":"accountNotFound"},"r"]"#));
+    assert!(
+        output.contains(&format!(
+            r#""position":1,"total":2,"ids":["{high}"]}},"w1""#
+        )),
+        "{output}"
+    );
+    assert!(output.contains(r#""total":0,"ids":[]},"w2""#), "{output}");
+    assert!(
+        output.contains(r#"["error",{"type":"unsupportedFilter"},"w3"]"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"["error",{"type":"invalidArguments"},"w4"]"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"["error",{"type":"unsupportedFilter"},"w5"]"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#"["error",{"type":"invalidArguments"},"w6"]"#),
+        "{output}"
+    );
     drop(complete);
     assert_eq!(owner.used().unwrap(), 0);
     assert!(!owner.admission_stopped());
@@ -6718,6 +6747,8 @@ fn exercise_query(
     expected.push(first.email);
     let query = read::EmailQuery {
         scope: read::EmailScope::All,
+        after: None,
+        before: None,
         ascending: false,
         position: 0,
         limit: 2,
@@ -6737,6 +6768,14 @@ fn exercise_query(
             let empty=view.query_emails(read::EmailQuery {scope,..query})?;
             assert!(empty.ids.is_empty());assert_eq!(empty.total,Some(0));assert!(!empty.has_more);
         }
+        let window=view.query_emails(read::EmailQuery {after:Some(-1),before:Some(5),..query})?;
+        assert_eq!(window.ids,vec![first.email]);assert_eq!(window.total,Some(1));assert!(!window.has_more);
+        let window=view.query_emails(read::EmailQuery {after:Some(5),before:Some(6),scope:read::EmailScope::Mailbox(mailbox),..query})?;
+        assert_eq!(window.ids,vec![second.email]);assert_eq!(window.total,Some(1));
+        let window=view.query_emails(read::EmailQuery {after:Some(5),before:Some(5),..query})?;
+        assert!(window.ids.is_empty());assert_eq!(window.total,Some(0));assert!(!window.has_more);
+        let window=view.query_emails(read::EmailQuery {after:Some(5),position:1,limit:1,..query})?;
+        assert_eq!(window.ids,vec![ties[1]]);assert_eq!(window.total,Some(2));assert!(!window.has_more);
         let zero=view.query_emails(read::EmailQuery {limit:0,..query})?;
         assert!(zero.ids.is_empty());assert!(zero.has_more);assert_eq!(zero.total,Some(3));
         let huge=view.query_emails(read::EmailQuery {position:u64::MAX,..query})?;

@@ -494,10 +494,22 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
                 let listing = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(destination)}));
                 assert!(listing["ok"].is_true(), "{listing}");
                 assert!(listing["emails"].as_array().unwrap().iter().any(|item| item["id"].as_str() == Some(target.as_str())), "{command}: {listing}; client log: {}", std::fs::read_to_string(&client.log_path).unwrap());
-                let mut retained = coordinator.retain_response(&response_spool, until).unwrap();
                 let phase = Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap();
-                let mut view = retained.method_view(account, phase).unwrap();
-                assert_eq!(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16).unwrap().values, [destination]);
+                loop {
+                    let observed = (|| -> Result<_, crate::store_fs::ResponseError> {
+                        let mut retained = coordinator.retain_response(&response_spool, until)?;
+                        let mut view = retained.method_view(account, phase)?;
+                        Ok(view.email_mailboxes(EmailId::from_bytes([10; 16]), None, 16)?.values)
+                    })();
+                    match observed {
+                        Ok(values) => { assert_eq!(values, [destination]); break; }
+                        Err(crate::store_fs::ResponseError::Store(crate::ports::Error::Busy)) => {
+                            assert!(clock.sample().unwrap().monotonic < phase.tick());
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("native mailbox probe failed: {error}"),
+                    }
+                }
             }
             devices.lock().unwrap().revoke(device, 2).unwrap();
             let revoked = client.ask(json!({"command":"query_emails", "mailbox_id":wire_id(inbox)}));

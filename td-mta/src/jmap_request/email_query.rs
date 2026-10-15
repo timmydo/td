@@ -17,9 +17,74 @@ use std::{cmp::Ordering, ops::Range};
 use td_json::scan;
 const RECORD: usize = 24;
 const RUN: usize = 256;
+#[derive(Default)]
+struct Filter {
+    mailbox: Option<Option<MailboxId>>,
+    after: Option<i64>,
+    before: Option<i64>,
+}
+impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
+    fn email_filter(&mut self, range: Range<u64>, result: &mut Filter) -> Result<(), Error> {
+        let mut fields = Children::new(range.clone(), scan::Kind::Object)?;
+        let (mut operator, mut conditions, mut scalar) = (false, None, false);
+        while let Some(item) = fields.next(self)? {
+            match item.key.bytes() {
+                b"operator" => {
+                    if self.read.is_none() || self.push_string(&item)?.bytes() != b"AND" {
+                        return Err(Error::UnsupportedFilter);
+                    }
+                    operator = true;
+                }
+                b"conditions" if self.read.is_none() => return Err(Error::UnsupportedFilter),
+                b"conditions" => conditions = Some(item),
+                _ => scalar = true,
+            }
+        }
+        match (operator, conditions) {
+            (false, None) => self.email_condition(range, result),
+            (true, Some(conditions)) if !scalar => {
+                let mut conditions = Children::new(conditions.range, scan::Kind::Array)?;
+                while let Some(item) = conditions.next(self)? {
+                    self.email_condition(item.range, result)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::InvalidArguments),
+        }
+    }
+    fn email_condition(&mut self, range: Range<u64>, result: &mut Filter) -> Result<(), Error> {
+        let mut fields = Children::new(range, scan::Kind::Object)?;
+        while let Some(item) = fields.next(self)? {
+            match item.key.bytes() {
+                b"inMailbox" => {
+                    let mailbox = self.push_string(&item)?.wire_id()?.local();
+                    result.mailbox = Some(match result.mailbox {
+                        None => mailbox,
+                        Some(previous) if previous == mailbox => mailbox,
+                        Some(None) => None,
+                        Some(Some(_)) if mailbox.is_none() => None,
+                        Some(Some(_)) => return Err(Error::UnsupportedFilter),
+                    });
+                }
+                b"after" | b"before" if self.read.is_some() => {
+                    let date = super::query_date::parse(self.push_string(&item)?.bytes())?;
+                    if item.key.bytes() == b"after" {
+                        result.after = Some(result.after.map_or(date, |old| old.max(date)));
+                    } else {
+                        result.before = Some(result.before.map_or(date, |old| old.min(date)));
+                    }
+                }
+                _ => return Err(Error::UnsupportedFilter),
+            }
+        }
+        Ok(())
+    }
+}
 struct Arguments {
     account: Name,
     mailbox: Option<Option<MailboxId>>,
+    after: Option<i64>,
+    before: Option<i64>,
     ascending: bool,
     position: u64,
     limit: usize,
@@ -34,24 +99,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     ) -> Result<Arguments, Error> {
         let mut fields = Children::new(range, scan::Kind::Object)?;
         let mut account = None;
-        let mut mailbox = None;
+        let mut filter = Filter::default();
         let (mut ascending, mut total) = (false, false);
         let (mut position, mut limit, mut include_limit) = (0, page, true);
         while let Some(item) = fields.next(self)? {
             match item.key.bytes() {
                 b"accountId" => account = Some(self.push_string(&item)?),
                 b"filter" if item.kind == scan::Kind::Null => (),
-                b"filter" => {
-                    let mut filter = Children::new(item.range, scan::Kind::Object)?;
-                    while let Some(item) = filter.next(self)? {
-                        match item.key.bytes() {
-                            b"inMailbox" => {
-                                mailbox = Some(self.push_string(&item)?.wire_id()?.local())
-                            }
-                            _ => return Err(Error::UnsupportedFilter),
-                        }
-                    }
-                }
+                b"filter" => self.email_filter(item.range, &mut filter)?,
                 b"sort" if item.kind == scan::Kind::Null => (),
                 b"sort" => {
                     let mut sort = Children::new(item.range, scan::Kind::Array)?;
@@ -121,7 +176,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         Ok(Arguments {
             account,
-            mailbox,
+            mailbox: filter.mailbox,
+            after: filter.after,
+            before: filter.before,
             ascending,
             position,
             limit,
@@ -365,6 +422,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 Some(Some(mailbox)) => EmailScope::Mailbox(mailbox),
                 Some(None) => EmailScope::Empty,
             },
+            after: arguments.after,
+            before: arguments.before,
             ascending: arguments.ascending,
             position: arguments.position,
             limit: arguments.limit,

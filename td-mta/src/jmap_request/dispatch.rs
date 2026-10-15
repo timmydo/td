@@ -13,6 +13,9 @@ pub use email_create::{DraftCreator, DraftError, DraftInput};
 mod mailbox_set;
 pub use mailbox_set::MailboxMutator;
 
+#[path = "query_date.rs"]
+mod query_date;
+
 #[path = "submission_query.rs"]
 mod submission_query;
 

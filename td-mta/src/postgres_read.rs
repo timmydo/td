@@ -55,6 +55,8 @@ pub enum EmailScope {
 #[derive(Clone, Copy, Debug)]
 pub struct EmailQuery {
     pub scope: EmailScope,
+    pub after: Option<i64>,
+    pub before: Option<i64>,
     pub ascending: bool,
     pub position: u64,
     pub limit: usize,
@@ -619,22 +621,22 @@ impl Snapshot<'_> {
                 total: query.calculate_total.then_some(0),
                 has_more: false,
             };
-            if query.scope == EmailScope::Empty { return Ok(page); }
+            if query.scope == EmailScope::Empty || matches!((query.after, query.before), (Some(after), Some(before)) if after >= before) { return Ok(page); }
             let account = identity.account.as_bytes().as_slice();
             let mailbox = mailbox.as_ref().map(|id|id.as_slice());
             if query.calculate_total {
-                let row=client.query_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2))", &[&account,&mailbox]).await.map_err(|_|Error::Database)?;
+                let row=client.query_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2)) AND ($3::bigint IS NULL OR e.received_at >= $3) AND ($4::bigint IS NULL OR e.received_at < $4)", &[&account,&mailbox,&query.after,&query.before]).await.map_err(|_|Error::Database)?;
                 let total:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
                 page.total=Some(u64::try_from(total).map_err(|_|Error::Integrity)?);
             }
             let Ok(position)=i64::try_from(query.position) else { return Ok(page); };
             let limit=i64::try_from(query.limit+1).map_err(|_|Error::Capacity)?;
             let sql=if query.ascending {
-                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) ORDER BY e.received_at ASC,e.id ASC LIMIT $3 OFFSET $4"
+                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at ASC,e.id ASC LIMIT $3 OFFSET $4"
             } else {
-                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"
+                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) AND ($5::bigint IS NULL OR e.received_at >= $5) AND ($6::bigint IS NULL OR e.received_at < $6) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"
             };
-            let rows=client.query(sql,&[&account,&mailbox,&limit,&position]).await.map_err(|_|Error::Database)?;
+            let rows=client.query(sql,&[&account,&mailbox,&limit,&position,&query.after,&query.before]).await.map_err(|_|Error::Database)?;
             page.ids.try_reserve_exact(query.limit).map_err(|_|Error::Capacity)?;
             page.has_more=rows.len()>query.limit;
             let mut previous:Option<(i64,[u8;16])>=None;
