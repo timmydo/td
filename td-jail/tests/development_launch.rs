@@ -29,6 +29,45 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
         fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))?;
         scratch.push_str(&format!("scratch={}\n", path.display()));
     }
+    let source = base.join("development.c");
+    fs::write(&source, include_str!("development_probe.c"))?;
+    let compiler = Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(base.join("tree/nested-probe"))
+        .output()?;
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    let compat = base.join("compat.S");
+    fs::write(&compat, ".global _start\n.text\n_start:\nmov $20, %eax\nint $0x80\ntest %eax, %eax\njle fail\nxor %ebx, %ebx\njmp done\nfail:\nmov $1, %ebx\ndone:\nmov $1, %eax\nint $0x80\n")?;
+    let compiler = Command::new("cc")
+        .args(["-m32", "-nostdlib", "-static", "-Wl,--build-id=none"])
+        .arg(&compat)
+        .arg("-o")
+        .arg(base.join("tree/compat-probe"))
+        .output()?;
+    assert!(
+        compiler.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiler.stderr)
+    );
+    let repository = base.join("repository");
+    for name in [
+        "objects/info",
+        "worktrees",
+        "branches",
+        "hooks",
+        "info",
+        "remotes",
+    ] {
+        fs::create_dir_all(repository.join(name))?;
+    }
+    for name in ["commondir", "config", "config.worktree", "shallow"] {
+        fs::write(repository.join(name), "protected")?;
+    }
     let secret = base.join("ungranted");
     fs::write(&secret, "host-only")?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -36,20 +75,22 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
     fs::write(
         base.join("tree/inputs"),
         format!(
-            "{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n",
             listener.local_addr()?,
             fs::read_link("/proc/self/ns/net")?.display(),
-            secret.display()
+            secret.display(),
+            repository.display()
         ),
     )?;
     let spec = base.join("spec");
     fs::write(
         &spec,
         format!(
-            "format=1\nprofile=development\nentry={}\nhome={}\n{scratch}worktree={}\n",
+            "format=1\nprofile=development\nentry={}\nhome={}\n{scratch}worktree={}\nrepository={}\n",
             fs::canonicalize(std::env::current_exe()?)?.display(),
             base.join("home").display(),
-            base.join("tree").display()
+            base.join("tree").display(),
+            repository.display()
         ),
     )?;
     fs::set_permissions(&spec, fs::Permissions::from_mode(0o600))?;
@@ -73,6 +114,7 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
     assert!(reply.contains("development-boundary=passed"), "{reply}");
     let reply = run_probe(&spec, "persistence_probe")?;
     assert!(reply.contains("persistent-state=passed"), "{reply}");
+    assert_eq!(fs::read_to_string(repository.join("config"))?, "protected");
     Ok(())
 }
 
@@ -113,6 +155,7 @@ fn development_probe() -> Result<(), Box<dyn Error>> {
     let address = lines.next().ok_or("missing host address")?;
     let network = lines.next().ok_or("missing host network")?;
     let secret = lines.next().ok_or("missing host secret path")?;
+    let repository = lines.next().ok_or("missing repository path")?;
     assert_eq!(
         fs::read_link("/proc/self/ns/net")?.to_string_lossy(),
         network
@@ -140,6 +183,13 @@ fn development_probe() -> Result<(), Box<dyn Error>> {
         .args(["--exact", "home_probe", "--ignored"])
         .status()?
         .success());
+    let nested = Command::new("./nested-probe").arg(repository).output()?;
+    assert!(
+        nested.status.success(),
+        "nested: {}",
+        String::from_utf8_lossy(&nested.stderr)
+    );
+    assert!(Command::new("./compat-probe").status()?.success());
     println!("\ndevelopment-boundary=passed");
     Ok(())
 }

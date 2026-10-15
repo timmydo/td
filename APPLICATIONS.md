@@ -3562,8 +3562,8 @@ write=/absolute/shared/read-write
 `profile=development` is optional immediately after `format=1`; omission
 selects the isolated profile used by reviews and maintenance. Unknown,
 repeated or misplaced profile lines are refused. Development shares the
-host network namespace and uses the standard socket rules, admitting Unix
-sockets and datagram pairs. It binds the canonical regular-file target of
+host network namespace and selects the development syscall policy, admitting
+Unix sockets and datagram pairs. It binds the canonical regular-file target of
 `/etc/resolv.conf` read-only (at most 64 KiB); a missing or invalid resolver
 refuses launch. Host-local services and sockets are intentionally reachable;
 the filesystem grants do not constrain the authority those services expose.
@@ -3579,6 +3579,26 @@ remains noexec; the other scratch paths permit execution. Stage 2 validates
 flags and writability, allowing existing files. The optional host system
 link in `/run` is created if absent and refreshed when the host generation
 changes; an existing nonsymlink is refused. Unrelated runtime files remain.
+
+The development syscall policy is a default-allow filter for x86-64 and
+i386, with unknown architectures and x32 killed. It allows process and thread
+creation (including clone3), nested user/mount/PID namespaces, old and new
+mount APIs, ptrace of visible processes, io_uring, userfaultfd and performance
+APIs subject to kernel permissions. It refuses host keyrings (`add_key`,
+`request_key`, `keyctl`), `open_by_handle_at`, BPF, module and kexec loading,
+raw I/O privilege, accounting, swap control, syslog and vhangup, and terminal
+injection ioctls TIOCSTI/TIOCLINUX, with EPERM. Native and compatibility
+syscall numbers have separate compiled tables; legacy i386 socketcall is
+allowed. It does not require host setup or privileged helpers and never
+retries a refused launch without the boundary. Kernel-disabled features can
+still fail. This is a development compatibility policy, not a kernel attack
+surface minimization policy.
+
+The live development probe exercises nested user/mount namespaces and tmpfs,
+proves inherited readonly mounts cannot be remounted or detached, and attempts
+both nonrecursive bind and open_tree clones of protected Git metadata. It
+also runs an i386 executable. Interpreter tests cover both denial tables and
+ABI dispatch, including x32, without depending on host kernel defaults.
 
 `entry` and `home` appear once; `program` (with `entry`, at most four)
 and `alias` (at most 64) and `path` (at most 16) repeat, as do `worktree`, `checkout`,
@@ -3644,7 +3664,9 @@ with the kind's own departures:
   and inode are checked before and after its bind as a grant's are. So
   every directory between a repository's top and a protected entry is
   itself a mount, which the kernel will not rename or remove, and the
-  filter refuses every mount call. The chain adds at most 1024 mounts,
+  isolated profile refuses every mount call. Development drops capabilities
+  in the owning user namespace; nested user namespaces cannot unlock inherited
+  readonly mounts or split off their locked child mounts. The chain adds at most 1024 mounts,
   a protected file must be its owner's to write (so a write to it fails
   for the read-only mount alone), and a plan's paths take at most 384 KiB
   of stage 2's argv. When the spec names a

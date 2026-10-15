@@ -330,6 +330,74 @@ define_policy!(
     467, // open_tree_attr
 );
 
+// Development permits ordinary execution and nested isolation. The paired
+// numbers are x86-64/i386 from Linux's syscall tables; socketcall is allowed.
+macro_rules! development_policy {
+    ($(($native:expr, $compat:expr)),+ $(,)?) => {
+        #[cfg(test)]
+        const DEVELOPMENT_DENIED: &[(u32, u32)] = &[$(($native, $compat)),+];
+        const DEVELOPMENT_NATIVE: &[SockFilter] = &[
+            load(OFFSET_NR),
+            and(X32_SYSCALL_MASK),
+            jump_eq(X32_SYSCALL_BIT, 0, 1),
+            ret(SECCOMP_RET_KILL_PROCESS),
+            load(OFFSET_NR),
+            jump_eq(SYS_IOCTL, 0, 6),
+            load(OFFSET_ARG1_LOW),
+            jump_eq(TIOCSTI, 0, 1), ret(errno(EPERM)),
+            jump_eq(TIOCLINUX, 0, 1), ret(errno(EPERM)),
+            load(OFFSET_NR),
+            $(jump_eq($native, 0, 1), ret(errno(EPERM)),)+
+            ret(SECCOMP_RET_ALLOW),
+        ];
+        const DEVELOPMENT_COMPAT: &[SockFilter] = &[
+            load(OFFSET_NR),
+            jump_eq(54, 0, 6), // i386 ioctl
+            load(OFFSET_ARG1_LOW),
+            jump_eq(TIOCSTI, 0, 1), ret(errno(EPERM)),
+            jump_eq(TIOCLINUX, 0, 1), ret(errno(EPERM)),
+            load(OFFSET_NR),
+            $(jump_eq($compat, 0, 1), ret(errno(EPERM)),)+
+            ret(SECCOMP_RET_ALLOW),
+        ];
+    };
+}
+
+development_policy!(
+    (103, 103),      // syslog
+    (153, 111),      // vhangup
+    (163, 51),       // acct
+    (167, 87),       // swapon
+    (168, 115),      // swapoff
+    (172, 110),      // iopl
+    (173, 101),      // ioperm
+    (175, 128),      // init_module
+    (176, 129),      // delete_module
+    (246, 283),      // kexec_load
+    (248, 286),      // add_key
+    (249, 287),      // request_key
+    (250, 288),      // keyctl
+    (304, 342),      // open_by_handle_at
+    (313, 350),      // finit_module
+    (320, u32::MAX), // kexec_file_load has no i386 entry
+    (321, 357),      // bpf
+);
+
+pub(crate) fn development_program() -> io::Result<Vec<SockFilter>> {
+    let compat = u8::try_from(DEVELOPMENT_NATIVE.len() + 1)
+        .map_err(|_| io::Error::other("development ABI dispatch exceeds BPF jump bound"))?;
+    let mut program = vec![
+        load(OFFSET_ARCH),
+        jump_eq(AUDIT_ARCH_X86_64, 2, 0),
+        jump_eq(AUDIT_ARCH_I386, compat, 0),
+        ret(SECCOMP_RET_KILL_PROCESS),
+    ];
+    program.extend_from_slice(DEVELOPMENT_NATIVE);
+    program.extend_from_slice(DEVELOPMENT_COMPAT);
+    validate(&program, program.len())?;
+    Ok(program)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AuditAction {
     code: u32,
@@ -774,6 +842,54 @@ mod tests {
             }
         }
         Err("interpreter exceeded its instruction bound".to_string())
+    }
+
+    #[test]
+    fn development_abis_preserve_denials_and_allow_nested_builds() {
+        let program = development_program().unwrap();
+        for (native, compat) in DEVELOPMENT_DENIED {
+            for (arch, number) in [(AUDIT_ARCH_X86_64, *native), (AUDIT_ARCH_I386, *compat)] {
+                let mut call = data(number as i32);
+                call.arch = arch;
+                assert_eq!(interpret(&program, call).unwrap(), errno(EPERM));
+            }
+        }
+        for (arch, numbers, ioctl) in [
+            (
+                AUDIT_ARCH_X86_64,
+                &[
+                    56, 435, 272, 165, 166, 155, 161, 308, 101, 298, 310, 425, 426, 427, 442,
+                ][..],
+                16,
+            ),
+            (
+                AUDIT_ARCH_I386,
+                &[
+                    120, 435, 310, 21, 52, 217, 61, 346, 26, 336, 347, 425, 426, 427, 442,
+                ][..],
+                54,
+            ),
+        ] {
+            for number in numbers {
+                let mut call = data(*number);
+                call.arch = arch;
+                call.args[0] = u64::MAX;
+                assert_eq!(interpret(&program, call).unwrap(), SECCOMP_RET_ALLOW);
+            }
+            for request in [TIOCSTI, TIOCLINUX] {
+                let mut call = data(ioctl);
+                call.arch = arch;
+                call.args[1] = u64::from(request);
+                assert_eq!(interpret(&program, call).unwrap(), errno(EPERM));
+            }
+        }
+        let mut call = data(1);
+        call.arch = 0;
+        assert_eq!(interpret(&program, call).unwrap(), SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(
+            interpret(&program, data((X32_SYSCALL_BIT | 1) as i32)).unwrap(),
+            SECCOMP_RET_KILL_PROCESS
+        );
     }
 
     #[test]

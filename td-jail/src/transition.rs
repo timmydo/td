@@ -7593,8 +7593,12 @@ fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<(
     Ok(())
 }
 
-fn install_workspace_seccomp_filter() -> io::Result<()> {
-    let program = seccomp::workspace_program()?;
+fn install_workspace_seccomp_filter(development: bool) -> io::Result<()> {
+    let program = if development {
+        seccomp::development_program()?
+    } else {
+        seccomp::workspace_program()?.instructions().to_vec()
+    };
     sys::set_no_new_privileges()?;
     if !sys::no_new_privileges()? {
         return Err(io::Error::new(
@@ -7602,7 +7606,7 @@ fn install_workspace_seccomp_filter() -> io::Result<()> {
             "PR_SET_NO_NEW_PRIVS succeeded without changing its readback",
         ));
     }
-    sys::install_seccomp_filter(program.instructions(), false)?;
+    sys::install_seccomp_filter(&program, false)?;
     require_runtime_confinement()
 }
 
@@ -7620,11 +7624,7 @@ fn run_stage2_workspace(
         return Err(io::Error::other("workspace stage 2 identity changed"));
     }
     clear_and_require_empty_capabilities()?;
-    if plan.development {
-        install_standard_seccomp_filter(false)?;
-    } else {
-        install_workspace_seccomp_filter()?;
-    }
+    install_workspace_seccomp_filter(plan.development)?;
     sys::set_dumpable(false)?;
     if sys::dumpable()? {
         return Err(io::Error::other("workspace PID 1 remained dumpable"));

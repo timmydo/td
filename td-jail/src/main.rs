@@ -330,9 +330,14 @@ mod confinement {
             at(stage2, "require_workspace_mount_plan(plan, token)?;")
                 < at(stage2, "clear_and_require_empty_capabilities()?;")
                 && at(stage2, "clear_and_require_empty_capabilities()?;")
-                    < at(stage2, "install_workspace_seccomp_filter()?;")
-                && at(stage2, "install_workspace_seccomp_filter()?;")
-                    < at(stage2, "sys::set_dumpable(false)?;")
+                    < at(
+                        stage2,
+                        "install_workspace_seccomp_filter(plan.development)?;"
+                    )
+                && at(
+                    stage2,
+                    "install_workspace_seccomp_filter(plan.development)?;"
+                ) < at(stage2, "sys::set_dumpable(false)?;")
                 && at(stage2, "sys::set_dumpable(false)?;")
                     < at(stage2, "start_stage1_liveness_watcher()?;")
                 && at(stage2, "start_stage1_liveness_watcher()?;") < at(stage2, "command.spawn()")
@@ -353,7 +358,7 @@ mod confinement {
                     )
         );
         assert!(TRANSITION.contains(
-            "fn install_workspace_seccomp_filter() -> io::Result<()> {\n    let program = seccomp::workspace_program()?;"
+            "fn install_workspace_seccomp_filter(development: bool) -> io::Result<()> {\n    let program = if development {\n        seccomp::development_program()?"
         ));
     }
 
@@ -1243,11 +1248,11 @@ mod confinement {
         );
         assert_eq!(
             TRANSITION
-                .matches("sys::install_seccomp_filter(program.instructions(), false)?;")
+                .matches("sys::install_seccomp_filter(&program, false)?;")
                 .count(),
             1
         );
-        assert!(TRANSITION.contains("install_workspace_seccomp_filter()?;"));
+        assert!(TRANSITION.contains("install_workspace_seccomp_filter(plan.development)?;"));
         assert_eq!(FIREFOX.matches("sandbox.filters >= 2").count(), 1);
         assert!(TRANSITION.contains("sys::terminate_namespace,"));
         assert!(!shipped_main.contains("sys::"));

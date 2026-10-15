@@ -2059,8 +2059,15 @@ a new caller of an existing operation, binding the instance to its
 launcher as stage 1 is bound to td-jail. Stage 1 selects the existing shared-network unshare set for the optional
 `profile=development` spec, otherwise the isolated set and loopback. It
 checks the selected namespace identities and maps the caller to itself.
-Development uses the existing standard filter, including Unix sockets;
-reviews and maintenance retain the workspace filter. No syscall, operation
+Development selects a third compiled policy, assembled from fixed x86-64
+and i386 instruction tables by `seccomp::development_program`, with its
+architecture dispatch and jumps validated before installation. Reviews and
+maintenance retain the workspace filter. Development allows ordinary code,
+nested namespaces and mounts, with the exact denial roster and inherited-mount
+boundary in APPLICATIONS.md §C. The raw installation wrapper is unchanged.
+The test-only C development probe calls unshare, uid/gid-map writes, mount,
+umount2, keyctl, open_tree and move_mount to exercise this policy; its i386
+assembly companion only gets its PID and exits. Neither is a shipped wrapper. No syscall, operation
 or namespace flag set is added. Its mount plan
 is the compiled base plan, with `/tmp` and `/var/tmp` executable; the
 host's compiled system-tree list bound recursively read-only, `nosuid`
@@ -2085,7 +2092,8 @@ for its socket rules, which refuse `socket(2)` for `AF_UNIX` with
 `EPERM` and admit `socketpair(2)` only for `AF_UNIX` with `SOCK_STREAM`
 or `SOCK_SEQPACKET`, `SOCK_NONBLOCK` and `SOCK_CLOEXEC` masked off. The kind selects
 the program; no caller does. The interpreter test runs both programs
-over the roster and requires them to differ only in those rules; the C
+over the standard/workspace roster and requires those two to differ only
+in their socket rules; development has its own two-ABI interpreter oracle; the C
 kernel probe covers the standard program alone, and the workspace
 program's kernel behaviour is the ignored live launch tests', which
 need unprivileged user namespaces: a Rust probe inside an instance finds
@@ -2107,7 +2115,7 @@ There is likewise no `fork`, `pre_exec`, `clone`, `setns`, or caller-
 supplied namespace, mount set, or BPF program. A fifteenth syscall, a ninth
 prctl operation, a second seccomp operation, a seccomp flag outside the exact
 `{0, SECCOMP_FILTER_FLAG_LOG}` set, a fourth ambient sub-operation, a third
-unshare flag set, or a third compiled seccomp program is an amendment here.
+unshare flag set, or a fourth compiled seccomp policy is an amendment here.
 
 ## 10. `td-busd` — the session bus broker
 

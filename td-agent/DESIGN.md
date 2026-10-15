@@ -3681,6 +3681,11 @@ Every instance has:
   process, where later limits attach (below).
 - **Isolation:** private PID, UTS, and, where the kernel provides it, IPC
   namespaces (td today does not, APPLICATIONS.md §0); no new privileges.
+  The development syscall policy allows ordinary x86-64/i386 code, threads,
+  clone3, nested isolation and mounts, debugging and io_uring under kernel
+  permissions. Keyrings, handle-based filesystem access, BPF and a small
+  host-administration roster remain denied (APPLICATIONS.md §C). Reviews and
+  Git maintenance keep their separate restrictive filter.
 - **Inheritance:** no descriptor but the instance's pipe, no runtime
   directory, and an environment scrubbed to `PATH`, `HOME`, `TMPDIR`,
   `LANG` and `TERM=dumb`. `PATH` begins with the host's own `PATH`
@@ -3712,8 +3717,11 @@ outside:
 Bind mounts protect a path only while no directory above it can be
 renamed: the kernel refuses to rename a mount point but moves a mount with
 a renamed ancestor. So every directory on the path from a mount top to a
-protected entry is itself a mount, and td-jail's filter refuses the whole
-mount surface, old and new API. The chain:
+protected entry is itself a mount. The isolated filter refuses mount APIs.
+Development permits nested isolation after dropping capabilities in the
+owning namespace; the kernel locks inherited mounts and their readonly flags
+against the child's namespace. Nonrecursive clones cannot split locked Git
+submounts from their parents (APPLICATIONS.md §C, live development oracle). The chain:
 
 - the workspace repository `<repo>.git`, read-write, as a mount, with
   `config`, `config.worktree`, `commondir`, `shallow`, `hooks/`, `info/`,
