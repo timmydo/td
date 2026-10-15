@@ -85,19 +85,45 @@ pub fn with_email<T>(
             if schema.store_epoch != selected.epoch { return Err(Error::Epoch); }
             client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_| Error::Database)?;
             postgres_devices::authenticate(client, selected.account, presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
-            let rows = client.query("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id) FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=$2 LIMIT 2", &[&selected.account.as_bytes().as_slice(), &selected.email.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if rows.is_empty() { return Err(Error::Missing); }
-            if rows.len() != 1 { return Err(Error::Integrity); }
-            metadata(rows.first().ok_or(Error::Integrity)?, selected)
+            email_metadata(client,selected).await
         })).map_err(Error::Connection)??;
-        let mut body = Body { worker, metadata: BlobMetadata { identity: metadata.identity, blob: metadata.blob, body: metadata.body }, deadline, failed: None, cache: Vec::new(), cache_start: 0 };
-        body.verify().map_err(Error::Read)?;
-        body.check().map_err(Error::Read)?;
-        let result = read(metadata, &mut body);
-        // Even a callback swallowing a failed read cannot turn it into success.
-        body.check().map_err(Error::Read)?;
-        result.map_err(Error::Read)
+        with_verified_body(worker,BlobMetadata { identity:metadata.identity,blob:metadata.blob,body:metadata.body },deadline,|body|read(metadata,body))
     }).map_err(Error::Connection)?
+}
+
+pub(crate) async fn email_metadata(
+    client: &tokio_postgres::Client,
+    selected: ReadRequest,
+) -> Result<Metadata, Error> {
+    let rows = client.query("SELECT a.sequence,a.floor,e.blob_id,e.thread_id,e.received_at,b.length,b.digest,b.created_at,b.chunk_count,e.changed,b.changed,t.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=a.id AND c.blob_id=e.blob_id) FROM td_mta.accounts a JOIN td_mta.emails e ON e.account=a.id LEFT JOIN td_mta.blobs b ON b.account=e.account AND b.id=e.blob_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id WHERE a.id=$1 AND e.id=$2 LIMIT 2", &[&selected.account.as_bytes().as_slice(), &selected.email.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    if rows.is_empty() {
+        return Err(Error::Missing);
+    }
+    if rows.len() != 1 {
+        return Err(Error::Integrity);
+    }
+    metadata(rows.first().ok_or(Error::Integrity)?, selected)
+}
+
+pub(crate) fn with_verified_body<T>(
+    worker: &mut Worker,
+    metadata: BlobMetadata,
+    deadline: Instant,
+    read: impl FnOnce(&mut dyn BlobReader) -> Result<T, ports::Error>,
+) -> Result<T, Error> {
+    let mut body = Body {
+        worker,
+        metadata,
+        deadline,
+        failed: None,
+        cache: Vec::new(),
+        cache_start: 0,
+    };
+    body.verify().map_err(Error::Read)?;
+    body.check().map_err(Error::Read)?;
+    let result = read(&mut body);
+    body.check().map_err(Error::Read)?;
+    result.map_err(Error::Read)
 }
 
 /// Verify and replay one immutable snapshot. Account-owned Email/submission

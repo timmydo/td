@@ -1897,12 +1897,19 @@ fn real_postgres_changes_preserve_transaction_pages_and_snapshot_state() {
     exercise_configuration(ConfigurationExercise::Changes);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_email_views_keep_metadata_values_and_bodies_on_one_snapshot() {
+    exercise_configuration(ConfigurationExercise::Read);
+}
+
 enum ConfigurationExercise {
     Flags,
     Uploads,
     Downloads,
     Drafts,
     Changes,
+    Read,
 }
 
 fn exercise_configuration(exercise: ConfigurationExercise) {
@@ -2439,6 +2446,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Read => {
+                    exercise_read(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Changes => {
                     exercise_changes(&fixture, &request, &trust, prepared.binding())
@@ -4604,4 +4614,172 @@ fn exercise_changes(
         read(DataType::Email, u64::MAX - 2, 10),
         Err(changes::Error::Unauthenticated)
     ));
+}
+
+fn exercise_read(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        compose_text::{Address, Message},
+        ids::{EmailId, MailboxId},
+        postgres_body, postgres_devices as devices, postgres_drafts as drafts,
+        postgres_read as read,
+    };
+    let account = binding.account();
+    let creation = devices::prepare_creation(binding.epoch(), account, "read fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let mailbox = MailboxId::from_bytes([0x33; 16]);
+    sql(fixture,&format!("INSERT INTO td_mta.mailboxes SELECT id,decode('{mailbox}','hex'),'Drafts',NULL,NULL,0,1,sequence FROM td_mta.accounts"));
+    let create = |id| {
+        let message = Message {
+            from: Address {
+                name: "Sender",
+                email: "sender@example.test",
+            },
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            reply_to: &[],
+            subject: "Snapshot",
+            message_id: id,
+            in_reply_to: &[],
+            references: &[],
+            sent_at_ms: 0,
+            text: "snapshot text",
+        };
+        let draft = drafts::prepare(
+            drafts::DraftRequest {
+                binding,
+                device: creation.device_id(),
+                mailbox,
+                expected: None,
+            },
+            &message,
+            deadline(),
+        )
+        .unwrap();
+        drafts::publish(request, trust, deadline(), &draft, password).unwrap()
+    };
+    let first = create("first@example.test");
+    let second = create("second@example.test");
+    let snapshot = |callback: fn(&mut read::Snapshot<'_>) -> Result<(), read::Error>| {
+        read::with_snapshot(request, trust, deadline(), binding, password, callback)
+    };
+    assert!(matches!(
+        read::with_snapshot(request, trust, deadline(), binding, b"bad", |_| Ok(())),
+        Err(read::Error::Unauthenticated)
+    ));
+    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+        assert_eq!(view.identity().committed_sequence.number(),3);
+        let metadata=view.email(first.email)?.unwrap();
+        assert_eq!(metadata.blob,first.blob);
+        assert_eq!(view.email(EmailId::from_bytes([0xee;16]))?,None);
+        let boxes=view.mailboxes(first.email,None,1)?;
+        assert_eq!(boxes.values,vec![mailbox]);
+        assert!(!boxes.has_more);
+        assert!(view.mailboxes(first.email,Some(mailbox),1)?.values.is_empty());
+        let first_keyword=view.keywords(first.email,None,1)?;
+        assert_eq!(first_keyword.values,vec!["$draft"]);
+        assert!(first_keyword.has_more);
+        let last_keyword=view.keywords(first.email,Some("$draft"),1)?;
+        assert_eq!(last_keyword.values,vec!["$seen"]);
+        assert!(!last_keyword.has_more);
+        sql(fixture,&format!("INSERT INTO td_mta.keywords VALUES(decode('{account}','hex'),decode('{}','hex'),'new',decode('0000000000000004','hex')); UPDATE td_mta.accounts SET sequence=decode('0000000000000004','hex')",first.email));
+        assert_eq!(view.keywords(first.email,None,256)?.values,vec!["$draft","$seen"]);
+        sql(fixture,&format!("BEGIN; DELETE FROM td_mta.memberships WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.keywords WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.thread_anchors WHERE email_id=decode('{}','hex'); DELETE FROM td_mta.emails WHERE id=decode('{}','hex'); DELETE FROM td_mta.blobs WHERE id=decode('{}','hex'); DELETE FROM td_mta.threads WHERE id=decode('{}','hex'); COMMIT",first.email,first.email,first.email,first.email,first.blob,first.thread));
+        let bytes=view.with_body(first.email,|metadata,body| {
+            assert_eq!(metadata.identity.committed_sequence.number(),3);
+            let mut bytes=vec![0;metadata.body.length as usize];
+            let mut position=0;
+            while position<bytes.len() { let n=body.read_at(position as u64,&mut bytes[position..])?;assert!(n>0);position+=n; }
+            Ok(bytes)
+        })?;
+        assert!(String::from_utf8(bytes).unwrap().ends_with("c25hcHNob3QgdGV4dA==\r\n"));
+        assert!(view.email(second.email)?.is_some());
+        Ok(())
+    }).unwrap();
+    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        assert_eq!(view.identity().committed_sequence.number(), 4);
+        assert_eq!(view.email(first.email)?, None);
+        assert!(view.mailboxes(first.email, None, 1)?.values.is_empty());
+        Ok(())
+    })
+    .unwrap();
+    sql(fixture,&format!("INSERT INTO td_mta.keywords SELECT decode('{account}','hex'),decode('{}','hex'),'k'||lpad(n::text,3,'0'),decode('0000000000000004','hex') FROM generate_series(0,256) n",second.email));
+    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        let page = view.keywords(second.email, Some("$seen"), 256)?;
+        assert_eq!(page.values.len(), 256);
+        assert!(page.has_more);
+        assert_eq!(page.values.last().unwrap(), "k255");
+        let last = view.keywords(second.email, Some("k255"), 256)?;
+        assert_eq!(last.values, vec!["k256"]);
+        assert!(!last.has_more);
+        Ok(())
+    })
+    .unwrap();
+    let invalid = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        assert_eq!(
+            view.keywords(second.email, Some(""), 1).unwrap_err(),
+            read::Error::Invalid
+        );
+        Ok(())
+    });
+    assert_eq!(invalid, Err(read::Error::Invalid));
+    sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,0) WHERE blob_id=decode('{}','hex')",second.blob));
+    let corrupt = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        let error = view
+            .with_body::<()>(second.email, |_, _| panic!("corrupt body admitted"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            read::Error::Body(postgres_body::Error::Read(_))
+        ));
+        Ok(())
+    });
+    assert!(matches!(
+        corrupt,
+        Err(read::Error::Body(postgres_body::Error::Read(_)))
+    ));
+    let killed = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        assert!(view.email(second.email)?.is_some());
+        sql(fixture,"SELECT pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND pid<>pg_backend_pid()");
+        thread::sleep(Duration::from_millis(100));
+        let _ = view.check();
+        Ok(())
+    });
+    assert!(killed.is_err());
+    let late = read::with_snapshot(
+        request,
+        trust,
+        Instant::now() + Duration::from_secs(2),
+        binding,
+        password,
+        |_| {
+            thread::sleep(Duration::from_secs(2));
+            Ok(())
+        },
+    );
+    assert_eq!(
+        late,
+        Err(read::Error::Connection(
+            td_mta::postgres_probe::Error::Deadline
+        ))
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')",
+    );
+    assert_eq!(snapshot(|_| Ok(())), Err(read::Error::Policy));
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    let revoke =
+        devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(snapshot(|_| Ok(())), Err(read::Error::Unauthenticated));
 }

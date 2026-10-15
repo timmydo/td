@@ -1551,3 +1551,33 @@ no partial results escape or resume on a different snapshot.
 Authorization and policy are admitted at snapshot start; the finite read
 may finish after concurrent revocation. HTTP dispatch and runtime connection
 admission remain part of the production cutover.
+
+
+## 39. Shared Email read snapshots
+
+`postgres_read::with_snapshot` admits the selected JMAP profile and current
+device, then retains one primary repeatable-read snapshot across Email
+metadata, mailbox membership, keyword windows and verified body callbacks.
+The common private snapshot admission helper also serves change-history
+reads. All results bind the same account sequence and history floor. The
+handle and connection cannot escape the outer callback; returned passive
+values confer no authority on later operations.
+
+Email metadata reads validate the manifest, chunk count and referenced thread
+without reading MIME body bytes. Membership and keyword windows are ordered,
+exclusive-after, and limited to 256 values plus one validated overflow row.
+An empty window alone does not prove Email existence. Membership reads check
+the referenced mailbox and both change sequences; keyword values use the
+existing local syntax validator. Body callbacks reuse the same complete
+SHA-256 verifier and chunk replay cache as existing downloads, on this
+snapshot's connection and original deadline.
+
+Every method and final callback completion checks the original connection and
+deadline. A failed operation retires the whole view, including when its caller
+swallows the error. Missing Email metadata remains a normal absent result.
+Concurrent writes or retirement cannot splice new metadata or body bytes into
+an admitted read. Current profile/device authority is checked at admission;
+revocation does not extend or invalidate an already admitted finite snapshot.
+The existing read-worker byte/frame caps apply across all methods and bodies,
+without replenishment. This API adds no runtime listener, pool or backend
+selection; production dispatch and atomic SQLite removal remain pending.

@@ -7,7 +7,7 @@ use crate::{
     postgres_devices,
     postgres_probe::{self, Request, Worker},
     postgres_runtime_profile::Binding,
-    postgres_schema,
+    postgres_schema, postgres_snapshot,
     sync::DataState,
 };
 use std::{collections::VecDeque, io::ErrorKind, time::Instant};
@@ -48,24 +48,25 @@ pub fn read(
     }
     let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
     let binding = binding.clone();
-    postgres_probe::with_body_worker(request,trust,deadline,|worker| {
-        let identity=worker.run(|client|Box::pin(async move {
-            let schema=postgres_schema::lock_and_inspect(client).await.map_err(Error::Schema)?;
-            if schema.store_epoch!=binding.epoch() { return Err(Error::Epoch); }
-            client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
-            let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true",&[]).await.map_err(|_|Error::Database)?;
-            let generation=decode_sequence(selected.try_get(0).map_err(|_|Error::Integrity)?).map_err(|_|Error::Integrity)?;
-            let version:Option<&[u8]>=selected.try_get(1).map_err(|_|Error::Integrity)?;
-            if generation.number()!=binding.selection().generation || version!=Some(binding.selection().version.as_bytes().as_slice()) { return Err(Error::Policy); }
-            postgres_devices::authenticate(client,binding.account(),presented).await.map_err(Error::Credential)?.ok_or(Error::Unauthenticated)?;
-            let row=client.query_one("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1", &[&binding.account().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
-            let sequence=decode_sequence(row.try_get(0).map_err(|_|Error::Integrity)?).map_err(|_|Error::Integrity)?;
-            let floor=decode_sequence(row.try_get(1).map_err(|_|Error::Integrity)?).map_err(|_|Error::Integrity)?;
-            if floor>sequence { return Err(Error::Integrity); }
-            Ok(ViewIdentity { account:binding.account(),epoch:binding.epoch(),committed_sequence:sequence,history_floor:floor })
-        })).map_err(Error::Connection)??;
-        let mut view=View { worker,identity,kind:since.kind.object_type(),batch:VecDeque::new(),complete:false };
-        let mut cursor=jmap_changes::Cursor::new(&mut view,since.kind,since,maximum).map_err(Error::Page)?;
+    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+        let identity = worker
+            .run(|client| {
+                Box::pin(async move {
+                    postgres_snapshot::begin(client, &binding, presented)
+                        .await
+                        .map_err(snapshot_error)
+                })
+            })
+            .map_err(Error::Connection)??;
+        let mut view = View {
+            worker,
+            identity,
+            kind: since.kind.object_type(),
+            batch: VecDeque::new(),
+            complete: false,
+        };
+        let mut cursor = jmap_changes::Cursor::new(&mut view, since.kind, since, maximum)
+            .map_err(Error::Page)?;
         for _ in 0..MAX_HISTORY_POLLS {
             if cursor.poll().map_err(Error::Page)? {
                 return cursor.finish().map_err(Error::Page);
@@ -74,7 +75,8 @@ pub fn read(
         // A stable work-limit failure must let the client refresh its state,
         // rather than retrying the same oversized folding history forever.
         Err(Error::Page(jmap_changes::Error::CannotCalculateChanges))
-    }).map_err(Error::Connection)?
+    })
+    .map_err(Error::Connection)?
 }
 
 struct View<'a> {
@@ -149,5 +151,17 @@ fn connection_error(error: postgres_probe::Error) -> ports::Error {
         ports::Error::Deadline
     } else {
         database_error()
+    }
+}
+
+fn snapshot_error(error: postgres_snapshot::Error) -> Error {
+    match error {
+        postgres_snapshot::Error::Schema(value) => Error::Schema(value),
+        postgres_snapshot::Error::Credential(value) => Error::Credential(value),
+        postgres_snapshot::Error::Epoch => Error::Epoch,
+        postgres_snapshot::Error::Policy => Error::Policy,
+        postgres_snapshot::Error::Unauthenticated => Error::Unauthenticated,
+        postgres_snapshot::Error::Integrity => Error::Integrity,
+        postgres_snapshot::Error::Database => Error::Database,
     }
 }
