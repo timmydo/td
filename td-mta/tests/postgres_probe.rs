@@ -1903,7 +1903,14 @@ fn real_postgres_email_views_keep_metadata_values_and_bodies_on_one_snapshot() {
     exercise_configuration(ConfigurationExercise::Read);
 }
 
+#[test]
+#[ignore = "requires local PostgreSQL binaries"]
+fn real_postgres_email_queries_bind_order_pages_and_totals_to_one_snapshot() {
+    exercise_configuration(ConfigurationExercise::Query);
+}
+
 enum ConfigurationExercise {
+    Query,
     Flags,
     Uploads,
     Downloads,
@@ -2446,6 +2453,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Query => {
+                    exercise_query(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Read => {
                     exercise_read(&fixture, &request, &trust, prepared.binding())
@@ -4782,4 +4792,117 @@ fn exercise_read(
         devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
     devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
     assert_eq!(snapshot(|_| Ok(())), Err(read::Error::Unauthenticated));
+}
+
+fn exercise_query(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        compose_text::{Address, Message},
+        ids::MailboxId,
+        postgres_devices as devices, postgres_drafts as drafts, postgres_read as read,
+    };
+    let account = binding.account();
+    let creation = devices::prepare_creation(binding.epoch(), account, "query fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let mailbox = MailboxId::from_bytes([0x33; 16]);
+    sql(fixture,&format!("INSERT INTO td_mta.mailboxes SELECT id,decode('{mailbox}','hex'),'Drafts',NULL,NULL,0,1,sequence FROM td_mta.accounts"));
+    let create = |id| {
+        let message = Message {
+            from: Address {
+                name: "Sender",
+                email: "sender@example.test",
+            },
+            to: &[],
+            cc: &[],
+            bcc: &[],
+            reply_to: &[],
+            subject: "Query",
+            message_id: id,
+            in_reply_to: &[],
+            references: &[],
+            sent_at_ms: 0,
+            text: "query text",
+        };
+        let draft = drafts::prepare(
+            drafts::DraftRequest {
+                binding,
+                device: creation.device_id(),
+                mailbox,
+                expected: None,
+            },
+            &message,
+            deadline(),
+        )
+        .unwrap();
+        drafts::publish(request, trust, deadline(), &draft, password).unwrap()
+    };
+    let first = create("first@example.test");
+    let second = create("second@example.test");
+    let third = create("third@example.test");
+    sql(fixture,&format!("UPDATE td_mta.emails SET received_at=5; UPDATE td_mta.emails SET received_at=-1 WHERE id=decode('{}','hex'); DELETE FROM td_mta.memberships WHERE email_id=decode('{}','hex')",first.email,third.email));
+    let mut ties = vec![second.email, third.email];
+    ties.sort_by_key(|id| *id.as_bytes());
+    let mut expected = ties.clone();
+    expected.push(first.email);
+    let query = read::EmailQuery {
+        scope: read::EmailScope::All,
+        ascending: false,
+        position: 0,
+        limit: 2,
+        calculate_total: true,
+    };
+    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+        let page=view.query_emails(query)?;
+        assert_eq!(page.ids,ties);assert_eq!(page.total,Some(3));assert!(page.has_more);
+        assert_eq!(page.state.sequence.number(),4);
+        let last=view.query_emails(read::EmailQuery {position:2,..query})?;
+        assert_eq!(last.ids,vec![first.email]);assert!(!last.has_more);assert_eq!(last.position,2);
+        let mut ascending=vec![first.email];ascending.extend_from_slice(&ties);
+        assert_eq!(view.query_emails(read::EmailQuery {ascending:true,limit:3,..query})?.ids,ascending);
+        let selected=view.query_emails(read::EmailQuery {scope:read::EmailScope::Mailbox(mailbox),..query})?;
+        assert_eq!(selected.ids,vec![second.email,first.email]);assert_eq!(selected.total,Some(2));assert!(!selected.has_more);
+        for scope in [read::EmailScope::Empty,read::EmailScope::Mailbox(MailboxId::from_bytes([0xfe;16]))] {
+            let empty=view.query_emails(read::EmailQuery {scope,..query})?;
+            assert!(empty.ids.is_empty());assert_eq!(empty.total,Some(0));assert!(!empty.has_more);
+        }
+        let zero=view.query_emails(read::EmailQuery {limit:0,..query})?;
+        assert!(zero.ids.is_empty());assert!(zero.has_more);assert_eq!(zero.total,Some(3));
+        let huge=view.query_emails(read::EmailQuery {position:u64::MAX,..query})?;
+        assert!(huge.ids.is_empty());assert!(!huge.has_more);assert_eq!(huge.total,Some(3));
+        assert_eq!(view.query_emails(read::EmailQuery {calculate_total:false,..query})?.total,None);
+        sql(fixture,&format!("UPDATE td_mta.emails SET received_at=99,changed=decode('0000000000000005','hex') WHERE id=decode('{}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000005','hex')",first.email));
+        assert_eq!(view.query_emails(read::EmailQuery {limit:3,..query})?.ids,expected);
+        assert_eq!(view.email(first.email)?.unwrap().identity.committed_sequence.number(),4);
+        Ok(())
+    }).unwrap();
+    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        let page = view.query_emails(query)?;
+        assert_eq!(page.ids.first(), Some(&first.email));
+        assert_eq!(page.state.sequence.number(), 5);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+            let _ = view.query_emails(read::EmailQuery {
+                limit: 1025,
+                ..query
+            });
+            Ok(())
+        }),
+        Err(read::Error::Capacity)
+    );
+    sql(fixture,&format!("UPDATE td_mta.emails SET changed=decode('0000000000000006','hex') WHERE id=decode('{}','hex')",first.email));
+    assert_eq!(
+        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+            let _ = view.query_emails(query);
+            Ok(())
+        }),
+        Err(read::Error::Integrity)
+    );
 }

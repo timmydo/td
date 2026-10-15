@@ -1581,3 +1581,26 @@ revocation does not extend or invalidate an already admitted finite snapshot.
 The existing read-worker byte/frame caps apply across all methods and bodies,
 without replenishment. This API adds no runtime listener, pool or backend
 selection; production dispatch and atomic SQLite removal remain pending.
+
+## 40. Snapshot-bound Email query pages
+
+`postgres_read::Snapshot::query_emails` supplies the existing td-mail inbox
+query shapes: all mail or one mailbox, received date ascending/descending,
+nonnegative position, a bounded page and optional total. Equal dates always
+sort by ascending Email ID, preserving the existing query interpretation.
+A foreign wire mailbox can be represented by the explicit empty scope.
+No text-search, thread collapse or new client feature is added here.
+
+The page and its query state use the same authenticated repeatable-read
+snapshot as metadata and body reads. Closed SQL filters by account and
+mailbox before ordering; optional totals count the same filtered relation.
+The page ceiling is 1024 IDs plus one validated overflow row. Zero limit is
+valid; a position above PostgreSQL's signed row-count range returns an empty
+page while retaining the requested position and optional total. Returned rows,
+including overflow, validate ordering and change sequences. Failed query
+operations retire the view even if callers swallow the error.
+
+Server statement limits and the original worker deadline bound sorting,
+counting and offset work; worker byte/frame limits remain shared across the
+whole view. No retained cursor or backend activation is introduced. Production
+JMAP dispatch and the atomic replacement remain pending.

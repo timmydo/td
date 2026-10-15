@@ -36,6 +36,31 @@ pub struct Values<T> {
     pub has_more: bool,
 }
 
+/// The mailbox filter shapes already supported by td-mail's Email/query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmailScope {
+    All,
+    Mailbox(MailboxId),
+    Empty,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct EmailQuery {
+    pub scope: EmailScope,
+    pub ascending: bool,
+    pub position: u64,
+    pub limit: usize,
+    pub calculate_total: bool,
+}
+#[derive(Debug)]
+pub struct EmailPage {
+    pub state: crate::sync::QueryState,
+    pub position: u64,
+    pub ids: Vec<EmailId>,
+    pub total: Option<u64>,
+    pub has_more: bool,
+}
+pub const MAX_EMAIL_PAGE: usize = 1024;
+
 /// Every result belongs to the original snapshot. Neither this handle nor its
 /// connection can escape the callback. Failed operations retire the whole view.
 pub struct Snapshot<'a> {
@@ -214,6 +239,68 @@ impl Snapshot<'_> {
                 previous=Some(text);
             }
             Ok(Values { identity,email,values,has_more })
+        })).map_err(Error::Connection).and_then(|result|result);
+        self.retain(result)
+    }
+    /// Order received dates in the requested direction and equal dates by ID
+    /// ascending, matching the existing td-mail query interpretation.
+    pub fn query_emails(&mut self, query: EmailQuery) -> Result<EmailPage, Error> {
+        self.check()?;
+        if query.limit > MAX_EMAIL_PAGE {
+            return self.retain(Err(Error::Capacity));
+        }
+        let identity = self.identity;
+        let result = self.worker.run(|client| Box::pin(async move {
+            let mailbox = match query.scope {
+                EmailScope::Mailbox(id) => Some(*id.as_bytes()),
+                _ => None,
+            };
+            let mut page = EmailPage {
+                state: crate::sync::QueryState::current(identity, crate::sync::QueryType::Email),
+                position: query.position,
+                ids: Vec::new(),
+                total: query.calculate_total.then_some(0),
+                has_more: false,
+            };
+            if query.scope == EmailScope::Empty { return Ok(page); }
+            let account = identity.account.as_bytes().as_slice();
+            let mailbox = mailbox.as_ref().map(|id|id.as_slice());
+            if query.calculate_total {
+                let row=client.query_one("SELECT count(*) FROM td_mta.emails e WHERE e.account=$1 AND ($2::bytea IS NULL OR EXISTS (SELECT 1 FROM td_mta.memberships m WHERE m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2))", &[&account,&mailbox]).await.map_err(|_|Error::Database)?;
+                let total:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
+                page.total=Some(u64::try_from(total).map_err(|_|Error::Integrity)?);
+            }
+            let Ok(position)=i64::try_from(query.position) else { return Ok(page); };
+            let limit=i64::try_from(query.limit+1).map_err(|_|Error::Capacity)?;
+            let sql=if query.ascending {
+                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) ORDER BY e.received_at ASC,e.id ASC LIMIT $3 OFFSET $4"
+            } else {
+                "SELECT e.id,e.received_at,e.changed,m.changed FROM td_mta.emails e LEFT JOIN td_mta.memberships m ON m.account=e.account AND m.email_id=e.id AND m.mailbox_id=$2 WHERE e.account=$1 AND ($2::bytea IS NULL OR m.email_id IS NOT NULL) ORDER BY e.received_at DESC,e.id ASC LIMIT $3 OFFSET $4"
+            };
+            let rows=client.query(sql,&[&account,&mailbox,&limit,&position]).await.map_err(|_|Error::Database)?;
+            page.ids.try_reserve_exact(query.limit).map_err(|_|Error::Capacity)?;
+            page.has_more=rows.len()>query.limit;
+            let mut previous:Option<(i64,[u8;16])>=None;
+            for row in rows {
+                let id:&[u8]=row.try_get(0).map_err(|_|Error::Integrity)?;
+                let id:[u8;16]=id.try_into().map_err(|_|Error::Integrity)?;
+                let date:i64=row.try_get(1).map_err(|_|Error::Integrity)?;
+                check_changed(row.try_get(2).map_err(|_|Error::Integrity)?,identity)?;
+                let membership:Option<&[u8]>=row.try_get(3).map_err(|_|Error::Integrity)?;
+                match (mailbox,membership) {
+                    (Some(_),Some(changed))=>check_changed(changed,identity)?,
+                    (None,None)=>(),
+                    _=>return Err(Error::Integrity),
+                }
+                if let Some((old_date,old_id))=previous {
+                    let order=old_date.cmp(&date);
+                    let order=if query.ascending {order} else {order.reverse()};
+                    if !order.then_with(||old_id.cmp(&id)).is_lt() { return Err(Error::Integrity); }
+                }
+                previous=Some((date,id));
+                if page.ids.len()<query.limit { page.ids.push(EmailId::from_bytes(id)); }
+            }
+            Ok(page)
         })).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
