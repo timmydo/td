@@ -166,4 +166,5 @@ pub(super) fn exercise(
         ),
         "0"
     );
+    super::attempt_refusal::exercise(fixture, request, trust, claim, generation, submission);
 }

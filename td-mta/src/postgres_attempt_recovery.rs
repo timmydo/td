@@ -131,7 +131,7 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
-fn retry_delay(entropy: &mut impl Entropy, count: u32) -> Result<i64, Error> {
+pub(crate) fn retry_delay(entropy: &mut impl Entropy, count: u32) -> Result<i64, Error> {
     let exponent = count.checked_sub(1).ok_or(Error::Integrity)?.min(4);
     let nominal = (300_000u64
         .checked_mul(1u64 << exponent)

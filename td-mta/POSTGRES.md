@@ -3176,3 +3176,29 @@ final replies, rollback, delayed COMMIT, duplicate-risk preservation, attempt
 retirement, exclusion of Accepted recipients from subsequent dispatch, and
 final-batch completion after expiry. Negative outcomes, final-outcome capacity
 admission and runtime recovery/scheduling remain separate prerequisites.
+
+
+## 112. Durable final DATA refusals
+
+Schema 21 adds at most 1024 digest-bound final-refusal receipts per account.
+The prepared publisher accepts one actual 4xx/5xx final DATA reply for the
+exact AcceptancePossible subset under its current boot, claim and route
+fence. It preserves positive RCPT history and earlier uncertainty. A definite
+negative final reply does not introduce uncertainty merely because the
+current attempt had reached AcceptancePossible.
+
+Temporary refusals schedule each recipient using the shared bounded jitter
+policy; earlier uncertainty yields OutcomeUnknown, otherwise RetryWait.
+A retry that cannot precede expiry refuses with ExpiryHold for the separate
+clock-confirmed expiry path. Permanent refusals terminate retries, retaining
+OutcomeUnknown for prior uncertainty and Failed otherwise; a genuine refusal
+can be retained after expiry. Result rows, submission completion and pending
+failure notice, attempt retirement, history and receipt commit together.
+Historical replay preserves the original random retry times.
+
+The runtime-role fixture exercises ordering, exact subsets, maximum replies,
+near-expiry hold, rollback, delayed COMMIT settlement, conflicting replay,
+retry bounds, uncertainty preservation and final completion after expiry.
+This prepares final DATA results only. RCPT/MAIL/DATA-command refusals,
+transport failures, retry dispatch, capacity reservation and production
+activation remain separate work.
