@@ -45,6 +45,13 @@ impl Input {
         }
     }
 
+    pub(super) fn runtime(self) -> Self {
+        Self {
+            frames: self.frames.max(1024),
+            ..self
+        }
+    }
+
     pub(super) fn body() -> Self {
         Self {
             bytes: 128 * 1024 * 1024,

@@ -130,7 +130,7 @@ pub fn inspect(
     result
 }
 
-async fn qualify(client: &Client) -> Result<(), Error> {
+pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
     let row = client
         .query_one(ROLE, &[])
         .await

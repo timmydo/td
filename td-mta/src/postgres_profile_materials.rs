@@ -169,6 +169,7 @@ mod tests {
         let request = Request {
             address: "127.0.0.1:1".parse().unwrap(),
             server_name: "localhost",
+            mode: crate::postgres_probe::Mode::Preparation,
             user: "fixture",
             database: "fixture",
             password: b"unused",

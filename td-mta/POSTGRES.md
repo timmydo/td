@@ -2031,3 +2031,32 @@ recheck before restart. Do not install default privileges on future tables.
 The cold check uses the existing bounded listing transport (512 frames,
 1 MiB input, 64 KiB output), retaining the original ten-second maximum
 operation deadline and the shared migration lock through inspection.
+
+## 56. Qualification on each runtime connection
+
+The internal database request distinguishes preparation from runtime mode.
+Preparation remains the default of the protected bootstrap parser and all
+operator commands. Runtime mode authenticates TLS/SCRAM, checks primary and
+durability settings, acquires the shared migration lock, validates the current
+schema and checks the dedicated runtime role/table privileges before admitting
+an operation's SQL. A new connection repeats all of those checks; a previous
+cold receipt never substitutes for them. The lock and connection remain held
+through the operation. Mail helpers still enforce their own epoch, current
+configuration, device, snapshot and publication fences.
+
+Qualification failure closes the connection before the application callback
+runs, with separate redacted schema/role/privilege errors. It performs no
+reconnect, publication retry or deadline renewal. An operation trying to
+resolve an earlier uncertain publication still retains that uncertainty when
+qualification refuses; refusal does not prove the earlier operation rolled
+back. Schema initialization and grants remain explicit owner operations.
+
+Runtime connections use at least the existing 1024-frame mutation allowance
+to include qualification and the operation in one budget. Larger existing
+frame budgets, byte budgets, per-frame/authentication caps and output budgets
+are unchanged; qualification does not replenish any allowance. The original
+absolute deadline covers connection setup, qualification and application work.
+No runtime pool, listener or automatic retry is activated by this increment.
+The real PostgreSQL fixture loads both profiles and exercises read/unread/star
+mutations, batch receipts and lost-COMMIT handling through the dedicated
+runtime login; privilege changes are refused on the next connection.

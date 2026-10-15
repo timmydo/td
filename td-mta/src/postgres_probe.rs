@@ -34,6 +34,14 @@ pub struct Request<'a> {
     pub user: &'a str,
     pub database: &'a str,
     pub password: &'a [u8],
+    pub mode: Mode,
+}
+
+/// Preparation commands may use the owner; serving connections may not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Preparation,
+    Runtime,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +52,9 @@ pub enum Error {
     Tls,
     Database,
     Settings,
+    RuntimeSchema,
+    RuntimeRole,
+    RuntimePrivileges,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +284,11 @@ fn connect_worker(
         .ssl_mode(SslMode::Require)
         .ssl_negotiation(SslNegotiation::Postgres)
         .channel_binding(ChannelBinding::Disable);
+    let input = if request.mode == Mode::Runtime {
+        input.runtime()
+    } else {
+        input
+    };
     let connector = Connector {
         session,
         clock,
@@ -293,14 +309,30 @@ fn connect_worker(
             thread::park_timeout(Duration::from_millis(1));
         }
     };
-    Ok(Worker {
+    let mut worker = Worker {
         client,
         connection: Box::pin(connection),
         deadline,
         waker,
         failed: None,
         activity,
-    })
+    };
+    if request.mode == Mode::Runtime {
+        worker.run(|client| {
+            Box::pin(async move {
+                crate::postgres_schema::lock_and_inspect(client)
+                    .await
+                    .map_err(|_| Error::RuntimeSchema)?;
+                crate::postgres_runtime_access::qualify(client)
+                    .await
+                    .map_err(|error| match error {
+                        crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
+                        _ => Error::RuntimePrivileges,
+                    })
+            })
+        })??;
+    }
+    Ok(worker)
 }
 
 pub(crate) struct Worker {
@@ -654,6 +686,7 @@ mod tests {
         let request = Request {
             address,
             server_name: "localhost",
+            mode: Mode::Preparation,
             user: "probe",
             database: "probe",
             password: b"fixture",

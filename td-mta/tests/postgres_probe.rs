@@ -195,6 +195,7 @@ impl Fixture {
         Request {
             address: ([127, 0, 0, 1], self.port).into(),
             server_name: "localhost",
+            mode: td_mta::postgres_probe::Mode::Preparation,
             user: "td_probe",
             database: "postgres",
             password: PASSWORD,
@@ -274,6 +275,14 @@ fn sql(fixture: &Fixture, query: &str) -> String {
     wait_command(&mut child);
     assert!(fs::metadata(&path).unwrap().len() < 4096);
     fs::read_to_string(path).unwrap().trim().to_owned()
+}
+
+fn create_runtime_login(fixture: &Fixture) {
+    sql(fixture, "CREATE ROLE mail_runtime LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_runtime; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO mail_runtime");
+}
+
+fn grant_runtime_mail(fixture: &Fixture) {
+    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime");
 }
 
 fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
@@ -615,14 +624,14 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         access::inspect(&owner, &trust, deadline()),
         Err(access::Error::Role)
     );
-    sql(&fixture, "CREATE ROLE mail_runtime LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_runtime; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO mail_runtime");
+    create_runtime_login(&fixture);
     let mut runtime = fixture.request();
     runtime.user = "mail_runtime";
     assert_eq!(
         access::inspect(&runtime, &trust, deadline()),
         Err(access::Error::Privileges)
     );
-    sql(&fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime");
+    grant_runtime_mail(&fixture);
     assert_eq!(
         access::inspect(&runtime, &trust, deadline()).unwrap(),
         receipt
@@ -642,6 +651,14 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     sql(&fixture, "ALTER DATABASE postgres OWNER TO td_probe");
     assert_eq!(
         access::inspect(&runtime, &trust, deadline()).unwrap(),
+        receipt
+    );
+    let mut serving = fixture.request();
+    serving.mode = td_mta::postgres_probe::Mode::Runtime;
+    assert_eq!(probe(&serving, &trust, deadline()), Err(Error::RuntimeRole));
+    serving.user = "mail_runtime";
+    assert_eq!(
+        schema::inspect(&serving, &trust, deadline()).unwrap(),
         receipt
     );
     for (grant, revoke, error) in [
@@ -707,17 +724,44 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         ),
     ] {
         sql(&fixture, grant);
+        let expected = if error == access::Error::Role {
+            Error::RuntimeRole
+        } else {
+            Error::RuntimePrivileges
+        };
+        assert_eq!(
+            probe(&serving, &trust, deadline()),
+            Err(expected),
+            "{grant}"
+        );
         assert_eq!(
             access::inspect(&runtime, &trust, deadline()),
             Err(error),
             "{grant}"
         );
         sql(&fixture, revoke);
+        assert!(probe(&serving, &trust, deadline()).is_ok());
         assert_eq!(
             access::inspect(&runtime, &trust, deadline()).unwrap(),
             receipt
         );
     }
+    sql(
+        &fixture,
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=18",
+    );
+    assert_eq!(
+        probe(&serving, &trust, deadline()),
+        Err(Error::RuntimeSchema)
+    );
+    sql(
+        &fixture,
+        "UPDATE td_mta.schema_migrations SET version=18 WHERE version=99",
+    );
+    assert_eq!(
+        schema::inspect(&serving, &trust, deadline()).unwrap(),
+        receipt
+    );
     // Column-only UPDATE permits policy locking without pointer mutation.
     let execute = |statement: &str, expected: bool| {
         let mut child = ProbeChild(
@@ -2715,10 +2759,20 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
+    let mut serving = fixture.request();
+    serving.user = "mail_runtime";
+    serving.mode = td_mta::postgres_probe::Mode::Runtime;
+    let profile_request = if matches!(exercise, ConfigurationExercise::Flags) {
+        create_runtime_login(&fixture);
+        grant_runtime_mail(&fixture);
+        &serving
+    } else {
+        &request
+    };
     for (name, roles) in [("desktop", 2), ("cloud", cloud_roles)] {
         let mut domain = GenerationSet::<TlsPolicies>::at_startup();
         let prepared = runtime::load(
-            &request,
+            profile_request,
             &trust,
             deadline(),
             epoch,
@@ -2779,7 +2833,7 @@ per_peer_limit = 1
                     exercise_moves(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Flags => {
-                    exercise_flags(&fixture, &request, &trust, prepared.binding())
+                    exercise_flags(&fixture, profile_request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())

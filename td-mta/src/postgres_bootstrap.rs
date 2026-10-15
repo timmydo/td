@@ -135,6 +135,7 @@ impl Bootstrap {
         Request {
             address: (address, self.port).into(),
             server_name: &self.host,
+            mode: crate::postgres_probe::Mode::Preparation,
             user: &self.user,
             database: &self.database,
             password: &self.password,
