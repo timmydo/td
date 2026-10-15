@@ -337,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 14);
+    assert_eq!(receipt.version, 15);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -414,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        14
+        15
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -539,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":14"));
+    assert!(initialized.contains("\"schema_version\":15"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -710,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 14);
+    assert_eq!(receipt.version, 15);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1212,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "32");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "33");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1306,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1323,6 +1323,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_drafts.sql"),
             include_str!("../src/postgres_mailbox_create.sql"),
             include_str!("../src/postgres_receiving.sql"),
+            include_str!("../src/postgres_submissions.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1358,6 +1359,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             11 => "mailbox_create_receipts",
             12 => "receiving_receipts",
             13 => "submission_receipts",
+            14 => "submission_routes",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1391,7 +1393,11 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 14);
+        assert_eq!(receipt.version, 15);
+        assert_eq!(
+            sql(&fixture, "SELECT count(*) FROM td_mta.submission_routes"),
+            "0"
+        );
         if previous_version == 9 {
             assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"3|2|3|3|2");
         }
@@ -6435,6 +6441,23 @@ fn exercise_submission_publication(
         ),
         "1"
     );
+    assert_eq!(first.route(), binding.route());
+    let destination: String = binding
+        .route()
+        .destination()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let route_row = format!("desktop|personal-smarthost|{destination}");
+    assert_eq!(sql(fixture, "SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes"), route_row);
+    for assignment in [
+        "route_name='Other'",
+        "submitting_profile=''",
+        "route_name=repeat('a',65)",
+        "destination=decode('00','hex')",
+    ] {
+        sql(fixture, &format!("DO $$ BEGIN BEGIN UPDATE td_mta.submission_routes SET {assignment}; RAISE EXCEPTION 'unexpected success'; EXCEPTION WHEN check_violation THEN NULL; END; END $$"));
+    }
     let usage = sql(fixture, "SELECT body_bytes||','||blob_count||','||queue_bytes||','||queue_submissions FROM td_mta.account_usage");
     assert_eq!(
         usage,
@@ -6466,6 +6489,29 @@ fn exercise_submission_publication(
     sql(
         fixture,
         "DROP TRIGGER reject_submission ON td_mta.submission_receipts",
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"),
+        "1"
+    );
+    sql(fixture, "CREATE TRIGGER reject_route BEFORE INSERT ON td_mta.submission_routes FOR EACH ROW EXECUTE FUNCTION public.reject_submission()");
+    assert_eq!(
+        submissions::publish(request, trust, deadline(), &refused, password),
+        Err(submissions::Error::Database)
+    );
+    assert_eq!(
+        submissions::inspect(request, trust, deadline(), &refused).unwrap(),
+        None
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "1");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blobs"), "2");
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"),
+        "1"
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER reject_route ON td_mta.submission_routes",
     );
 
     for (column, cap, old) in [
@@ -6575,6 +6621,11 @@ fn exercise_submission_publication(
         .unwrap()
         .unwrap();
     assert_eq!(recovered.new_sequence, 4);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submission_routes"),
+        "2"
+    );
+
     assert_eq!(
         submissions::publish(request, trust, deadline(), &refused, password).unwrap(),
         recovered
@@ -6706,4 +6757,5 @@ fn exercise_submission_publication(
         "0"
     );
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{}','hex') AND state=1",a.submission)),"2");
+    assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
 }

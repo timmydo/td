@@ -574,8 +574,9 @@ version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
 Version 10 adds src/postgres_uploads.sql; version 11 adds
 src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
-src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql.
-New initialization applies all fourteen in
+src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql;
+version 15 adds src/postgres_submission_routes.sql.
+New initialization applies all fifteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1847,5 +1848,22 @@ profile. Whole-generation preparation rejects conflicting definitions of a
 shared name; profile loading retains the selected route in its binding.
 `serves_route` is only passive eligibility evidence and requires the relay
 role plus matching name and destination. It grants no lease or continuing
-policy authority. Queue persistence and worker ownership remain subsequent
-increments; the production single-process backend is unchanged.
+policy authority. Section 50 supplies queue persistence; worker ownership remains subsequent
+work. The production single-process backend is unchanged.
+
+## 50. Submission route persistence
+
+Schema version 15 adds owner-private `submission_routes`, one account-bound
+mapping per queued submission. New enqueue transactions write the submitting
+profile, selected route name and destination fingerprint atomically with
+outgoing bytes, recipients, quota charges, history and the operation receipt.
+The retained request digest explicitly binds the route and destination.
+Failures while inserting either route or receipt roll back the entire enqueue.
+
+The mapping has no foreign key to the current configuration: removal or
+replacement of a profile cannot rewrite an already queued destination.
+Source Email deletion leaves it intact; submission retirement cascades its
+mapping. Migration preserves older inert queue fixtures without inventing a
+route. A queue row lacking a mapping is ineligible for dispatch and requires
+explicit repair; workers must never infer a default from their own profile.
+This increment still enables no worker or client endpoint.

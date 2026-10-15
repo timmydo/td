@@ -63,6 +63,9 @@ pub struct Submission {
     request_digest: [u8; 32],
 }
 impl Submission {
+    pub fn route(&self) -> &crate::postgres_routes::Route {
+        self.input.binding().route()
+    }
     pub fn operation(&self) -> SubmissionOperationId {
         self.operation
     }
@@ -93,7 +96,7 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
     let selection = binding.selection();
     let source = input.source();
     for bytes in [
-        b"td-mta PostgreSQL submission v1".as_slice(),
+        b"td-mta PostgreSQL submission v2".as_slice(),
         binding.epoch().as_bytes().as_slice(),
         binding.account().as_bytes().as_slice(),
         &selection.generation.to_be_bytes(),
@@ -111,15 +114,20 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
         &blob,
         &(input.bytes().len() as u64).to_be_bytes(),
         &body_digest,
+        binding.route().destination(),
         &[u8::from(input.expected().is_some())],
         &input.expected().unwrap_or(0).to_be_bytes(),
         &(input.recipients().len() as u64).to_be_bytes(),
     ] {
         hash.update(bytes).map_err(|_| Error::Crypto)?;
     }
-    for text in [binding.profile(), input.reverse_path()]
-        .into_iter()
-        .chain(input.recipients())
+    for text in [
+        binding.profile(),
+        binding.route().name(),
+        input.reverse_path(),
+    ]
+    .into_iter()
+    .chain(input.recipients())
     {
         check_deadline(deadline)?;
         hash.update(&(text.len() as u64).to_be_bytes())
@@ -369,6 +377,9 @@ pub fn publish(
                 &[&account, &submission, &source.email.as_bytes().as_slice(),
                     &source.thread.as_bytes().as_slice(), &input.identity().as_bytes().as_slice(),
                     &value.blob.as_bytes().as_slice(), &input.reverse_path(), &send_at, &expires_at, &count, &changed])
+                .await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
+            if client.execute("INSERT INTO td_mta.submission_routes(account,submission_id,submitting_profile,route_name,destination) VALUES($1,$2,$3,$4,$5)",
+                &[&account, &submission, &binding.profile(), &binding.route().name(), &binding.route().destination().as_slice()])
                 .await.map_err(|_| Error::Database)? != 1 { return Err(Error::Integrity); }
             let mut recipients = Vec::new();
             recipients
