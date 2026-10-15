@@ -17,6 +17,7 @@ use std::time::Duration;
 pub struct Request<'a> {
     pub account: AccountId,
     pub device: DeviceId,
+    pub credentials: &'a crate::http_auth::BasicCredentials,
     pub framing: Framing,
     pub content_type: &'a str,
     pub prefix: &'a [u8],
@@ -47,6 +48,8 @@ impl Response {
     }
 }
 /// Authenticated HTTPS operations. Transfer methods run on the body worker.
+/// Request credentials borrow the original bounded owner through the call;
+/// parsing and the initial device observation confer no later store authority.
 pub trait Backend: Sync {
     fn account(&self) -> AccountId;
     fn session(&self) -> Option<&crate::jmap_session::Session> {

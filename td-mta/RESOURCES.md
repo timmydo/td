@@ -4861,3 +4861,9 @@ network/TLS/body workers responsive during bounded backend lookup. The HTTPS
 fixture blocks the backend while a second client handshakes and receives its
 origin refusal, then checks the original request resumes after local registry
 contention without consuming a second attempt allowance.
+
+Body-worker upload, download and API calls borrow that same credential owner;
+they add no decoded copy or secret allocation. The owner is cleared as soon
+as the synchronous backend call returns, before closing or draining the
+connection. Initial lookup is still only an observation: storage authorization
+and publication fencing remain the backend's responsibility.

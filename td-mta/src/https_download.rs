@@ -74,6 +74,7 @@ impl Target {
 pub struct Request<'a> {
     pub target: &'a Target,
     pub device: DeviceId,
+    pub credentials: &'a crate::http_auth::BasicCredentials,
     pub deadline: Deadline,
 }
 #[derive(Debug)]

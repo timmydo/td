@@ -439,6 +439,67 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
 
 #[test]
 fn https_uploads_commit_real_bodies_and_recheck_revocation() {
+    struct Credentials<'a, 'r> {
+        inner: &'a dyn crate::https_upload::Backend,
+        devices: &'a Mutex<DeviceStore<'r>>,
+        calls: AtomicU64,
+    }
+    impl Credentials<'_, '_> {
+        fn check(&self, credentials: &http_auth::BasicCredentials, device: DeviceId, bit: u64) {
+            assert_eq!(std::thread::current().name(), Some("https-body"));
+            assert_eq!(
+                self.devices
+                    .lock()
+                    .unwrap()
+                    .authenticate(credentials.password())
+                    .unwrap(),
+                Some(device)
+            );
+            self.calls.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+    impl crate::https_upload::Backend for Credentials<'_, '_> {
+        fn account(&self) -> AccountId {
+            self.inner.account()
+        }
+        fn session(&self) -> Option<&crate::jmap_session::Session> {
+            self.inner.session()
+        }
+        fn event_snapshot(
+            &self,
+            device: DeviceId,
+            deadline: Deadline,
+        ) -> Result<crate::jmap_events::Snapshot, Error> {
+            self.inner.event_snapshot(device, deadline)
+        }
+        fn receive(
+            &self,
+            request: crate::https_upload::Request<'_>,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<crate::https_upload::Response, Error> {
+            self.check(request.credentials, request.device, 1);
+            self.inner.receive(request, transport, control)
+        }
+        fn api(
+            &self,
+            request: crate::https_api::Request<'_>,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), crate::https_download::Failure> {
+            self.check(request.credentials, request.device, 2);
+            self.inner.api(request, transport, control)
+        }
+        fn download(
+            &self,
+            request: crate::https_download::Request<'_>,
+            transport: &mut dyn Transport,
+            control: &Control,
+        ) -> Result<(), crate::https_download::Failure> {
+            self.check(request.credentials, request.device, 4);
+            self.inner.download(request, transport, control)
+        }
+    }
     use crate::{
         admission::logical::Cell,
         format::{key::Key, row::Row},
@@ -556,6 +617,11 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
         response_maximum: admission.disk().response_bytes,
         clock: clock.as_ref(),
         timeouts: &timeouts,
+    };
+    let api = Credentials {
+        inner: &api,
+        devices: &devices,
+        calls: AtomicU64::new(0),
     };
     let handshakes = HandshakePool::new(2).unwrap();
     let ready = AtomicBool::new(false);
@@ -849,6 +915,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
             });
         })
         .unwrap();
+    assert_eq!(api.calls.load(Ordering::Relaxed), 7);
     assert_eq!(spool.status().unwrap().occupied_slots, 0);
     assert_eq!(
         coordinator

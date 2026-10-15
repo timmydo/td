@@ -20,6 +20,7 @@ use td_json::arena;
 
 pub struct Request<'a> {
     pub device: DeviceId,
+    pub credentials: &'a crate::http_auth::BasicCredentials,
     pub framing: Framing,
     pub prefix: &'a [u8],
     pub expect_continue: bool,

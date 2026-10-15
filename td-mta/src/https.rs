@@ -948,11 +948,13 @@ impl Https<'_> {
             Request {
                 target: &target,
                 device: client.device.ok_or(Error::Invalid)?,
+                credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 deadline: operation,
             },
             client.connection.as_mut().ok_or(Error::Invalid)?,
             control,
         );
+        client.credentials = None;
         match result {
             Ok(()) => {
                 client.phase = Phase::Close;
@@ -985,6 +987,7 @@ impl Https<'_> {
         let result = backend.api(
             crate::https_api::Request {
                 device: client.device.ok_or(Error::Invalid)?,
+                credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 framing,
                 expect_continue,
                 prefix: client
@@ -996,6 +999,7 @@ impl Https<'_> {
             client.connection.as_mut().ok_or(Error::Invalid)?,
             control,
         );
+        client.credentials = None;
         client.input.fill(0);
         client.input_used = 0;
         client.drain_left = 0;
@@ -1065,6 +1069,7 @@ impl Https<'_> {
             https_upload::Request {
                 account: backend.account(),
                 device: client.device.ok_or(Error::Invalid)?,
+                credentials: client.credentials.as_ref().ok_or(Error::Invalid)?,
                 framing,
                 content_type: media,
                 prefix: client
@@ -1078,6 +1083,7 @@ impl Https<'_> {
             client.connection.as_mut().ok_or(Error::Invalid)?,
             control,
         );
+        client.credentials = None;
         client.drain_left = if result.is_ok() {
             0
         } else {

@@ -2482,6 +2482,7 @@ fn chunked_https_quota_refusal_does_not_speculatively_evict() {
                 crate::https_upload::Request {
                     account: ACCOUNT,
                     device: DEVICE,
+                    credentials: &crate::http_auth::parse_basic("u", Some("Basic dTpw")).unwrap(),
                     framing: crate::http_request::Framing::Chunked,
                     content_type: "text/plain",
                     prefix: &[],

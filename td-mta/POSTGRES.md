@@ -2222,3 +2222,18 @@ alone. The cutover must supply runtime-qualified primary lookup, fresh
 method authorization and service readiness/backoff, including its independent
 health/settlement connection capacity. DESIGN.md and RESOURCES.md own the
 worker lifecycle and active resource boundaries.
+
+## 64. Request credentials at the body-worker boundary
+
+Upload, download and API requests now borrow the original bounded Basic
+credential owner for the synchronous backend call. The initial device ID
+remains an observation; PostgreSQL consumers must freshly authenticate the
+presented bytes under their operation's original deadline and policy fence.
+The handoff copies no secret and allocates no credential storage. Completion
+clears the owner before close, drain or refusal handling, including failed
+backend calls. EventSource retains its existing credential-free contract.
+
+The active local backend still uses its device registry guard. The HTTPS
+fixture checks the presented password against the observed device on the
+body worker for all three operations, including its second-device requests.
+This handoff prepares PostgreSQL operation adapters without activating them.
