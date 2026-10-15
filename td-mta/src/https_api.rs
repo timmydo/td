@@ -60,7 +60,7 @@ fn parser(error: arena::Error) -> ApiError {
         arena::ErrorKind::Storage => jmap_request::Error::Storage,
     })
 }
-fn response_error(error: ResponseError) -> ApiError {
+pub(crate) fn response_error(error: ResponseError) -> ApiError {
     ApiError::Io(match error {
         ResponseError::Store(error) => error,
         ResponseError::Ledger(_) => Error::Busy,
@@ -323,9 +323,17 @@ impl<'a> Exchange<'a> {
         sender.check()?;
         sender.idle = sender.deadline;
         authorize(sender.deadline)?;
+        // Retention requires a strictly earlier execution phase, even when
+        // the original request allowance is shorter than the policy budget.
+        let outer_tick = sender
+            .deadline
+            .tick()
+            .0
+            .checked_sub(1)
+            .ok_or(Error::Deadline)?;
         let execution = timers::deadline(sender.last, self.timeouts.execution_seconds())
             .map_err(|_| Error::Capacity)?
-            .min(sender.deadline);
+            .min(Deadline::after(crate::ports::Tick(outer_tick), 0)?);
         let mut cursor = arena::OwnedCursor::with_input_length(
             bytes,
             tokens,
@@ -441,7 +449,7 @@ fn headers(sender: &mut Sender<'_>, status: u16, media: &str, length: u64) -> Re
     let length = out.len();
     sender.write(bytes.get(..length).ok_or(Error::Invalid)?)
 }
-fn problem(sender: &mut Sender<'_>, error: jmap_request::Error) -> Result<(), Error> {
+pub(crate) fn problem(sender: &mut Sender<'_>, error: jmap_request::Error) -> Result<(), Error> {
     let body: &[u8] = match error {
         jmap_request::Error::NotJson => br#"{"type":"urn:ietf:params:jmap:error:notJSON","status":400}"#,
         jmap_request::Error::NotRequest => br#"{"type":"urn:ietf:params:jmap:error:notRequest","status":400}"#,

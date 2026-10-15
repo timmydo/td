@@ -5397,6 +5397,227 @@ fn exercise_read_dispatch(
     assert!(!owner.admission_stopped());
 }
 
+fn exercise_http_read(
+    fixture: &Fixture,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    password: &[u8],
+    device: td_mta::ids::DeviceId,
+) {
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{timers::NetworkLimits, DiskLimits, ViewMode, WorkLimits},
+        http_request::Framing,
+        https_upload::Backend,
+        ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Transport},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
+    };
+    struct Wire {
+        input: Vec<u8>,
+        position: usize,
+        output: Vec<u8>,
+        fail_write: bool,
+    }
+    impl Transport for Wire {
+        fn read(&mut self, bytes: &mut [u8]) -> Result<IoProgress, Error> {
+            let count = bytes.len().min(17).min(self.input.len() - self.position);
+            if count == 0 {
+                return Ok(IoProgress::Closed);
+            }
+            bytes[..count].copy_from_slice(&self.input[self.position..self.position + count]);
+            self.position += count;
+            Ok(IoProgress::Bytes(count))
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<IoProgress, Error> {
+            if self.fail_write {
+                return Err(Error::Invalid);
+            }
+            let count = bytes.len().min(13);
+            if count == 0 {
+                return Ok(IoProgress::Pending);
+            }
+            self.output.extend_from_slice(&bytes[..count]);
+            Ok(IoProgress::Bytes(count))
+        }
+        fn flush(&mut self) -> Result<FlushProgress, Error> {
+            Ok(FlushProgress::Complete)
+        }
+        fn close(&mut self) -> Result<FlushProgress, Error> {
+            Ok(FlushProgress::Complete)
+        }
+        fn abort(&mut self) {}
+    }
+    let credentials = |password: &[u8]| {
+        let bytes = [b"reader:".as_slice(), password].concat();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::from("Basic ");
+        for group in bytes.chunks(3) {
+            let bits = (u32::from(group[0]) << 16)
+                | (u32::from(group.get(1).copied().unwrap_or(0)) << 8)
+                | u32::from(group.get(2).copied().unwrap_or(0));
+            encoded.push(char::from(alphabet[(bits >> 18) as usize]));
+            encoded.push(char::from(alphabet[((bits >> 12) & 63) as usize]));
+            encoded.push(if group.len() > 1 {
+                char::from(alphabet[((bits >> 6) & 63) as usize])
+            } else {
+                '='
+            });
+            encoded.push(if group.len() > 2 {
+                char::from(alphabet[(bits & 63) as usize])
+            } else {
+                '='
+            });
+        }
+        td_mta::http_auth::parse_basic("reader", Some(&encoded)).unwrap()
+    };
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let resources = td_mta::limits::Limits::default().plan().unwrap();
+    let disk = DiskLimits::default()
+        .plan(
+            &resources,
+            WorkLimits::default(),
+            ViewMode::OnlineBackground,
+        )
+        .unwrap();
+    let timeouts = NetworkLimits::default().plan(&disk).unwrap();
+    let clock = Arc::new(td_mta::clock::RuntimeClock::new());
+    let until = || Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let directory = fixture.root.join("http-read-responses");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut root = PrivateRoot::open(directory.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let spool = RequestSpool::open(&mut root, clock.clone(), until()).unwrap();
+    let mut states = [const { td_mta::ownership::SlotState::EMPTY }; 4];
+    let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
+    let responses =
+        ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
+    let slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+    let session = td_mta::jmap_session::Session::mail_access(
+        td_mta::config::endpoint::Origin::parse("https://localhost").unwrap(),
+        td_mta::config::identities::AccountView {
+            id: binding.account(),
+            username: "reader",
+            name: "Reader",
+        },
+        &resources,
+        td_mta::jmap_session::Concurrency {
+            uploads: 1,
+            requests: 1,
+        },
+    )
+    .unwrap();
+    let service = td_mta::postgres_http_api::Service {
+        loaded: &loaded,
+        executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
+        binding,
+        slots: &slots,
+        responses: &responses,
+        resources: &resources,
+        session: &session,
+        response_maximum: disk.disk().response_bytes,
+        clock: &clock,
+        timeouts: &timeouts,
+    };
+    let mut id = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(binding.account(), &mut id).unwrap();
+    let body = format!(
+        r##"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}","properties":["name"]}},"m"],["Email/query",{{"accountId":"{account}","calculateTotal":true}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"fetchTextBodyValues":true}},"g"]]}}"##
+    );
+    td_json::parse(&body).unwrap();
+    let control = td_mta::smtp_receiving::Control::default();
+    let call = |body: &str, password: &[u8], device, chunked, fail_write, expired| {
+        let credentials = credentials(password);
+        let input = if chunked {
+            format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into_bytes()
+        } else {
+            body.as_bytes().to_vec()
+        };
+        let mut wire = Wire {
+            input,
+            position: 0,
+            output: Vec::new(),
+            fail_write,
+        };
+        let result = service.api(
+            td_mta::https_api::Request {
+                device,
+                credentials: &credentials,
+                framing: if chunked {
+                    Framing::Chunked
+                } else {
+                    Framing::Length(body.len() as u64)
+                },
+                prefix: &[],
+                expect_continue: chunked,
+                deadline: if expired {
+                    Deadline::after(td_mta::ports::Tick(0), 0).unwrap()
+                } else {
+                    until()
+                },
+            },
+            &mut wire,
+            &control,
+        );
+        assert_eq!(responses.used().unwrap(), 0);
+        assert!(!responses.admission_stopped());
+        (result, String::from_utf8(wire.output).unwrap())
+    };
+    for chunked in [false, true] {
+        let (result, wire) = call(&body, password, device, chunked, false, false);
+        result.unwrap();
+        let wire = wire
+            .strip_prefix("HTTP/1.1 100 Continue\r\n\r\n")
+            .unwrap_or(&wire);
+        let (headers, json) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+        assert!(headers.contains(&format!("Content-Length: {}\r\n", json.len())));
+        assert!(json.contains("\"total\":2"));
+        assert_eq!(json.matches("\"subject\":\"Snapshot\"").count(), 2);
+        assert!(json.contains("snapshot text"));
+    }
+    let (result, wire) = call("{", password, device, false, false, false);
+    result.unwrap();
+    assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+    assert!(wire.contains("notJSON"));
+    let mut wrong = password.to_vec();
+    let last = wrong.last_mut().unwrap();
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    for (secret, id) in [
+        (&wrong[..], device),
+        (password, td_mta::ids::DeviceId::from_bytes([0xfe; 16])),
+    ] {
+        let (result, wire) = call(&body, secret, id, false, false, false);
+        assert!(matches!(
+            result,
+            Err(td_mta::https_download::Failure::Before(Error::Forbidden))
+        ));
+        assert!(wire.is_empty());
+    }
+    let (result, wire) = call(&body, password, device, false, false, true);
+    assert!(matches!(
+        result,
+        Err(td_mta::https_download::Failure::Before(Error::Deadline))
+    ));
+    assert!(wire.is_empty());
+    assert!(call(&body, password, device, false, true, false).0.is_err());
+    call(&body, password, device, false, false, false)
+        .0
+        .unwrap();
+}
+
 fn exercise_resolved_read(
     fixture: &Fixture,
     binding: &td_mta::postgres_runtime_profile::Binding,
@@ -5567,6 +5788,7 @@ fn exercise_read(
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
+    exercise_http_read(fixture, binding, password, creation.device_id());
     // Pin equal dates so both sort directions must use ascending-ID ties.
     sql(
         fixture,

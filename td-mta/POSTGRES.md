@@ -2389,3 +2389,28 @@ ten-second worker ceiling can only shorten that allowance. No connection or
 DNS queue is created, and all failed paths release their slot after closing
 owned work. Health and settlement retain independent admission capacity at
 runtime integration. This entry prepares HTTP workers; it activates no role.
+
+## 73. Prepared HTTP read backend
+
+`postgres_http_api::Service` connects the fixed HTTPS body-worker interface
+to the shared bounded HTTP framing and PostgreSQL read dispatcher. It remains
+inert until the atomic cutover. Its prepared Session, profile binding and
+resource plan must agree; HTTPS, response retention and dispatch share one
+RuntimeClock. It implements Core/echo, Mailbox/get, Email/query and Email/get;
+uploads, downloads, mutations and EventSource remain unsupported here.
+
+Original credentials stay borrowed through body preparation and fresh primary
+snapshot authentication. The observed device ID must match their syntax, but
+only the fresh snapshot grants read authority. One reserved read slot covers
+fresh DNS, runtime-role qualification and the whole batch under the original
+execution deadline. Final snapshot validation precedes response output; the
+connection and read slot drop before headers, while temporary response quota
+remains charged through output and cleanup. No database work runs on the
+network reactor, no success escapes a failed snapshot, and uncertain response
+cleanup stops admission. No new listener or production command activates it.
+
+Shared HTTP framing keeps the execution deadline strictly before the outer
+response deadline, including short original request allowances. It caps
+execution one clock tick before the outer limit without extending either
+budget. This preserves response retention's phase-ordering contract; the
+one-tick separation does not promise transmission time after expiry.
