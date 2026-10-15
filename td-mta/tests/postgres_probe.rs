@@ -8903,6 +8903,151 @@ fn exercise_http_submission_owner(
         .unwrap()
         .is_none());
     exercise_http_filing_owner(fixture, &loaded, binding, input, password);
+    exercise_submission_reads(fixture, &loaded, binding, input, password);
+}
+
+fn exercise_submission_reads(
+    fixture: &Fixture,
+    loaded: &td_mta::postgres_input::Loaded,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    input: &td_mta::postgres_submission_input::Prepared,
+    password: &[u8],
+) {
+    use td_mta::{
+        ids::{IdentityId, SubmissionId},
+        postgres_read::{Error, ReadSlots, Snapshot, SubmissionQuery, MAX_SUBMISSION_PAGE},
+        sync::QueryType,
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let mut connection = loaded
+        .bootstrap
+        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    connection.mode = td_mta::postgres_probe::Mode::Runtime;
+    let mut view = Snapshot::open_runtime(
+        &slots,
+        &connection,
+        &loaded.trust,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    let query = SubmissionQuery {
+        identity: input.identity(),
+        after: i64::MIN,
+        before: i64::MAX,
+        ascending: true,
+        position: 0,
+        limit: MAX_SUBMISSION_PAGE,
+        calculate_total: true,
+    };
+    let all = view.query_submissions(query).unwrap();
+    assert!(all.ids.len() >= 2);
+    assert_eq!(all.total, Some(all.ids.len() as u64));
+    assert!(!all.has_more);
+    assert!(all
+        .state
+        .matches_current(view.identity(), QueryType::Submission));
+    let expected = sql(fixture, &format!("SELECT encode(id,'hex') FROM td_mta.submissions WHERE account=decode('{}','hex') AND identity_id=decode('{}','hex') ORDER BY send_at,id", binding.account(), input.identity()));
+    assert_eq!(
+        all.ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        expected
+    );
+    let first = *all.ids.first().unwrap();
+    for (position, expected) in all.ids.iter().enumerate() {
+        let page = view
+            .query_submissions(SubmissionQuery {
+                position: position as u64,
+                limit: 1,
+                ..query
+            })
+            .unwrap();
+        assert_eq!(page.ids, vec![*expected]);
+        assert_eq!(page.state, all.state);
+        assert_eq!(page.total, all.total);
+        assert_eq!(page.position, position as u64);
+        assert_eq!(page.has_more, position + 1 < all.ids.len());
+    }
+    let record = view.submission(first).unwrap().unwrap();
+    assert_eq!(record.view, view.identity());
+    assert_eq!(record.identity, input.identity());
+    assert_eq!(record.submission, first);
+    assert_eq!(record.email.to_string(), sql(fixture, &format!("SELECT encode(email_id,'hex') FROM td_mta.submissions WHERE id=decode('{first}','hex')")));
+    let absent = SubmissionId::from_bytes([0xfe; 16]);
+    assert!(view.submission(absent).unwrap().is_none());
+    let same_time = view
+        .query_submissions(SubmissionQuery {
+            after: record.send_at,
+            before: record.send_at + 1,
+            ..query
+        })
+        .unwrap();
+    assert!(same_time.ids.contains(&first));
+    let excluded = view
+        .query_submissions(SubmissionQuery {
+            before: record.send_at,
+            ..query
+        })
+        .unwrap();
+    assert!(!excluded.ids.contains(&first));
+    let descending = view
+        .query_submissions(SubmissionQuery {
+            ascending: false,
+            ..query
+        })
+        .unwrap();
+    let expected = sql(fixture, &format!("SELECT encode(id,'hex') FROM td_mta.submissions WHERE account=decode('{}','hex') AND identity_id=decode('{}','hex') ORDER BY send_at DESC,id", binding.account(), input.identity()));
+    assert_eq!(
+        descending
+            .ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        expected
+    );
+    let empty = view
+        .query_submissions(SubmissionQuery {
+            identity: IdentityId::from_bytes([0xfe; 16]),
+            ..query
+        })
+        .unwrap();
+    assert_eq!(empty.total, Some(0));
+    assert!(empty.ids.is_empty());
+    let zero = view
+        .query_submissions(SubmissionQuery { limit: 0, ..query })
+        .unwrap();
+    assert!(zero.ids.is_empty() && zero.has_more);
+    let beyond = view
+        .query_submissions(SubmissionQuery {
+            position: u64::MAX,
+            ..query
+        })
+        .unwrap();
+    assert!(beyond.ids.is_empty() && !beyond.has_more);
+    assert_eq!(beyond.total, all.total);
+    let inverted = view
+        .query_submissions(SubmissionQuery {
+            after: 1,
+            before: 0,
+            calculate_total: false,
+            ..query
+        })
+        .unwrap();
+    assert!(inverted.ids.is_empty());
+    assert_eq!(inverted.total, None);
+    assert!(matches!(
+        view.query_submissions(SubmissionQuery {
+            limit: MAX_SUBMISSION_PAGE + 1,
+            ..query
+        }),
+        Err(Error::Capacity)
+    ));
+    assert_eq!(view.submission(first), Err(Error::Capacity));
 }
 
 fn exercise_http_filing_owner(

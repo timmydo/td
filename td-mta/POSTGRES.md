@@ -2787,3 +2787,19 @@ without queue or draft loss, delayed-COMMIT fencing, settlement with occupied
 foreground capacity, the final membership/draft state, and missing-source
 refusal. This adapter does not yet connect the JMAP implicit response or
 advertise Submission.
+
+## 92. Prepared submission reconciliation reads
+
+The authenticated PostgreSQL Snapshot exposes historical submission identity
+metadata and bounded identity/time query pages for td-mail reconciliation.
+Metadata retains the original Email, Thread and sending Identity IDs and
+sendAt even if the current Email has been deleted; those IDs confer no body
+access. Each row's changed sequence must belong to the pinned account view.
+
+Query windows use inclusive after and exclusive before against immutable
+sendAt, either date direction and ascending raw SubmissionId ties. Pages have
+at most 1024 returned IDs plus one lookahead, an optional same-snapshot total,
+and account/epoch/sequence/interpretation-bound Submission query state. The
+original read slot, SQL worker, authenticated snapshot and absolute deadline
+remain in force; a failure poisons the view. No JMAP dispatch, capability,
+recipient status projection or production PostgreSQL cutover is activated.

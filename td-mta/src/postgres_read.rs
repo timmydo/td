@@ -13,6 +13,12 @@ use crate::{
 use std::time::Instant;
 use td_crypto::TrustStore;
 
+#[path = "postgres_read_submissions.rs"]
+mod submission_reads;
+pub use submission_reads::{
+    SubmissionMetadata, SubmissionPage, SubmissionQuery, MAX_SUBMISSION_PAGE,
+};
+
 pub use crate::email_response::{EmailValues as Values, MAX_EMAIL_VALUES as MAX_VALUES};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
