@@ -836,6 +836,57 @@ pub(super) mod tests {
         format!(r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":{calls}}}"#)
     }
     #[test]
+    fn core_dispatch_retains_responses_without_a_mail_database() {
+        use crate::{
+            admission::{DiskLimits, ViewMode, WorkLimits},
+            ports::Clock,
+            store_fs::{tests::Fixture, RequestSpool, ResponseCoordinator},
+        };
+        let files = Fixture::new();
+        let mut root = files.locked();
+        let clock = std::sync::Arc::new(crate::clock::RuntimeClock::new());
+        let deadline = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let spool = RequestSpool::open(&mut root, clock.clone(), deadline).unwrap();
+        let resources = Limits::default().plan().unwrap();
+        let plan = DiskLimits::default()
+            .plan(
+                &resources,
+                WorkLimits::default(),
+                ViewMode::OnlineBackground,
+            )
+            .unwrap();
+        let mut states = [const { crate::ownership::SlotState::EMPTY }; 4];
+        let mut cells = [const { crate::admission::logical::Cell::EMPTY }; 4];
+        let coordinator =
+            ResponseCoordinator::new(spool, &plan, &mut states, &mut cells, clock).unwrap();
+        let retention = coordinator.retain_response(deadline).unwrap();
+        let mut preflight = response::Preflight::new(
+            request(&batch(r#"[["Core/echo",{"value":42},"echo"]]"#)),
+            "session",
+            retention.maximum(),
+        )
+        .unwrap();
+        while !preflight.step(&mut [0; 4096]).unwrap() {}
+        let mut complete = run(
+            preflight.finish().unwrap(),
+            retention,
+            Deadline::after(Tick(0), deadline.tick().0 - 1).unwrap(),
+            AccountId::from_bytes([1; 16]),
+        )
+        .unwrap();
+        let result = complete.responses.get(0).unwrap().unwrap();
+        assert_eq!(result.name, "Core/echo");
+        let mut bytes = vec![0; result.arguments.length() as usize];
+        complete
+            .retention
+            .read_at(result.arguments.offset(), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, br#"{"value":42}"#);
+        drop(complete);
+        assert_eq!(coordinator.used().unwrap(), 0);
+        assert!(!coordinator.admission_stopped());
+    }
+    #[test]
     fn echo_resolves_wildcards_and_first_duplicate_id_in_wire_order() {
         let replies = execute(
             &batch(

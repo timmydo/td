@@ -1,4 +1,4 @@
-//! Private disposable request files. Byte quota is owned by StoreCoordinator.
+//! Private disposable request files. The response owner retains byte quota.
 use super::{LockedRoot, MAX_PATH_BYTES};
 use crate::{
     ports,

@@ -33,11 +33,119 @@ impl std::fmt::Display for ResponseError {
 }
 impl std::error::Error for ResponseError {}
 
+/// Process-local response quota only. Own the cold, empty request spool so no
+/// second coordinator can account for the same temporary files independently.
+pub struct ResponseCoordinator<'sr, 'a> {
+    spool: RequestSpool<'sr>,
+    state: Mutex<AdmissionState<'a>>,
+    clock: std::sync::Arc<dyn Clock>,
+    work: crate::admission::WorkLimits,
+    maximum: u64,
+}
+impl<'sr, 'a> ResponseCoordinator<'sr, 'a> {
+    pub fn new(
+        spool: RequestSpool<'sr>,
+        plan: &Plan,
+        states: &'a mut [SlotState],
+        cells: &'a mut [LeaseCell],
+        clock: std::sync::Arc<dyn Clock>,
+    ) -> Result<Self, ResponseError> {
+        let status = spool.status();
+        if status.occupied_slots != 0
+            || status.retired_slots != 0
+            || cells.len() < 2
+            || states.len() < 2
+        {
+            return Err(ports::Error::Invalid.into());
+        }
+        let ledger = Leases::new(
+            plan,
+            crate::admission::quota::Usage::default(),
+            states,
+            cells,
+        )?;
+        Ok(Self {
+            spool,
+            state: Mutex::new(AdmissionState {
+                ledger,
+                stopped: false,
+                recoverable_files: false,
+            }),
+            clock,
+            work: *plan.work(),
+            maximum: plan.disk().response_bytes,
+        })
+    }
+    pub fn retain_response<'c>(
+        &'c self,
+        deadline: Deadline,
+    ) -> Result<ResponseRetention<'c, 'c, 'static, 'sr, 'a, ()>, ResponseError> {
+        RetentionOwner::Response(self).retain(
+            &self.spool,
+            deadline,
+            Kind::ResponseBytes,
+            self.maximum,
+        )
+    }
+    pub fn admission_stopped(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.stopped)
+    }
+    pub fn used(&self) -> Result<u64, logical::Error> {
+        self.state
+            .lock()
+            .map_err(|_| logical::Error::Poisoned)?
+            .ledger
+            .used(Kind::ResponseBytes)
+    }
+}
+
+enum RetentionOwner<'c, 'r, 'sr, 'a, P> {
+    Native(&'c StoreCoordinator<'r, 'a, P>),
+    Response(&'c ResponseCoordinator<'sr, 'a>),
+}
+impl<'c, 'r, 'sr, 'a, P> RetentionOwner<'c, 'r, 'sr, 'a, P> {
+    fn state(&self) -> &Mutex<AdmissionState<'a>> {
+        match self {
+            Self::Native(owner) => &owner.state,
+            Self::Response(owner) => &owner.state,
+        }
+    }
+    fn clock(&self) -> &std::sync::Arc<dyn Clock> {
+        match self {
+            Self::Native(owner) => &owner.store.clock,
+            Self::Response(owner) => &owner.clock,
+        }
+    }
+    fn work(&self) -> &crate::admission::WorkLimits {
+        match self {
+            Self::Native(owner) => &owner.work,
+            Self::Response(owner) => &owner.work,
+        }
+    }
+    fn native(&self) -> Result<&'c StoreCoordinator<'r, 'a, P>, ports::Error> {
+        match self {
+            Self::Native(owner) => Ok(owner),
+            Self::Response(_) => Err(ports::Error::Invalid),
+        }
+    }
+    fn time(&self, deadline: Deadline, last: &mut Tick) -> Result<Time, ports::Error> {
+        let time = self.clock().sample()?;
+        if time.monotonic < *last {
+            return Err(ports::Error::Invalid);
+        }
+        *last = time.monotonic;
+        if deadline.expired(time.monotonic) {
+            return Err(ports::Error::Deadline);
+        }
+        Ok(time)
+    }
+}
+
 /// Raw bounded retention; publication and JSON validity belong to the dispatcher.
 /// No path, file descriptor, mutable ledger or cleanup proof escapes this owner.
 #[must_use = "retained response storage remains charged until discarded"]
 pub struct ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
-    coordinator: &'c StoreCoordinator<'r, 'a, P>,
+    owner: RetentionOwner<'c, 'r, 'sr, 'a, P>,
     temporary: Option<Temporary<'s, 'sr>>,
     lease: Option<LeaseId>,
     effect: Option<EffectTicket>,
@@ -99,7 +207,21 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         kind: Kind,
         maximum: u64,
     ) -> Result<ResponseRetention<'c, 's, 'r, 'sr, 'a, P>, ResponseError> {
-        let mut state = self.try_state()?;
+        RetentionOwner::Native(self).retain(spool, deadline, kind, maximum)
+    }
+}
+impl<'c, 'r, 'sr, 'a, P> RetentionOwner<'c, 'r, 'sr, 'a, P> {
+    fn retain<'s>(
+        self,
+        spool: &'s RequestSpool<'sr>,
+        deadline: Deadline,
+        kind: Kind,
+        maximum: u64,
+    ) -> Result<ResponseRetention<'c, 's, 'r, 'sr, 'a, P>, ResponseError> {
+        let mut state = self.state().try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ports::Error::Busy,
+            std::sync::TryLockError::Poisoned(_) => ports::Error::WriterStopped,
+        })?;
         if state.stopped {
             return Err(ports::Error::WriterStopped.into());
         }
@@ -107,8 +229,8 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         if state.ledger.available_cells() < 2 {
             return Err(logical::Error::Full.into());
         }
-        let mut last = self.store.clock.sample()?.monotonic;
-        let now = check_time(&self.store, deadline, &mut last)?.monotonic;
+        let mut last = self.clock().sample()?.monotonic;
+        let now = self.time(deadline, &mut last)?.monotonic;
         let lease = state.ledger.reserve(
             &[[
                 Charge {
@@ -137,8 +259,9 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             }
         };
         drop(state);
+        let work = *self.work();
         let mut response = ResponseRetention {
-            coordinator: self,
+            owner: self,
             temporary: None,
             lease: Some(lease),
             effect: Some(effect),
@@ -150,9 +273,9 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             meter: Meter::new(
                 deadline,
                 WorkCharge {
-                    io_bytes: self.work.foreground_io_bytes,
-                    records: self.work.foreground_records,
-                    output_bytes: self.work.foreground_io_bytes,
+                    io_bytes: work.foreground_io_bytes,
+                    records: work.foreground_records,
+                    output_bytes: work.foreground_io_bytes,
                     unlinks: 0,
                 },
             ),
@@ -177,13 +300,13 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
             return Err(ports::Error::Deadline);
         }
         Ok((
-            self.coordinator.store.clock.clone(),
+            self.owner.clock().clone(),
             Meter::new(
                 phase,
                 WorkCharge {
-                    io_bytes: self.coordinator.work.foreground_io_bytes,
-                    records: self.coordinator.work.foreground_records,
-                    output_bytes: self.coordinator.work.foreground_io_bytes,
+                    io_bytes: self.owner.work().foreground_io_bytes,
+                    records: self.owner.work().foreground_records,
+                    output_bytes: self.owner.work().foreground_io_bytes,
                     unlinks: 0,
                 },
             ),
@@ -196,12 +319,13 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
         if !self.admit_before(phase)? {
             return Err(ports::Error::Deadline);
         }
-        let cap = self.coordinator.sort_bytes / 2;
+        let coordinator = self.owner.native()?;
+        let cap = coordinator.sort_bytes / 2;
         if cap == 0 {
             return Err(ports::Error::Capacity);
         }
         Ok((
-            self.coordinator,
+            coordinator,
             self.temporary
                 .as_ref()
                 .ok_or(ports::Error::Invalid)?
@@ -217,7 +341,7 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
         if !self.admit_before(phase)? {
             return Err(ports::Error::Deadline);
         }
-        self.coordinator.store.view(account, phase)
+        self.owner.native()?.store.view(account, phase)
     }
 
     /// Materialize the complete result bound and prepay its final overwrite.
@@ -308,7 +432,7 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        let result = check_time(&self.coordinator.store, self.deadline, &mut self.last).map(|_| ());
+        let result = self.owner.time(self.deadline, &mut self.last).map(|_| ());
         self.record(result)
     }
     fn record<T>(&mut self, result: Result<T, ports::Error>) -> Result<T, ports::Error> {
@@ -431,7 +555,7 @@ impl<'c, 's, 'r, 'sr, 'a, P> ResponseRetention<'c, 's, 'r, 'sr, 'a, P> {
         // Unlink and close before releasing any reservation; not subject
         // to an expired request deadline. Drop runs only on storage workers.
         let cleanup = self.temporary.as_mut().map_or(Ok(()), Temporary::cleanup);
-        let mut state = lock(&self.coordinator.state)?;
+        let mut state = lock(self.owner.state())?;
         let effect = self.effect.as_mut().ok_or(ports::Error::Invalid)?;
         let result = state.ledger.complete_effect(
             effect,
@@ -540,6 +664,155 @@ mod tests {
     }
     fn deadline() -> Deadline {
         Deadline::after(Tick(0), 100).unwrap()
+    }
+    fn response_only(test: impl FnOnce(&ResponseCoordinator<'_, '_>, &Fixture, &Timer)) {
+        response_only_inner(false, test);
+    }
+    fn response_only_inner(
+        retired: bool,
+        test: impl FnOnce(&ResponseCoordinator<'_, '_>, &Fixture, &Timer),
+    ) {
+        let files = Fixture::new();
+        let mut root = files.locked();
+        let clock = Arc::new(Timer(AtomicU64::new(1)));
+        let spool = RequestSpool::open(&mut root, clock.clone(), deadline()).unwrap();
+        if retired {
+            let mut temporary = spool.reserve().unwrap();
+            temporary.create().unwrap();
+            let path = files.path.join("request-00/response");
+            fs::remove_file(&path).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            drop(temporary);
+            assert_eq!(spool.status().retired_slots, 1);
+        }
+        let resources = Limits {
+            json_bytes: 64,
+            json_methods: 1,
+            ..Limits::default()
+        }
+        .plan()
+        .unwrap();
+        let plan = DiskLimits {
+            response_bytes: 72000,
+            response_total_bytes: 144000,
+            ..DiskLimits::default()
+        }
+        .plan(
+            &resources,
+            WorkLimits::default(),
+            ViewMode::OnlineBackground,
+        )
+        .unwrap();
+        let mut states = [const { SlotState::EMPTY }; 4];
+        let mut cells = [const { LeaseCell::EMPTY }; 4];
+        let owner = ResponseCoordinator::new(spool, &plan, &mut states, &mut cells, clock.clone());
+        if retired {
+            assert!(matches!(
+                owner,
+                Err(ResponseError::Store(ports::Error::Invalid))
+            ));
+            return;
+        }
+        let owner = owner.unwrap();
+        test(&owner, &files, &clock);
+    }
+    #[test]
+    fn response_only_owner_refuses_a_retired_spool() {
+        response_only_inner(true, |_, _, _| panic!("retired spool admitted"));
+    }
+    #[test]
+    fn response_only_owner_preserves_caps_prepaid_output_and_cleanup() {
+        response_only(|owner, files, _| {
+            let mut first = owner.retain_response(deadline()).unwrap();
+            let phase = Deadline::after(Tick(0), 90).unwrap();
+            assert_eq!(
+                first
+                    .method_view(AccountId::from_bytes([1; 16]), phase)
+                    .err(),
+                Some(ports::Error::Invalid)
+            );
+            assert_eq!(
+                first.method_sort_context(phase).err(),
+                Some(ports::Error::Invalid)
+            );
+            let second = owner.retain_response(deadline()).unwrap();
+            assert!(owner.retain_response(deadline()).is_err());
+            assert_eq!(
+                owner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::ResponseBytes)
+                    .unwrap(),
+                144000
+            );
+            let reserved = first.reserve_mutation_output(400).unwrap();
+            assert_eq!(first.finish_mutation_output(reserved, b"{}").unwrap(), 0..2);
+            let mut output = [0; 2];
+            first.read_at(0, &mut output).unwrap();
+            assert_eq!(&output, b"{}");
+            first.discard().unwrap();
+            drop(second);
+            assert_eq!(
+                owner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ledger
+                    .pending(Kind::ResponseBytes)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(owner.used().unwrap(), 0);
+            assert_eq!(owner.spool.status().occupied_slots, 0);
+            assert!(!files.path.join("request-00/response").exists());
+            assert!(!owner.admission_stopped());
+        });
+    }
+    #[test]
+    fn response_only_owner_retains_uncertain_cleanup_charges() {
+        response_only(|owner, files, _| {
+            let mut response = owner.retain_response(deadline()).unwrap();
+            response.append(b"secret").unwrap();
+            let path = files.path.join("request-00/response");
+            fs::remove_file(&path).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            assert!(response.discard().is_err());
+            assert!(path.exists());
+            assert_eq!(owner.used().unwrap(), 72000);
+            assert_eq!(owner.spool.status().retired_slots, 1);
+            let next = owner.retain_response(deadline()).unwrap();
+            assert!(owner.retain_response(deadline()).is_err());
+            drop(next);
+            assert_eq!(owner.used().unwrap(), 72000);
+        });
+    }
+    #[test]
+    fn response_only_owner_keeps_clock_failure_sticky() {
+        for end in [0, 100] {
+            response_only(|owner, _, clock| {
+                let mut response = owner.retain_response(deadline()).unwrap();
+                response.append(b"[]").unwrap();
+                clock.0.store(end, Ordering::SeqCst);
+                let failure = response.publish().err().unwrap();
+                clock.0.store(1, Ordering::SeqCst);
+                assert_eq!(response.append(b"x"), Err(failure));
+                response.discard().unwrap();
+                assert_eq!(owner.used().unwrap(), 0);
+                assert_eq!(owner.spool.status().occupied_slots, 0);
+            });
+        }
     }
     fn run(test: impl FnOnce(&StoreCoordinator<'_, '_, ()>, &RequestSpool<'_>, &Fixture, &Timer)) {
         run_with_cells(4, test);

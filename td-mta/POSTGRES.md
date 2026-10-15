@@ -2263,3 +2263,27 @@ read fixture checks valid, malformed, wrong and revoked credentials, expired
 deadlines, rejection of owner credentials and subsequent successful lookup.
 A held table lock checks concurrent Busy refusal, finite lock failure and
 in-flight deadline expiry, followed by successful lookup after release.
+
+## 66. Response retention without a mail database
+
+The prepared `ResponseCoordinator` owns one cold, empty RequestSpool and a
+process-local response quota ledger. Construction consumes the spool and
+refuses occupied or retired slots; it opens no mail database and grants no
+mail authority. Its only reservation surface is response bytes. PostgreSQL
+remains responsible for durable quotas; the local ledger cannot reserve
+bodies, uploads or delivery responsibility.
+
+Both the active local StoreCoordinator and this prepared owner use the same
+retention implementation: full-cap reservation before file creation, original
+work/deadline accounting, prepaid mutation output, and unlink-before-credit
+cleanup. Failed cleanup retains the full charge and retires the slot; ledger
+failure stops admission. The prepared owner refuses the legacy native-view
+and external-sort hooks. PostgreSQL method adapters must supply their own
+authenticated snapshots and bounded queries rather than accidentally opening
+a local view.
+
+The existing Core dispatcher runs against this owner without constructing a
+mail database. Fixtures cover complete echo output, quota saturation, prepaid
+output, successful cleanup, replacement-file uncertainty and sticky clock
+failure. Production still supplies the local coordinator until atomic cutover;
+the temporary owner enum and legacy hooks are preparation plumbing.

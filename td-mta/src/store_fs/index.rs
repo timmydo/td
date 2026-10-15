@@ -82,12 +82,12 @@ pub use upload::{
     DraftAuthorization, DraftCompletion, DraftRequest, EmailDestroyCompletion, EmailDestroyRequest,
     EmailDestroyResult, EmailUpdate, EmailUpdateAuthorization, EmailUpdateCompletion,
     EmailUpdateRequest, EmailUpdateResult, MailboxAuthorization, MailboxCreateCompletion,
-    MailboxCreateRequest, MailboxCreateResult, NativeSortJob, ResponseError, ResponseRetention,
-    SortError, SortRetention, SortSource, SortWork, SortWorkspace, StoreCoordinator,
-    SubmissionAuthorization, SubmissionCompletion, SubmissionError, SubmissionGuard,
-    SubmissionRequest, Upload, UploadAttempt, UploadAuthorization, UploadCleanup, UploadCompletion,
-    UploadError, UploadGuard, UploadMaintenance, UploadRequest, UploadSweepDisposition,
-    MAX_EMAIL_DESTROYS, MAX_EMAIL_UPDATES, MAX_MAILBOX_CREATES,
+    MailboxCreateRequest, MailboxCreateResult, NativeSortJob, ResponseCoordinator, ResponseError,
+    ResponseRetention, SortError, SortRetention, SortSource, SortWork, SortWorkspace,
+    StoreCoordinator, SubmissionAuthorization, SubmissionCompletion, SubmissionError,
+    SubmissionGuard, SubmissionRequest, Upload, UploadAttempt, UploadAuthorization, UploadCleanup,
+    UploadCompletion, UploadError, UploadGuard, UploadMaintenance, UploadRequest,
+    UploadSweepDisposition, MAX_EMAIL_DESTROYS, MAX_EMAIL_UPDATES, MAX_MAILBOX_CREATES,
 };
 #[path = "index/backup.rs"]
 mod backup;

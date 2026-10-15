@@ -2931,3 +2931,13 @@ original work meter; exhausted work refuses creation. This is linear in
 retained kind history, not an ID-point lookup. Pruned history is outside
 this collision claim, matching QUEUE.md's random-ID policy. Composition
 enforces a shorter execution-phase deadline without renewing its meter.
+
+## Prepared response storage owner
+
+`ResponseCoordinator` is inert PostgreSQL-cutover preparation. It consumes a
+cold, empty RequestSpool and owns a process-local response-byte ledger without
+opening a mail database. It shares the active retention implementation and
+its full reservation, original work/deadline, prepaid-output and conservative
+cleanup rules. Occupied or retired slots refuse construction. Native view and
+sort hooks refuse for this owner; it conveys no durable-mail quota or device
+authority. POSTGRES.md owns its activation boundary.
