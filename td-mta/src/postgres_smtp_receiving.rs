@@ -96,6 +96,39 @@ pub struct Receiving<'a> {
     pub pending: &'a Pending,
 }
 impl Receiving<'_> {
+    /// A bounded startup/reconnect observation. Every delivery still rechecks
+    /// current selection and Inbox inside its publication transaction.
+    pub fn ready(&self, until: Deadline) -> Result<(), Error> {
+        if !self.executable.is_absolute()
+            || !self.binding.roles().receive()
+            || self.loaded.bootstrap.profile() != self.binding.profile()
+        {
+            return Err(ports::Error::Forbidden.into());
+        }
+        let pending = self
+            .pending
+            .change
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let deadline = phase(self.clock, until)?;
+        let _slot = self.slots.acquire().map_err(|_| ports::Error::Busy)?;
+        for address in addresses(self.loaded, self.executable, deadline)? {
+            let mut connection = self.loaded.bootstrap.request(address);
+            connection.mode = Mode::Runtime;
+            match changes::ready(&connection, &self.loaded.trust, deadline, self.binding) {
+                Ok(_) => return Ok(()),
+                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
+                Err(error) => return Err(Error::Publication(error)),
+            }
+        }
+        Err(Error::Publication(changes::Error::Connection(
+            postgres_probe::Error::Transport,
+        )))
+    }
+
     /// Publish completed, caller-admitted SMTP input. The trusted caller owns
     /// peer, gateway, recipient and ingress authority; receipt facts are passive.
     pub fn create(

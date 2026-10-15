@@ -3039,3 +3039,21 @@ continues to construct only that adapter. This is a storage interface for the
 PostgreSQL cutover, not a new SMTP feature or an activated PostgreSQL listener.
 Existing real SMTP/TLS, storage refusal and shutdown fixtures exercise the
 same production adapter through the new boundary.
+
+
+## 106. Fresh receiving readiness
+
+The prepared SMTP owner checks readiness through a bounded, runtime-qualified
+primary connection before reporting that its selected receiving profile and
+Inbox are available. The check validates schema epoch and selection, then
+holds the account share lock while checking sequence/floor coherence and one
+Inbox with a valid ID and change sequence. Publication uses the same Inbox
+validator under its account write lock. Readiness writes no mail or receipt
+and does not replace fresh publication authorization or reserve quota.
+
+The owner refuses readiness while an uncertain delivery is retained, reserves
+foreground capacity before fresh resolution and retains one ten-second phase
+under the caller's deadline. Errors remain typed; no local fallback or listener
+activation is introduced. The runtime-role PostgreSQL fixture covers success,
+missing Inbox, incoherent Inbox history, stale selection and pending delivery,
+including unchanged account state and absent publication effects.

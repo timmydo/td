@@ -228,11 +228,11 @@ fn sequence(bytes: &[u8]) -> Result<u64, Error> {
     ))
 }
 
-async fn begin(client: &Client, delivery: &Delivery) -> Result<(), Error> {
+async fn begin(client: &Client, binding: &Binding) -> Result<(), Error> {
     let schema = postgres_schema::lock_and_inspect(client)
         .await
         .map_err(Error::Schema)?;
-    if schema.store_epoch != delivery.binding.epoch() {
+    if schema.store_epoch != binding.epoch() {
         return Err(Error::Epoch);
     }
     client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
@@ -276,6 +276,64 @@ async fn receipt(client: &Client, delivery: &Delivery) -> Result<Option<Outcome>
     }))
 }
 
+async fn inbox(
+    client: &Client,
+    account: crate::ids::AccountId,
+    state: u64,
+) -> Result<MailboxId, Error> {
+    let rows = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account.as_bytes().as_slice()])
+        .await.map_err(|_| Error::Database)?;
+    if rows.len() != 1 {
+        return Err(Error::MissingMailbox);
+    }
+    let row = rows.first().ok_or(Error::Integrity)?;
+    let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+    let id = MailboxId::from_bytes(id.try_into().map_err(|_| Error::Integrity)?);
+    if sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > state {
+        return Err(Error::Integrity);
+    }
+    Ok(id)
+}
+
+/// Fresh startup observation only; neither ingress nor publication authority.
+/// Hold configuration then account share locks for one coherent Inbox check.
+pub fn ready(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    binding: &Binding,
+) -> Result<MailboxId, Error> {
+    if !binding.roles().receive() {
+        return Err(Error::Policy);
+    }
+    let binding = binding.clone();
+    let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
+        Box::pin(async move {
+            begin(client, &binding).await?;
+            let selected = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[])
+                .await.map_err(|_| Error::Database)?;
+            let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
+            let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
+            if generation != binding.selection().generation
+                || version != Some(binding.selection().version.as_bytes().as_slice()) {
+                return Err(Error::Policy);
+            }
+            let account = binding.account();
+            let row = client.query_one("SELECT sequence,floor FROM td_mta.accounts WHERE id=$1 FOR SHARE", &[&account.as_bytes().as_slice()])
+                .await.map_err(|_| Error::Database)?;
+            let state = sequence(row.try_get(0).map_err(|_| Error::Integrity)?)?;
+            if sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > state {
+                return Err(Error::Integrity);
+            }
+            inbox(client, account, state).await
+        })
+    }).map_err(Error::Connection)?;
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
+    result
+}
+
 pub fn inspect(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -285,7 +343,7 @@ pub fn inspect(
     let delivery = delivery.clone();
     let result = postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            begin(client, &delivery).await?;
+            begin(client, &delivery.binding).await?;
             client
                 .query_one(
                     "SELECT id FROM td_mta.accounts WHERE id=$1 FOR SHARE",
@@ -318,7 +376,7 @@ pub fn publish(
     let marker = attempted.clone();
     let result = postgres_probe::with_upload_client(request, trust, deadline, move |client| {
         Box::pin(async move {
-            begin(client, &delivery).await?;
+            begin(client, &delivery.binding).await?;
             let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE",&[]).await.map_err(|_|Error::Database)?;
             let generation = sequence(selected.try_get(0).map_err(|_| Error::Integrity)?)?;
             let version: Option<&[u8]> = selected.try_get(1).map_err(|_| Error::Integrity)?;
@@ -350,16 +408,8 @@ pub fn publish(
             if count >= MAX_RECEIPTS {
                 return Err(Error::Capacity);
             }
-            let inbox = client.query("SELECT id,changed FROM td_mta.mailboxes WHERE account=$1 AND role='inbox' ORDER BY id LIMIT 2", &[&account]).await.map_err(|_| Error::Database)?;
-            if inbox.len() != 1 {
-                return Err(Error::MissingMailbox);
-            }
-            let row = inbox.first().ok_or(Error::Integrity)?;
-            let mailbox: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-            if mailbox.len() != 16 || sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
-            {
-                return Err(Error::Integrity);
-            }
+            let mailbox_id = inbox(client, account_id, old).await?;
+            let mailbox = mailbox_id.as_bytes().as_slice();
             let email = delivery.email.as_bytes().as_slice();
             let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.emails WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=3 AND object=$2)", &[&account,&email]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
             if used {

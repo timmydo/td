@@ -11055,6 +11055,51 @@ fn exercise_smtp_receiving_owner(
         clock: &clock,
         pending: &pending,
     };
+    worker.ready(until(10_000)).unwrap();
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "0"
+    );
+    let inbox = sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.mailboxes SET role=NULL WHERE role='inbox'",
+    );
+    assert_eq!(
+        worker.ready(until(10_000)),
+        Err(owner::Error::Publication(changes::Error::MissingMailbox))
+    );
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.mailboxes SET role='inbox' WHERE id=decode('{inbox}','hex')"),
+    );
+    let state = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    let changed = sql(
+        fixture,
+        &format!(
+            "SELECT encode(changed,'hex') FROM td_mta.mailboxes WHERE id=decode('{inbox}','hex')"
+        ),
+    );
+    sql(fixture, &format!("UPDATE td_mta.mailboxes SET changed=decode('ffffffffffffffff','hex') WHERE id=decode('{inbox}','hex')"));
+    assert_eq!(
+        worker.ready(until(10_000)),
+        Err(owner::Error::Publication(changes::Error::Integrity))
+    );
+    sql(fixture, &format!("UPDATE td_mta.mailboxes SET changed=decode('{changed}','hex') WHERE id=decode('{inbox}','hex')"));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        state
+    );
+    worker.ready(until(10_000)).unwrap();
     let mut recipient_bytes = [0; 1024];
     let recipients =
         ReceiptRecipients::encode(&["alice@example.test"], &mut recipient_bytes).unwrap();
@@ -11101,6 +11146,10 @@ fn exercise_smtp_receiving_owner(
         Err(owner::Error::Publication(changes::Error::Indeterminate))
     );
     let operation = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.ready(until(10_000)),
+        Err(owner::Error::Admission(Error::Busy))
+    );
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Admission(Error::Busy))
@@ -11150,6 +11199,10 @@ fn exercise_smtp_receiving_owner(
         pending: &fresh,
         ..worker
     };
+    assert_eq!(
+        worker.ready(until(10_000)),
+        Err(owner::Error::Publication(changes::Error::Policy))
+    );
     assert_eq!(
         worker.create(&message, until(10_000), &mut meter()),
         Err(owner::Error::Publication(changes::Error::Policy))
