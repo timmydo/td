@@ -79,7 +79,7 @@ impl ReadSlots {
             used: std::sync::atomic::AtomicUsize::new(0),
         })
     }
-    fn acquire(&self) -> Result<ReadPermit<'_>, Error> {
+    pub(crate) fn acquire(&self) -> Result<ReadPermit<'_>, Error> {
         use std::sync::atomic::Ordering;
         let mut used = self.used.load(Ordering::Relaxed);
         for _ in 0..8 {
@@ -99,7 +99,7 @@ impl ReadSlots {
         Err(Error::Busy)
     }
 }
-struct ReadPermit<'a>(&'a ReadSlots);
+pub(crate) struct ReadPermit<'a>(&'a ReadSlots);
 impl Drop for ReadPermit<'_> {
     fn drop(&mut self) {
         self.0

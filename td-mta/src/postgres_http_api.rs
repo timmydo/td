@@ -33,6 +33,7 @@ pub struct Service<'s, 'sr, 'a> {
     pub session: &'s Session,
     pub response_maximum: u64,
     pub clock: &'s RuntimeClock,
+    pub admission: &'s crate::admission::Plan,
     pub timeouts: &'s TimeoutPlan,
 }
 
@@ -50,6 +51,14 @@ impl https_upload::Backend for Service<'_, '_, '_> {
         _control: &Control,
     ) -> Result<https_upload::Response, Error> {
         Err(Error::NotFound)
+    }
+    fn download(
+        &self,
+        request: crate::https_download::Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+    ) -> Result<(), Failure> {
+        self.send_download(request, transport, control)
     }
     fn api(
         &self,
@@ -85,6 +94,136 @@ impl https_upload::Backend for Service<'_, '_, '_> {
     }
 }
 impl Service<'_, '_, '_> {
+    fn send_download(
+        &self,
+        request: crate::https_download::Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
+    ) -> Result<(), Failure> {
+        let mut sender = Sender::new(
+            transport,
+            control,
+            self.clock,
+            self.timeouts,
+            request.deadline,
+        )
+        .map_err(Failure::Before)?;
+        let result = self.download_body(&request, &mut sender);
+        result.map_err(|error| {
+            if sender.started {
+                Failure::Started(error)
+            } else {
+                Failure::Before(error)
+            }
+        })
+    }
+    fn download_body(
+        &self,
+        request: &crate::https_download::Request<'_>,
+        sender: &mut Sender<'_>,
+    ) -> Result<(), Error> {
+        use crate::{
+            admission::work::{Charge, Meter},
+            ports::Deadline,
+            postgres_body, postgres_probe,
+        };
+        if request.target.account() != self.binding.account() {
+            return Err(Error::NotFound);
+        }
+        if !self.binding.roles().jmap()
+            || self.loaded.bootstrap.profile() != self.binding.profile()
+            || !self.executable.is_absolute()
+        {
+            return Err(Error::Forbidden);
+        }
+        let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
+        if presented.id() != request.device {
+            return Err(Error::Forbidden);
+        }
+        sender.check()?;
+        let started_at = sender.last;
+        let until = Deadline::after(started_at, 10_000)?.min(request.deadline);
+        sender.deadline = until;
+        let deadline = self.clock.deadline_instant(until)?;
+        // Verification retains one snapshot while fresh authorization opens
+        // another connection. Reserve both before launching the DNS helper.
+        let _body_slot = self.slots.acquire().map_err(read_error)?;
+        let _auth_slot = self.slots.acquire().map_err(read_error)?;
+        let dns_deadline = deadline.min(
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(5))
+                .ok_or(Error::Invalid)?,
+        );
+        let addresses = crate::postgres_resolver::resolve(
+            self.executable,
+            &self.loaded.bootstrap,
+            dns_deadline,
+        )
+        .map_err(|error| match error {
+            crate::postgres_resolver::Error::Deadline => Error::Deadline,
+            _ => Error::Dns,
+        })?;
+        let work = self.admission.work();
+        let mut meter = Meter::new(
+            until,
+            Charge {
+                io_bytes: work.foreground_io_bytes,
+                records: work.foreground_records,
+                output_bytes: work.foreground_io_bytes,
+                ..Default::default()
+            },
+        );
+        for address in addresses {
+            let mut connection = self.loaded.bootstrap.request(address);
+            connection.mode = postgres_probe::Mode::Runtime;
+            let result = postgres_body::with_pinned_blob(
+                &connection,
+                &self.loaded.trust,
+                deadline,
+                postgres_body::BlobRequest {
+                    binding: self.binding,
+                    blob: request.target.blob(),
+                    maximum: self.resources.limits().message_bytes as u64,
+                },
+                request.credentials.password(),
+                |_, pin| {
+                    crate::https_download::send_verified(
+                        pin,
+                        &mut meter,
+                        request.target,
+                        self.resources.limits(),
+                        started_at,
+                        until,
+                        sender,
+                    )
+                },
+            );
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Deadline);
+            }
+            match result {
+                Ok(()) => return Ok(()),
+                Err(postgres_body::Error::Connection(postgres_probe::Error::Transport))
+                    if !sender.started => {}
+                Err(error) => {
+                    return Err(match error {
+                        postgres_body::Error::Connection(postgres_probe::Error::Deadline) => {
+                            Error::Deadline
+                        }
+                        postgres_body::Error::Read(error) => error,
+                        postgres_body::Error::Missing => Error::NotFound,
+                        postgres_body::Error::Unauthenticated | postgres_body::Error::Policy => {
+                            Error::Forbidden
+                        }
+                        postgres_body::Error::Capacity => Error::Capacity,
+                        postgres_body::Error::Integrity => Error::Corrupt,
+                        _ => Error::Invalid,
+                    })
+                }
+            }
+        }
+        Err(Error::Invalid)
+    }
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
         let presented = Presented::parse(request.credentials.password()).ok_or(Error::Forbidden)?;
         if presented.id() != request.device {

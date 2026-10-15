@@ -2397,7 +2397,7 @@ to the shared bounded HTTP framing and PostgreSQL read dispatcher. It remains
 inert until the atomic cutover. Its prepared Session, profile binding and
 resource plan must agree; HTTPS, response retention and dispatch share one
 RuntimeClock. It implements Core/echo, Mailbox/get, Email/query and Email/get;
-uploads, downloads, mutations and EventSource remain unsupported here.
+uploads, mutations and EventSource remain unsupported here.
 
 Original credentials stay borrowed through body preparation and fresh primary
 snapshot authentication. The observed device ID must match their syntax, but
@@ -2414,3 +2414,21 @@ response deadline, including short original request allowances. It caps
 execution one clock tick before the outer limit without extending either
 budget. This preserves response retention's phase-ordering contract; the
 one-tick separation does not promise transmission time after expiry.
+## 74. Prepared HTTP downloads
+
+The prepared HTTP backend serves raw blobs and direct MIME-part locators
+through the existing shared download encoder. Target account and observed
+device must match before connection admission. It reserves two read slots
+before fresh DNS: one for the verified body snapshot, one for fresh primary
+reauthorization before the callback. Both runtime connections qualify the
+database role. The snapshot, MIME processing and transmission share the
+original deadline capped at ten seconds; no reconnect renews that budget.
+
+Whole-body digest verification and account-reference/upload-lease policy
+remain `postgres_body::with_pinned_blob` responsibilities. Forged locators
+are checked against the verified MIME tree and decoded length is counted
+before headers. A single foreground work meter covers interpretation and
+replay; no full-message resident buffer is introduced. Both connection
+reservations survive callback output and are released after their sockets
+drop, including failed writes. A pool with fewer than two free slots refuses
+immediately. Uploads and production activation remain unimplemented.

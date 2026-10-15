@@ -5504,7 +5504,7 @@ fn exercise_http_read(
     let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
     let responses =
         ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
-    let slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+    let slots = td_mta::postgres_read::ReadSlots::new(2).unwrap();
     let session = td_mta::jmap_session::Session::mail_access(
         td_mta::config::endpoint::Origin::parse("https://localhost").unwrap(),
         td_mta::config::identities::AccountView {
@@ -5528,13 +5528,14 @@ fn exercise_http_read(
         resources: &resources,
         session: &session,
         response_maximum: disk.disk().response_bytes,
+        admission: &disk,
         clock: &clock,
         timeouts: &timeouts,
     };
     let mut id = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let account = td_mta::wire::encode_id(binding.account(), &mut id).unwrap();
     let body = format!(
-        r##"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}","properties":["name"]}},"m"],["Email/query",{{"accountId":"{account}","calculateTotal":true}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"fetchTextBodyValues":true}},"g"]]}}"##
+        r##"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}","properties":["name"]}},"m"],["Email/query",{{"accountId":"{account}","calculateTotal":true}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","blobId","subject","textBody","bodyValues"],"fetchTextBodyValues":true}},"g"]]}}"##
     );
     td_json::parse(&body).unwrap();
     let control = td_mta::smtp_receiving::Control::default();
@@ -5585,7 +5586,11 @@ fn exercise_http_read(
         assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
         assert!(headers.contains(&format!("Content-Length: {}\r\n", json.len())));
         assert!(json.contains("\"total\":2"));
-        assert_eq!(json.matches("\"subject\":\"Snapshot\"").count(), 2);
+        assert_eq!(
+            json.matches("\"subject\":\"Snapshot\"").count(),
+            2,
+            "{json}"
+        );
         assert!(json.contains("snapshot text"));
     }
     let (result, wire) = call("{", password, device, false, false, false);
@@ -5616,6 +5621,84 @@ fn exercise_http_read(
     call(&body, password, device, false, false, false)
         .0
         .unwrap();
+    let (_, output) = call(&body, password, device, false, false, false);
+    let json = td_json::parse(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let email = &json["methodResponses"][2][1]["list"][0];
+    let raw = email["blobId"].as_str().unwrap();
+    let part = email["textBody"][0]["blobId"].as_str().unwrap();
+    let download = |blob: &str, secret: &[u8], fail_write| {
+        let target = td_mta::https_download::Target::parse(&format!(
+            "/jmap/download/{account}/{blob}/snapshot.txt?type=text%2Fplain"
+        ))
+        .unwrap();
+        let credentials = credentials(secret);
+        let mut wire = Wire {
+            input: Vec::new(),
+            position: 0,
+            output: Vec::new(),
+            fail_write,
+        };
+        let result = service.download(
+            td_mta::https_download::Request {
+                target: &target,
+                device,
+                credentials: &credentials,
+                deadline: until(),
+            },
+            &mut wire,
+            &control,
+        );
+        (result, String::from_utf8(wire.output).unwrap())
+    };
+    let (result, raw_wire) = download(raw, password, false);
+    result.unwrap();
+    let (headers, message) = raw_wire.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(headers.contains(&format!("Content-Length: {}\r\n", message.len())));
+    assert!(
+        message.contains("Subject:\r\n =?UTF-8?B?U25hcHNob3Q=?=\r\n"),
+        "{message}"
+    );
+    let (result, part_wire) = download(part, password, false);
+    result.unwrap();
+    assert_eq!(part_wire.split_once("\r\n\r\n").unwrap().1, "snapshot text");
+    let mut locator = td_mta::wire::PartLocator::decode(part).unwrap();
+    locator.offset += 1;
+    let mut locator_bytes = [0; 255];
+    let forged = locator.encode(&mut locator_bytes).unwrap();
+    let (result, wire) = download(forged, password, false);
+    assert!(matches!(
+        result,
+        Err(td_mta::https_download::Failure::Before(Error::NotFound))
+    ));
+    assert!(wire.is_empty());
+    let (result, wire) = download(raw, &wrong, false);
+    assert!(matches!(
+        result,
+        Err(td_mta::https_download::Failure::Before(Error::Forbidden))
+    ));
+    assert!(wire.is_empty());
+    assert!(download(raw, password, true).0.is_err());
+    download(raw, password, false).0.unwrap();
+    // One held read leaves only one slot: refuse before opening either of the
+    // download's two connections, then release its partial reservation.
+    let held = td_mta::postgres_read::Snapshot::open_resolved(
+        &slots,
+        &loaded,
+        service.executable,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    let (result, wire) = download(raw, password, false);
+    assert!(matches!(
+        result,
+        Err(td_mta::https_download::Failure::Before(Error::Busy))
+    ));
+    assert!(wire.is_empty());
+    drop(held);
+    download(raw, password, false).0.unwrap();
 }
 
 fn exercise_resolved_read(

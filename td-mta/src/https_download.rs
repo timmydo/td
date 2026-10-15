@@ -67,6 +67,9 @@ impl Target {
         out.media_len = media.len();
         Ok(out)
     }
+    pub(crate) fn blob(&self) -> BlobId {
+        self.blob
+    }
     pub fn account(&self) -> AccountId {
         self.account
     }
@@ -113,73 +116,15 @@ pub(crate) fn send<P: BlobAuthorization>(
             deadline: request.deadline,
         },
         |body, work| {
-            sender.check()?;
-            sender.deadline = timers::deadline(
+            send_verified(
+                body,
+                work,
+                target,
+                settings.limits,
                 started_at,
-                timeouts
-                    .http_exchange_seconds(0, body.len())
-                    .map_err(|_| Error::Invalid)?,
+                request.deadline,
+                &mut sender,
             )
-            .map_err(|_| Error::Invalid)?
-            .min(request.deadline);
-            let decoded = match target.part {
-                Some(locator) => Some(part::prepare(
-                    body,
-                    locator,
-                    settings.limits,
-                    work,
-                    clock,
-                    &mut sender,
-                )?),
-                None => None,
-            };
-            let length = decoded.as_ref().map_or(body.len(), |part| part.length);
-            sender.check()?;
-            sender.idle = timers::deadline(sender.last, timeouts.limits().response_idle_seconds)
-                .map_err(|_| Error::Invalid)?
-                .min(sender.deadline);
-            let mut buffer = [0; QUANTUM];
-            let mut header = TextBuffer::new(&mut buffer);
-            let media =
-                std::str::from_utf8(target.media.get(..target.media_len).ok_or(Error::Invalid)?)
-                    .map_err(|_| Error::Invalid)?;
-            header
-                .format(format_args!(
-                    concat!(
-                        "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\n",
-                        "Content-Length: {}\r\nContent-Type: {}\r\n",
-                        "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
-                        "Content-Disposition: attachment; filename*=UTF-8''"
-                    ),
-                    crate::https::http_date(clock.sample()?.utc_ms)?,
-                    length,
-                    media
-                ))
-                .map_err(|_| Error::Capacity)?;
-            for byte in target.name.get(..target.name_len).ok_or(Error::Invalid)? {
-                header
-                    .format(format_args!("%{byte:02X}"))
-                    .map_err(|_| Error::Capacity)?;
-            }
-            header.append("\r\n\r\n").map_err(|_| Error::Capacity)?;
-            let length = header.len();
-            sender.write(buffer.get(..length).ok_or(Error::Invalid)?)?;
-            if let Some(part) = decoded {
-                part::send(body, part, work, clock, &mut sender, &mut buffer)?;
-                return sender.flush();
-            }
-            let mut offset = 0u64;
-            while offset < body.len() {
-                sender.check()?;
-                let count = body.read_at(offset, &mut buffer)?;
-                if count == 0 || count > buffer.len() || count as u64 > body.len() - offset {
-                    return Err(Error::Corrupt);
-                }
-                sender.write(buffer.get(..count).ok_or(Error::Invalid)?)?;
-                offset = offset.checked_add(count as u64).ok_or(Error::Corrupt)?;
-                buffer.get_mut(..count).ok_or(Error::Invalid)?.fill(0);
-            }
-            sender.flush()
         },
     );
     result.map_err(|error| {
@@ -189,6 +134,79 @@ pub(crate) fn send<P: BlobAuthorization>(
             Failure::Before(error)
         }
     })
+}
+
+/// The caller owns verified custody, fresh authorization and the original work.
+pub(crate) fn send_verified(
+    body: &mut crate::store_fs::PinnedBlob<'_, '_>,
+    work: &mut crate::admission::work::Meter,
+    target: &Target,
+    limits: &crate::limits::Limits,
+    started_at: crate::ports::Tick,
+    deadline: Deadline,
+    sender: &mut Sender<'_>,
+) -> Result<(), Error> {
+    let clock = sender.clock;
+    let timeouts = sender.timeouts;
+    sender.check()?;
+    sender.deadline = timers::deadline(
+        started_at,
+        timeouts
+            .http_exchange_seconds(0, body.len())
+            .map_err(|_| Error::Invalid)?,
+    )
+    .map_err(|_| Error::Invalid)?
+    .min(deadline);
+    let decoded = match target.part {
+        Some(locator) => Some(part::prepare(body, locator, limits, work, clock, sender)?),
+        None => None,
+    };
+    let length = decoded.as_ref().map_or(body.len(), |part| part.length);
+    sender.check()?;
+    sender.idle = timers::deadline(sender.last, timeouts.limits().response_idle_seconds)
+        .map_err(|_| Error::Invalid)?
+        .min(sender.deadline);
+    let mut buffer = [0; QUANTUM];
+    let mut header = TextBuffer::new(&mut buffer);
+    let media = std::str::from_utf8(target.media.get(..target.media_len).ok_or(Error::Invalid)?)
+        .map_err(|_| Error::Invalid)?;
+    header
+        .format(format_args!(
+            concat!(
+                "HTTP/1.1 200 OK\r\nDate: {}\r\nConnection: close\r\n",
+                "Content-Length: {}\r\nContent-Type: {}\r\n",
+                "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
+                "Content-Disposition: attachment; filename*=UTF-8''"
+            ),
+            crate::https::http_date(clock.sample()?.utc_ms)?,
+            length,
+            media
+        ))
+        .map_err(|_| Error::Capacity)?;
+    for byte in target.name.get(..target.name_len).ok_or(Error::Invalid)? {
+        header
+            .format(format_args!("%{byte:02X}"))
+            .map_err(|_| Error::Capacity)?;
+    }
+    header.append("\r\n\r\n").map_err(|_| Error::Capacity)?;
+    let length = header.len();
+    sender.write(buffer.get(..length).ok_or(Error::Invalid)?)?;
+    if let Some(part) = decoded {
+        part::send(body, part, work, clock, sender, &mut buffer)?;
+        return sender.flush();
+    }
+    let mut offset = 0u64;
+    while offset < body.len() {
+        sender.check()?;
+        let count = body.read_at(offset, &mut buffer)?;
+        if count == 0 || count > buffer.len() || count as u64 > body.len() - offset {
+            return Err(Error::Corrupt);
+        }
+        sender.write(buffer.get(..count).ok_or(Error::Invalid)?)?;
+        offset = offset.checked_add(count as u64).ok_or(Error::Corrupt)?;
+        buffer.get_mut(..count).ok_or(Error::Invalid)?.fill(0);
+    }
+    sender.flush()
 }
 
 #[cfg(test)]
