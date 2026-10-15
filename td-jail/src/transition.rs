@@ -425,6 +425,7 @@ pub enum Stage2Action {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Workspace {
     development: bool,
+    persistent: bool,
     programs: Vec<String>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -2189,6 +2190,7 @@ fn prepare_base_mounts(
     identity: Identity,
     terminal: bool,
     executable_scratch: bool,
+    persistent: bool,
 ) -> io::Result<String> {
     let dev = format!("{NEW_ROOT}/dev");
     mount_tmpfs(&dev, sys::MS_NOSUID | sys::MS_NOEXEC, "mode=0755")?;
@@ -2203,11 +2205,13 @@ fn prepare_base_mounts(
         mount_bind_read_only(&format!("/dev/{name}"), &target)?;
     }
 
-    mount_tmpfs(
-        &format!("{dev}/shm"),
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
-        "mode=1777,size=536870912",
-    )?;
+    if !persistent {
+        mount_tmpfs(
+            &format!("{dev}/shm"),
+            sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC,
+            "mode=1777,size=536870912",
+        )?;
+    }
     let devpts = cstring("devpts")?;
     let pts = cstring(&format!("{dev}/pts"))?;
     let pts_data = cstring(&format!(
@@ -2229,21 +2233,23 @@ fn prepare_base_mounts(
     symlink("/proc/self/fd/1", format!("{dev}/stdout"))?;
     symlink("/proc/self/fd/2", format!("{dev}/stderr"))?;
 
-    let scratch = if executable_scratch {
-        sys::MS_NOSUID | sys::MS_NODEV
-    } else {
-        sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC
-    };
-    mount_tmpfs(
-        &format!("{NEW_ROOT}/tmp"),
-        scratch,
-        "mode=1777,size=268435456",
-    )?;
-    mount_tmpfs(
-        &format!("{NEW_ROOT}/var/tmp"),
-        scratch,
-        "mode=1777,size=268435456",
-    )?;
+    if !persistent {
+        let scratch = if executable_scratch {
+            sys::MS_NOSUID | sys::MS_NODEV
+        } else {
+            sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC
+        };
+        mount_tmpfs(
+            &format!("{NEW_ROOT}/tmp"),
+            scratch,
+            "mode=1777,size=268435456",
+        )?;
+        mount_tmpfs(
+            &format!("{NEW_ROOT}/var/tmp"),
+            scratch,
+            "mode=1777,size=268435456",
+        )?;
+    }
     Ok(dev)
 }
 
@@ -2288,7 +2294,7 @@ fn prepare_mount_plan(
     }
 
     let terminal = application.is_some_and(|plan| plan.terminal);
-    let dev = prepare_base_mounts(identity, terminal, false)?;
+    let dev = prepare_base_mounts(identity, terminal, false, false)?;
     if let Some(application) = application {
         if let Some(probe) = &application.firefox_seccomp_probe {
             create_dir(&format!("{NEW_ROOT}/opt"), 0o555)?;
@@ -3430,6 +3436,7 @@ fn require_base_plan(
     token: &[u8; TOKEN_LEN],
     terminal: bool,
     executable_scratch: bool,
+    persistent: bool,
 ) -> io::Result<String> {
     require_mode("/", 0o755)?;
     require_mode("/dev", 0o755)?;
@@ -3481,18 +3488,37 @@ fn require_base_plan(
         (&["rw", "nosuid", "nodev", "noexec"], &["ro"])
     };
     for path in ["/tmp", "/var/tmp"] {
-        require_mount(&mountinfo, path, Some("tmpfs"), scratch, not_scratch)?;
-        require_mount_super_option(&mountinfo, path, "size=262144k")?;
+        require_mount(
+            &mountinfo,
+            path,
+            if persistent { None } else { Some("tmpfs") },
+            scratch,
+            not_scratch,
+        )?;
+        if !persistent {
+            require_mount_super_option(&mountinfo, path, "size=262144k")?;
+        }
         require_writable_directory(path, token)?;
     }
     require_mount(
         &mountinfo,
         "/dev/shm",
-        Some("tmpfs"),
+        if persistent { None } else { Some("tmpfs") },
         &["rw", "nosuid", "nodev", "noexec"],
         &["ro"],
     )?;
-    require_mount_super_option(&mountinfo, "/dev/shm", "size=524288k")?;
+    if !persistent {
+        require_mount_super_option(&mountinfo, "/dev/shm", "size=524288k")?;
+    } else {
+        require_mount(
+            &mountinfo,
+            "/run",
+            None,
+            &["rw", "nosuid", "nodev"],
+            &["ro", "noexec"],
+        )?;
+        require_writable_directory("/run", token)?;
+    }
     require_mount(
         &mountinfo,
         "/dev/pts",
@@ -3551,7 +3577,7 @@ fn require_mount_plan(
             )));
         }
     }
-    let mountinfo = require_base_plan(token, terminal, false)?;
+    let mountinfo = require_base_plan(token, terminal, false, false)?;
 
     if application {
         let filesystems = filesystems.unwrap_or_default();
@@ -6563,6 +6589,11 @@ fn stage2_workspace_arguments(
         } else {
             "confined"
         }),
+        OsString::from(if plan.scratch.is_empty() {
+            "ephemeral"
+        } else {
+            "persistent"
+        }),
         OsString::from(STAGE2_PROGRAMS_ARG),
         OsString::from(plan.programs.len().to_string()),
     ];
@@ -6645,6 +6676,11 @@ where
     let development = match args.next().as_deref().and_then(OsStr::to_str) {
         Some("development") => true,
         Some("confined") => false,
+        _ => return Err(usage_error()),
+    };
+    let persistent = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some("persistent") if development => true,
+        Some("ephemeral") => false,
         _ => return Err(usage_error()),
     };
     expect(STAGE2_PROGRAMS_ARG, args)?;
@@ -6786,6 +6822,7 @@ where
     expect(STAGE2_ARGUMENTS_ARG, args)?;
     let plan = Stage2Workspace {
         development,
+        persistent,
         programs,
         aliases,
         path,
@@ -6814,6 +6851,29 @@ where
 /// trees and selective `/etc`, the programs, the home, the worktrees, the
 /// shared directories, the repositories, and the git chain over them in
 /// its order, each link after the one it lies on.
+fn refresh_workspace_run_link(target: &Path, resolved: &Path) -> io::Result<()> {
+    match fs::read_link(target) {
+        Ok(existing) if existing == resolved => return Ok(()),
+        Ok(_) => match fs::remove_file(target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match symlink(resolved, target) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                && fs::read_link(target).is_ok_and(|current| current == resolved) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io::Result<()> {
     let root = cstring("/")?;
     sys::mount(None, &root, None, sys::MS_REC | sys::MS_PRIVATE, None)
@@ -6839,6 +6899,19 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     }
     create_dir(&format!("{NEW_ROOT}/var/tmp"), 0o1777)?;
     create_dir(&format!("{NEW_ROOT}/opt/workspace"), 0o755)?;
+    create_dir(&format!("{NEW_ROOT}{}", workspace::PROGRAM_DIR), 0o755)?;
+    create_dir(&format!("{NEW_ROOT}{}", workspace::ALIAS_DIR), 0o755)?;
+    for alias in &plan.aliases {
+        workspace::admit_alias(alias)?;
+        symlink(
+            &alias.source,
+            format!("{NEW_ROOT}{}/{}", workspace::ALIAS_DIR, alias.name),
+        )?;
+    }
+    let dev = prepare_base_mounts(identity, false, true, !plan.scratch.is_empty())?;
+    for grant in &plan.scratch {
+        mount_grant(grant, grant.target != Path::new("/dev/shm"))?;
+    }
     // Each to where the host's link resolves, when that lies in a system
     // tree the plan binds; a chain through an unbound tree, such as Guix's
     // `/var/guix/profiles`, would otherwise dangle.
@@ -6853,19 +6926,10 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
             continue;
         };
         if in_system_tree(&resolved) {
-            symlink(&resolved, format!("{NEW_ROOT}/run/{name}"))?;
+            let target = format!("{NEW_ROOT}/run/{name}");
+            refresh_workspace_run_link(Path::new(&target), &resolved)?;
         }
     }
-    create_dir(&format!("{NEW_ROOT}{}", workspace::PROGRAM_DIR), 0o755)?;
-    create_dir(&format!("{NEW_ROOT}{}", workspace::ALIAS_DIR), 0o755)?;
-    for alias in &plan.aliases {
-        workspace::admit_alias(alias)?;
-        symlink(
-            &alias.source,
-            format!("{NEW_ROOT}{}/{}", workspace::ALIAS_DIR, alias.name),
-        )?;
-    }
-    let dev = prepare_base_mounts(identity, false, true)?;
     for name in workspace::SYSTEM_TREES {
         bind_system_tree(name)?;
     }
@@ -6880,7 +6944,7 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
     for program in &plan.programs {
         mount_workspace_program(program)?;
     }
-    mount_grant(&plan.home, false)?;
+    mount_grant(&plan.home, plan.development)?;
     for tree in &plan.worktrees {
         mount_grant(tree, true)?;
     }
@@ -7078,7 +7142,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "detached host root remains reachable in the fresh root",
         ));
     }
-    let mountinfo = require_base_plan(token, false, true)?;
+    let mountinfo = require_base_plan(token, false, true, plan.persistent)?;
     // The root holds the fixed trees, the host's system trees and the
     // first component of each admitted directory, and nothing else.
     let mut fixed: BTreeSet<String> = ["dev", "etc", "opt", "proc", "run", "tmp", "var"]
@@ -7140,7 +7204,11 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
             "workspace root binds neither the host's /usr nor its /td directory",
         ));
     }
-    for name in read_dir_names("/run")? {
+    for name in if plan.persistent {
+        BTreeSet::new()
+    } else {
+        read_dir_names("/run")?
+    } {
         if !workspace::RUN_LINKS.contains(&name.as_str())
             || !fs::symlink_metadata(format!("/run/{name}"))?
                 .file_type()
@@ -7222,7 +7290,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
         read_only: false,
         source_kind: FilesystemSourceKind::Directory,
     };
-    require_tree_mount_policy(&mountinfo, &home, false)?;
+    require_tree_mount_policy(&mountinfo, &home, plan.development)?;
     for tree in &plan.worktrees {
         let tree = Stage2Filesystem {
             target: tree.clone(),
@@ -7500,6 +7568,9 @@ fn require_planned_rows(plan: &Stage2Workspace, mountinfo: &str) -> io::Result<(
         .into_iter()
         .map(PathBuf::from)
         .collect();
+    if plan.persistent {
+        planned.push(PathBuf::from("/run"));
+    }
     planned.push(PathBuf::from(workspace::PROGRAM_DIR));
     planned.extend(
         workspace::SYSTEM_TREES
@@ -7586,6 +7657,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persistent_system_link_follows_host_generations() {
+        let owned = td_fs::TempDir::new("system-link").unwrap();
+        let link = owned.path().join("current-system");
+        let log = owned.path().join("log");
+        fs::write(&log, "retained").unwrap();
+        for generation in ["/nix/store/first", "/nix/store/second", "/nix/store/first"] {
+            refresh_workspace_run_link(&link, Path::new(generation)).unwrap();
+            refresh_workspace_run_link(&link, Path::new(generation)).unwrap();
+            assert_eq!(fs::read_link(&link).unwrap(), Path::new(generation));
+            assert_eq!(fs::read_to_string(&log).unwrap(), "retained");
+        }
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "not generated").unwrap();
+        assert!(refresh_workspace_run_link(&link, Path::new("/nix/store/third")).is_err());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "not generated");
+    }
+
+    #[test]
     fn a_chain_link_must_be_mounted_on_the_link_it_lies_in() {
         let link = |path: &str| Stage2Filesystem {
             target: PathBuf::from(path),
@@ -7594,6 +7683,7 @@ mod tests {
         };
         let plan = Stage2Workspace {
             development: false,
+            persistent: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -7644,6 +7734,7 @@ mod tests {
         };
         let plan = WorkspacePlan {
             development: false,
+            scratch: Vec::new(),
             uid: 1000,
             gid: 1000,
             programs: vec![
@@ -7768,11 +7859,11 @@ mod tests {
             "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
-                parse_stage2_workspace(&mut words(&format!("confined {bad}")).into_iter()).is_err(),
+                parse_stage2_workspace(&mut words(&format!("confined ephemeral {bad}")).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good = "confined --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
+        let good = "confined ephemeral --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
     }
     use crate::authority::{

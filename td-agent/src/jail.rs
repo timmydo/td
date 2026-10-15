@@ -162,6 +162,7 @@ impl Programs {
 pub struct Policy {
     /// Host networking for ordinary development; reviews remain isolated.
     pub development: bool,
+    pub scratch: Vec<PathBuf>,
     pub home: PathBuf,
     pub worktrees: Vec<PathBuf>,
     /// Linked worktrees of `repositories`, each with its `.git` bound
@@ -257,6 +258,9 @@ fn spec_text_with_aliases(
         line("path", directory)?;
     }
     line("home", &policy.home)?;
+    for tree in &policy.scratch {
+        line("scratch", tree)?;
+    }
     for tree in &policy.worktrees {
         line("worktree", tree)?;
     }
@@ -859,6 +863,7 @@ mod tests {
     fn the_spec_is_td_jails_ordered_keyfile() {
         let policy = Policy {
             development: false,
+            scratch: Vec::new(),
             home: "/s/jail/a/home".into(),
             worktrees: vec!["/w/a".into(), "/w/b".into()],
             checkouts: vec!["/t/r".into()],

@@ -22,6 +22,13 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
         fs::create_dir(base.join(name))?;
     }
     fs::set_permissions(base.join("home"), fs::Permissions::from_mode(0o700))?;
+    let mut scratch = String::new();
+    for name in ["tmp", "var-tmp", "shm", "run"] {
+        let path = base.join(name);
+        fs::create_dir(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))?;
+        scratch.push_str(&format!("scratch={}\n", path.display()));
+    }
     let secret = base.join("ungranted");
     fs::write(&secret, "host-only")?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -39,7 +46,7 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
     fs::write(
         &spec,
         format!(
-            "format=1\nprofile=development\nentry={}\nhome={}\nworktree={}\n",
+            "format=1\nprofile=development\nentry={}\nhome={}\n{scratch}worktree={}\n",
             fs::canonicalize(std::env::current_exe()?)?.display(),
             base.join("home").display(),
             base.join("tree").display()
@@ -60,12 +67,22 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
             }
         }
     });
+    let reply = run_probe(&spec, "development_probe")?;
+    let served = server.join().map_err(|_| "host listener panicked")?;
+    served?;
+    assert!(reply.contains("development-boundary=passed"), "{reply}");
+    let reply = run_probe(&spec, "persistence_probe")?;
+    assert!(reply.contains("persistent-state=passed"), "{reply}");
+    Ok(())
+}
+
+fn run_probe(spec: &Path, probe: &str) -> Result<String, Box<dyn Error>> {
     let (mut channel, entry) = UnixStream::pair()?;
     channel.set_read_timeout(Some(Duration::from_secs(20)))?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_td-jail"))
         .args(["--workspace", &std::process::id().to_string()])
-        .arg(&spec)
-        .args(["--exact", "development_probe", "--ignored", "--nocapture"])
+        .arg(spec)
+        .args(["--exact", probe, "--ignored", "--nocapture"])
         .stdin(Stdio::from(OwnedFd::from(entry.try_clone()?)))
         .stdout(Stdio::from(OwnedFd::from(entry)))
         .stderr(Stdio::piped())
@@ -76,16 +93,13 @@ fn development_shares_host_network_and_hides_ungranted_files() -> Result<(), Box
         let _ = child.kill();
     }
     let output = child.wait_with_output()?;
-    let served = server.join().map_err(|_| "host listener panicked")?;
     assert!(
         output.status.success(),
         "{reply}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     read?;
-    served?;
-    assert!(reply.contains("development-boundary=passed"), "{reply}");
-    Ok(())
+    Ok(reply)
 }
 
 #[test]
@@ -116,6 +130,36 @@ fn development_probe() -> Result<(), Box<dyn Error>> {
     let (_a, _b) = UnixDatagram::pair()?;
     assert!(fs::metadata("/etc/resolv.conf")?.is_file());
     assert!(fs::write("/etc/resolv.conf", "changed").is_err());
+    for path in ["/tmp", "/var/tmp", "/dev/shm", "/run"] {
+        fs::write(Path::new(path).join("retained"), "first job")?;
+    }
+    let home = std::env::var_os("HOME").ok_or("no home")?;
+    let executable = Path::new(&home).join("probe");
+    fs::copy(std::env::current_exe()?, &executable)?;
+    assert!(Command::new(executable)
+        .args(["--exact", "home_probe", "--ignored"])
+        .status()?
+        .success());
     println!("\ndevelopment-boundary=passed");
     Ok(())
 }
+
+#[test]
+#[ignore = "invoked only by the development jail fixture"]
+fn persistence_probe() -> Result<(), Box<dyn Error>> {
+    if !std::env::current_exe()?.starts_with("/opt/workspace/bin") {
+        return Ok(());
+    }
+    for path in ["/tmp", "/var/tmp", "/dev/shm", "/run"] {
+        assert_eq!(
+            fs::read_to_string(Path::new(path).join("retained"))?,
+            "first job"
+        );
+    }
+    println!("persistent-state=passed");
+    Ok(())
+}
+
+#[test]
+#[ignore = "invoked only by the executable-home probe"]
+fn home_probe() {}

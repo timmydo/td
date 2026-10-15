@@ -2070,8 +2070,13 @@ synthesized files and a compiled allowlist of host entries, bound
 read-only and `noexec`; at most four admitted program files, read-only
 and executable, device and inode checked; and the admitted directories
 at their real paths through the same grant bind and hardening loop,
-`noexec` but for worktrees, which keeps a flag the host set on a row;
-admission refuses a pseudo-filesystem mounted below any of them. Stage
+`noexec` but for worktrees and the development private home, which keeps
+a flag the host set on a row. Development may replace the ephemeral scratch
+mounts with four admitted persistent directory binds at compiled targets
+`/tmp`, `/var/tmp`, `/dev/shm`, `/run`; only `/dev/shm` is noexec. These use
+existing bind operations and identity checks; stage 2 checks mount flags
+and writable directories without requiring tmpfs sizes or empty contents.
+No syscall surface is added. Admission refuses a pseudo-filesystem mounted below any of them. Stage
 2 reads it all back, down to every scaffold directory's names and the
 absence of any unplanned mount, before it clears capabilities, then
 installs the selected profile's filter. For the isolated profile this is

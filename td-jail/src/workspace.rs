@@ -34,6 +34,8 @@ pub(crate) const ALIAS_DIR: &str = "/opt/workspace/path";
 pub(crate) const PATH: &str =
     "/usr/local/bin:/usr/bin:/bin:/run/current-system/profile/bin:/run/current-system/sw/bin";
 pub(crate) const TMPDIR: &str = "/tmp";
+/// Persistent development mounts, ordered as the spec's scratch lines.
+pub(crate) const SCRATCH_TARGETS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run"];
 pub(crate) const LANG: &str = "C.UTF-8";
 pub(crate) const TERM: &str = "dumb";
 /// The host's trees bound read-only and executable, as the host has them:
@@ -165,6 +167,7 @@ impl Program {
 #[derive(Debug)]
 pub(crate) struct WorkspacePlan {
     pub(crate) development: bool,
+    pub(crate) scratch: Vec<FilesystemGrant>,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     /// The first program, which is the entry.
@@ -238,6 +241,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
     development: bool,
+    scratch: Vec<PathBuf>,
     programs: Vec<PathBuf>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -269,6 +273,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         "alias",
         "path",
         "home",
+        "scratch",
         "worktree",
         "checkout",
         "repository",
@@ -320,6 +325,7 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
             "program" => return Err(invalid("workspace spec names a program before its entry")),
             "path" => spec.path.push(path),
             "home" => home = Some(path),
+            "scratch" => spec.scratch.push(path),
             "worktree" => spec.worktrees.push(path),
             "checkout" => spec.checkouts.push(path),
             "repository" => spec.repositories.push(path),
@@ -331,6 +337,13 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         return Err(invalid("workspace spec names no entry"));
     }
     spec.home = home.ok_or_else(|| invalid("workspace spec names no home"))?;
+    if !spec.scratch.is_empty()
+        && (!spec.development || spec.scratch.len() != SCRATCH_TARGETS.len())
+    {
+        return Err(invalid(
+            "persistent scratch needs development and four directories",
+        ));
+    }
     if spec.aliases.len() > crate::host_path::MAX_ALIASES {
         return Err(invalid("workspace spec names more than 64 PATH aliases"));
     }
@@ -566,7 +579,22 @@ fn admit(
     for tree in &spec.write {
         shared.push(admit_directory(tree, false)?);
     }
+    let scratch = spec
+        .scratch
+        .iter()
+        .zip(SCRATCH_TARGETS)
+        .map(|(source, target)| {
+            let mut grant = admit_directory(source, false)?;
+            let metadata = fs::symlink_metadata(source)?;
+            if metadata.uid() != uid || metadata.permissions().mode() & 0o7777 != 0o1777 {
+                return Err(invalid("persistent scratch must be caller-owned mode 1777"));
+            }
+            grant.target = PathBuf::from(target);
+            Ok(grant)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let all: Vec<&FilesystemGrant> = std::iter::once(&home)
+        .chain(scratch.iter())
         .chain(worktrees.iter())
         .chain(repositories.iter())
         .chain(shared.iter())
@@ -666,6 +694,7 @@ fn admit(
     }
     Ok(WorkspacePlan {
         development: spec.development,
+        scratch,
         uid,
         gid,
         programs,
@@ -1106,6 +1135,20 @@ mod tests {
     }
 
     #[test]
+    fn persistent_scratch_requires_development_and_all_four_sources() {
+        let scratch = "scratch=/a\nscratch=/b\nscratch=/c\nscratch=/d\n";
+        assert!(parse_spec(&format!("format=1\nentry=/e\nhome=/h\n{scratch}")).is_err());
+        assert!(
+            parse_spec("format=1\nprofile=development\nentry=/e\nhome=/h\nscratch=/a\n").is_err()
+        );
+        let spec = parse_spec(&format!(
+            "format=1\nprofile=development\nentry=/e\nhome=/h\n{scratch}"
+        ))
+        .unwrap();
+        assert_eq!(spec.scratch.len(), 4);
+    }
+
+    #[test]
     fn development_profile_is_explicit_and_cannot_be_repeated_or_reordered() {
         assert!(
             !parse_spec("format=1\nentry=/a\nhome=/h\n")
@@ -1277,6 +1320,7 @@ mod tests {
         let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
             development: false,
+            scratch: Vec::new(),
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
             aliases: Vec::new(),
             path: Vec::new(),

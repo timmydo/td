@@ -3665,8 +3665,12 @@ Every instance has:
 - **System:** the system's executable and library trees and a selective
   `/etc`, read-only, and td-agent's own tool host and td-txt, read-only.
   No cgroupfs, no `/sys`.
-- **Home:** the workspace's private `HOME` and a private `/tmp`, under the
-  jail directory. The caller's home is absent except through the
+- **Home and runtime:** the conversation's private executable `HOME` and
+  persistent `/tmp`, `/var/tmp`, `/dev/shm` and `/run`, backed by private
+  directories under its jail directory. Jobs mount the same backing paths;
+  their exit reaps processes without deleting caches, sockets or logs.
+  `/dev/shm` stays noexec. These are disk-backed, with no tmpfs size cap.
+  Removing the conversation removes this state; reopening retains it. The caller's home is absent except through the
   worktrees and shared directories, so `~/.ssh`, keyrings and the agent's
   own state are invisible, not merely unwritable.
 - **Network:** ordinary development shares host networking (§10). Review and
@@ -3987,7 +3991,7 @@ signal, checked against its parent as stage 1's is, ends the instance
 with its launcher, so td-agent starts td-jail from the conversation
 process's main thread. `/tmp` and `/var/tmp` are fresh, private and
 executable, since worktrees are executable anyway and test suites run
-scripts they write to `TMPDIR`; the home is `noexec`. The kind refuses
+scripts they write to `TMPDIR`; development's private home is executable. The kind refuses
 every overlap between its directories; the git chain's nesting is not
 an overlap of directories but mounts td-jail derives from a repository's
 fixed names (As built (increment 11, the chain), below). td-agent's own
@@ -5661,7 +5665,7 @@ and reaches is what the model's own commands could. Its program is
 whatever the jail can run: one the jail's `PATH` finds or one a worktree
 or shared directory holds, never a td artifact and never outside the
 jail. Package runners that fetch and run code at start (`npx`, `uvx`)
-fail under the jail's `noexec` home (§8) until the executable-home increment (§8). The template is the
+can use the executable private home and persistent caches (§8). The template is the
 person's standing decision to run `command` there, as `system` is the
 person's decision to give the system view: no card asks at a start. What
 the program runs is workspace content the model can change, so a server

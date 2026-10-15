@@ -1508,8 +1508,27 @@ pub fn policy(
         }
         _ => None,
     };
+    let runtime = made("runtime")?;
+    let scratch = ["tmp", "var-tmp", "shm", "run"]
+        .iter()
+        .map(|name| {
+            let path = runtime.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(format!("{} is not a runtime directory", path.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&path).map_err(|e| e.to_string())?;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o1777))
+                        .map_err(|e| e.to_string())?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let policy = Policy {
         development: true,
+        scratch,
         home: made("home")?,
         worktrees,
         checkouts,

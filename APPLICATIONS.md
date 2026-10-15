@@ -3567,7 +3567,18 @@ sockets and datagram pairs. It binds the canonical regular-file target of
 `/etc/resolv.conf` read-only (at most 64 KiB); a missing or invalid resolver
 refuses launch. Host-local services and sockets are intentionally reachable;
 the filesystem grants do not constrain the authority those services expose.
-The stage-2 protocol carries the exact development/confined profile word.
+The stage-2 protocol carries the exact development/confined profile word
+and persistent/ephemeral scratch word. Only development may request persistent
+scratch: exactly four `scratch` source lines after `home`, mapped in order
+to `/tmp`, `/var/tmp`, `/dev/shm` and `/run`. Sources pass the same directory,
+overlap, mount-identity and pseudo-filesystem admission as other grants and
+must be caller-owned mode 1777 directories. The harness keeps their parent
+private and outside all grants. They replace the fresh tmpfs scratch mounts;
+there is no tmpfs capacity claim for their disk-backed contents. `/dev/shm`
+remains noexec; the other scratch paths permit execution. Stage 2 validates
+flags and writability, allowing existing files. The optional host system
+link in `/run` is created if absent and refreshed when the host generation
+changes; an existing nonsymlink is refused. Unrelated runtime files remain.
 
 `entry` and `home` appear once; `program` (with `entry`, at most four)
 and `alias` (at most 64) and `path` (at most 16) repeat, as do `worktree`, `checkout`,
@@ -3640,21 +3651,24 @@ with the kind's own departures:
   repository, a plain `worktree` holding a `.git` is refused: a git
   worktree is a `checkout`, whose `.git` is protected.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
-  shared directories are `noexec`; worktrees are not, because the
+  shared directories are `noexec` in the isolated profile; development's
+  private home is executable, while shared directories remain noexec.
+  Worktrees are executable, because the
   agent's shell runs what it builds there. `read` directories are
   read-only. The hardening loop keeps a flag the host already set on a
   row, read-only and `noexec` included, so a grant is never wider than
   its source.
 
 The rest of the plan is fixed. The base trees are an application's:
-`/dev`, procfs, devpts, `/dev/shm`, and fresh `/tmp` and `/var/tmp`,
-which here are executable, since a worktree is anyway. The host's
+`/dev`, procfs, devpts, `/dev/shm`, and fresh `/tmp` and `/var/tmp`
+unless persistent scratch was requested as above. `/tmp` and `/var/tmp`
+are executable, since a worktree is anyway. The host's
 `/bin`, `/gnu`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/nix`, `/sbin`,
 `/td` and `/usr` are bound recursively read-only, `nosuid,nodev`,
 executable, or recreated as the same link, and are absent where the host
 lacks them; a `/usr` or a `/td` directory is required, where the host's
 programs are (td has no `/usr`, and its `/bin` and `/etc` links resolve
-into `/td/store`). `/run` holds only a store-based host's
+into `/td/store`). Without persistent scratch, `/run` holds only a store-based host's
 `current-system` link, to its resolved target when that lies in a bound
 tree. `/etc` is a tmpfs holding synthesized account, group, host,
 hostname and NSS files, the account the caller's identity with the
@@ -3663,7 +3677,7 @@ pointing where it resolves when that is in a bound tree (the dynamic
 loader's cache and configuration, certificates, `gitconfig`,
 `localtime`, `os-release`, `terminfo` and similar), bound read-only and
 `noexec`. There is no `/home` but the admitted directories, no `/sys`,
-no cgroupfs, and no Wayland, bus, audio, fetch, tty or runtime
+no cgroupfs, and no host Wayland, bus, audio, fetch, tty or runtime
 directory. Stage 2 reads all of it back before confinement: the exact
 names of the root, of every directory between it and an admitted tree,
 and of `/run`, `/etc` and `/opt/workspace`; every program's flags; every
