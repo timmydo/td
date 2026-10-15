@@ -125,6 +125,7 @@ pub mod postgres_http_drafts;
 pub mod postgres_http_mailboxes;
 pub mod postgres_http_submissions;
 pub mod postgres_http_updates;
+pub mod postgres_http_uploads;
 pub mod postgres_input;
 pub mod postgres_mailboxes;
 pub mod postgres_materials;

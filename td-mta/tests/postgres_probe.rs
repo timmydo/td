@@ -284,7 +284,7 @@ fn create_runtime_login(fixture: &Fixture) {
 }
 
 fn grant_runtime_mail(fixture: &Fixture) {
-    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime");
+    sql(fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime; GRANT INSERT ON td_mta.leases TO mail_runtime");
 }
 
 fn hold_schema_lock(fixture: &Fixture, shared: bool) -> ProbeChild {
@@ -710,6 +710,21 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
             access::Error::Privileges,
         ),
         (
+            "REVOKE INSERT ON td_mta.leases FROM mail_runtime",
+            "GRANT INSERT ON td_mta.leases TO mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "GRANT UPDATE(expires_at) ON td_mta.leases TO mail_runtime",
+            "REVOKE UPDATE(expires_at) ON td_mta.leases FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "GRANT DELETE ON td_mta.leases TO mail_runtime",
+            "REVOKE DELETE ON td_mta.leases FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
             "GRANT TRUNCATE ON td_mta.emails TO mail_runtime",
             "REVOKE TRUNCATE ON td_mta.emails FROM mail_runtime",
             access::Error::Privileges,
@@ -789,6 +804,8 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
         "CREATE TABLE td_mta.forbidden(id integer)",
         "DELETE FROM td_mta.schema_migrations",
+        "UPDATE td_mta.leases SET expires_at=expires_at",
+        "DELETE FROM td_mta.leases",
     ] {
         execute(statement, false);
     }
@@ -2197,7 +2214,14 @@ fn real_postgres_td_mail_sends_plain_text() {
     exercise_configuration(ConfigurationExercise::SendClient);
 }
 
+#[test]
+#[ignore = "real PostgreSQL 17 installation required"]
+fn real_postgres_http_upload_owner_retains_and_settles() {
+    exercise_configuration(ConfigurationExercise::HttpUploads);
+}
+
 enum ConfigurationExercise {
+    HttpUploads,
     HttpDrafts,
     Client,
     SendClient,
@@ -2806,6 +2830,7 @@ per_peer_limit = 1
         ConfigurationExercise::Flags
             | ConfigurationExercise::Read
             | ConfigurationExercise::HttpDrafts
+            | ConfigurationExercise::HttpUploads
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -2885,6 +2910,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Flags => {
                     exercise_flags(&fixture, profile_request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::HttpUploads => {
+                    exercise_http_upload_owner(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
@@ -10608,4 +10636,165 @@ fn exercise_submission_set_dispatch(
         drop(completed);
         assert_eq!(owner.used().unwrap(), 0);
     }
+}
+
+fn exercise_http_upload_owner(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline, Error},
+        postgres_devices as devices, postgres_http_uploads as owner,
+        postgres_read::{ReadSlots, Snapshot},
+        postgres_uploads as changes,
+    };
+    let creation =
+        devices::prepare_creation(binding.epoch(), binding.account(), "upload owner", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let clock = RuntimeClock::new();
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let meter = || {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes: 1024 * 1024,
+                output_bytes: 1024,
+                records: 4096,
+                ..Charge::default()
+            },
+        )
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let settlement = ReadSlots::new(1).unwrap();
+    let pending = owner::Pending::default();
+    let worker = owner::Uploads {
+        loaded: &loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &pending,
+        password: creation.password(),
+    };
+    let input = |ms| owner::Input {
+        account: binding.account(),
+        device: creation.device_id(),
+        bytes: b"bounded uploaded bytes",
+        deadline: until(ms),
+    };
+    let mut exhausted = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        worker.create(input(10_000), &mut exhausted),
+        Err(owner::Error::Admission(Error::Capacity))
+    );
+    assert!(exhausted.stopped().is_some());
+    assert_eq!(pending.operation().unwrap(), None);
+    let first = worker.create(input(10_000), &mut meter()).unwrap();
+    assert_eq!(first.length, b"bounded uploaded bytes".len() as u64);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "1"
+    );
+    sql(fixture, "CREATE FUNCTION public.reject_owned_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject upload'; END $$; CREATE TRIGGER reject_owned_upload BEFORE INSERT ON td_mta.upload_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_owned_upload()");
+    assert_eq!(
+        worker.create(input(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Database))
+    );
+    assert_eq!(pending.operation().unwrap(), None);
+    sql(fixture, "DROP TRIGGER reject_owned_upload ON td_mta.upload_receipts; CREATE FUNCTION public.delay_owned_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_owned_upload()");
+    assert_eq!(
+        worker.create(input(3000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    let operation = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.create(input(10_000), &mut meter()),
+        Err(owner::Error::Admission(Error::Busy))
+    );
+    assert_eq!(pending.operation().unwrap(), Some(operation));
+    thread::sleep(Duration::from_secs(5));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_owned_upload ON td_mta.upload_receipts",
+    );
+    let mut connection = loaded
+        .bootstrap
+        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    connection.mode = td_mta::postgres_probe::Mode::Runtime;
+    let foreground = Snapshot::open_runtime(
+        &slots,
+        &connection,
+        &loaded.trust,
+        deadline(),
+        binding,
+        creation.password(),
+    )
+    .unwrap();
+    let settled = pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(settled.outcome.length, first.length);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "2"
+    );
+    drop(foreground);
+    sql(fixture, "CREATE CONSTRAINT TRIGGER reject_owned_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.reject_owned_upload()");
+    assert_eq!(
+        worker.create(input(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Indeterminate))
+    );
+    let absent = pending.operation().unwrap().unwrap();
+    assert!(pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .is_none());
+    assert_eq!(pending.operation().unwrap(), Some(absent));
+    assert_eq!(
+        worker.create(input(10_000), &mut meter()),
+        Err(owner::Error::Admission(Error::Busy))
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER reject_owned_upload ON td_mta.upload_receipts",
+    );
+    let revoked =
+        devices::prepare_revocation(binding.epoch(), binding.account(), creation.device_id(), 2)
+            .unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoked).unwrap();
+    let fresh = owner::Pending::default();
+    let worker = owner::Uploads {
+        pending: &fresh,
+        ..worker
+    };
+    assert_eq!(
+        worker.create(input(10_000), &mut meter()),
+        Err(owner::Error::Publication(changes::Error::Unauthenticated))
+    );
+    assert_eq!(fresh.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
+        "2"
+    );
 }

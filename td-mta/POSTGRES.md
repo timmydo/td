@@ -1997,7 +1997,8 @@ this check; database administrators remain trusted.
 The exact table privilege roster lives in `postgres_runtime_access::TABLES`.
 All current tables require SELECT. Mail data and receipt tables require
 INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
-receipts, bootstrap receipts and reserved import/lease tables are read-only.
+receipts, bootstrap receipts and reserved import tables are read-only.
+Upload leases require SELECT and INSERT only; UPDATE and DELETE refuse.
 The selection singleton permits only column-level UPDATE on `singleton`,
 which allows FOR SHARE policy fencing without changing its generation/version.
 Application tables must be ordinary logged tables without row security.
@@ -2020,6 +2021,7 @@ REVOKE INSERT, UPDATE, DELETE ON
     td_mta.config_selection_receipts, td_mta.account_bootstraps,
     td_mta.leases, td_mta.imports FROM td_mta_runtime;
 GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
+GRANT INSERT ON td_mta.leases TO td_mta_runtime;
 COMMIT;
 ```
 
@@ -2929,3 +2931,26 @@ only shorten the meter's original deadline; no database work or new allowance
 is introduced. The cold convenience wrapper constructs its bounded meter and
 uses the same implementation. Memory/concurrency admission, HTTPS upload
 receipt ownership and production activation remain separate work.
+
+
+## 101. Fixed-worker upload ownership
+
+The inert `postgres_http_uploads` owner publishes completed, caller-admitted
+upload bytes under the original meter and deadline. One process-lifetime
+pending owner excludes concurrent preparation and retains at most one bounded
+immutable body on uncertain COMMIT. Publication rechecks current device and
+profile policy. Known outcomes release the owner; uncertainty keeps the exact
+operation and refuses another upload. No password survives the call.
+
+Receipt settlement uses fresh runtime-qualified connections and separate
+connection capacity. A confirmed receipt releases the fence and returns the
+original operation/outcome. Absence, timeout or connection failure preserves
+it; settlement does not replay or authorize publication. The runtime caller
+still owns ingress memory, response retention and startup/recovery scheduling.
+No HTTPS upload endpoint or production backend is activated by this owner.
+
+The runtime privilege roster permits INSERT on upload leases for publication,
+beside their existing SELECT permission. UPDATE and DELETE remain refused,
+including column-only UPDATE grants. Provisioning grants must match this
+roster before the runtime connection qualifies; no owner credential fallback
+is used for an upload.

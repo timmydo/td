@@ -46,7 +46,7 @@ const TABLES: &[(&str, Access)] = &[
     ("thread_anchors", Access::Mail),
     ("submissions", Access::Mail),
     ("recipients", Access::Mail),
-    ("leases", Access::Read),
+    ("leases", Access::Insert),
     ("imports", Access::Read),
     ("changes", Access::Mail),
     ("devices", Access::Mail),
@@ -67,6 +67,7 @@ const TABLES: &[(&str, Access)] = &[
 #[derive(Clone, Copy)]
 enum Access {
     Read,
+    Insert,
     Selection,
     Mail,
 }
@@ -93,7 +94,10 @@ const PRIVILEGES: &str = "SELECT c.relname::text,
             WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
             AND a.attname<>'singleton'
             AND pg_catalog.has_column_privilege(c.oid,a.attnum,'UPDATE'))
-        ELSE false END
+        ELSE false END,
+    pg_catalog.has_table_privilege(c.oid,'INSERT')
+        AND NOT pg_catalog.has_any_column_privilege(c.oid,'UPDATE')
+        AND NOT pg_catalog.has_table_privilege(c.oid,'DELETE')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='td_mta' AND c.relkind IN ('r','p','v','m','f','S')
     ORDER BY c.relname LIMIT $1";
@@ -159,6 +163,7 @@ pub(crate) async fn qualify(client: &Client) -> Result<(), Error> {
         }
         let allowed = match access {
             Access::Read => !value(4)?,
+            Access::Insert => value(7)?,
             Access::Selection => value(6)?,
             Access::Mail => value(3)?,
         };
