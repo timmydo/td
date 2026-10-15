@@ -1322,7 +1322,7 @@ cutover work.
 Schema version 8 adds owner-private flag_receipts. The cold postgres_flags
 boundary assigns optional seen/starred values to one existing Email. It is
 not wired to production JMAP. Section 33 adds separate batch entry points;
-mailbox moves remain unimplemented.
+section 43 adds single-destination mailbox replacement.
 Preparation binds an unpredictable operation ID and canonical digest to the
 profile binding, account, device, Email, optional expected sequence and flag
 assignments. The retained object contains no app password.
@@ -1382,8 +1382,8 @@ The closed mutation worker admits 1024 input frames, one MiB total input,
 use this worker. Other workers retain their own bounds;
 SCRAM qualification and the original ten-second maximum deadline are unchanged.
 The finite larger frame count covers the two result sets and protocol overhead.
-Production JMAP dispatch, mailbox moves and serving retention remain cutover
-work; this API is not a public authentication endpoint.
+Production JMAP dispatch and serving retention remain cutover work; this API
+is not a public authentication endpoint.
 
 ## 34. Shared logical quota policy
 
@@ -1651,3 +1651,30 @@ resolved with that same operation. Each account retains at most 1024 receipts;
 expiry/reclamation remains part of cutover work. Folder transactions have a
 one-MiB output ceiling for bounded names and a one-MiB/1024-frame input budget.
 Preparation, publication and replay do not enable PostgreSQL serving.
+
+
+## 43. Atomic Email mailbox replacement
+
+The existing `postgres_flags::Update` now accepts an optional existing
+account mailbox alongside seen/star assignments. A batch replaces each
+successful Email's memberships with that one target. Missing Emails return
+NotFound before destination validation; missing destinations return
+InvalidMailbox and leave that Email's flags and memberships unchanged.
+Already-satisfied moves are no-ops. Removing other memberships while retaining
+an existing target preserves the target membership row and its sequence.
+
+Batch digest domain v2 includes target presence and ID; existing single-Email
+flag preparation is unchanged. The same schema-9 receipt format admits the
+new per-object result byte, validated against the prepared move request.
+No schema migration or production dispatcher change is needed.
+
+The account lock serializes moves, flags and account history. Set-oriented
+queries inspect at most 256 memberships plus an overflow sentinel per moved
+Email, returning only bounded aggregates. At most 256 affected Mailboxes are
+returned across the batch. SQL work remains subject to the original deadline.
+Mailbox history covers removed/added memberships and all previous memberships
+whose unread count changes, deduplicated across Emails. Retained targets need
+no Mailbox history unless seen changes. Changed Emails each get one history
+entry, Thread history is unchanged, and the account advances once. All rows,
+history and the ordered receipt commit together; uncertainty resolves through
+the original operation. Existing mutation-worker wire bounds are unchanged.

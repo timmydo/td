@@ -1923,7 +1923,14 @@ fn real_postgres_folders_publish_names_history_and_retained_outcomes() {
     exercise_configuration(ConfigurationExercise::Folders);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_moves_commit_memberships_flags_history_and_receipts() {
+    exercise_configuration(ConfigurationExercise::Moves);
+}
+
 enum ConfigurationExercise {
+    Moves,
     Folders,
     Threads,
     Query,
@@ -2464,6 +2471,9 @@ per_peer_limit = 1
         assert_eq!(prepared.configuration().roles().bits(), roles);
         if name == "desktop" {
             match exercise {
+                ConfigurationExercise::Moves => {
+                    exercise_moves(&fixture, &request, &trust, prepared.binding())
+                }
                 ConfigurationExercise::Flags => {
                     exercise_flags(&fixture, &request, &trust, prepared.binding())
                 }
@@ -3695,6 +3705,7 @@ fn exercise_flag_batches(
         |change: &flags::Change| flags::publish_batch(request, trust, deadline(), change, password);
     let account = binding.account();
     let update = flags::Update {
+        mailbox: None,
         email,
         seen: None,
         flagged: None,
@@ -3748,6 +3759,7 @@ fn exercise_flag_batches(
     sql(fixture, &format!("BEGIN; INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n+2048),32,'0'),'hex'),'bulk',NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,255) n; INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex') FROM generate_series(1,256) n; INSERT INTO td_mta.memberships SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),CASE WHEN n=256 THEN (SELECT id FROM td_mta.mailboxes WHERE account=decode('{account}','hex') AND role='inbox') ELSE decode(lpad(to_hex(n+2048),32,'0'),'hex') END,decode('0000000000000001','hex') FROM generate_series(1,256) n; COMMIT"));
     let updates: Vec<_> = (1..=256)
         .map(|n| flags::Update {
+            mailbox: None,
             email: EmailId::parse(&format!("{:032x}", n + 1024)).unwrap(),
             seen: Some(true),
             flagged: Some(true),
@@ -5243,6 +5255,294 @@ fn exercise_folders(
     );
     assert_eq!(
         folders::publish(request, trust, deadline(), &mixed, password).unwrap(),
+        result
+    );
+}
+
+fn exercise_moves(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        ids::{EmailId, MailboxId},
+        postgres_devices as devices, postgres_flags as flags,
+    };
+    let account = binding.account();
+    let email = EmailId::from_bytes([0xe1; 16]);
+    let creation = devices::prepare_creation(binding.epoch(), account, "move fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let device = creation.device_id();
+    let password = creation.password();
+    sql(fixture, &format!("BEGIN; INSERT INTO td_mta.blob_ids VALUES(decode('{account}','hex'),decode('{email}','hex')); INSERT INTO td_mta.blobs VALUES(decode('{account}','hex'),decode('{email}','hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,decode('0000000000000001','hex'),0); INSERT INTO td_mta.threads VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('0000000000000001','hex')); INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships SELECT account,decode('{email}','hex'),id,changed FROM td_mta.mailboxes WHERE account=decode('{account}','hex'); COMMIT"));
+    let inbox = MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
+    ))
+    .unwrap();
+    let destination = MailboxId::from_bytes([0xd1; 16]);
+    let absent = MailboxId::from_bytes([0xd2; 16]);
+    sql(fixture, &format!("INSERT INTO td_mta.mailboxes VALUES(decode('{account}','hex'),decode('{destination}','hex'),'Destination',NULL,NULL,0,1,decode('0000000000000001','hex'))"));
+    let update = flags::Update {
+        email,
+        mailbox: Some(destination),
+        seen: Some(true),
+        flagged: Some(true),
+    };
+    let prepare = |updates: &[flags::Update], expected| {
+        flags::prepare_batch(binding, device, updates, expected).unwrap()
+    };
+    let publish =
+        |change: &flags::Change| flags::publish_batch(request, trust, deadline(), change, password);
+    let first = prepare(&[update], Some(1));
+    assert_eq!(
+        flags::inspect_batch(request, trust, deadline(), &first).unwrap(),
+        None
+    );
+    assert_eq!(
+        flags::publish_batch(request, trust, deadline(), &first, b"bad"),
+        Err(flags::Error::Unauthenticated)
+    );
+    let result = publish(&first).unwrap();
+    assert_eq!(
+        result.state,
+        flags::Outcome {
+            old_sequence: 1,
+            new_sequence: 2
+        }
+    );
+    assert_eq!(result.results, [flags::UpdateResult::Updated]);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"
+        ),
+        destination.to_string()
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "2");
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT kind FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex') ORDER BY operation"
+        ),
+        "3\n1\n1"
+    );
+    let listed = td_mta::postgres_mailboxes::list(
+        request,
+        trust,
+        deadline(),
+        binding.epoch(),
+        account,
+        password,
+    )
+    .unwrap();
+    assert_eq!(
+        listed
+            .mailboxes
+            .iter()
+            .find(|m| m.id == inbox)
+            .unwrap()
+            .counts
+            .total_emails,
+        0
+    );
+    assert_eq!(
+        listed
+            .mailboxes
+            .iter()
+            .find(|m| m.id == destination)
+            .unwrap()
+            .counts
+            .unread_emails,
+        0
+    );
+    assert_eq!(
+        publish(&prepare(&[update], Some(2)))
+            .unwrap()
+            .state
+            .new_sequence,
+        2
+    );
+    assert_eq!(
+        publish(&prepare(&[update], Some(1))),
+        Err(flags::Error::State)
+    );
+    let mixed = prepare(
+        &[
+            flags::Update {
+                mailbox: Some(absent),
+                seen: Some(false),
+                flagged: Some(false),
+                ..update
+            },
+            flags::Update {
+                email: EmailId::from_bytes([0xee; 16]),
+                mailbox: Some(absent),
+                ..update
+            },
+        ],
+        Some(2),
+    );
+    let mixed_result = publish(&mixed).unwrap();
+    assert_eq!(mixed_result.state.new_sequence, 2);
+    assert_eq!(
+        mixed_result.results,
+        [
+            flags::UpdateResult::InvalidMailbox,
+            flags::UpdateResult::NotFound
+        ]
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "2");
+    assert_eq!(publish(&mixed).unwrap(), mixed_result);
+    // Moving from two memberships to an already-present target retains its row.
+    sql(fixture, &format!("INSERT INTO td_mta.memberships VALUES(decode('{account}','hex'),decode('{email}','hex'),decode('{inbox}','hex'),decode('0000000000000002','hex'))"));
+    let collapse = publish(&prepare(&[update], Some(2))).unwrap();
+    assert_eq!(collapse.state.new_sequence, 3);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(changed,'hex') FROM td_mta.memberships"
+        ),
+        "0000000000000002"
+    );
+    assert_eq!(sql(fixture, "SELECT kind FROM td_mta.changes WHERE sequence=decode('0000000000000003','hex') ORDER BY operation"), "3\n1");
+    let back = prepare(
+        &[flags::Update {
+            mailbox: Some(inbox),
+            seen: Some(false),
+            ..update
+        }],
+        Some(3),
+    );
+    sql(fixture, "CREATE FUNCTION public.reject_moves() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_moves BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_moves()");
+    assert_eq!(publish(&back), Err(flags::Error::Database));
+    assert_eq!(
+        flags::inspect_batch(request, trust, deadline(), &back).unwrap(),
+        None
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"
+        ),
+        destination.to_string()
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords"), "2");
+    sql(fixture, "DROP TRIGGER reject_moves ON td_mta.flag_receipts; CREATE FUNCTION public.delay_moves() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_catalog.pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_moves AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_moves()");
+    assert_eq!(
+        flags::publish_batch(
+            request,
+            trust,
+            Instant::now() + Duration::from_secs(1),
+            &back,
+            password
+        ),
+        Err(flags::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(fixture, "DROP TRIGGER delay_moves ON td_mta.flag_receipts");
+    assert_eq!(
+        flags::inspect_batch(request, trust, deadline(), &back)
+            .unwrap()
+            .unwrap()
+            .state
+            .new_sequence,
+        4
+    );
+    assert_eq!(publish(&back).unwrap().state.new_sequence, 4);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"
+        ),
+        inbox.to_string()
+    );
+    // Competing expected-state moves publish exactly one operation.
+    let left = prepare(&[update], Some(4));
+    let right = prepare(
+        &[flags::Update {
+            seen: Some(true),
+            mailbox: None,
+            ..update
+        }],
+        Some(4),
+    );
+    let (a, b) = thread::scope(|scope| {
+        let a = scope.spawn(|| publish(&left));
+        let b = scope.spawn(|| publish(&right));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    assert!(matches!(
+        if a.is_err() { a } else { b },
+        Err(flags::Error::State | flags::Error::Database)
+    ));
+    // All 256 updates can replace all 256 memberships without transferring them.
+    sql(fixture, &format!("INSERT INTO td_mta.mailboxes SELECT decode('{account}','hex'),decode(lpad(to_hex(n+2048),32,'0'),'hex'),'bulk',NULL,NULL,0,1,decode('0000000000000001','hex') FROM generate_series(1,254) n; INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),decode('{email}','hex'),decode('{email}','hex'),0,2,decode('0000000000000001','hex') FROM generate_series(1,256) n; INSERT INTO td_mta.memberships SELECT decode('{account}','hex'),decode(lpad(to_hex(n+1024),32,'0'),'hex'),id,changed FROM td_mta.mailboxes CROSS JOIN generate_series(1,256) n WHERE account=decode('{account}','hex')"));
+    let updates: Vec<_> = (1..=256)
+        .map(|n| flags::Update {
+            email: EmailId::parse(&format!("{:032x}", n + 1024)).unwrap(),
+            ..update
+        })
+        .collect();
+    let bulk = prepare(&updates, Some(5));
+    sql(fixture, &format!("INSERT INTO td_mta.mailboxes VALUES(decode('{account}','hex'),decode(repeat('ab',16),'hex'),'overflow',NULL,NULL,0,1,decode('0000000000000001','hex')); INSERT INTO td_mta.memberships VALUES(decode('{account}','hex'),decode(lpad(to_hex(1025),32,'0'),'hex'),decode(repeat('ab',16),'hex'),decode('0000000000000001','hex'))"));
+    assert_eq!(publish(&bulk), Err(flags::Error::Capacity));
+    assert_eq!(
+        flags::inspect_batch(request, trust, deadline(), &bulk).unwrap(),
+        None
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.memberships"),
+        "65538"
+    );
+    sql(fixture, "DELETE FROM td_mta.memberships WHERE mailbox_id=decode(repeat('ab',16),'hex'); DELETE FROM td_mta.mailboxes WHERE id=decode(repeat('ab',16),'hex')");
+    let outcome = flags::publish_batch(
+        request,
+        trust,
+        Instant::now() + Duration::from_secs(10),
+        &bulk,
+        password,
+    )
+    .unwrap();
+    assert_eq!(outcome.results, vec![flags::UpdateResult::Updated; 256]);
+    assert_eq!(outcome.state.new_sequence, 6);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.memberships"),
+        "257"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.changes WHERE sequence=decode('0000000000000006','hex')"
+        ),
+        "512"
+    );
+    // A corrupt future target refuses the complete transaction, even a no-op.
+    sql(fixture, &format!("UPDATE td_mta.mailboxes SET changed=decode('0000000000000007','hex') WHERE id=decode('{destination}','hex')"));
+    assert_eq!(
+        publish(&prepare(&[update], None)),
+        Err(flags::Error::Integrity)
+    );
+    sql(fixture, &format!("UPDATE td_mta.mailboxes SET changed=decode('0000000000000006','hex') WHERE id=decode('{destination}','hex'); UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')"));
+    assert_eq!(
+        publish(&prepare(&[update], None)),
+        Err(flags::Error::Policy)
+    );
+    assert_eq!(publish(&first).unwrap(), result);
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(
+        publish(&prepare(&[update], None)),
+        Err(flags::Error::Unauthenticated)
+    );
+    assert_eq!(
+        flags::publish_batch(request, trust, deadline(), &first, b"bad").unwrap(),
         result
     );
 }
