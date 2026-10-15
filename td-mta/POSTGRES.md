@@ -2360,3 +2360,16 @@ by a fraction of a millisecond, losing the worker's deadline classification
 in a generic driver error. This does not extend the worker allowance: each
 poll still checks the exact original Instant, and phase tightening can only
 shorten it. An unrepresentable transport tick is refused.
+
+## 71. Shared HTTPS API framing
+
+The existing HTTPS API backend now delegates bounded body reception, JSON
+validation, response preflight and final retained-response encoding to a
+shared exchange helper. The backend still reserves storage before body
+reception and supplies the same fresh authorization at the receive boundary
+and before dispatch. All exchange, transfer, idle and execution deadlines
+remain anchored to their existing start points.
+
+This prepares the PostgreSQL HTTP backend to reuse the exact request and
+response path. The helper owns no database authority and selects no backend;
+production service construction remains unchanged pending atomic cutover.

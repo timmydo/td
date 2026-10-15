@@ -13,7 +13,9 @@ use crate::{
     limits::ResourcePlan,
     ports::{Clock, Deadline, Error, IoProgress, Transport},
     smtp_receiving::Control,
-    store_fs::{BlobAuthorization, RequestSpool, ResponseError, StoreCoordinator},
+    store_fs::{
+        BlobAuthorization, RequestSpool, ResponseError, ResponseRetention, StoreCoordinator,
+    },
 };
 use std::{thread, time::Duration};
 use td_json::arena;
@@ -41,7 +43,7 @@ pub struct Service<'s, 'r, 'a, 'sr, 'd, P> {
 }
 
 #[derive(Debug)]
-enum ApiError {
+pub(crate) enum ApiError {
     Request(jmap_request::Error),
     Io(Error),
 }
@@ -162,8 +164,66 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
     Service<'_, '_, '_, '_, '_, P>
 {
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
-        let limits = self.resources.limits();
+        let exchange = Exchange {
+            resources: self.resources,
+            session: self.session,
+            response_maximum: self.response_maximum,
+            timeouts: self.timeouts,
+        };
+        let start = exchange.begin(request, sender)?;
+        let mut retention = self
+            .coordinator
+            .retain_response(self.spool, sender.deadline)
+            .map_err(response_error)?;
+        let (plan, execution) =
+            exchange.receive(request, sender, start, &mut retention, |deadline| {
+                drop(self.policy.authorize_blob(
+                    self.transfers.account(),
+                    request.device,
+                    deadline,
+                )?);
+                Ok(())
+            })?;
         let device = request.device;
+        retention.admit_work_turn()?;
+        drop(
+            self.policy
+                .authorize_blob(self.transfers.account(), device, sender.deadline)?,
+        );
+        let complete = dispatch::run_with_mail_access(
+            plan,
+            retention,
+            execution,
+            self.transfers.account(),
+            device,
+            self.coordinator,
+            Some(self.drafts),
+        )
+        .map_err(|error| {
+            ApiError::Io(match error {
+                dispatch::Error::Storage(error) => error,
+                _ => Error::Capacity,
+            })
+        })?;
+        send_response(complete, sender)
+    }
+}
+
+/// Shared bounded HTTP/JMAP framing. Storage admission and fresh authorization
+/// remain with the backend that owns the response and dispatch snapshot.
+pub(crate) struct Exchange<'a> {
+    pub(crate) resources: &'a ResourcePlan,
+    pub(crate) session: &'a Session,
+    pub(crate) response_maximum: u64,
+    pub(crate) timeouts: &'a TimeoutPlan,
+}
+impl<'a> Exchange<'a> {
+    pub(crate) fn begin(
+        &self,
+        request: &Request<'_>,
+        sender: &mut Sender<'_>,
+    ) -> Result<crate::ports::Tick, ApiError> {
+        let limits = self.resources.limits();
         let start = sender.last;
         sender.deadline = timers::deadline(
             start,
@@ -176,10 +236,17 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
         sender.idle = sender.deadline;
         sender.check()?;
         jmap_request::Request::validate_resources(self.resources).map_err(ApiError::Request)?;
-        let mut retention = self
-            .coordinator
-            .retain_response(self.spool, sender.deadline)
-            .map_err(response_error)?;
+        Ok(start)
+    }
+    pub(crate) fn receive<'c, 's, 'r, 'sr, 'data, P>(
+        &self,
+        request: &Request<'_>,
+        sender: &mut Sender<'_>,
+        start: crate::ports::Tick,
+        retention: &mut ResponseRetention<'c, 's, 'r, 'sr, 'data, P>,
+        authorize: impl FnOnce(Deadline) -> Result<(), Error>,
+    ) -> Result<(response::Plan<'a>, Deadline), ApiError> {
+        let limits = self.resources.limits();
         if retention.maximum() != self.response_maximum {
             return Err(Error::Capacity.into());
         }
@@ -255,11 +322,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
         }
         sender.check()?;
         sender.idle = sender.deadline;
-        drop(self.policy.authorize_blob(
-            self.transfers.account(),
-            request.device,
-            sender.deadline,
-        )?);
+        authorize(sender.deadline)?;
         let execution = timers::deadline(sender.last, self.timeouts.execution_seconds())
             .map_err(|_| Error::Capacity)?
             .min(sender.deadline);
@@ -320,53 +383,41 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
             }
         }
         sender.check()?;
-        retention.admit_work_turn()?;
-        drop(
-            self.policy
-                .authorize_blob(self.transfers.account(), device, sender.deadline)?,
-        );
-        let mut complete = dispatch::run_with_mail_access(
-            plan.finish().map_err(|_| Error::Capacity)?,
-            retention,
-            execution,
-            self.transfers.account(),
-            device,
-            self.coordinator,
-            Some(self.drafts),
-        )
-        .map_err(|error| {
-            ApiError::Io(match error {
-                dispatch::Error::Storage(error) => error,
-                _ => Error::Capacity,
-            })
-        })?;
-        let mut encoder = complete.encoder().map_err(wire_error)?;
-        loop {
-            sender.check()?;
-            if encoder.count_step(&mut output).map_err(wire_error)? {
-                break;
-            }
-        }
-        let length = encoder.begin_output().map_err(wire_error)?;
-        sender.check()?;
-        sender.idle = timers::deadline(sender.last, self.timeouts.limits().response_idle_seconds)
-            .map_err(|_| Error::Capacity)?
-            .min(sender.deadline);
-        headers(sender, 200, "application/json", length)?;
-        loop {
-            sender.check()?;
-            let next = encoder.poll_output(&mut output).map_err(wire_error)?;
-            sender.write(output.get(..next.written).ok_or(Error::Invalid)?)?;
-            if next.complete {
-                break;
-            }
-        }
-        encoder.finish().map_err(wire_error)?;
-        sender.flush()?;
-        drop(complete);
-        Ok(())
+        Ok((plan.finish().map_err(|_| Error::Capacity)?, execution))
     }
 }
+pub(crate) fn send_response<P>(
+    mut complete: dispatch::Completed<'_, '_, '_, '_, '_, '_, P>,
+    sender: &mut Sender<'_>,
+) -> Result<(), ApiError> {
+    let mut output = [0; QUANTUM];
+    let mut encoder = complete.encoder().map_err(wire_error)?;
+    loop {
+        sender.check()?;
+        if encoder.count_step(&mut output).map_err(wire_error)? {
+            break;
+        }
+    }
+    let length = encoder.begin_output().map_err(wire_error)?;
+    sender.check()?;
+    sender.idle = timers::deadline(sender.last, sender.timeouts.limits().response_idle_seconds)
+        .map_err(|_| Error::Capacity)?
+        .min(sender.deadline);
+    headers(sender, 200, "application/json", length)?;
+    loop {
+        sender.check()?;
+        let next = encoder.poll_output(&mut output).map_err(wire_error)?;
+        sender.write(output.get(..next.written).ok_or(Error::Invalid)?)?;
+        if next.complete {
+            break;
+        }
+    }
+    encoder.finish().map_err(wire_error)?;
+    sender.flush()?;
+    drop(complete);
+    Ok(())
+}
+
 fn headers(sender: &mut Sender<'_>, status: u16, media: &str, length: u64) -> Result<(), Error> {
     let mut bytes = [0; 1024];
     let mut out = TextBuffer::new(&mut bytes);
