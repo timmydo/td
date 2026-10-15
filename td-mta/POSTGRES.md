@@ -3085,3 +3085,19 @@ restart custody and atomic backend cutover remain separate work. The runtime
 PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
 including discarded ingress, sticky refusal, generation/clock mismatch,
 single ingress capacity, success, delayed COMMIT and historical settlement.
+
+## 108. Real SMTP worker qualification
+
+The explicit PostgreSQL fixture runs the production SMTP receiving worker and
+prepared PostgreSQL storage adapter together on an ephemeral TCP listener.
+Its database-loaded profile supplies routing, resource limits and retained
+TLS policy. The runtime database role supplies readiness and publication.
+The fixture checks the SMTP greeting, envelope admission, DATA and final
+success reply against durable receiving receipts and Email rows. A known
+database rollback produces 451, preserves the ready worker and permits a
+later successful transaction on that connection. Shutdown discards unfinished
+DATA, joins the workers and leaves no additional message or receipt.
+
+This qualifies the plaintext direct-SMTP transport path in the prepared
+runtime. It does not activate a production PostgreSQL listener, qualify a new
+STARTTLS path or replace the existing native TLS and shutdown fixtures.

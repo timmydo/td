@@ -2226,7 +2226,17 @@ fn real_postgres_smtp_owner_retains_and_settles() {
     exercise_configuration(ConfigurationExercise::ReceivingOwner);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_worker_receives_and_drains() {
+    exercise_configuration(ConfigurationExercise::ReceivingTransport);
+}
+
+#[path = "postgres_probe/smtp_transport.rs"]
+mod smtp_transport;
+
 enum ConfigurationExercise {
+    ReceivingTransport,
     ReceivingOwner,
     HttpUploads,
     HttpDrafts,
@@ -2354,6 +2364,13 @@ certificate = "public"
 session_limit = 1
 per_peer_limit = 1
 "#;
+    let mut smtp_socket = matches!(exercise, ConfigurationExercise::ReceivingTransport)
+        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let cloud = if let Some(socket) = &smtp_socket {
+        cloud.replace("0.0.0.0:25", &socket.local_addr().unwrap().to_string())
+    } else {
+        cloud
+    };
     let cloud_roles = if matches!(exercise, ConfigurationExercise::Submissions) {
         7
     } else {
@@ -2839,6 +2856,7 @@ per_peer_limit = 1
             | ConfigurationExercise::HttpDrafts
             | ConfigurationExercise::HttpUploads
             | ConfigurationExercise::ReceivingOwner
+            | ConfigurationExercise::ReceivingTransport
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -2909,7 +2927,9 @@ per_peer_limit = 1
                 ConfigurationExercise::SubmissionInput => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), false)
                 }
-                ConfigurationExercise::Receiving | ConfigurationExercise::ReceivingOwner => {}
+                ConfigurationExercise::Receiving
+                | ConfigurationExercise::ReceivingOwner
+                | ConfigurationExercise::ReceivingTransport => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -2989,6 +3009,16 @@ per_peer_limit = 1
                 } else {
                     mail_client::Mode::Read(https_socket.take().unwrap())
                 },
+            );
+            return;
+        }
+        if name == "cloud" && matches!(exercise, ConfigurationExercise::ReceivingTransport) {
+            smtp_transport::exercise(
+                &fixture,
+                &binding,
+                &configuration,
+                &active,
+                smtp_socket.take().unwrap(),
             );
             return;
         }
