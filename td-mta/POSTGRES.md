@@ -2349,3 +2349,14 @@ limits and the original snapshot worker budget bound reads, and the shared
 response owner bounds retained JSON. Final snapshot and execution checks
 precede publication. A result reference into the query IDs feeds the same
 snapshot's Email/get without client-visible storage-specific handling.
+
+## 70. Exact worker expiry and transport ticks
+
+The PostgreSQL worker's original Instant deadline remains authoritative
+through connection, qualification and query polling. Its TLS transport uses
+whole-millisecond ticks, so the initial remaining allowance rounds upward
+when deriving that secondary cap. Rounding downward could expire TLS first
+by a fraction of a millisecond, losing the worker's deadline classification
+in a generic driver error. This does not extend the worker allowance: each
+poll still checks the exact original Instant, and phase tightening can only
+shorten it. An unrepresentable transport tick is refused.

@@ -5114,8 +5114,10 @@ fn exercise_http_auth(
         assert_eq!(auth.authenticate(password, until()), Err(Error::Busy));
         assert_eq!(worker.join().unwrap(), Err(Error::Invalid));
     });
-    let short = Deadline::after(clock.sample().unwrap().monotonic, 500).unwrap();
-    assert_eq!(auth.authenticate(password, short), Err(Error::Deadline));
+    for _ in 0..3 {
+        let short = Deadline::after(clock.sample().unwrap().monotonic, 500).unwrap();
+        assert_eq!(auth.authenticate(password, short), Err(Error::Deadline));
+    }
     writeln!(input, "COMMIT;").unwrap();
     drop(input);
     wait_command(&mut blocker);

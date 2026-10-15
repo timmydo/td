@@ -267,7 +267,7 @@ fn connect_worker(
     }
     let clock: Arc<dyn Clock> = Arc::new(RuntimeClock::new());
     let now = clock.sample().map_err(|_| Error::Deadline)?.monotonic;
-    let milliseconds = u64::try_from(allowance.as_millis()).map_err(|_| Error::Invalid)?;
+    let milliseconds = transport_milliseconds(allowance)?;
     let cap = Deadline::after(now, milliseconds).map_err(|_| Error::Invalid)?;
     let tls_clock = Arc::new(ClockHandle::new(TlsClockSource::new(clock.clone())));
     let policy = Arc::new(
@@ -436,6 +436,13 @@ pub(crate) async fn qualify(client: &tokio_postgres::Client) -> Result<Status, E
         }
     }
     status.ok_or(Error::Settings)
+}
+
+// TLS uses whole ticks; the worker's exact Instant remains authoritative.
+// Rounding down can turn sub-millisecond expiry into a generic TLS failure
+// before the worker sees its own deadline.
+fn transport_milliseconds(allowance: Duration) -> Result<u64, Error> {
+    u64::try_from(allowance.as_nanos().div_ceil(1_000_000)).map_err(|_| Error::Invalid)
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, Error> {
@@ -638,6 +645,24 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    #[test]
+    fn transport_tick_never_expires_before_exact_worker_allowance() {
+        for nanos in [
+            1,
+            999_999,
+            1_000_000,
+            1_000_001,
+            499_999_999,
+            500_000_000,
+            9_999_999_999,
+        ] {
+            let exact = Duration::from_nanos(nanos);
+            let rounded = Duration::from_millis(transport_milliseconds(exact).unwrap());
+            assert!(rounded >= exact);
+            assert!(rounded - exact < Duration::from_millis(1));
+        }
+        assert_eq!(transport_milliseconds(Duration::MAX), Err(Error::Invalid));
+    }
     #[test]
     fn socket_activity_distinguishes_progress_from_idle_polling() {
         use std::io::{Read, Write};
