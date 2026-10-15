@@ -123,6 +123,7 @@ pub mod postgres_http_api;
 pub mod postgres_http_auth;
 pub mod postgres_http_drafts;
 pub mod postgres_http_mailboxes;
+pub mod postgres_http_submissions;
 pub mod postgres_http_updates;
 pub mod postgres_input;
 pub mod postgres_mailboxes;

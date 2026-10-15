@@ -8689,6 +8689,7 @@ fn exercise_submission_publication(
         draft.email,
         password,
     );
+    exercise_http_submission_owner(fixture, binding, &input, password);
     let capacity = make();
     sql(fixture,"INSERT INTO td_mta.submission_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),submission_id,blob_id,length,send_at,expires_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.submission_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
     assert_eq!(
@@ -8736,6 +8737,148 @@ fn exercise_submission_publication(
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
     read_outgoing().unwrap();
     exercise_dispatch(fixture, request, trust, relay.binding(), a.submission);
+}
+
+fn exercise_http_submission_owner(
+    fixture: &Fixture,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    input: &td_mta::postgres_submission_input::Prepared,
+    password: &[u8],
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{self, Clock, Deadline},
+        postgres_http_submissions::{self as http, Error},
+        postgres_read::ReadSlots,
+        postgres_submissions as submissions,
+    };
+    create_runtime_login(fixture);
+    grant_runtime_mail(fixture);
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let clock = RuntimeClock::new();
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let meter = || {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes: 1_000_000,
+                records: 100_000,
+                output_bytes: 1_000_000,
+                ..Default::default()
+            },
+        )
+    };
+    let pending = http::Pending::default();
+    let slots = ReadSlots::new(1).unwrap();
+    let settlement = ReadSlots::new(1).unwrap();
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let worker = http::Submissions {
+        loaded: &loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &pending,
+        password,
+    };
+    let request = |ms| http::Input {
+        account: binding.account(),
+        device: input.device(),
+        email: input.source().email,
+        identity: input.identity(),
+        expected: None,
+        deadline: until(ms),
+    };
+    let count = || {
+        sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+            .parse::<u64>()
+            .unwrap()
+    };
+    let before = count();
+    let mut exhausted = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        worker.create(request(10_000), &mut exhausted),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    assert!(exhausted.stopped().is_some());
+    assert_eq!(
+        worker.create(request(0), &mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    let mut wrong = request(10_000);
+    wrong.device = td_mta::ids::DeviceId::from_bytes([0xee; 16]);
+    assert_eq!(
+        worker.create(wrong, &mut meter()),
+        Err(Error::Admission(ports::Error::Forbidden))
+    );
+    assert_eq!(count(), before);
+    let success = worker.create(request(10_000), &mut meter()).unwrap();
+    assert_eq!(count(), before + 1);
+    assert_eq!(success.email, input.source().email);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(sql(fixture,&format!("SELECT submitting_profile||':'||route_name FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')",success.submission)),"desktop:personal-smarthost");
+    sql(fixture, "CREATE TRIGGER refuse_http_submission BEFORE INSERT ON td_mta.submission_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_submission()");
+    assert_eq!(
+        worker.create(request(10_000), &mut meter()),
+        Err(Error::Publication(submissions::Error::Database))
+    );
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(count(), before + 1);
+    sql(fixture, "DROP TRIGGER refuse_http_submission ON td_mta.submission_receipts; CREATE FUNCTION public.delay_http_submission() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_submission AFTER INSERT ON td_mta.submission_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_submission()");
+    assert_eq!(
+        worker.create(request(3000), &mut meter()),
+        Err(Error::Publication(submissions::Error::Indeterminate))
+    );
+    let operation = pending.operation().unwrap().unwrap();
+    assert_eq!(
+        worker.create(request(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert_eq!(pending.operation().unwrap(), Some(operation));
+    thread::sleep(Duration::from_secs(5));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_http_submission ON td_mta.submission_receipts",
+    );
+    let mut connection = loaded
+        .bootstrap
+        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    connection.mode = td_mta::postgres_probe::Mode::Runtime;
+    let foreground = td_mta::postgres_read::Snapshot::open_runtime(
+        &slots,
+        &connection,
+        &loaded.trust,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    let settled = pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(settled.outcome.email, input.source().email);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(count(), before + 2);
+    assert_eq!(sql(fixture,&format!("SELECT encode(submission_id,'hex') FROM td_mta.submission_receipts WHERE operation=decode('{operation}','hex')")), settled.outcome.submission.to_string());
+    drop(foreground);
+    assert!(pending
+        .settle(&loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .is_none());
 }
 
 fn exercise_success_filing(

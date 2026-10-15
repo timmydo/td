@@ -2719,3 +2719,27 @@ consumption of an already-used meter. Its successful result feeds the existing
 concurrent publication, receipt, routing and failure evidence. This preparation
 does not acquire database capacity, publish mail or enable Submission; those
 remain caller obligations, alongside retained-memory admission.
+
+## 89. Fixed-worker submission ownership
+
+The inert postgres_http_submissions adapter admits one active or uncertain
+submission per retained owner. It acquires the owner and foreground connection
+allowance before DNS, source reading or body preparation. Fresh Runtime
+qualification, account/device checks, original request work, and a shared
+absolute deadline cover authenticated preparation and queue publication.
+Transport retries retain the same prepared operation and submitting route;
+other failures do not fall back to another profile.
+
+An uncertain COMMIT retains the exact immutable submission and fences another
+submission. The owner stores no application password. Its settlement method
+uses independent connection capacity and fresh resolution to inspect the
+historical receipt. Confirmed outcomes release the owner; absence and errors
+retain it. One outgoing body is bounded by preparation's 32 MiB cap, alongside
+the temporary verified source during preparation. The HTTP mutation owner
+holds this submission owner separately from drafts and Email mutations.
+
+The local PostgreSQL fixture uses the restricted Runtime login to check
+publication, the submitting route, prepublication budget/device/deadline
+refusals, rollback, delayed COMMIT fencing, and exact receipt settlement while
+foreground capacity is occupied. JMAP dispatch, implicit success filing,
+durable startup ownership and capability activation remain separate work.
