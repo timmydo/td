@@ -5397,6 +5397,123 @@ fn exercise_read_dispatch(
     assert!(!owner.admission_stopped());
 }
 
+fn exercise_resolved_read(
+    fixture: &Fixture,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    password: &[u8],
+) {
+    use td_mta::postgres_read::{Error, ReadSlots, Snapshot};
+    let loaded = |user| td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://{user}:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let loaded_runtime = loaded("mail_runtime");
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let missing = fixture.root.join("missing-td-mta");
+    let slots = ReadSlots::new(1).unwrap();
+    let mut view = Snapshot::open_resolved(
+        &slots,
+        &loaded_runtime,
+        executable,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    assert_eq!(view.identity().account, binding.account());
+    assert!(!view.mailbox_listing().unwrap().is_empty());
+    // Capacity refusal must happen before trying to launch this missing helper.
+    assert_eq!(
+        Snapshot::open_resolved(
+            &slots,
+            &loaded_runtime,
+            &missing,
+            deadline(),
+            binding,
+            password
+        )
+        .err(),
+        Some(Error::Busy)
+    );
+    drop(view);
+    assert_eq!(
+        Snapshot::open_resolved(
+            &slots,
+            &loaded_runtime,
+            &missing,
+            deadline(),
+            binding,
+            password
+        )
+        .err(),
+        Some(Error::Resolution(td_mta::postgres_resolver::Error::Spawn))
+    );
+    assert_eq!(
+        Snapshot::open_resolved(
+            &slots,
+            &loaded_runtime,
+            executable,
+            Instant::now(),
+            binding,
+            password
+        )
+        .err(),
+        Some(Error::Connection(td_mta::postgres_probe::Error::Deadline))
+    );
+    assert_eq!(
+        Snapshot::open_resolved(
+            &slots,
+            &loaded_runtime,
+            &missing,
+            deadline(),
+            binding,
+            b"bad"
+        )
+        .err(),
+        Some(Error::Unauthenticated)
+    );
+    let mut wrong = password.to_vec();
+    let last = wrong.last_mut().unwrap();
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    assert_eq!(
+        Snapshot::open_resolved(
+            &slots,
+            &loaded_runtime,
+            executable,
+            deadline(),
+            binding,
+            &wrong
+        )
+        .err(),
+        Some(Error::Unauthenticated)
+    );
+    let owner = loaded("td_probe");
+    assert_eq!(
+        Snapshot::open_resolved(&slots, &owner, executable, deadline(), binding, password).err(),
+        Some(Error::Connection(
+            td_mta::postgres_probe::Error::RuntimeRole
+        ))
+    );
+    let replacement = Snapshot::open_resolved(
+        &slots,
+        &loaded_runtime,
+        executable,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    drop(replacement);
+}
+
 fn exercise_read(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -5415,6 +5532,7 @@ fn exercise_read(
     devices::publish_creation(request, trust, deadline(), &creation).unwrap();
     let password = creation.password();
     exercise_http_auth(fixture, binding, password, creation.device_id());
+    exercise_resolved_read(fixture, binding, password);
     let mailbox = MailboxId::from_bytes([0x33; 16]);
     sql(fixture,&format!("INSERT INTO td_mta.mailboxes SELECT id,decode('{mailbox}','hex'),'Drafts',NULL,NULL,0,1,sequence FROM td_mta.accounts"));
     let create = |id| {

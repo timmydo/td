@@ -2373,3 +2373,19 @@ remain anchored to their existing start points.
 This prepares the PostgreSQL HTTP backend to reuse the exact request and
 response path. The helper owns no database authority and selects no backend;
 production service construction remains unchanged pending atomic cutover.
+
+## 72. Reserved fresh runtime reads
+
+`Snapshot::open_resolved` reserves a process-local read slot before starting
+DNS, then resolves the protected bootstrap endpoint afresh and forces runtime
+connection qualification. The same slot and original finite allowance cover
+resolution, all attempted addresses, authentication and snapshot ownership.
+Only transport connection failures advance to another resolved address;
+policy, credential, schema and database failures have no fallback.
+
+The selected bootstrap profile must match the prepared binding. Resolution
+has a five-second cap within the original request allowance; the existing
+ten-second worker ceiling can only shorten that allowance. No connection or
+DNS queue is created, and all failed paths release their slot after closing
+owned work. Health and settlement retain independent admission capacity at
+runtime integration. This entry prepares HTTP workers; it activates no role.
