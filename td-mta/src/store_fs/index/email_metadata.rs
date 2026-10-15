@@ -1,26 +1,7 @@
 //! Native stored Email metadata and bounded membership/keyword windows.
 use super::*;
-use crate::ids::{EmailId, ThreadId};
-pub const MAX_EMAIL_VALUES: usize = 256;
-/// Passive snapshot data; no blob-read or response-publication authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EmailMetadata {
-    pub identity: ViewIdentity,
-    pub email: EmailId,
-    pub blob: BlobId,
-    pub thread: ThreadId,
-    pub size: u64,
-    pub received_at: i64,
-}
-/// Ascending, exclusive-after window on one Email in the original snapshot.
-/// Empty values do not prove Email existence; fetch metadata separately.
-#[derive(Debug)]
-pub struct EmailValues<T> {
-    pub identity: ViewIdentity,
-    pub email: EmailId,
-    pub values: Vec<T>,
-    pub has_more: bool,
-}
+pub use crate::email_response::{EmailMetadata, EmailValues, MAX_EMAIL_VALUES};
+use crate::ids::EmailId;
 const MAILBOX_FIRST: &str = "SELECT mailbox_id,changed FROM memberships WHERE account=?1 AND email_id=?2 ORDER BY mailbox_id LIMIT ?3";
 const MAILBOX_AFTER: &str = "SELECT mailbox_id,changed FROM memberships WHERE account=?1 AND email_id=?2 AND mailbox_id>?3 ORDER BY mailbox_id LIMIT ?4";
 const KEYWORD_FIRST: &str = "SELECT keyword,changed FROM keywords WHERE account=?1 AND email_id=?2 ORDER BY keyword LIMIT ?3";

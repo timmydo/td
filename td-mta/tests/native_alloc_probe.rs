@@ -611,7 +611,7 @@ mod smtp_session;
 #[allow(unused)]
 pub mod store_fs;
 #[cfg(td_native_alloc_probe)]
-use td_mta::mailbox_response;
+use td_mta::{email_response, mailbox_response};
 
 #[cfg(td_native_alloc_probe)]
 fn sqlite_body(mode: sqlite_body_scenario::Mode) {

@@ -2,6 +2,7 @@
 use super::*;
 use crate::{
     format::row::{BlobRow, EmailOrigin, EmailRow, MailboxRow},
+    ids::ThreadId,
     ports::{Crypto, Tick, Time},
     store_fs::tests::Fixture,
 };

@@ -5106,6 +5106,27 @@ fn exercise_read(
         read::with_snapshot(request, trust, deadline(), binding, b"bad", |_| Ok(())),
         Err(read::Error::Unauthenticated)
     ));
+    let stored = |view: &mut read::Snapshot<'_>, email| -> Result<Option<String>, read::Error> {
+        let mut output = Vec::new();
+        let found = td_mta::email_response::write_stored(
+            view,
+            email,
+            td_mta::email_response::Stored::all(),
+            &mut [],
+            |chunk| {
+                assert!(chunk.len() <= td_mta::email_response::MAX_CHUNK_BYTES);
+                assert!(output.len() + chunk.len() <= 8192);
+                output.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
+        if found {
+            Ok(Some(String::from_utf8(output).unwrap()))
+        } else {
+            assert!(output.is_empty());
+            Ok(None)
+        }
+    };
     let check_mailbox = |view: &mut read::Snapshot<'_>, expected: u64| -> Result<(), read::Error> {
         use td_mta::mailbox_response::{self, Object, Projection, Rights};
         let listing = view.mailbox_listing()?;
@@ -5168,6 +5189,13 @@ fn exercise_read(
     read::with_snapshot(request,trust,deadline(),binding,password,|view| {
         assert_eq!(view.identity().committed_sequence.number(),3);
         check_mailbox(view, 2)?;
+        let original = stored(view, first.email)?.unwrap();
+        assert!(original.contains("\"keywords\":{\"$draft\":true,\"$seen\":true}"));
+        assert!(original.contains("\"mailboxIds\":{"));
+        assert!(original.contains("\"blobId\":"));
+        assert!(original.contains("\"threadId\":"));
+        assert!(original.contains("\"receivedAt\":"));
+
         let metadata=view.email(first.email)?.unwrap();
         assert_eq!(metadata.blob,first.blob);
         assert_eq!(view.email(EmailId::from_bytes([0xee;16]))?,None);
@@ -5193,12 +5221,24 @@ fn exercise_read(
         })?;
         assert!(String::from_utf8(bytes).unwrap().ends_with("c25hcHNob3QgdGV4dA==\r\n"));
         assert!(view.email(second.email)?.is_some());
+        assert_eq!(stored(view, first.email)?, Some(original));
         check_mailbox(view, 2)?;
         Ok(())
     }).unwrap();
     read::with_snapshot(request, trust, deadline(), binding, password, |view| {
         assert_eq!(view.identity().committed_sequence.number(), 4);
         check_mailbox(view, 1)?;
+        assert_eq!(stored(view, first.email)?, None);
+        assert_eq!(
+            td_mta::email_response::write_stored(
+                view,
+                second.email,
+                td_mta::email_response::Stored::all(),
+                &mut [],
+                |_| Err(td_mta::ports::Error::Capacity)
+            ),
+            Err(read::Error::Output(td_mta::ports::Error::Capacity))
+        );
         assert_eq!(view.email(first.email)?, None);
         assert!(view.mailboxes(first.email, None, 1)?.values.is_empty());
         Ok(())
@@ -5206,6 +5246,9 @@ fn exercise_read(
     .unwrap();
     sql(fixture,&format!("INSERT INTO td_mta.keywords SELECT decode('{account}','hex'),decode('{}','hex'),'k'||lpad(n::text,3,'0'),decode('0000000000000004','hex') FROM generate_series(0,256) n",second.email));
     read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        let encoded = stored(view, second.email)?.unwrap();
+        assert!(encoded.contains("\"k000\":true"));
+        assert!(encoded.contains("\"k256\":true"));
         let page = view.keywords(second.email, Some("$seen"), 256)?;
         assert_eq!(page.values.len(), 256);
         assert!(page.has_more);

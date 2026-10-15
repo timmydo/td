@@ -2096,3 +2096,23 @@ accidental cross-view substitution; passive values are not authorization.
 The caller retains and checks the original admitted view before publishing
 output. The local wrapper still checks its snapshot before and after encoding.
 This prepares existing JMAP output for cutover; it activates no listener.
+
+## 59. Stored Email projection on the admitted snapshot
+
+The stored-field encoder consumes `email_response::Source`, implemented by
+the existing local view and PostgreSQL's admitted `Snapshot`. Both adapters
+share the passive metadata and value-window types; the native adapter remains
+a forwarding wrapper over its existing reads. PostgreSQL maps its body
+manifest length to stored size and uses its existing snapshot queries for
+mailbox memberships and keywords. No MIME parsing or body reads are added.
+
+The encoder checks the retained view around every bounded sink callback,
+keeps each emission at 512 bytes or less, and pages sets in windows of at
+most 256 values. Metadata and every window must name the requested Email;
+windows must match the metadata snapshot identity. Output stays provisional
+until successful completion and the enclosing request's final checks.
+PostgreSQL read failures retain their typed errors; sink/format errors use
+`postgres_read::Error::Output` and do not imply database publication.
+The same-snapshot fixture exercises stored output across a concurrent Email
+removal, a later absent object, multi-page keywords and a refusing output sink.
+Service admission remains part of the atomic cutover.

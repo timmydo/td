@@ -13,7 +13,7 @@ use crate::{
 use std::time::Instant;
 use td_crypto::TrustStore;
 
-pub const MAX_VALUES: usize = 256;
+pub use crate::email_response::{EmailValues as Values, MAX_EMAIL_VALUES as MAX_VALUES};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -28,13 +28,12 @@ pub enum Error {
     Invalid,
     Body(postgres_body::Error),
     Mailboxes(postgres_mailboxes::Error),
+    Output(ports::Error),
 }
-#[derive(Debug)]
-pub struct Values<T> {
-    pub identity: ViewIdentity,
-    pub email: EmailId,
-    pub values: Vec<T>,
-    pub has_more: bool,
+impl From<ports::Error> for Error {
+    fn from(error: ports::Error) -> Self {
+        Self::Output(error)
+    }
 }
 
 /// The mailbox filter shapes already supported by td-mail's Email/query.
@@ -69,6 +68,45 @@ pub struct Snapshot<'a> {
     identity: ViewIdentity,
     deadline: Instant,
     failed: Option<Error>,
+}
+
+impl crate::email_response::Source for Snapshot<'_> {
+    type Error = Error;
+    fn check_snapshot(&mut self) -> Result<(), Error> {
+        self.check()
+    }
+    fn email_metadata(
+        &mut self,
+        email: EmailId,
+        _scratch: &mut [u8],
+    ) -> Result<Option<crate::email_response::EmailMetadata>, Error> {
+        self.email(email).map(|metadata| {
+            metadata.map(|metadata| crate::email_response::EmailMetadata {
+                identity: metadata.identity,
+                email: metadata.email,
+                blob: metadata.blob,
+                thread: metadata.thread,
+                size: metadata.body.length,
+                received_at: metadata.received_at,
+            })
+        })
+    }
+    fn email_mailboxes(
+        &mut self,
+        email: EmailId,
+        after: Option<MailboxId>,
+        maximum: usize,
+    ) -> Result<Values<MailboxId>, Error> {
+        self.mailboxes(email, after, maximum)
+    }
+    fn email_keywords(
+        &mut self,
+        email: EmailId,
+        after: Option<&str>,
+        maximum: usize,
+    ) -> Result<Values<String>, Error> {
+        self.keywords(email, after, maximum)
+    }
 }
 
 pub fn with_snapshot<T>(
