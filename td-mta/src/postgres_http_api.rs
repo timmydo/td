@@ -247,13 +247,13 @@ impl Service<'_, '_, '_> {
             exchange.receive(request, sender, start, &mut retention, |_| Ok(()))?;
         retention.admit_work_turn()?;
         let execution = execution.min(crate::ports::Deadline::after(sender.last, 10_000)?);
-        let updates_only = {
+        let mutation = {
             let request = plan.request().map_err(|_| ApiError::Io(Error::Invalid))?;
-            request.call_count() == 1
-                && request
-                    .calls()
-                    .next()
-                    .is_some_and(|call| call.name == b"Email/set")
+            if request.call_count() == 1 {
+                request.calls().next().map(|call| call.name)
+            } else {
+                None
+            }
         };
         let mut snapshot = Snapshot::open_resolved(
             self.slots,
@@ -264,29 +264,49 @@ impl Service<'_, '_, '_> {
             request.credentials.password(),
         )
         .map_err(|error| ApiError::Io(read_error(error)))?;
-        let complete = if updates_only {
+        let complete = if matches!(mutation, Some(b"Email/set" | b"Mailbox/set")) {
             drop(
                 snapshot
                     .finish_method()
                     .map_err(|error| ApiError::Io(read_error(error)))?,
             );
-            let updates = crate::postgres_http_updates::Updates {
-                loaded: self.loaded,
-                executable: self.executable,
-                binding: self.binding,
-                slots: self.slots,
-                clock: self.clock,
-                pending: self.pending,
-                password: request.credentials.password(),
-            };
-            dispatch::run_with_postgres_updates(
-                plan,
-                retention,
-                execution,
-                self.binding.account(),
-                request.device,
-                &updates,
-            )
+            if mutation == Some(b"Mailbox/set".as_slice()) {
+                let mailboxes = crate::postgres_http_mailboxes::Mailboxes {
+                    loaded: self.loaded,
+                    executable: self.executable,
+                    binding: self.binding,
+                    slots: self.slots,
+                    clock: self.clock,
+                    pending: &self.pending.mailboxes,
+                    password: request.credentials.password(),
+                };
+                dispatch::run_with_postgres_mailboxes(
+                    plan,
+                    retention,
+                    execution,
+                    self.binding.account(),
+                    request.device,
+                    &mailboxes,
+                )
+            } else {
+                let updates = crate::postgres_http_updates::Updates {
+                    loaded: self.loaded,
+                    executable: self.executable,
+                    binding: self.binding,
+                    slots: self.slots,
+                    clock: self.clock,
+                    pending: self.pending,
+                    password: request.credentials.password(),
+                };
+                dispatch::run_with_postgres_updates(
+                    plan,
+                    retention,
+                    execution,
+                    self.binding.account(),
+                    request.device,
+                    &updates,
+                )
+            }
         } else {
             let result = dispatch::run_with_postgres_read(
                 plan,

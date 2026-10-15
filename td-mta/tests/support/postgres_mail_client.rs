@@ -308,14 +308,19 @@ pub(super) fn exercise(
                 assert_eq!(fresh["emails"][0]["is_read"].as_bool(), Some(seen), "{fresh}");
                 assert_eq!(fresh["emails"][0]["is_flagged"].as_bool(), Some(flagged), "{fresh}");
             }
-            let archive = td_mta::postgres_mailbox_create::prepare(binding, device.device_id(), None, &["Archive"], deadline()).unwrap();
-            let created = td_mta::postgres_mailbox_create::publish(request, trust, deadline(), &archive, device.password()).unwrap();
-            let td_mta::postgres_mailbox_create::ResultEntry::Created(archive) = created.results[0] else { panic!("archive fixture creation"); };
-            let mut archive_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
-            let archive_wire = td_mta::wire::encode_id(archive, &mut archive_wire).unwrap();
+            let created = client.ask(json!({"command":"create_mailbox", "name":"Archive"}));
+            assert!(created["ok"].is_true(), "{created}");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes WHERE name='Archive'"), "1");
+            let duplicate = client.ask(json!({"command":"create_mailbox", "name":"Archive"}));
+            assert!(!duplicate["ok"].is_true(), "{duplicate}");
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes WHERE name='Archive'"), "1");
+            let listing = client.ask(json!({"command":"list_mailboxes"}));
+            assert!(listing["ok"].is_true(), "{listing}");
+            let archive_wire = listing["mailboxes"].as_array().unwrap().iter().find(|folder| folder["name"].as_str() == Some("Archive")).unwrap()["id"].as_str().unwrap();
+            let archive = sql(fixture, "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE name='Archive'");
             let inbox_wire = folders[0]["id"].as_str().unwrap();
             let inbox = sql(fixture, "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships");
-            for (destination, expected) in [(archive_wire, archive.to_string()), (inbox_wire, inbox)] {
+            for (destination, expected) in [(archive_wire, archive), (inbox_wire, inbox)] {
                 let moved = client.ask(json!({"command":"move_email", "id":email["id"], "to_mailbox_id":destination}));
                 assert!(moved["ok"].is_true(), "{moved}");
                 assert_eq!(sql(fixture, "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"), expected);
@@ -519,4 +524,67 @@ pub(super) fn exercise(
 
     assert_eq!(responses.used().unwrap(), 0);
     assert!(!responses.admission_stopped());
+    let folders = td_mta::postgres_http_mailboxes::Mailboxes {
+        loaded: &loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &confirmed.mailboxes,
+        password: device.password(),
+    };
+    sql(fixture, "CREATE FUNCTION public.delay_folder_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_folder_commit AFTER INSERT ON td_mta.mailbox_create_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_folder_commit()");
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
+    let mut meter = td_mta::admission::work::Meter::new(
+        until,
+        td_mta::admission::work::Charge {
+            records: 10000,
+            io_bytes: 65536,
+            output_bytes: 65536,
+            ..Default::default()
+        },
+    );
+    let completion = td_mta::jmap_request::dispatch::MailboxMutator::create_mailboxes(
+        &folders,
+        td_mta::store_fs::MailboxCreateRequest {
+            account: binding.account(),
+            device: device.device_id(),
+            expected: None,
+            names: &["Recovered"],
+            deadline: until,
+        },
+        &mut meter,
+    )
+    .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        Err(td_mta::ports::CommitFailure::Indeterminate(_))
+    ));
+    let operation = confirmed.mailboxes.operation().unwrap().unwrap();
+    thread::sleep(Duration::from_secs(5));
+    sql(fixture, "DROP TRIGGER delay_folder_commit ON td_mta.mailbox_create_receipts; DROP FUNCTION public.delay_folder_commit()");
+    let settled = confirmed
+        .mailboxes
+        .settle(
+            &loaded,
+            executable,
+            &settlement_slots,
+            &clock,
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert!(matches!(
+        settled.outcome.results.as_slice(),
+        [td_mta::postgres_mailbox_create::ResultEntry::Created(_)]
+    ));
+    assert_eq!(confirmed.mailboxes.operation().unwrap(), None);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='Recovered'"
+        ),
+        "1"
+    );
 }

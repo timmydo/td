@@ -105,6 +105,30 @@ pub fn prepare(
             ..Charge::default()
         },
     );
+    prepare_with_meter(
+        binding, device, expected, names, deadline, &mut meter, &clock,
+    )
+}
+
+/// Prepare using the HTTP request's original work allowance and clock.
+pub fn prepare_with_meter(
+    binding: &Binding,
+    device: DeviceId,
+    expected: Option<u64>,
+    names: &[&str],
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Creation, Error> {
+    if !binding.roles().jmap() {
+        return Err(Error::Policy);
+    }
+    if names.len() > MAX_CREATES {
+        return Err(Error::Capacity);
+    }
+    if Instant::now() >= deadline {
+        return Err(Error::Connection(postgres_probe::Error::Deadline));
+    }
     let mut scratch = td_mime::nfc::Scratch::new();
     let mut entries = Vec::new();
     entries
@@ -118,7 +142,7 @@ pub fn prepare(
             return Err(Error::Connection(postgres_probe::Error::Deadline));
         }
         let mut budget = td_mime::nfc::HeaderBudget::new();
-        let valid = crate::mailbox_name::valid(name, &mut meter, &mut budget, &mut scratch, || {
+        let valid = crate::mailbox_name::valid(name, meter, &mut budget, &mut scratch, || {
             Ok(clock.sample()?.monotonic)
         })
         .map_err(Error::Validation)?;

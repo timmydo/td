@@ -34,7 +34,8 @@ pub enum MailboxCreateResult {
 #[derive(Debug)]
 #[must_use = "preserve the durable result even when admission has stopped"]
 pub struct MailboxCreateCompletion {
-    pub before: ViewIdentity,
+    pub before_epoch: StoreEpoch,
+    pub before_sequence: Sequence,
     pub outcome: Result<Sequence, CommitError>,
     /// Planned results become durable only when outcome is Ok.
     pub results: Vec<MailboxCreateResult>,
@@ -244,7 +245,8 @@ impl<P: MailboxAuthorization> StoreCoordinator<'_, '_, P> {
         )?;
         drop(guard);
         Ok(MailboxCreateCompletion {
-            before,
+            before_epoch: before.epoch,
+            before_sequence: before.committed_sequence,
             outcome,
             results,
             admission_stopped: state.stopped,

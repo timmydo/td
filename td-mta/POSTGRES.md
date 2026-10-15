@@ -2540,7 +2540,8 @@ remain atomic. Unknown destinations are per-object invalidProperties, and
 membership changes retain the original Email, Thread and body identities.
 
 Prepared HTTP mailbox rights advertise add/remove alongside seen/keyword
-updates. Folder creation, rename, deletion and submission stay unadvertised.
+updates. Section 82 connects root-folder creation. Rename, folder deletion and
+submission remain unsupported.
 The same uncertainty owner and settlement mechanism cover combined flag/move
 requests without new retry identities. The real-client fixture prepares an
 Archive folder through the existing storage helper, moves Inbox to Archive
@@ -2570,3 +2571,27 @@ checks authoritative Email and quota state, and confirms the first message
 still reads and downloads. A delayed deletion COMMIT is settled through its
 original receipt and releases the final body quota. Draft creation and
 production PostgreSQL activation remain separate.
+
+
+## 82. Prepared root-folder creation
+
+Singleton Mailbox/set now connects td-mail's name-only root creation to the
+existing PostgreSQL transaction. Preparation spends the original HTTP work
+meter for name validation and NFC; publication prepays bounded row work,
+reserves result capacity and a database slot before DNS, and rechecks runtime
+role, profile, account, device and expected state under the original deadline.
+Mixed method batches never enter this mutation path or native storage.
+
+A dedicated bounded owner retains one exact Creation through uncertain COMMIT.
+It blocks further folder creation without stopping reads or independent Email
+writes. Receipt settlement uses separately admitted capacity and never retries
+creation with a new identity. Absence and errors preserve the owner; confirmed
+outcomes survive local expiry. The encompassing prepared mutation owner keeps
+both operation families across requests. Restart persistence, settlement
+scheduling and receipt reclamation remain required before production cutover.
+
+Mailbox completion exposes only the original epoch and sequence, without a
+fabricated snapshot identity. The real td-mail fixture creates Archive, rejects
+its duplicate, lists it and moves mail through it. A delayed creation COMMIT
+proves exact receipt settlement and one durable folder. Hierarchy, renaming
+and folder deletion remain outside this td-mail milestone.

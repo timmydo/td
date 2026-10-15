@@ -176,6 +176,36 @@ pub fn run_with_postgres_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+/// Prepared singleton Mailbox/set. Refuse mixed requests before any effect;
+/// this path has no native read adapter or draft implementation.
+pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+    device: crate::ids::DeviceId,
+    mailboxes: &dyn MailboxMutator,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let request = plan.request().map_err(|_| Error::State)?;
+    if request.call_count() != 1
+        || request
+            .calls()
+            .next()
+            .is_none_or(|call| call.name != b"Mailbox/set")
+    {
+        return Err(Error::InvalidArguments);
+    }
+    run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        Profile {
+            mailboxes: Some((mailboxes, device)),
+            ..Profile::default()
+        },
+    )
+}
 /// Authenticated td-mail mutations, including root-folder creation.
 pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,

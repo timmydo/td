@@ -5,7 +5,7 @@ use crate::{
     ids::{AccountId, DeviceId, MailboxId, StoreEpoch},
     jmap_request::{dispatch, resolution, response, CORE, MAIL},
     limits::Limits,
-    ports::{self, Deadline, Tick, ViewIdentity},
+    ports::{self, Deadline, Tick},
     store_fs::{EmailUpdateCompletion, EmailUpdateRequest},
 };
 use std::cell::RefCell;
@@ -44,12 +44,8 @@ impl MailboxMutator for Mutator {
             return Err(error.into());
         }
         Ok(MailboxCreateCompletion {
-            before: ViewIdentity {
-                account: ACCOUNT,
-                epoch: StoreEpoch::from_bytes([7; 16]),
-                committed_sequence: Sequence::from_u64(3),
-                history_floor: Sequence::default(),
-            },
+            before_epoch: StoreEpoch::from_bytes([7; 16]),
+            before_sequence: Sequence::from_u64(3),
             outcome: if self.indeterminate {
                 Err(crate::store_fs::CommitError::Indeterminate(
                     ports::Error::Io {
@@ -355,4 +351,40 @@ fn creation_overlay_limit_refuses_the_whole_call_before_effects() {
     );
     assert!(mutator.names.borrow().is_empty());
     assert_eq!(response["createdIds"], td_json::json!({}));
+}
+
+#[test]
+fn postgres_mailbox_dispatch_refuses_mixed_or_read_calls_before_effects() {
+    let folders = Mutator::default();
+    for calls in [
+        td_json::json!([["Email/get", {}, "read"]]),
+        td_json::json!([["Mailbox/set", {}, "write"], ["Core/echo", {}, "echo"]]),
+    ] {
+        resolution::tests::run(|coordinator, spool, _, _| {
+            let retention = coordinator
+                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .unwrap();
+            let input = td_json::json!({"using":[CORE, MAIL], "methodCalls":calls}).to_string();
+            let request = dispatch::tests::request_with_capabilities(
+                &input,
+                Limits::default(),
+                &[CORE, MAIL],
+            );
+            let mut plan =
+                response::Preflight::new(request, "session", retention.maximum()).unwrap();
+            while !plan.step(&mut [0; 4096]).unwrap() {}
+            assert!(matches!(
+                dispatch::run_with_postgres_mailboxes(
+                    plan.finish().unwrap(),
+                    retention,
+                    Deadline::after(Tick(0), 90).unwrap(),
+                    ACCOUNT,
+                    DEVICE,
+                    &folders
+                ),
+                Err(Error::InvalidArguments)
+            ));
+        });
+    }
+    assert!(folders.names.borrow().is_empty());
 }
