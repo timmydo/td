@@ -2463,3 +2463,22 @@ poisoning a healthy snapshot, so later methods can continue. Database,
 integrity, work and deadline failures remain terminal for this prepared read
 batch. Final snapshot checks precede publication. Production activation and
 mutation coordination remain separate.
+
+## 77. Read boundaries for prepared method coordination
+
+A successful Snapshot::finish_method consumes and closes the PostgreSQL
+connection before returning a BetweenMethods reservation. No body pin can
+survive that transition. The connection slot remains reserved until the next
+method reopens it or drops the reservation; this is conservative capacity
+accounting, not a retained database transaction.
+
+Reopening performs fresh DNS, runtime-role qualification and full device
+secret authentication against the original profile/account binding. It
+captures a new account state. The original deadline is capped once at read
+admission and never extended by closing or reopening. The reservation stores
+no password and refuses a different device ID. Every failed reopen releases
+its capacity. A failed snapshot cannot produce a reservation.
+
+This supplies a boundary for future mixed read/write batches. Existing
+read-only HTTP dispatch retains its single snapshot; no mutation endpoint
+or production PostgreSQL service is activated here.

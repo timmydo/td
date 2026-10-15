@@ -6366,6 +6366,110 @@ fn exercise_read(
         devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
     devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
     assert_eq!(snapshot(|_| Ok(())), Err(read::Error::Unauthenticated));
+    exercise_read_boundaries(fixture, request, trust, binding, second.email);
+}
+
+fn exercise_read_boundaries(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    email: td_mta::ids::EmailId,
+) {
+    use td_mta::{
+        postgres_devices as devices,
+        postgres_read::{Error, ReadSlots, Snapshot},
+    };
+    let creation =
+        devices::prepare_creation(binding.epoch(), binding.account(), "method boundary", 1)
+            .unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let slots = ReadSlots::new(1).unwrap();
+    let open =
+        || Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password).unwrap();
+    let mut view = open();
+    assert_eq!(
+        view.keywords(email, Some("$draft"), 1).unwrap().values,
+        ["$seen"]
+    );
+    let next = view.identity().committed_sequence.number() + 1;
+    let between = view.finish_method().unwrap();
+    assert!(matches!(
+        Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password),
+        Err(Error::Busy)
+    ));
+    let stop_at = Instant::now() + Duration::from_secs(5);
+    while sql(
+        fixture,
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'",
+    ) != "0"
+    {
+        assert!(
+            Instant::now() < stop_at,
+            "closed method retains PostgreSQL connection"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let account = binding.account();
+    sql(fixture, &format!("BEGIN; INSERT INTO td_mta.keywords VALUES(decode('{account}','hex'),decode('{email}','hex'),'$flagged',decode('{next:016x}','hex')); UPDATE td_mta.accounts SET sequence=decode('{next:016x}','hex'); COMMIT"));
+    let mut view = between.reopen(&loaded, executable, password).unwrap();
+    assert_eq!(view.identity().committed_sequence.number(), next);
+    assert_eq!(
+        view.keywords(email, Some("$draft"), 1).unwrap().values,
+        ["$flagged"]
+    );
+    let between = view.finish_method().unwrap();
+    let mut wrong = password.to_vec();
+    let last = wrong.last_mut().unwrap();
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    assert!(matches!(
+        between.reopen(&loaded, executable, &wrong),
+        Err(Error::Unauthenticated)
+    ));
+    let between = open().finish_method().unwrap();
+    let failed = between.reopen(&loaded, &fixture.root.join("missing-helper"), password);
+    assert!(matches!(failed, Err(Error::Resolution(_))));
+    let view = Snapshot::open_runtime(
+        &slots,
+        request,
+        trust,
+        Instant::now() + Duration::from_secs(2),
+        binding,
+        password,
+    )
+    .unwrap();
+    let between = view.finish_method().unwrap();
+    thread::sleep(Duration::from_secs(2));
+    assert!(matches!(
+        between.reopen(&loaded, executable, password),
+        Err(Error::Connection(td_mta::postgres_probe::Error::Deadline))
+    ));
+    let between = open().finish_method().unwrap();
+    let revoke =
+        devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert!(matches!(
+        between.reopen(&loaded, executable, password),
+        Err(Error::Unauthenticated)
+    ));
+    assert!(matches!(
+        Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password),
+        Err(Error::Unauthenticated)
+    ));
 }
 
 fn exercise_query(
