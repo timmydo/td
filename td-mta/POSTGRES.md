@@ -2204,3 +2204,21 @@ concurrent source deletion and checks subject/address, decoded preview/text,
 body lists and locator output, plus a refusing response sink. Full native
 validation still exercises the real td-mail client against the active local
 service. PostgreSQL protocol/service activation remains the atomic cutover.
+
+## 63. HTTPS authentication off the network reactor
+
+The active HTTPS adapter now hands admitted credential work to one fixed
+authentication worker through a bounded backend interface. This prepares
+PostgreSQL lookup without putting connection, authentication or SQL work on
+the network reactor. Origin/rate admission precedes the handoff; lookup and
+completion retain the request's original finite deadline. Client-owned
+credentials survive the initial device observation for subsequent fresh
+storage authorization. Ordinary responses and EventSource clear them before
+output; other client retirement also clears them.
+
+The current service still supplies its local device registry. This increment
+activates no database-backed listener and grants no authority from parsing
+alone. The cutover must supply runtime-qualified primary lookup, fresh
+method authorization and service readiness/backoff, including its independent
+health/settlement connection capacity. DESIGN.md and RESOURCES.md own the
+worker lifecycle and active resource boundaries.

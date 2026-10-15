@@ -385,7 +385,7 @@ fn td_mail_reads_native_mail_and_downloads_emitted_attachment_ids() {
             listeners: &listeners,
             policies: &lease,
             handshakes: &handshakes,
-            devices: &devices,
+            authentication: &devices,
             origin: Origin::parse(&origin).unwrap(),
             username: "private-user",
             resources: &resources,

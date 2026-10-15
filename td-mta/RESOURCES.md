@@ -4328,13 +4328,16 @@ and streaming fixtures are not a claim about kernel page-cache residency.
 
 ## HTTPS authentication runtime
 
-The mailbox-access profile adds one fixed HTTPS network thread and one fixed
-TLS worker to the receiver/control threads. A startup vector contains at
+The mailbox-access profile adds fixed HTTPS network, TLS, authentication and
+body workers to the receiver/control threads. A startup vector contains at
 most https_connections mutex-protected slots (compiled maximum 32); each
 occupied slot holds two 18,437-byte TLS wire arrays, a 32 KiB request head,
 a 16 KiB plaintext input buffer, bounded response headers (under 512 bytes),
 an optional fixed 2 KiB event frame plus stream bookkeeping, deadlines and
-transport state. Head storage may be owned; retiring it clears credentials.
+transport state. The client also owns the bounded decoded credentials while
+authentication or body work needs them. Ordinary responses and EventSource
+clear both the credential head and decoded owner before retaining output;
+other client retirement also clears them.
 Consumed input is cleared after each framing turn; bytes beyond the head
 remain in the same buffer until body dispatch or refusal. All input is
 cleared on retirement. These are ordinary buffer hygiene measures, not
@@ -4346,9 +4349,10 @@ The TLS worker constructs sessions and visits each eligible handshake at most
 once per ten milliseconds, under the receiver's shared HandshakePool. Network
 and TLS scans wait at most five milliseconds between passes and never wait on
 socket readiness. Each nonblocking network turn reads at most 16 KiB, parses
-one head turn or advances one bounded response. Authentication is one bounded
-in-memory lookup/hash; the network thread only tries the registry mutex and
-never performs credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
+one head turn or advances one bounded response. The network thread admits
+origin/rate checks and hands credential lookup to the fixed authentication
+worker. The current local backend tries its registry mutex there and performs
+no credential file I/O. A network-owned 32-entry peer table avoids locking TLS slots for admission;
 a retired slot can retain its old peer charge until the next scan. The
 listener has a fixed two-connection per-IP cap.
 Transient accept resource failures back off for five seconds. Session slots
@@ -4362,8 +4366,8 @@ precedes password output. Authentication attempts use a fixed 64-entry table,
 work already executing is joined on shutdown, not forcibly canceled. The
 current HTTPS profile uses a separate fixed body worker for uploads, raw
 downloads and retained Core API responses; ADMISSION.md owns those lifetimes.
-Discovery retires the 32 KiB credential head before allocating its at-most
-32 KiB Session response. EventSource retains only its fixed frame and passive
+Discovery retires the 32 KiB credential head and decoded credentials before
+allocating its at-most 32 KiB Session response. EventSource retains only its fixed frame and passive
 snapshot; it never holds a store view or a response file. The prepared
 Session is shared startup metadata. These bounds fit the existing per-client
 scratch reservation; integrated whole-service measurement remains pending.
@@ -4839,3 +4843,21 @@ reads and downloads while a previous exchange retires. For reads, the client
 retries 429/503 at most twice using a one-to-five-second Retry-After, or one
 second for 503 without that header. Persistent pressure remains an error.
 No seamless concurrent-read or contention-retry guarantee is made here.
+
+## Active HTTPS authentication worker
+
+The current foreground profile adds one fixed `https-auth` worker alongside
+its HTTPS handshake and body workers. It scans the existing bounded client
+slots, with one lookup at a time and no separate queue or per-client thread.
+Each slot retains one 352-byte decoded credential buffer plus its range and
+one scalar authentication outcome. The request releases this storage before an ordinary response/EventSource or
+on drop; Busy does not allocate another credential owner or renew attempt admission.
+
+This is active runtime layout, not a claim that the proposed eight-role table
+or 256-KiB worker-stack budget above is fully qualified. As with the existing
+foreground workers, host default thread stacks remain outside that proposed
+whole-process measurement. The isolated authentication worker keeps the
+network/TLS/body workers responsive during bounded backend lookup. The HTTPS
+fixture blocks the backend while a second client handshakes and receives its
+origin refusal, then checks the original request resumes after local registry
+contention without consuming a second attempt allowance.

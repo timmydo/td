@@ -2532,3 +2532,23 @@ allocating or searching. Initial mappings need no second allocation or
 quadratic seed scan. Counting and output stream one bounded pair per turn.
 This profile records creation IDs but does not yet resolve #draft in
 EmailSubmission/set or advertise Submission capability.
+
+## HTTPS authentication worker handoff
+
+HTTPS origin checks and bounded attempt admission remain on the network
+reactor. Credential decoding and verifier lookup run on one fixed
+`https-auth` worker through `http_auth::Authenticator`. Pending work occupies
+only existing bounded connection slots; no task or connection is spawned per
+authentication. Busy retries keep the same attempt charge and original
+absolute/header/idle deadline. The worker checks monotonic time before and
+after lookup; an expired or regressed result cannot enter routing.
+
+Decoded credentials remain in the bounded client owner, with zero-on-drop
+storage, for future fresh body/method authorization. Ordinary responses and
+EventSource clear them with the original credential head before output;
+other client retirement also clears them. A successful device ID is
+only the initial observation; mutations and body admission keep their existing
+fresh authorization boundaries. The local verifier remains active until the
+atomic PostgreSQL cutover. The backend contract requires bounded completion
+under the supplied deadline. Service shutdown joins the verifier along with
+the existing workers; database lookup must never run on the network reactor.

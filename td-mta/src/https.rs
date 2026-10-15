@@ -16,7 +16,6 @@ use crate::{
         TlsTransport, Transport,
     },
     smtp_receiving::Control,
-    store_fs::DeviceStore,
     tls_admission::HandshakePool,
     tls_io::TLS_WIRE_BYTES,
     tls_policy::{PolicyRole, TlsConnection, TlsPolicies},
@@ -67,6 +66,7 @@ enum Phase {
     Tls,
     Head,
     Authorize,
+    Authenticate,
     Upload,
     Download,
     Api,
@@ -90,6 +90,8 @@ struct Client {
     sent: usize,
     attempt_admitted: bool,
     device: Option<DeviceId>,
+    credentials: Option<http_auth::BasicCredentials>,
+    authentication: Option<Result<Option<DeviceId>, Error>>,
     body_slot: bool,
     events: Option<EventState>,
     stop_after_response: bool,
@@ -121,11 +123,11 @@ impl Drop for Finish<'_> {
     }
 }
 
-pub struct Https<'a, 'r> {
+pub struct Https<'a> {
     pub listeners: &'a [BoundListener],
     pub policies: &'a GenerationLease<TlsPolicies>,
     pub handshakes: &'a HandshakePool,
-    pub devices: &'a Mutex<DeviceStore<'r>>,
+    pub authentication: &'a dyn http_auth::Authenticator,
     pub origin: Origin<'a>,
     pub username: &'a str,
     pub resources: &'a ResourcePlan,
@@ -134,7 +136,7 @@ pub struct Https<'a, 'r> {
     pub uploads: Option<&'a dyn https_upload::Backend>,
     pub ready: &'a AtomicBool,
 }
-impl Https<'_, '_> {
+impl Https<'_> {
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         if self.listeners.is_empty() {
             return Err(Error::Invalid);
@@ -241,6 +243,48 @@ impl Https<'_, '_> {
                 done: &done,
                 worker: uploader.thread(),
             };
+            let verifier = match std::thread::Builder::new()
+                .name("https-auth".into())
+                .spawn_scoped(scope, || {
+                    while !done.load(Ordering::Acquire) {
+                        for cell in &slots {
+                            let mut slot = match cell.try_lock() {
+                                Ok(slot) => slot,
+                                Err(TryLockError::WouldBlock) => continue,
+                                Err(_) => {
+                                    control.fail();
+                                    return;
+                                }
+                            };
+                            let Some(client) =
+                                slot.as_mut().filter(|c| c.phase == Phase::Authenticate)
+                            else {
+                                continue;
+                            };
+                            if let Err(error) = self.authenticate(client) {
+                                if error == Error::WriterStopped {
+                                    control.fail();
+                                    return;
+                                }
+                                *slot = None;
+                            }
+                        }
+                        std::thread::park_timeout(SCAN);
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    drop(upload_finish);
+                    drop(finish);
+                    let _ = uploader.join();
+                    let _ = worker.join();
+                    return Err(error.into());
+                }
+            };
+            let auth_finish = Finish {
+                done: &done,
+                worker: verifier.thread(),
+            };
             while !body_warm.load(Ordering::Acquire)
                 && !uploader.is_finished()
                 && !control.stop_requested()
@@ -250,15 +294,20 @@ impl Https<'_, '_> {
             let result = if control.stop_requested() {
                 Ok(())
             } else if body_warm.load(Ordering::Acquire) {
-                self.network(&slots, &worker, &uploader, &body_active, control)
+                self.network(&slots, &worker, &uploader, &verifier, &body_active, control)
             } else {
                 Err(Error::WriterStopped)
             };
             if result.is_err() {
                 control.fail();
             }
+            drop(auth_finish);
             drop(upload_finish);
             drop(finish);
+            if verifier.join().is_err() {
+                control.fail();
+                return Err(Error::WriterStopped);
+            }
             if uploader.join().is_err() {
                 control.fail();
                 return Err(Error::WriterStopped);
@@ -279,6 +328,38 @@ impl Https<'_, '_> {
             }
             result
         })
+    }
+    fn authenticate(&self, client: &mut Client) -> Result<(), Error> {
+        let before = self.clock.sample()?.monotonic;
+        let deadline = client.absolute.min(client.phase_deadline).min(client.idle);
+        if deadline.expired(before) {
+            return Err(Error::Deadline);
+        }
+        if client.credentials.is_none() {
+            let head = client.head.head().map_err(|_| Error::Invalid)?;
+            client.credentials = http_auth::parse_basic(self.username, head.authorization);
+        }
+        let result = match client.credentials.as_ref() {
+            Some(credentials) => self
+                .authentication
+                .authenticate(credentials.password(), deadline),
+            None => Ok(None),
+        };
+        let after = self.clock.sample()?.monotonic;
+        if after < before {
+            return Err(Error::Invalid);
+        }
+        if deadline.expired(after) {
+            return Err(Error::Deadline);
+        }
+        match result {
+            Err(Error::Busy) => return Ok(()),
+            Err(Error::WriterStopped) => return Err(Error::WriterStopped),
+            _ => (),
+        }
+        client.authentication = Some(result);
+        client.phase = Phase::Authorize;
+        Ok(())
     }
     fn tls(&self, client: &mut Client) -> Result<(), Error> {
         let now = self.clock.sample()?.monotonic;
@@ -355,6 +436,7 @@ impl Https<'_, '_> {
         slots: &[Mutex<Option<Client>>],
         worker: &std::thread::ScopedJoinHandle<'_, ()>,
         uploader: &std::thread::ScopedJoinHandle<'_, ()>,
+        verifier: &std::thread::ScopedJoinHandle<'_, ()>,
         body_active: &AtomicU8,
         control: &Control,
     ) -> Result<(), Error> {
@@ -372,7 +454,7 @@ impl Https<'_, '_> {
         let mut accept_after = Tick(0);
         let mut event_count = 0usize;
         while !control.stop_requested() {
-            if worker.is_finished() || uploader.is_finished() {
+            if worker.is_finished() || uploader.is_finished() || verifier.is_finished() {
                 control.fail();
                 return Err(Error::WriterStopped);
             }
@@ -400,13 +482,15 @@ impl Https<'_, '_> {
                 };
                 if matches!(
                     client.phase,
-                    Phase::Tls | Phase::Upload | Phase::Download | Phase::Api
+                    Phase::Tls | Phase::Authenticate | Phase::Upload | Phase::Download | Phase::Api
                 ) {
                     continue;
                 }
                 let mut wake_body = false;
+                let mut wake_auth = false;
                 match self.step(client, &mut attempts, body_active, &mut event_count) {
                     Ok(true) => {
+                        wake_auth = client.phase == Phase::Authenticate;
                         if matches!(client.phase, Phase::Upload | Phase::Download | Phase::Api) {
                             wake_body = true;
                         }
@@ -438,6 +522,9 @@ impl Https<'_, '_> {
                 drop(slot);
                 if wake_body {
                     uploader.thread().unpark();
+                }
+                if wake_auth {
+                    verifier.thread().unpark();
                 }
             }
             cursor = (cursor + 1) % slots.len();
@@ -525,6 +612,8 @@ impl Https<'_, '_> {
                     sent: 0,
                     attempt_admitted: false,
                     device: None,
+                    credentials: None,
+                    authentication: None,
                     body_slot: false,
                     events: None,
                     stop_after_response: false,
@@ -618,12 +707,11 @@ impl Https<'_, '_> {
                     429
                 } else {
                     client.attempt_admitted = true;
-                    let devices = match self.devices.try_lock() {
-                        Ok(devices) => devices,
-                        Err(TryLockError::WouldBlock) => return Ok(true),
-                        Err(_) => return Err(Error::WriterStopped),
+                    let Some(authentication) = client.authentication.take() else {
+                        client.phase = Phase::Authenticate;
+                        return Ok(true);
                     };
-                    match http_auth::basic(&devices, self.username, head.authorization) {
+                    match authentication {
                         Ok(Some(device)) => {
                             if let Some(backend) = self.uploads {
                                 if let Some(account) = head.target.strip_prefix("/jmap/upload/") {
@@ -691,7 +779,6 @@ impl Https<'_, '_> {
                                         Ordering::AcqRel,
                                         Ordering::Acquire,
                                     ) {
-                                        drop(devices);
                                         if active == 2 {
                                             return self.respond_body(client, 429, time.utc_ms,
                                                 br#"{"type":"urn:ietf:params:jmap:error:limit","status":429,"limit":"maxConcurrentRequests"}"#).map(|()| true);
@@ -711,7 +798,6 @@ impl Https<'_, '_> {
                                     {
                                         400
                                     } else if let Some(session) = backend.session() {
-                                        drop(devices);
                                         return self
                                             .respond_body(client, 200, time.utc_ms, session.bytes())
                                             .map(|()| true);
@@ -737,13 +823,11 @@ impl Https<'_, '_> {
                                             match crate::jmap_events::Options::parse(query) {
                                                 Ok(options) => options,
                                                 Err(_) => {
-                                                    drop(devices);
                                                     return self
                                                         .respond(client, 400, time.utc_ms)
                                                         .map(|()| true);
                                                 }
                                             };
-                                        drop(devices);
                                         let snapshot =
                                             match backend.event_snapshot(device, client.absolute) {
                                                 Ok(snapshot) => snapshot,
@@ -829,7 +913,7 @@ impl Https<'_, '_> {
                     &mut client.drain_left,
                 );
             }
-            Phase::Tls | Phase::Upload | Phase::Download | Phase::Api => {
+            Phase::Tls | Phase::Authenticate | Phase::Upload | Phase::Download | Phase::Api => {
                 return Err(Error::Invalid)
             }
         }
@@ -1038,6 +1122,7 @@ impl Https<'_, '_> {
         client.input.fill(0);
         client.input_used = 0;
         client.drain_left = 0;
+        client.credentials = None;
         client.head = HeadReader::new(Vec::new().into_boxed_slice());
         client.response.clear();
         client
@@ -1151,6 +1236,7 @@ impl Https<'_, '_> {
         client.input.fill(0);
         client.input_used = 0;
         // Retire credentials before allocating or waiting on Session output.
+        client.credentials = None;
         client.head = HeadReader::new(Vec::new().into_boxed_slice());
         client
             .response

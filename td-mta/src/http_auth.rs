@@ -67,6 +67,27 @@ pub fn basic(
     }
 }
 
+/// Bounded credential lookup on the fixed authentication worker, never the
+/// network reactor. Busy retries retain the original request deadline and
+/// attempt admission. Success is an observation, not a later mutation guard.
+pub trait Authenticator: Sync {
+    fn authenticate(&self, password: &[u8], deadline: Deadline) -> Result<Option<DeviceId>, Error>;
+}
+impl Authenticator for Mutex<DeviceStore<'_>> {
+    fn authenticate(
+        &self,
+        password: &[u8],
+        _deadline: Deadline,
+    ) -> Result<Option<DeviceId>, Error> {
+        let store = match self.try_lock() {
+            Ok(store) => store,
+            Err(TryLockError::WouldBlock) => return Err(Error::Busy),
+            Err(TryLockError::Poisoned(_)) => return Err(Error::WriterStopped),
+        };
+        store.authenticate(password).map_err(|_| Error::Invalid)
+    }
+}
+
 /// Binds upload commits and blob-read admission to the live device registry. Callers may
 /// supply only the device ID obtained by successful HTTPS authentication.
 /// The fixed configuration generation is retained for the service lifetime;

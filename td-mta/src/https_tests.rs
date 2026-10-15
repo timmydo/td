@@ -2,8 +2,9 @@ use super::*;
 use crate::{
     admission::{timers::NetworkLimits, DiskLimits, ViewMode, WorkLimits},
     config::{endpoint::Origin, listener::Kind},
+    http_auth,
     https::{BoundListener, Https},
-    ids::AccountId,
+    ids::{AccountId, DeviceId},
     limits::Limits,
     ports::{Deadline, FlushProgress, Handshake, IoProgress, TlsTransport, Transport},
     smtp_receiving::Control,
@@ -139,6 +140,38 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
     *last = if *last == b'0' { b'1' } else { b'0' };
     let incorrect = base64(&[b"private-user:".as_slice(), &incorrect].concat());
     let devices = Mutex::new(devices);
+    struct Delayed<'a, 'r> {
+        inner: &'a Mutex<DeviceStore<'r>>,
+        armed: AtomicBool,
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+    impl http_auth::Authenticator for Delayed<'_, '_> {
+        fn authenticate(
+            &self,
+            password: &[u8],
+            deadline: Deadline,
+        ) -> Result<Option<DeviceId>, Error> {
+            assert_eq!(std::thread::current().name(), Some("https-auth"));
+            if self.armed.swap(false, Ordering::AcqRel) {
+                self.entered.store(true, Ordering::Release);
+                let until = Instant::now() + Duration::from_secs(5);
+                while !self.released.load(Ordering::Acquire) {
+                    if Instant::now() >= until {
+                        return Err(Error::Deadline);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            http_auth::Authenticator::authenticate(self.inner, password, deadline)
+        }
+    }
+    let authentication = Delayed {
+        inner: &devices,
+        armed: AtomicBool::new(false),
+        entered: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    };
     let material = Material::new();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
@@ -171,7 +204,7 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
-                devices: &devices,
+                authentication: &authentication,
                 origin: Origin::parse(&origin_text).unwrap(),
                 username: "private-user",
                 resources: &resource,
@@ -256,12 +289,20 @@ fn https_enforces_auth_origin_framing_revocation_and_idle_deadlines() {
                 // Retrying a busy registry charges this request only once.
                 clock.1.fetch_add(2_000, Ordering::Relaxed);
                 let registry = devices.lock().unwrap();
+                authentication.armed.store(true, Ordering::Release);
                 let reply = std::thread::scope(|waiting_scope| {
                     let waiting = waiting_scope.spawn(|| {
                         let mut wire = client(address, &lease, clock.clone());
                         let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {authorization}\r\n\r\n");
                         request(&mut wire, head.as_bytes())
                     });
+                    wait(|| authentication.entered.load(Ordering::Acquire));
+                    // A blocked credential backend cannot stall handshakes or
+                    // the reactor's origin refusal for another client.
+                    let mut other = client(address, &lease, clock.clone());
+                    assert!(request(&mut other, b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n").starts_with("HTTP/1.1 421 "));
+                    other.abort();
+                    authentication.released.store(true, Ordering::Release);
                     std::thread::sleep(Duration::from_millis(250));
                     drop(registry);
                     waiting.join().unwrap()
@@ -547,7 +588,7 @@ fn https_uploads_commit_real_bodies_and_recheck_revocation() {
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
-                devices: &devices,
+                authentication: &devices,
                 origin: Origin::parse(&origin_text).unwrap(),
                 username: "private-user",
                 resources: &resource,
@@ -973,7 +1014,7 @@ fn stopped_upload_receipt(late: bool) {
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
-                devices: &devices,
+                authentication: &devices,
                 origin: Origin::parse(&origin_text).unwrap(),
                 username: "private-user",
                 resources: &resource,
@@ -1111,7 +1152,7 @@ fn download_failures_release_shared_slot_and_shutdown_joins_streaming() {
                 listeners: &listeners,
                 policies: &lease,
                 handshakes: &handshakes,
-                devices: &devices,
+                authentication: &devices,
                 origin: Origin::parse(&origin_text).unwrap(),
                 username: "private-user",
                 resources: &resource,

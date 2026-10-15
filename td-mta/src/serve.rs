@@ -284,7 +284,7 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
                     listeners: &https_listeners,
                     policies: &policies,
                     handshakes: &handshakes,
-                    devices,
+                    authentication: devices,
                     origin: view
                         .origin()
                         .map_err(|_| config_failure("configuration", "invariant"))?,
