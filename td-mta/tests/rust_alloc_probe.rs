@@ -64,6 +64,7 @@ mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)] // Second compilation; the library build remains the lint authority.
 pub mod store_fs;
+use td_mta::mailbox_response;
 
 // Expand at this root to retain production child paths and restricted visibility.
 include!("../src/mime_probe_modules.rs");

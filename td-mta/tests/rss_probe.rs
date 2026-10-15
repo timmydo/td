@@ -207,6 +207,7 @@ mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)]
 pub mod store_fs;
+use td_mta::mailbox_response;
 
 fn sqlite_body(mode: sqlite_body_scenario::Mode) {
     let phases = mode.phases();

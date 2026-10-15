@@ -610,6 +610,8 @@ mod smtp_session;
 #[path = "../src/store_fs.rs"]
 #[allow(unused)]
 pub mod store_fs;
+#[cfg(td_native_alloc_probe)]
+use td_mta::mailbox_response;
 
 #[cfg(td_native_alloc_probe)]
 fn sqlite_body(mode: sqlite_body_scenario::Mode) {

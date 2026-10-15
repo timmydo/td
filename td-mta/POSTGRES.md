@@ -2078,3 +2078,21 @@ those checks with the result of earlier authentication. TLS, configured-origin
 and attempt admission precede parsing. Invalid password syntax still goes to
 the backend's credential check; HTTP decoding is not app-password validation.
 No PostgreSQL listener or alternative production backend is activated here.
+
+## 58. Mailbox projection from the admitted read snapshot
+
+`postgres_read::Snapshot::mailbox_listing` reads the bounded mailbox hierarchy
+and counts through the same authenticated connection and repeatable-read
+snapshot as Email metadata and bodies. Its original policy/device admission,
+account state, deadline and connection budgets remain in force. It reuses the
+closed mailbox query and validators of the separate mailbox observation;
+errors retire the view. At most 256 mailboxes escape, with overflow refused.
+
+`mailbox_response::encode_object` projects a checked passive Mailbox row and
+snapshot-bound counts without opening storage. Both the local adapter and
+PostgreSQL use this encoder and the shared `MailboxCounts` value. Counts must
+match the supplied account/epoch/state identity and mailbox ID. This catches
+accidental cross-view substitution; passive values are not authorization.
+The caller retains and checks the original admitted view before publishing
+output. The local wrapper still checks its snapshot before and after encoding.
+This prepares existing JMAP output for cutover; it activates no listener.

@@ -30,13 +30,7 @@ pub enum Error {
     Database,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Counts {
-    pub total_emails: u64,
-    pub unread_emails: u64,
-    pub total_threads: u64,
-    pub unread_threads: u64,
-}
+pub use crate::mailbox_response::MailboxCounts as Counts;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Mailbox {
@@ -120,15 +114,7 @@ pub fn list(
             let floor = sequence_from_row(row, 1)?;
             if floor > sequence { return Err(Error::Integrity); }
             let identity = ViewIdentity { account, epoch, committed_sequence: Sequence::from_u64(sequence), history_floor: Sequence::from_u64(floor) };
-            let rows = client.query(MAILBOXES, &[&account.as_bytes().as_slice(), &sequence.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if rows.len() > MAX_MAILBOXES { return Err(Error::Capacity); }
-            let mut mailboxes = Vec::new();
-            mailboxes.try_reserve_exact(rows.len()).map_err(|_| Error::Capacity)?;
-            for row in &rows {
-                if Instant::now() >= deadline { return Err(Error::Connection(postgres_probe::Error::Deadline)); }
-                mailboxes.push(decode(row, sequence)?);
-            }
-            hierarchy(&mailboxes)?;
+            let mailboxes = read(client, identity, deadline).await?;
             Ok(Listing { identity, device, mailboxes })
         })
     }).map_err(Error::Connection)?;
@@ -136,6 +122,39 @@ pub fn list(
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
     result
+}
+
+pub(crate) async fn read(
+    client: &tokio_postgres::Client,
+    identity: ViewIdentity,
+    deadline: Instant,
+) -> Result<Vec<Mailbox>, Error> {
+    let sequence = identity.committed_sequence.number().to_be_bytes();
+    let rows = client
+        .query(
+            MAILBOXES,
+            &[
+                &identity.account.as_bytes().as_slice(),
+                &sequence.as_slice(),
+            ],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    if rows.len() > MAX_MAILBOXES {
+        return Err(Error::Capacity);
+    }
+    let mut mailboxes = Vec::new();
+    mailboxes
+        .try_reserve_exact(rows.len())
+        .map_err(|_| Error::Capacity)?;
+    for row in &rows {
+        if Instant::now() >= deadline {
+            return Err(Error::Connection(postgres_probe::Error::Deadline));
+        }
+        mailboxes.push(decode(row, identity)?);
+    }
+    hierarchy(&mailboxes)?;
+    Ok(mailboxes)
 }
 
 fn sequence(bytes: &[u8]) -> Result<u64, Error> {
@@ -153,7 +172,7 @@ fn text(value: &str) -> Result<String, Error> {
     copy.push_str(value);
     Ok(copy)
 }
-fn decode(row: &tokio_postgres::Row, sequence: u64) -> Result<Mailbox, Error> {
+fn decode(row: &tokio_postgres::Row, identity: ViewIdentity) -> Result<Mailbox, Error> {
     let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
     let id = MailboxId::from_bytes(id.try_into().map_err(|_| Error::Integrity)?);
     let name: &str = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -184,7 +203,7 @@ fn decode(row: &tokio_postgres::Row, sequence: u64) -> Result<Mailbox, Error> {
         .map_err(|_| Error::Integrity)?;
     let changed = sequence_from_row(row, 6)?;
     let valid: bool = row.try_get(11).map_err(|_| Error::Integrity)?;
-    if changed > sequence || !valid {
+    if changed > identity.committed_sequence.number() || !valid {
         return Err(Error::Integrity);
     }
     let count = |column| -> Result<u64, Error> {
@@ -192,6 +211,8 @@ fn decode(row: &tokio_postgres::Row, sequence: u64) -> Result<Mailbox, Error> {
         u64::try_from(value).map_err(|_| Error::Integrity)
     };
     let counts = Counts {
+        identity,
+        mailbox: id,
         total_emails: count(7usize)?,
         unread_emails: count(8usize)?,
         total_threads: count(9usize)?,

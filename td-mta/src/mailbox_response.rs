@@ -1,12 +1,34 @@
 //! Bounded Mailbox object projection from a retained account snapshot.
 use crate::{
     bounded::TextBuffer,
-    format::{key::Key, row::Row},
+    format::{
+        key::Key,
+        row::{MailboxRow, Row},
+    },
     ids::MailboxId,
-    ports::{Error, ReadView},
-    store_fs::{IndexReadView, MailboxCounts},
+    ports::{Error, ReadView, ViewIdentity},
+    store_fs::IndexReadView,
     wire,
 };
+
+/// Passive counts from one account snapshot, never authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MailboxCounts {
+    pub identity: ViewIdentity,
+    pub mailbox: MailboxId,
+    pub total_emails: u64,
+    pub unread_emails: u64,
+    pub total_threads: u64,
+    pub unread_threads: u64,
+}
+
+/// One bounded row and optional counts from the caller's admitted snapshot.
+pub struct Object<'a> {
+    pub identity: ViewIdentity,
+    pub id: MailboxId,
+    pub row: MailboxRow<'a>,
+    pub counts: Option<&'a MailboxCounts>,
+}
 
 /// Enough for every valid stored Mailbox object, including JSON escaping.
 pub const MAX_OBJECT_BYTES: usize = 8192;
@@ -100,6 +122,43 @@ pub fn encode(
     let Row::Mailbox(row) = row else {
         return Err(Error::Corrupt);
     };
+    let length = encode_object(
+        Object {
+            identity: view.identity(),
+            id,
+            row,
+            counts,
+        },
+        projection,
+        rights,
+        output,
+    )?;
+    view.check_snapshot()?;
+    Ok(Some(length))
+}
+
+/// Project passive values without storage access. The caller must keep its
+/// original snapshot/deadline and verify it before publishing these bytes.
+pub fn encode_object(
+    object: Object<'_>,
+    projection: Projection,
+    rights: Rights,
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    let Object {
+        identity,
+        id,
+        row,
+        counts,
+    } = object;
+    Row::Mailbox(row)
+        .validate_key(Key::Mailbox(id))
+        .map_err(|_| Error::Corrupt)?;
+    if let Some(counts) = counts {
+        if counts.identity != identity || counts.mailbox != id {
+            return Err(Error::Invalid);
+        }
+    }
     if projection.needs_counts() && counts.is_none() {
         return Err(Error::Invalid);
     }
@@ -176,8 +235,7 @@ pub fn encode(
         )?;
     }
     append(&mut out, "}")?;
-    view.check_snapshot()?;
-    Ok(Some(out.len()))
+    Ok(out.len())
 }
 fn append(out: &mut TextBuffer<'_>, text: &str) -> Result<(), Error> {
     out.append(text).map_err(|_| Error::Capacity)

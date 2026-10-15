@@ -2762,7 +2762,10 @@ per_peer_limit = 1
     let mut serving = fixture.request();
     serving.user = "mail_runtime";
     serving.mode = td_mta::postgres_probe::Mode::Runtime;
-    let profile_request = if matches!(exercise, ConfigurationExercise::Flags) {
+    let profile_request = if matches!(
+        exercise,
+        ConfigurationExercise::Flags | ConfigurationExercise::Read
+    ) {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
         &serving
@@ -2848,7 +2851,7 @@ per_peer_limit = 1
                     exercise_query(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Read => {
-                    exercise_read(&fixture, &request, &trust, prepared.binding())
+                    exercise_read(&fixture, profile_request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Changes => {
                     exercise_changes(&fixture, &request, &trust, prepared.binding())
@@ -3356,6 +3359,8 @@ fn real_postgres_mailbox_reads_bind_authentication_counts_and_state() {
     assert_eq!(
         listing.mailboxes[0].counts,
         mailboxes::Counts {
+            identity: listing.identity,
+            mailbox: creation.inbox(),
             total_emails: 5,
             unread_emails: 2,
             total_threads: 2,
@@ -5101,8 +5106,68 @@ fn exercise_read(
         read::with_snapshot(request, trust, deadline(), binding, b"bad", |_| Ok(())),
         Err(read::Error::Unauthenticated)
     ));
+    let check_mailbox = |view: &mut read::Snapshot<'_>, expected: u64| -> Result<(), read::Error> {
+        use td_mta::mailbox_response::{self, Object, Projection, Rights};
+        let listing = view.mailbox_listing()?;
+        let row = listing.iter().find(|row| row.id == mailbox).unwrap();
+        assert_eq!(row.counts.identity, view.identity());
+        assert_eq!(row.counts.total_emails, expected);
+        assert_eq!(row.counts.unread_emails, 0);
+        let rights = Rights {
+            may_read_items: true,
+            may_add_items: true,
+            may_remove_items: true,
+            may_set_seen: true,
+            may_set_keywords: true,
+            may_create_child: false,
+            may_rename: false,
+            may_delete: false,
+            may_submit: false,
+        };
+        let mut bytes = [0; mailbox_response::MAX_OBJECT_BYTES];
+        let object = Object {
+            identity: view.identity(),
+            id: row.id,
+            row: row.row(),
+            counts: Some(&row.counts),
+        };
+        let length =
+            mailbox_response::encode_object(object, Projection::all(), rights, &mut bytes).unwrap();
+        let text = std::str::from_utf8(&bytes[..length]).unwrap();
+        assert!(text.contains("\"name\":\"Drafts\""));
+        assert!(text.contains(&format!("\"totalEmails\":{expected},")));
+        assert!(text.contains("\"unreadEmails\":0,"));
+        assert!(text.contains("\"maySubmit\":false"));
+        // Passive counts from another snapshot or mailbox must not mix.
+        for mismatch in [
+            td_mta::mailbox_response::MailboxCounts {
+                mailbox: MailboxId::from_bytes([0xee; 16]),
+                ..row.counts
+            },
+            td_mta::mailbox_response::MailboxCounts {
+                identity: td_mta::ports::ViewIdentity {
+                    committed_sequence: td_mta::format::Sequence::from_u64(999),
+                    ..view.identity()
+                },
+                ..row.counts
+            },
+        ] {
+            let object = Object {
+                identity: view.identity(),
+                id: row.id,
+                row: row.row(),
+                counts: Some(&mismatch),
+            };
+            assert_eq!(
+                mailbox_response::encode_object(object, Projection::all(), rights, &mut bytes),
+                Err(td_mta::ports::Error::Invalid)
+            );
+        }
+        view.check()
+    };
     read::with_snapshot(request,trust,deadline(),binding,password,|view| {
         assert_eq!(view.identity().committed_sequence.number(),3);
+        check_mailbox(view, 2)?;
         let metadata=view.email(first.email)?.unwrap();
         assert_eq!(metadata.blob,first.blob);
         assert_eq!(view.email(EmailId::from_bytes([0xee;16]))?,None);
@@ -5128,10 +5193,12 @@ fn exercise_read(
         })?;
         assert!(String::from_utf8(bytes).unwrap().ends_with("c25hcHNob3QgdGV4dA==\r\n"));
         assert!(view.email(second.email)?.is_some());
+        check_mailbox(view, 2)?;
         Ok(())
     }).unwrap();
     read::with_snapshot(request, trust, deadline(), binding, password, |view| {
         assert_eq!(view.identity().committed_sequence.number(), 4);
+        check_mailbox(view, 1)?;
         assert_eq!(view.email(first.email)?, None);
         assert!(view.mailboxes(first.email, None, 1)?.values.is_empty());
         Ok(())

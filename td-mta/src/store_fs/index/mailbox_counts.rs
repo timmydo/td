@@ -2,16 +2,7 @@
 use super::*;
 use crate::ids::ThreadId;
 
-/// Passive snapshot metadata, not authorization or a mutation reservation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MailboxCounts {
-    pub identity: ViewIdentity,
-    pub mailbox: MailboxId,
-    pub total_emails: u64,
-    pub unread_emails: u64,
-    pub total_threads: u64,
-    pub unread_threads: u64,
-}
+pub use crate::mailbox_response::MailboxCounts;
 
 /// Maximum input batch; memory is bounded independently of account size.
 pub const MAX_MAILBOX_COUNTS: usize = 256;

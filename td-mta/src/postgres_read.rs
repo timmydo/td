@@ -5,7 +5,7 @@ use crate::{
     ids::{EmailId, MailboxId, ThreadId},
     ports::{self, BlobReader, ViewIdentity},
     postgres_body::{self, BlobMetadata, Metadata, ReadRequest},
-    postgres_devices,
+    postgres_devices, postgres_mailboxes,
     postgres_probe::{self, Request, Worker},
     postgres_runtime_profile::Binding,
     postgres_schema, postgres_snapshot,
@@ -27,6 +27,7 @@ pub enum Error {
     Database,
     Invalid,
     Body(postgres_body::Error),
+    Mailboxes(postgres_mailboxes::Error),
 }
 #[derive(Debug)]
 pub struct Values<T> {
@@ -126,6 +127,19 @@ impl Snapshot<'_> {
         }
         self.check()?;
         result
+    }
+    /// Names, hierarchy and counts share this view's policy/device admission,
+    /// state and deadline. Returned rows confer no later read authority.
+    pub fn mailbox_listing(&mut self) -> Result<Vec<postgres_mailboxes::Mailbox>, Error> {
+        self.check()?;
+        let identity = self.identity;
+        let deadline = self.deadline;
+        let result = self
+            .worker
+            .run(|client| Box::pin(postgres_mailboxes::read(client, identity, deadline)))
+            .map_err(Error::Connection)
+            .and_then(|result| result.map_err(Error::Mailboxes));
+        self.retain(result)
     }
     /// Metadata alone does not authorize body output; with_body verifies the
     /// exact same snapshot's chunks before calling its consumer.
