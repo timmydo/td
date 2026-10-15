@@ -206,6 +206,48 @@ pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+#[derive(Clone, Copy)]
+pub struct DraftAccess<'a> {
+    pub creator: &'a dyn DraftCreator,
+    pub device: crate::ids::DeviceId,
+    pub state: Option<crate::sync::DataState>,
+}
+/// Prepared singleton Email/set with freshly authenticated state for drafts.
+pub fn run_with_postgres_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    state: crate::sync::DataState,
+    device: crate::ids::DeviceId,
+    creator: &dyn DraftCreator,
+    flags: &dyn EmailMutator,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let request = plan.request().map_err(|_| Error::State)?;
+    if state.kind != crate::sync::DataType::Email
+        || request.call_count() != 1
+        || request
+            .calls()
+            .next()
+            .is_none_or(|call| call.name != b"Email/set")
+    {
+        return Err(Error::InvalidArguments);
+    }
+    run_inner(
+        plan,
+        retention,
+        execution,
+        state.account,
+        Profile {
+            flags: Some((flags, device)),
+            drafts: Some(DraftAccess {
+                creator,
+                device,
+                state: Some(state),
+            }),
+            ..Profile::default()
+        },
+    )
+}
 /// Authenticated td-mail mutations, including root-folder creation.
 pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
@@ -224,7 +266,11 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
         Profile {
             flags: Some((mutations, device)),
             mailboxes: Some((mutations, device)),
-            drafts: drafts.map(|creator| (creator, device)),
+            drafts: drafts.map(|creator| DraftAccess {
+                creator,
+                device,
+                state: None,
+            }),
             identities: None,
             read: None,
             email_updates: false,
@@ -540,7 +586,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
 struct Profile<'a> {
     flags: Option<(&'a dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&'a dyn MailboxMutator, crate::ids::DeviceId)>,
-    drafts: Option<(&'a dyn DraftCreator, crate::ids::DeviceId)>,
+    drafts: Option<DraftAccess<'a>>,
     identities: Option<&'a crate::identity_catalog::Catalog>,
     read: Option<&'a mut dyn MailRead>,
     email_updates: bool,
@@ -557,7 +603,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     account: AccountId,
     flags: Option<(&'io dyn EmailMutator, crate::ids::DeviceId)>,
     mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
-    drafts: Option<(&'io dyn DraftCreator, crate::ids::DeviceId)>,
+    drafts: Option<DraftAccess<'io>>,
     identities: Option<&'io crate::identity_catalog::Catalog>,
     read: Option<&'io mut dyn MailRead>,
     email_updates: bool,

@@ -135,6 +135,7 @@ struct Completion {
 pub struct Pending {
     change: Mutex<Option<Operation>>,
     pub mailboxes: crate::postgres_http_mailboxes::Pending,
+    pub drafts: crate::postgres_http_drafts::Pending,
 }
 impl Pending {
     pub fn operation(&self) -> Result<Option<EmailOperationId>, Error> {

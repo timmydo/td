@@ -2185,7 +2185,14 @@ fn real_postgres_td_mail_reads_and_downloads() {
     exercise_configuration(ConfigurationExercise::Client);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools required"]
+fn real_postgres_http_drafts_create_read_and_settle() {
+    exercise_configuration(ConfigurationExercise::HttpDrafts);
+}
+
 enum ConfigurationExercise {
+    HttpDrafts,
     Client,
     Submissions,
     SubmissionInput,
@@ -2786,7 +2793,10 @@ per_peer_limit = 1
     serving.mode = td_mta::postgres_probe::Mode::Runtime;
     let profile_request = if matches!(
         exercise,
-        ConfigurationExercise::Flags | ConfigurationExercise::Read | ConfigurationExercise::Client
+        ConfigurationExercise::Flags
+            | ConfigurationExercise::Read
+            | ConfigurationExercise::HttpDrafts
+            | ConfigurationExercise::Client
     ) {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
@@ -2873,8 +2883,11 @@ per_peer_limit = 1
                 ConfigurationExercise::Query => {
                     exercise_query(&fixture, &request, &trust, prepared.binding())
                 }
+                ConfigurationExercise::HttpDrafts => {
+                    exercise_read(&fixture, profile_request, &trust, prepared.binding(), true)
+                }
                 ConfigurationExercise::Read => {
-                    exercise_read(&fixture, profile_request, &trust, prepared.binding())
+                    exercise_read(&fixture, profile_request, &trust, prepared.binding(), false)
                 }
                 ConfigurationExercise::Changes => {
                     exercise_changes(&fixture, &request, &trust, prepared.binding())
@@ -5513,6 +5526,7 @@ fn exercise_http_read(
     binding: &td_mta::postgres_runtime_profile::Binding,
     password: &[u8],
     device: td_mta::ids::DeviceId,
+    drafts: bool,
 ) {
     use std::sync::Arc;
     use td_mta::{
@@ -5602,7 +5616,8 @@ fn exercise_http_read(
         .unwrap();
     let timeouts = NetworkLimits::default().plan(&disk).unwrap();
     let clock = Arc::new(td_mta::clock::RuntimeClock::new());
-    let until = || Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let milliseconds = std::cell::Cell::new(10_000);
+    let until = || Deadline::after(clock.sample().unwrap().monotonic, milliseconds.get()).unwrap();
     let directory = fixture.root.join("http-read-responses");
     fs::create_dir(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5916,6 +5931,60 @@ fn exercise_http_read(
     assert!(wire.is_empty());
     drop(held);
     download(raw, password, false).0.unwrap();
+    if drafts {
+        let mailbox = sql(
+            fixture,
+            "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE name='Drafts'",
+        );
+        let mailbox = td_mta::ids::MailboxId::parse(&mailbox).unwrap();
+        let mut encoded = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let mailbox = td_mta::wire::encode_id(mailbox, &mut encoded).unwrap();
+        let draft = td_json::json!({
+            "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},
+            "from":[{"name":"Sender","email":"sender@example.test"}],
+            "to":[{"name":null,"email":"recipient@example.test"}],
+            "subject":"HTTP PostgreSQL draft", "messageId":["http-postgres@example.test"],
+            "sentAt":"2026-10-13T12:00:59Z",
+            "textBody":[{"partId":"text","type":"text/plain"}],
+            "bodyValues":{"text":{"value":"HTTP draft body","isEncodingProblem":false,"isTruncated":false}}
+        });
+        let body = td_json::json!({"using":["urn:ietf:params:jmap:mail"], "methodCalls":[["Email/set", {"accountId":account,"create":{"draft":draft.clone()}},"c"]]}).to_string();
+        let (result, output) = call(&body, password, device, false, false, false);
+        result.unwrap();
+        let created = td_json::parse(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let result = &created["methodResponses"][0][1];
+        let email = result["created"]["draft"]["id"].as_str().unwrap();
+        let blob = result["created"]["draft"]["blobId"].as_str().unwrap();
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
+        let stale = td_json::json!({"using":["urn:ietf:params:jmap:mail"], "methodCalls":[["Email/set", {"accountId":account,"ifInState":result["oldState"].clone(),"create":{"draft":draft.clone()}},"c"]]}).to_string();
+        let (result, output) = call(&stale, password, device, false, false, false);
+        result.unwrap();
+        assert!(output.contains("stateMismatch"), "{output}");
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "3");
+        let get = td_json::json!({"using":["urn:ietf:params:jmap:mail"], "methodCalls":[["Email/get", {"accountId":account,"ids":[email],"properties":["subject","bodyValues","textBody"],"fetchTextBodyValues":true},"g"]]}).to_string();
+        let (result, output) = call(&get, password, device, false, false, false);
+        result.unwrap();
+        assert!(output.contains("HTTP draft body"), "{output}");
+        let (result, output) = download(blob, password, false);
+        result.unwrap();
+        assert!(output.contains("http-postgres@example.test"), "{output}");
+        sql(fixture, "CREATE FUNCTION public.delay_http_draft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_draft AFTER INSERT ON td_mta.draft_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_draft()");
+        milliseconds.set(2_000);
+        let _ = call(&body, password, device, false, false, false);
+        let operation = pending.drafts.operation().unwrap().unwrap();
+        milliseconds.set(10_000);
+        thread::sleep(Duration::from_secs(5));
+        sql(fixture, "DROP TRIGGER delay_http_draft ON td_mta.draft_receipts; DROP FUNCTION public.delay_http_draft()");
+        let settlement = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+        let settled = pending
+            .drafts
+            .settle(&loaded, service.executable, &settlement, &clock, until())
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.operation, operation);
+        assert_eq!(pending.drafts.operation().unwrap(), None);
+        assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
+    }
 }
 
 fn exercise_resolved_read(
@@ -6040,6 +6109,7 @@ fn exercise_read(
     request: &Request<'_>,
     trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
+    http_drafts: bool,
 ) {
     use td_mta::{
         compose_text::{Address, Message},
@@ -6088,7 +6158,16 @@ fn exercise_read(
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
-    exercise_http_read(fixture, binding, password, creation.device_id());
+    exercise_http_read(
+        fixture,
+        binding,
+        password,
+        creation.device_id(),
+        http_drafts,
+    );
+    if http_drafts {
+        return;
+    }
     // Pin equal dates so both sort directions must use ascending-ID ties.
     sql(
         fixture,

@@ -45,7 +45,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         expected: Option<(StoreEpoch, Sequence)>,
         maximum: usize,
     ) -> Result<Range<u64>, Error> {
-        let (creator, device) = self.drafts.ok_or(Error::InvalidArguments)?;
+        let access = self.drafts.ok_or(Error::InvalidArguments)?;
+        let creator = access.creator;
+        let device = access.device;
         let mut objects = create.as_object().ok_or(Error::InvalidArguments)?;
         if objects.len() > maximum {
             return Err(Error::RequestTooLarge);
@@ -66,12 +68,26 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             .try_reserve_exact(bound)
             .map_err(|_| Error::ResponseCapacity)?;
         output.resize(bound, 0);
-        let before = self
-            .retention
-            .method_view(self.account, self.execution)
-            .map_err(storage)?
-            .identity();
-        if expected.is_some_and(|state| state != (before.epoch, before.committed_sequence)) {
+        let before = match access.state {
+            Some(state) => state,
+            None => {
+                let view = self
+                    .retention
+                    .method_view(self.account, self.execution)
+                    .map_err(storage)?;
+                let identity = view.identity();
+                DataState {
+                    account: self.account,
+                    epoch: identity.epoch,
+                    kind: DataType::Email,
+                    sequence: identity.committed_sequence,
+                }
+            }
+        };
+        if before.account != self.account || before.kind != DataType::Email {
+            return Err(Error::State);
+        }
+        if expected.is_some_and(|state| state != (before.epoch, before.sequence)) {
             return Err(Error::StateMismatch);
         }
         let creation = self.prepare_creation(key.as_bytes())?;
@@ -106,11 +122,21 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     }
                     Err(CommitError::Indeterminate(_)) => return Err(Error::ServerPartialFail),
                 };
-                (complete.before, sequence, Some(complete), None, "")
+                (
+                    DataState {
+                        epoch: complete.before_epoch,
+                        sequence: complete.before_sequence,
+                        ..before
+                    },
+                    sequence,
+                    Some(complete),
+                    None,
+                    "",
+                )
             }
             Err(DraftError::Input(draft_input::Error::Property(property))) => (
                 before,
-                before.committed_sequence,
+                before.sequence,
                 None,
                 Some(property),
                 "invalidProperties",
@@ -129,15 +155,15 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             ))) => {
                 // These codes also describe clock, spool and store failures;
                 // they cannot establish which client property was invalid.
-                (before, before.committed_sequence, None, None, "serverFail")
+                (before, before.sequence, None, None, "serverFail")
             }
             Err(DraftError::Store(UploadError::Store(ports::Error::Quota))) => {
-                (before, before.committed_sequence, None, None, "tooLarge")
+                (before, before.sequence, None, None, "tooLarge")
             }
             Err(DraftError::Store(error)) => return Err(failure(error, expected.is_some())),
         };
         (|| {
-            let old = DataState { account: self.account, epoch: before.epoch, kind: DataType::Email, sequence: before.committed_sequence };
+            let old = DataState { account: self.account, epoch: before.epoch, kind: DataType::Email, sequence: before.sequence };
             let new = DataState { sequence, ..old };
             let mut old_bytes = [0; DataState::WIRE_BYTES];
             let mut new_bytes = [0; DataState::WIRE_BYTES];

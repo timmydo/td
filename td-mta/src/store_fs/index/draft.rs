@@ -33,7 +33,8 @@ pub struct DraftRequest {
 #[derive(Debug)]
 #[must_use = "preserve known publication even if accounting or cleanup fails"]
 pub struct DraftCompletion {
-    pub before: ViewIdentity,
+    pub before_epoch: StoreEpoch,
+    pub before_sequence: Sequence,
     pub email: EmailId,
     pub blob: BlobId,
     pub thread: ThreadId,
@@ -434,7 +435,8 @@ impl<P: DraftAuthorization> StoreCoordinator<'_, '_, P> {
         state.recoverable_files = recoverable && canceled;
         reservation.lease = None;
         Ok(DraftCompletion {
-            before,
+            before_epoch: before.epoch,
+            before_sequence: before.committed_sequence,
             email,
             blob,
             thread,

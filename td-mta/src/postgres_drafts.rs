@@ -90,6 +90,13 @@ impl Draft {
     pub fn blob(&self) -> BlobId {
         self.blob
     }
+    /// Provisional candidate only; publication can select an existing thread.
+    pub fn thread_candidate(&self) -> ThreadId {
+        self.new_thread
+    }
+    pub fn length(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 fn copy(value: &str) -> Result<String, Error> {

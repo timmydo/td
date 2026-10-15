@@ -412,3 +412,9 @@ SQLite native fixture. It does not activate a production PostgreSQL service
 or qualify folder deletion, submission, cloud-provider
 failover or managed-database deployment. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.
+
+The separate `real_postgres_http_drafts_create_read_and_settle` fixture drives
+the prepared HTTP body adapter with the td-mail structured plain-text shape.
+It checks creation, stale-state refusal, body retrieval, raw download and
+delayed-COMMIT receipt settlement. It does not exercise td-mail sending or
+advertise Submission.

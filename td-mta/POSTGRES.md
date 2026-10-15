@@ -2614,3 +2614,28 @@ HTTP creation. The PostgreSQL draft fixture checks exhausted record/output
 budgets and expired original/phase deadlines refuse before publication, then
 publishes a caller-funded draft through the existing receipt, body, thread and
 history checks.
+
+
+## 84. Prepared HTTP plain-text drafts
+
+The singleton Email/set service now accepts td-mail's existing structured
+plain-text draft shape. It captures authenticated Email state, closes the
+read transaction before composition, and supplies that state to the shared
+response adapter without opening a native view. Publication rechecks device,
+profile, epoch, mailbox and optional sequence. Completion carries the actual
+before epoch/sequence and known durable result through response generation.
+
+The prepared owner admits one composed or uncertain draft body, bounded by the
+selected message ceiling and the helper's 32-MiB cap. It is held before input
+parsing or composition; the original request meter funds decoding, composition,
+hashing and prepaid publication work. A foreground database slot is reserved
+before DNS. No app password survives the synchronous call. Other mutation
+families retain their independent bounded owners. Runtime memory-plan
+qualification and durable restart ownership remain production cutover work.
+
+Uncertain COMMIT retains the original Draft and blocks new draft creation.
+Settlement uses separately admitted database capacity to inspect that exact
+receipt; absence or error preserves the owner. It does not publish again.
+The HTTP fixture creates and retrieves a draft, refuses a stale state without
+effects, downloads its immutable message and settles a delayed commit. This
+activates no production service, attachment upload or submission capability.

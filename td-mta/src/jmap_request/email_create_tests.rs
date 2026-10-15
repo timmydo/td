@@ -6,7 +6,7 @@ use crate::{
     jmap_request::{dispatch, response, CORE, MAIL},
     limits::Limits,
     ownership::SlotState,
-    ports::{Clock, Deadline, Tick, Time, ViewIdentity},
+    ports::{Clock, Deadline, Tick, Time},
     store_fs::{tests::Fixture, AuxiliaryUsage, IndexStore, RequestSpool, StoreCoordinator},
 };
 use std::sync::{
@@ -59,12 +59,8 @@ impl DraftCreator for Creator {
             _ => (),
         }
         Ok(DraftCompletion {
-            before: ViewIdentity {
-                account: ACCOUNT,
-                epoch: StoreEpoch::from_bytes([7; 16]),
-                committed_sequence: Sequence::from_u64(1),
-                history_floor: Sequence::default(),
-            },
+            before_epoch: StoreEpoch::from_bytes([7; 16]),
+            before_sequence: Sequence::from_u64(1),
             email: EmailId::from_bytes([3; 16]),
             blob: BlobId::from_bytes([4; 16]),
             thread: ThreadId::from_bytes([5; 16]),
@@ -364,7 +360,11 @@ fn insufficient_response_space_refuses_before_calling_the_creator() {
             account: ACCOUNT,
             flags: Some((&creator, DEVICE)),
             mailboxes: None,
-            drafts: Some((&creator, DEVICE)),
+            drafts: Some(dispatch::DraftAccess {
+                creator: &creator,
+                device: DEVICE,
+                state: None,
+            }),
             identities: None,
             read: None,
             email_updates: false,

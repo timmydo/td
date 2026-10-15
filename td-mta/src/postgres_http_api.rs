@@ -264,6 +264,7 @@ impl Service<'_, '_, '_> {
             request.credentials.password(),
         )
         .map_err(|error| ApiError::Io(read_error(error)))?;
+        let identity = snapshot.identity();
         let complete = if matches!(mutation, Some(b"Email/set" | b"Mailbox/set")) {
             drop(
                 snapshot
@@ -298,12 +299,28 @@ impl Service<'_, '_, '_> {
                     pending: self.pending,
                     password: request.credentials.password(),
                 };
-                dispatch::run_with_postgres_updates(
+                let drafts = crate::postgres_http_drafts::Drafts {
+                    loaded: self.loaded,
+                    executable: self.executable,
+                    binding: self.binding,
+                    slots: self.slots,
+                    clock: self.clock,
+                    pending: &self.pending.drafts,
+                    password: request.credentials.password(),
+                    maximum_text: self.resources.limits().json_bytes,
+                };
+                dispatch::run_with_postgres_mail_access(
                     plan,
                     retention,
                     execution,
-                    self.binding.account(),
+                    crate::sync::DataState {
+                        account: identity.account,
+                        epoch: identity.epoch,
+                        kind: crate::sync::DataType::Email,
+                        sequence: identity.committed_sequence,
+                    },
                     request.device,
+                    &drafts,
                     &updates,
                 )
             }
