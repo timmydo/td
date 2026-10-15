@@ -214,6 +214,7 @@ mod tests {
 }
 
 pub mod submission_envelope;
+pub mod submission_request;
 
 mod device_credentials;
 

@@ -2657,3 +2657,21 @@ publication work, fresh device authorization and receipt ownership remain the
 runtime caller's obligations. The local PostgreSQL fixture verifies exhausted
 work and both deadline refusals, then checks caller-funded input through the
 existing privacy, source-state, route and queue-publication evidence.
+
+
+## 86. td-mail submission request decoding
+
+The inert submission_request decoder borrows the parsed JSON arena and spends
+its original work meter under a non-extending phase deadline. It decodes only
+td-mail's emailId/identityId creation object and success-filing patch: remove
+$draft, optionally add the Sent membership and remove the original membership.
+Both mailbox operands survive decoding; a later publisher must not interpret
+that patch as permission to replace an unrelated current mailbox.
+
+Literal and request-local Email references remain distinct. A valid opaque ID
+is retained without claiming it names a local object. The decoder neither
+resolves creation IDs nor authorizes account, identity or mailbox access.
+Call-level account/state checks, creation-key binding, successful-submission
+selection, publication and the separate implicit Email/set response remain
+handler work. Unsupported fields and incomplete filing shapes are explicit
+refusals. No Submission capability or serving path is enabled by this decoder.
