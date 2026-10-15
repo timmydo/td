@@ -2887,3 +2887,14 @@ transaction states. Each worker freshly authorizes its operation. These
 calls are independent transactions: a failed submission leaves its draft,
 and failed filing leaves a successful submission. This does not advertise
 Submission or activate the production PostgreSQL backend.
+
+## 98. Prepared HTTP submission dispatch
+
+The inert PostgreSQL HTTP adapter admits the Submission capability and
+routes a singleton EmailSubmission/set or td-mail's draft-and-submit batch
+to the prepared mutation dispatcher. It releases its fresh authenticated
+snapshot before mutations, retains the original response owner and deadline,
+and uses the shared pending owners for draft, submission and filing. Read
+requests can use Identity/get and submission reconciliation through the same
+admission path. Session metadata and the active SQLite HTTP adapter remain
+unchanged; production activation still requires atomic backend cutover.

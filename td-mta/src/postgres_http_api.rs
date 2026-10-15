@@ -231,6 +231,11 @@ impl Service<'_, '_, '_> {
             return Err(Error::Forbidden.into());
         }
         let exchange = Exchange {
+            capabilities: &[
+                crate::jmap_request::CORE,
+                crate::jmap_request::MAIL,
+                crate::jmap_request::SUBMISSION,
+            ],
             resources: self.resources,
             session: self.session,
             response_maximum: self.response_maximum,
@@ -247,12 +252,21 @@ impl Service<'_, '_, '_> {
             exchange.receive(request, sender, start, &mut retention, |_| Ok(()))?;
         retention.admit_work_turn()?;
         let execution = execution.min(crate::ports::Deadline::after(sender.last, 10_000)?);
-        let mutation = {
+        let (mutation, send_batch) = {
             let request = plan.request().map_err(|_| ApiError::Io(Error::Invalid))?;
+            let mut calls = request.calls();
+            let first = calls.next();
             if request.call_count() == 1 {
-                request.calls().next().map(|call| call.name)
+                (first.map(|call| call.name), false)
+            } else if request.call_count() == 2
+                && first.is_some_and(|call| call.name == b"Email/set")
+                && calls
+                    .next()
+                    .is_some_and(|call| call.name == b"EmailSubmission/set")
+            {
+                (Some(b"EmailSubmission/set".as_slice()), true)
             } else {
-                None
+                (None, false)
             }
         };
         let mut snapshot = Snapshot::open_resolved(
@@ -265,7 +279,10 @@ impl Service<'_, '_, '_> {
         )
         .map_err(|error| ApiError::Io(read_error(error)))?;
         let identity = snapshot.identity();
-        let complete = if matches!(mutation, Some(b"Email/set" | b"Mailbox/set")) {
+        let complete = if matches!(
+            mutation,
+            Some(b"Email/set" | b"Mailbox/set" | b"EmailSubmission/set")
+        ) {
             drop(
                 snapshot
                     .finish_method()
@@ -309,20 +326,51 @@ impl Service<'_, '_, '_> {
                     password: request.credentials.password(),
                     maximum_text: self.resources.limits().json_bytes,
                 };
-                dispatch::run_with_postgres_mail_access(
-                    plan,
-                    retention,
-                    execution,
-                    crate::sync::DataState {
-                        account: identity.account,
-                        epoch: identity.epoch,
-                        kind: crate::sync::DataType::Email,
-                        sequence: identity.committed_sequence,
-                    },
-                    request.device,
-                    &drafts,
-                    &updates,
-                )
+                if mutation == Some(b"EmailSubmission/set".as_slice()) {
+                    let submissions = crate::postgres_http_submissions::Submissions {
+                        loaded: self.loaded,
+                        executable: self.executable,
+                        binding: self.binding,
+                        slots: self.slots,
+                        clock: self.clock,
+                        pending: &self.pending.submissions,
+                        password: request.credentials.password(),
+                    };
+                    let access = dispatch::SubmissionAccess {
+                        creator: &submissions,
+                        filer: &updates,
+                        clock: self.clock,
+                        device: request.device,
+                        state: crate::sync::DataState {
+                            account: identity.account,
+                            epoch: identity.epoch,
+                            kind: crate::sync::DataType::Submission,
+                            sequence: identity.committed_sequence,
+                        },
+                    };
+                    if send_batch {
+                        dispatch::run_with_postgres_send(
+                            plan, retention, execution, access, &drafts, &updates,
+                        )
+                    } else {
+                        dispatch::run_with_postgres_submissions(plan, retention, execution, access)
+                    }
+                } else {
+                    dispatch::run_with_postgres_mail_access(
+                        plan,
+                        retention,
+                        execution,
+                        crate::sync::DataState {
+                            account: identity.account,
+                            epoch: identity.epoch,
+                            kind: crate::sync::DataType::Email,
+                            sequence: identity.committed_sequence,
+                        },
+                        request.device,
+                        &drafts,
+                        &updates,
+                    )
+                }
             }
         } else {
             let result = dispatch::run_with_postgres_read(

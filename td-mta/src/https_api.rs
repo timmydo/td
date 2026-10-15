@@ -165,6 +165,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
 {
     fn execute(&self, request: &Request<'_>, sender: &mut Sender<'_>) -> Result<(), ApiError> {
         let exchange = Exchange {
+            capabilities: &[jmap_request::CORE, jmap_request::MAIL],
             resources: self.resources,
             session: self.session,
             response_maximum: self.response_maximum,
@@ -212,6 +213,7 @@ impl<P: crate::store_fs::EmailUpdateAuthorization + crate::store_fs::MailboxAuth
 /// Shared bounded HTTP/JMAP framing. Storage admission and fresh authorization
 /// remain with the backend that owns the response and dispatch snapshot.
 pub(crate) struct Exchange<'a> {
+    pub(crate) capabilities: &'static [&'static str],
     pub(crate) resources: &'a ResourcePlan,
     pub(crate) session: &'a Session,
     pub(crate) response_maximum: u64,
@@ -356,12 +358,9 @@ impl<'a> Exchange<'a> {
         }
         sender.check()?;
         let document = cursor.finish().map_err(|error| parser(error.error()))?;
-        let mut validation = jmap_request::OwnedValidation::new(
-            document,
-            self.resources,
-            &[jmap_request::CORE, jmap_request::MAIL],
-        )
-        .map_err(|error| ApiError::Request(error.error()))?;
+        let mut validation =
+            jmap_request::OwnedValidation::new(document, self.resources, self.capabilities)
+                .map_err(|error| ApiError::Request(error.error()))?;
         loop {
             sender.check()?;
             if !retention.admit_before(execution)? {

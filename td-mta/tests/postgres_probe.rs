@@ -6036,6 +6036,73 @@ fn exercise_http_read(
         assert_eq!(settled.operation, operation);
         assert_eq!(pending.drafts.operation().unwrap(), None);
         assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "4");
+        let catalog = binding.identity_catalog().unwrap();
+        let identity_id = catalog.ids().next().unwrap();
+        let mut identity_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+        let identity = td_mta::wire::encode_id(identity_id, &mut identity_bytes).unwrap();
+        let mut send_draft = draft;
+        let _ = send_draft.insert(
+            "from",
+            td_json::json!([{"email":binding.identity_email(identity_id).unwrap()}]),
+        );
+        let send = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail","urn:ietf:params:jmap:submission"],"methodCalls":[
+            ["Email/set",{"accountId":account,"create":{"draft":send_draft}},"0"],
+            ["EmailSubmission/set",{"accountId":account,"create":{"submission":{"emailId":"#draft","identityId":identity}},"onSuccessUpdateEmail":{"#submission":{"keywords/$draft":null}}},"1"]
+        ]}).to_string();
+        let before = sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+            .parse::<usize>()
+            .unwrap();
+        let (result, output) = call(&send, password, device, true, false, false);
+        result.unwrap();
+        let output = output
+            .strip_prefix("HTTP/1.1 100 Continue\r\n\r\n")
+            .unwrap();
+        let output = td_json::parse(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+        let replies = output["methodResponses"].as_array().unwrap();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0][0].as_str(), Some("Email/set"));
+        assert_eq!(replies[1][0].as_str(), Some("EmailSubmission/set"));
+        assert_eq!(replies[2][0].as_str(), Some("Email/set"));
+        assert_eq!(replies[1][2], replies[2][2]);
+        let email = replies[0][1]["created"]["draft"]["id"].as_str().unwrap();
+        assert!(replies[2][1]["updated"].get(email).unwrap().is_null());
+        let submitted = replies[1][1]["created"]["submission"]["id"]
+            .as_str()
+            .unwrap();
+        let read = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:submission"],"methodCalls":[
+            ["Identity/get",{"accountId":account},"i"],
+            ["EmailSubmission/get",{"accountId":account,"ids":[submitted],"properties":["id","emailId"]},"s"]
+        ]}).to_string();
+        let (result, output) = call(&read, password, device, false, false, false);
+        result.unwrap();
+        let output = td_json::parse(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            output["methodResponses"][0][0].as_str(),
+            Some("Identity/get")
+        );
+        assert_eq!(
+            output["methodResponses"][1][1]["list"][0]["emailId"].as_str(),
+            Some(email)
+        );
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+                .parse::<usize>()
+                .unwrap(),
+            before + 1
+        );
+        // A lost final HTTP response must not erase accepted responsibility.
+        let (result, _) = call(&send, password, device, false, true, false);
+        assert!(result.is_err());
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+                .parse::<usize>()
+                .unwrap(),
+            before + 2
+        );
+        assert_eq!(pending.submissions.operation().unwrap(), None);
+        assert_eq!(pending.drafts.operation().unwrap(), None);
+        assert_eq!(pending.operation().unwrap(), None);
+        assert_eq!(responses.used().unwrap(), 0);
     }
 }
 
