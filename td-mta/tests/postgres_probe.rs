@@ -2052,9 +2052,14 @@ certificate = "public"
 session_limit = 1
 per_peer_limit = 1
 "#;
+    let cloud_roles = if matches!(exercise, ConfigurationExercise::Submissions) {
+        7
+    } else {
+        3
+    };
     let one = Profile {
         name: "cloud",
-        roles: Roles::from_bits(3).unwrap(),
+        roles: Roles::from_bits(cloud_roles).unwrap(),
         source: cloud.as_bytes(),
     };
     let two = Profile {
@@ -2078,7 +2083,7 @@ per_peer_limit = 1
     assert_eq!(candidate.profile_count(), 2);
     assert_eq!(candidate.profile(0).unwrap().name, "cloud");
     assert_eq!(candidate.profile(1).unwrap().name, "desktop");
-    assert_eq!(candidate.profile(0).unwrap().roles.bits(), 3);
+    assert_eq!(candidate.profile(0).unwrap().roles.bits(), cloud_roles);
     assert!(candidate.profile(2).is_none());
     assert_eq!(candidate.digest(), prepare(&[one, two]).unwrap().digest());
     assert_eq!(
@@ -2402,7 +2407,11 @@ per_peer_limit = 1
                 desktop_file.to_str().unwrap(),
                 "--instance",
                 "cloud",
-                "receive,jmap",
+                if cloud_roles == 7 {
+                    "receive,jmap,relay"
+                } else {
+                    "receive,jmap"
+                },
                 cloud_file.to_str().unwrap(),
             ]);
         }
@@ -2518,7 +2527,7 @@ per_peer_limit = 1
         td_mta::postgres_accounts::prepare(epoch, account).unwrap(),
     )
     .unwrap();
-    for (name, roles) in [("desktop", 2), ("cloud", 3)] {
+    for (name, roles) in [("desktop", 2), ("cloud", cloud_roles)] {
         let mut domain = GenerationSet::<TlsPolicies>::at_startup();
         let prepared = runtime::load(
             &request,
@@ -2535,9 +2544,12 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().profile(), name);
         assert_eq!(prepared.binding().roles().bits(), roles);
         assert_eq!(prepared.binding().route(), candidate.route(name).unwrap());
-        assert!(!prepared
-            .binding()
-            .serves_route(candidate.route(name).unwrap()));
+        assert_eq!(
+            prepared
+                .binding()
+                .serves_route(candidate.route(name).unwrap()),
+            roles & 4 != 0
+        );
         assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
         let limits = prepared
@@ -2628,7 +2640,10 @@ per_peer_limit = 1
             TlsPolicies::role(&active, https).unwrap(),
             td_mta::tls_policy::PolicyRole::Https
         );
-        assert_eq!(TlsPolicies::listener(&active, "smtp").is_ok(), roles == 3);
+        assert_eq!(
+            TlsPolicies::listener(&active, "smtp").is_ok(),
+            roles & 1 != 0
+        );
     }
     assert_eq!(
         runtime::load(
@@ -4903,7 +4918,9 @@ fn exercise_read(
     sql(fixture,&format!("UPDATE td_mta.blob_chunks SET bytes=set_byte(bytes,0,0) WHERE blob_id=decode('{}','hex')",second.blob));
     let corrupt = read::with_snapshot(request, trust, deadline(), binding, password, |view| {
         let error = view
-            .with_body::<()>(second.email, |_, _| panic!("corrupt body admitted"))
+            .with_body::<()>(second.email, |_, _| -> Result<(), td_mta::ports::Error> {
+                panic!("corrupt body admitted")
+            })
             .unwrap_err();
         assert!(matches!(
             error,
@@ -6442,6 +6459,141 @@ fn exercise_submission_publication(
         "1"
     );
     assert_eq!(first.route(), binding.route());
+    use td_mta::{
+        generations::GenerationSet, postgres_delivery_body as delivery_body,
+        postgres_runtime_profile as runtime, tls_policy::TlsPolicies,
+    };
+    let domain = GenerationSet::<TlsPolicies>::at_startup();
+    let relay = runtime::load(
+        request,
+        trust,
+        deadline(),
+        binding.epoch(),
+        "cloud",
+        domain.reserve().unwrap(),
+    )
+    .unwrap();
+    assert!(relay.binding().serves_route(first.route()));
+    assert_eq!(
+        delivery_body::with_submission(
+            request,
+            trust,
+            deadline(),
+            delivery_body::ReadRequest {
+                binding,
+                submission: a.submission,
+                maximum: a.length
+            },
+            |_, _| Ok(())
+        ),
+        Err(delivery_body::Error::Policy)
+    );
+    let read_outgoing = || {
+        delivery_body::with_submission(
+            request,
+            trust,
+            deadline(),
+            delivery_body::ReadRequest {
+                binding: relay.binding(),
+                submission: a.submission,
+                maximum: a.length,
+            },
+            |metadata, body| {
+                assert_eq!(metadata.blob, a.blob);
+                assert_eq!(metadata.body.length, a.length);
+                let mut bytes = vec![0; a.length as usize];
+                assert_eq!(body.read_at(0, &mut bytes)?, bytes.len());
+                assert_eq!(bytes, input.bytes());
+                Ok(())
+            },
+        )
+    };
+    read_outgoing().unwrap();
+    assert_eq!(
+        delivery_body::with_submission(
+            request,
+            trust,
+            deadline(),
+            delivery_body::ReadRequest {
+                binding: relay.binding(),
+                submission: a.submission,
+                maximum: a.length - 1
+            },
+            |_, _| -> Result<(), td_mta::ports::Error> { panic!("oversized body admitted") }
+        ),
+        Err(delivery_body::Error::Capacity)
+    );
+    for assignment in [
+        "route_name='other-route'",
+        "destination=decode(repeat('00',32),'hex')",
+    ] {
+        sql(
+            fixture,
+            &format!("UPDATE td_mta.submission_routes SET {assignment}"),
+        );
+        assert_eq!(read_outgoing(), Err(delivery_body::Error::Missing));
+        let destination: String = binding
+            .route()
+            .destination()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        sql(fixture, &format!("UPDATE td_mta.submission_routes SET route_name='personal-smarthost', destination=decode('{destination}','hex')"));
+    }
+    sql(fixture, "DELETE FROM td_mta.submission_routes");
+    assert_eq!(read_outgoing(), Err(delivery_body::Error::Missing));
+    let route_digest: String = binding
+        .route()
+        .destination()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    sql(fixture, &format!("INSERT INTO td_mta.submission_routes VALUES(decode('{}','hex'),decode('{}','hex'),'desktop','personal-smarthost',decode('{route_digest}','hex'))", binding.account(), a.submission));
+    delivery_body::with_submission(
+        request,
+        trust,
+        deadline(),
+        delivery_body::ReadRequest {
+            binding: relay.binding(),
+            submission: a.submission,
+            maximum: a.length,
+        },
+        |_, body| {
+            sql(
+                fixture,
+                "UPDATE td_mta.submission_routes SET route_name='other-route'",
+            );
+            let mut bytes = vec![0; a.length as usize];
+            assert_eq!(body.read_at(0, &mut bytes)?, bytes.len());
+            assert_eq!(bytes, input.bytes());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(read_outgoing(), Err(delivery_body::Error::Missing));
+    sql(
+        fixture,
+        "UPDATE td_mta.submission_routes SET route_name='personal-smarthost'",
+    );
+    let original = sql(fixture, &format!("SELECT encode(bytes,'hex') FROM td_mta.blob_chunks WHERE blob_id=decode('{}','hex') AND ordinal=0", a.blob));
+    sql(fixture, &format!("UPDATE td_mta.blob_chunks SET bytes=convert_to(repeat('x',octet_length(bytes)),'UTF8') WHERE blob_id=decode('{}','hex') AND ordinal=0", a.blob));
+    assert!(matches!(
+        delivery_body::with_submission(
+            request,
+            trust,
+            deadline(),
+            delivery_body::ReadRequest {
+                binding: relay.binding(),
+                submission: a.submission,
+                maximum: a.length
+            },
+            |_, _| -> Result<(), td_mta::ports::Error> { panic!("corrupt body admitted") }
+        ),
+        Err(delivery_body::Error::Body(_))
+    ));
+    sql(fixture, &format!("UPDATE td_mta.blob_chunks SET bytes=decode('{original}','hex') WHERE blob_id=decode('{}','hex') AND ordinal=0", a.blob));
+    read_outgoing().unwrap();
+
     let destination: String = binding
         .route()
         .destination()
@@ -6561,6 +6713,7 @@ fn exercise_submission_publication(
         submissions::publish(request, trust, deadline(), &refused, password),
         Err(submissions::Error::Policy)
     );
+    assert_eq!(read_outgoing(), Err(delivery_body::Error::Policy));
     assert_eq!(
         submissions::publish(request, trust, deadline(), &first, b"bad").unwrap(),
         a
@@ -6758,4 +6911,5 @@ fn exercise_submission_publication(
     );
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{}','hex') AND state=1",a.submission)),"2");
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
+    read_outgoing().unwrap();
 }

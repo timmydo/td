@@ -1867,3 +1867,21 @@ mapping. Migration preserves older inert queue fixtures without inventing a
 route. A queue row lacking a mapping is ineligible for dispatch and requires
 explicit repair; workers must never infer a default from their own profile.
 This increment still enables no worker or client endpoint.
+
+## 51. Route-scoped outgoing body snapshots
+
+The inert `postgres_delivery_body::with_submission` worker requires a selected
+relay role and opens a finite read-only primary snapshot. It rechecks epoch
+and configuration selection, then joins the queued submission's stored route
+name and destination to the worker's selected route. Missing mappings, wrong
+routes and different destinations cannot expose an outgoing body. Account
+state, changed sequences, manifest and chunk coverage must be valid.
+
+The shared body verifier checks the entire bounded outgoing blob before the
+callback receives its reader. Verification and replay share the original
+snapshot and deadline. No Email or device credential is needed: queued
+responsibility survives source deletion and device revocation. The database
+credential and selected relay profile authorize this internal read. A read
+is passive evidence, including after a policy change during its snapshot; it
+grants no attempt ownership or right to transmit. Fenced claim and phase
+publication remain required before SMTP work.

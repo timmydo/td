@@ -211,6 +211,7 @@ mod device_credentials;
 pub mod postgres_changes;
 pub mod postgres_configuration;
 pub mod postgres_configuration_store;
+pub mod postgres_delivery_body;
 pub mod postgres_devices;
 pub mod postgres_drafts;
 pub mod postgres_email_set;
