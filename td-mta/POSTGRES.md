@@ -1519,3 +1519,35 @@ requires retaining and resolving that same operation. Failure before commit
 rolls back bodies, ID reservation, metadata, usage and receipt together.
 This remains a cold storage API: HTTP dispatch, sender-identity policy,
 submission, runtime admission and the atomic production cutover remain work.
+
+
+## 38. Authenticated change-history pages
+
+`postgres_changes` reads detached Mailbox/Thread/Email/Submission change
+pages under one authenticated primary repeatable-read snapshot. It checks
+the selected JMAP profile generation/version, epoch and current device,
+then binds the account sequence and retained history floor. State tokens
+convey no authority. Wrong account/epoch, future or pruned state refuses.
+
+The existing `jmap_changes` transaction-aligned merger now accepts a small
+history-source interface; the SQLite source keeps its existing checks and
+semantics. PostgreSQL seeks the native account/kind/sequence/operation index
+in batches of at most 128 rows. Each row validates ordering, sequence,
+operation, action and object identity. The merger preserves whole sequence
+groups, folds repeated object changes and rejects a first group exceeding
+the requested page limit. At most 1024 final changes plus one bounded
+transaction group are retained. An empty kind advances to the pinned account
+sequence without scanning unrelated kinds.
+
+All polls, including cached rows and completion, check the original
+at-most-ten-second deadline and terminal connection state. This cold API
+uses the existing read worker's 128 MiB/8192-frame input and 512 KiB output
+ceilings without replenishment between batches. The merger gets at most
+4096 polls, leaving room below the wire-frame ceiling for setup and batch
+replies. If that work bound prevents completion, return cannotCalculateChanges
+so td-mail refreshes its state instead of retrying the same folding history
+forever. Other connection/deadline failures still refuse the whole page;
+no partial results escape or resume on a different snapshot.
+Authorization and policy are admitted at snapshot start; the finite read
+may finish after concurrent revocation. HTTP dispatch and runtime connection
+admission remain part of the production cutover.

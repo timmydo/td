@@ -1891,11 +1891,18 @@ fn real_postgres_drafts_publish_body_threads_history_and_retained_outcomes() {
     exercise_configuration(ConfigurationExercise::Drafts);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_changes_preserve_transaction_pages_and_snapshot_state() {
+    exercise_configuration(ConfigurationExercise::Changes);
+}
+
 enum ConfigurationExercise {
     Flags,
     Uploads,
     Downloads,
     Drafts,
+    Changes,
 }
 
 fn exercise_configuration(exercise: ConfigurationExercise) {
@@ -2432,6 +2439,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Changes => {
+                    exercise_changes(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Drafts => {
                     exercise_drafts(&fixture, &request, &trust, prepared.binding())
@@ -4457,4 +4467,141 @@ fn exercise_drafts(
         ),
     );
     assert_eq!(publish(&first), Err(drafts::Error::Integrity));
+}
+
+fn exercise_changes(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        format::Sequence,
+        jmap_changes,
+        ports::ChangeAction,
+        postgres_changes as changes, postgres_devices as devices,
+        sync::{DataState, DataType},
+    };
+    let account = binding.account();
+    let creation =
+        devices::prepare_creation(binding.epoch(), account, "change fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let state = |kind, sequence| DataState {
+        account,
+        epoch: binding.epoch(),
+        kind,
+        sequence: Sequence::from_u64(sequence),
+    };
+    let read = |kind, since, maximum| {
+        changes::read(
+            request,
+            trust,
+            deadline(),
+            binding,
+            password,
+            state(kind, since),
+            maximum,
+        )
+    };
+    let empty = read(DataType::Email, 1, 10).unwrap();
+    assert!(empty.changes.is_empty());
+    assert_eq!(empty.new_state.sequence.number(), 1);
+    assert!(!empty.has_more);
+    let bootstrap = read(DataType::Mailbox, 0, 10).unwrap();
+    assert_eq!(bootstrap.changes.len(), 1);
+    assert_eq!(bootstrap.changes[0].action, ChangeAction::Created);
+    sql(fixture,&format!("INSERT INTO td_mta.changes VALUES (decode('{account}','hex'),decode('0000000000000002','hex'),0,3,1,decode(repeat('a1',16),'hex')),(decode('{account}','hex'),decode('0000000000000003','hex'),0,3,2,decode(repeat('a1',16),'hex')),(decode('{account}','hex'),decode('0000000000000004','hex'),0,3,1,decode(repeat('b1',16),'hex')),(decode('{account}','hex'),decode('0000000000000005','hex'),0,3,3,decode(repeat('b1',16),'hex')); UPDATE td_mta.accounts SET sequence=decode('0000000000000006','hex')"));
+    let folded = read(DataType::Email, 1, 10).unwrap();
+    assert_eq!(folded.changes.len(), 1);
+    assert_eq!(folded.changes[0].id, [0xa1; 16]);
+    assert_eq!(folded.changes[0].action, ChangeAction::Created);
+    assert_eq!(folded.new_state.sequence.number(), 6);
+    let first = read(DataType::Email, 1, 1).unwrap();
+    assert!(first.has_more);
+    assert_eq!(first.new_state.sequence.number(), 3);
+    let second = read(DataType::Email, 3, 1).unwrap();
+    assert!(!second.has_more);
+    assert!(second.changes.is_empty());
+    assert_eq!(second.new_state.sequence.number(), 6);
+    assert!(matches!(
+        read(DataType::Email, 7, 10),
+        Err(changes::Error::Page(
+            jmap_changes::Error::CannotCalculateChanges
+        ))
+    ));
+    let mut wrong = state(DataType::Email, 1);
+    wrong.epoch = td_mta::ids::StoreEpoch::from_bytes([0x99; 16]);
+    assert!(matches!(
+        changes::read(request, trust, deadline(), binding, password, wrong, 10),
+        Err(changes::Error::Page(
+            jmap_changes::Error::CannotCalculateChanges
+        ))
+    ));
+    sql(fixture,&format!("INSERT INTO td_mta.changes SELECT decode('{account}','hex'),pg_catalog.int8send(10+n),0,3,1,decode(lpad(to_hex(n),32,'0'),'hex') FROM generate_series(1::bigint,1025::bigint) n; UPDATE td_mta.accounts SET sequence=pg_catalog.int8send(1035::bigint)"));
+    let page = read(DataType::Email, 10, 1024).unwrap();
+    assert_eq!(page.changes.len(), 1024);
+    assert!(page.has_more);
+    assert_eq!(page.new_state.sequence.number(), 1034);
+    let final_page = read(DataType::Email, 1034, 1024).unwrap();
+    assert_eq!(final_page.changes.len(), 1);
+    assert!(!final_page.has_more);
+    assert_eq!(final_page.new_state.sequence.number(), 1035);
+    sql(fixture,&format!("INSERT INTO td_mta.changes SELECT decode('{account}','hex'),pg_catalog.int8send(2000::bigint),n,3,1,decode(repeat(CASE WHEN n=0 THEN 'c1' ELSE 'c2' END,16),'hex') FROM generate_series(0,1) n; UPDATE td_mta.accounts SET sequence=pg_catalog.int8send(2000::bigint)"));
+    assert!(matches!(
+        read(DataType::Email, 1035, 1),
+        Err(changes::Error::Page(
+            jmap_changes::Error::CannotCalculateChanges
+        ))
+    ));
+    let group = read(DataType::Email, 1035, 2).unwrap();
+    assert_eq!(group.changes.len(), 2);
+    assert_eq!(group.new_state.sequence.number(), 2000);
+    sql(fixture,&format!("INSERT INTO td_mta.changes SELECT decode('{account}','hex'),pg_catalog.int8send(2000+n),0,1,2,(SELECT id FROM td_mta.mailboxes ORDER BY id LIMIT 1) FROM generate_series(1::bigint,9000::bigint) n; UPDATE td_mta.accounts SET sequence=pg_catalog.int8send(11000::bigint)"));
+    assert!(matches!(
+        read(DataType::Mailbox, 2000, 10),
+        Err(changes::Error::Page(
+            jmap_changes::Error::CannotCalculateChanges
+        ))
+    ));
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET floor=pg_catalog.int8send(1500::bigint)",
+    );
+    assert!(matches!(
+        read(DataType::Email, 1035, 10),
+        Err(changes::Error::Page(
+            jmap_changes::Error::CannotCalculateChanges
+        ))
+    ));
+    sql(fixture,&format!("INSERT INTO td_mta.changes VALUES(decode('{account}','hex'),decode('fffffffffffffffe','hex'),0,3,1,decode(repeat('fe',16),'hex')); UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')"));
+    let high = read(DataType::Email, u64::MAX - 2, 10).unwrap();
+    assert_eq!(high.changes.len(), 1);
+    assert_eq!(high.new_state.sequence.number(), u64::MAX);
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET sequence=decode('fffffffffffffffd','hex')",
+    );
+    assert!(matches!(
+        read(DataType::Email, u64::MAX - 2, 10),
+        Err(changes::Error::Page(jmap_changes::Error::Store(
+            td_mta::ports::Error::Corrupt
+        )))
+    ));
+    sql(fixture,"UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex'); UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
+    assert!(matches!(
+        read(DataType::Email, u64::MAX - 2, 10),
+        Err(changes::Error::Policy)
+    ));
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+    );
+    let revoke =
+        devices::prepare_revocation(binding.epoch(), account, creation.device_id(), 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert!(matches!(
+        read(DataType::Email, u64::MAX - 2, 10),
+        Err(changes::Error::Unauthenticated)
+    ));
 }

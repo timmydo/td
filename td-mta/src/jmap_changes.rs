@@ -34,10 +34,37 @@ pub struct Page {
     pub has_more: bool,
     pub changes: Vec<Change>,
 }
+/// A bounded history source pinned to one account snapshot. Implementations
+/// check the original deadline and terminal snapshot failures on every poll.
+pub trait History {
+    fn history_identity(&self) -> ViewIdentity;
+    fn check_history(&mut self) -> Result<(), ports::Error>;
+    fn read_change(
+        &mut self,
+        after: ChangeCursor,
+        kind: crate::format::ObjectType,
+    ) -> Result<ChangeStep, ports::Error>;
+}
+impl History for IndexReadView<'_, '_> {
+    fn history_identity(&self) -> ViewIdentity {
+        ReadView::identity(self)
+    }
+    fn check_history(&mut self) -> Result<(), ports::Error> {
+        self.check_snapshot()
+    }
+    fn read_change(
+        &mut self,
+        after: ChangeCursor,
+        kind: crate::format::ObjectType,
+    ) -> Result<ChangeStep, ports::Error> {
+        ReadView::next_change(self, after, kind)
+    }
+}
+
 /// One poll reads at most one history record. The service must charge each
 /// poll against its original request work meter; no worker is started here.
-pub struct Cursor<'v, 's, 'r> {
-    view: &'v mut IndexReadView<'s, 'r>,
+pub struct Cursor<'v, V: History> {
+    view: &'v mut V,
     old_state: DataState,
     identity: ViewIdentity,
     maximum: usize,
@@ -50,18 +77,18 @@ pub struct Cursor<'v, 's, 'r> {
     more: bool,
     failed: Option<Error>,
 }
-impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
+impl<'v, V: History> Cursor<'v, V> {
     pub fn new(
-        view: &'v mut IndexReadView<'s, 'r>,
+        view: &'v mut V,
         kind: DataType,
         since: DataState,
         maximum: usize,
     ) -> Result<Self, Error> {
-        view.check_snapshot()?;
+        view.check_history()?;
         if maximum == 0 || maximum > MAX_CHANGES {
             return Err(Error::Invalid);
         }
-        let identity = view.identity();
+        let identity = view.history_identity();
         let current = DataState {
             account: identity.account,
             epoch: identity.epoch,
@@ -79,7 +106,7 @@ impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
         checkpoint
             .try_reserve_exact(maximum)
             .map_err(|_| Error::Store(ports::Error::Capacity))?;
-        view.check_snapshot()?;
+        view.check_history()?;
         Ok(Self {
             view,
             old_state: since,
@@ -109,13 +136,13 @@ impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
         result
     }
     fn step(&mut self) -> Result<bool, Error> {
-        self.view.check_snapshot()?;
+        self.view.check_history()?;
         if self.complete {
             return Ok(true);
         }
         match self
             .view
-            .next_change(self.after, self.old_state.kind.object_type())?
+            .read_change(self.after, self.old_state.kind.object_type())?
         {
             ChangeStep::Record(record) => {
                 if (record.cursor.sequence, record.cursor.operation)
@@ -154,7 +181,7 @@ impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
                 }
             }
         }
-        self.view.check_snapshot()?;
+        self.view.check_history()?;
         Ok(self.complete)
     }
     fn close_group(&mut self) -> Result<bool, Error> {
@@ -169,13 +196,13 @@ impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
             self.tentative.extend_from_slice(&self.checkpoint);
             self.more = true;
             self.complete = true;
-            self.view.check_snapshot()?;
+            self.view.check_history()?;
             return Ok(true);
         }
         self.accepted = group;
         self.checkpoint.clear();
         self.checkpoint.extend_from_slice(&self.tentative);
-        self.view.check_snapshot()?;
+        self.view.check_history()?;
         Ok(false)
     }
     fn merge(&mut self, change: Change) -> Result<(), Error> {
@@ -217,7 +244,7 @@ impl<'v, 's, 'r> Cursor<'v, 's, 'r> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        self.view.check_snapshot()?;
+        self.view.check_history()?;
         if !self.complete {
             return Err(Error::Incomplete);
         }

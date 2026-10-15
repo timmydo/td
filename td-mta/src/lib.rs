@@ -203,6 +203,7 @@ pub mod submission_envelope;
 
 mod device_credentials;
 
+pub mod postgres_changes;
 pub mod postgres_configuration;
 pub mod postgres_configuration_store;
 pub mod postgres_devices;
