@@ -1,6 +1,9 @@
 //! Retained owner-side SMTP publication; no listener or gateway admission.
 use crate::{
+    admission::work::{Charge, Meter, Stop},
+    clock::RuntimeClock,
     ids::{BlobId, EmailId, MailboxId, ReceivingOperationId, ThreadId},
+    ports::{self, Clock, Deadline},
     postgres_probe::{self, Request},
     postgres_publication as publication,
     postgres_runtime_profile::Binding,
@@ -86,9 +89,82 @@ pub fn prepare(
     message: &Message<'_>,
     deadline: Instant,
 ) -> Result<Delivery, Error> {
+    preparation_time(binding, deadline)?;
+    let clock = RuntimeClock::new();
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(Error::Input(ports::Error::Deadline))?;
+    let cap = Deadline::after(
+        clock.sample().map_err(Error::Input)?.monotonic,
+        u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
+    )
+    .map_err(Error::Input)?;
+    let limits = binding.work();
+    let mut meter = Meter::new(
+        cap,
+        Charge {
+            io_bytes: limits.foreground_io_bytes,
+            records: limits.foreground_records,
+            output_bytes: binding.upload_maximum().min(32 * 1024 * 1024) as u64 + 1024 * 1024,
+            ..Charge::default()
+        },
+    );
+    prepare_with_meter(binding, message, deadline, &mut meter, &clock)
+}
+
+fn preparation_time(binding: &Binding, deadline: Instant) -> Result<(), Error> {
     if !binding.roles().receive() {
         return Err(Error::Policy);
     }
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
+        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
+    Ok(())
+}
+struct PreparationClock<'a> {
+    clock: &'a RuntimeClock,
+    deadline: Instant,
+}
+impl Clock for PreparationClock<'_> {
+    fn sample(&self) -> Result<ports::Time, ports::Error> {
+        if Instant::now() >= self.deadline {
+            return Err(ports::Error::Deadline);
+        }
+        self.clock.sample()
+    }
+}
+fn charge(clock: &impl Clock, meter: &mut Meter, bytes: usize, output: usize) -> Result<(), Error> {
+    meter
+        .charge(
+            clock.sample().map_err(Error::Input)?.monotonic,
+            Charge {
+                io_bytes: bytes as u64,
+                output_bytes: output as u64,
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(|error| {
+            Error::Input(match error {
+                Stop::Deadline => ports::Error::Deadline,
+                _ => ports::Error::Capacity,
+            })
+        })
+}
+
+/// Prepare completed DATA using its caller's original work allowance. Memory,
+/// peer and routing admission remain the trusted connection owner's duty.
+pub fn prepare_with_meter(
+    binding: &Binding,
+    message: &Message<'_>,
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Delivery, Error> {
+    preparation_time(binding, deadline)?;
+    let clock = PreparationClock { clock, deadline };
+    charge(&clock, meter, 0, 0)?;
     let mut ids = [[0; 16]; 4];
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     for id in &mut ids {
@@ -101,12 +177,10 @@ pub fn prepare(
         ThreadId::from_bytes(new_thread),
     );
     let (bytes, anchors, message_id, provenance) =
-        input::prepare(binding, message, email, blob, new_thread, deadline)?;
+        input::prepare(binding, message, email, blob, new_thread, &clock, meter)?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in bytes.chunks(publication::CHUNK) {
-        if Instant::now() >= deadline {
-            return Err(Error::Connection(postgres_probe::Error::Deadline));
-        }
+        charge(&clock, meter, part.len(), 0)?;
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     let body_digest = hash.finish().map_err(|_| Error::Crypto)?;
@@ -126,12 +200,11 @@ pub fn prepare(
         provenance.encoded.as_slice(),
         binding.profile().as_bytes(),
     ] {
+        charge(&clock, meter, part.len(), 0)?;
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
-    if Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
-    }
+    charge(&clock, meter, 0, 0)?;
     Ok(Delivery {
         binding: binding.clone(),
         operation: ReceivingOperationId::from_bytes(operation),

@@ -2975,3 +2975,23 @@ continues to fence uploads until settlement. Reads and the service remain
 available. SQLite confirmed responses retain their existing behavior.
 This remains prepared integration: production cutover, attachment composition,
 and resource/recovery activation are separate requirements.
+
+
+## 103. Caller-funded receiving preparation
+
+`postgres_receiving::prepare_with_meter` prepares completed DATA under the
+connection owner's original meter and runtime clock. Header filtering,
+identifier copies, body hashing and request-digest construction share that
+allowance. A bounded phase clock cannot extend its deadline. The cold owner
+entry point wraps the same path with profile work limits and a bounded body
+plus 1 MiB metadata output allowance; it does not admit network peers.
+
+Before metadata validation and copying, preparation prepays four 64 KiB
+metadata passes and two 64 KiB retained metadata extents plus trace scratch.
+Line discovery prepays at most 1001 bytes and a record per turn, retaining
+no unused credit; a missing newline cannot cause a whole-body scan. Existing
+header and output accounting remains separate. Exhaustion stays sticky across
+retries. The caller still owns body and scratch memory admission, gateway and
+recipient authority, publication and durable uncertain-operation custody.
+The real PostgreSQL receiving fixture exercises shared-meter exhaustion,
+expiry and successful publication with unchanged provenance and threading.

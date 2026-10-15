@@ -1,10 +1,9 @@
 //! Trusted receiving facts and bounded DATA preparation before publication.
 use super::*;
 use crate::{
-    admission::work::{Charge, Meter},
-    clock::RuntimeClock,
+    admission::work::Meter,
     format::row::{EmailOrigin, EmailRow, ReceiptTls, Row, SmtpReceipt},
-    ports::{Clock, Deadline},
+    ports::Clock,
     receiving_headers as headers,
 };
 use std::net::IpAddr;
@@ -38,12 +37,9 @@ pub(super) fn prepare(
     email: EmailId,
     blob: BlobId,
     thread: ThreadId,
-    deadline: Instant,
+    clock: &impl Clock,
+    meter: &mut Meter,
 ) -> Result<(Vec<u8>, Vec<String>, String, Provenance), Error> {
-    let _ = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
-        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
     let maximum = binding.upload_maximum().min(32 * 1024 * 1024);
     let allowance = headers::trace_allowance(message.hostname).map_err(Error::Input)?;
     if message.header_bytes == 0
@@ -53,6 +49,13 @@ pub(super) fn prepare(
     {
         return Err(Error::Capacity);
     }
+    // Prepay bounded metadata validation, encoding, copies and trace scratch.
+    charge(
+        clock,
+        meter,
+        4 * crate::format::MAX_VALUE_BYTES,
+        2 * crate::format::MAX_VALUE_BYTES + allowance,
+    )?;
     let row = Row::Email(EmailRow {
         blob,
         thread,
@@ -99,30 +102,13 @@ pub(super) fn prepare(
         allowance,
     )
     .map_err(Error::Input)?;
-    let clock = RuntimeClock::new();
     let mut last = clock.sample().map_err(Error::Input)?.monotonic;
-    let left = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
-    let cap = Deadline::after(
-        last,
-        u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
-    )
-    .map_err(Error::Input)?;
-    let limits = binding.work();
-    let mut meter = Meter::new(
-        cap,
-        Charge {
-            io_bytes: limits.foreground_io_bytes,
-            records: limits.foreground_records,
-            output_bytes: maximum as u64,
-            ..Charge::default()
-        },
-    );
+    let cap = crate::ports::Deadline::after(crate::ports::Tick(0), meter.deadline().tick().0)
+        .map_err(Error::Input)?;
     let mut work = headers::Work {
-        clock: &clock,
+        clock,
         deadline: cap,
-        meter: &mut meter,
+        meter,
         last: &mut last,
     };
     let mut header = headers::Headers::new(message.header_bytes).map_err(header_error)?;
@@ -141,7 +127,19 @@ pub(super) fn prepare(
         bytes.extend_from_slice(part);
         Ok(())
     };
-    for line in message.bytes.split_inclusive(|byte| *byte == b'\n') {
+    let mut remaining = message.bytes;
+    while !remaining.is_empty() {
+        let window = remaining
+            .get(..remaining.len().min(1001))
+            .ok_or(Error::Integrity)?;
+        charge(clock, work.meter, window.len(), 0)?;
+        let length = window
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::Input(crate::ports::Error::Invalid))?;
+        let line = remaining.get(..length).ok_or(Error::Integrity)?;
+        remaining = remaining.get(length..).ok_or(Error::Integrity)?;
         if line.len() > 1000 || !line.ends_with(b"\r\n") {
             return Err(Error::Input(crate::ports::Error::Invalid));
         }
@@ -190,6 +188,7 @@ pub(super) fn prepare(
             if let Some(id) = headers::candidate(&header.source, item, &mut scratch, &mut work)
                 .map_err(Error::Input)?
             {
+                charge(clock, work.meter, id.len(), id.len())?;
                 anchors.push(copy(id)?);
             }
         }
@@ -200,18 +199,20 @@ pub(super) fn prepare(
         .map(|item| {
             headers::candidate(&header.source, item, &mut scratch, &mut work)
                 .map_err(Error::Input)?
-                .map(copy)
+                .map(|id| {
+                    charge(clock, work.meter, id.len(), id.len())?;
+                    copy(id)
+                })
                 .transpose()
         })
         .transpose()?
         .flatten()
         .unwrap_or_default();
     if !own.is_empty() {
+        charge(clock, work.meter, own.len(), own.len())?;
         anchors.push(copy(&own)?);
     }
-    if Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
-    }
+    charge(clock, work.meter, 0, 0)?;
     Ok((bytes, anchors, own, provenance))
 }
 fn header_error(error: headers::HeaderError) -> Error {

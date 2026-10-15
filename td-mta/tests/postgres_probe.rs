@@ -7977,20 +7977,111 @@ fn exercise_receiving(
         reverse_path: "sender@example.test",
         recipients,
     };
+    let clock = td_mta::clock::RuntimeClock::new();
+    fn message<'a>(bytes: &'a [u8], receipt: SmtpReceipt<'a>) -> receiving::Message<'a> {
+        receiving::Message {
+            bytes,
+            receipt,
+            hostname: "mail.example.test",
+            extended: true,
+            header_bytes: 65536,
+            received_at: 1_700_000_000_000,
+        }
+    }
+    let capacity = td_mta::admission::work::Charge {
+        io_bytes: binding.work().foreground_io_bytes,
+        records: binding.work().foreground_records,
+        output_bytes: 33 * 1024 * 1024,
+        ..Default::default()
+    };
+    let cap = || {
+        use td_mta::ports::Clock;
+        td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 30_000).unwrap()
+    };
     let prepare = |bytes: &[u8]| {
-        receiving::prepare(
+        let mut meter = td_mta::admission::work::Meter::new(cap(), capacity);
+        receiving::prepare_with_meter(
             binding,
-            &receiving::Message {
-                bytes,
-                receipt,
-                hostname: "mail.example.test",
-                extended: true,
-                header_bytes: 65536,
-                received_at: 1_700_000_000_000,
-            },
+            &message(bytes, receipt),
             deadline(),
+            &mut meter,
+            &clock,
         )
     };
+    for limited in [
+        td_mta::admission::work::Charge {
+            io_bytes: 0,
+            ..capacity
+        },
+        td_mta::admission::work::Charge {
+            records: 0,
+            ..capacity
+        },
+        td_mta::admission::work::Charge {
+            output_bytes: 0,
+            ..capacity
+        },
+    ] {
+        let mut meter = td_mta::admission::work::Meter::new(cap(), limited);
+        for bytes in [b"Subject: refusal\r\n\r\nbody\r\n".as_slice(), b"\r\n"] {
+            assert!(matches!(
+                receiving::prepare_with_meter(
+                    binding,
+                    &message(bytes, receipt),
+                    deadline(),
+                    &mut meter,
+                    &clock
+                ),
+                Err(receiving::Error::Input(td_mta::ports::Error::Capacity))
+            ));
+        }
+        assert!(meter.stopped().is_some());
+    }
+    let expired = td_mta::ports::Deadline::after(td_mta::ports::Tick(0), 0).unwrap();
+    let mut expired = td_mta::admission::work::Meter::new(expired, capacity);
+    assert!(matches!(
+        receiving::prepare_with_meter(
+            binding,
+            &message(b"\r\n", receipt),
+            deadline(),
+            &mut expired,
+            &clock
+        ),
+        Err(receiving::Error::Input(td_mta::ports::Error::Deadline))
+    ));
+    let mut consumed = td_mta::admission::work::Meter::new(cap(), capacity);
+    receiving::prepare_with_meter(
+        binding,
+        &message(b"Subject: paid\r\n\r\nbody\r\n", receipt),
+        deadline(),
+        &mut consumed,
+        &clock,
+    )
+    .unwrap();
+    assert!(consumed.remaining().io_bytes < capacity.io_bytes);
+    assert!(consumed.remaining().output_bytes < capacity.output_bytes);
+    assert!(consumed.remaining().records < capacity.records);
+    receiving::prepare(binding, &message(b"\r\n", receipt), deadline()).unwrap();
+    let mut bounded = td_mta::admission::work::Meter::new(cap(), capacity);
+    let long_line = vec![b'x'; 1024 * 1024];
+    assert!(matches!(
+        receiving::prepare_with_meter(
+            binding,
+            &message(&long_line, receipt),
+            deadline(),
+            &mut bounded,
+            &clock
+        ),
+        Err(receiving::Error::Input(td_mta::ports::Error::Invalid))
+    ));
+    assert_eq!(
+        capacity.io_bytes - bounded.remaining().io_bytes,
+        4 * td_mta::format::MAX_VALUE_BYTES as u64 + 1001
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+        "0"
+    );
     assert!(prepare(b"broken\n").is_err());
     assert!(prepare(&[b'x'; 1001]).is_err());
     let first = prepare(b"Return-Path: <forged@example.test>\r\nMessage-ID: <root@example.test>\r\nSubject: Inbox\r\n\r\nhello\r\n").unwrap();
