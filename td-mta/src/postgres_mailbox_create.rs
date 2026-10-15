@@ -303,7 +303,7 @@ pub fn publish(
     let creation = creation.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_folder_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             begin(client, &creation).await?;
             let selected=client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;

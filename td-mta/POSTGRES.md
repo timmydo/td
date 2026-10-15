@@ -3119,3 +3119,35 @@ The test uses bounded TLS wire buffers and per-I/O waits, verifies the server
 name and does not change production trust, client authentication or gateway
 policy. This is prepared PostgreSQL integration evidence; production backend
 selection and deployment qualification remain unchanged.
+
+
+## 110. Durable outgoing DATA phases
+
+Schema 19 retains one phase receipt per account, attempt and target phase.
+Fresh initialization permits at most 1024 inbound protocol frames for the
+complete migration ledger; byte and individual-frame ceilings stay unchanged.
+The prepared phase publisher checks current configuration, account and route
+ownership in their existing lock order, then the exact active attempt's boot,
+claim, destination and fencing generation. Body publication accepts one
+ordered subset of at most 100 original attempt ordinals with bounded positive
+RCPT replies. It clears older DATA replies for that subset. AcceptancePossible
+requires exactly the entire stored Body subset and preserves those RCPT
+replies. Other prepared recipients remain untouched. Neither transition
+retires the attempt, invents a remote result or clears prior uncertainty.
+
+Recipient, submission and account sequences, change history and the digest-
+bound receipt commit atomically. A second request for the same phase with
+different input refuses. Historical receipt inspection precedes fresh policy
+checks and excludes an in-progress publisher through the account lock;
+unknown COMMIT requires closing transport, not transmitting on guessed state.
+Receipt storage has a 2048-per-account ceiling. Runtime retention/reclamation
+and final-outcome capacity admission remain prerequisites for activation.
+
+These are durable facts, not continuing permission to transmit. The runtime
+must retain current ownership and its monotonic transport fence, and reserve
+final-outcome capacity before allowing a terminator. This increment enables no
+SMTP relay. PostgreSQL fixtures cover invalid subsets/replies, stale ownership,
+known rollback, phase ordering, exact Body membership, retained replies,
+100 distinct maximum-length replies, conflicting replay, delayed COMMIT
+and historical settlement after a policy
+change. Schema upgrade tests include the version-18 boundary.

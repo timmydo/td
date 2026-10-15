@@ -143,8 +143,8 @@ pub(crate) fn with_mutation_client<T>(
     )
 }
 
-// Root-folder batches carry at most 256 names twice, plus ordered receipts.
-pub(crate) fn with_folder_client<T>(
+// Folder names or 100 maximum-length RCPT replies, plus protocol overhead.
+pub(crate) fn with_batch_client<T>(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,

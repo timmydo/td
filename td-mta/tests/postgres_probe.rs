@@ -348,7 +348,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 18);
+    assert_eq!(receipt.version, 19);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -425,7 +425,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        18
+        19
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -550,7 +550,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":18"));
+    assert!(initialized.contains("\"schema_version\":19"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -765,7 +765,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=18",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=19",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -773,7 +773,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=18 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=19 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -955,7 +955,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 18);
+    assert_eq!(receipt.version, 19);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1551,7 +1551,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1572,6 +1572,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_submission_routes.sql"),
             include_str!("../src/postgres_route_owners.sql"),
             include_str!("../src/postgres_attempts.sql"),
+            include_str!("../src/postgres_attempt_recovery.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1611,6 +1612,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             15 => "route_owners",
             16 => "submission_attempts",
             17 => "attempt_recovery_receipts",
+            18 => "attempt_phase_receipts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1644,7 +1646,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 18);
+        assert_eq!(receipt.version, 19);
         assert_eq!(
             sql(&fixture, "SELECT count(*) FROM td_mta.submission_routes"),
             "0"
@@ -10204,6 +10206,9 @@ fn exercise_route_owners(
     );
 }
 
+#[path = "postgres_probe/attempt_phases.rs"]
+mod attempt_phases;
+
 fn exercise_dispatch(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -10307,6 +10312,14 @@ fn exercise_dispatch(
         td_mta::postgres_attempt_recovery::publish(request, trust, deadline(), &current_recovery),
         Err(td_mta::postgres_attempt_recovery::Error::CurrentOwner)
     );
+    attempt_phases::exercise(
+        fixture,
+        request,
+        trust,
+        &claim,
+        owner.generation,
+        value.attempt(),
+    );
     let other = attempts::prepare(&claim, owner.generation, submission).unwrap();
     assert_eq!(
         attempts::publish(request, trust, deadline(), &other),
@@ -10366,7 +10379,8 @@ fn exercise_attempt_recovery(
         recovery::inspect(request, trust, deadline(), &value).unwrap(),
         None
     );
-    // Simulate durable SMTP phases; this increment activates no SMTP worker.
+    // Independently seed all recovery phase cases after phase-publication checks.
+    sql(fixture, &format!("UPDATE td_mta.recipients SET phase=1,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex') AND state=2"));
     sql(fixture,&format!("UPDATE td_mta.recipients SET phase=3,rcpt_reply='250 accepted' WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.recipients SET phase=2,rcpt_reply='250 accepted' WHERE submission_id=decode('{submission}','hex') AND ordinal=1; UPDATE td_mta.recipients SET uncertain=1 WHERE submission_id=decode('{submission}','hex') AND ordinal=2"));
     let expiry = sql(
         fixture,
