@@ -81,6 +81,7 @@ object_ids!(
     ReceivingOperationId,
     SubmissionOperationId,
     RouteClaimId,
+    AttemptRecoveryId,
     MailboxOperationId,
     StoreEpoch,
     MaterialVersion,

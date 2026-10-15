@@ -576,8 +576,9 @@ Version 10 adds src/postgres_uploads.sql; version 11 adds
 src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
 src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql;
 version 15 adds src/postgres_submission_routes.sql; version 16 adds
-src/postgres_route_owners.sql; version 17 adds src/postgres_attempts.sql.
-New initialization applies all seventeen in
+src/postgres_route_owners.sql; version 17 adds src/postgres_attempts.sql;
+version 18 adds src/postgres_attempt_recovery.sql.
+New initialization applies all eighteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1947,3 +1948,28 @@ phase/result publication and conservative takeover recovery must resolve it
 before another attempt. Clock validation and monotonic retry guards remain
 runtime activation requirements. The supplied submission is selected by a
 future bounded scheduler; no unbounded due-queue scan is introduced here.
+
+
+## 54. Inert abandoned-attempt recovery
+
+Schema 18 adds retained `attempt_recovery_receipts`. A current route owner
+may recover an active attempt only from a strictly older fencing generation
+with the same route and destination. Account/route locks exclude stale phase
+writes. Up to 100 remaining InFlight recipients resolve atomically with
+submission/account history, active-attempt retirement and one receipt.
+Historical replay precedes current policy and ownership checks.
+
+Prepared and Body recover with Network reason, preserving prior uncertainty.
+AcceptancePossible always becomes uncertain OutcomeUnknown with Uncertain
+reason. No recovery produces Accepted or erases replies, attempt count or
+attempt identity. Retry times use the queue contract's clipped uniform jitter
+with at most 32 entropy draws; failure rolls back. Recipient updates use one
+bounded SQL array batch rather than one protocol exchange per recipient.
+
+This path handles only work with room for a retry before expiry. It refuses
+near-expiry/overdue responsibility as ExpiryHold without clearing the active
+attempt or declaring terminal failure. Clock-confirmed expiry remains a
+separate activation prerequisite. A backwards last-attempt timestamp refuses.
+Runtime clock discontinuity validation and the five-minute monotonic restart
+guard still precede any actual retry. Receipt storage has a 1024-per-account
+cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
