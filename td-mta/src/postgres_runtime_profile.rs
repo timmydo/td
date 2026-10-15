@@ -3,7 +3,7 @@ use crate::{
     clock::{RuntimeClock, TlsClockSource},
     config::{materialize::ResolvedProfile, profile::Roles, stanza, storage, stream, values},
     generations::{GenerationConstruction, PreparedGeneration},
-    ids::{AccountId, StoreEpoch},
+    ids::{AccountId, IdentityId, StoreEpoch},
     postgres_accounts,
     postgres_configuration::{self as configuration, ProfileInput},
     postgres_probe::{self, Request},
@@ -39,6 +39,20 @@ pub struct Binding {
     upload_maximum: usize,
     upload_expiry_seconds: usize,
     work: crate::admission::WorkLimits,
+    header_maximum: usize,
+    recipient_maximum: usize,
+    identities: Arc<Vec<SendingIdentity>>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct SendingIdentity {
+    id: IdentityId,
+    email: String,
+}
+impl std::fmt::Debug for SendingIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SendingIdentity(<redacted>)")
+    }
 }
 impl Binding {
     pub fn epoch(&self) -> StoreEpoch {
@@ -64,6 +78,20 @@ impl Binding {
     }
     pub fn work(&self) -> crate::admission::WorkLimits {
         self.work
+    }
+    pub fn header_maximum(&self) -> usize {
+        self.header_maximum
+    }
+    pub fn recipient_maximum(&self) -> usize {
+        self.recipient_maximum
+    }
+    /// Configured mailbox evidence only; publication must fence selection and
+    /// device authority again before taking responsibility for delivery.
+    pub fn identity_email(&self, id: IdentityId) -> Option<&str> {
+        self.identities
+            .iter()
+            .find(|identity| identity.id == id)
+            .map(|identity| identity.email.as_str())
     }
     pub fn roles(&self) -> Roles {
         self.roles
@@ -146,18 +174,38 @@ pub fn load(
         reserved,
     )
     .map_err(Error::Configuration)?;
-    let account = configuration
+    let catalog = configuration
         .candidate()
         .identities()
-        .map_err(|_| Error::Account)?
-        .account()
-        .map_err(|_| Error::Account)?
-        .id;
+        .map_err(|_| Error::Account)?;
+    let account = catalog.account().map_err(|_| Error::Account)?.id;
+    let mut identities = Vec::new();
+    identities
+        .try_reserve_exact(catalog.len())
+        .map_err(|_| Error::Capacity)?;
+    for index in 0..catalog.len() {
+        let identity = catalog
+            .identity(index)
+            .map_err(|_| Error::Account)?
+            .ok_or(Error::Account)?;
+        let mut email = String::new();
+        email
+            .try_reserve_exact(identity.email.len())
+            .map_err(|_| Error::Capacity)?;
+        email.push_str(identity.email);
+        identities.push(SendingIdentity {
+            id: identity.id,
+            email,
+        });
+    }
+    let identities = Arc::new(identities);
     postgres_accounts::inspect(request, trust, deadline, epoch, account)
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
     let quotas = candidate.quotas();
     let limits = configuration.candidate().resources().resources().limits();
+    let header_maximum = limits.header_bytes;
+    let recipient_maximum = limits.smtp_recipients;
     let upload_maximum = limits.message_bytes;
     let upload_expiry_seconds = limits.upload_expiry_seconds;
     let work = *configuration.candidate().resources().admission().work();
@@ -181,6 +229,9 @@ pub fn load(
             upload_maximum,
             upload_expiry_seconds,
             work,
+            header_maximum,
+            recipient_maximum,
+            identities,
         },
         configuration,
         policies,

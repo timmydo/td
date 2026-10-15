@@ -1304,7 +1304,14 @@ configured account's durable bootstrap receipt. All material comes from the
 database under the original deadline; there is no filesystem fallback.
 The caller's TLS generation reservation remains in its original domain and
 is released on failure. The returned resolved text contains secrets and has
-no diagnostic dump; its explicit binding contains only passive identifiers.
+no diagnostic dump. Its explicit binding retains passive identifiers, limits
+and the selected sending identity IDs/mailboxes. At most 64 mailboxes of at
+most 254 bytes are copied from the validated configuration; binding clones
+share that immutable catalog. Diagnostic formatting redacts the mailboxes.
+The header and SMTP recipient limits come from the same selected profile.
+Identity lookup is configuration evidence, not sending authority: submission
+publication must freshly fence the selection and current device. No relay
+credentials or signature material enter the binding.
 
 Before returning, a final primary observation rejects a selection already
 superseded during preparation. This does not freeze future changes: runtime

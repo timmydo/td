@@ -2479,6 +2479,29 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().roles().bits(), roles);
         assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
+        let limits = prepared
+            .configuration()
+            .candidate()
+            .resources()
+            .resources()
+            .limits();
+        assert_eq!(prepared.binding().header_maximum(), limits.header_bytes);
+        assert_eq!(
+            prepared.binding().recipient_maximum(),
+            limits.smtp_recipients
+        );
+        let sending = td_mta::ids::IdentityId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let unknown = td_mta::ids::IdentityId::from_bytes([0xef; 16]);
+        assert_eq!(
+            prepared.binding().identity_email(sending),
+            Some("main@example.test")
+        );
+        assert_eq!(prepared.binding().identity_email(unknown), None);
+        assert_eq!(
+            prepared.binding().clone().identity_email(sending),
+            Some("main@example.test")
+        );
+        assert!(!format!("{:?}", prepared.binding()).contains("main@example.test"));
         if name == "desktop" {
             match exercise {
                 ConfigurationExercise::Receiving => {}
@@ -2606,10 +2629,12 @@ per_peer_limit = 1
         if matches!(
             result,
             Err(selection::Error::Configuration(
-                versions::Error::Validation(configuration::Error::Provider)
+                versions::Error::Validation(
+                    configuration::Error::Provider | configuration::Error::Profile
+                )
             ))
         ) {
-            // Cross-domain generation-ID contention can refuse preparation.
+            // Global text-owner or generation-ID contention can refuse preparation.
             // Revalidate once after the winner; this operation must stay stale.
             assert_eq!(
                 selection::publish(&request, &trust, race_deadline(), change),
