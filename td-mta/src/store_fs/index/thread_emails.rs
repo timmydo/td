@@ -3,22 +3,7 @@ use super::*;
 use crate::ids::{EmailId, ThreadId};
 use std::collections::BinaryHeap;
 
-pub const MAX_THREAD_EMAILS: usize = 256;
-/// Passive sort coordinate, not a wire ID or snapshot/authorization proof.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ThreadEmail {
-    // Field order is the received-date order, with the ID breaking ties.
-    pub received_at: i64,
-    pub email: EmailId,
-}
-/// A bounded ascending window; callers retain and recheck the owning view.
-#[derive(Debug)]
-pub struct ThreadEmails {
-    pub identity: ViewIdentity,
-    pub thread: ThreadId,
-    pub emails: Vec<ThreadEmail>,
-    pub has_more: bool,
-}
+pub use crate::ports::{ThreadEmail, ThreadEmails, MAX_THREAD_EMAILS};
 const MEMBERS: &str = "SELECT id,received_at,changed FROM emails INDEXED BY emails_thread WHERE account=?1 AND thread_id=?2 ORDER BY id";
 impl IndexReadView<'_, '_> {
     /// Select at most maximum members by (received_at, id), strictly after the

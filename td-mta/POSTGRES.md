@@ -1604,3 +1604,19 @@ Server statement limits and the original worker deadline bound sorting,
 counting and offset work; worker byte/frame limits remain shared across the
 whole view. No retained cursor or backend activation is introduced. Production
 JMAP dispatch and the atomic replacement remain pending.
+
+## 41. Snapshot-bound thread member windows
+
+`postgres_read::Snapshot::thread_emails` reads one thread's members in
+ascending received-date and Email-ID order, strictly after an optional
+coordinate. Shared passive `ports::ThreadEmail` and `ThreadEmails` values
+also serve the existing SQLite reader; its algorithm is unchanged. The
+window ceiling remains 256 members plus one validated overflow row.
+
+An absent stored thread returns `None`; an empty stored thread returns an
+empty window, leaving the existing JMAP rule that hides empty threads to the
+protocol adapter. Thread and returned member change sequences must not exceed
+the snapshot. All reads, including repeated windows after concurrent deletion,
+retain the same account state, worker budget and deadline. Invalid limits or
+other read errors retire the view. This supplies storage for td-mail's
+Thread/get without activating PostgreSQL production dispatch.

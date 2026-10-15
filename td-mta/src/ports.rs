@@ -4,7 +4,7 @@ pub use td_crypto::{Crypto, Digest, Entropy, Error as CryptoError};
 
 use crate::{
     format::{key::Key, row::Row, ObjectType, Sequence, Table},
-    ids::{AccountId, BlobId, DeviceId, StoreEpoch},
+    ids::{AccountId, BlobId, DeviceId, EmailId, StoreEpoch, ThreadId},
 };
 use std::{io::ErrorKind, net::IpAddr};
 
@@ -604,4 +604,21 @@ mod crypto_boundary_tests {
             ]
         );
     }
+}
+
+pub const MAX_THREAD_EMAILS: usize = 256;
+/// Passive sort coordinate, not a wire ID or snapshot/authorization proof.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ThreadEmail {
+    // Field order is the received-date order, with the ID breaking ties.
+    pub received_at: i64,
+    pub email: EmailId,
+}
+/// A bounded ascending window; callers retain and recheck the owning view.
+#[derive(Debug)]
+pub struct ThreadEmails {
+    pub identity: ViewIdentity,
+    pub thread: ThreadId,
+    pub emails: Vec<ThreadEmail>,
+    pub has_more: bool,
 }

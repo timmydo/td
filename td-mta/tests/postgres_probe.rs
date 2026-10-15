@@ -1909,7 +1909,14 @@ fn real_postgres_email_queries_bind_order_pages_and_totals_to_one_snapshot() {
     exercise_configuration(ConfigurationExercise::Query);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_thread_windows_retain_order_membership_and_snapshot() {
+    exercise_configuration(ConfigurationExercise::Threads);
+}
+
 enum ConfigurationExercise {
+    Threads,
     Query,
     Flags,
     Uploads,
@@ -2454,6 +2461,9 @@ per_peer_limit = 1
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
                 }
+                ConfigurationExercise::Threads => {
+                    exercise_threads(&fixture, &request, &trust, prepared.binding())
+                }
                 ConfigurationExercise::Query => {
                     exercise_query(&fixture, &request, &trust, prepared.binding())
                 }
@@ -2545,20 +2555,38 @@ per_peer_limit = 1
     );
     let next = selection::prepare(epoch, 1, version, &candidate).unwrap();
     let contender = selection::prepare(epoch, 1, version, &candidate).unwrap();
+    // Revalidation opens several material connections under this one budget.
+    let race_deadline = || Instant::now() + Duration::from_secs(10);
     let results = thread::scope(|scope| {
-        let a = scope.spawn(|| selection::publish(&request, &trust, deadline(), next));
-        let b = scope.spawn(|| selection::publish(&request, &trust, deadline(), contender));
+        let a = scope.spawn(|| selection::publish(&request, &trust, race_deadline(), next));
+        let b = scope.spawn(|| selection::publish(&request, &trust, race_deadline(), contender));
         (a.join().unwrap(), b.join().unwrap())
     });
-    assert_ne!(results.0.is_ok(), results.1.is_ok());
-    assert!(matches!(
-        results.0,
-        Ok(_) | Err(selection::Error::Conflict) | Err(selection::Error::Database)
-    ));
-    assert!(matches!(
-        results.1,
-        Ok(_) | Err(selection::Error::Conflict) | Err(selection::Error::Database)
-    ));
+    assert_ne!(results.0.is_ok(), results.1.is_ok(), "{results:?}");
+    for (result, change) in [(results.0, next), (results.1, contender)] {
+        if matches!(
+            result,
+            Err(selection::Error::Configuration(
+                versions::Error::Validation(configuration::Error::Provider)
+            ))
+        ) {
+            // Cross-domain generation-ID contention can refuse preparation.
+            // Revalidate once after the winner; this operation must stay stale.
+            assert_eq!(
+                selection::publish(&request, &trust, race_deadline(), change),
+                Err(selection::Error::Conflict),
+                "initial race: {results:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Ok(_) | Err(selection::Error::Conflict) | Err(selection::Error::Database)
+                ),
+                "{results:?}"
+            );
+        }
+    }
     assert_eq!(
         selection::read(&request, &trust, deadline(), epoch)
             .unwrap()
@@ -4901,6 +4929,67 @@ fn exercise_query(
     assert_eq!(
         read::with_snapshot(request, trust, deadline(), binding, password, |view| {
             let _ = view.query_emails(query);
+            Ok(())
+        }),
+        Err(read::Error::Integrity)
+    );
+}
+
+fn exercise_threads(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        ids::{EmailId, ThreadId},
+        postgres_devices as devices, postgres_read as read,
+    };
+    let account = binding.account();
+    let creation =
+        devices::prepare_creation(binding.epoch(), account, "thread fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let password = creation.password();
+    let thread = ThreadId::from_bytes([0x44; 16]);
+    let empty = ThreadId::from_bytes([0x55; 16]);
+    // Empty blobs suffice: this fixture exercises member ordering, not bodies.
+    sql(fixture,&format!("BEGIN; INSERT INTO td_mta.threads SELECT id,decode('{thread}','hex'),sequence FROM td_mta.accounts; INSERT INTO td_mta.threads SELECT id,decode('{empty}','hex'),sequence FROM td_mta.accounts; INSERT INTO td_mta.blob_ids SELECT id,decode(repeat('66',16),'hex') FROM td_mta.accounts; INSERT INTO td_mta.blobs SELECT id,decode(repeat('66',16),'hex'),0,decode('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855','hex'),0,sequence,0 FROM td_mta.accounts; INSERT INTO td_mta.emails(account,id,blob_id,thread_id,received_at,origin,changed) SELECT a.id,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('66',16),'hex'),decode('{thread}','hex'),CASE WHEN n=0 THEN -9223372036854775808 WHEN n=257 THEN 9223372036854775807 ELSE 0 END,2,a.sequence FROM td_mta.accounts a CROSS JOIN generate_series(0,257) n; COMMIT"));
+    let unknown = ThreadId::from_bytes([0xee; 16]);
+    read::with_snapshot(request,trust,deadline(),binding,password,|view| {
+        assert!(view.thread_emails(unknown,None,1)?.is_none());
+        let empty=view.thread_emails(empty,None,1)?.unwrap();assert!(empty.emails.is_empty());assert!(!empty.has_more);
+        let page=view.thread_emails(thread,None,256)?.unwrap();
+        assert_eq!(page.emails.len(),256);assert!(page.has_more);
+        assert_eq!(page.emails.first().unwrap().received_at,i64::MIN);
+        assert_eq!(page.emails.last().unwrap().email,EmailId::from_bytes(255_u128.to_be_bytes()));
+        let last=view.thread_emails(thread,page.emails.last().copied(),256)?.unwrap();
+        assert_eq!(last.emails.len(),2);assert!(!last.has_more);
+        assert_eq!(last.emails.last().unwrap().received_at,i64::MAX);
+        assert!(view.thread_emails(thread,last.emails.last().copied(),1)?.unwrap().emails.is_empty());
+        sql(fixture,&format!("BEGIN; DELETE FROM td_mta.emails WHERE account=decode('{account}','hex') AND thread_id=decode('{thread}','hex'); DELETE FROM td_mta.threads WHERE account=decode('{account}','hex') AND id=decode('{thread}','hex'); UPDATE td_mta.accounts SET sequence=decode('0000000000000002','hex'); COMMIT"));
+        let again=view.thread_emails(thread,None,256)?.unwrap();
+        assert_eq!(again.emails,page.emails);assert_eq!(again.identity,page.identity);
+        Ok(())
+    }).unwrap();
+    read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+        assert!(view.thread_emails(thread, None, 1)?.is_none());
+        assert_eq!(view.identity().committed_sequence.number(), 2);
+        Ok(())
+    })
+    .unwrap();
+    for (maximum, error) in [(0, read::Error::Invalid), (257, read::Error::Capacity)] {
+        assert_eq!(
+            read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+                let _ = view.thread_emails(empty, None, maximum);
+                Ok(())
+            }),
+            Err(error)
+        );
+    }
+    sql(fixture,&format!("UPDATE td_mta.threads SET changed=decode('0000000000000003','hex') WHERE id=decode('{empty}','hex')"));
+    assert_eq!(
+        read::with_snapshot(request, trust, deadline(), binding, password, |view| {
+            let _ = view.thread_emails(empty, None, 1);
             Ok(())
         }),
         Err(read::Error::Integrity)

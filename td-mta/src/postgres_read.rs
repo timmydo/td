@@ -2,7 +2,7 @@
 use crate::{
     device_credentials::Presented,
     format::key::Key,
-    ids::{EmailId, MailboxId},
+    ids::{EmailId, MailboxId, ThreadId},
     ports::{self, BlobReader, ViewIdentity},
     postgres_body::{self, BlobMetadata, Metadata, ReadRequest},
     postgres_devices,
@@ -301,6 +301,53 @@ impl Snapshot<'_> {
                 if page.ids.len()<query.limit { page.ids.push(EmailId::from_bytes(id)); }
             }
             Ok(page)
+        })).map_err(Error::Connection).and_then(|result|result);
+        self.retain(result)
+    }
+    /// Ascending received-date/ID windows on this view's immutable thread
+    /// assignment. An empty stored thread remains distinguishable from absence.
+    pub fn thread_emails(
+        &mut self,
+        thread: ThreadId,
+        after: Option<ports::ThreadEmail>,
+        maximum: usize,
+    ) -> Result<Option<ports::ThreadEmails>, Error> {
+        self.check()?;
+        let result = if maximum == 0 {
+            Err(Error::Invalid)
+        } else if maximum > ports::MAX_THREAD_EMAILS {
+            Err(Error::Capacity)
+        } else {
+            i64::try_from(maximum + 1).map_err(|_| Error::Capacity)
+        };
+        let limit = self.retain(result)?;
+        let identity = self.identity;
+        let result=self.worker.run(|client|Box::pin(async move {
+            let account=identity.account.as_bytes().as_slice();
+            let thread_bytes=thread.as_bytes().as_slice();
+            let row=client.query_opt("SELECT changed FROM td_mta.threads WHERE account=$1 AND id=$2", &[&account,&thread_bytes]).await.map_err(|_|Error::Database)?;
+            let Some(row)=row else { return Ok(None); };
+            check_changed(row.try_get(0).map_err(|_|Error::Integrity)?,identity)?;
+            let date=after.map(|entry|entry.received_at);
+            let id=after.map(|entry|*entry.email.as_bytes());
+            let id=id.as_ref().map(|id|id.as_slice());
+            let rows=client.query("SELECT id,received_at,changed FROM td_mta.emails WHERE account=$1 AND thread_id=$2 AND ($3::bigint IS NULL OR (received_at,id)>($3,$4::bytea)) ORDER BY received_at ASC,id ASC LIMIT $5", &[&account,&thread_bytes,&date,&id,&limit]).await.map_err(|_|Error::Database)?;
+            let has_more=rows.len()>maximum;
+            let mut emails=Vec::new();
+            emails.try_reserve_exact(maximum).map_err(|_|Error::Capacity)?;
+            let mut previous=after;
+            for row in rows {
+                let id:&[u8]=row.try_get(0).map_err(|_|Error::Integrity)?;
+                let entry=ports::ThreadEmail {
+                    email:EmailId::from_bytes(id.try_into().map_err(|_|Error::Integrity)?),
+                    received_at:row.try_get(1).map_err(|_|Error::Integrity)?,
+                };
+                check_changed(row.try_get(2).map_err(|_|Error::Integrity)?,identity)?;
+                if previous.is_some_and(|previous|previous>=entry) { return Err(Error::Integrity); }
+                previous=Some(entry);
+                if emails.len()<maximum { emails.push(entry); }
+            }
+            Ok(Some(ports::ThreadEmails {identity,thread,emails,has_more}))
         })).map_err(Error::Connection).and_then(|result|result);
         self.retain(result)
     }
