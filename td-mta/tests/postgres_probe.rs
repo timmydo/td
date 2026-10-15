@@ -8902,6 +8902,136 @@ fn exercise_http_submission_owner(
         .settle(&loaded, executable, &settlement, &clock, until(10_000))
         .unwrap()
         .is_none());
+    exercise_http_filing_owner(fixture, &loaded, binding, input, password);
+}
+
+fn exercise_http_filing_owner(
+    fixture: &Fixture,
+    loaded: &td_mta::postgres_input::Loaded,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    input: &td_mta::postgres_submission_input::Prepared,
+    password: &[u8],
+) {
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ids::MailboxId,
+        ports::{self, Clock, Deadline},
+        postgres_email_set::UpdateResult,
+        postgres_http_updates::{FilingRequest, Pending, Updates},
+        postgres_read::{ReadSlots, Snapshot},
+    };
+    let clock = RuntimeClock::new();
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let meter = || {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes: 1_000_000,
+                records: 100_000,
+                output_bytes: 1_000_000,
+                ..Default::default()
+            },
+        )
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let settlement = ReadSlots::new(1).unwrap();
+    let pending = Pending::default();
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let worker = Updates {
+        loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &pending,
+        password,
+    };
+    let source = MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
+    ))
+    .unwrap();
+    let sent = MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE name='Filing Sent'",
+    ))
+    .unwrap();
+    let request = |ms| FilingRequest {
+        account: binding.account(),
+        device: input.device(),
+        email: input.source().email,
+        movement: Some((source, sent)),
+        deadline: until(ms),
+    };
+    let email = input.source().email;
+    let queued = sql(fixture, "SELECT count(*) FROM td_mta.submissions");
+    let exhausted_request = request(10_000);
+    let mut exhausted = Meter::new(exhausted_request.deadline, Charge::default());
+    assert!(matches!(
+        worker.file(exhausted_request, &mut exhausted),
+        Err(td_mta::store_fs::UploadError::Store(ports::Error::Capacity))
+    ));
+    assert!(exhausted.stopped().is_some());
+    sql(fixture, "CREATE TRIGGER reject_http_filing BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_filing()");
+    assert!(worker.file(request(10_000), &mut meter()).is_err());
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submissions"),
+        queued
+    );
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.keywords WHERE email_id=decode('{email}','hex') AND keyword='$draft'")), "1");
+    sql(fixture, "DROP TRIGGER reject_http_filing ON td_mta.flag_receipts; CREATE FUNCTION public.delay_http_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_filing AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_filing()");
+    let result = worker.file(request(3000), &mut meter()).unwrap();
+    assert!(matches!(
+        result.outcome,
+        Err(ports::CommitFailure::Indeterminate(_))
+    ));
+    assert!(result.admission_stopped);
+    let operation = pending.operation().unwrap().unwrap();
+    assert!(matches!(
+        worker.file(request(10_000), &mut meter()),
+        Err(td_mta::store_fs::UploadError::Store(ports::Error::Busy))
+    ));
+    assert_eq!(pending.operation().unwrap(), Some(operation));
+    thread::sleep(Duration::from_secs(5));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_http_filing ON td_mta.flag_receipts",
+    );
+    let mut connection = loaded
+        .bootstrap
+        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    connection.mode = td_mta::postgres_probe::Mode::Runtime;
+    let foreground = Snapshot::open_runtime(
+        &slots,
+        &connection,
+        &loaded.trust,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    let settled = pending
+        .settle(loaded, executable, &settlement, &clock, until(10_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(settled.outcome.results, [UpdateResult::Updated]);
+    assert_eq!(pending.operation().unwrap(), None);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submissions"),
+        queued
+    );
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.keywords WHERE email_id=decode('{email}','hex') AND keyword='$draft'")), "0");
+    assert_eq!(sql(fixture,&format!("SELECT encode(mailbox_id,'hex') FROM td_mta.memberships WHERE email_id=decode('{email}','hex')")), sent.to_string());
+    drop(foreground);
+    let missing_source = worker.file(request(10_000), &mut meter()).unwrap();
+    assert!(missing_source.outcome.is_ok());
+    assert_eq!(
+        missing_source.results,
+        [td_mta::store_fs::EmailUpdateResult::InvalidMailbox]
+    );
 }
 
 fn exercise_success_filing(

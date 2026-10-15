@@ -4,10 +4,10 @@ use crate::{
     clock::RuntimeClock,
     device_credentials::Presented,
     format::Sequence,
-    ids::{AccountId, DeviceId, EmailId, EmailOperationId, StoreEpoch},
+    ids::{AccountId, DeviceId, EmailId, EmailOperationId, MailboxId, StoreEpoch},
     jmap_request::dispatch::EmailMutator,
     ports::{Clock, CommitFailure, Deadline, Error},
-    postgres_email_set::{self as changes, deletion, Change},
+    postgres_email_set::{self as changes, deletion, filing, Change},
     postgres_input::Loaded,
     postgres_probe::{self, Mode},
     postgres_read::ReadSlots,
@@ -26,12 +26,14 @@ use std::{
 enum Operation {
     Update(Change),
     Destroy(deletion::Deletion),
+    Filing(filing::Filing),
 }
 impl Operation {
     fn operation(&self) -> EmailOperationId {
         match self {
             Self::Update(value) => value.operation(),
             Self::Destroy(value) => value.operation(),
+            Self::Filing(value) => value.operation(),
         }
     }
     fn inspect(
@@ -43,6 +45,7 @@ impl Operation {
         match self {
             Self::Update(value) => changes::inspect_batch(connection, trust, deadline, value),
             Self::Destroy(value) => deletion::inspect(connection, trust, deadline, value),
+            Self::Filing(value) => filing::inspect(connection, trust, deadline, value),
         }
     }
     fn publish(
@@ -57,23 +60,26 @@ impl Operation {
                 changes::publish_batch(connection, trust, deadline, value, password)
             }
             Self::Destroy(value) => deletion::publish(connection, trust, deadline, value, password),
+            Self::Filing(value) => filing::publish(connection, trust, deadline, value, password),
         }
     }
 }
 enum Input<'a> {
     Update(&'a [EmailUpdate]),
     Destroy(&'a [EmailId]),
+    Filing(EmailId, Option<(MailboxId, MailboxId)>),
 }
 impl Input<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Update(values) => values.len(),
             Self::Destroy(values) => values.len(),
+            Self::Filing(..) => 1,
         }
     }
     fn valid_result(&self, result: changes::UpdateResult) -> bool {
         match self {
-            Self::Update(_) => matches!(
+            Self::Update(_) | Self::Filing(..) => matches!(
                 result,
                 changes::UpdateResult::Updated
                     | changes::UpdateResult::NotFound
@@ -92,6 +98,9 @@ impl Input<'_> {
         expected: Option<u64>,
     ) -> Result<Operation, Error> {
         match self {
+            Self::Filing(email, movement) => filing::prepare(binding, device, *email, *movement)
+                .map(Operation::Filing)
+                .map_err(map_error),
             Self::Destroy(values) => deletion::prepare(binding, device, values, expected)
                 .map(Operation::Destroy)
                 .map_err(map_error),
@@ -220,6 +229,15 @@ pub struct Updates<'a> {
     pub pending: &'a Pending,
     pub password: &'a [u8],
 }
+/// Apply only after a known successful submission. Filing is an independent
+/// Email transaction and must never replace the submission's durable outcome.
+pub struct FilingRequest {
+    pub account: AccountId,
+    pub device: DeviceId,
+    pub email: EmailId,
+    pub movement: Option<(MailboxId, MailboxId)>,
+    pub deadline: Deadline,
+}
 impl EmailMutator for Updates<'_> {
     fn update(
         &self,
@@ -298,6 +316,39 @@ impl EmailMutator for Updates<'_> {
     }
 }
 impl Updates<'_> {
+    pub fn file(
+        &self,
+        request: FilingRequest,
+        meter: &mut Meter,
+    ) -> Result<EmailUpdateCompletion, UploadError> {
+        let mut results = Vec::new();
+        results.try_reserve_exact(1).map_err(|_| Error::Capacity)?;
+        let complete = self.apply(
+            MutationRequest {
+                account: request.account,
+                device: request.device,
+                expected: None,
+                deadline: request.deadline,
+                input: Input::Filing(request.email, request.movement),
+            },
+            meter,
+        )?;
+        for result in complete.results {
+            results.push(match result {
+                changes::UpdateResult::Updated => EmailUpdateResult::Updated,
+                changes::UpdateResult::NotFound => EmailUpdateResult::NotFound,
+                changes::UpdateResult::InvalidMailbox => EmailUpdateResult::InvalidMailbox,
+                _ => return Err(Error::Corrupt.into()),
+            });
+        }
+        Ok(EmailUpdateCompletion {
+            before_epoch: self.binding.epoch(),
+            before_sequence: complete.before_sequence,
+            outcome: complete.outcome,
+            results,
+            admission_stopped: complete.admission_stopped,
+        })
+    }
     fn apply(&self, request: MutationRequest<'_>, meter: &mut Meter) -> Result<Completion, Error> {
         if !self.executable.is_absolute()
             || !self.binding.roles().jmap()
@@ -327,6 +378,8 @@ impl Updates<'_> {
                         * (crate::postgres_mailboxes::MAX_MAILBOXES as u64
                             + if matches!(&request.input, Input::Destroy(_)) {
                                 3 * 256 + 32
+                            } else if matches!(&request.input, Input::Filing(..)) {
+                                2 * crate::postgres_mailboxes::MAX_MAILBOXES as u64 + 32
                             } else {
                                 16
                             })

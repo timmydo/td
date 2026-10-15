@@ -2766,3 +2766,24 @@ listing, selected/missing IDs, result-reference lookup, signature bytes and
 foreign-account refusal alongside the normal Mail methods. HTTPS capability
 admission and the Session remain unchanged: this increment does not advertise
 Submission before sending and reconciliation are connected.
+
+## 91. Fixed-worker success filing
+
+The prepared HTTPS Email mutation owner accepts the exact success-filing
+operation alongside flags, moves and deletion. The caller supplies a known
+successful submission's Email and optional source/destination pair. Filing
+uses its own Email transaction and response completion; no filing error
+replaces or rolls back the queue outcome.
+
+The original request meter funds bounded membership inspection and history
+updates before effects. Fresh Runtime qualification, account/device checks,
+the current selected policy and the original deadline apply as for other
+Email writes. Uncertain filing retains its exact receipt operation in the
+same owner and fences subsequent Email mutations. Independent settlement
+capacity can recover it without obtaining another application password.
+
+The local PostgreSQL fixture verifies exhausted work, transaction rollback
+without queue or draft loss, delayed-COMMIT fencing, settlement with occupied
+foreground capacity, the final membership/draft state, and missing-source
+refusal. This adapter does not yet connect the JMAP implicit response or
+advertise Submission.
