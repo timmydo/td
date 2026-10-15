@@ -2287,3 +2287,33 @@ mail database. Fixtures cover complete echo output, quota saturation, prepaid
 output, successful cleanup, replacement-file uncertainty and sticky clock
 failure. Production still supplies the local coordinator until atomic cutover;
 the temporary owner enum and legacy hooks are preparation plumbing.
+
+## 67. Prepared PostgreSQL Mailbox/get dispatch
+
+`dispatch::run_with_postgres_read` accepts a freshly authenticated runtime
+snapshot and a response retention owner. Core/echo and Mailbox/get use the
+existing whole-request admission, argument parser, result references,
+method-error handling and retained response encoder. Other methods return
+unknownMethod at this preparation boundary; they never fall through to the
+local database. Production remains on the existing backend until cutover.
+
+Mailbox/get obtains bounded names, hierarchy and counts from that snapshot,
+uses its identity for state, and uses the shared object encoder. Explicit
+IDs retain request order and duplicate/notFound behavior; null IDs select
+the bounded mailbox list. Snapshot checks precede and follow the operation
+and the batch. All response bytes remain provisional until those checks
+succeed. The prepared profile has no mutations and advertises read-only
+rights. The temporary read seam and native path are removed at cutover.
+
+The dispatcher converts its execution tick using the response owner's
+RuntimeClock and tightens both the snapshot and SQL worker deadlines before
+any dispatch. This can only shorten the original allowance; a subsequent
+call cannot extend it or clear a terminal error. Nested mailbox expiry keeps
+its executionDeadline classification.
+
+Losing the snapshot is terminal for this prepared read batch, including
+execution-phase expiry: the final snapshot check discards the entire retained
+result and returns the deadline error. Argument and unsupported-method errors
+still produce per-method replies while the snapshot remains usable. The
+runtime HTTP adapter must settle such terminal refusal without publishing
+any prefix of the discarded batch.

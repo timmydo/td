@@ -228,6 +228,16 @@ impl<'a> Snapshot<'a> {
     }
 }
 impl Snapshot<'_> {
+    /// Tighten the original allowance for a shorter enclosing request phase.
+    /// Never renews time, including after a terminal failure.
+    pub fn constrain_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
+        self.deadline = self.deadline.min(deadline);
+        let result = self
+            .worker
+            .constrain_deadline(self.deadline)
+            .map_err(Error::Connection);
+        self.retain(result)
+    }
     pub fn identity(&self) -> ViewIdentity {
         self.identity
     }

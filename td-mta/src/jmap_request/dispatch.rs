@@ -166,6 +166,7 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
             mailboxes: Some((mutations, device)),
             drafts: drafts.map(|creator| (creator, device)),
             identities: None,
+            read: None,
         },
     )
 }
@@ -189,6 +190,79 @@ pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+/// Prepared PostgreSQL read dispatch. The caller owns the freshly authenticated
+/// runtime snapshot and its original deadline for this batch. `clock` must be
+/// the response owner's clock; its execution instant tightens SQL as well as
+/// response work. Only Core and
+/// Mailbox/get are connected here; production activation is a separate cutover.
+pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    snapshot: &mut crate::postgres_read::Snapshot<'_>,
+    clock: &crate::clock::RuntimeClock,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    snapshot
+        .constrain_deadline(
+            clock
+                .deadline_instant(execution)
+                .map_err(mailbox_get::storage)?,
+        )
+        .map_err(postgres_read_error)?;
+    let account = snapshot.identity().account;
+    let complete = run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        Profile {
+            read: Some(snapshot),
+            ..Profile::default()
+        },
+    )?;
+    snapshot.check().map_err(postgres_read_error)?;
+    Ok(complete)
+}
+
+fn reborrow_read<'short, 'long: 'short>(
+    view: &'short mut (dyn MailRead + 'long),
+) -> &'short mut (dyn MailRead + 'short) {
+    view
+}
+
+// This preparation seam disappears with the local database adapter at cutover.
+trait MailRead {
+    fn identity(&self) -> ports::ViewIdentity;
+    fn check(&mut self) -> Result<(), Error>;
+    fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error>;
+}
+impl MailRead for crate::postgres_read::Snapshot<'_> {
+    fn identity(&self) -> ports::ViewIdentity {
+        self.identity()
+    }
+    fn check(&mut self) -> Result<(), Error> {
+        self.check().map_err(postgres_read_error)
+    }
+    fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error> {
+        self.mailbox_listing().map_err(postgres_read_error)
+    }
+}
+fn postgres_read_error(error: crate::postgres_read::Error) -> Error {
+    use crate::postgres_read::Error as Read;
+    match error {
+        Read::Connection(crate::postgres_probe::Error::Deadline)
+        | Read::Mailboxes(crate::postgres_mailboxes::Error::Connection(
+            crate::postgres_probe::Error::Deadline,
+        )) => Error::ExecutionDeadline,
+        Read::Busy => Error::StorageBusy,
+        Read::Capacity | Read::Mailboxes(crate::postgres_mailboxes::Error::Capacity) => {
+            Error::StorageCapacity
+        }
+        Read::Output(error) => mailbox_get::storage(error),
+        _ => Error::Storage(ports::Error::Invalid),
+    }
+}
+
 fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     mut retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -201,6 +275,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         mailboxes,
         drafts,
         identities,
+        read,
     } = profile;
     if identities.is_some_and(|catalog| catalog.account() != account) {
         return Err(Error::State);
@@ -235,6 +310,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         retention.admit_work_turn().map_err(Error::Storage)?;
         calls.push(call.token_index());
     }
+    let mut read = read;
     let mut worker = Worker {
         retention: &mut retention,
         execution,
@@ -245,6 +321,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         mailboxes,
         drafts,
         identities,
+        read: read.as_mut().map(|view| reborrow_read(&mut **view)),
         submission,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
@@ -319,6 +396,7 @@ struct Profile<'a> {
     mailboxes: Option<(&'a dyn MailboxMutator, crate::ids::DeviceId)>,
     drafts: Option<(&'a dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'a crate::identity_catalog::Catalog>,
+    read: Option<&'a mut dyn MailRead>,
 }
 struct Resolved {
     value: usize,
@@ -334,6 +412,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     mailboxes: Option<(&'io dyn MailboxMutator, crate::ids::DeviceId)>,
     drafts: Option<(&'io dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'io crate::identity_catalog::Catalog>,
+    read: Option<&'io mut dyn MailRead>,
     submission: bool,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
@@ -454,6 +533,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 value: value.token_index(),
                 range,
             });
+        }
+        if self.read.is_some() && !matches!(call.name, b"Core/echo" | b"Mailbox/get") {
+            return Err(Error::UnknownMethod);
         }
         let name = match call.name {
             b"Identity/get" if self.submission && self.identities.is_some() => "Identity/get",
@@ -836,6 +918,17 @@ pub(super) mod tests {
         format!(r#"{{"using":["urn:ietf:params:jmap:core"],"methodCalls":{calls}}}"#)
     }
     #[test]
+    fn postgres_deadline_classification_preserves_nested_mailbox_expiry() {
+        assert_eq!(
+            postgres_read_error(crate::postgres_read::Error::Mailboxes(
+                crate::postgres_mailboxes::Error::Connection(
+                    crate::postgres_probe::Error::Deadline
+                ),
+            )),
+            Error::ExecutionDeadline,
+        );
+    }
+    #[test]
     fn core_dispatch_retains_responses_without_a_mail_database() {
         use crate::{
             admission::{DiskLimits, ViewMode, WorkLimits},
@@ -1019,6 +1112,7 @@ pub(super) mod tests {
                 mailboxes: None,
                 drafts: None,
                 identities: None,
+                read: None,
                 submission: false,
             };
             assert_eq!(
@@ -1427,6 +1521,7 @@ pub(super) mod tests {
                 mailboxes: None,
                 drafts: None,
                 identities: None,
+                read: None,
                 submission: false,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));

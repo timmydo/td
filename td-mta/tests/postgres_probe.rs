@@ -5173,6 +5173,177 @@ fn exercise_http_auth(
     assert_eq!(auth.authenticate(password, until()), Ok(Some(device)));
 }
 
+fn exercise_mailbox_dispatch(
+    fixture: &Fixture,
+    snapshot: &mut td_mta::postgres_read::Snapshot<'_>,
+    mailbox: td_mta::ids::MailboxId,
+    blocked: bool,
+) {
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{DiskLimits, ViewMode, WorkLimits},
+        jmap_request::{dispatch, response, OwnedValidation, CORE, MAIL},
+        limits::Limits,
+        ports::{Clock, Deadline, Tick},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
+    };
+    let mut id_bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(snapshot.identity().account, &mut id_bytes)
+        .unwrap()
+        .to_owned();
+    let mailbox = td_mta::wire::encode_id(mailbox, &mut id_bytes)
+        .unwrap()
+        .to_owned();
+    let missing = td_mta::wire::encode_id(
+        td_mta::ids::MailboxId::from_bytes([0xfe; 16]),
+        &mut id_bytes,
+    )
+    .unwrap()
+    .to_owned();
+    let input = format!(
+        r##"{{"using":["{CORE}","{MAIL}"],"methodCalls":[
+        ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],
+        ["Mailbox/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"Mailbox/get","path":"/list/*/id"}},"properties":["id"]}},"b"],
+        ["Mailbox/get",{{"accountId":"{account}","ids":null,"properties":["name"]}},"c"],
+        ["Mailbox/get",{{"accountId":"{account}","properties":["unsupported"]}},"d"],
+        ["Email/get",{{"accountId":"{account}"}},"e"],
+        ["Core/echo",{{"after":true}},"f"]
+    ]}}"##
+    );
+    let limits = Limits::default();
+    let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
+    bytes[..input.len()].copy_from_slice(input.as_bytes());
+    let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+    let mut parser = td_json::arena::OwnedCursor::with_input_length(
+        bytes,
+        tokens,
+        input.len(),
+        td_json::arena::ParseLimits {
+            max_bytes: limits.json_bytes,
+            max_depth: limits.json_depth,
+            max_tokens: limits.json_tokens,
+        },
+    )
+    .unwrap();
+    while !parser.step().unwrap() {}
+    let resources = limits.plan().unwrap();
+    let mut validation =
+        OwnedValidation::new(parser.finish().unwrap(), &resources, &[CORE, MAIL]).unwrap();
+    while !validation.step().unwrap() {}
+    let request = validation.finish().unwrap();
+    let directory = fixture.root.join(if blocked {
+        "jmap-blocked-responses"
+    } else {
+        "jmap-responses"
+    });
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut root = PrivateRoot::open(directory.to_str().unwrap())
+        .unwrap()
+        .try_lock()
+        .unwrap();
+    let clock = Arc::new(td_mta::clock::RuntimeClock::new());
+    let deadline = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let spool = RequestSpool::open(&mut root, clock.clone(), deadline).unwrap();
+    let disk = DiskLimits::default()
+        .plan(
+            &resources,
+            WorkLimits::default(),
+            ViewMode::OnlineBackground,
+        )
+        .unwrap();
+    let mut states = [const { td_mta::ownership::SlotState::EMPTY }; 4];
+    let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
+    let owner =
+        ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
+    let retention = owner.retain_response(deadline).unwrap();
+    let mut preflight = response::Preflight::new(request, "session", retention.maximum()).unwrap();
+    while !preflight.step(&mut [0; 4096]).unwrap() {}
+    let mut blocker = None;
+    if blocked {
+        use std::io::Write;
+        let mut child = ProbeChild(
+            sql_command(fixture)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        writeln!(
+            input,
+            "BEGIN; LOCK TABLE td_mta.mailboxes IN ACCESS EXCLUSIVE MODE;"
+        )
+        .unwrap();
+        let stop = self::deadline();
+        while sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-schema-fixture' AND state='idle in transaction' AND query LIKE '%ACCESS EXCLUSIVE MODE%'") != "1" {
+            assert!(Instant::now() < stop);
+            thread::sleep(Duration::from_millis(5));
+        }
+        blocker = Some((child, input));
+    }
+    let execution = if blocked {
+        Deadline::after(clock.sample().unwrap().monotonic, 250).unwrap()
+    } else {
+        Deadline::after(Tick(0), deadline.tick().0 - 1).unwrap()
+    };
+    let result = dispatch::run_with_postgres_read(
+        preflight.finish().unwrap(),
+        retention,
+        execution,
+        snapshot,
+        &clock,
+    );
+    if let Some((mut child, mut input)) = blocker {
+        use std::io::Write;
+        assert!(matches!(result, Err(dispatch::Error::ExecutionDeadline)));
+        let expired =
+            td_mta::postgres_read::Error::Connection(td_mta::postgres_probe::Error::Deadline);
+        assert_eq!(snapshot.check(), Err(expired));
+        assert_eq!(snapshot.constrain_deadline(self::deadline()), Err(expired));
+        drop(result);
+        assert_eq!(owner.used().unwrap(), 0);
+        writeln!(input, "COMMIT;").unwrap();
+        drop(input);
+        wait_command(&mut child);
+        return;
+    }
+    let mut complete = result.unwrap();
+    assert_eq!(complete.responses().len(), 6);
+    let mut encoder = complete.encoder().unwrap();
+    while !encoder.count_step(&mut [0; 4096]).unwrap() {}
+    let length = encoder.begin_output().unwrap();
+    let mut output = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let progress = encoder.poll_output(&mut chunk).unwrap();
+        output.extend_from_slice(&chunk[..progress.written]);
+        if progress.complete {
+            break;
+        }
+    }
+    assert_eq!(encoder.finish().unwrap(), length);
+    assert_eq!(output.len() as u64, length);
+    let output = String::from_utf8(output).unwrap();
+    assert!(
+        output.contains(r#""name":"Drafts","totalEmails":2"#),
+        "{output}"
+    );
+    assert!(output.contains(r#""mayReadItems":true,"mayAddItems":false"#));
+    assert!(output.contains(&format!(r#""notFound":["{missing}"]"#)));
+    assert!(output.contains(&format!(
+        r#""list":[{{"id":"{mailbox}"}}],"notFound":[]}},"b""#
+    )));
+    assert!(output.contains(r#"["error",{"type":"invalidArguments"},"d"]"#));
+    assert!(output.contains(r#"["error",{"type":"unknownMethod"},"e"]"#));
+    assert!(output.contains(r#"["Core/echo",{"after":true},"f"]"#));
+    assert_eq!(output.matches(r#""name":"Drafts""#).count(), 2);
+    drop(complete);
+    assert_eq!(owner.used().unwrap(), 0);
+    assert!(!owner.admission_stopped());
+}
+
 fn exercise_read(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -5229,6 +5400,7 @@ fn exercise_read(
     let mut owned =
         read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
             .unwrap();
+    exercise_mailbox_dispatch(fixture, &mut owned, mailbox, false);
     assert_eq!(owned.identity().committed_sequence.number(), 3);
     assert!(owned.email(first.email).unwrap().is_some());
     assert_eq!(
@@ -5237,6 +5409,11 @@ fn exercise_read(
     );
     assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'"), "1");
     drop(owned);
+    let mut blocked =
+        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
+            .unwrap();
+    exercise_mailbox_dispatch(fixture, &mut blocked, mailbox, true);
+    drop(blocked);
     let closed = deadline();
     while sql(
         fixture,

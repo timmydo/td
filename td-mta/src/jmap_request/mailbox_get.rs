@@ -59,6 +59,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::AccountNotFound);
         }
         self.check()?;
+        if let Some(view) = self.read.take() {
+            let result =
+                self.postgres_mailboxes(view, &account, &mut requested, all, maximum, projection);
+            self.read = Some(view);
+            return result;
+        }
         let mut view = self
             .retention
             .method_view(self.account, self.execution)
@@ -182,6 +188,104 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         self.get_not_found(&requested)?;
         self.append(b"]}")?;
         view.check_snapshot().map_err(storage)?;
+        self.check()?;
+        let end = self.retention.publish().map_err(Error::Storage)?;
+        Ok(start..end)
+    }
+    fn postgres_mailboxes(
+        &mut self,
+        view: &mut dyn super::MailRead,
+        account: &super::push::Name,
+        requested: &mut Vec<Requested<MailboxId>>,
+        all: bool,
+        maximum: usize,
+        projection: Projection,
+    ) -> Result<Range<u64>, Error> {
+        view.check()?;
+        let identity = view.identity();
+        if identity.account != self.account {
+            return Err(Error::State);
+        }
+        let rows = view.mailboxes()?;
+        if all {
+            if rows.len() > maximum {
+                return Err(Error::RequestTooLarge);
+            }
+            for row in &rows {
+                self.check()?;
+                requested.push(Requested {
+                    name: None,
+                    id: Some(row.id),
+                    found: false,
+                });
+            }
+        }
+        let mut state_bytes = [0; DataState::WIRE_BYTES];
+        let state = DataState {
+            account: identity.account,
+            epoch: identity.epoch,
+            kind: DataType::Mailbox,
+            sequence: identity.committed_sequence,
+        }
+        .encode(&mut state_bytes)
+        .map_err(|_| Error::State)?;
+        let start = self.retention.len();
+        self.append(br#"{"accountId":"#)?;
+        self.push_id(account)?;
+        self.append(br#","state":""#)?;
+        self.append(state.as_bytes())?;
+        self.append(br#"","list":["#)?;
+        let mut output = vec![0; mailbox_response::MAX_OBJECT_BYTES];
+        let mut first = true;
+        for item in requested.iter_mut() {
+            self.check()?;
+            let Some(id) = item.id else {
+                continue;
+            };
+            let mut found = None;
+            for row in &rows {
+                self.check()?;
+                if row.id == id {
+                    found = Some(row);
+                    break;
+                }
+            }
+            let Some(row) = found else {
+                continue;
+            };
+            let length = mailbox_response::encode_object(
+                mailbox_response::Object {
+                    identity,
+                    id,
+                    row: row.row(),
+                    counts: Some(&row.counts),
+                },
+                projection,
+                Rights {
+                    may_read_items: true,
+                    may_add_items: false,
+                    may_remove_items: false,
+                    may_set_seen: false,
+                    may_set_keywords: false,
+                    may_create_child: false,
+                    may_rename: false,
+                    may_delete: false,
+                    may_submit: false,
+                },
+                &mut output,
+            )
+            .map_err(storage)?;
+            if !first {
+                self.append(b",")?;
+            }
+            first = false;
+            self.append(output.get(..length).ok_or(Error::State)?)?;
+            item.found = true;
+        }
+        self.append(br#"],"notFound":["#)?;
+        self.get_not_found(requested)?;
+        self.append(b"]}")?;
+        view.check()?;
         self.check()?;
         let end = self.retention.publish().map_err(Error::Storage)?;
         Ok(start..end)

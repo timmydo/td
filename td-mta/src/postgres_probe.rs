@@ -352,6 +352,10 @@ pub(crate) struct Worker {
     activity: Arc<AtomicBool>,
 }
 impl Worker {
+    pub(crate) fn constrain_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
+        self.deadline = self.deadline.min(deadline);
+        self.check()
+    }
     // No query or round trip: drain available asynchronous messages so an idle
     // cached read cannot hide a terminal connection error behind a notice.
     pub(crate) fn check(&mut self) -> Result<(), Error> {
