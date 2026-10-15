@@ -232,6 +232,7 @@ pub mod postgres_email_set;
 mod postgres_publication;
 pub mod postgres_receiving;
 pub mod postgres_smtp_receiving;
+pub mod postgres_smtp_storage;
 pub mod postgres_uploads;
 
 mod mailbox_name;

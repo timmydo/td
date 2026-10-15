@@ -2956,6 +2956,7 @@ per_peer_limit = 1
         }
         if name == "cloud" && matches!(exercise, ConfigurationExercise::ReceivingOwner) {
             exercise_smtp_receiving_owner(&fixture, prepared.binding());
+            exercise_smtp_storage(&fixture, prepared.binding());
         }
         let (binding, configuration, policies) = prepared.into_parts();
         assert_eq!(
@@ -11004,6 +11005,218 @@ fn exercise_http_upload_owner(
         sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts"),
         "2"
     );
+}
+
+fn exercise_smtp_storage(fixture: &Fixture, binding: &td_mta::postgres_runtime_profile::Binding) {
+    use std::{num::NonZeroU32, sync::Arc};
+    use td_mta::{
+        clock::RuntimeClock,
+        config::{
+            routing::{AliasSlot, Builder, DomainSlot},
+            syntax::Location,
+        },
+        format::row::ReceiptTls,
+        ports::{Clock, CommitFailure, Deadline, Error},
+        postgres_read::ReadSlots,
+        postgres_smtp_receiving::{Pending, Receiving},
+        postgres_smtp_storage::Backend,
+        smtp_session::{Pending as Action, Session, Settings},
+        smtp_storage::{Begin, Failure, Job, Storage},
+    };
+    let loaded = td_mta::postgres_input::Loaded {
+        bootstrap: td_mta::postgres_bootstrap::Bootstrap::parse(
+            &format!(
+                "postgresql://mail_runtime:{}@localhost:{}/postgres",
+                std::str::from_utf8(PASSWORD).unwrap(),
+                fixture.port
+            ),
+            binding.profile(),
+        )
+        .unwrap(),
+        trust: TrustStore::from_pem(&fixture.ca).unwrap(),
+    };
+    let clock = Arc::new(RuntimeClock::new());
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let slots = ReadSlots::new(1).unwrap();
+    let pending = Pending::default();
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let storage = Backend::new(
+        Receiving {
+            loaded: &loaded,
+            executable,
+            binding,
+            slots: &slots,
+            clock: &clock,
+            pending: &pending,
+        },
+        clock.clone(),
+        7,
+    )
+    .unwrap();
+    let mut text = [0; 1024];
+    let mut domains = [DomainSlot::EMPTY; 1];
+    let mut aliases = [AliasSlot::EMPTY; 1];
+    let at = Location {
+        line: NonZeroU32::new(1).unwrap(),
+        column: 1,
+    };
+    let mut builder = Builder::new(&mut text, &mut domains, &mut aliases).unwrap();
+    builder.account(binding.account(), at).unwrap();
+    builder.domain("example.test", at).unwrap();
+    builder
+        .alias("alice@example.test", binding.account(), at)
+        .unwrap();
+    let routes = builder.finish().unwrap();
+    let initial: u64 = sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts")
+        .parse()
+        .unwrap();
+    let mut random = td_crypto::SystemEntropy::try_new().unwrap();
+    for case in 0..4 {
+        let mut session = Session::new(
+            &routes,
+            Settings {
+                hostname: "mail.example.test",
+                message_bytes: 32768,
+                trace_bytes: 4096,
+                recipients: 100,
+                starttls: false,
+            },
+        )
+        .unwrap();
+        session.reply_sent().unwrap();
+        for line in [
+            "EHLO sender.example.test\r\n",
+            "MAIL FROM:<sender@example.test>\r\n",
+            "RCPT TO:<alice@example.test>\r\n",
+        ] {
+            assert_eq!(session.feed(line.as_bytes()).unwrap(), line.len());
+            assert!(
+                matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"250"))
+            );
+            session.reply_sent().unwrap();
+        }
+        session.feed(b"DATA\r\n").unwrap();
+        let deadline = until(if case == 3 { 3000 } else { 10_000 });
+        let begin = |clock: Arc<dyn Clock>, generation| Begin {
+            account: binding.account(),
+            config_generation: generation,
+            peer: "192.0.2.2".parse().unwrap(),
+            tls: ReceiptTls::Plain,
+            clock,
+            session: &session,
+            header_bytes: 16384,
+            deadline,
+        };
+        assert!(matches!(
+            storage.begin(begin(Arc::new(RuntimeClock::new()), 7), &mut random),
+            Err(Failure::Refused(Error::Forbidden))
+        ));
+        assert!(matches!(
+            storage.begin(begin(clock.clone(), 8), &mut random),
+            Err(Failure::Refused(Error::Forbidden))
+        ));
+        let mut job = storage.begin(begin(clock.clone(), 7), &mut random).unwrap();
+        assert!(matches!(
+            storage.begin(begin(clock.clone(), 7), &mut random),
+            Err(Failure::Retry)
+        ));
+        if case == 0 {
+            drop(job);
+            assert_eq!(
+                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                initial.to_string()
+            );
+            continue;
+        }
+        if case == 1 {
+            assert_eq!(job.write(b"invalid"), Err(Failure::Refused(Error::Invalid)));
+            assert_eq!(
+                job.write(b"valid\r\n"),
+                Err(Failure::Refused(Error::Invalid))
+            );
+            assert_eq!(
+                job.prepare(until(10_000)),
+                Err(Failure::Refused(Error::Invalid))
+            );
+            drop(job);
+            continue;
+        }
+        session.data_ready(Ok(())).unwrap();
+        assert!(
+            matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"354"))
+        );
+        session.reply_sent().unwrap();
+        for line in [
+            b"Subject: SMTP PostgreSQL\r\n".as_slice(),
+            b"\r\n",
+            b"body\r\n",
+        ] {
+            assert_eq!(session.feed(line).unwrap(), line.len());
+            let Action::Data(bytes) = session.pending() else {
+                panic!("expected DATA")
+            };
+            job.write(bytes).unwrap();
+            session.data_written(Ok(())).unwrap();
+        }
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+            (initial + u64::from(case == 3)).to_string()
+        );
+        session.feed(b".\r\n").unwrap();
+        assert!(matches!(session.pending(), Action::Commit));
+        job.prepare(until(10_000)).unwrap();
+        if case == 3 {
+            sql(fixture, "CREATE FUNCTION public.delay_storage_receiving() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_storage_receiving AFTER INSERT ON td_mta.receiving_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_storage_receiving()");
+        }
+        let completed = job.commit().unwrap();
+        assert!(matches!(
+            job.commit(),
+            Err(Failure::Refused(Error::Conflict))
+        ));
+        drop(job);
+        if case == 2 {
+            assert!(!completed.stop);
+            let commit = completed.outcome.unwrap();
+            assert_eq!(commit.account, binding.account());
+            assert_eq!(commit.epoch, binding.epoch());
+            session.committed(Ok(commit)).unwrap();
+            assert!(
+                matches!(session.pending(), Action::Reply { bytes, .. } if bytes.starts_with(b"250"))
+            );
+            assert_eq!(
+                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                (initial + 1).to_string()
+            );
+        } else {
+            assert!(completed.stop && storage.stopped());
+            assert!(matches!(
+                completed.outcome,
+                Err(CommitFailure::Indeterminate(_))
+            ));
+            session.committed(completed.outcome).unwrap();
+            assert!(matches!(session.pending(), Action::Closed));
+            assert_eq!(
+                storage.ready(binding.account(), until(10_000)),
+                Err(Error::WriterStopped)
+            );
+            assert!(pending.operation().unwrap().is_some());
+            thread::sleep(Duration::from_secs(5));
+            sql(
+                fixture,
+                "DROP TRIGGER delay_storage_receiving ON td_mta.receiving_receipts",
+            );
+            let settlement = ReadSlots::new(1).unwrap();
+            assert!(pending
+                .settle(&loaded, executable, &settlement, &clock, until(10_000))
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                sql(fixture, "SELECT count(*) FROM td_mta.receiving_receipts"),
+                (initial + 2).to_string()
+            );
+            assert!(storage.stopped());
+        }
+    }
 }
 
 fn exercise_smtp_receiving_owner(

@@ -3057,3 +3057,31 @@ under the caller's deadline. Errors remain typed; no local fallback or listener
 activation is introduced. The runtime-role PostgreSQL fixture covers success,
 missing Inbox, incoherent Inbox history, stale selection and pending delivery,
 including unchanged account state and absent publication effects.
+
+## 107. Prepared SMTP DATA storage
+
+`postgres_smtp_storage` implements the fixed worker's storage boundary for
+direct SMTP. Its constructor pins the receiving owner, one shared runtime
+clock and the local policy generation. Begin checks the routed account,
+generation and configured message/header/recipient bounds, takes one ingress
+permit and observes fresh receiving readiness before admitting DATA. The
+permit and resident buffer survive worker turns without a database transaction
+or mutex guard spanning peer input. Dropping the job releases that capacity.
+
+The original absolute deadline and profile work allowance cover bounded DATA
+copies, receipt metadata, preparation and publication. Admission prepays one
+incoming buffer of at most 32 MiB; preparation may retain one additional
+filtered body under the same meter. Each decoded line is at most 1000 bytes.
+A failed write remains failed, and publication can be attempted only once.
+The trusted connection owner still supplies routing and observed peer/TLS
+facts; no gateway authority is inferred from message content.
+
+Known publication yields the account, epoch and sequence required for SMTP's
+final success reply. Unknown COMMIT retains the original operation in the
+publication owner, stops this backend and produces no final SMTP receipt.
+Historical settlement does not automatically restart this backend. Production
+still constructs only native storage; aggregate runtime admission, durable
+restart custody and atomic backend cutover remain separate work. The runtime
+PostgreSQL fixture drives the SMTP session through admission, DATA and commit,
+including discarded ingress, sticky refusal, generation/clock mismatch,
+single ingress capacity, success, delayed COMMIT and historical settlement.
