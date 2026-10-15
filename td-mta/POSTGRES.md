@@ -2702,3 +2702,20 @@ Email intact, exact receipt recovery after delayed COMMIT, preservation of an
 unrelated membership, missing-source refusal, clear-only/no-op behavior, and
 digest-conflict detection. Caller resource admission and bounded receipt
 reclamation remain activation obligations.
+
+## 88. Caller-funded submission publication preparation
+
+The inert postgres_submissions::prepare_with_meter helper uses the request's
+original work meter and runtime clock for body and request hashing. Each body
+chunk, fixed request field and length-delimited envelope string is charged
+before hashing, with both the original deadline and a bounded absolute phase
+deadline enforced. The cold helper creates a configured allowance and
+delegates. Prepared input remains shared immutable storage; this step does
+not copy the outgoing body or charge a second output allocation.
+
+The local submission publication fixture checks exhausted records, a body
+larger than remaining I/O, original and phase deadline refusals, and continued
+consumption of an already-used meter. Its successful result feeds the existing
+concurrent publication, receipt, routing and failure evidence. This preparation
+does not acquire database capacity, publish mail or enable Submission; those
+remain caller obligations, alongside retained-memory admission.

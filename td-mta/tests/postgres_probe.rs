@@ -8175,7 +8175,66 @@ fn exercise_submission_publication(
         .unwrap();
         submissions::prepare(prepared, deadline()).unwrap()
     };
-    let first = submissions::prepare(input.clone(), deadline()).unwrap();
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline},
+    };
+    let clock = RuntimeClock::new();
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+    let capacity = Charge {
+        io_bytes: 65536,
+        records: 10000,
+        ..Default::default()
+    };
+    let mut exhausted = Meter::new(until, Charge::default());
+    assert!(matches!(
+        submissions::prepare_with_meter(input.clone(), deadline(), &mut exhausted, &clock),
+        Err(submissions::Error::Work(td_mta::ports::Error::Capacity))
+    ));
+    assert!(exhausted.stopped().is_some());
+    let mut short = Meter::new(
+        until,
+        Charge {
+            io_bytes: input.bytes().len() as u64 - 1,
+            ..capacity
+        },
+    );
+    assert!(matches!(
+        submissions::prepare_with_meter(input.clone(), deadline(), &mut short, &clock),
+        Err(submissions::Error::Work(td_mta::ports::Error::Capacity))
+    ));
+    assert!(short.stopped().is_some());
+    let mut expired = Meter::new(
+        Deadline::after(clock.sample().unwrap().monotonic, 0).unwrap(),
+        capacity,
+    );
+    assert!(matches!(
+        submissions::prepare_with_meter(input.clone(), deadline(), &mut expired, &clock),
+        Err(submissions::Error::Work(td_mta::ports::Error::Deadline))
+    ));
+    let mut meter = Meter::new(until, capacity);
+    meter
+        .charge(
+            clock.sample().unwrap().monotonic,
+            Charge {
+                records: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let before = meter.remaining();
+    assert!(matches!(
+        submissions::prepare_with_meter(input.clone(), Instant::now(), &mut meter, &clock),
+        Err(submissions::Error::Connection(
+            td_mta::postgres_probe::Error::Deadline
+        ))
+    ));
+    let first =
+        submissions::prepare_with_meter(input.clone(), deadline(), &mut meter, &clock).unwrap();
+    let after = meter.remaining();
+    assert!(after.io_bytes < before.io_bytes && after.records < before.records);
+    assert_eq!(after.output_bytes, before.output_bytes);
     assert_eq!(
         submissions::inspect(request, trust, deadline(), &first).unwrap(),
         None

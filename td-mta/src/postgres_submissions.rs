@@ -1,7 +1,10 @@
 //! Retained atomic publication of prepared td-mail submissions.
 use crate::{
+    admission::work::{Charge, Meter, Stop},
+    clock::RuntimeClock,
     device_credentials::Presented,
     ids::{BlobId, EmailId, SubmissionId, SubmissionOperationId, ThreadId},
+    ports::{self, Clock, Deadline},
     postgres_devices,
     postgres_probe::{self, Request},
     postgres_publication as publication, postgres_schema,
@@ -25,6 +28,7 @@ pub enum Error {
     Connection(postgres_probe::Error),
     Schema(postgres_schema::Error),
     Credential(postgres_devices::Error),
+    Work(ports::Error),
     Epoch,
     Policy,
     Unauthenticated,
@@ -79,6 +83,36 @@ impl Submission {
 
 pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> {
     check_deadline(deadline)?;
+    let clock = RuntimeClock::new();
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(Error::Connection(postgres_probe::Error::Deadline))?;
+    let cap = Deadline::after(
+        clock.sample().map_err(Error::Work)?.monotonic,
+        u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
+    )
+    .map_err(Error::Work)?;
+    let work = input.binding().work();
+    let mut meter = Meter::new(
+        cap,
+        Charge {
+            io_bytes: work.foreground_io_bytes,
+            records: work.foreground_records,
+            ..Charge::default()
+        },
+    );
+    prepare_with_meter(input, deadline, &mut meter, &clock)
+}
+
+/// Hash the retained input under the original request budget. Publication and
+/// retained-memory admission remain separate obligations of the caller.
+pub fn prepare_with_meter(
+    input: Prepared,
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Submission, Error> {
+    charge(clock, meter, deadline, 0)?;
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let mut ids = [[0; 16]; 3];
     for id in &mut ids {
@@ -87,7 +121,7 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
     let [operation, id, blob] = ids;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for chunk in input.bytes().chunks(publication::CHUNK) {
-        check_deadline(deadline)?;
+        charge(clock, meter, deadline, chunk.len())?;
         hash.update(chunk).map_err(|_| Error::Crypto)?;
     }
     let body_digest = hash.finish().map_err(|_| Error::Crypto)?;
@@ -119,6 +153,7 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
         &input.expected().unwrap_or(0).to_be_bytes(),
         &(input.recipients().len() as u64).to_be_bytes(),
     ] {
+        charge(clock, meter, deadline, bytes.len())?;
         hash.update(bytes).map_err(|_| Error::Crypto)?;
     }
     for text in [
@@ -129,13 +164,18 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
     .into_iter()
     .chain(input.recipients())
     {
-        check_deadline(deadline)?;
+        charge(
+            clock,
+            meter,
+            deadline,
+            text.len().checked_add(8).ok_or(Error::Capacity)?,
+        )?;
         hash.update(&(text.len() as u64).to_be_bytes())
             .map_err(|_| Error::Crypto)?;
         hash.update(text.as_bytes()).map_err(|_| Error::Crypto)?;
     }
     let request_digest = hash.finish().map_err(|_| Error::Crypto)?;
-    check_deadline(deadline)?;
+    charge(clock, meter, deadline, 0)?;
     Ok(Submission {
         input,
         operation: SubmissionOperationId::from_bytes(operation),
@@ -144,6 +184,29 @@ pub fn prepare(input: Prepared, deadline: Instant) -> Result<Submission, Error> 
         body_digest,
         request_digest,
     })
+}
+fn charge(
+    clock: &RuntimeClock,
+    meter: &mut Meter,
+    deadline: Instant,
+    bytes: usize,
+) -> Result<(), Error> {
+    check_deadline(deadline)?;
+    meter
+        .charge(
+            clock.sample().map_err(Error::Work)?.monotonic,
+            Charge {
+                io_bytes: bytes as u64,
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(|error| {
+            Error::Work(match error {
+                Stop::Deadline => ports::Error::Deadline,
+                _ => ports::Error::Capacity,
+            })
+        })
 }
 fn check_deadline(deadline: Instant) -> Result<(), Error> {
     if deadline
