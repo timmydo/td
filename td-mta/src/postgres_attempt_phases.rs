@@ -1,4 +1,4 @@
-//! Durable DATA phase fences. Historical receipts never authorize transport.
+//! Durable DATA phases and positive outcomes under the current attempt fence.
 use crate::{
     ids::AttemptId,
     postgres_probe::{self, Request},
@@ -70,6 +70,24 @@ pub fn acceptance_possible(
         ordinals.iter().map(|n| (*n, "")),
     )
 }
+/// Retain a genuine final positive DATA reply for the entire transmitted
+/// subset. This records handoff, not final mailbox delivery or deduplication.
+pub fn accepted(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    ordinals: &[u32],
+    reply: &str,
+) -> Result<Change, Error> {
+    prepare(
+        claim,
+        generation,
+        attempt,
+        4,
+        ordinals.iter().map(|n| (*n, reply)),
+    )
+}
+
 fn prepare<'a>(
     claim: &Claim,
     generation: u64,
@@ -109,7 +127,7 @@ fn prepare<'a>(
         if ordinals.len() == 100
             || ordinal >= 1000
             || ordinals.last().is_some_and(|last| *last >= ordinal)
-            || (phase == 2 && !positive_reply(reply))
+            || (phase != 3 && !positive_reply(reply))
         {
             return Err(Error::Integrity);
         }
@@ -150,7 +168,22 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
     ))
 }
 async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
-    let rows = client.query("SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3", &[&value.claim.binding().account().as_bytes().as_slice(), &value.attempt.as_bytes().as_slice(), &value.phase]).await.map_err(|_| Error::Database)?;
+    let query = if value.phase == 4 {
+        "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_acceptance_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
+    } else {
+        "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_phase_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
+    };
+    let rows = client
+        .query(
+            query,
+            &[
+                &value.claim.binding().account().as_bytes().as_slice(),
+                &value.attempt.as_bytes().as_slice(),
+                &value.phase,
+            ],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -189,7 +222,7 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
-/// Publishes only a phase, never a remote result. Unknown COMMIT requires the
+/// Publishes the retained phase or positive outcome. Unknown COMMIT requires the
 /// caller to close transport; receipt settlement is historical evidence only.
 pub fn publish(
     request: &Request<'_>,
@@ -257,12 +290,22 @@ pub fn publish(
             if number(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
                 || number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old
                 || completed.is_some()
-                || timestamp >= expires
+                || (value.phase != 4 && timestamp >= expires)
             {
                 return Err(Error::Integrity);
             }
-            let count: i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", &[&account]).await.map_err(|_| Error::Database)?.try_get(0).map_err(|_| Error::Integrity)?;
-            if count >= 2048 {
+            let (count_query, ceiling) = if value.phase == 4 {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_acceptance_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+            } else {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", 2048)
+            };
+            let count: i64 = client
+                .query_one(count_query, &[&account])
+                .await
+                .map_err(|_| Error::Database)?
+                .try_get(0)
+                .map_err(|_| Error::Integrity)?;
+            if count >= ceiling {
                 return Err(Error::Capacity);
             }
             let rows = client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,last_attempt_at,uncertain,attempt_count,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_| Error::Database)?;
@@ -270,7 +313,7 @@ pub fn publish(
                 return Err(Error::Integrity);
             }
             let mut selected = 0;
-            let mut body_count = 0;
+            let mut prior_count = 0;
             for row in &rows {
                 let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let phase: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -295,13 +338,13 @@ pub fn publish(
                 {
                     return Err(Error::Integrity);
                 }
-                if phase == 2 {
-                    body_count += 1;
+                if phase == value.phase - 1 {
+                    prior_count += 1;
                 }
                 if value.ordinals.binary_search(&ordinal).is_ok() {
                     selected += 1;
                     if phase != value.phase - 1
-                        || (phase == 2
+                        || (phase >= 2
                             && (reply.is_none_or(|s| !positive_reply(s)) || data.is_some()))
                     {
                         return Err(Error::Conflict);
@@ -310,18 +353,48 @@ pub fn publish(
                     return Err(Error::Conflict);
                 }
             }
-            if selected != value.ordinals.len() || (value.phase == 3 && body_count != selected) {
+            if selected != value.ordinals.len() || (value.phase >= 3 && prior_count != selected) {
                 return Err(Error::Conflict);
             }
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
             let affected = if value.phase == 2 {
             client.execute("UPDATE td_mta.recipients r SET phase=2,rcpt_reply=u.reply,data_reply=NULL,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
+        } else if value.phase == 4 {
+            client.execute("UPDATE td_mta.recipients r SET state=4,phase=4,data_reply=u.reply,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
         } else {
             client.execute("UPDATE td_mta.recipients SET phase=3,changed=$4 WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($3)", &[&account,&submission,&value.ordinals,&changed]).await
         }.map_err(|_| Error::Database)?;
             if affected != value.ordinals.len() as u64 {
                 return Err(Error::Integrity);
+            }
+            if value.phase == 4 {
+                let totals = client.query_one("SELECT count(*),min(ordinal),max(ordinal),count(*) FILTER (WHERE state IN (1,2,3) OR (state=7 AND next_attempt_at IS NOT NULL)),count(*) FILTER (WHERE state IN (5,7)) FROM td_mta.recipients WHERE account=$1 AND submission_id=$2", &[&account,&submission]).await.map_err(|_| Error::Database)?;
+                let count: i64 = totals.try_get(0).map_err(|_| Error::Integrity)?;
+                let first: Option<i64> = totals.try_get(1).map_err(|_| Error::Integrity)?;
+                let last: Option<i64> = totals.try_get(2).map_err(|_| Error::Integrity)?;
+                let pending: i64 = totals.try_get(3).map_err(|_| Error::Integrity)?;
+                let failed: i64 = totals.try_get(4).map_err(|_| Error::Integrity)?;
+                let expected: i64 = client
+                    .query_one(
+                        "SELECT recipient_count FROM td_mta.submissions WHERE account=$1 AND id=$2",
+                        &[&account, &submission],
+                    )
+                    .await
+                    .map_err(|_| Error::Database)?
+                    .try_get(0)
+                    .map_err(|_| Error::Integrity)?;
+                if !(1..=1000).contains(&count)
+                    || count != expected
+                    || first != Some(0)
+                    || last != count.checked_sub(1)
+                {
+                    return Err(Error::Integrity);
+                }
+                if pending == 0 {
+                    client.execute("UPDATE td_mta.submissions SET completed_at=$3,notification=CASE WHEN notification=0 AND $4 THEN 1 ELSE notification END WHERE account=$1 AND id=$2 AND completed_at IS NULL", &[&account,&submission,&timestamp,&(failed != 0)]).await.map_err(|_| Error::Database)?;
+                }
+                client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND NOT EXISTS (SELECT 1 FROM td_mta.recipients WHERE account=$1 AND submission_id=$3 AND attempt_id=$2 AND state=2)", &[&account,&attempt,&submission]).await.map_err(|_| Error::Database)?;
             }
             if client
                 .execute(
@@ -353,9 +426,14 @@ pub fn publish(
                 return Err(Error::Integrity);
             }
             let recipients = i64::try_from(value.ordinals.len()).map_err(|_| Error::Capacity)?;
+            let insert = if value.phase == 4 {
+                "INSERT INTO td_mta.attempt_acceptance_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+            } else {
+                "INSERT INTO td_mta.attempt_phase_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+            };
             client
                 .execute(
-                    "INSERT INTO td_mta.attempt_phase_receipts VALUES($1,$2,$3,$4,$5,$6,$7)",
+                    insert,
                     &[
                         &account,
                         &attempt,

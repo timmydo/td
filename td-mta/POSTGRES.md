@@ -3151,3 +3151,28 @@ known rollback, phase ordering, exact Body membership, retained replies,
 100 distinct maximum-length replies, conflicting replay, delayed COMMIT
 and historical settlement after a policy
 change. Schema upgrade tests include the version-18 boundary.
+
+
+## 111. Durable positive SMTP outcomes
+
+Schema 20 adds acceptance receipts, bounded to 1024 per account. The prepared
+attempt publisher records a genuine positive final DATA reply for exactly the
+AcceptancePossible subset under the same current policy, boot, claim and route
+fence. It preserves positive RCPT replies, attempt history and any earlier
+uncertainty latch. A positive result records smart-host handoff, not final
+mailbox delivery. Passing the message expiry time cannot discard a received
+positive reply; current owner and clock checks still apply.
+
+Accepted rows, reply text, submission/account change history and one digest-
+bound receipt commit atomically. The attempt retires only when no recipient
+remains InFlight under it. If the complete ordinal set has no future delivery
+obligation, completion time is published once; terminal failures retain their
+failure-notice obligation. Historical replay neither advances time nor changes
+replies. Unknown COMMIT settles through the original receipt without inventing
+a second remote result. No connection or SMTP relay is activated here.
+
+The PostgreSQL fixture covers ordering and exact-subset refusal, maximum-length
+final replies, rollback, delayed COMMIT, duplicate-risk preservation, attempt
+retirement, exclusion of Accepted recipients from subsequent dispatch, and
+final-batch completion after expiry. Negative outcomes, final-outcome capacity
+admission and runtime recovery/scheduling remain separate prerequisites.
