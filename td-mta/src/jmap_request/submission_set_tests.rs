@@ -32,6 +32,8 @@ struct Service {
     clock: Arc<Now>,
     creates: AtomicUsize,
     files: AtomicUsize,
+    drafts: AtomicUsize,
+    draft_mode: u8,
     create_mode: u8,
     file_mode: u8,
 }
@@ -41,6 +43,8 @@ impl Service {
             clock: Arc::new(Now(AtomicU64::new(1))),
             creates: AtomicUsize::new(0),
             files: AtomicUsize::new(0),
+            drafts: AtomicUsize::new(0),
+            draft_mode: 0,
             create_mode,
             file_mode,
         }
@@ -159,8 +163,8 @@ impl SubmissionCreator for Service {
             length: 123,
             send_at: 1,
             expires_at: 2,
-            old_sequence: 1,
-            new_sequence: 2,
+            old_sequence: 1 + self.drafts.load(Ordering::Relaxed) as u64,
+            new_sequence: 2 + self.drafts.load(Ordering::Relaxed) as u64,
         })
     }
 }
@@ -187,11 +191,13 @@ impl SubmissionFiler for Service {
             } else {
                 EPOCH
             },
-            before_sequence: Sequence::from_u64(2),
+            before_sequence: Sequence::from_u64(2 + self.drafts.load(Ordering::Relaxed) as u64),
             outcome: if self.file_mode == 2 {
                 Err(CommitError::Indeterminate(ports::Error::Corrupt))
             } else {
-                Ok(Sequence::from_u64(3))
+                Ok(Sequence::from_u64(
+                    3 + self.drafts.load(Ordering::Relaxed) as u64,
+                ))
             },
             results: vec![match self.file_mode {
                 4 => EmailUpdateResult::InvalidMailbox,
@@ -237,18 +243,19 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
     );
     let mut preflight = response::Preflight::new(request, "session", retention.maximum()).unwrap();
     while !preflight.step(&mut [0; 4096]).unwrap() {}
-    let mut completed = dispatch::run_with_postgres_submissions(
-        preflight.finish().unwrap(),
-        retention,
-        deadline(90),
-        SubmissionAccess {
-            creator: service,
-            filer: service,
-            clock: &*service.clock,
-            device: DEVICE,
-            state: state(),
-        },
-    )?;
+    let access = SubmissionAccess {
+        creator: service,
+        filer: service,
+        clock: &*service.clock,
+        device: DEVICE,
+        state: state(),
+    };
+    let plan = preflight.finish().unwrap();
+    let mut completed = if input["methodCalls"].as_array().unwrap().len() == 2 {
+        dispatch::run_with_postgres_send(plan, retention, deadline(90), access, service, service)
+    } else {
+        dispatch::run_with_postgres_submissions(plan, retention, deadline(90), access)
+    }?;
     let mut encoder = completed.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -580,6 +587,165 @@ fn transient_failures_and_deterministic_work_have_method_errors() {
             result["methodResponses"][0][1]["description"].as_str(),
             Some(description)
         );
+        assert_eq!(service.files.load(Ordering::Relaxed), 0);
+    }
+}
+
+impl dispatch::DraftCreator for Service {
+    fn create_draft(
+        &self,
+        input: dispatch::DraftInput<'_>,
+        meter: &mut Meter,
+    ) -> Result<crate::store_fs::DraftCompletion, dispatch::DraftError> {
+        assert_eq!(input.account, ACCOUNT);
+        assert_eq!(input.device, DEVICE);
+        assert_eq!(input.deadline, deadline(90));
+        assert_eq!(meter.deadline(), deadline(100).into());
+        self.drafts.fetch_add(1, Ordering::Relaxed);
+        if self.draft_mode == 1 {
+            return Err(dispatch::DraftError::Input(
+                crate::draft_input::Error::Property("from"),
+            ));
+        }
+        Ok(crate::store_fs::DraftCompletion {
+            before_epoch: EPOCH,
+            before_sequence: Sequence::from_u64(1),
+            outcome: if self.draft_mode == 2 {
+                Err(CommitError::Indeterminate(ports::Error::Corrupt))
+            } else {
+                Ok(Sequence::from_u64(2))
+            },
+            email: EMAIL,
+            blob: BlobId::from_bytes([9; 16]),
+            thread: ThreadId::from_bytes([8; 16]),
+            size: 123,
+            admission_stopped: false,
+            cleanup_error: None,
+        })
+    }
+}
+impl dispatch::EmailMutator for Service {
+    fn update(
+        &self,
+        _: crate::store_fs::EmailUpdateRequest<'_>,
+        _: &mut Meter,
+    ) -> Result<EmailUpdateCompletion, UploadError> {
+        panic!("send batch must create its draft");
+    }
+}
+fn batch() -> td_json::Json {
+    let mut request = input(true);
+    let _ = args_mut(&mut request)
+        .get_mut("create")
+        .unwrap()
+        .get_mut("send")
+        .unwrap()
+        .insert("emailId", "#draft");
+    let td_json::Json::Arr(calls) = request.get_mut("methodCalls").unwrap() else {
+        panic!("calls");
+    };
+    calls.insert(0, td_json::json!(["Email/set", {"accountId":id(ACCOUNT),"create":{"draft":{"subject":"fixture"}}}, "draft-call"]));
+    request
+}
+#[test]
+fn draft_submission_and_filing_keep_order_and_transaction_states() {
+    let service = Service::new(0, 0);
+    let result = run(batch(), &service).unwrap();
+    let responses = result["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 3);
+    for (index, name) in ["Email/set", "EmailSubmission/set", "Email/set"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(responses[index][0].as_str(), Some(name));
+        assert_eq!(
+            DataState::decode(responses[index][1]["oldState"].as_str().unwrap())
+                .unwrap()
+                .sequence
+                .number(),
+            index as u64 + 1
+        );
+        assert_eq!(
+            DataState::decode(responses[index][1]["newState"].as_str().unwrap())
+                .unwrap()
+                .sequence
+                .number(),
+            index as u64 + 2
+        );
+    }
+    assert_eq!(responses[0][2].as_str(), Some("draft-call"));
+    assert_eq!(responses[1][2], responses[2][2]);
+    assert_eq!(
+        result["createdIds"]["draft"].as_str(),
+        Some(id(EMAIL).as_str())
+    );
+    assert_eq!(
+        result["createdIds"]["send"].as_str(),
+        Some(id(SUBMITTED).as_str())
+    );
+}
+#[test]
+fn submission_failure_keeps_the_draft_and_its_latest_state() {
+    let service = Service::new(1, 0);
+    let result = run(batch(), &service).unwrap();
+    let responses = result["methodResponses"].as_array().unwrap();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(
+        responses[0][1]["created"]["draft"]["id"].as_str(),
+        Some(id(EMAIL).as_str())
+    );
+    assert_eq!(
+        responses[1][1]["notCreated"]["send"]["type"].as_str(),
+        Some("overQuota")
+    );
+    for key in ["oldState", "newState"] {
+        assert_eq!(
+            DataState::decode(responses[1][1][key].as_str().unwrap())
+                .unwrap()
+                .sequence
+                .number(),
+            2
+        );
+    }
+    assert_eq!(service.files.load(Ordering::Relaxed), 0);
+}
+#[test]
+fn failed_or_uncertain_draft_is_not_submitted() {
+    for mode in [1, 2] {
+        let mut service = Service::new(0, 0);
+        service.draft_mode = mode;
+        let result = run(batch(), &service).unwrap();
+        assert_eq!(result["methodResponses"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            result["methodResponses"][1][1]["type"].as_str(),
+            Some("invalidArguments")
+        );
+        assert_eq!(service.creates.load(Ordering::Relaxed), 0);
+        assert_eq!(service.files.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn send_batch_rejects_update_and_destroy_first_calls_before_effects() {
+    for destroy in [false, true] {
+        let service = Service::new(1, 0);
+        let mut request = batch();
+        let args = args_mut(&mut request);
+        let _ = args.insert("create", td_json::Json::Null);
+        if destroy {
+            let _ = args.insert("destroy", td_json::json!([id(EMAIL)]));
+        } else {
+            let _ = args.insert(
+                "update",
+                td_json::json!({id(EMAIL):{"keywords/$seen":true}}),
+            );
+        }
+        assert!(matches!(
+            run(request, &service),
+            Err(Error::InvalidArguments)
+        ));
+        assert_eq!(service.drafts.load(Ordering::Relaxed), 0);
+        assert_eq!(service.creates.load(Ordering::Relaxed), 0);
         assert_eq!(service.files.load(Ordering::Relaxed), 0);
     }
 }

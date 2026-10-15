@@ -2874,3 +2874,16 @@ reply; retained operations and td-mail reconciliation remain necessary.
 Indeterminate creation keeps its native fence and returns serverPartialFail
 without invoking filing. Initial creation mappings remain fallback-only;
 new successful request mappings shadow them.
+
+## 97. Prepared td-mail draft-and-submit batch
+
+Prepared dispatch accepts td-mail's ordered singleton literal Email/set
+creation then EmailSubmission/set request. A noncreation first call refuses
+before effects. The batch uses one response owner, creation map, work
+meter and execution deadline. The second call resolves the first call's
+successful draft ID. Draft publication advances the state used by a later
+submission refusal; successful submission and filing retain their own
+transaction states. Each worker freshly authorizes its operation. These
+calls are independent transactions: a failed submission leaves its draft,
+and failed filing leaves a successful submission. This does not advertise
+Submission or activate the production PostgreSQL backend.

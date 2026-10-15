@@ -10220,6 +10220,7 @@ fn exercise_submission_set_dispatch(
     };
     let slots = ReadSlots::new(1).unwrap();
     let pending = sending::Pending::default();
+    let draft_pending = td_mta::postgres_http_drafts::Pending::default();
     let filing_pending = filing::Pending::default();
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
     let mut connection = loaded
@@ -10236,7 +10237,7 @@ fn exercise_submission_set_dispatch(
     let identity = td_mta::wire::encode_id(source.identity(), &mut buffer)
         .unwrap()
         .to_owned();
-    for refused in [false, true] {
+    for (refused, batch) in [(false, false), (true, false), (false, true), (true, true)] {
         let snapshot = Snapshot::open_runtime(
             &slots,
             &connection,
@@ -10262,11 +10263,38 @@ fn exercise_submission_set_dispatch(
         } else {
             td_json::json!({"keywords/$draft":null})
         };
-        let input = td_json::json!({"using":[CORE,MAIL,SUBMISSION],"createdIds":{"draft":email},"methodCalls":[["EmailSubmission/set",{
+        let mut input = td_json::json!({"using":[CORE,MAIL,SUBMISSION],"createdIds":{"draft":email},"methodCalls":[["EmailSubmission/set",{
             "accountId":account,"ifInState":state.encode(&mut [0;DataState::WIRE_BYTES]).unwrap(),
             "create":{"send":{"emailId":"#draft","identityId":identity}},
             "onSuccessUpdateEmail":{"#send":patch}
-        },"send\n☃"]]}).to_string();
+        },"send\n☃"]]});
+        if batch {
+            let _ = input.insert("createdIds", td_json::json!({}));
+            let mailbox = td_mta::ids::MailboxId::parse(&sql(
+                fixture,
+                "SELECT encode(id,'hex') FROM td_mta.mailboxes ORDER BY id LIMIT 1",
+            ))
+            .unwrap();
+            let mailbox = td_mta::wire::encode_id(mailbox, &mut buffer).unwrap();
+            let draft = td_json::json!({
+                "mailboxIds":{mailbox:true},"keywords":{"$draft":true,"$seen":true},
+                "from":[{"email":binding.identity_email(source.identity()).unwrap()}],
+                "to":[{"email":"recipient@example.test"}],
+                "subject":"PostgreSQL send batch", "messageId":["postgres-send-batch@example.test"],
+                "sentAt":"2026-10-15T12:00:00Z",
+                "textBody":[{"partId":"text","type":"text/plain"}],
+                "bodyValues":{"text":{"value":"Send batch body","isEncodingProblem":false,"isTruncated":false}}
+            });
+            let td_json::Json::Arr(calls) = input.get_mut("methodCalls").unwrap() else {
+                panic!("calls");
+            };
+            let td_json::Json::Arr(call) = &mut calls[0] else {
+                panic!("call");
+            };
+            let _ = call[1].insert("ifInState", td_json::Json::Null);
+            calls.insert(0, td_json::json!(["Email/set", {"accountId":account,"create":{"draft":draft}}, "draft"]));
+        }
+        let input = input.to_string();
         let limits = Limits::default();
         let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
         bytes[..input.len()].copy_from_slice(input.as_bytes());
@@ -10292,11 +10320,9 @@ fn exercise_submission_set_dispatch(
         .unwrap();
         while !validation.step().unwrap() {}
         let request = validation.finish().unwrap();
-        let directory = fixture.root.join(if refused {
-            "submission-set-filing-refused"
-        } else {
-            "submission-set-filed"
-        });
+        let directory = fixture
+            .root
+            .join(format!("submission-set-{refused}-{batch}"));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let mut root = PrivateRoot::open(directory.to_str().unwrap())
@@ -10340,20 +10366,31 @@ fn exercise_submission_set_dispatch(
             pending: &filing_pending,
             password,
         };
-        let mut completed = dispatch::run_with_postgres_submissions(
-            preflight.finish().unwrap(),
-            retention,
-            execution,
-            dispatch::SubmissionAccess {
-                creator: &creator,
-                filer: &filer,
-                clock: &*clock,
-                device: source.device(),
-                state,
-            },
-        )
+        let access = dispatch::SubmissionAccess {
+            creator: &creator,
+            filer: &filer,
+            clock: &*clock,
+            device: source.device(),
+            state,
+        };
+        let drafts = td_mta::postgres_http_drafts::Drafts {
+            loaded,
+            executable,
+            binding,
+            slots: &slots,
+            clock: &clock,
+            pending: &draft_pending,
+            password,
+            maximum_text: 1024 * 1024,
+        };
+        let plan = preflight.finish().unwrap();
+        let mut completed = if batch {
+            dispatch::run_with_postgres_send(plan, retention, execution, access, &drafts, &filer)
+        } else {
+            dispatch::run_with_postgres_submissions(plan, retention, execution, access)
+        }
         .unwrap();
-        assert_eq!(completed.responses().len(), 2);
+        assert_eq!(completed.responses().len(), if batch { 3 } else { 2 });
         let mut encoder = completed.encoder().unwrap();
         while !encoder.count_step(&mut [0; 4096]).unwrap() {}
         let length = encoder.begin_output().unwrap();
@@ -10369,7 +10406,16 @@ fn exercise_submission_set_dispatch(
         assert_eq!(encoder.finish().unwrap(), length);
         let output = td_json::parse_slice(&output).unwrap();
         let responses = output["methodResponses"].as_array().unwrap();
-        assert_eq!(responses.len(), 2);
+        assert_eq!(responses.len(), if batch { 3 } else { 2 });
+        let email = if batch {
+            assert_eq!(responses[0][0].as_str(), Some("Email/set"));
+            responses[0][1]["created"]["draft"]["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{output}"))
+        } else {
+            email.as_str()
+        };
+        let responses = &responses[usize::from(batch)..];
         assert_eq!(responses[0][0].as_str(), Some("EmailSubmission/set"));
         let submitted: td_mta::ids::SubmissionId =
             td_mta::wire::Id::parse(responses[0][1]["created"]["send"]["id"].as_str().unwrap())
@@ -10381,14 +10427,11 @@ fn exercise_submission_set_dispatch(
         assert_eq!(responses[0][2], responses[1][2]);
         if refused {
             assert_eq!(
-                responses[1][1]["notUpdated"][email.as_str()]["type"].as_str(),
+                responses[1][1]["notUpdated"][email]["type"].as_str(),
                 Some("invalidProperties")
             );
         } else {
-            assert!(responses[1][1]["updated"]
-                .get(email.as_str())
-                .unwrap()
-                .is_null());
+            assert!(responses[1][1]["updated"].get(email).unwrap().is_null());
         }
         assert_eq!(
             sql(fixture, "SELECT count(*) FROM td_mta.submissions")
@@ -10399,6 +10442,7 @@ fn exercise_submission_set_dispatch(
         assert_eq!(sql(fixture,&format!("SELECT submitting_profile||':'||route_name FROM td_mta.submission_routes WHERE submission_id=decode('{submitted}','hex')")),"desktop:personal-smarthost");
         assert_eq!(pending.operation().unwrap(), None);
         assert_eq!(filing_pending.operation().unwrap(), None);
+        assert_eq!(draft_pending.operation().unwrap(), None);
         drop(completed);
         assert_eq!(owner.used().unwrap(), 0);
     }

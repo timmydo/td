@@ -247,6 +247,55 @@ pub fn run_with_postgres_submissions<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+/// td-mail's ordered draft creation followed by submission and optional filing.
+/// Both operations spend one original request budget; they are not atomic.
+pub fn run_with_postgres_send<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    access: SubmissionAccess<'_>,
+    drafts: &dyn DraftCreator,
+    flags: &dyn EmailMutator,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let request = plan.request().map_err(|_| Error::State)?;
+    let mut calls = request.calls();
+    if access.state.kind != crate::sync::DataType::Submission
+        || request.call_count() != 2
+        || calls.next().is_none_or(|call| {
+            call.name != b"Email/set"
+                || call
+                    .arguments
+                    .get("create")
+                    .and_then(|value| value.as_object())
+                    .is_none_or(|objects| objects.len() != 1)
+        })
+        || calls
+            .next()
+            .is_none_or(|call| call.name != b"EmailSubmission/set")
+    {
+        return Err(Error::InvalidArguments);
+    }
+    drop(calls);
+    run_inner(
+        plan,
+        retention,
+        execution,
+        access.state.account,
+        Profile {
+            flags: Some((flags, access.device)),
+            drafts: Some(DraftAccess {
+                creator: drafts,
+                device: access.device,
+                state: Some(crate::sync::DataState {
+                    kind: crate::sync::DataType::Email,
+                    ..access.state
+                }),
+            }),
+            submissions: Some(access),
+            ..Profile::default()
+        },
+    )
+}
 #[derive(Clone, Copy)]
 pub struct DraftAccess<'a> {
     pub creator: &'a dyn DraftCreator,

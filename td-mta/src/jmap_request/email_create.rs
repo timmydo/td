@@ -122,6 +122,10 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                     }
                     Err(CommitError::Indeterminate(_)) => return Err(Error::ServerPartialFail),
                 };
+                if let Some(access) = self.submissions.as_mut() {
+                    access.state.epoch = complete.before_epoch;
+                    access.state.sequence = sequence;
+                }
                 (
                     DataState {
                         epoch: complete.before_epoch,
