@@ -4,11 +4,10 @@ use crate::{
     admission::work::{Charge as WorkCharge, Meter},
     format::row::{EmailOrigin, EmailRow, ReceiptRecipients, ReceiptTls, SmtpReceipt},
     ids::{EmailId, MailboxId, ThreadId},
+    receiving_headers as headers,
     smtp_session::Session,
 };
 use std::{fmt::Write as _, net::IpAddr};
-#[path = "delivery_headers.rs"]
-mod headers;
 
 /// Passive facts supplied by the trusted connection owner, never a credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +57,14 @@ pub enum DeliveryError {
     CoordinationBusy,
     HeaderLimit,
     Storage(UploadError),
+}
+impl From<headers::HeaderError> for DeliveryError {
+    fn from(error: headers::HeaderError) -> Self {
+        match error {
+            headers::HeaderError::HeaderLimit => Self::HeaderLimit,
+            headers::HeaderError::Work(error) => error.into(),
+        }
+    }
 }
 impl From<ports::Error> for DeliveryError {
     fn from(error: ports::Error) -> Self {

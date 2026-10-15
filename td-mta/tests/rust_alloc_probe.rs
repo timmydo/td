@@ -56,6 +56,8 @@ pub use td_mta::smtp_wire;
 mod device_credentials;
 #[path = "../src/mailbox_name.rs"]
 mod mailbox_name;
+#[path = "../src/receiving_headers.rs"]
+mod receiving_headers;
 #[path = "../src/smtp_session.rs"]
 #[allow(unused)] // Keep the receiving context with the recompiled storage core.
 mod smtp_session;

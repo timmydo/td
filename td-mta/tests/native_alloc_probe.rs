@@ -600,6 +600,9 @@ mod device_credentials;
 #[path = "../src/mailbox_name.rs"]
 mod mailbox_name;
 #[cfg(td_native_alloc_probe)]
+#[path = "../src/receiving_headers.rs"]
+mod receiving_headers;
+#[cfg(td_native_alloc_probe)]
 #[path = "../src/smtp_session.rs"]
 #[allow(unused)] // Keep the receiving context with the recompiled storage core.
 mod smtp_session;

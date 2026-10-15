@@ -1713,3 +1713,14 @@ resolves. Historical receipts remain inspectable after later policy change,
 revocation, object deletion or body retirement. This does not grant a fresh
 write or a new body read. Reclamation of retained leases, submissions and
 operation receipts remains cutover work.
+
+## 45. Shared receiving header preparation
+
+The storage-independent `receiving_headers` module owns the existing bounded
+root-header retention, Return-Path removal, supplied trace insertion and
+Message-ID/References/In-Reply-To selection used by receiving. The SQLite
+delivery adapter now consumes it through an explicit error mapping. Its
+64 KiB output turns, source bounds, deadline checks and original work-meter
+charges are unchanged. The module grants no recipient, gateway or publication
+authority and performs no database access. PostgreSQL receiving publication
+and runtime integration remain cutover work.

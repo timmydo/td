@@ -5,7 +5,20 @@ use crate::{
 };
 use td_mime::{header_message_ids as ids, headers};
 
-pub(super) struct Work<'a> {
+const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeaderError {
+    HeaderLimit,
+    Work(Error),
+}
+impl From<Error> for HeaderError {
+    fn from(error: Error) -> Self {
+        Self::Work(error)
+    }
+}
+
+pub(crate) struct Work<'a> {
     pub clock: &'a dyn Clock,
     pub deadline: Deadline,
     pub meter: &'a mut Meter,
@@ -26,13 +39,13 @@ impl Work<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Candidate {
+pub(crate) struct Candidate {
     pub start: usize,
     pub end: usize,
     pub length: usize,
 }
 #[derive(Clone, Copy, Default)]
-pub(super) struct Ring {
+pub(crate) struct Ring {
     items: [Option<Candidate>; 32],
     next: usize,
     count: usize,
@@ -61,7 +74,7 @@ impl Ring {
     }
 }
 #[derive(Default)]
-pub(super) struct Identifiers {
+pub(crate) struct Identifiers {
     pub own: Option<Candidate>,
     pub references: Ring,
     pub reply: Ring,
@@ -143,7 +156,7 @@ impl Identifiers {
     }
 }
 
-pub(super) fn candidate<'a>(
+pub(crate) fn candidate<'a>(
     source: &[u8],
     item: Candidate,
     output: &'a mut [u8],
@@ -189,7 +202,7 @@ fn id_error(error: ids::Error) -> Error {
         ids::Error::Malformed | ids::Error::InvalidState => Error::Invalid,
     }
 }
-pub(super) fn extent(source: &[u8], start: u64, end: u64) -> Result<&[u8], Error> {
+pub(crate) fn extent(source: &[u8], start: u64, end: u64) -> Result<&[u8], Error> {
     source
         .get(
             usize::try_from(start).map_err(|_| Error::Invalid)?
@@ -198,7 +211,7 @@ pub(super) fn extent(source: &[u8], start: u64, end: u64) -> Result<&[u8], Error
         .ok_or(Error::Invalid)
 }
 
-pub(super) struct Headers {
+pub(crate) struct Headers {
     pub source: Vec<u8>,
     pub identifiers: Identifiers,
     scanner: headers::Scanner,
@@ -207,7 +220,7 @@ pub(super) struct Headers {
     end: Option<headers::End>,
 }
 impl Headers {
-    pub fn new(limit: usize) -> Result<Self, super::DeliveryError> {
+    pub fn new(limit: usize) -> Result<Self, HeaderError> {
         let capacity = limit.checked_add(1000).ok_or(Error::Capacity)?;
         let mut source = Vec::new();
         source
@@ -230,7 +243,7 @@ impl Headers {
         input: &[u8],
         last: bool,
         work: &mut Work<'_>,
-    ) -> Result<bool, super::DeliveryError> {
+    ) -> Result<bool, HeaderError> {
         if self.complete() || input.len() > 1000 {
             return Err(Error::Invalid.into());
         }
@@ -240,7 +253,7 @@ impl Headers {
             .checked_add(input.len())
             .ok_or(Error::Capacity)?;
         if next > self.limit.checked_add(1000).ok_or(Error::Capacity)? {
-            return Err(super::DeliveryError::HeaderLimit);
+            return Err(HeaderError::HeaderLimit);
         }
         self.source.extend_from_slice(input);
         loop {
@@ -276,13 +289,13 @@ impl Headers {
         trace: &[u8],
         mut write: impl FnMut(&[u8]) -> Result<(), Error>,
         work: &mut Work<'_>,
-    ) -> Result<(), super::DeliveryError> {
+    ) -> Result<(), HeaderError> {
         let expected = self.end.ok_or(Error::Invalid)?;
         let mut scanner = headers::Scanner::new(0, self.limit as u64);
         let mut position = 0usize;
         let mut retained = trace.len();
         if retained > self.limit {
-            return Err(super::DeliveryError::HeaderLimit);
+            return Err(HeaderError::HeaderLimit);
         }
         emit(trace, &mut write, work)?;
         loop {
@@ -309,7 +322,7 @@ impl Headers {
                         }
                         retained = retained.checked_add(bytes.len()).ok_or(Error::Capacity)?;
                         if retained > self.limit {
-                            return Err(super::DeliveryError::HeaderLimit);
+                            return Err(HeaderError::HeaderLimit);
                         }
                         emit(bytes, &mut write, work)?;
                     }
@@ -336,9 +349,9 @@ impl Headers {
         }
     }
 }
-fn header_error(error: headers::Error) -> super::DeliveryError {
+fn header_error(error: headers::Error) -> HeaderError {
     match error {
-        headers::Error::HeaderLimit => super::DeliveryError::HeaderLimit,
+        headers::Error::HeaderLimit => HeaderError::HeaderLimit,
         headers::Error::Work(td_mime::work::Stop::Deadline) => Error::Deadline.into(),
         headers::Error::Work(_) | headers::Error::InterpretationLimit => Error::Capacity.into(),
         headers::Error::Offset | headers::Error::InvalidState => Error::Invalid.into(),
@@ -350,7 +363,7 @@ fn emit(
     write: &mut impl FnMut(&[u8]) -> Result<(), Error>,
     work: &mut Work<'_>,
 ) -> Result<(), Error> {
-    for chunk in bytes.chunks(crate::limits::SQLITE_BODY_CHUNK_BYTES) {
+    for chunk in bytes.chunks(OUTPUT_CHUNK_BYTES) {
         let now = work.tick()?;
         work.meter
             .charge(
