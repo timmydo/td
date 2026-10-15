@@ -8621,6 +8621,15 @@ fn exercise_submission_publication(
         "1000"
     );
 
+    exercise_success_filing(
+        fixture,
+        request,
+        trust,
+        binding,
+        &input,
+        draft.email,
+        password,
+    );
     let capacity = make();
     sql(fixture,"INSERT INTO td_mta.submission_receipts SELECT account,decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),submission_id,blob_id,length,send_at,expires_at,old_sequence,new_sequence FROM (SELECT * FROM td_mta.submission_receipts LIMIT 1) r CROSS JOIN generate_series(1,1024) n");
     assert_eq!(
@@ -8668,6 +8677,175 @@ fn exercise_submission_publication(
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
     read_outgoing().unwrap();
     exercise_dispatch(fixture, request, trust, relay.binding(), a.submission);
+}
+
+fn exercise_success_filing(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    input: &td_mta::postgres_submission_input::Prepared,
+    email: td_mta::ids::EmailId,
+    password: &[u8],
+) {
+    use td_mta::{
+        ids::{EmailId, MailboxId},
+        postgres_email_set::{filing, Error, UpdateResult},
+        postgres_mailbox_create as folders,
+    };
+    let creation = folders::prepare(
+        binding,
+        input.device(),
+        None,
+        &["Filing Sent", "Unrelated"],
+        deadline(),
+    )
+    .unwrap();
+    let created = folders::publish(request, trust, deadline(), &creation, password).unwrap();
+    let [folders::ResultEntry::Created(sent), folders::ResultEntry::Created(other)] =
+        created.results.as_slice()
+    else {
+        panic!("folders not created")
+    };
+    let source = MailboxId::parse(&sql(
+        fixture,
+        "SELECT encode(id,'hex') FROM td_mta.mailboxes WHERE role='inbox'",
+    ))
+    .unwrap();
+    let account = binding.account();
+    let make = |movement| filing::prepare(binding, input.device(), email, movement).unwrap();
+    let patch = make(Some((source, *sent)));
+    assert!(matches!(
+        filing::prepare(binding, input.device(), email, Some((source, source))),
+        Err(Error::Invalid)
+    ));
+    assert_eq!(
+        filing::publish(request, trust, deadline(), &patch, b"bad"),
+        Err(Error::Unauthenticated)
+    );
+    let state = || {
+        sql(fixture, &format!("SELECT encode(changed,'hex')||':'||(SELECT count(*) FROM td_mta.keywords WHERE email_id=e.id AND keyword='$draft') FROM td_mta.emails e WHERE id=decode('{email}','hex')"))
+    };
+    let memberships = || {
+        sql(fixture, &format!("SELECT string_agg(encode(mailbox_id,'hex'),',' ORDER BY mailbox_id) FROM td_mta.memberships WHERE email_id=decode('{email}','hex')"))
+    };
+    let queued = sql(fixture, "SELECT count(*) FROM td_mta.submissions");
+    sql(fixture, &format!("DELETE FROM td_mta.keywords WHERE email_id=decode('{email}','hex') AND keyword='$seen'"));
+    let before = state();
+    sql(fixture, "CREATE FUNCTION public.reject_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refuse filing'; END $$; CREATE TRIGGER reject_filing BEFORE INSERT ON td_mta.flag_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_filing()");
+    assert_eq!(
+        filing::publish(request, trust, deadline(), &patch, password),
+        Err(Error::Database)
+    );
+    assert_eq!(
+        filing::inspect(request, trust, deadline(), &patch).unwrap(),
+        None
+    );
+    assert_eq!(state(), before);
+    assert_eq!(memberships(), source.to_string());
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submissions"),
+        queued
+    );
+    sql(
+        fixture,
+        "DROP TRIGGER reject_filing ON td_mta.flag_receipts",
+    );
+    let missing = make(Some((source, MailboxId::from_bytes([0xee; 16]))));
+    let refused = filing::publish(request, trust, deadline(), &missing, password).unwrap();
+    assert_eq!(refused.results, [UpdateResult::InvalidMailbox]);
+    assert_eq!(refused.state.old_sequence, refused.state.new_sequence);
+    assert_eq!(state(), before);
+    // A successful patch must retain unrelated memberships added meanwhile.
+    sql(fixture, &format!("INSERT INTO td_mta.memberships SELECT id,decode('{email}','hex'),decode('{other}','hex'),sequence FROM td_mta.accounts WHERE id=decode('{account}','hex')"));
+    sql(fixture, "CREATE FUNCTION public.delay_filing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_filing AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_filing()");
+    assert_eq!(
+        filing::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_millis(1500),
+            &patch,
+            password
+        ),
+        Err(Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(fixture, "DROP TRIGGER delay_filing ON td_mta.flag_receipts");
+    let recovered = filing::inspect(request, trust, deadline(), &patch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.results, [UpdateResult::Updated]);
+    assert_eq!(
+        recovered.state.new_sequence,
+        recovered.state.old_sequence + 1
+    );
+    assert!(state().ends_with(":0"));
+    let mut expected = [sent.to_string(), other.to_string()];
+    expected.sort();
+    assert_eq!(memberships(), expected.join(","));
+    assert_eq!(
+        filing::publish(request, trust, deadline(), &patch, b"bad").unwrap(),
+        recovered
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submissions"),
+        queued
+    );
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", recovered.state.new_sequence)), "3");
+    // An absent source refuses without clearing draft or overwriting a move.
+    sql(fixture, &format!("INSERT INTO td_mta.keywords SELECT id,decode('{email}','hex'),'$draft',sequence FROM td_mta.accounts WHERE id=decode('{account}','hex')"));
+    let before = state();
+    let moved = make(Some((source, *sent)));
+    assert_eq!(
+        filing::publish(request, trust, deadline(), &moved, password)
+            .unwrap()
+            .results,
+        [UpdateResult::InvalidMailbox]
+    );
+    assert_eq!(state(), before);
+    assert_eq!(memberships(), expected.join(","));
+    let clear = make(None);
+    let cleared = filing::publish(request, trust, deadline(), &clear, password).unwrap();
+    assert_eq!(cleared.state.new_sequence, cleared.state.old_sequence + 1);
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", cleared.state.new_sequence)), "2");
+    let no_op = filing::publish(request, trust, deadline(), &make(None), password).unwrap();
+    assert_eq!(no_op.state.old_sequence, no_op.state.new_sequence);
+    assert_eq!(memberships(), expected.join(","));
+    // An existing destination still changes unread counts when draft clears.
+    sql(fixture, &format!("INSERT INTO td_mta.memberships SELECT id,decode('{email}','hex'),decode('{source}','hex'),sequence FROM td_mta.accounts WHERE id=decode('{account}','hex'); INSERT INTO td_mta.keywords SELECT id,decode('{email}','hex'),'$draft',sequence FROM td_mta.accounts WHERE id=decode('{account}','hex')"));
+    let existing = filing::publish(
+        request,
+        trust,
+        deadline(),
+        &make(Some((source, *sent))),
+        password,
+    )
+    .unwrap();
+    assert_eq!(memberships(), expected.join(","));
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", existing.state.new_sequence)), "3");
+    // Seen clear-only filing changes Email history but no mailbox counts.
+    sql(fixture, &format!("INSERT INTO td_mta.keywords SELECT id,decode('{email}','hex'),keyword,sequence FROM td_mta.accounts CROSS JOIN (VALUES ('$seen'),('$draft')) k(keyword) WHERE id=decode('{account}','hex')"));
+    let seen = filing::publish(request, trust, deadline(), &make(None), password).unwrap();
+    assert_eq!(seen.state.new_sequence, seen.state.old_sequence + 1);
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.changes WHERE sequence=decode('{:016x}','hex') AND kind=1", seen.state.new_sequence)), "0");
+    let absent = filing::prepare(
+        binding,
+        input.device(),
+        EmailId::from_bytes([0xee; 16]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        filing::publish(request, trust, deadline(), &absent, password)
+            .unwrap()
+            .results,
+        [UpdateResult::NotFound]
+    );
+    sql(fixture, &format!("UPDATE td_mta.flag_receipts SET request_digest=decode(repeat('00',32),'hex') WHERE operation=decode('{}','hex')", patch.operation()));
+    assert_eq!(
+        filing::inspect(request, trust, deadline(), &patch),
+        Err(Error::Conflict)
+    );
 }
 
 fn exercise_route_owners(

@@ -2675,3 +2675,30 @@ Call-level account/state checks, creation-key binding, successful-submission
 selection, publication and the separate implicit Email/set response remain
 handler work. Unsupported fields and incomplete filing shapes are explicit
 refusals. No Submission capability or serving path is enabled by this decoder.
+
+## 87. Retained success filing
+
+The inert postgres_email_set::filing helper clears $draft and optionally
+removes one exact source membership and adds one destination. It preserves
+other memberships and keywords. Missing source membership or destination
+refuses the whole patch without clearing $draft; a concurrent unrelated move
+is never replaced. Clearing an unseen draft updates Mailbox state/history
+for every membership whose unread counts change, including retained folders
+and an already-present destination. A seen clear-only patch changes only
+Email history. An already-cleared Email records a no-op receipt without
+advancing its state.
+
+Filing shares the bounded Email receipt table, account serialization, fresh
+device authorization and policy fencing. Its distinct request digest binds
+both mailbox operands. Retaining the exact Filing permits historical recovery
+after an uncertain commit, even when authorization subsequently changes.
+Publication is a separate transaction from submission: refusal or rollback
+never retracts the durable queue entry. The caller must select only known
+successful submissions and report the independent implicit Email/set result.
+This helper does not activate Submission or the HTTP sending flow.
+
+The local PostgreSQL submission fixture proves rollback leaves the queue and
+Email intact, exact receipt recovery after delayed COMMIT, preservation of an
+unrelated membership, missing-source refusal, clear-only/no-op behavior, and
+digest-conflict detection. Caller resource admission and bounded receipt
+reclamation remain activation obligations.

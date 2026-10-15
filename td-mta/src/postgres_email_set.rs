@@ -18,6 +18,7 @@ use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
 pub mod deletion;
+pub mod filing;
 
 pub const MAX_RECEIPTS: i64 = 1024;
 pub const MAX_UPDATES: usize = 256;
@@ -73,6 +74,7 @@ pub struct Change {
     updates: Vec<Update>,
     single: bool,
     destroy: bool,
+    filing: Option<filing::Patch>,
     expected: Option<u64>,
     digest: [u8; 32],
 }
@@ -131,6 +133,7 @@ pub fn prepare(
         }])?,
         single: true,
         destroy: false,
+        filing: None,
         expected,
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -213,6 +216,7 @@ fn prepare_batch_kind(
         updates,
         single: false,
         destroy,
+        filing: None,
         expected,
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -328,7 +332,7 @@ pub fn inspect_batch(
     deadline: Instant,
     change: &Change,
 ) -> Result<Option<BatchOutcome>, Error> {
-    if change.single || change.destroy {
+    if change.single || change.destroy || change.filing.is_some() {
         return Err(Error::Invalid);
     }
     inspect_record(request, trust, deadline, change)
@@ -388,7 +392,7 @@ pub fn publish_batch(
     change: &Change,
     password: &[u8],
 ) -> Result<BatchOutcome, Error> {
-    if change.single || change.destroy {
+    if change.single || change.destroy || change.filing.is_some() {
         return Err(Error::Invalid);
     }
     publish_record(request, trust, deadline, change, password)
@@ -473,6 +477,8 @@ fn publish_record(
             }
             let (next, results) = if change.destroy {
                 deletion::apply(client, &change, old).await?
+            } else if let Some(patch) = change.filing {
+                filing::apply(client, &change, patch, old).await?
             } else {
                 let mut requested = Vec::new();
                 requested
