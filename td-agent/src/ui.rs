@@ -86,28 +86,13 @@ const YOU: &str = "you";
 /// The split's child minima, in logical pixels.
 const LIST_MIN: u32 = 160;
 const CONVERSATION_MIN: u32 = 320;
-/// The list's columns, which fit the list at its default share of a
-/// window 1024 pixels wide.
-const COLUMNS: &[Column<'static>] = &[
-    Column {
-        title: "Conversation",
-        minimum: 120,
-        preferred: 152,
-        numeric: false,
-    },
-    Column {
-        title: "State",
-        minimum: 72,
-        preferred: 72,
-        numeric: false,
-    },
-    Column {
-        title: "Workspace",
-        minimum: 96,
-        preferred: 96,
-        numeric: false,
-    },
-];
+/// The title uses the whole list; state is a compact prefix.
+const COLUMNS: &[Column<'static>] = &[Column {
+    title: "Conversation",
+    minimum: 120,
+    preferred: 320,
+    numeric: false,
+}];
 
 /// A conversation's process as the list shows it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,7 +301,7 @@ pub struct Row {
     pub state: RowState,
     /// The human paused it: messages from other conversations wait.
     pub paused: bool,
-    /// What it works in; the list's Workspace column names it.
+    /// What it works in; the list groups conversations by workspace.
     pub workspace: Option<Workspace>,
     /// The human archived it: the list hides it unless archived ones
     /// show, and it opens only once unarchived.
@@ -347,17 +332,25 @@ fn fold_key(item: &Item) -> Item {
 /// conversation, not two.
 const DOUBLE_PRESS: Duration = Duration::from_millis(400);
 
-/// A conversation's workspace as the list's third column names it.
-fn workspace_label(workspace: Option<&Workspace>) -> String {
-    match workspace {
-        None => "none".to_string(),
-        // The folder's own name, which the column has room for; the
-        // deletion question names it whole.
-        Some(Workspace::Directory(path)) => path.file_name().map_or_else(
-            || path.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ),
-        Some(workspace) => workspace.label(),
+/// Monochrome symbols keep the state small without needing emoji fonts.
+fn state_label(state: &str, title: &str) -> String {
+    let icon = match state {
+        "starting" => "…",
+        "idle" => "○",
+        "running" => "▶",
+        "restarting" => "↻",
+        "failed" => "!",
+        "paused" => "‖",
+        "archived" => "□",
+        "deleting" => "×",
+        "archiving" => "↓",
+        ASKS => "?",
+        _ => "",
+    };
+    if icon.is_empty() {
+        title.to_string()
+    } else {
+        format!("{icon} {title}")
     }
 }
 
@@ -853,10 +846,8 @@ pub struct App {
     item_ids: BTreeMap<Item, usize>,
     /// The last id given an item.
     next_item: usize,
-    /// Each row's own words, its first column's, for a row that is not a
-    /// conversation, and its third, the workspace a conversation is in;
-    /// and a conversation's place in `rows` when the list was built.
-    item_labels: BTreeMap<usize, ([String; 2], Option<usize>)>,
+    /// Each row's title with its state prefix, rebuilt when state changes.
+    item_labels: BTreeMap<usize, String>,
     /// When a group last started a conversation, and which.
     started_in: Option<(Instant, Group)>,
     /// A conversation started since, its composer focused.
@@ -869,6 +860,12 @@ pub struct App {
     /// The sub-agent whose start the transcript is to show once its
     /// conversation's log has brought it.
     focus_task: Option<(Id, u64)>,
+    /// The task whose transcript is open; none shows the parent.
+    transcript_task: Option<u64>,
+    /// Ownership of requests, replies and calls in the replayed log.
+    task_requests: BTreeMap<u64, u64>,
+    task_replies: BTreeMap<u64, u64>,
+    task_calls: BTreeMap<u64, u64>,
     /// The last event of the log the open conversation's process is
     /// replaying, 0 for none.
     replaying_to: u64,
@@ -1099,6 +1096,10 @@ impl App {
             sub_agents: BTreeMap::new(),
             list_stale: false,
             focus_task: None,
+            transcript_task: None,
+            task_requests: BTreeMap::new(),
+            task_replies: BTreeMap::new(),
+            task_calls: BTreeMap::new(),
             replaying_to: 0,
             folded: BTreeSet::new(),
             show_archived: false,
@@ -1731,6 +1732,7 @@ impl App {
     pub fn ask_removal(&mut self, id: Id, title: String, lost: Vec<String>, archive: bool) {
         self.removals.retain(|(of, _, _, _)| of != &id);
         self.removals.push((id, title, lost, archive));
+        self.refresh_list();
         self.offer();
     }
 
@@ -2029,6 +2031,7 @@ impl App {
         }
         self.active = Some(id);
         self.focus_task = None;
+        self.transcript_task = None;
         self.clear_transcript();
         self.refresh_list();
         // The selection follows the conversation opened.
@@ -2238,6 +2241,9 @@ impl App {
         self.exchanges.clear();
         self.turns.clear();
         self.reviews.clear();
+        self.task_requests.clear();
+        self.task_replies.clear();
+        self.task_calls.clear();
         self.last_seq = 0;
         self.replaying_to = 0;
         self.meter = Meter::default();
@@ -2501,6 +2507,52 @@ impl App {
                 self.relist();
             }
         }
+        let owner = match &event.kind {
+            Kind::Task { .. } => Some(event.seq),
+            Kind::Request {
+                purpose: Purpose::Task,
+                prefix,
+                ..
+            } => {
+                self.task_requests.insert(event.seq, *prefix);
+                Some(*prefix)
+            }
+            Kind::Assistant { request, .. } => {
+                let task = self.task_requests.get(request).copied();
+                if let Some(task) = task {
+                    self.task_replies.insert(event.seq, task);
+                }
+                task
+            }
+            Kind::ToolCall { reply, .. } => {
+                let task = self.task_replies.get(reply).copied();
+                if let Some(task) = task {
+                    self.task_calls.insert(event.seq, task);
+                }
+                task
+            }
+            Kind::ToolResult { reply, .. } => self.task_replies.get(reply).copied(),
+            Kind::Approval { call, .. } => self.task_calls.get(call).copied(),
+            Kind::TaskNote { task, .. } => Some(*task),
+            _ => None,
+        };
+        // Accounting and conversation state follow the whole log even
+        // when only one task's transcript is open.
+        let bookkeeping = matches!(
+            event.kind,
+            Kind::Request { .. }
+                | Kind::Usage { .. }
+                | Kind::Started { .. }
+                | Kind::Finished { .. }
+                | Kind::Interrupted { .. }
+                | Kind::Todo { .. }
+                | Kind::Choice { .. }
+                | Kind::Routing { .. }
+                | Kind::Pause { .. }
+        );
+        if owner != self.transcript_task && !bookkeeping {
+            return self.touch();
+        }
         // From the end: a turn's records follow its message closely, so a
         // replay finds each at once rather than scanning the whole log.
         let message_of = |messages: &[(u64, usize)], turns: &[(u64, u64)], started: u64| {
@@ -2600,7 +2652,7 @@ impl App {
                     || outcome == "no model"
                     || (compaction && outcome == "compacted")
                     || (self.reviews.contains(&started) && outcome.starts_with("reviewed "));
-                if !said {
+                if !said && self.transcript_task.is_none() {
                     let text = if retry {
                         format!("{outcome}\nC-r asks again.")
                     } else {
@@ -2646,6 +2698,7 @@ impl App {
                     .turns
                     .iter()
                     .any(|(turn, of)| *turn == started && *of == 0)
+                    && self.transcript_task.is_none()
                 {
                     let pushed = Message::new("td-agent")
                         .and_then(|m| m.status("compaction", Tone::Neutral))
@@ -2830,14 +2883,15 @@ impl App {
                 }
             }
             Kind::Prefix { text } => self.system(Ok(&text), self.system_shown),
-            // A sub-agent's start: its prompt behind its header, its
-            // replies below it as the sub-agent's (DESIGN.md §12, `task`).
+            // A sub-agent's own transcript starts with its prompt.
             Kind::Task {
                 agent,
                 model,
+                prefix,
                 prompt,
                 ..
             } => {
+                self.system(Ok(&prefix), false);
                 let pushed = Message::new("td-agent")
                     .and_then(|m| m.status(&format!("{agent} sub-agent"), Tone::Neutral))
                     .and_then(|m| m.text(&format!("the {agent} sub-agent runs on {model}")))
@@ -2946,7 +3000,7 @@ impl App {
                 error,
                 pictures,
                 ..
-            } if !self.show_activity => {
+            } if !self.show_activity && name != "task" => {
                 if error {
                     let first = content.lines().next().unwrap_or_default();
                     let first: String = first.chars().take(300).collect();
@@ -3012,7 +3066,7 @@ impl App {
                 }
             )),
             Kind::Todo { items, cleared } => {
-                if cleared {
+                if cleared && self.transcript_task.is_none() {
                     self.notice_message("you cleared the todo list");
                 }
                 let rows = self.todo_rows();
@@ -3027,7 +3081,9 @@ impl App {
                 }
                 self.routing = routing;
                 let said = format!("routing {}, from the next request", self.routing());
-                self.notice_message(&said);
+                if self.transcript_task.is_none() {
+                    self.notice_message(&said);
+                }
                 self.touch();
             }
             Kind::Choice { model, effort } => {
@@ -3042,7 +3098,9 @@ impl App {
                     "no reasoning".to_string()
                 };
                 let said = format!("model {}, {effort}, from the next request", self.model());
-                self.notice_message(&said);
+                if self.transcript_task.is_none() {
+                    self.notice_message(&said);
+                }
                 self.touch();
             }
             Kind::Pause { paused } => {
@@ -3050,11 +3108,13 @@ impl App {
                     row.paused = paused;
                 }
                 self.relist();
-                self.notice_message(if paused {
-                    "paused: messages from other conversations wait, held, until you resume it (C-S-p) or write here"
-                } else {
-                    "resumed"
-                });
+                if self.transcript_task.is_none() {
+                    self.notice_message(if paused {
+                        "paused: messages from other conversations wait, held, until you resume it (C-S-p) or write here"
+                    } else {
+                        "resumed"
+                    });
+                }
             }
             // Folded, a call allowed by the mode, a rule or the classifier
             // says nothing the step's line does not; the person's answer,
@@ -3084,6 +3144,9 @@ impl App {
     /// The system context's message (DESIGN.md §4): the prefix in force
     /// from here, folded, or a notice of why the window has none.
     fn system(&mut self, prefix: Result<&str, &str>, replaced: bool) {
+        if self.transcript_task.is_some() && self.last_seq == 0 {
+            return;
+        }
         let prefix = match prefix {
             Ok(prefix) => prefix,
             Err(why) => {
@@ -3220,6 +3283,9 @@ impl App {
     /// message, which the request's first delta starts (DESIGN.md §4).
     /// Once the transcript cannot draw it, the rest waits for the log.
     fn delta(&mut self, request: u64, reasoning: &str, content: &str) {
+        if self.task_requests.get(&request).copied() != self.transcript_task {
+            return;
+        }
         // A compaction's summary is shown whole, folded, when it comes.
         let summary = self.meter.request(request).map(|r| r.0) == Some(Purpose::Compact);
         // A reply already shown whole, as a redraw that read the log
@@ -3550,7 +3616,7 @@ impl App {
         };
         let mut tree: Vec<TreeRow<usize>> = Vec::new();
         let mut items: BTreeMap<usize, Item> = BTreeMap::new();
-        let mut labels: BTreeMap<usize, ([String; 2], Option<usize>)> = BTreeMap::new();
+        let mut labels: BTreeMap<usize, String> = BTreeMap::new();
         for group in groups {
             let conversations = under.get(&group).map_or(&[][..], Vec::as_slice);
             let item = Item::Group(group.clone());
@@ -3563,7 +3629,7 @@ impl App {
                 children: !conversations.is_empty(),
                 expanded: open && !conversations.is_empty(),
             });
-            labels.insert(parent, (self.group_labels(&group), None));
+            labels.insert(parent, self.group_label(&group));
             items.insert(parent, item);
             if !open {
                 continue;
@@ -3588,8 +3654,10 @@ impl App {
                     children: under,
                     expanded: open && under,
                 });
-                let words = [String::new(), workspace_label(row.workspace.as_ref())];
-                labels.insert(conversation, (words, Some(at)));
+                labels.insert(
+                    conversation,
+                    state_label(self.conversation_state(row), &row.title),
+                );
                 items.insert(conversation, item);
                 if !open {
                     continue;
@@ -3605,11 +3673,13 @@ impl App {
                         children: false,
                         expanded: false,
                     });
-                    let words = [
-                        format!("p{number} {}", crate::tools::visible(&cut)),
-                        String::new(),
-                    ];
-                    labels.insert(process, (words, None));
+                    labels.insert(
+                        process,
+                        state_label(
+                            "running",
+                            &format!("p{number} {}", crate::tools::visible(&cut)),
+                        ),
+                    );
                     items.insert(process, item);
                 }
                 let starts = tasks.map(|t| &t.starts);
@@ -3624,11 +3694,14 @@ impl App {
                         children: false,
                         expanded: false,
                     });
-                    let words = [
-                        crate::tools::visible(&format!("{}: {}", start.agent, start.prompt)),
-                        String::new(),
-                    ];
-                    labels.insert(task, (words, None));
+                    let running = tasks.is_some_and(|tasks| tasks.running.contains(&start.call))
+                        && row.state == RowState::Running;
+                    let title =
+                        crate::tools::visible(&format!("{}: {}", start.agent, start.prompt));
+                    labels.insert(
+                        task,
+                        state_label(if running { "running" } else { "" }, &title),
+                    );
                     items.insert(task, item);
                 }
                 let more = starts
@@ -3644,11 +3717,7 @@ impl App {
                         children: false,
                         expanded: false,
                     });
-                    let words = [
-                        format!("{more} earlier sub-agent(s), in its log"),
-                        String::new(),
-                    ];
-                    labels.insert(earlier, (words, None));
+                    labels.insert(earlier, format!("{more} earlier sub-agent(s), in its log"));
                     items.insert(earlier, item);
                 }
             }
@@ -3696,19 +3765,31 @@ impl App {
         self.item_ids.get(item).copied()
     }
 
-    /// The words of group `group`'s row: its name, and what it starts.
-    fn group_labels(&self, group: &Group) -> [String; 2] {
-        let (name, what) = match group {
-            Group::Empty => (crate::config::EMPTY.to_string(), "scratch"),
-            Group::Directory => (crate::config::DIRECTORY.to_string(), "folder"),
-            Group::Template(name) => {
-                let repos = self.templates.iter().any(|(t, repos)| t == name && *repos);
-                (name.clone(), if repos { "repositories" } else { "scratch" })
-            }
-            Group::Unlisted(name) => (format!("{name} (not configured)"), ""),
-            Group::Bare => ("No workspace".to_string(), ""),
+    /// The workspace heading already identifies where its conversations work.
+    fn group_label(&self, group: &Group) -> String {
+        let name = match group {
+            Group::Empty => crate::config::EMPTY.to_string(),
+            Group::Directory => crate::config::DIRECTORY.to_string(),
+            Group::Template(name) => name.clone(),
+            Group::Unlisted(name) => format!("{name} (not configured)"),
+            Group::Bare => "No workspace".to_string(),
         };
-        [crate::tools::visible(&name), what.to_string()]
+        crate::tools::visible(&name)
+    }
+
+    fn conversation_state(&self, row: &Row) -> &'static str {
+        let id = &row.id;
+        if self.removals.iter().any(|(of, _, _, _)| of == id) {
+            ASKS
+        } else if let Some(doing) = self.closing_word(id) {
+            doing
+        } else if self.cards.iter().any(|c| &c.conversation == id)
+            || self.questions.iter().any(|q| &q.conversation == id)
+        {
+            ASKS
+        } else {
+            row.word()
+        }
     }
 
     /// The list's row `id` activated: a way to start a conversation
@@ -3799,6 +3880,15 @@ impl App {
         if self.active.as_ref() != Some(&id) {
             return;
         }
+        // Rebuild from the durable log even when switching views of the
+        // same conversation. No child events are copied or discarded.
+        if !self.requests.contains(&Request::Open(id.clone()))
+            && !self.requests.contains(&Request::Redraw)
+        {
+            self.requests.push(Request::Redraw);
+        }
+        self.transcript_task = Some(seq);
+        self.clear_transcript();
         self.focus_task = Some((id, seq));
         self.show_task();
         self.list.select(self.listed(&item), true);
@@ -3839,7 +3929,10 @@ impl App {
     /// The open conversation's row in the list, when it shows it.
     fn shown_active(&self) -> Option<usize> {
         let id = self.active.as_ref()?;
-        self.listed(&Item::Conversation(id.clone()))
+        match self.transcript_task {
+            Some(seq) => self.listed(&Item::SubAgent(id.clone(), seq)),
+            None => self.listed(&Item::Conversation(id.clone())),
+        }
     }
 
     /// The conversation of the list's row `id`, when it is one.
@@ -4085,6 +4178,12 @@ impl App {
             if let Err(e) = self.list.resize(self.surface, regions.list) {
                 self.note(format!("the list: {e}"));
             }
+            let width = (regions.list.width / self.surface.scale.value() as u32)
+                .saturating_sub(td_ui::tree_table::GUTTER)
+                .clamp(120, td_ui::tree_table::COLUMN_WIDTH);
+            if let Err(e) = self.list.set_width(0, width) {
+                self.note(format!("the list width: {e}"));
+            }
             // A narrower transcript wraps to more rows than its bound
             // may hold: the oldest messages go until it fits.
             loop {
@@ -4192,7 +4291,23 @@ impl App {
         if self.active.as_ref() != Some(&id) || self.active_failed() {
             self.set_active(id.clone());
             self.requests.push(Request::Open(id));
+        } else {
+            self.parent_transcript();
         }
+    }
+
+    /// A local view change never restarts the conversation process.
+    fn parent_transcript(&mut self) {
+        if self.transcript_task.take().is_none() {
+            return;
+        }
+        self.focus_task = None;
+        self.clear_transcript();
+        if !self.requests.contains(&Request::Redraw) {
+            self.requests.push(Request::Redraw);
+        }
+        self.list.select(self.shown_active(), true);
+        self.touch();
     }
 
     /// Focuses and shows the person's message before the transcript's
@@ -4291,6 +4406,8 @@ impl App {
             ));
             return;
         }
+        // Input addresses the parent, so its message and reply must show.
+        self.parent_transcript();
         // The schedule commands are the human's, not messages (§3), and
         // the window's, whatever the open conversation's process is.
         if let Some(command) = crate::schedule::command(&text) {
@@ -4406,6 +4523,7 @@ impl App {
             );
             return;
         }
+        self.parent_transcript();
         self.requests.push(Request::Compact(focus));
         self.note("compacting");
         self.touch();
@@ -5941,6 +6059,7 @@ impl App {
     /// card forgotten.
     fn answer_removal(&mut self, id: Id, remove: bool) {
         self.removals.retain(|(of, _, _, _)| of != &id);
+        self.refresh_list();
         self.requests.push(Request::Remove { id, remove });
     }
 
@@ -6399,6 +6518,7 @@ impl App {
             "C-r" if !repeat => {
                 if self.meter.retry {
                     self.meter.retry = false;
+                    self.parent_transcript();
                     self.requests.push(Request::Retry);
                     self.touch();
                 }
@@ -6641,71 +6761,15 @@ impl App {
 
     // --- drawing ----------------------------------------------------
 
-    /// A cell of the list's row `index`.
+    /// The list has one column; labels are prepared outside painting.
     fn cell(&self, index: usize, column: usize) -> Cell<'_> {
-        let (Some(item), Some(([first, third], at))) =
-            (self.items.get(&index), self.item_labels.get(&index))
-        else {
+        if column != 0 {
             return Cell::empty();
-        };
-        let text = match item {
-            Item::Group(_) => match column {
-                0 => first.as_str(),
-                1 => "",
-                _ => third.as_str(),
-            },
-            Item::Process(..) => match column {
-                0 => first.as_str(),
-                1 => "running",
-                _ => "",
-            },
-            // Running while its result is not heard and its conversation's
-            // turn runs: a turn its process left open is over.
-            Item::Earlier(_) => match column {
-                0 => first.as_str(),
-                _ => "",
-            },
-            Item::SubAgent(id, seq) => match column {
-                0 => first.as_str(),
-                1 => {
-                    let running = self.sub_agents.get(id).is_some_and(|t| {
-                        t.starts
-                            .get(seq)
-                            .is_some_and(|start| t.running.contains(&start.call))
-                    }) && self
-                        .rows
-                        .iter()
-                        .any(|r| &r.id == id && r.state == RowState::Running);
-                    if running {
-                        "running"
-                    } else {
-                        ""
-                    }
-                }
-                _ => "",
-            },
-            Item::Conversation(id) => {
-                // Where it was when the list was built, unless `rows` has
-                // changed since.
-                let row = at
-                    .and_then(|at| self.rows.get(at))
-                    .filter(|row| &row.id == id)
-                    .or_else(|| self.rows.iter().find(|row| &row.id == id));
-                let Some(row) = row else {
-                    return Cell::empty();
-                };
-                match column {
-                    0 => row.title.as_str(),
-                    1 if self.removals.iter().any(|(of, _, _, _)| of == id) => ASKS,
-                    1 if self.closing(id) => self.closing_word(id).unwrap_or_default(),
-                    1 if self.cards.iter().any(|c| &c.conversation == id) => ASKS,
-                    1 if self.questions.iter().any(|q| &q.conversation == id) => ASKS,
-                    1 => row.word(),
-                    _ => third.as_str(),
-                }
-            }
-        };
-        Cell::new(text).unwrap_or_else(|_| Cell::empty())
+        }
+        self.item_labels
+            .get(&index)
+            .and_then(|label| Cell::new(label).ok())
+            .unwrap_or_else(Cell::empty)
     }
 
     /// The queued messages, then the todo list, a line to an item, over
@@ -8887,9 +8951,14 @@ pub mod tests {
         });
         let says = |app: &App, of: u8| {
             let at = row_of(app, &Item::Conversation(id(of)));
-            app.cell(at, 1).text().to_string()
+            app.cell(at, 0)
+                .text()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
         };
-        assert_eq!(says(&app, 3), ASKS);
+        assert_eq!(says(&app, 3), "?");
         app.withdraw(&id(1), Some(4));
         assert!(app.question_lines().is_empty());
         assert_eq!(app.regions.unwrap().transcript.height, before);
@@ -8904,7 +8973,7 @@ pub mod tests {
         );
         app.withdraw(&id(3), None);
         assert!(app.question_lines().is_empty());
-        assert_ne!(says(&app, 3), ASKS);
+        assert_ne!(says(&app, 3), "?");
     }
 
     /// C-Up and C-Down show the person's own messages in turn, from the
@@ -9778,16 +9847,14 @@ pub mod tests {
                 depth(0, "gone (not configured)"),
                 depth(1, "title 5"),
                 depth(0, "No workspace"),
-                depth(1, "title 1"),
+                depth(1, "… title 1"),
                 depth(1, "title 3"),
                 depth(1, "title 2"),
             ]
         );
-        // The third column says what each group starts.
+        assert_eq!(app.list.model().columns().len(), 1);
         let notes = row_of(&app, &Item::Group(Group::Template("notes".into())));
-        assert_eq!(app.cell(notes, 2).text(), "scratch");
-        let td = row_of(&app, &Item::Group(Group::Template("td".into())));
-        assert_eq!(app.cell(td, 2).text(), "repositories");
+        assert_eq!(app.cell(notes, 0).text(), "notes");
         // A press on a template's row starts a conversation from it, on
         // Empty's a scratch one, on Directory…'s the folder chooser.
         let press = |app: &mut App, group: Group| {
@@ -9831,6 +9898,37 @@ pub mod tests {
         assert!(app.take_requests().is_empty());
         key(&mut app, "Return");
         assert_eq!(app.take_requests(), [Request::NewFrom("td".into())]);
+    }
+
+    #[test]
+    fn titles_use_the_list_width_and_state_prefixes_follow_updates() {
+        let mut app = app();
+        let title = "Review storage snapshots";
+        app.rows.iter_mut().find(|r| r.id == id(1)).unwrap().title = title.into();
+        for (state, prefix) in [
+            (RowState::Closed, ""),
+            (RowState::Starting, "… "),
+            (RowState::Idle, "○ "),
+            (RowState::Running, "▶ "),
+            (RowState::Restarting, "↻ "),
+            (RowState::Failed, "! "),
+        ] {
+            app.rows.iter_mut().find(|r| r.id == id(1)).unwrap().state = state;
+            app.refresh_list();
+            let at = row_of(&app, &Item::Conversation(id(1)));
+            assert_eq!(app.cell(at, 0).text(), format!("{prefix}{title}"));
+            assert!(text(&app).contains(title), "{}", text(&app));
+        }
+        for width in [720, 1024, 1500] {
+            app.resize(Surface::new(width, 640, Scale::default()).unwrap());
+            assert_eq!(app.list.model().columns().len(), 1);
+            let pane = app.regions.unwrap().list;
+            assert_eq!(
+                app.list.width(0),
+                Some(pane.width - td_ui::tree_table::GUTTER)
+            );
+            assert!(app.list.geometry().unwrap().horizontal().is_none());
+        }
     }
 
     /// A group folds away its conversations; opening a conversation
@@ -10068,8 +10166,7 @@ pub mod tests {
         let rows = app.list.model().rows();
         let r = rows.iter().find(|r| r.id == row).unwrap();
         assert_eq!((r.depth, r.parent), (2, Some(three)));
-        assert_eq!(app.cell(row, 0).text(), "explore: find it");
-        assert_eq!(app.cell(row, 1).text(), "running");
+        assert_eq!(app.cell(row, 0).text(), "▶ explore: find it");
         let result = Kind::ToolResult {
             reply: 4,
             id: "t".into(),
@@ -10083,7 +10180,7 @@ pub mod tests {
             pictures: Vec::new(),
         };
         app.background(&id(3), &at(7, result), 0);
-        assert_eq!(app.cell(row, 1).text(), "");
+        assert_eq!(app.cell(row, 0).text(), "explore: find it");
         // Read from the log: the one heard is not listed twice, nor said
         // to run again; an older one is listed below it.
         app.set_sub_agents(vec![(
@@ -10245,10 +10342,226 @@ pub mod tests {
         )]);
         app.replay(Ok(""), vec![task(10, 9, "later")]);
         press_row(&mut app, &Item::SubAgent(id(2), 9), 60);
+        app.replay(Ok(""), vec![task(10, 9, "later")]);
         assert!(app
             .log
             .last()
             .is_some_and(|n| n.contains("no longer shows that sub-agent")));
+    }
+
+    #[test]
+    fn child_transcripts_keep_their_steps_while_the_parent_shows_reports() {
+        let text = |app: &App| {
+            (0..app.transcript.len())
+                .filter_map(|i| app.transcript.message(i))
+                .flat_map(|m| (0..m.sections()).filter_map(|i| m.section_text(i)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let event = |seq, kind| Event { seq, time: 0, kind };
+        let result = |reply, call, name: &str, content: &str, error| Kind::ToolResult {
+            reply,
+            id: format!("c{call}"),
+            name: name.into(),
+            call,
+            content: content.into(),
+            error,
+            kept: None,
+            digest: None,
+            digests: Vec::new(),
+            pictures: Vec::new(),
+        };
+        let child_request = |prefix| Kind::Request {
+            turn: 2,
+            purpose: Purpose::Task,
+            prefix,
+            head: String::new(),
+            bytes: 0,
+            reserved: 100,
+        };
+        let mut events = vec![
+            event(
+                1,
+                Kind::User {
+                    delivery: "d".into(),
+                    text: "parent question".into(),
+                    pictures: Vec::new(),
+                },
+            ),
+            event(
+                2,
+                Kind::Started {
+                    effect: crate::store::Effect::Turn,
+                    of: 1,
+                },
+            ),
+            event(3, request(2, 900)),
+            event(4, reply(3, "", "parent plan", false)),
+            task(6, 5, "first child prompt"),
+            event(7, child_request(6)),
+            event(8, reply(7, "child reasoning", "child progress", false)),
+            event(
+                9,
+                Kind::ToolCall {
+                    reply: 8,
+                    id: "c9".into(),
+                    name: "read_file".into(),
+                },
+            ),
+            event(
+                10,
+                Kind::Approval {
+                    call: 9,
+                    outcome: "deny".into(),
+                    by: "human".into(),
+                    probabilities: None,
+                    reason: None,
+                },
+            ),
+            event(
+                11,
+                result(8, 9, "read_file", "error: child-only failure", true),
+            ),
+            event(
+                12,
+                Kind::Usage {
+                    request: 7,
+                    tokens: crate::cost::Tokens::default(),
+                    cost: 50,
+                    basis: crate::store::Basis::Reported,
+                },
+            ),
+            event(
+                13,
+                Kind::Finished {
+                    started: 7,
+                    outcome: "replied".into(),
+                    retry: false,
+                },
+            ),
+            event(
+                14,
+                Kind::TaskNote {
+                    task: 6,
+                    text: "last request".into(),
+                },
+            ),
+            event(15, child_request(6)),
+            event(16, reply(15, "", "first final answer", false)),
+            event(17, result(4, 5, "task", "first report for parent", false)),
+            task(18, 17, "second child prompt"),
+            event(19, child_request(18)),
+            event(20, reply(19, "", "second child progress", false)),
+            event(
+                21,
+                result(4, 17, "task", "error: second task stopped", true),
+            ),
+        ];
+        let mut app = app();
+        app.set_active(id(2));
+        // Live child streams, including reasoning, never enter the parent.
+        for e in events.iter().take(6) {
+            app.update(Update::Up(Up::Event(e.clone())), 0);
+        }
+        app.update(
+            delta(7, "private streamed reasoning", "private streamed text"),
+            0,
+        );
+        assert!(!text(&app).contains("private streamed"));
+        for e in events.iter().skip(6) {
+            app.update(Update::Up(Up::Event(e.clone())), 0);
+        }
+        for activity in [false, true] {
+            app.show_activity = activity;
+            app.replay(Ok(""), events.clone());
+            let shown = text(&app);
+            assert!(shown.contains("parent plan"), "{shown}");
+            assert!(shown.contains("first report for parent"), "{shown}");
+            assert!(shown.contains("second task stopped"), "{shown}");
+            for hidden in [
+                "child progress",
+                "child reasoning",
+                "child-only failure",
+                "approval: deny",
+                "next request is its last",
+            ] {
+                assert!(!shown.contains(hidden), "{hidden}: {shown}");
+            }
+            assert_eq!(app.meter.spent, 50);
+        }
+        press_row(&mut app, &Item::SubAgent(id(2), 6), 60);
+        assert_eq!(app.take_requests(), [Request::Redraw]);
+        app.replay(Ok(""), events.clone());
+        assert!(app.messages.iter().any(|(seq, _)| *seq == 6));
+        let shown = text(&app);
+        for visible in [
+            "child progress",
+            "child-only failure",
+            "approval: deny",
+            "first final answer",
+        ] {
+            assert!(shown.contains(visible), "{visible}: {shown}");
+        }
+        for hidden in [
+            "parent question",
+            "parent plan",
+            "report for parent",
+            "second child",
+            "second task stopped",
+        ] {
+            assert!(!shown.contains(hidden), "{hidden}: {shown}");
+        }
+        assert_eq!(app.meter.spent, 50, "hidden usage still counts");
+        // A child view follows only that child's live requests.
+        app.update(at(22, child_request(6)), 0);
+        app.update(delta(22, "", "first child streaming"), 0);
+        assert!(text(&app).contains("first child streaming"));
+        app.update(delta(19, "", "second child streaming"), 0);
+        assert!(!text(&app).contains("second child streaming"));
+        events.push(event(22, child_request(6)));
+        press_row(&mut app, &Item::SubAgent(id(2), 18), 60);
+        assert_eq!(app.take_requests(), [Request::Redraw]);
+        app.replay(Ok(""), events.clone());
+        assert!(text(&app).contains("second child progress"));
+        assert!(!text(&app).contains("first child prompt"));
+        press_row(&mut app, &Item::Conversation(id(2)), 60);
+        assert_eq!(app.take_requests(), [Request::Redraw]);
+        app.replay(Ok(""), events);
+        assert!(text(&app).contains("first report for parent"));
+        assert!(!text(&app).contains("child progress"));
+    }
+
+    #[test]
+    fn input_from_a_child_view_returns_to_the_parent_without_reopening() {
+        for input in [
+            "follow up",
+            "/triage PR 12",
+            "/review",
+            "/compact",
+            "/schedules",
+        ] {
+            let mut app = app();
+            app.set_sub_agents(vec![(
+                id(1),
+                vec![crate::store::task_start(3, 2, "explore", "find it")],
+            )]);
+            app.open_sub_agent(id(1), 3);
+            assert_eq!(app.take_requests(), [Request::Redraw]);
+            assert_eq!(app.transcript_task, Some(3));
+            app.composer.insert(input).unwrap();
+            app.send();
+            assert_eq!(app.transcript_task, None, "{input}");
+            let requests = app.take_requests();
+            assert_eq!(
+                requests.first(),
+                Some(&Request::Redraw),
+                "{input}: {requests:?}"
+            );
+            assert_eq!(requests.len(), 2, "{input}: {requests:?}");
+            assert!(!requests.iter().any(|r| matches!(r, Request::Open(_))));
+            exchange_at(&mut app, 0);
+            assert!(text(&app).contains("hi there"), "{}", text(&app));
+        }
     }
 
     /// A narrow status row lets whole items go and never cuts one, in the
@@ -10433,8 +10746,7 @@ pub mod tests {
             })
             .collect();
         let first = *children.first().unwrap();
-        assert_eq!(app.cell(first, 0).text(), "p1 make<U+0009>all");
-        assert_eq!(app.cell(first, 1).text(), "running");
+        assert_eq!(app.cell(first, 0).text(), "▶ p1 make<U+0009>all");
         // Its menu from the keyboard: Show output, then Kill.
         app.set_focus(Focus::List);
         app.list.select(Some(first), true);
@@ -10607,7 +10919,7 @@ pub mod tests {
         assert!(app.shows_archived());
         assert_eq!(shown(&app), [id(1), id(3), id(2)]);
         let at = row_of(&app, &Item::Conversation(id(3)));
-        assert_eq!(app.cell(at, 1).text(), "archived");
+        assert_eq!(app.cell(at, 0).text(), "□ title 3");
         let (x, y) = row_at(&app, 3);
         press(&mut app, x, y);
         assert!(app.take_requests().is_empty());
@@ -11597,26 +11909,25 @@ pub mod tests {
         key(&mut app, "Escape");
         assert!(app.chooser().is_none() && app.confirm().is_some());
         app.withdraw(&id(1), None);
-        // The list's third column names each conversation's workspace;
-        // the status row, of fixed width, does not.
+        // Workspace headings group conversations without another column.
         app.add_row(Row {
             workspace: Some(Workspace::Template("notes".into())),
             ..row(9, 1)
         });
         app.set_active(id(9));
         let at = row_of(&app, &Item::Conversation(id(9)));
-        assert_eq!(app.item_labels[&at].0[1], "template notes");
-        // The columns fit the list at its default share of a window 1024
-        // pixels wide: no sideways scrollbar.
+        assert_eq!(app.cell(at, 0).text(), "… title 9");
+        assert!(tree(&app).contains(&(0, "notes".into())));
+        // The title fills the list without a sideways scrollbar.
         assert!(app.list.geometry().unwrap().horizontal().is_none());
-        // A directory by its folder's name, which the column has room for.
+        // Directory conversations retain the directory heading.
         app.add_row(Row {
             workspace: Some(Workspace::Directory("/home/u/src/notes".into())),
             ..row(8, 2)
         });
         let at = row_of(&app, &Item::Conversation(id(8)));
-        assert_eq!(app.item_labels[&at].0[1], "notes");
-        assert!(app.item_labels.iter().any(|label| label.1 .0[1] == "none"));
+        assert_eq!(app.cell(at, 0).text(), "title 8");
+        assert!(tree(&app).contains(&(0, "Directory…".into())));
         assert!(
             !app.status_line().contains("notes"),
             "{}",
@@ -12007,7 +12318,7 @@ pub mod tests {
         let entry = app.directory().into_iter().find(|e| e.id == id(1)).unwrap();
         assert!(entry.failed, "nothing is delivered to it meanwhile");
         let index = row_of(&app, &Item::Conversation(id(1)));
-        assert_eq!(app.cell(index, 1).text(), "deleting");
+        assert_eq!(app.cell(index, 0).text(), "× title 1");
         // Previous and next pass over it: above the next, it is not.
         app.set_active(id(3));
         key(&mut app, "C-PageUp");
@@ -12030,7 +12341,7 @@ pub mod tests {
         let shown = text(&app);
         assert!(shown.contains(confirm::REMOVE_TITLE), "{shown}");
         assert!(shown.contains("2 changed or untracked files"), "{shown}");
-        assert_eq!(app.cell(index, 1).text(), ASKS);
+        assert_eq!(app.cell(index, 0).text(), "? title 1");
         // Set aside with the keyboard, and asked again when it is back.
         app.input(Input::Focus(false), &mut NoClipboard);
         assert!(app.confirm().is_none());
@@ -12065,7 +12376,7 @@ pub mod tests {
         // Archiving says so in the list and on its card.
         app.set_closing(&id(2), Some("archiving"));
         let index = row_of(&app, &Item::Conversation(id(2)));
-        assert_eq!(app.cell(index, 1).text(), "archiving");
+        assert_eq!(app.cell(index, 0).text(), "↓ title 2");
         app.open(id(2));
         assert!(app
             .notice()
@@ -12192,11 +12503,16 @@ pub mod tests {
         };
         let says = |app: &App, of: u8| {
             let at = row_of(app, &Item::Conversation(id(of)));
-            app.cell(at, 1).text().to_string()
+            app.cell(at, 0)
+                .text()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
         };
         app.ask(card(3, 7));
         assert!(app.confirm().is_none(), "another conversation's waits");
-        assert_eq!(says(&app, 3), ASKS);
+        assert_eq!(says(&app, 3), "?");
         app.ask(card(2, 5));
         assert_eq!(shown(&app), Some((id(2), 5)));
         assert_eq!(app.confirm().unwrap().focus(), "cancel");
@@ -12244,7 +12560,7 @@ pub mod tests {
         assert_eq!(shown(&app), Some((id(3), 7)));
         app.withdraw(&id(3), None);
         assert!(app.confirm().is_none() && app.cards().is_empty());
-        assert_ne!(says(&app, 3), ASKS);
+        assert_ne!(says(&app, 3), "?");
         // A modal open first goes first.
         app.open_delete();
         app.ask(card(3, 12));

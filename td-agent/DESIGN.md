@@ -1198,9 +1198,13 @@ the state directory, which the toolkit's widget leaves to the consumer.
 the top rows are the ways to start one, Empty, Directory… and each
 template, and a press on one starts a conversation from it, with no
 dialog between; under each, the conversations started so, most recently
-active first and none pinned. Each conversation's row shows its title,
-its workspace (the template's name or the directory), conversation state
-(idle, running, waiting for approval, failed) and branch, and opens to
+active first and none pinned. The list has one Conversation column,
+using its full width for titles. Each conversation's title has a compact
+state prefix: `…` starting, `○` idle, `▶` running, `↻` restarting, `!`
+failed, `‖` paused, `□` archived, `×` deleting, `↓` archiving, and `?`
+waiting for the person (approval, question or removal card). A closed
+conversation has no prefix. Workspace headings provide the grouping;
+there are no separate State or Workspace columns. The row opens to
 its worktrees with their state (fetching, checking out, ready, failed),
 any forked conversations, its background processes and the sub-agents it
 started (§12). A row waiting for approval is marked distinctly, so a run
@@ -1403,8 +1407,7 @@ socket is opt-in, `--control-socket PATH`, and its actions are `new`,
 Directory… and each configured template in the order written, always
 shown; then, only while a conversation names one, each template no
 longer configured, `NAME (not configured)`, by name; then `No
-workspace`, while a conversation has none. A group's third column says
-what it starts (`scratch`, `folder`, `repositories`). Under each group
+workspace`, while a conversation has none. Under each group
 are its conversations, archived ones only while they show, the most
 recently active first; under each conversation, its background
 processes, then its sub-agents, the most recent first. A press on a
@@ -1459,15 +1462,20 @@ one cannot fill the list past the tree table's bound. While the open
 conversation's log is replayed, to its `last` or as the window reads it,
 the list is rebuilt once, at its end (`relist`), not for each event that
 changes a row; a background conversation's events still rebuild it each,
-as before. A press on one, or `Return`, opens its conversation, the row
-kept selected unless the opening was refused, and once its log has been
-replayed (to the `last` event its process's `Hello` names, or as the
-window reads it) the transcript focuses and shows that message, which
-the messages after it then do not scroll away; one evicted from the
-transcript is said to be in the log alone. A jump not yet made is
-dropped when another conversation opens. Its menus are the open
-conversation's, as a group's are; it is folded away with its
-conversation's processes.
+as before. A press on one, or `Return`, opens only that sub-agent's
+transcript, the row kept selected unless the opening was refused. Its
+prefix, prompt, streaming and logged replies, tool activity, approvals
+and limit notes are shown there; the parent and other sub-agents'
+messages are left out. Opening the parent row returns to its transcript.
+Switching views within the open conversation replays the durable log
+locally, without restarting its process or changing any stored event or
+model context. Sending a message or command, compacting, or retrying
+from a child view first returns to the parent transcript, where the
+resulting exchange shows. Once replay ends the sub-agent's start is
+focused; a start evicted from the transcript is said to be in the log
+alone. A jump not yet made is dropped when another conversation opens.
+Its menus are the open conversation's, as a group's are; it is folded
+away with its conversation's processes.
 
 **As built (increment 5).** A row's state may also be `running`, while
 a turn is under way. A reply shows as an `assistant` message: its
@@ -1679,14 +1687,12 @@ so under its title and lays the list out once a resize gives it room,
 and a window too small for the split still draws it. A note the list
 refuses past its bounds takes the oldest shown with it, as the
 transcript's do, and the list keeps no more notes than the log. The
-workspace a conversation works in, which the row named, is the list's
-third column, `Workspace`: `none`, `scratch`, `template NAME`, or a
-directory by its folder's name (the deletion question names it whole, so
-two folders of one name tell apart there). The list's default share is a
-third of the body, so that its three columns fit a window 1024 pixels
-wide. The driven action is `messages`, and the state gains `notes`
-(`open` or `closed`), `unread` and `note`, the newest note whole on one
-line.
+workspace a conversation works in is given by its group; the workspace
+card and deletion question name directories whole. The list's default
+share is a third of the body, and its one column expands and contracts
+with that pane, reserving only the scrollbar gutter. The driven action
+is `messages`, and the state gains `notes` (`open` or `closed`),
+`unread` and `note`, the newest note whole on one line.
 
 **As built (row menus).** A right press on a conversation's row (td-ui's
 `Context`, td-ui/DESIGN.md, "Widget window") opens its row menu at the
@@ -3014,7 +3020,7 @@ conversations reach without the human choosing it. When the lists,
 with the templates' network policies and MCP servers, would take more
 than half of a setup frame they are not handed on, said in a note, and
 template workspaces bind none, reach no network and run no server.
-The list's Workspace column and the `conversations` tool name the
+The list groups it under NAME and the `conversations` tool names the
 workspace `template NAME`, and the question before a deletion says,
 by the workspace's kind and not its name, that a template's scratch
 directory goes with the conversation.
@@ -3471,7 +3477,7 @@ start does the same for one left without its conversation or cut short.
 The walk goes through directory descriptors opened without following a
 link, so a process still running in the tree cannot turn it out of the
 tree, and holds at most 256 open, moving a deeper directory up within
-the tree. The list's Workspace column names the workspace; the deletion
+the tree. The list groups conversations by workspace; the deletion
 question says whether a scratch workspace goes with the conversation;
 and the diagnostics export leaves `jail/` out, since it holds the
 human's work, and writes its archive, which holds every conversation's
@@ -6347,8 +6353,10 @@ as listed by the provider, for example `openai/gpt-6.1-sol` rather than
 `gpt-6.1-sol`; the task schema names this requirement. An unknown bare name
 gets an exact qualified-ID hint only when the cached models list has one
 unambiguous suffix match. No model is silently substituted, and ambiguous
-names receive no guessed provider. Its prompt must supply
-the exact full commit, or a workspace path to it, and the review scope.
+names receive no guessed provider. For an explore commit review its prompt
+must supply the full commit ID, complete diff and review scope. It has no
+Git command tool: a missing diff is a stated limitation, not a reason to
+reconstruct Git internals or assume the checkout is the committed patch.
 It cannot run tests; the caller asks its report to state that limitation.
 Each request is estimated from its own requests
 alone (§14), reserved, limited by `max_cost_per_turn` and
@@ -6382,8 +6390,11 @@ sub-agent's request is rebuilt from those alone (`client::task_view`),
 which the live loop and the Debug view both use, and its records are
 never in the conversation's view: its replies are not turn replies,
 and a result answering one is left out of every request and of
-compaction's pruning. The window shows the start with its prompt
-folded, and its replies as the sub-agent's, while they stream as well.
+compaction's pruning. The window keeps the sub-agent's intermediate
+steps in its own transcript view, opened through its row (§4). The
+parent shows the returned `task` report even with tool activity folded,
+and messages explicitly sent back by peer conversations, never child
+streams, intermediate replies, tool results or approvals.
 The conversation's title is made from a reply of its own, never a
 sub-agent's.
 
@@ -7746,7 +7757,7 @@ does. The window's units cover notes counted and not shown in the row,
 open, a paste dropped, its closing, its refusal over another modal, the
 key dialog replacing it, its drawing in a window too narrow for the
 split, a background notice kept under its conversation's title, and the
-list's Workspace column, a directory by its folder's name; the key
+list's workspace grouping and title-width allocation; the key
 tests hold that no note kept, not only the newest, carries the key. And
 `src/control.rs` drives `messages` and reads `notes`, `unread` and
 `note`.
