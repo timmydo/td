@@ -322,6 +322,19 @@ fn local_commit_review_resolves_frontier_aliases_at_high_effort() {
                 .and_then(Json::as_str),
             Some("high")
         );
+        let prefix = body
+            .get_path(&["messages"])
+            .and_then(|m| m.index(0))
+            .and_then(|m| m.get("content"))
+            .and_then(Json::as_str)
+            .unwrap();
+        assert!(
+            prefix.contains(&format!(
+                "requested provider model ID \"{concrete}\"; reasoning effort high"
+            )),
+            "{prefix}"
+        );
+        assert!(prefix.contains("An alias does not establish a concrete version"));
         assert!(requests[1].text().contains("ORIGINAL REVIEWED"));
         assert!(requests[1].text().contains("fixture review"));
         let logs = fixture.logs();

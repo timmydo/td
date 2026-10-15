@@ -2570,6 +2570,13 @@ fn a_task_selects_its_model_effort_and_routing() {
         let sub = flat(&requests[2].text());
         assert_eq!(sub["model"], "anthropic/claude-sonnet-5.5:nitro");
         assert_eq!(sub["reasoning.effort"], "xhigh");
+        let system = &sub["messages.0.content"];
+        assert!(system.contains("Harness model identity:"), "{system}");
+        assert!(system.contains("requested provider model ID \"anthropic/claude-sonnet-5.5\"; reasoning effort xhigh"), "{system}");
+        assert!(
+            system.contains("An alias does not establish a concrete version"),
+            "{system}"
+        );
         assert_eq!(sub["provider.max_price.prompt"], "6.000000");
         let parent = flat(&requests[3].text());
         assert_eq!(parent["model"], "anthropic/claude-haiku-4.5");
@@ -2581,6 +2588,7 @@ fn a_task_selects_its_model_effort_and_routing() {
             .unwrap();
         assert!(!error, "{report}");
         assert!(report.starts_with("A sparse checkout"), "{report}");
+        assert!(report.contains("[td-agent: sub-agent identity: requested provider model ID \"anthropic/claude-sonnet-5.5\"; reasoning effort xhigh.]"), "{report}");
         let (conversation, _) = h.close();
         let events = conversation.events();
         let at: Vec<usize> = events

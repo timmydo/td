@@ -173,7 +173,13 @@ fn mcp_tools() -> String {
 /// A sub-agent's prefix (DESIGN.md §12, `task`): its own instructions,
 /// the environment and project instructions of the conversation's
 /// workspace `place`, and the workspace's tools alone.
-pub fn task_prefix(created: u64, place: &Place, agent: crate::tools::SubAgent) -> String {
+pub fn task_prefix(
+    created: u64,
+    place: &Place,
+    agent: crate::tools::SubAgent,
+    model: &str,
+    effort: Option<&str>,
+) -> String {
     let explore = agent == crate::tools::SubAgent::Explore;
     let explore_git = format!("{GIT_WORK} {TASK_GIT}");
     let environment: Vec<String> = environment(created, &os(OS_RELEASE), Some(place))
@@ -194,11 +200,28 @@ pub fn task_prefix(created: u64, place: &Place, agent: crate::tools::SubAgent) -
         crate::tools::SubAgent::Explore => EXPLORE,
     };
     let mut system = format!("{}\n\n{}", instructions.trim_end(), environment.join("\n"));
+    system.push_str("\n\n");
+    system.push_str(&model_identity_instruction(model, effort));
     if let Some(project) = project(place) {
         system.push_str("\n\n");
         system.push_str(&project);
     }
     crate::tools::prefix(agent.kit(), place.system, &system, &[])
+}
+
+pub(crate) fn model_identity(model: &str, effort: Option<&str>) -> String {
+    format!(
+        "requested provider model ID {}; reasoning effort {}",
+        td_json::Json::Str(model.into()),
+        effort.unwrap_or("not sent")
+    )
+}
+
+pub(crate) fn model_identity_instruction(model: &str, effort: Option<&str>) -> String {
+    format!(
+        "Harness model identity: {}. This is td-agent's request configuration. Use this model ID and effort when identifying yourself in a report; you do not need to infer them from your own knowledge. An alias does not establish a concrete version: do not invent a snapshot or a resolved identity beyond this ID.",
+        model_identity(model, effort)
+    )
 }
 
 /// A repository workspace's project instructions (DESIGN.md §13), none
@@ -559,7 +582,13 @@ mod tests {
         assert!(!block.contains("Git: none"), "{block}");
         // A sub-agent's has the worktrees, and neither the news, the time
         // stamps nor the git tools, which are the conversation's.
-        let task = task_prefix(0, &place, crate::tools::SubAgent::General);
+        let task = task_prefix(
+            0,
+            &place,
+            crate::tools::SubAgent::General,
+            "test/model",
+            Some("high"),
+        );
         assert!(task.contains("You are a sub-agent of td-agent"), "{task}");
         assert!(task.contains("`git sparse-checkout add`"), "{task}");
         assert!(
@@ -580,7 +609,13 @@ mod tests {
         }
         // An explorer's has no shell, no git work and no network line,
         // and its own instructions and tools.
-        let explore = task_prefix(0, &place, crate::tools::SubAgent::Explore);
+        let explore = task_prefix(
+            0,
+            &place,
+            crate::tools::SubAgent::Explore,
+            "test/model",
+            Some("high"),
+        );
         assert!(
             explore.contains("You are an explore sub-agent"),
             "{explore}"
@@ -838,7 +873,13 @@ mod tests {
         // never that a shell runs, whatever the block's wording.
         for place in [&place, &scratch] {
             assert!(environment(0, "td", Some(place)).contains(SHELL_THERE));
-            let explore = task_prefix(0, place, crate::tools::SubAgent::Explore);
+            let explore = task_prefix(
+                0,
+                place,
+                crate::tools::SubAgent::Explore,
+                "test/model",
+                Some("high"),
+            );
             assert!(explore.contains(SEARCH_THERE), "{explore}");
             for gone in ["shell", "- Network:"] {
                 assert!(!explore.contains(gone), "{gone}: {explore}");

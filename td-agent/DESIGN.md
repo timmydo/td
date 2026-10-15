@@ -223,7 +223,10 @@ from the API model list to the highest numeric stable frontier release of
 Claude Opus or GPT Sol respectively, excluding routed variants and smaller
 model variants. A missing family fails before any completion. The requested
 alias and concrete resolved identity are logged; every request uses the
-concrete identity. Explicit concrete model ids remain available. All code
+concrete identity. Both review forms seed that selected provider model ID
+and the requested effort in the reviewer system prompt, using the same
+identity guidance as subagents (§12), so reports can name their reviewer
+without guessing. Explicit concrete model ids remain available. All code
 reviews, including the conversation's `/review`, use high effort; an
 explicit effort other than high or a model without reasoning support is
 refused. `--max-tokens` defaults to 32768, cut to the model's limit.
@@ -6305,6 +6308,14 @@ is up and going otherwise, set again at every change to the cards; its
 start's deadline and each listing's again, the turn's wait for its
 listing, and a call's bound for a server not yet begun each add the
 time it stopped since they began.
+
+A sub-agent's prefix names the exact provider model ID requested and the
+reasoning effort actually sent (or that none is sent), so a reviewer need
+not infer its identity from its own knowledge. Every successful task
+report also ends with the same harness-written identity, independently
+of what the model says about itself. These are request settings, not
+provider attestation: an alias is not resolved or promoted to a concrete
+version by this annotation, and no unreported snapshot is invented.
 
 **As built (`task`).** `task {prompt, agent?, model?, effort?, routing?}`
 runs a sub-agent within

@@ -223,8 +223,13 @@ impl Session {
             model,
             routing,
         } = asking;
+        let effort = model
+            .as_ref()
+            .is_none_or(|m| m.supports("reasoning"))
+            .then_some(reasoning_effort.as_str());
+        let identity = crate::prompt::model_identity(&name, effort);
         let prefix = match self.placed(&client, |created, place| {
-            place.map(|place| crate::prompt::task_prefix(created, place, agent))
+            place.map(|place| crate::prompt::task_prefix(created, place, agent, &name, effort))
         }) {
             Ok(Some(prefix)) => prefix,
             Ok(None) => {
@@ -245,10 +250,6 @@ impl Session {
             .seq;
         self.sync()?;
         let pricing = model.as_ref().and_then(|m| m.pricing);
-        let effort = model
-            .as_ref()
-            .is_none_or(|m| m.supports("reasoning"))
-            .then_some(reasoning_effort.as_str());
         // Where `tool_choice` cannot be sent, the last request offers its
         // tools still, and a call it makes anyway is answered as not run.
         let choice = model.as_ref().is_some_and(|m| m.supports("tool_choice"));
@@ -418,6 +419,7 @@ impl Session {
                         &completion.finish,
                         wrap.as_deref(),
                         last,
+                        &identity,
                     )));
                 }
                 Streamed::Failed { failure, partial } => {
@@ -485,6 +487,7 @@ impl Session {
         finish: &str,
         wrap: Option<&str>,
         last: bool,
+        identity: &str,
     ) -> String {
         let mut notes = Vec::new();
         match finish {
@@ -525,6 +528,7 @@ impl Session {
             ));
             report.truncate(end);
         }
+        notes.push(format!("sub-agent identity: {identity}"));
         if !notes.is_empty() {
             report.push_str(&format!("\n\n[td-agent: {}.]", notes.join("; ")));
         }
