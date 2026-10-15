@@ -3,6 +3,12 @@ use crate::{
     admission::work::Meter,
     ports::{Clock, Deadline, Error, Tick},
 };
+use crate::{
+    format::row::{ReceiptTls, SmtpReceipt},
+    ids::EmailId,
+    ports,
+};
+use std::{fmt::Write as _, net::IpAddr};
 use td_mime::{header_message_ids as ids, headers};
 
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
@@ -385,4 +391,72 @@ fn emit(
         write(chunk)?;
     }
     Ok(())
+}
+
+pub(crate) fn trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
+    crate::config::values::certificate_name(hostname).map_err(|_| ports::Error::Invalid)?;
+    // Each variable has a protocol bound; 128 covers every fixed delimiter,
+    // the longest protocol/TLS comment and UTC date; two more bytes protect
+    // an orphan continuation with an explicit header/body separator.
+    hostname
+        .len()
+        .checked_add(crate::format::row::MAX_EHLO)
+        .and_then(|n| n.checked_add(crate::format::row::MAX_ADDRESS))
+        .and_then(|n| n.checked_add(52 + 32 + 128 + 2))
+        .ok_or(ports::Error::Capacity)
+}
+pub(crate) fn trace(
+    receipt: &SmtpReceipt<'_>,
+    hostname: &str,
+    extended: bool,
+    email: EmailId,
+    utc_ms: i64,
+    maximum: usize,
+) -> Result<String, ports::Error> {
+    let date = td_civil::unix_to_civil_utc_checked(utc_ms.div_euclid(1000))
+        .ok_or(ports::Error::Invalid)?;
+    if !(1900..=9999).contains(&date.year) {
+        return Err(ports::Error::Invalid);
+    }
+    const MONTHS: &[&str] = &[
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .get(
+            usize::from(date.month)
+                .checked_sub(1)
+                .ok_or(ports::Error::Invalid)?,
+        )
+        .ok_or(ports::Error::Invalid)?;
+    let protocol = match (extended, receipt.tls) {
+        (true, ReceiptTls::Plain) => "ESMTP",
+        (true, _) => "ESMTPS",
+        (false, _) => "SMTP",
+    };
+    let tls = match receipt.tls {
+        ReceiptTls::Plain => "",
+        ReceiptTls::Tls12 => " (TLSv1.2)",
+        ReceiptTls::Tls13 => " (TLSv1.3)",
+    };
+    let mut output = String::new();
+    output
+        .try_reserve_exact(maximum)
+        .map_err(|_| ports::Error::Capacity)?;
+    write!(
+        output,
+        "Return-Path: <{}>\r\nReceived: from {} (",
+        receipt.reverse_path, receipt.ehlo
+    )
+    .map_err(|_| ports::Error::Capacity)?;
+    match receipt.peer {
+        IpAddr::V4(ip) => write!(output, "[{ip}]"),
+        IpAddr::V6(ip) => write!(output, "[IPv6:{ip}]"),
+    }
+    .map_err(|_| ports::Error::Capacity)?;
+    write!(output, ")\r\n\tby {hostname} with {protocol}{tls} id {email};\r\n\t{} {month} {} {:02}:{:02}:{:02} +0000\r\n",
+        date.day, date.year, date.hour, date.minute, date.second).map_err(|_| ports::Error::Capacity)?;
+    if output.len() > maximum {
+        return Err(ports::Error::Capacity);
+    }
+    Ok(output)
 }

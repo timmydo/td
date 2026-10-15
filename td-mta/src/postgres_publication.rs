@@ -128,3 +128,37 @@ pub(crate) async fn write_blob(
     }
     Ok(())
 }
+
+pub(crate) async fn select_thread(
+    client: &Client,
+    account: AccountId,
+    requested: &[String],
+    fresh: crate::ids::ThreadId,
+    old: u64,
+) -> Result<(crate::ids::ThreadId, bool), Error> {
+    let mut anchors = Vec::new();
+    anchors
+        .try_reserve_exact(requested.len())
+        .map_err(|_| Error::Capacity)?;
+    anchors.extend(requested.iter().map(String::as_str));
+    let rows=client.query("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[&account.as_bytes().as_slice(),&anchors]).await.map_err(|_|Error::Database)?;
+    let Some(row) = rows.first() else {
+        return Ok((fresh, true));
+    };
+    let email: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+    let thread: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+    if email.len() != 16
+        || (2..=4).any(|column| {
+            row.try_get::<_, &[u8]>(column)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok().map(u64::from_be_bytes))
+                .is_none_or(|changed| changed > old)
+        })
+    {
+        return Err(Error::Integrity);
+    }
+    Ok((
+        crate::ids::ThreadId::from_bytes(thread.try_into().map_err(|_| Error::Integrity)?),
+        false,
+    ))
+}

@@ -555,8 +555,8 @@ adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
 version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
 Version 10 adds src/postgres_uploads.sql; version 11 adds
-src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql.
-New initialization applies all twelve in
+src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
+src/postgres_receiving.sql. New initialization applies all thirteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1724,3 +1724,37 @@ delivery adapter now consumes it through an explicit error mapping. Its
 charges are unchanged. The module grants no recipient, gateway or publication
 authority and performs no database access. PostgreSQL receiving publication
 and runtime integration remain cutover work.
+
+## 46. Retained SMTP receiving publication
+
+Schema version 13 adds `receiving_receipts`. The owner-side `postgres_receiving`
+adapter prepares completed decoded DATA outside its write transaction. The
+trusted connection owner supplies envelope/socket facts and must already have
+admitted the peer, gateway and recipient routes under the selected profile.
+Passive receipt facts confer no authority. This increment opens no listener and
+does not replace the production SQLite receiving path.
+
+Preparation validates bounded SMTP metadata, complete CRLF lines of at most
+1000 bytes, the selected message ceiling and a root-header ceiling of at most
+1 MiB. It uses the shared receiving header and trace formatter: prepend the
+server Return-Path/Received fields, strip supplied Return-Path fields, retain
+root identifiers and keep body bytes unchanged. Original work/deadline limits
+cover filtering and identifier replay. Input reserves the trace allowance
+within the message ceiling. Prepared bytes, IDs, provenance and the request
+digest remain immutable across retries; no network input occurs under a lock.
+
+Publication takes the configuration share lock before the account write lock,
+rechecks epoch and selected profile generation, and requires its receiving
+role. It resolves exactly one Inbox, selects the thread using the shared draft
+anchor lookup, and publishes body chunks, SMTP provenance and ordered envelope
+recipients, one unread/unstarred Email, membership, anchor, history, shared
+quota effects and the operation receipt in one synchronous transaction.
+Each delivery advances account state once; repeated envelope recipients still
+produce one Email. Body and blob quotas are charged once. Retained receipts
+are capped at 1024 per account and survive deletion of the delivered Email.
+
+Lost COMMIT responses are indeterminate. Inspect/replay waits behind the prior
+account publisher and uses the retained operation/digest; known success stays
+success after policy replacement. This is internal delivery recovery, not
+cross-session SMTP deduplication. Runtime connection/gateway authorization,
+ingress reservations, retention/reclamation and activation remain cutover work.

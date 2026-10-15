@@ -7,7 +7,7 @@ use crate::{
     receiving_headers as headers,
     smtp_session::Session,
 };
-use std::{fmt::Write as _, net::IpAddr};
+use std::net::IpAddr;
 
 /// Passive facts supplied by the trusted connection owner, never a credential.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,17 +100,9 @@ impl std::error::Error for DeliveryError {}
 /// Format-derived maximum, including the longest envelope, IP literal, ID and
 /// four-digit UTC date. Use this for Settings::trace_bytes, never a new knob.
 pub fn smtp_trace_allowance(hostname: &str) -> Result<usize, ports::Error> {
-    crate::config::values::certificate_name(hostname).map_err(|_| ports::Error::Invalid)?;
-    // Each variable has a protocol bound; 128 covers every fixed delimiter,
-    // the longest protocol/TLS comment and UTC date; two more bytes protect
-    // an orphan continuation with an explicit header/body separator.
-    hostname
-        .len()
-        .checked_add(crate::format::row::MAX_EHLO)
-        .and_then(|n| n.checked_add(crate::format::row::MAX_ADDRESS))
-        .and_then(|n| n.checked_add(52 + 32 + 128 + 2))
-        .ok_or(ports::Error::Capacity)
+    headers::trace_allowance(hostname)
 }
+
 struct Receipt {
     account: AccountId,
     peer: IpAddr,
@@ -292,8 +284,8 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
         let email = EmailId::from_bytes(bytes);
         entropy.fill(&mut bytes).map_err(ports::Error::from)?;
         let fresh_thread = ThreadId::from_bytes(bytes);
-        let trace = trace(
-            &receipt,
+        let trace = headers::trace(
+            &receipt.row()?,
             settings.hostname,
             extended,
             email,
@@ -364,62 +356,6 @@ impl<'r, 'a, P> StoreCoordinator<'r, 'a, P> {
             failed: false,
         })
     }
-}
-
-fn trace(
-    receipt: &Receipt,
-    hostname: &str,
-    extended: bool,
-    email: EmailId,
-    utc_ms: i64,
-    maximum: usize,
-) -> Result<String, ports::Error> {
-    let date = td_civil::unix_to_civil_utc_checked(utc_ms.div_euclid(1000))
-        .ok_or(ports::Error::Invalid)?;
-    if !(1900..=9999).contains(&date.year) {
-        return Err(ports::Error::Invalid);
-    }
-    const MONTHS: &[&str] = &[
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let month = MONTHS
-        .get(
-            usize::from(date.month)
-                .checked_sub(1)
-                .ok_or(ports::Error::Invalid)?,
-        )
-        .ok_or(ports::Error::Invalid)?;
-    let protocol = match (extended, receipt.tls) {
-        (true, ReceiptTls::Plain) => "ESMTP",
-        (true, _) => "ESMTPS",
-        (false, _) => "SMTP",
-    };
-    let tls = match receipt.tls {
-        ReceiptTls::Plain => "",
-        ReceiptTls::Tls12 => " (TLSv1.2)",
-        ReceiptTls::Tls13 => " (TLSv1.3)",
-    };
-    let mut output = String::new();
-    output
-        .try_reserve_exact(maximum)
-        .map_err(|_| ports::Error::Capacity)?;
-    write!(
-        output,
-        "Return-Path: <{}>\r\nReceived: from {} (",
-        receipt.reverse, receipt.hello
-    )
-    .map_err(|_| ports::Error::Capacity)?;
-    match receipt.peer {
-        IpAddr::V4(ip) => write!(output, "[{ip}]"),
-        IpAddr::V6(ip) => write!(output, "[IPv6:{ip}]"),
-    }
-    .map_err(|_| ports::Error::Capacity)?;
-    write!(output, ")\r\n\tby {hostname} with {protocol}{tls} id {email};\r\n\t{} {month} {} {:02}:{:02}:{:02} +0000\r\n",
-        date.day, date.year, date.hour, date.minute, date.second).map_err(|_| ports::Error::Capacity)?;
-    if output.len() > maximum {
-        return Err(ports::Error::Capacity);
-    }
-    Ok(output)
 }
 
 impl<C: Crypto, P, A: DeliveryAuthorization> Delivery<'_, '_, '_, '_, C, P, A> {

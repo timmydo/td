@@ -300,38 +300,6 @@ pub fn inspect(
     result
 }
 
-async fn select_thread(
-    client: &Client,
-    draft: &Draft,
-    old: u64,
-) -> Result<(ThreadId, bool), Error> {
-    let mut anchors = Vec::new();
-    anchors
-        .try_reserve_exact(draft.anchors.len())
-        .map_err(|_| Error::Capacity)?;
-    anchors.extend(draft.anchors.iter().map(String::as_str));
-    let rows=client.query("SELECT a.email_id,e.thread_id,a.changed,e.changed,t.changed FROM unnest($2::text[]) WITH ORDINALITY requested(message_id,position) JOIN LATERAL (SELECT email_id,changed FROM td_mta.thread_anchors WHERE account=$1 AND message_id=requested.message_id ORDER BY email_id LIMIT 1) a ON true LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=a.email_id LEFT JOIN td_mta.threads t ON t.account=e.account AND t.id=e.thread_id ORDER BY requested.position LIMIT 1", &[&draft.binding.account().as_bytes().as_slice(),&anchors]).await.map_err(|_|Error::Database)?;
-    let Some(row) = rows.first() else {
-        return Ok((draft.new_thread, true));
-    };
-    let email: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-    let thread: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-    if email.len() != 16
-        || (2..=4).any(|column| {
-            row.try_get::<_, &[u8]>(column)
-                .ok()
-                .and_then(|bytes| sequence(bytes).ok())
-                .is_none_or(|changed| changed > old)
-        })
-    {
-        return Err(Error::Integrity);
-    }
-    Ok((
-        ThreadId::from_bytes(thread.try_into().map_err(|_| Error::Integrity)?),
-        false,
-    ))
-}
-
 /// A historical receipt is known success, not authority for a fresh write.
 pub fn publish(
     request: &Request<'_>,
@@ -411,7 +379,15 @@ pub fn publish(
             if used {
                 return Err(Error::Conflict);
             }
-            let (thread_id, new_thread) = select_thread(client, &draft, old).await?;
+            let (thread_id, new_thread) = publication::select_thread(
+                client,
+                account_id,
+                &draft.anchors,
+                draft.new_thread,
+                old,
+            )
+            .await
+            .map_err(publication_error)?;
             let thread = thread_id.as_bytes().as_slice();
             if new_thread {
                 let used:bool=client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.threads WHERE account=$1 AND id=$2) OR EXISTS(SELECT 1 FROM td_mta.changes WHERE account=$1 AND kind=2 AND object=$2)", &[&account,&thread]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;

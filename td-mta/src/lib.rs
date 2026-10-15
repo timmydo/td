@@ -212,6 +212,7 @@ pub mod postgres_devices;
 pub mod postgres_drafts;
 pub mod postgres_email_set;
 mod postgres_publication;
+pub mod postgres_receiving;
 pub mod postgres_uploads;
 
 mod mailbox_name;

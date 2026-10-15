@@ -1043,6 +1043,11 @@ fn trace_covers_tls_ipv6_helo_gateway_and_worst_case_allowance() {
         "d".repeat(61)
     );
     let allowance = smtp_trace_allowance(&hostname).unwrap();
+    let mut recipient_storage = [0; 256];
+    let recipients = ReceiptRecipients::encode(&["r@example.test"], &mut recipient_storage)
+        .unwrap()
+        .encoded()
+        .to_vec();
     let mut receipt = Receipt {
         account: ACCOUNT,
         peer: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap(),
@@ -1050,7 +1055,7 @@ fn trace_covers_tls_ipv6_helo_gateway_and_worst_case_allowance() {
         gateway: Some("gateway-private-name".into()),
         hello: "h".repeat(crate::format::row::MAX_EHLO),
         reverse: "r".repeat(crate::format::row::MAX_ADDRESS),
-        recipients: Vec::new(),
+        recipients,
     };
     for (extended, tls, protocol) in [
         (true, ReceiptTls::Plain, "with ESMTP id"),
@@ -1060,8 +1065,8 @@ fn trace_covers_tls_ipv6_helo_gateway_and_worst_case_allowance() {
         (false, ReceiptTls::Tls13, "with SMTP (TLSv1.3) id"),
     ] {
         receipt.tls = tls;
-        let value = trace(
-            &receipt,
+        let value = headers::trace(
+            &receipt.row().unwrap(),
             &hostname,
             extended,
             EmailId::from_bytes([255; 16]),

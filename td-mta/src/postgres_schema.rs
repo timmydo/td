@@ -26,8 +26,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_uploads.sql"),
     include_str!("postgres_drafts.sql"),
     include_str!("postgres_mailbox_create.sql"),
+    include_str!("postgres_receiving.sql"),
 ];
-const VERSION: u32 = 12;
+const VERSION: u32 = 13;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,
