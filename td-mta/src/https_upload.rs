@@ -29,8 +29,50 @@ pub struct Response {
     bytes: [u8; 4096],
     length: usize,
     pub stop: bool,
+    uncertain: bool,
 }
 impl Response {
+    /// Publication may have committed. The HTTP owner must close without a
+    /// final response; the backend retains the operation for settlement.
+    pub(crate) fn uncertain() -> Self {
+        Self {
+            bytes: [0; 4096],
+            length: 0,
+            stop: false,
+            uncertain: true,
+        }
+    }
+    pub(crate) fn is_uncertain(&self) -> bool {
+        self.uncertain
+    }
+    pub(crate) fn created(
+        account: AccountId,
+        blob: crate::ids::BlobId,
+        length: u64,
+        content_type: &str,
+        stop: bool,
+    ) -> Result<Self, Error> {
+        let mut response = Self {
+            bytes: [0; 4096],
+            length: 0,
+            stop,
+            uncertain: false,
+        };
+        let mut account_bytes = [0; wire::IdKind::WIRE_BYTES];
+        let mut blob_bytes = [0; wire::IdKind::WIRE_BYTES];
+        let account =
+            wire::encode_id(account, &mut account_bytes).map_err(|_| Error::WriterStopped)?;
+        let blob = wire::encode_id(blob, &mut blob_bytes).map_err(|_| Error::WriterStopped)?;
+        let mut out = TextBuffer::new(&mut response.bytes);
+        out.format(format_args!(
+            "{{\"accountId\":\"{account}\",\"blobId\":\"{blob}\",\"size\":{length},\"type\":"
+        ))
+        .map_err(|_| Error::WriterStopped)?;
+        crate::jmap_session::quoted(&mut out, content_type).map_err(|_| Error::WriterStopped)?;
+        out.append("}").map_err(|_| Error::WriterStopped)?;
+        response.length = out.len();
+        Ok(response)
+    }
     #[cfg(test)]
     pub(crate) fn stopped_for_test() -> Self {
         let mut bytes = [0; 4096];
@@ -41,9 +83,13 @@ impl Response {
             bytes,
             length: 2,
             stop: true,
+            uncertain: false,
         }
     }
     pub fn bytes(&self) -> Result<&[u8], Error> {
+        if self.uncertain {
+            return Err(Error::Conflict);
+        }
         self.bytes.get(..self.length).ok_or(Error::Invalid)
     }
 }
@@ -268,27 +314,13 @@ impl<P: UploadAuthorization + BlobAuthorization + Sync> Backend for Service<'_, 
             return Err(Error::Conflict);
         };
         let stop = completion_stop(&completion)?;
-        let mut response = Response {
-            bytes: [0; 4096],
-            length: 0,
+        Response::created(
+            request.account,
+            completion.id,
+            completion.length,
+            request.content_type,
             stop,
-        };
-        let mut account = [0; wire::IdKind::WIRE_BYTES];
-        let mut blob = [0; wire::IdKind::WIRE_BYTES];
-        let account =
-            wire::encode_id(request.account, &mut account).map_err(|_| Error::WriterStopped)?;
-        let blob = wire::encode_id(completion.id, &mut blob).map_err(|_| Error::WriterStopped)?;
-        let mut out = TextBuffer::new(&mut response.bytes);
-        out.format(format_args!(
-            "{{\"accountId\":\"{account}\",\"blobId\":\"{blob}\",\"size\":{},\"type\":",
-            completion.length
-        ))
-        .map_err(|_| Error::WriterStopped)?;
-        crate::jmap_session::quoted(&mut out, request.content_type)
-            .map_err(|_| Error::WriterStopped)?;
-        out.append("}").map_err(|_| Error::WriterStopped)?;
-        response.length = out.len();
-        Ok(response)
+        )
     }
 }
 fn body_error(error: crate::http_request::Error) -> Error {

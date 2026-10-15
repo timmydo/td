@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     path::Path,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -33,6 +33,29 @@ impl From<ports::Error> for Error {
 #[derive(Default)]
 pub struct Pending {
     change: Mutex<Option<Upload>>,
+    ingress: Mutex<()>,
+}
+
+pub(crate) struct Ingress<'a> {
+    owner: &'a Pending,
+    _guard: MutexGuard<'a, ()>,
+}
+impl Pending {
+    pub(crate) fn admit_ingress(&self) -> Result<Ingress<'_>, ports::Error> {
+        let guard = self.ingress.try_lock().map_err(|_| ports::Error::Busy)?;
+        if self
+            .change
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?
+            .is_some()
+        {
+            return Err(ports::Error::Busy);
+        }
+        Ok(Ingress {
+            owner: self,
+            _guard: guard,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -107,6 +130,18 @@ impl Uploads<'_> {
     /// Publish completed, caller-admitted ingress with one retained operation.
     /// The caller keeps its original body and response reservations until return.
     pub fn create(&self, input: Input<'_>, meter: &mut Meter) -> Result<changes::Outcome, Error> {
+        let ingress = self.pending.admit_ingress()?;
+        self.create_admitted(input, meter, &ingress)
+    }
+    pub(crate) fn create_admitted(
+        &self,
+        input: Input<'_>,
+        meter: &mut Meter,
+        ingress: &Ingress<'_>,
+    ) -> Result<changes::Outcome, Error> {
+        if !std::ptr::eq(ingress.owner, self.pending) {
+            return Err(ports::Error::Invalid.into());
+        }
         if !self.executable.is_absolute()
             || !self.binding.roles().jmap()
             || self.loaded.bootstrap.profile() != self.binding.profile()
@@ -219,4 +254,19 @@ fn addresses(
             _ => ports::Error::Dns,
         }
     })
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    #[test]
+    fn ingress_is_exclusive_and_released_without_publication() -> Result<(), ports::Error> {
+        let pending = Pending::default();
+        let permit = pending.admit_ingress()?;
+        assert!(matches!(pending.admit_ingress(), Err(ports::Error::Busy)));
+        assert_eq!(pending.operation(), Ok(None));
+        drop(permit);
+        assert!(pending.admit_ingress().is_ok());
+        Ok(())
+    }
 }

@@ -6222,6 +6222,111 @@ fn exercise_http_read(
                 .unwrap(),
             before + 2
         );
+        let upload = |body: &[u8], framing, expect_continue, secret: &[u8]| {
+            let credentials = credentials(secret);
+            let mut wire = Wire {
+                input: body.to_vec(),
+                position: 0,
+                output: Vec::new(),
+                fail_write: false,
+            };
+            let until = until();
+            let result = service.receive(
+                td_mta::https_upload::Request {
+                    account: binding.account(),
+                    device,
+                    credentials: &credentials,
+                    framing,
+                    content_type: "text/plain",
+                    prefix: &[],
+                    deadline: until,
+                    body_deadline: until,
+                    expect_continue,
+                },
+                &mut wire,
+                &control,
+            );
+            (result, wire.output)
+        };
+        let uploads_before = sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts")
+            .parse::<usize>()
+            .unwrap();
+        for (bytes, framing, interim) in [
+            (b"uploaded body".as_slice(), Framing::Length(13), false),
+            (
+                b"d\r\nuploaded body\r\n0\r\n\r\n".as_slice(),
+                Framing::Chunked,
+                true,
+            ),
+        ] {
+            let (result, wire) = upload(bytes, framing, interim, password);
+            let response = result.unwrap();
+            assert!(!response.stop);
+            let response = td_json::parse_slice(response.bytes().unwrap()).unwrap();
+            assert_eq!(response["size"].as_u64(), Some(13));
+            assert_eq!(response["type"].as_str(), Some("text/plain"));
+            if interim {
+                assert_eq!(wire, b"HTTP/1.1 100 Continue\r\n\r\n");
+            } else {
+                assert!(wire.is_empty());
+            }
+            let (result, wire) = download(response["blobId"].as_str().unwrap(), password, false);
+            result.unwrap();
+            assert_eq!(wire.split_once("\r\n\r\n").unwrap().1, "uploaded body");
+        }
+        assert_eq!(pending.uploads.operation().unwrap(), None);
+        for (bytes, framing, expected) in [
+            (b"short".as_slice(), Framing::Length(6), Error::Invalid),
+            (b"z\r\n".as_slice(), Framing::Chunked, Error::Invalid),
+            (
+                b"".as_slice(),
+                Framing::Length(33 * 1024 * 1024),
+                Error::Capacity,
+            ),
+        ] {
+            let (result, _) = upload(bytes, framing, false, password);
+            assert!(matches!(result, Err(error) if error == expected));
+        }
+        assert!(matches!(
+            upload(b"x", Framing::Length(1), false, &wrong).0,
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts")
+                .parse::<usize>()
+                .unwrap(),
+            uploads_before + 2
+        );
+        sql(fixture, "CREATE FUNCTION public.delay_http_upload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_http_upload AFTER INSERT ON td_mta.upload_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_http_upload()");
+        milliseconds.set(3000);
+        let (result, _) = upload(b"uncertain", Framing::Length(9), false, password);
+        let response = result.unwrap();
+        assert_eq!(response.bytes(), Err(Error::Conflict));
+        assert!(!response.stop);
+        let operation = pending.uploads.operation().unwrap().unwrap();
+        milliseconds.set(10_000);
+        let (result, wire) = upload(b"x", Framing::Length(1), true, password);
+        assert!(matches!(result, Err(Error::Busy)));
+        assert!(wire.is_empty());
+        thread::sleep(Duration::from_secs(5));
+        sql(
+            fixture,
+            "DROP TRIGGER delay_http_upload ON td_mta.upload_receipts",
+        );
+        let settled = pending
+            .uploads
+            .settle(&loaded, service.executable, &settlement, &clock, until())
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.operation, operation);
+        assert_eq!(settled.outcome.length, 9);
+        assert_eq!(pending.uploads.operation().unwrap(), None);
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.upload_receipts")
+                .parse::<usize>()
+                .unwrap(),
+            uploads_before + 3
+        );
         assert_eq!(pending.submissions.operation().unwrap(), None);
         assert_eq!(pending.drafts.operation().unwrap(), None);
         assert_eq!(pending.operation().unwrap(), None);

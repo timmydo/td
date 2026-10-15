@@ -1013,11 +1013,15 @@ fn full_reply(client: &mut impl Transport) -> (u16, String, String) {
 #[test]
 fn stopped_upload_receipt_retires_after_expiry_or_shutdown() {
     for late in [false, true] {
-        stopped_upload_receipt(late);
+        stopped_upload_receipt(Some(late));
     }
 }
-fn stopped_upload_receipt(late: bool) {
-    struct Late<'a>(&'a Now, bool);
+#[test]
+fn uncertain_upload_closes_only_its_exchange_without_a_receipt() {
+    stopped_upload_receipt(None);
+}
+fn stopped_upload_receipt(late: Option<bool>) {
+    struct Late<'a>(&'a Now, Option<bool>);
     impl crate::https_upload::Backend for Late<'_> {
         fn account(&self) -> AccountId {
             AccountId::from_bytes([0xaa; 16])
@@ -1028,7 +1032,10 @@ fn stopped_upload_receipt(late: bool) {
             _: &mut dyn Transport,
             control: &Control,
         ) -> Result<crate::https_upload::Response, Error> {
-            if self.1 {
+            let Some(late) = self.1 else {
+                return Ok(crate::https_upload::Response::uncertain());
+            };
+            if late {
                 self.0
                      .1
                     .store(request.deadline.tick().0 + 1, Ordering::Relaxed);
@@ -1106,14 +1113,31 @@ fn stopped_upload_receipt(late: bool) {
                     address.port()
                 );
                 send(&mut wire, head.as_bytes());
-                wait(|| worker.is_finished());
-                assert_eq!(worker.join().unwrap(), Err(Error::WriterStopped));
+                if late.1.is_some() {
+                    wait(|| worker.is_finished());
+                }
                 let mut bytes = [0; 4096];
                 wait(|| match wire.read(&mut bytes) {
                     Ok(IoProgress::Pending) => false,
                     Ok(IoProgress::Bytes(_)) => panic!("expired exchange wrote a receipt"),
                     Ok(IoProgress::Closed) | Err(_) => true,
                 });
+                if late.1.is_none() {
+                    assert!(!control.stop_requested());
+                    assert!(!worker.is_finished());
+                    let mut next = client(address, &lease, clock.clone());
+                    send(&mut next, head.as_bytes());
+                    wait(|| match next.read(&mut bytes) {
+                        Ok(IoProgress::Pending) => false,
+                        Ok(IoProgress::Bytes(_)) => panic!("uncertain upload wrote a receipt"),
+                        Ok(IoProgress::Closed) | Err(_) => true,
+                    });
+                    assert!(!control.stop_requested());
+                    control.stop();
+                    worker.join().unwrap().unwrap();
+                } else {
+                    assert_eq!(worker.join().unwrap(), Err(Error::WriterStopped));
+                }
             });
         })
         .unwrap();

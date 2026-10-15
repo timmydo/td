@@ -47,11 +47,11 @@ impl https_upload::Backend for Service<'_, '_, '_> {
     }
     fn receive(
         &self,
-        _request: https_upload::Request<'_>,
-        _transport: &mut dyn Transport,
-        _control: &Control,
+        request: https_upload::Request<'_>,
+        transport: &mut dyn Transport,
+        control: &Control,
     ) -> Result<https_upload::Response, Error> {
-        Err(Error::NotFound)
+        crate::postgres_http_upload_receive::receive(self, request, transport, control)
     }
     fn download(
         &self,

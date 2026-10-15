@@ -430,3 +430,12 @@ stored message retrieval and retained-send reconciliation after failed local
 draft retirement. The second client attempt must return the original
 submission ID with exactly one queued submission. It does not deliver via
 SMTP, test attachment sending, or activate the production backend.
+
+
+The prepared PostgreSQL HTTP fixture also receives length-delimited and
+chunked uploads, downloads their blobs under current device authorization,
+refuses malformed/oversized input, and settles a delayed COMMIT without a
+second publication. A separate real HTTPS test proves an uncertain upload
+closes only its exchange without a final receipt and releases its body slot
+for another request. This does not qualify td-mail attachment composition or
+activate the production backend.

@@ -1103,6 +1103,9 @@ impl Https<'_> {
         }
         let time = self.clock.sample()?;
         match result {
+            // Retire only this exchange; no success or retryable failure can
+            // describe an unresolved publication. The backend retains its fence.
+            Ok(response) if response.is_uncertain() => Err(Error::Conflict),
             Ok(response) => self.respond_body(client, 200, time.utc_ms, response.bytes()?),
             Err(error) => {
                 let status = match error {

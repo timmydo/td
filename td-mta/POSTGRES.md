@@ -2954,3 +2954,24 @@ beside their existing SELECT permission. UPDATE and DELETE remain refused,
 including column-only UPDATE grants. Provisioning grants must match this
 roster before the runtime connection qualifies; no owner credential fallback
 is used for an upload.
+
+
+## 102. Prepared HTTPS upload receipt
+
+The prepared PostgreSQL HTTPS adapter receives length-delimited or chunked
+upload bytes on the fixed body worker. One ingress permit excludes another
+body or preparation on that pending owner; an uncertain upload refuses before
+100 Continue or body allocation. The original request meter prepays bounded
+ingress and response storage, charges wire/decoded input, and carries through
+preparation/publication. Body idle, transfer and original deadlines never
+extend each other. No SQL transaction spans peer input. Publication rechecks
+current device/profile policy before creating the lease and receipt.
+
+Known outcomes return the bounded upload JSON and admit authenticated raw
+blob download. An uncertain COMMIT returns an internal uncertain response
+whose bytes cannot be serialized. The HTTPS owner retires only that exchange
+without final success or temporary-failure output; the retained operation
+continues to fence uploads until settlement. Reads and the service remain
+available. SQLite confirmed responses retain their existing behavior.
+This remains prepared integration: production cutover, attachment composition,
+and resource/recovery activation are separate requirements.
