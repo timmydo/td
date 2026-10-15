@@ -2056,8 +2056,12 @@ product configuration is installed. Before the session bootstrap its
 outer process sets the existing `PR_SET_PDEATHSIG=SIGKILL` and then
 requires its direct parent, read from procfs, to be the named launcher:
 a new caller of an existing operation, binding the instance to its
-launcher as stage 1 is bound to td-jail. Stage 1 always selects the isolated
-unshare set and loopback, and maps the caller to itself. Its mount plan
+launcher as stage 1 is bound to td-jail. Stage 1 selects the existing shared-network unshare set for the optional
+`profile=development` spec, otherwise the isolated set and loopback. It
+checks the selected namespace identities and maps the caller to itself.
+Development uses the existing standard filter, including Unix sockets;
+reviews and maintenance retain the workspace filter. No syscall, operation
+or namespace flag set is added. Its mount plan
 is the compiled base plan, with `/tmp` and `/var/tmp` executable; the
 host's compiled system-tree list bound recursively read-only, `nosuid`
 and `nodev`, or recreated as the same link; a `/run` holding only a
@@ -2070,7 +2074,7 @@ at their real paths through the same grant bind and hardening loop,
 admission refuses a pseudo-filesystem mounted below any of them. Stage
 2 reads it all back, down to every scaffold directory's names and the
 absence of any unplanned mount, before it clears capabilities, then
-installs
+installs the selected profile's filter. For the isolated profile this is
 the second compiled program, `WORKSPACE_FILTER`: the standard filter but
 for its socket rules, which refuse `socket(2)` for `AF_UNIX` with
 `EPERM` and admit `socketpair(2)` only for `AF_UNIX` with `SOCK_STREAM`

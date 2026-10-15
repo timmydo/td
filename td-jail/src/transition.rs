@@ -424,6 +424,7 @@ pub enum Stage2Action {
 /// from `home` and `path` (`workspace::environment`).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Stage2Workspace {
+    development: bool,
     programs: Vec<String>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -6452,16 +6453,18 @@ pub fn launch_workspace(plan: WorkspacePlan) -> io::Result<()> {
     let token = random_token()?;
     let executable = std::env::current_exe()?;
     writeln!(io::stderr(), "{WORKSPACE_DEGRADATION}")?;
-    sys::unshare_namespaces(true).map_err(|error| {
+    sys::unshare_namespaces(!plan.development).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("the workspace kind requires namespace confinement: {error}"),
         )
     })?;
     install_launch_identity_maps(inside_identity, outside_identity, true)?;
-    NamespaceSnapshot::read()?.require_application_change(&before, true)?;
-    sys::bring_up_loopback()
-        .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+    NamespaceSnapshot::read()?.require_application_change(&before, !plan.development)?;
+    if !plan.development {
+        sys::bring_up_loopback()
+            .map_err(|e| io::Error::other(format!("bring up isolated loopback: {e}")))?;
+    }
     close_inherited_descriptors(None)?;
     prepare_workspace_mount_plan(&plan, inside_identity)?;
     prepare_capability_bridge()?;
@@ -6555,6 +6558,11 @@ fn stage2_workspace_arguments(
         OsString::from(identity_map.outside.uid.to_string()),
         OsString::from(identity_map.outside.gid.to_string()),
         OsString::from(STAGE2_WORKSPACE_ARG),
+        OsString::from(if plan.development {
+            "development"
+        } else {
+            "confined"
+        }),
         OsString::from(STAGE2_PROGRAMS_ARG),
         OsString::from(plan.programs.len().to_string()),
     ];
@@ -6633,6 +6641,11 @@ where
         let path = PathBuf::from(value.ok_or_else(usage_error)?);
         authority::validate_filesystem_target(&path)?;
         Ok(path)
+    };
+    let development = match args.next().as_deref().and_then(OsStr::to_str) {
+        Some("development") => true,
+        Some("confined") => false,
+        _ => return Err(usage_error()),
     };
     expect(STAGE2_PROGRAMS_ARG, args)?;
     let count = parse_count(args.next(), "program count")?;
@@ -6772,6 +6785,7 @@ where
     }
     expect(STAGE2_ARGUMENTS_ARG, args)?;
     let plan = Stage2Workspace {
+        development,
         programs,
         aliases,
         path,
@@ -7001,6 +7015,25 @@ fn prepare_workspace_etc(plan: &WorkspacePlan, identity: Identity) -> io::Result
             Ok(_) => {}
         }
     }
+    if plan.development {
+        let path = fs::canonicalize("/etc/resolv.conf")?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > 64 * 1024 {
+            return Err(io::Error::other(
+                "host resolver configuration is not a bounded regular file",
+            ));
+        }
+        mount_resolved_file(
+            &ResolvedFile {
+                path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                size: metadata.len(),
+            },
+            &etc.join("resolv.conf"),
+            "workspace resolver configuration",
+        )?;
+    }
     remount_read_only(etc_text, sys::MS_NOSUID | sys::MS_NODEV | sys::MS_NOEXEC)
 }
 
@@ -7134,6 +7167,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
     if let Some(stray) = etc.iter().find(|name| {
         !workspace::SYNTHESIZED_ETC.contains(&name.as_str())
             && !workspace::HOST_ETC.contains(&name.as_str())
+            && !(plan.development && name.as_str() == "resolv.conf")
     }) {
         return Err(io::Error::other(format!(
             "workspace /etc holds {stray}, which its plan does not"
@@ -7515,7 +7549,11 @@ fn run_stage2_workspace(
         return Err(io::Error::other("workspace stage 2 identity changed"));
     }
     clear_and_require_empty_capabilities()?;
-    install_workspace_seccomp_filter()?;
+    if plan.development {
+        install_standard_seccomp_filter(false)?;
+    } else {
+        install_workspace_seccomp_filter()?;
+    }
     sys::set_dumpable(false)?;
     if sys::dumpable()? {
         return Err(io::Error::other("workspace PID 1 remained dumpable"));
@@ -7555,6 +7593,7 @@ mod tests {
             source_kind: FilesystemSourceKind::Directory,
         };
         let plan = Stage2Workspace {
+            development: false,
             programs: vec!["a".into()],
             aliases: Vec::new(),
             path: Vec::new(),
@@ -7604,6 +7643,7 @@ mod tests {
             source_inode: 2,
         };
         let plan = WorkspacePlan {
+            development: false,
             uid: 1000,
             gid: 1000,
             programs: vec![
@@ -7728,11 +7768,11 @@ mod tests {
             "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --shared 0 --working-directory /h --arguments".into(),
         ] {
             assert!(
-                parse_stage2_workspace(&mut words(&bad).into_iter()).is_err(),
+                parse_stage2_workspace(&mut words(&format!("confined {bad}")).into_iter()).is_err(),
                 "{bad}"
             );
         }
-        let good = "--programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
+        let good = "confined --programs 1 a --path-aliases 0 --path 0 --home /h --worktrees 0 --repositories 0 --git-chain 0 --shared 0 --working-directory /h --arguments";
         assert!(parse_stage2_workspace(&mut words(good).into_iter()).is_ok());
     }
     use crate::authority::{

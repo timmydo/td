@@ -55,7 +55,7 @@ const FIELDS: &[(&str, &str, usize)] = &[
         SPARSE_BYTES,
     ),
     (
-        "Network: off, allowlist or open; empty takes your settings'",
+        "Web fetch: off, allowlist or open; commands use host networking",
         "off, allowlist or open",
         NETWORK_BYTES,
     ),
@@ -279,8 +279,8 @@ impl TemplateDialog {
             .map_or(0, |template| template.repos.len().saturating_sub(1));
         let explanation = match &editing {
             None => "Each conversation made from it works on a worktree of its own of the remote, on the branch, from the base, or in a scratch folder with no remote, and reaches the shared folders. Return saves, Tab moves, Escape cancels.".to_string(),
-            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it keep their worktrees, and their conversations take its network policy and shared folders at once."),
-            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it keep their worktrees, and their conversations take its network policy and shared folders at once.".to_string(),
+            Some(_) if more > 0 => format!("Save keeps the template in place of what it was; Remove removes it. Its other {more} repositories are kept as they are. Workspaces made from it keep their worktrees, and their conversations take its web-fetch policy and shared folders at once."),
+            Some(_) => "Save keeps the template in place of what it was; Remove removes it. Workspaces made from it keep their worktrees, and their conversations take its web-fetch policy and shared folders at once.".to_string(),
         };
         let mut dialog = Self {
             sparse_opened: texts[SPARSE].to_string(),

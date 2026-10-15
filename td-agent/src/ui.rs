@@ -1456,7 +1456,10 @@ impl App {
             rank: 1,
             kind: StatusKind::Mode,
         });
-        parts.push(part(format!("network {}", self.shown_network().name()), 2));
+        parts.push(part(
+            format!("network host; web {}", self.shown_network().name()),
+            2,
+        ));
         parts.push(StatusPart {
             text: format!("{model} {effort}"),
             rank: 3,
@@ -7114,7 +7117,7 @@ pub mod tests {
         let mut app = app();
         assert_eq!(
             app.status_line(),
-            "starting | mode ask | network off | m/default medium | ctx 0/200k | cost $0.0000 | no limits | 0 background"
+            "starting | mode ask | network host; web off | m/default medium | ctx 0/200k | cost $0.0000 | no limits | 0 background"
         );
         app.update(
             Update::Up(Up::Hello {
@@ -7136,7 +7139,7 @@ pub mod tests {
         );
         assert_eq!(
             app.status_line(),
-            "idle | 1 new message: C-S-m | mode ask | network off | m/default medium | ctx 0/200k \
+            "idle | 1 new message: C-S-m | mode ask | network host; web off | m/default medium | ctx 0/200k \
              | cost $0.0000 | today $0.2500 | credit $7.5000 | no limits | 0 background"
         );
         // Each total against its limit, where one is set.
@@ -7157,7 +7160,7 @@ pub mod tests {
         // The drawn row, narrower than the line, keeps the model whole,
         // its provider left off before anything is cut.
         assert!(
-            text(&app).contains("| network off | default medium"),
+            text(&app).contains("| network host; web off | default medium"),
             "{}",
             text(&app)
         );
@@ -10599,7 +10602,7 @@ pub mod tests {
                 "1 new message: C-S-m",
                 "workspace: C-S-w",
                 "mode auto, classifier without Jev",
-                "network off",
+                "network host; web off",
                 "m/default medium",
                 "ctx 0/200k",
                 "cost $0.0000",
@@ -10635,7 +10638,7 @@ pub mod tests {
             ("mode auto, classifier without Jev", Some("mode auto")),
             ("no key: F10", None),
             ("default", None),
-            ("network off", None),
+            ("network host; web off", None),
             ("mode auto", None),
         ] {
             step(&mut items, from, to);
@@ -12013,8 +12016,8 @@ pub mod tests {
         let mut app = app();
         let network = |app: &App| {
             let line = app.status_line();
-            let at = line.find("| network ").unwrap();
-            line.get(at + 10..)
+            let at = line.find("; web ").unwrap();
+            line.get(at + 6..)
                 .and_then(|rest| rest.split(' ').next())
                 .unwrap()
                 .to_string()

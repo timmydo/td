@@ -130,7 +130,7 @@ impl Bench {
 
     /// The instance `call`, logged as `started`, runs in: a fresh one, or
     /// the file tools', started when there is none.
-    pub fn take(&mut self, call: &Call, started: u64) -> Result<Client, String> {
+    pub fn take(&mut self, call: &Call, _started: u64) -> Result<Client, String> {
         if !fresh(call) {
             if let Some(files) = self.files.take() {
                 return Ok(files);
@@ -145,34 +145,10 @@ impl Bench {
             .policy
             .as_ref()
             .ok_or("the workspace is not prepared")?;
-        // Only a command's instance runs what would reach the network,
-        // and none under `off`, which gives it no proxy.
-        let off = self
-            .judge
-            .lock()
-            .map_or(true, |egress| egress.network == crate::config::Network::Off);
-        let linked = match call {
-            Call::Shell { .. } | Call::Background { .. } if !off => Some(crate::egress::Linked {
-                judge: std::sync::Arc::clone(&self.judge),
-                asker: self.asker.clone(),
-                call: started,
-            }),
-            // An MCP server's connections belong to no call: `started` is
-            // its start's owner (DESIGN.md §12, Its connections).
-            Call::Serve { .. } if !off => Some(crate::egress::Linked {
-                judge: std::sync::Arc::clone(&self.judge),
-                asker: self.asker.clone(),
-                call: started,
-            }),
-            _ => None,
-        };
-        jail::launch_linked(programs, policy, specs, linked)
+        jail::launch(programs, policy, specs)
     }
 
-    /// The network a command's instance is given: `network`, the
-    /// allowlist it is judged by, and the relay it goes out through; `off`
-    /// gives no proxy to the next, and refuses a running one's next
-    /// connection.
+    /// The web-fetch policy; command and MCP networking is host networking.
     pub fn set_network(
         &mut self,
         network: crate::config::Network,
@@ -203,12 +179,10 @@ impl Bench {
             .as_ref()
             .map(|(shared, prepared, _, _)| (shared.clone(), prepared.clone()))
             .unwrap_or_default();
-        let (network, allowlist) = self.network();
-        (shared, prepared, network, allowlist)
+        (shared, prepared)
     }
 
-    /// The network commands are given and the allowlist, as the
-    /// classifier is told them.
+    /// The web-fetch policy and allowlist supplied to its classifier.
     pub fn network(&self) -> (crate::config::Network, Vec<crate::config::Destination>) {
         self.judge.lock().map_or_else(
             |_| (crate::config::Network::Off, Vec::new()),
@@ -360,6 +334,16 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::store::Call as Asked;
+
+    #[test]
+    fn web_fetch_settings_do_not_restart_servers() {
+        let mut bench = Bench::default();
+        let launch = bench.launch();
+        bench.set_network(crate::config::Network::Open, Vec::new(), None);
+        assert_eq!(launch, bench.launch());
+        bench.set_network(crate::config::Network::Off, Vec::new(), None);
+        assert_eq!(launch, bench.launch());
+    }
 
     #[test]
     fn a_write_carries_the_digest_of_the_last_read() {

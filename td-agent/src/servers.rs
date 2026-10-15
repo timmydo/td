@@ -331,13 +331,8 @@ pub fn serve<T: Ending>(
 }
 
 /// What a server's instance was launched with, which a change of
-/// restarts it: the workspace's mounts and network policy.
-pub type Launch = (
-    Vec<crate::workspace::Shared>,
-    Vec<std::path::PathBuf>,
-    crate::config::Network,
-    Vec<crate::config::Destination>,
-);
+/// restarts it: the workspace's mounts.
+pub type Launch = (Vec<crate::workspace::Shared>, Vec<std::path::PathBuf>);
 
 /// A server the main thread started.
 pub struct Running {
@@ -417,7 +412,7 @@ pub struct Servers {
 
 impl Servers {
     /// Ends every server not in `wanted`, changed there, or launched with
-    /// other mounts or network policy than `launch`: the servers to
+    /// other mounts than `launch`: the servers to
     /// start, those of `wanted` not running, but for one that failed when
     /// it has started again `MAX_RESTARTS` times after a failure, which
     /// this start counts. One changed, or launched otherwise, since it
@@ -1005,12 +1000,7 @@ mod tests {
 
     fn launch(prepared: usize) -> Launch {
         let path = std::path::PathBuf::from(format!("/r{prepared}"));
-        (
-            Vec::new(),
-            vec![path],
-            crate::config::Network::Off,
-            Vec::new(),
-        )
+        (Vec::new(), vec![path])
     }
 
     #[test]

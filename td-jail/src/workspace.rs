@@ -164,6 +164,7 @@ impl Program {
 /// An admitted spec: what `transition::launch_workspace` performs.
 #[derive(Debug)]
 pub(crate) struct WorkspacePlan {
+    pub(crate) development: bool,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     /// The first program, which is the entry.
@@ -236,6 +237,7 @@ pub(crate) fn is_workspace_argument(argument: &OsStr) -> bool {
 /// The spec as written, before admission.
 #[derive(Debug, Default, Eq, PartialEq)]
 struct Spec {
+    development: bool,
     programs: Vec<PathBuf>,
     aliases: Vec<crate::host_path::Alias>,
     path: Vec<PathBuf>,
@@ -251,10 +253,16 @@ struct Spec {
 /// and `path` directories, one `home`, then any `worktree`, `checkout`,
 /// `repository`, `read` and `write` lines, each group in that order.
 fn parse_spec(text: &str) -> io::Result<Spec> {
-    let mut lines = text.lines();
+    let mut lines = text.lines().peekable();
     if lines.next() != Some(FORMAT_LINE) {
         return Err(invalid("workspace spec does not begin with format=1"));
     }
+    let development = if lines.peek() == Some(&"profile=development") {
+        lines.next();
+        true
+    } else {
+        false
+    };
     const ORDER: &[&str] = &[
         "entry",
         "program",
@@ -267,7 +275,10 @@ fn parse_spec(text: &str) -> io::Result<Spec> {
         "read",
         "write",
     ];
-    let mut spec = Spec::default();
+    let mut spec = Spec {
+        development,
+        ..Spec::default()
+    };
     let mut last = 0usize;
     let mut home = None;
     let mut entry = false;
@@ -654,6 +665,7 @@ fn admit(
         }
     }
     Ok(WorkspacePlan {
+        development: spec.development,
         uid,
         gid,
         programs,
@@ -1094,6 +1106,27 @@ mod tests {
     }
 
     #[test]
+    fn development_profile_is_explicit_and_cannot_be_repeated_or_reordered() {
+        assert!(
+            !parse_spec("format=1\nentry=/a\nhome=/h\n")
+                .unwrap()
+                .development
+        );
+        assert!(
+            parse_spec("format=1\nprofile=development\nentry=/a\nhome=/h\n")
+                .unwrap()
+                .development
+        );
+        for text in [
+            "format=1\nprofile=host\nentry=/a\nhome=/h\n",
+            "format=1\nprofile=development\nprofile=development\nentry=/a\nhome=/h\n",
+            "format=1\nentry=/a\nprofile=development\nhome=/h\n",
+        ] {
+            assert!(parse_spec(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn the_spec_is_an_exact_ordered_keyfile() {
         let spec = parse_spec(
             "format=1\nentry=/w/bin/td-agent\nprogram=/w/bin/td-txt\nhome=/s/home\n\
@@ -1243,6 +1276,7 @@ mod tests {
         symlink(&tree, base.join("link")).unwrap();
         let real_home = &[PathBuf::from("/nonexistent-td-jail-home")];
         let spec = |programs: &[&Path], home: &Path, worktrees: &[&Path], read: &[&Path]| Spec {
+            development: false,
             programs: programs.iter().map(|path| path.to_path_buf()).collect(),
             aliases: Vec::new(),
             path: Vec::new(),

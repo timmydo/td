@@ -84,27 +84,17 @@ fn network(place: &Place) -> String {
     if place.removed {
         return String::new();
     }
-    let proxy = "through td-agent's proxy, which the proxy environment variables (http_proxy, https_proxy, all_proxy) name: programs that use them, such as git, cargo, pip and curl, reach it, and others reach nothing";
-    let rest = "A plain http request is carried alone on its connection and must state its body's length; https and other protocols go through CONNECT. The person's rules may refuse a destination or ask about it, and a refusal comes back as the proxy's 403 with td-agent's reason";
-    match place.network {
-        crate::config::Network::Off => {
-            "\n- Network: off. Nothing a command runs reaches the network; there is no proxy.".into()
-        }
-        crate::config::Network::Allowlist => {
-            let list: Vec<String> = place.allowlist.iter().map(|d| d.text()).collect();
-            let list = if list.is_empty() {
-                "none".to_string()
-            } else {
-                list.join(", ")
-            };
-            format!(
-                "\n- Network: allowlist. A command reaches the network only {proxy}. It opens these destinations, port 443 unless named: {list}. A connection elsewhere waits while the person decides, and may be refused. {rest}."
-            )
-        }
-        crate::config::Network::Open => format!(
-            "\n- Network: open. A command reaches any public destination {proxy}; this machine's own addresses and its local networks are refused. {rest}."
-        ),
-    }
+    let list = place
+        .allowlist
+        .iter()
+        .map(|d| d.text())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n- Network: host. Commands share this machine's network, including localhost, LAN, internet and Unix sockets reachable through granted paths. No proxy or destination approval applies to commands. The web_fetch tool separately uses {} policy; its configured destinations are: {}.",
+        place.network.name(),
+        if list.is_empty() { "none" } else { &list },
+    )
 }
 
 /// The prefix a conversation begun at `created` begins with: a JSON
@@ -983,30 +973,20 @@ mod tests {
             allowlist: &allowlist,
             system: false,
         };
-        let block = environment(0, "td", Some(&place));
-        assert!(
-            block.contains(
-                "- Network: allowlist. A command reaches the network only through td-agent's proxy"
-            ),
-            "{block}"
-        );
-        assert!(
-            block.contains("port 443 unless named: static.crates.io, code.example.org:8443. A connection elsewhere waits while the person decides"),
-            "{block}"
-        );
-        place.network = crate::config::Network::Open;
-        let block = environment(0, "td", Some(&place));
-        assert!(
-            block.contains("- Network: open. A command reaches any public destination"),
-            "{block}"
-        );
-        assert!(!block.contains("static.crates.io"), "{block}");
-        place.network = crate::config::Network::Off;
-        let block = environment(0, "td", Some(&place));
-        assert!(
-            block.contains("- Network: off. Nothing a command runs reaches the network"),
-            "{block}"
-        );
+        for policy in [
+            crate::config::Network::Allowlist,
+            crate::config::Network::Open,
+            crate::config::Network::Off,
+        ] {
+            place.network = policy;
+            let block = environment(0, "td", Some(&place));
+            assert!(block.contains("- Network: host."), "{block}");
+            assert!(
+                block.contains("No proxy or destination approval applies to commands"),
+                "{block}"
+            );
+            assert!(block.contains("web_fetch tool separately uses"), "{block}");
+        }
         place.removed = true;
         assert!(!environment(0, "td", Some(&place)).contains("- Network:"));
         assert!(!environment(0, "td", None).contains("- Network:"));

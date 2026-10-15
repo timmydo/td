@@ -39,10 +39,8 @@ with its calibrated threshold, the circuit breaker and the trust mark
 compaction, by hand and past `compact_at`, and the card that asks how to
 resume a conversation whose cache has gone cold (§14). Increment 14,
 the push and fetch tools, is built; increment 15, the network, is
-built, so a workspace's commands reach its allowlist, or anywhere under
-`open`, through its proxy and the egress relay, and a destination off
-the allowlist waits on the person's card in `ask`, and on the
-classifier in `auto` (§10, §11). Where building
+built. Development commands now share host networking; `network` controls
+only `web_fetch` (§10, §11). Where building
 an increment settled a point the design left open, the section says so
 under "As built". The `td-agent` recipe builds it for the image (§17).
 The decisions below that
@@ -126,8 +124,7 @@ MCP client (planned, §12, MCP servers: servers are commands in the jail,
 never loaded into td-agent), web search, a provider dialect other than
 OpenAI Chat Completions, pictures other than the PNG and JPEG the person
 pastes or an MCP tool returns (§6, Pictures: a reply's pictures are a
-later increment), plugins, and any socket listening outside a jail's own
-loopback.
+later increment), and plugins.
 
 ## 2. Processes and trust
 
@@ -144,7 +141,7 @@ loopback.
                 v
   +----------------------------------+
   | td-agent conversation <id>       |--> fetchd -----> model provider
-  |  loop, model client, log writer, |--> egress -----> permitted hosts
+  |  loop, model client, log writer, |
   |  approval engine                 |
   +----------------------------------+
                 | one framed pipe per jail instance
@@ -153,7 +150,7 @@ loopback.
   | td-jail instance, workspace      |
   |  tool host -> sh, td-txt, git    |
   |  worktrees rw, git pointers ro,  |
-  |  system ro, loopback proxy only  |
+  |  system ro, host networking     |
   +----------------------------------+
 ```
 
@@ -175,8 +172,7 @@ There are four parties, and the design is the separation between them:
 2. **The tool host** is the same binary under the `tool-host` personality,
    started inside a jail instance. It performs every tool effect, file
    reads and edits as well as shell commands, local commits and the
-   instruction reads of §13, and serves the in-jail end of the network
-   proxy (§10). Path confinement is therefore the jail's mount namespace,
+   instruction reads of §13. Path confinement is therefore the jail's mount namespace,
    not path-string checks in the harness, and td-agent needs no `unsafe`
    and no new UNSAFE.md surface. It speaks a bounded, length-framed,
    multiplexed protocol over the pipe the agent holds. **Every reply the
@@ -189,21 +185,17 @@ There are four parties, and the design is the separation between them:
    network destination decided under §11 and fetched with the request's
    `public` line, so it reaches no private, local or own address. No
    jail instance is ever given its socket.
-4. **The egress relay**, a td-net applet beside fetchd, carries a jail's
-   permitted network traffic (§10). td-agent decides each destination; the
-   relay refuses loopback, link-local, private and the machine's own
-   addresses whatever it is told, a stricter predicate than fetchd's.
+4. **The egress relay** remains available for isolated protocol fixtures.
+   Ordinary development instances do not use it.
 
-The combination to avoid is the "lethal trifecta": private data, untrusted
-content, and a channel to an attacker-chosen destination. The provider
-receives workspace content by design; that is the product. What must not
-exist is a channel whose destination the model or the content picks
-without a decision of §11. The key never enters a prompt, a transcript, the
-classifier's input or a jail. A jail holds the workspace and untrusted
-content, and its only way out is the proxy, whose every destination is a
-standing decision of the human's or decided under §11 when asked for.
-Publication with the human's credentials happens only through the git
-worker's push, bound to a commit the human or classifier approved.
+The provider receives workspace content by design. Development commands
+also have unrestricted host-network destinations: approved commands can send
+workspace content anywhere they can connect, and reach local services that
+may exercise host authority. The filesystem boundary protects direct path
+access, not authority exposed by those services. The agent's API key is not
+mounted in the workspace or supplied in its environment. The trusted Git
+worker offers publication bound to an approved commit, but shared networking
+does not promise that it is the only possible publication channel.
 
 **The review command** is `td-agent review --commit REV
 [--model opus-latest|gpt-sol-latest]`, invoked from the change's local
@@ -3677,23 +3669,9 @@ Every instance has:
   jail directory. The caller's home is absent except through the
   worktrees and shared directories, so `~/.ssh`, keyrings and the agent's
   own state are invisible, not merely unwritable.
-- **Network:** a network namespace with loopback alone. The tool host
-  listens there for the proxy of §10 when the workspace's policy is not
-  `off`; that listener is inside the instance's own namespace, and
-  nothing else leaves.
-- **Unix sockets:** a seccomp policy that refuses `socket(AF_UNIX, ...)`
-  and admits `socketpair(AF_UNIX, ...)` for `SOCK_STREAM` and
-  `SOCK_SEQPACKET` alone, the type compared with `SOCK_NONBLOCK` and
-  `SOCK_CLOEXEC` masked off; Rust's `Command::spawn` makes a
-  sequenced-packet pair for every child, and a connected one cannot
-  address another socket. A network
-  namespace does not separate pathname Unix sockets, so without that
-  refusal a socket a host service publishes in a worktree or shared
-  directory would be a way out; and a datagram pair could still address
-  one with `sendto`, which a connected stream pair cannot. td-jail's
-  current filter admits `AF_UNIX`, so this is a variant of it for the
-  `workspace` kind. The cost is that a program needing its own Unix
-  listener fails in the jail.
+- **Network:** ordinary development shares host networking (§10). Review and
+  maintenance instances retain isolated loopback. Development permits Unix
+  sockets; reaching host services is an intentional part of its authority.
 - **Limits:** none in the first increments; the instance is placed
   under its conversation, on a host as a descendant of its conversation
   process, where later limits attach (below).
@@ -3701,8 +3679,7 @@ Every instance has:
   namespaces (td today does not, APPLICATIONS.md §0); no new privileges.
 - **Inheritance:** no descriptor but the instance's pipe, no runtime
   directory, and an environment scrubbed to `PATH`, `HOME`, `TMPDIR`,
-  `LANG`, `TERM=dumb` and, when the policy is not `off`, the proxy
-  variables of §10. `PATH` begins with the host's own `PATH`
+  `LANG` and `TERM=dumb`. `PATH` begins with the host's own `PATH`
   directories as they resolve, those inside a system tree the instance
   binds, each once and at most 16 (`jail::system_path`, td-jail's
   `path` spec key); the admitted read-only programs follow, then td-jail's
@@ -4728,275 +4705,40 @@ they use a local repository as any build does.
 
 ## 10. Network policy
 
-A workspace has one of three network policies, shown in the status row:
+Development commands share the host network namespace. Shell, grep, sed,
+file-tool instances and MCP servers use the `profile=development` workspace
+spec. TCP, UDP, localhost, LAN connections and Unix sockets reachable through
+admitted filesystem paths are available without a proxy or destination
+approval. The launcher binds the host's resolved `/etc/resolv.conf` read-only.
+No privileged helper, host networking setup or cgroup delegation is required.
 
-- `off`: no proxy, no proxy variables; nothing leaves the jail.
-- `allowlist` (the default): the proxy admits destinations, each a host
-  and port (443 when unspecified), on the workspace's allowlist, which
-  starts from `network_allowlist` in configuration. The shipped default
-  names only download hosts: `static.crates.io`, `index.crates.io`,
-  `static.rust-lang.org`, `pypi.org` (whose uploads go to
-  `upload.pypi.org`), `files.pythonhosted.org`, `codeload.github.com`,
-  `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
-  `proxy.golang.org` and `sum.golang.org`. Hosts that also accept uploads
-  with a token (`github.com`, `crates.io`, `registry.npmjs.org`) are not in
-  it, because an injected token would make any of them a publication
-  channel outside `git_push`; so `npm install`, for one, fails by default
-  until the human admits its registry. Another
-  destination is a crossing (§11): the connection waits while it is
-  decided, and an "always allow" answer writes `allow network
-  HOST[:PORT]` under the workspace's header in the human's rules, which
-  opens it as the allowlist would.
-- `open`: any destination the relay will reach. Only the human sets it,
-  in a template: one in the configuration, or one made in the window,
-  whose network the window's own keyboard or pointer alone sets (§7).
+This is filesystem and process confinement, not network isolation. A host
+service reachable through loopback, an abstract Unix socket or an admitted
+pathname socket may provide authority beyond the filesystem grants. Commands
+may transmit workspace contents. Shell/MCP tool approval still decides whether
+the operation runs; network rules do not inspect its subsequent connections.
 
-An allowlisted host is a standing decision by the human, and one that
-accepts uploads remains a possible channel out; the card that adds one
-says whether it does.
+The `network`, template `network`, `network_allowlist` and `network` rules
+now apply only to `web_fetch`, whose requests use the fetch service. Its
+`off`, `allowlist` and `open` meanings remain unchanged: off refuses the tool,
+allowlist decides unlisted destinations through the approval engine, and open
+admits public destinations. The fetch service still refuses private and host
+addresses. The status row labels these settings `web`; the template dialog
+labels them `Web fetch`. The model's environment explicitly distinguishes
+host networking for commands from the web-fetch policy.
 
-**Mechanism.** Inside an instance whose policy is not `off`, the tool
-host listens on `127.0.0.1` in the instance's own network namespace and
-speaks HTTP `CONNECT` and plain-HTTP proxying there. The environment
-carries `https_proxy`, `http_proxy` and `all_proxy` naming it, in both
-lower and upper case, and `no_proxy=localhost,127.0.0.1,::1`; a `CONNECT`
-to a loopback name is refused by the tool host itself. Each accepted
-connection is a channel of the instance's existing pipe to td-agent, which
-checks the destination against the policy, decides or asks per §11, and
-opens it through the egress relay. The jail therefore needs no Unix socket
-and no route. Only the listed host and port are reached, so SSH or another
-protocol tunnelled through `CONNECT` reaches only a host the human
-admitted on a port the human admitted; a program that ignores the proxy
-variables reaches nothing. Names are resolved by the relay, not in the
-jail.
+Review and Git maintenance instances retain their isolated network namespace
+and stricter workspace socket filter. They never select the development
+profile. The low-level proxy protocol remains available to isolated diagnostic
+fixtures; ordinary workspace execution no longer starts or connects a proxy.
 
-**The egress relay** is a new td-net applet beside fetchd, served by the
-installed launch on a development host and as a unit on td. It takes a host
-and port from td-agent over its socket, resolves, and refuses loopback,
-link-local, unspecified, broadcast, multicast, RFC 1918, unique-local and
-carrier-grade NAT addresses, and the machine's own addresses, read from
-`/proc/net` without any new `unsafe`, after decoding IPv4-mapped,
-IPv4-compatible, NAT64 (both the well-known and the local-use prefix),
-6to4 and Teredo forms to the IPv4 address they carry; fetchd today refuses only
-the first five of those (APPLICATIONS.md §W.8), so this predicate is new
-and tested on its own. It then connects and splices bytes, under
-per-connection deadlines, and holds no other policy; the policy is
-td-agent's. With
-fetchd it is where td-agent's traffic leaves, the git worker's transports
-(§9) being the other way out, and its landing amends APPLICATIONS.md §W.8
-with a destination-carrying sibling. It sees only ciphertext for TLS
-destinations, so policy is by host name, as in Claude Code's and Codex's
-proxies, and a host that fronts other domains is a residual risk.
-
-As built (the policy): `config::Network` and `config::Destination`.
-`network` is `off` or `allowlist`; `open` there is refused, being a
-template's alone. `network_allowlist` is at most 256 hosts, each
-a DNS name (lower-cased, a trailing dot dropped, its last label not a
-number, decimal or `0x` hexadecimal, as the relay's hosts are, APPLICATIONS.md
-§W.8 item 6) or an IPv4 address or an IPv6 one in brackets, with an
-optional port of one to five digits, each once; no wildcard. A template's `network` is any of the three.
-The window hands both keys and each template's own policy to every
-conversation in the setup frame, beside the shared directories, and
-`Client::network_for` gives a workspace its policy as `shared_for`
-gives its directories: its template's, else `network`, and `off` when
-its template is no longer configured, so removing or renaming one
-never widens what its conversations reach. A template made in the
-window names one when the person gave it one in the dialog (§7), and
-that file's `network` key is any of the three. Since a workspace's
-policy follows its template's name, a template is made, changed or
-renamed only by the person: the dialog saves only when the window's
-own keyboard or pointer presses Save, and never once any of its input
-came through the control seam (`TemplateDialog::driven`), saying so;
-the seam may open it and remove a template, which only narrows. The status row's `network` item
-says the open conversation's workspace's, `off` for a conversation with
-no workspace, and `network`'s with none open.
-
-As built (the proxy). A conversation hands its `Bench` the workspace's
-`egress::Egress` (its policy, the allowlist and the relay's socket,
-`td-egress/socket` under `XDG_RUNTIME_DIR` when it is there) each time
-it works out its prefix; `off` gives none. Only a `shell` call's or a
-background process's fresh instance is given it: td-jail starts that
-tool host with `--proxy`, and the tool host binds `127.0.0.1:3128`
-(`proxy::PORT`) before it serves a call, failing whole if it cannot,
-and sets each command's `http_proxy`, `https_proxy` and `all_proxy`,
-both cases, to `http://127.0.0.1:3128` and `no_proxy`/`NO_PROXY` to
-`localhost,127.0.0.1,::1`. The file tools' instance, and every instance
-of an `off` workspace, has no proxy and no variables.
-
-The proxy (`src/proxy.rs`) reads a request head of at most 16 KiB
-within 30 seconds: `CONNECT host:port` for a tunnel, or an absolute
-`http://` URL; any other form is answered 400, HTTP/2 505, and a
-loopback or unspecified host, `localhost` and `*.localhost` included,
-403 before anything goes up. A plain request's connection carries that
-request alone, so a later one on it never reaches the first one's
-destination with its own headers: the request line becomes the path,
-the `Host` header the URL's authority, the `Proxy-`, `Connection` and
-`Keep-Alive` headers are dropped and `Connection: close` added, and
-the body is carried as far as its `Content-Length` says and no
-further, what follows it read only to see the client end; a body of no
-stated length (`Transfer-Encoding`) is refused 501, so a chunked upload
-over plain `http://` (a large push to an http remote) does not go, and
-two lengths, a folded header line or a header name with space in it are
-refused 400. A client that wants a second request opens a second
-connection, as clients do when a response says `close`. Each connection is then a link
-(`host::Link`) over the instance's pipe: `Open` up with the host and
-port as the client gave them, then `Opened` or `Refused` down, then
-`Bytes` either way, at most 32 KiB each and sent as a binary frame (a
-zero byte, a kind byte, the link's id, the bytes) beside the calls'
-JSON ones, `Took` either way as bytes are delivered, and `Shut`. Each
-direction sends at most 256 KiB past the other end's `Took`
-(`host::Credit`), so a slow reader holds its own link and never the
-pipe; td-agent shuts a link whose tool host sends past it. A tool host
-holds at most 32 links, each until both its directions have ended,
-the client's end waking the side that waits on td-agent; a link waits
-at most 30 minutes to be opened, and a refused one is answered 403 with
-td-agent's reason, which a client shows (git: `remote: td-agent:
-other.test:80 is not on this workspace's allowlist`). When its input
-ends, the tool host stops the proxy, which sends nothing more and
-lets go of every link, so the host finishes.
-
-td-agent's side (`src/egress.rs`) is fed by the client's reader thread,
-so a link's frames never wait on the conversation, and writes down
-through the one writer the calls use, `egress::Pipe`: each frame is
-written whole within 30 seconds however slowly the tool host reads (the
-jailed pipe's writes return each second to look at the deadline); once
-one fails every later one, a call's or a cancel's included, fails at
-once; and a call's or a cancel's frame goes before any link's waiting,
-so it waits at most for the one frame being written, 30 seconds, and
-then its own, a minute at worst; a link's frame kept waiting by calls
-past its 30 seconds breaks the pipe, as a slow one does, rather than
-being dropped and its link left waiting on it. A tool host that
-stops reading costs the conversation a failed instance and never a held
-thread. (An unjailed tool host's pipe, the development path, has no
-write timeout, so a frame's deadline is looked at only between writes.) It takes every `Open` frame
-as the jail's: ids must rise, so none is reused; it judges the
-destination on the reader thread, so a refusal costs no thread: `open`
-admits any host, `allowlist` a host and port on the workspace's list,
-compared after the configuration's normalization (case, a trailing dot,
-IPv6 brackets), and either refuses what is not a host; and at most 40
-links hold a thread, the proxy's 32 and room for threads still
-finishing links that ended, each counted until its thread ends however
-its link ended, so opening and shutting links at any pace holds no more. A
-link's sender lives only in its place, so giving the place up ends the
-thread writing to the relay. A refusal's reason is cut to the 1 KiB a
-`Refused` frame carries. An admitted
-link is opened through the relay, `connect HOST PORT`, an IPv6 host in
-brackets; the relay's refusal comes back as the link's reason, and with
-no relay socket every link is refused saying td-agent was not launched
-by td-net.
-
-As built (crossings). The conversation's `egress::Egress` is one
-judge for every instance it launches, held by its `Bench` and changed
-in place when the settings come, when the workspace's policy is worked
-out for a turn and when the human's rules change, so a running
-background process's next
-connection is judged by the current policy and rules; an instance
-launched under `off` has no proxy, and one whose policy becomes `off`
-has its next connection refused. A connection is judged on the client's
-reader thread, in §11's order: under `off` none; a network deny, the
-human's or a repository's, refuses it, even to a destination the
-allowlist or `open` admits; a network ask, or a rules file not read,
-asks, offering no "always allow"; one of the human's network allows
-opens it; then `open` opens any destination, `allowlist` one on the
-list, and the rest ask. A connection that asks waits in its `Links`,
-holding no thread, at most 40 to an instance and 64 destinations asked
-about over an instance's life, past which it is refused; the
-conversation is told, with the call whose command made it, through its
-inbox, which every wait of the conversation's reads, in a turn, a card,
-a stream or idle, so a connection is put before the person within a
-tenth of a second while a command runs, and at once otherwise. The
-conversation judges it again by the policy as it is then, a rule's
-answer opening or refusing it without a card, and asks only of one
-that still waits. Connections waiting on one destination share one
-card, whatever command's instance made them (an MCP server's have cards
-of their own, §12, Its connections), its id past any call's, at most 8
-cards at once, past which a connection is refused: `Let a command
-connect to HOST:PORT?`, the calls whose commands ask (`shell #N`), why
-it is asked, and what each answer does, the card put again as more
-commands join it. Its "always" answers are `network HOST[:PORT]`
-rules, the window writing them as it writes a tool call's, a deny here
-or everywhere and an allow here; with the human's rules unread it
-offers none. The person's answer opens or refuses every connection
-waiting on that card, and holds for the rest of each instance that
-asked, a background process's included, where the allowlist alone
-would ask, so a command's retries ask once and a rule still decides;
-the next command asks again; an allow the policy now refuses is
-refused, a deny winning whenever it comes. A rule's answer is kept for
-no connection but the one it decides. A changed policy judges each
-waiting card again: one a rule now refuses or opens is taken back and
-its connections given that, and one still asked of is put again when
-why it asks or what it offers changed. The conversation takes the
-connections an answer settles out of waiting itself, so nothing it
-hears afterwards finds them waiting; what the answer sends down to a
-tool host is sent from a thread of its own, so the conversation never
-waits on one that has stopped reading. A connection that ends while it
-waits, its client leaving the proxy (looked for each second) or its
-instance ending, is said gone, and a card none waits on any longer is
-taken back. Each card's outcome is logged as an approval of each call
-whose command made one of its connections, `by` `human`, `rule` or,
-when taken back as gone or refused past the cards' bound, `td-agent`,
-its reason naming the destination; they are logged between calls or
-while the conversation is idle, never inside a request.
-
-In `auto` (not braked), a destination the allowlist alone asks about,
-no rule asking, goes to the classifier, §11's table's row, before any
-card: its card is made but held back, and asked of at the next point
-the conversation waits within a turn, between its steps, in a
-foreground command's wait or in `process_wait`, the command's time
-running meanwhile as it does while the person answers (the tool host
-keeps its own deadline). Interrupted, it is not asked. Asked, it is
-judged again first, a rule's answer settling it, and out of `auto`
-now, a rule asking, or a call whose command cannot be read, put to the
-person. The verdict is on the commands that asked when it was asked:
-one that joins the card meanwhile has it asked of again with the rest. The classifier is told
-the action `network`, its `destination`, this conversation as the
-source, the policy's `network` and `allowlist` beside the mode and
-rules, and the commands that asked, whole, each headed by its call, untrusted
-(the destination, which a command chose, is the agent's too); Jev's
-`discloses` asks whether the command sends the workspace's content
-there rather than fetching. Its allow opens the connections and holds
-for the rest of each command, as the person's does, logged `by`
-`classifier` with its probabilities; anything else puts the card to the
-person with Jev's probabilities and why, the verdict logged first and
-counted by the breaker. A verdict is logged once, at the first call
-whose command asked, naming the others, so the breaker counts
-verdicts. A held-back card goes to the person at once when no turn
-runs, the conversation idle, there being no turn to ask in, and while
-the turn waits on the person's answer to another card or to resuming
-cold; a card made while a model's reply streams waits for the next
-step. A conversation's system prompt names the policy, the
-allowlist under `allowlist`, and that a connection elsewhere waits on
-the person and may be refused.
-
-What remains of this as built: a background process's link frames
-share its reply queue's reader with its output, so a conversation that
-stops draining a background process's output stalls that process's
-network too; a link's frames share the tool host's outbox with a call's
-live output, which is dropped when the outbox is full, so heavy network
-traffic thins a running command's live output (its kept output is
-whole); a background process started under `off` has no proxy, so
-widening the policy reaches its next command and not one already
-running; the relay is one pool for every conversation, 64
-connections at once, which one workspace's links, 32 to an instance,
-can fill for as long as they are used; and the allowlist bounds the
-connection's destination, not the origin a shared front serves, which
-a tunnel's TLS names in its SNI (a plain request's `Host` is its URL's);
-and a link has no half-close, so a client that shuts its sending side
-to say it is done ends the link, its answer with it: a tunnel's, and a
-plain request's too, whose client's end is read for so that one that
-leaves frees its place; and a client that sent bytes past its head and
-then left while its link waits for the person is not seen to have left
-until the link's 30 minutes pass, what it sent standing in the way.
-
-As built (the relay): `td-egressd` (net/src/egress.rs) and
-APPLICATIONS.md §W.8 item 6, which states its protocol, deadlines and
-predicate. `td-net launch` serves it for td-agent alone, at
-`td-egress/socket` under the runtime directory it gives td-agent. On td
-the `egressd` unit runs it as td's account, at
-`/run/user/1000/td-egress/socket`, after `netup` as the fetch service
-is, from the `/bin/td-egressd` link to the shipped td-net. td-agent's
-links reach it
-(As built (the proxy)).
+The live `td-jail/tests/development_launch.rs` fixture connects from an
+instance to a real host-loopback listener, compares network namespace identity,
+opens Unix stream and datagram sockets, checks read-only resolver configuration,
+and proves an ungranted host file is absent. Run it with `TMPDIR` under the
+worktree's `.td-build-cache/agent-scratch/` and `--ignored`; its owned TempDir
+reclaims the fixture. Existing isolated-profile tests retain their socket and
+network-isolation assertions.
 
 ## 11. Approval
 
@@ -5011,14 +4753,13 @@ flag lets injected text lower its own bar.
 | history of its own conversation; `conversations` | run | run |
 | file edits, sed, shell (background and local commits included) inside the jail | human | run |
 | an MCP server's tool (§12, MCP servers), whatever it claims of itself | human | run |
-| an MCP server's connection its policy and rules would ask about (§12) | human | human |
 | reading or messaging another conversation (§3) | human | classifier |
 | `schedule` | human | human |
 | `schedules`, `cancel_schedule` of the schedules delivering to it | run | run |
 | `skill`, the person's own files | run | run |
 | `system_status`, where the template turns the system view on | run | run |
-| network to a destination on the workspace allowlist, a command's or `web_fetch`'s | run | run |
-| network to another destination, policy `allowlist`, a command's or `web_fetch`'s | human | classifier |
+| `web_fetch` to a destination on its allowlist | run | run |
+| `web_fetch` to another destination, policy `allowlist` | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
 | git_push to a protected branch, forced, or a scan match | human | human |
 | `request_directory`, read-only | human | classifier |
@@ -5733,8 +5474,8 @@ counts them. They end when killed, when their conversation is archived
 or deleted, or when their conversation process exits; none survives
 td-agent, and on restart the log records each still running as lost. A
 background process keeps its conversation process running (§2). Each
-instance has its own network namespace, so a server one call starts is
-not reachable from a later call's instance; §19 records that.
+instance shares host networking, so later calls and host programs can
+reach a background server through localhost while its job remains alive.
 
 **As built (increment 12, lifetime).** `shell` takes `background`; with
 it the call is `host::Call::Background`, its `timeout_ms` from 1 ms to
@@ -5914,14 +5655,13 @@ on no socket and uses no other transport. A server is a command in the
 jail, never loaded into td-agent: td-agent is no plugin host (§1).
 
 *Where they run.* Each server runs in a jail instance of its own, a
-`workspace` instance with the workspace's mounts, policy and proxy
+`workspace` instance with the workspace's mounts and host networking
 exactly as a background `shell`'s (§8, §10), so what it reads, writes
 and reaches is what the model's own commands could. Its program is
 whatever the jail can run: one the jail's `PATH` finds or one a worktree
 or shared directory holds, never a td artifact and never outside the
 jail. Package runners that fetch and run code at start (`npx`, `uvx`)
-fail under the jail's `noexec` home (§8) whatever the network, and npm's
-registry is off the default allowlist (§10). The template is the
+fail under the jail's `noexec` home (§8) until the executable-home increment (§8). The template is the
 person's standing decision to run `command` there, as `system` is the
 person's decision to give the system view: no card asks at a start. What
 the program runs is workspace content the model can change, so a server
@@ -5939,8 +5679,7 @@ output comes back as raw bytes and its standard error as text, each
 waiting for room as a background call's output does, never dropped, and
 td-agent keeps the last 2 KiB of the standard error from what arrives,
 so a server torn down for a hang still has its tail. Its environment is
-a command's (§12, `shell`), proxy variables included where the policy
-has a proxy, and no other variable reaches it. Launched on the
+a command's (§12, `shell`), with no injected proxy variables. Launched on the
 conversation's main thread as every instance is, each server's client
 goes to a thread of its own, as a background process's does, which
 always drains its output, answers its requests and parses its lines,
@@ -5960,8 +5699,8 @@ logs no listing, so the next turn, within the restarts allowed
 (*Failures*), waits again; after that a turn never waits for a start,
 and offers the tools last logged (*The prefix*, below). A call to a
 server not yet up waits for it within the call's timeout. A change to
-the workspace's mounts or policy (a worktree made ready, shared
-directories, the network policy) restarts each server at the next turn,
+the workspace's mounts (a worktree made ready or shared
+directories) restarts each server at the next turn,
 which is not counted as a failure's restart. A change to the template's
 `mcp` takes effect at the next turn: a server no longer named is ended
 and its tools dropped, one changed is restarted. Ending a server closes
@@ -6058,25 +5797,10 @@ ask, as for every tool; they bind calls and not what a server runs
 within one, as they bind a command's arguments and not what it runs
 (§11). The repeated-call guard counts an MCP call as any other.
 
-*Its connections.* A server's connections belong to no call: it may
-connect while it starts, between turns, or during any call. Its instance
-is linked to its `mcp` start, not to a call. A connection the policy and
-the rules let through runs as a command's would (§10); one that would be
-asked of the person waits on a card of its own, `Let MCP server NAME
-(COMMAND) connect to HOST:PORT?`, its command cut to 60 characters, the
-person's in both modes, since the classifier has no command of the
-model's to judge. A server's connection never joins a command's card,
-nor a command's a server's, and two servers' never share one. The answer
-holds for that server's instance until it ends and is logged as an
-approval naming the server, at its last `mcp` event, or 0 before its
-first; its "always" answers are `network` rules as a command's card's
-are. While a server's connection waits on a card, its start's clock is
-stopped, as a listing's is; a call's own time runs meanwhile, as a
-command's does (§11). Its cards count toward the 8 a conversation shows
-at once, so a server asking of many destinations leaves the model's
-commands' connections refused until the person answers. A server's
-loopback is its own namespace's (§19, Background servers), so it cannot
-reach a server the model started, nor the model's commands it.
+*Its connections.* Servers share host networking with commands and host
+programs. They may connect while starting, between turns, or during a call;
+no destination card is emitted. Web-fetch policy changes do not restart a
+server or constrain its connections.
 
 *Results.* A result's `content` items become the call's text in order,
 joined by blank lines: `text` as it is, a `resource` with `text` as that
@@ -6233,7 +5957,7 @@ listed the same. A failed server starts again at the next turn, twice in
 a process's life, and afresh once changed or launched otherwise. At a
 turn's start a server no longer named, or changed, is ended, and every
 server is started again when an instance would be launched with other
-shared directories, prepared repositories, network policy or allowlist;
+shared directories or prepared repositories;
 rules are judged live and restart nothing. Ending one sets its end,
 drops its asks, closes its input, waits 2 seconds and drops its client,
 which tears the instance down; a server started again does not wait for
@@ -6289,25 +6013,8 @@ carried MCP tools says, and its settled request records, that they may
 be why and names them. A template that names servers makes a
 conversation as any does.
 
-**As built (MCP, connections).** A server's instance is launched
-linked to its start, not a call: its `Linked.call` is the start's owner,
-`servers::LINKS` (2^61, past any sequence number and below the window's
-card ids, 2^62) plus its generation, with the conversation's asker. A
-connection whose owner is a start waits on a `LinkCard` of that start's
-alone, matched by destination and owner, never classified, titled with
-the server's name and its command quoted as a card shows it, cut to 60
-characters and then made visible; its details name the server and why
-it is asked, and say what an answer reaches, the instance's rest only
-where the allowlist alone asks, as §10 keeps it; its "always" answers
-are `network` rules as a command's card's are. Each waiting connection
-carries its server's name, which its approval names. A connection of a
-start since ended is refused. The answer is logged as an approval
-naming the server, at its last `mcp` event, 0 before its first. Each
-start has a clock (`servers::Clock`), stopped whenever a card of its own
-is up and going otherwise, set again at every change to the cards; its
-start's deadline and each listing's again, the turn's wait for its
-listing, and a call's bound for a server not yet begun each add the
-time it stopped since they began.
+MCP connections use host networking (§10); the former connection-card
+protocol is retained only for isolated diagnostic fixtures.
 
 A sub-agent's prefix names the exact provider model ID requested and the
 reasoning effort actually sent (or that none is sent), so a reviewer need
@@ -7486,9 +7193,9 @@ kind. td-agent's position on its features:
   the caller's home, the key file or the store's writable state; cannot
   write, rename or redirect any read-only entry of the git chain,
   including by renaming an ancestor; cannot create a linked worktree;
-  cannot create a Unix socket, reach one published in a worktree, or make
-  a datagram pair; can commit and `git switch -c`; with the proxy reaches
-  only allowlisted host and port pairs, and without it nothing; and
+  development can create Unix sockets and datagram pairs and reach host
+  loopback; isolated review and maintenance retain their socket restrictions;
+  can commit and `git switch -c`; and
   leaves no process running after a timed-out call, a killed
   background process, or a conversation or window process killed with
   `SIGKILL`. Admission refuses `$HOME`, the store, a credential
@@ -8205,8 +7912,7 @@ in parallel with it.
     non-Rust package (AGENTS.md). td-agent is a standalone program: no
     boot test starts it, its window or its model.
 
-After these: resource limits (§8), a loopback shared by a
-conversation's instances (§19), moving a conversation between
+After these: resource limits (§8), moving a conversation between
 workspaces, and a native Anthropic Messages dialect. The MCP client
 (§12, MCP servers) came in four steps, each one commit, and is built:
 
@@ -8249,13 +7955,6 @@ person's commands, `/review` and the MCP client are built (§3, §12,
   administrator; whether td-net's launch should create the scope
   itself; the defaults per conversation, per workspace and in total; and
   what the status row shows where nothing is delegated.
-- **Background servers.** Each jail instance has its own network
-  namespace, so a server a background process starts is unreachable from
-  the conversation's later calls. Sharing one loopback across a
-  conversation's instances needs td-jail to start an instance in an
-  existing network namespace, and on a host each instance's user
-  namespace is its own, so the namespace's owner has to be arranged; the
-  alternative is a conversation-long instance that runs every call.
 - **Other harnesses' sessions.** Whether td-agent should see sessions
   outside its own state directory: another td-agent's, or another agent
   harness's, by reading their logs read-only. Messaging them would need a

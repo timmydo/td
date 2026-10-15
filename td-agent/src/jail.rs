@@ -160,6 +160,8 @@ impl Programs {
 /// directories, read-only or read-write.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Policy {
+    /// Host networking for ordinary development; reviews remain isolated.
+    pub development: bool,
     pub home: PathBuf,
     pub worktrees: Vec<PathBuf>,
     /// Linked worktrees of `repositories`, each with its `.git` bound
@@ -223,6 +225,9 @@ fn spec_text_with_aliases(
         return Err("too many PATH aliases".into());
     }
     let mut text = String::from("format=1\n");
+    if policy.development {
+        text.push_str("profile=development\n");
+    }
     let mut line = |key: &str, path: &Path| -> Result<(), String> {
         let value = path
             .to_str()
@@ -312,6 +317,9 @@ pub fn launch_linked(
     spec_dir: &Path,
     linked: Option<crate::egress::Linked>,
 ) -> Result<Client, String> {
+    if policy.development && linked.is_some() {
+        return Err("development commands use host networking, not the egress proxy".into());
+    }
     let policy = Policy {
         home: private_dir(&policy.home)?,
         ..policy.clone()
@@ -850,6 +858,7 @@ mod tests {
     #[test]
     fn the_spec_is_td_jails_ordered_keyfile() {
         let policy = Policy {
+            development: false,
             home: "/s/jail/a/home".into(),
             worktrees: vec!["/w/a".into(), "/w/b".into()],
             checkouts: vec!["/t/r".into()],

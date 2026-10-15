@@ -1509,6 +1509,7 @@ pub fn policy(
         _ => None,
     };
     let policy = Policy {
+        development: true,
         home: made("home")?,
         worktrees,
         checkouts,

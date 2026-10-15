@@ -3546,6 +3546,7 @@ no one else can write, at most 64 KiB, and an exact, ordered keyfile:
 
 ```text
 format=1
+profile=development
 entry=/absolute/td-agent
 program=/absolute/td-txt
 alias=cc /gnu/store/...-gcc/bin/gcc
@@ -3557,6 +3558,16 @@ repository=/absolute/workspace/repository.git
 read=/absolute/shared/read-only
 write=/absolute/shared/read-write
 ```
+
+`profile=development` is optional immediately after `format=1`; omission
+selects the isolated profile used by reviews and maintenance. Unknown,
+repeated or misplaced profile lines are refused. Development shares the
+host network namespace and uses the standard socket rules, admitting Unix
+sockets and datagram pairs. It binds the canonical regular-file target of
+`/etc/resolv.conf` read-only (at most 64 KiB); a missing or invalid resolver
+refuses launch. Host-local services and sockets are intentionally reachable;
+the filesystem grants do not constrain the authority those services expose.
+The stage-2 protocol carries the exact development/confined profile word.
 
 `entry` and `home` appear once; `program` (with `entry`, at most four)
 and `alias` (at most 64) and `path` (at most 16) repeat, as do `worktree`, `checkout`,
@@ -3689,10 +3700,11 @@ and links to executables outside the system closure remain unavailable.
 This preserves a user's `~/.local/bin/cc -> gcc` just like any other admitted
 command alias; the jail does not choose compiler fallbacks.
 
-The instance always isolates the network, with loopback up, and keeps
+An isolated instance isolates the network, with loopback up. Development
+keeps the host network namespace and does not change loopback flags. Both keep
 §C's user, mount, PID and UTS namespaces, but maps the caller to itself
 rather than to uid 1000, so a worktree keeps its owner and git's
-ownership check reads it as outside. Its seccomp program is a second
+ownership check reads it as outside. The isolated profile's seccomp program is a second
 compiled one, identical to the standard filter except for its socket
 rules: `socket(AF_UNIX, ...)` is refused with `EPERM` and
 `socketpair(2)` is admitted for `AF_UNIX` with `SOCK_STREAM` or
