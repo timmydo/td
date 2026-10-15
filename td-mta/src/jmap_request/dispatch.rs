@@ -3,6 +3,9 @@ use super::{pointer, resolution, response, result_index, Invocation, CORE};
 use crate::{ids::AccountId, ports, store_fs::ResponseRetention};
 use std::{cmp::Ordering, ops::Range};
 use td_json::{arena, arena_emit::BorrowedEmitter};
+#[path = "submission_set.rs"]
+mod submission_set;
+pub use submission_set::{SubmissionAccess, SubmissionCreator, SubmissionFiler};
 #[path = "email_set.rs"]
 mod email_set;
 pub use email_set::EmailMutator;
@@ -214,6 +217,36 @@ pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+/// Prepared singleton submission creation and its optional success filing.
+/// The caller supplies freshly authenticated Submission state and the same
+/// clock used by response retention. Mixed draft/send batches remain refused.
+pub fn run_with_postgres_submissions<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    access: SubmissionAccess<'_>,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let request = plan.request().map_err(|_| Error::State)?;
+    if access.state.kind != crate::sync::DataType::Submission
+        || request.call_count() != 1
+        || request
+            .calls()
+            .next()
+            .is_none_or(|call| call.name != b"EmailSubmission/set")
+    {
+        return Err(Error::InvalidArguments);
+    }
+    run_inner(
+        plan,
+        retention,
+        execution,
+        access.state.account,
+        Profile {
+            submissions: Some(access),
+            ..Profile::default()
+        },
+    )
+}
 #[derive(Clone, Copy)]
 pub struct DraftAccess<'a> {
     pub creator: &'a dyn DraftCreator,
@@ -282,6 +315,7 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
             identities: None,
             read: None,
             email_updates: false,
+            submissions: None,
         },
     )
 }
@@ -497,6 +531,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         identities,
         read,
         email_updates,
+        submissions,
     } = profile;
     if identities.is_some_and(|catalog| catalog.account() != account) {
         return Err(Error::State);
@@ -545,6 +580,8 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         read: read.as_mut().map(|view| reborrow_read(&mut **view)),
         email_updates,
         submission,
+        submissions,
+        implicit: None,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
         let result = worker.method(&responses, ordinal, token, core, mail);
@@ -601,6 +638,17 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
                 worker.retention.published_len(),
             )
             .map_err(|_| Error::State)?;
+        if let Some((name, range)) = worker.implicit.take() {
+            responses
+                .append(
+                    ordinal,
+                    name,
+                    range.start,
+                    range.end.checked_sub(range.start).ok_or(Error::State)?,
+                    worker.retention.published_len(),
+                )
+                .map_err(|_| Error::State)?;
+        }
     }
     worker.retention.admit_work_turn().map_err(Error::Storage)?;
     let created = worker.created;
@@ -620,6 +668,7 @@ struct Profile<'a> {
     identities: Option<&'a crate::identity_catalog::Catalog>,
     read: Option<&'a mut dyn MailRead>,
     email_updates: bool,
+    submissions: Option<SubmissionAccess<'a>>,
 }
 struct Resolved {
     value: usize,
@@ -638,6 +687,8 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     read: Option<&'io mut dyn MailRead>,
     email_updates: bool,
     submission: bool,
+    submissions: Option<SubmissionAccess<'io>>,
+    implicit: Option<(&'static str, Range<u64>)>,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
     fn check(&mut self) -> Result<(), Error> {
@@ -777,6 +828,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::UnknownMethod);
         }
         let name = match call.name {
+            b"EmailSubmission/set" if self.submission && self.submissions.is_some() => {
+                "EmailSubmission/set"
+            }
             b"EmailSubmission/query" if self.submission && self.read.is_some() => {
                 "EmailSubmission/query"
             }
@@ -809,7 +863,13 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "EmailSubmission/query" {
+        let result = if name == "EmailSubmission/set" {
+            self.submission_set(
+                call,
+                responses.request().view().map_err(|_| Error::State)?,
+                responses.request().envelope.maximum_objects,
+            )
+        } else if name == "EmailSubmission/query" {
             self.submission_query(start..end, responses.request().envelope.query_page)
         } else if name == "EmailSubmission/get" {
             self.submission_get(start..end, responses.request().envelope.maximum_objects)
@@ -1382,6 +1442,8 @@ pub(super) mod tests {
                 read: None,
                 email_updates: false,
                 submission: false,
+                submissions: None,
+                implicit: None,
             };
             assert_eq!(
                 worker.reference(&responses, 1, value),
@@ -1792,6 +1854,8 @@ pub(super) mod tests {
                 read: None,
                 email_updates: false,
                 submission: false,
+                submissions: None,
+                implicit: None,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));
             assert_eq!(retention.failure(), None);

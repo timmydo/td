@@ -175,7 +175,9 @@ impl Submissions<'_> {
                 Err(error) => return Err(Error::Input(error)),
             }
         }
-        let prepared = prepared.ok_or(ports::Error::Invalid)?;
+        let prepared = prepared.ok_or(Error::Input(inputs::Error::Read(
+            postgres_read::Error::Connection(postgres_probe::Error::Transport),
+        )))?;
         let length = prepared.bytes().len() as u64;
         let recipients = prepared.recipients().len() as u64;
         let change = changes::prepare_with_meter(prepared, deadline, meter, self.clock)

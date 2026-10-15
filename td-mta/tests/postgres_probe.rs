@@ -8943,6 +8943,7 @@ fn exercise_http_submission_owner(
         .is_none());
     exercise_http_filing_owner(fixture, &loaded, binding, input, password);
     exercise_submission_reads(fixture, &loaded, binding, input, password);
+    exercise_submission_set_dispatch(fixture, &loaded, binding, input, password);
 }
 
 fn exercise_submission_reads(
@@ -10195,5 +10196,210 @@ fn exercise_submission_query_dispatch(
                 "{output}"
             );
         }
+    }
+}
+
+fn exercise_submission_set_dispatch(
+    fixture: &Fixture,
+    loaded: &td_mta::postgres_input::Loaded,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    source: &td_mta::postgres_submission_input::Prepared,
+    password: &[u8],
+) {
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{DiskLimits, ViewMode, WorkLimits},
+        clock::RuntimeClock,
+        jmap_request::{dispatch, response, OwnedValidation, CORE, MAIL, SUBMISSION},
+        limits::Limits,
+        ports::{Clock, Deadline, Tick},
+        postgres_http_submissions as sending, postgres_http_updates as filing,
+        postgres_read::{ReadSlots, Snapshot},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
+        sync::{DataState, DataType},
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let pending = sending::Pending::default();
+    let filing_pending = filing::Pending::default();
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_td-mta"));
+    let mut connection = loaded
+        .bootstrap
+        .request(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    connection.mode = td_mta::postgres_probe::Mode::Runtime;
+    let mut buffer = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(binding.account(), &mut buffer)
+        .unwrap()
+        .to_owned();
+    let email = td_mta::wire::encode_id(source.source().email, &mut buffer)
+        .unwrap()
+        .to_owned();
+    let identity = td_mta::wire::encode_id(source.identity(), &mut buffer)
+        .unwrap()
+        .to_owned();
+    for refused in [false, true] {
+        let snapshot = Snapshot::open_runtime(
+            &slots,
+            &connection,
+            &loaded.trust,
+            deadline(),
+            binding,
+            password,
+        )
+        .unwrap();
+        let view = snapshot.identity();
+        let state = DataState {
+            account: view.account,
+            epoch: view.epoch,
+            kind: DataType::Submission,
+            sequence: view.committed_sequence,
+        };
+        drop(snapshot);
+        let before = sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+            .parse::<usize>()
+            .unwrap();
+        let patch = if refused {
+            td_json::json!({"keywords/$draft":null,"mailboxIds/mfefefefefefefefefefefefefefefefe":null,"mailboxIds/mfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdfd":true})
+        } else {
+            td_json::json!({"keywords/$draft":null})
+        };
+        let input = td_json::json!({"using":[CORE,MAIL,SUBMISSION],"createdIds":{"draft":email},"methodCalls":[["EmailSubmission/set",{
+            "accountId":account,"ifInState":state.encode(&mut [0;DataState::WIRE_BYTES]).unwrap(),
+            "create":{"send":{"emailId":"#draft","identityId":identity}},
+            "onSuccessUpdateEmail":{"#send":patch}
+        },"send\n☃"]]}).to_string();
+        let limits = Limits::default();
+        let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        bytes[..input.len()].copy_from_slice(input.as_bytes());
+        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let mut parser = td_json::arena::OwnedCursor::with_input_length(
+            bytes,
+            tokens,
+            input.len(),
+            td_json::arena::ParseLimits {
+                max_bytes: limits.json_bytes,
+                max_depth: limits.json_depth,
+                max_tokens: limits.json_tokens,
+            },
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        let resources = limits.plan().unwrap();
+        let mut validation = OwnedValidation::new(
+            parser.finish().unwrap(),
+            &resources,
+            &[CORE, MAIL, SUBMISSION],
+        )
+        .unwrap();
+        while !validation.step().unwrap() {}
+        let request = validation.finish().unwrap();
+        let directory = fixture.root.join(if refused {
+            "submission-set-filing-refused"
+        } else {
+            "submission-set-filed"
+        });
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root = PrivateRoot::open(directory.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let clock = Arc::new(RuntimeClock::new());
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let execution = Deadline::after(Tick(0), until.tick().0 - 1).unwrap();
+        let spool = RequestSpool::open(&mut root, clock.clone(), until).unwrap();
+        let disk = DiskLimits::default()
+            .plan(
+                &resources,
+                WorkLimits::default(),
+                ViewMode::OnlineBackground,
+            )
+            .unwrap();
+        let mut states = [const { td_mta::ownership::SlotState::EMPTY }; 4];
+        let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
+        let owner =
+            ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
+        let retention = owner.retain_response(until).unwrap();
+        let mut preflight =
+            response::Preflight::new(request, "session", retention.maximum()).unwrap();
+        while !preflight.step(&mut [0; 4096]).unwrap() {}
+        let creator = sending::Submissions {
+            loaded,
+            executable,
+            binding,
+            slots: &slots,
+            clock: &clock,
+            pending: &pending,
+            password,
+        };
+        let filer = filing::Updates {
+            loaded,
+            executable,
+            binding,
+            slots: &slots,
+            clock: &clock,
+            pending: &filing_pending,
+            password,
+        };
+        let mut completed = dispatch::run_with_postgres_submissions(
+            preflight.finish().unwrap(),
+            retention,
+            execution,
+            dispatch::SubmissionAccess {
+                creator: &creator,
+                filer: &filer,
+                clock: &*clock,
+                device: source.device(),
+                state,
+            },
+        )
+        .unwrap();
+        assert_eq!(completed.responses().len(), 2);
+        let mut encoder = completed.encoder().unwrap();
+        while !encoder.count_step(&mut [0; 4096]).unwrap() {}
+        let length = encoder.begin_output().unwrap();
+        let mut output = Vec::new();
+        loop {
+            let mut bytes = [0; 4096];
+            let progress = encoder.poll_output(&mut bytes).unwrap();
+            output.extend_from_slice(&bytes[..progress.written]);
+            if progress.complete {
+                break;
+            }
+        }
+        assert_eq!(encoder.finish().unwrap(), length);
+        let output = td_json::parse_slice(&output).unwrap();
+        let responses = output["methodResponses"].as_array().unwrap();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0][0].as_str(), Some("EmailSubmission/set"));
+        let submitted: td_mta::ids::SubmissionId =
+            td_mta::wire::Id::parse(responses[0][1]["created"]["send"]["id"].as_str().unwrap())
+                .unwrap()
+                .local()
+                .unwrap();
+        assert_eq!(responses[1][0].as_str(), Some("Email/set"));
+        assert_eq!(responses[0][2].as_str(), Some("send\n☃"));
+        assert_eq!(responses[0][2], responses[1][2]);
+        if refused {
+            assert_eq!(
+                responses[1][1]["notUpdated"][email.as_str()]["type"].as_str(),
+                Some("invalidProperties")
+            );
+        } else {
+            assert!(responses[1][1]["updated"]
+                .get(email.as_str())
+                .unwrap()
+                .is_null());
+        }
+        assert_eq!(
+            sql(fixture, "SELECT count(*) FROM td_mta.submissions")
+                .parse::<usize>()
+                .unwrap(),
+            before + 1
+        );
+        assert_eq!(sql(fixture,&format!("SELECT submitting_profile||':'||route_name FROM td_mta.submission_routes WHERE submission_id=decode('{submitted}','hex')")),"desktop:personal-smarthost");
+        assert_eq!(pending.operation().unwrap(), None);
+        assert_eq!(filing_pending.operation().unwrap(), None);
+        drop(completed);
+        assert_eq!(owner.used().unwrap(), 0);
     }
 }

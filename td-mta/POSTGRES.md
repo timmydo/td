@@ -2852,3 +2852,25 @@ account isolation, receivedAt/EmailId ordering, lookahead and the original
 SQL deadline. The date decoder is shared with submission queries, including
 its numeric-position checks. This is an inert PostgreSQL read preparation;
 it does not enable Submission or the production backend cutover.
+
+## 96. Prepared singleton submission mutation
+
+Prepared dispatch accepts one EmailSubmission/set creation with an optional
+matching onSuccessUpdateEmail patch. It resolves literal Email IDs or
+request-local creation IDs without granting Email access; the fixed worker
+freshly authenticates and authorizes the account, source and identity and
+preserves the submitting profile's route. Mixed draft/send batches, updates,
+cancellation and destroy remain unconnected, as do capability advertising
+and production PostgreSQL selection.
+
+Response body and implicit-frame space are reserved before effects, under
+the original response and mutation meter. Known creation publishes its
+Submission ID and state independently of the later filing result. Filing
+uses the same meter and execution deadline and gets a separate Email/set
+response (or method error) under the original call ID. Filing refusal or
+uncertainty never rolls back the submission or changes its known result.
+Outer response I/O, deadline or exhausted original work can still prevent a
+reply; retained operations and td-mail reconciliation remain necessary.
+Indeterminate creation keeps its native fence and returns serverPartialFail
+without invoking filing. Initial creation mappings remain fallback-only;
+new successful request mappings shadow them.

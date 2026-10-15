@@ -81,6 +81,27 @@ impl CreationIds {
         let value = wire::encode_id(id, &mut bytes).map_err(|_| Error::State)?;
         self.set(slot, value.as_bytes())
     }
+    pub(super) fn lookup(
+        &self,
+        key: &[u8],
+        mut check: impl FnMut() -> Result<(), Error>,
+    ) -> Result<Option<Name>, Error> {
+        let (mut low, mut high) = (0, self.entries.len());
+        while low < high {
+            check()?;
+            let middle = low + (high - low) / 2;
+            let slot = *self.sorted.get(middle).ok_or(Error::State)?;
+            let entry = self.entries.get(slot).ok_or(Error::State)?;
+            match entry.key.bytes().cmp(key) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => {
+                    return Ok((!entry.value.bytes().is_empty()).then(|| entry.value.clone()))
+                }
+            }
+        }
+        Ok(None)
+    }
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }

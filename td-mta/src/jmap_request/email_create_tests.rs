@@ -369,6 +369,8 @@ fn insufficient_response_space_refuses_before_calling_the_creator() {
             read: None,
             email_updates: false,
             submission: false,
+            submissions: None,
+            implicit: None,
         };
         let mut bytes = br#"{"draft":{"literal":true}}"#.to_vec();
         let mut tokens = [td_json::arena::Token::EMPTY; 8];
