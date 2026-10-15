@@ -231,8 +231,16 @@ pub(crate) fn with_body_worker<T>(
     deadline: Instant,
     operation: impl FnOnce(&mut Worker) -> T,
 ) -> Result<T, Error> {
-    let mut worker = connect_worker(request, trust, deadline, 512 * 1024, Input::body())?;
+    let mut worker = body_worker(request, trust, deadline)?;
     Ok(operation(&mut worker))
+}
+
+pub(crate) fn body_worker(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+) -> Result<Worker, Error> {
+    connect_worker(request, trust, deadline, 512 * 1024, Input::body())
 }
 
 fn connect_worker(

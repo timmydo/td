@@ -2116,3 +2116,29 @@ PostgreSQL read failures retain their typed errors; sink/format errors use
 The same-snapshot fixture exercises stored output across a concurrent Email
 removal, a later absent object, multi-page keywords and a refusing output sink.
 Service admission remains part of the atomic cutover.
+
+## 60. Worker-owned read views and fixed admission slots
+
+`postgres_read::ReadSlots` reserves 1..256 process-local read connections.
+Acquisition uses at most eight atomic compare/exchange attempts and returns
+Busy on exhaustion or contention, without a queue, connection attempt or
+retry. The service must size this pool from its admitted resources and keep
+health/reconnect and settlement capacity separate. This is a read-slot
+primitive, not the full service's outage or connection-pool activation.
+
+`Snapshot::open_runtime` requires Runtime connection mode and acquires a
+slot before connecting. It returns an owned, thread-confined snapshot after
+primary/schema/privilege qualification and fresh profile/device admission.
+The connection drops before the slot is returned. Failed opening releases
+both. Neither the deadline, protocol budgets, snapshot identity nor sticky
+read failure can be renewed by retaining or borrowing this owner. The worker
+must drop it when the bounded method finishes; server idle-transaction expiry
+and local checks remain additional limits. No live view crosses worker threads.
+
+The existing `with_snapshot` preparation helper uses the same implementation
+with one local slot and still bounds custody to its callback. Its caller
+continues to own outer worker admission. This preserves preparation fixtures
+without allowing owner credentials through the runtime constructor. The real
+read fixture checks exhaustion before a second connection, server-side closure
+on drop, slot recovery after failed authentication and owner-mode refusal.
+No serving listener is activated by these ownership changes.

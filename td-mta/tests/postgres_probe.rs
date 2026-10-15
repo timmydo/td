@@ -5099,6 +5099,54 @@ fn exercise_read(
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
+    let slots = read::ReadSlots::new(1).unwrap();
+    let mut owned =
+        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
+            .unwrap();
+    assert_eq!(owned.identity().committed_sequence.number(), 3);
+    assert!(owned.email(first.email).unwrap().is_some());
+    assert_eq!(
+        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password).err(),
+        Some(read::Error::Busy)
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'"), "1");
+    drop(owned);
+    let closed = deadline();
+    while sql(
+        fixture,
+        "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'",
+    ) != "0"
+    {
+        assert!(
+            Instant::now() < closed,
+            "owned snapshot connection survived drop"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let mut wrong = password.to_vec();
+    let last = wrong.last_mut().unwrap();
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    assert_eq!(
+        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, &wrong).err(),
+        Some(read::Error::Unauthenticated)
+    );
+    // Authentication failure after connection setup must return its slot too.
+    let replacement =
+        read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
+            .unwrap();
+    drop(replacement);
+    assert_eq!(
+        read::Snapshot::open_runtime(
+            &slots,
+            &fixture.request(),
+            trust,
+            deadline(),
+            binding,
+            password
+        )
+        .err(),
+        Some(read::Error::Invalid)
+    );
     let snapshot = |callback: fn(&mut read::Snapshot<'_>) -> Result<(), read::Error>| {
         read::with_snapshot(request, trust, deadline(), binding, password, callback)
     };

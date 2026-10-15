@@ -23,6 +23,7 @@ pub enum Error {
     Policy,
     Unauthenticated,
     Capacity,
+    Busy,
     Integrity,
     Database,
     Invalid,
@@ -61,13 +62,61 @@ pub struct EmailPage {
 }
 pub const MAX_EMAIL_PAGE: usize = 1024;
 
-/// Every result belongs to the original snapshot. Neither this handle nor its
-/// connection can escape the callback. Failed operations retire the whole view.
+/// Fixed process-local read connection capacity. No waiter queue or retry.
+/// Reserve independent capacity for health and settlement outside this pool.
+pub struct ReadSlots {
+    maximum: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+impl ReadSlots {
+    pub fn new(maximum: usize) -> Result<Self, Error> {
+        if !(1..=256).contains(&maximum) {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            maximum,
+            used: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn acquire(&self) -> Result<ReadPermit<'_>, Error> {
+        use std::sync::atomic::Ordering;
+        let mut used = self.used.load(Ordering::Relaxed);
+        for _ in 0..8 {
+            if used >= self.maximum {
+                return Err(Error::Busy);
+            }
+            match self.used.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(ReadPermit(self)),
+                Err(current) => used = current,
+            }
+        }
+        Err(Error::Busy)
+    }
+}
+struct ReadPermit<'a>(&'a ReadSlots);
+impl Drop for ReadPermit<'_> {
+    fn drop(&mut self) {
+        self.0
+            .used
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Owns one authenticated snapshot and its original deadline and budgets.
+/// Worker-local: its poll waker is bound to the thread that opened it.
+/// The connection drops before its reserved slot becomes available again.
 pub struct Snapshot<'a> {
-    worker: &'a mut Worker,
+    worker: Worker,
     identity: ViewIdentity,
     deadline: Instant,
     failed: Option<Error>,
+    _worker_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    _permit: ReadPermit<'a>,
 }
 
 impl crate::email_response::Source for Snapshot<'_> {
@@ -117,12 +166,46 @@ pub fn with_snapshot<T>(
     password: &[u8],
     read: impl FnOnce(&mut Snapshot<'_>) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    if !binding.roles().jmap() {
-        return Err(Error::Policy);
+    // Existing preparation callers already reserve their worker externally.
+    let slots = ReadSlots::new(1)?;
+    let mut view = Snapshot::open(&slots, request, trust, deadline, binding, password)?;
+    view.check()?;
+    let result = read(&mut view);
+    view.check()?;
+    result
+}
+impl<'a> Snapshot<'a> {
+    /// Admit only qualified runtime connections, after reserving a shared slot.
+    /// The selected profile remains passive until the snapshot authenticates it.
+    pub fn open_runtime(
+        slots: &'a ReadSlots,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        binding: &Binding,
+        password: &[u8],
+    ) -> Result<Self, Error> {
+        if request.mode != postgres_probe::Mode::Runtime {
+            return Err(Error::Invalid);
+        }
+        Self::open(slots, request, trust, deadline, binding, password)
     }
-    let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
-    let binding = binding.clone();
-    postgres_probe::with_body_worker(request, trust, deadline, |worker| {
+    fn open(
+        slots: &'a ReadSlots,
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        binding: &Binding,
+        password: &[u8],
+    ) -> Result<Self, Error> {
+        if !binding.roles().jmap() {
+            return Err(Error::Policy);
+        }
+        let presented = Presented::parse(password).ok_or(Error::Unauthenticated)?;
+        let permit = slots.acquire()?;
+        let binding = binding.clone();
+        let mut worker =
+            postgres_probe::body_worker(request, trust, deadline).map_err(Error::Connection)?;
         let identity = worker
             .run(|client| {
                 Box::pin(async move {
@@ -132,18 +215,17 @@ pub fn with_snapshot<T>(
                 })
             })
             .map_err(Error::Connection)??;
-        let mut view = Snapshot {
+        let mut view = Self {
             worker,
             identity,
             deadline,
             failed: None,
+            _worker_thread: std::marker::PhantomData,
+            _permit: permit,
         };
         view.check()?;
-        let result = read(&mut view);
-        view.check()?;
-        result
-    })
-    .map_err(Error::Connection)?
+        Ok(view)
+    }
 }
 impl Snapshot<'_> {
     pub fn identity(&self) -> ViewIdentity {
@@ -216,7 +298,7 @@ impl Snapshot<'_> {
             .ok_or(Error::Body(postgres_body::Error::Missing));
         let metadata = self.retain(metadata)?;
         let result = postgres_body::with_verified_body(
-            self.worker,
+            &mut self.worker,
             BlobMetadata {
                 identity: metadata.identity,
                 blob: metadata.blob,
@@ -437,5 +519,26 @@ fn snapshot_error(error: postgres_snapshot::Error) -> Error {
         postgres_snapshot::Error::Unauthenticated => Error::Unauthenticated,
         postgres_snapshot::Error::Integrity => Error::Integrity,
         postgres_snapshot::Error::Database => Error::Database,
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn read_capacity_is_fixed_and_released_by_each_owner() {
+        assert!(ReadSlots::new(0).is_err());
+        assert!(ReadSlots::new(257).is_err());
+        let slots = ReadSlots::new(2).unwrap();
+        let first = slots.acquire().unwrap();
+        let second = slots.acquire().unwrap();
+        assert!(matches!(slots.acquire(), Err(Error::Busy)));
+        drop(first);
+        let replacement = slots.acquire().unwrap();
+        assert!(matches!(slots.acquire(), Err(Error::Busy)));
+        drop(second);
+        drop(replacement);
+        assert_eq!(slots.used.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }
