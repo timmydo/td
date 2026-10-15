@@ -37,6 +37,67 @@ impl Pending {
     }
 }
 
+/// A confirmed historical receipt; settling never authorizes a fresh write.
+#[derive(Debug)]
+pub struct Settled {
+    pub operation: EmailOperationId,
+    pub outcome: changes::BatchOutcome,
+}
+impl Pending {
+    /// Use a separate settlement connection allowance, never foreground slots.
+    /// Absence or any error retains the exact operation and keeps writes fenced.
+    pub fn settle(
+        &self,
+        loaded: &Loaded,
+        executable: &Path,
+        settlement_slots: &ReadSlots,
+        clock: &RuntimeClock,
+        until: Deadline,
+    ) -> Result<Option<Settled>, Error> {
+        if !executable.is_absolute() {
+            return Err(Error::Invalid);
+        }
+        let mut pending = self.change.try_lock().map_err(|_| Error::Busy)?;
+        let Some(change) = pending.as_ref() else {
+            return Ok(None);
+        };
+        let now = Instant::now();
+        let deadline = clock.deadline_instant(until)?.min(
+            now.checked_add(Duration::from_secs(10))
+                .ok_or(Error::Invalid)?,
+        );
+        if now >= deadline {
+            return Err(Error::Deadline);
+        }
+        let _slot = settlement_slots.acquire().map_err(|_| Error::Busy)?;
+        let dns_deadline = deadline.min(
+            now.checked_add(Duration::from_secs(5))
+                .ok_or(Error::Invalid)?,
+        );
+        let addresses =
+            crate::postgres_resolver::resolve(executable, &loaded.bootstrap, dns_deadline)
+                .map_err(|error| match error {
+                    crate::postgres_resolver::Error::Deadline => Error::Deadline,
+                    _ => Error::Dns,
+                })?;
+        for address in addresses {
+            let mut connection = loaded.bootstrap.request(address);
+            connection.mode = Mode::Runtime;
+            match changes::inspect_batch(&connection, &loaded.trust, deadline, change) {
+                Ok(Some(outcome)) => {
+                    let operation = change.operation();
+                    *pending = None;
+                    return Ok(Some(Settled { operation, outcome }));
+                }
+                Ok(None) => return Ok(None),
+                Err(changes::Error::Connection(postgres_probe::Error::Transport)) => (),
+                Err(error) => return Err(map_error(error)),
+            }
+        }
+        Err(Error::Invalid)
+    }
+}
+
 /// Borrows the request secret only for this synchronous call. No background SQL.
 pub struct Updates<'a> {
     pub loaded: &'a Loaded,

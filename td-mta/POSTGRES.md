@@ -2508,3 +2508,23 @@ unstars the delivered message, querying fresh state after every result. It
 also forces a COMMIT error and verifies a later write refuses without losing
 the original operation or stopping reads. Mailbox rights advertise seen and
 keyword updates while unsupported membership and structural rights stay false.
+
+## 79. Prepared flag receipt settlement
+
+Pending::settle inspects the exact retained Change under runtime-role
+qualification and the existing account lock that excludes a still-running
+COMMIT. It uses a separately supplied settlement connection allowance, fresh
+DNS and one original deadline capped at ten seconds. It borrows no app
+password and does not authorize or retry a mutation.
+
+A confirmed receipt returns its operation ID and complete original outcome,
+then releases the flag-write fence. Absence, deadline, DNS or database failure
+preserves the original Change and fence. A confirmed success survives a late
+local deadline poll. The caller must retain the returned outcome as required
+by its own recovery workflow. Production scheduling, restart persistence and
+receipt reclamation remain cutover requirements.
+
+The real-client fixture checks absence does not clear uncertainty. A second
+prepared owner loses a COMMIT acknowledgement to a deadline and later settles
+the committed receipt while both foreground read slots are held, proving that
+settlement has separate connection admission.

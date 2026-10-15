@@ -320,6 +320,11 @@ pub(super) fn exercise(
             let mut client = Client::start_with_state(&config, &runtime, &runtime.join("fresh-reader"));
             let connected = client.ask(json!({"command":"connect", "account":"test"}));
             assert!(connected["ok"].is_true(), "{connected}");
+            let settlement_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+            assert!(pending.settle(&loaded, executable, &settlement_slots, &clock,
+                Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap()).unwrap().is_none());
+            assert_eq!(pending.operation().unwrap(), Some(operation));
+
             let fresh = client.ask(json!({"command":"query_emails", "mailbox_id":folders[0]["id"], "limit":50}));
             assert!(fresh["ok"].is_true(), "{fresh}");
             assert!(!fresh["emails"][0]["is_flagged"].is_true());
@@ -337,6 +342,90 @@ pub(super) fn exercise(
             worker.join().unwrap().unwrap();
         });
     }).unwrap();
+    // A separate owner exercises a lost acknowledgement whose receipt commits.
+    // The HTTP owner's absent receipt above remains fenced.
+    let confirmed = td_mta::postgres_http_updates::Pending::default();
+    let updates = td_mta::postgres_http_updates::Updates {
+        loaded: &loaded,
+        executable,
+        binding,
+        slots: &slots,
+        clock: &clock,
+        pending: &confirmed,
+        password: device.password(),
+    };
+    let email_hex = sql(fixture, "SELECT encode(id,'hex') FROM td_mta.emails");
+    let email = td_mta::ids::EmailId::parse(&email_hex).unwrap();
+    sql(fixture, "CREATE FUNCTION public.delay_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(4); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_client_commit()");
+    let until = Deadline::after(clock.sample().unwrap().monotonic, 2_000).unwrap();
+    let mut meter = td_mta::admission::work::Meter::new(
+        until,
+        td_mta::admission::work::Charge {
+            records: 10000,
+            ..Default::default()
+        },
+    );
+    let completion = td_mta::jmap_request::dispatch::EmailMutator::update(
+        &updates,
+        td_mta::store_fs::EmailUpdateRequest {
+            account: binding.account(),
+            device: device.device_id(),
+            expected: None,
+            updates: &[td_mta::store_fs::EmailUpdate {
+                email,
+                mailbox: None,
+                seen: None,
+                flagged: Some(true),
+            }],
+            deadline: until,
+        },
+        &mut meter,
+    )
+    .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        Err(td_mta::ports::CommitFailure::Indeterminate(_))
+    ));
+    let operation = confirmed.operation().unwrap().unwrap();
+    thread::sleep(Duration::from_secs(5));
+    sql(fixture, "DROP TRIGGER delay_client_commit ON td_mta.flag_receipts; DROP FUNCTION public.delay_client_commit()");
+    let first = td_mta::postgres_read::Snapshot::open_resolved(
+        &slots,
+        &loaded,
+        executable,
+        deadline(),
+        binding,
+        device.password(),
+    )
+    .unwrap();
+    let second = td_mta::postgres_read::Snapshot::open_resolved(
+        &slots,
+        &loaded,
+        executable,
+        deadline(),
+        binding,
+        device.password(),
+    )
+    .unwrap();
+    let settlement_slots = td_mta::postgres_read::ReadSlots::new(1).unwrap();
+    let settled = confirmed
+        .settle(
+            &loaded,
+            executable,
+            &settlement_slots,
+            &clock,
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.operation, operation);
+    assert_eq!(
+        settled.outcome.results,
+        [td_mta::postgres_email_set::UpdateResult::Updated]
+    );
+    assert!(settled.outcome.state.new_sequence > settled.outcome.state.old_sequence);
+    assert_eq!(confirmed.operation().unwrap(), None);
+    drop((first, second));
     assert_eq!(responses.used().unwrap(), 0);
     assert!(!responses.admission_stopped());
 }
