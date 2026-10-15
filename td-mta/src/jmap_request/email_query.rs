@@ -245,6 +245,11 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         page: usize,
     ) -> Result<Range<u64>, Error> {
         let arguments = self.email_query_arguments(range, page)?;
+        if let Some(view) = self.read.take() {
+            let result = self.postgres_email_query(view, arguments);
+            self.read = Some(view);
+            return result;
+        }
         let execution = self.execution;
         let (coordinator, spool, cap) = self
             .retention
@@ -345,6 +350,74 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         source.view.check_snapshot().map_err(storage)?;
         source.worker.check()?;
         let end = source.worker.retention.publish().map_err(Error::Storage)?;
+        Ok(start..end)
+    }
+    fn postgres_email_query(
+        &mut self,
+        view: &mut dyn super::MailRead,
+        arguments: Arguments,
+    ) -> Result<Range<u64>, Error> {
+        use crate::postgres_read::{EmailQuery, EmailScope};
+        self.check()?;
+        let result = view.query(EmailQuery {
+            scope: match arguments.mailbox {
+                None => EmailScope::All,
+                Some(Some(mailbox)) => EmailScope::Mailbox(mailbox),
+                Some(None) => EmailScope::Empty,
+            },
+            ascending: arguments.ascending,
+            position: arguments.position,
+            limit: arguments.limit,
+            calculate_total: arguments.total,
+        })?;
+        let state = QueryState::current(view.identity(), QueryType::Email);
+        if result.state != state
+            || result.position != arguments.position
+            || result.ids.len() > arguments.limit
+            || result.total.is_some() != arguments.total
+        {
+            return Err(Error::State);
+        }
+        let start = self.retention.len();
+        self.append(br#"{"accountId":"#)?;
+        self.push_id(&arguments.account)?;
+        self.append(br#","queryState":""#)?;
+        self.append(
+            state
+                .encode(&mut [0; QueryState::WIRE_BYTES])
+                .map_err(|_| Error::State)?
+                .as_bytes(),
+        )?;
+        self.append(br#"","canCalculateChanges":false,"position":"#)?;
+        self.append(result.position.to_string().as_bytes())?;
+        if arguments.include_limit {
+            self.append(br#","limit":"#)?;
+            self.append(arguments.limit.to_string().as_bytes())?;
+        }
+        if let Some(total) = result.total {
+            self.append(br#","total":"#)?;
+            self.append(total.to_string().as_bytes())?;
+        }
+        self.append(br#","ids":["#)?;
+        let mut first = true;
+        for id in result.ids {
+            self.check()?;
+            if !first {
+                self.append(b",")?;
+            }
+            first = false;
+            self.append(b"\"")?;
+            self.append(
+                wire::encode_id(id, &mut [0; wire::IdKind::WIRE_BYTES])
+                    .map_err(|_| Error::State)?
+                    .as_bytes(),
+            )?;
+            self.append(b"\"")?;
+        }
+        self.append(b"]}")?;
+        view.check()?;
+        self.check()?;
+        let end = self.retention.publish().map_err(Error::Storage)?;
         Ok(start..end)
     }
 }

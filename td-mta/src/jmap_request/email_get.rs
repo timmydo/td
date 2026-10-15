@@ -253,7 +253,13 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             if all {
                 match &mut view {
                     View::Postgres(view) => {
-                        let page = view.emails(limits.objects_per_method)?;
+                        let page = view.query(crate::postgres_read::EmailQuery {
+                            scope: crate::postgres_read::EmailScope::All,
+                            ascending: true,
+                            position: 0,
+                            limit: limits.objects_per_method,
+                            calculate_total: false,
+                        })?;
                         if page.has_more || page.ids.len() > limits.objects_per_method {
                             return Err(Error::RequestTooLarge);
                         }

@@ -193,7 +193,7 @@ pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
 /// Prepared PostgreSQL read dispatch. The caller owns the freshly authenticated
 /// runtime snapshot and its original deadline for this batch. `clock` must be
 /// the response owner's clock; its execution instant tightens SQL as well as
-/// response work. Core, Mailbox/get and Email/get are connected here;
+/// response work. Core, Mailbox/get, Email/get and Email/query are connected here;
 /// production activation is a separate cutover.
 pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
@@ -235,7 +235,10 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
     fn identity(&self) -> ports::ViewIdentity;
     fn check(&mut self) -> Result<(), Error>;
     fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error>;
-    fn emails(&mut self, maximum: usize) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn query(
+        &mut self,
+        query: crate::postgres_read::EmailQuery,
+    ) -> Result<crate::postgres_read::EmailPage, Error>;
     fn email_body(
         &mut self,
         email: crate::ids::EmailId,
@@ -253,15 +256,11 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
     fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error> {
         self.mailbox_listing().map_err(postgres_read_error)
     }
-    fn emails(&mut self, maximum: usize) -> Result<crate::postgres_read::EmailPage, Error> {
-        self.query_emails(crate::postgres_read::EmailQuery {
-            scope: crate::postgres_read::EmailScope::All,
-            ascending: true,
-            position: 0,
-            limit: maximum.min(crate::postgres_read::MAX_EMAIL_PAGE),
-            calculate_total: false,
-        })
-        .map_err(postgres_read_error)
+    fn query(
+        &mut self,
+        query: crate::postgres_read::EmailQuery,
+    ) -> Result<crate::postgres_read::EmailPage, Error> {
+        self.query_emails(query).map_err(postgres_read_error)
     }
     fn email_body(
         &mut self,
@@ -583,7 +582,11 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 range,
             });
         }
-        if self.read.is_some() && !matches!(call.name, b"Core/echo" | b"Mailbox/get" | b"Email/get")
+        if self.read.is_some()
+            && !matches!(
+                call.name,
+                b"Core/echo" | b"Mailbox/get" | b"Email/get" | b"Email/query"
+            )
         {
             return Err(Error::UnknownMethod);
         }

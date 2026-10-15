@@ -2335,3 +2335,17 @@ pin. The snapshot additionally retains its connection budget and shortened
 execution deadline. A projection/output refusal does not poison a healthy
 snapshot; body integrity or connection failure remains terminal. Provisional
 bytes are published only after both projection and final snapshot checks.
+
+## 69. Prepared PostgreSQL Email/query dispatch
+
+Email/query reuses the existing td-mail argument parser and result framing
+with the PostgreSQL snapshot query. The supported inMailbox filter,
+receivedAt ordering with ascending-ID ties, position, bounded limit and
+optional total retain their existing semantics. Query state comes from the
+same admitted snapshot as the returned IDs; query changes remain unsupported.
+
+The PostgreSQL path requires no local external-sort files: database query
+limits and the original snapshot worker budget bound reads, and the shared
+response owner bounds retained JSON. Final snapshot and execution checks
+precede publication. A result reference into the query IDs feeds the same
+snapshot's Email/get without client-visible storage-specific handling.

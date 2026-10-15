@@ -5212,17 +5212,27 @@ fn exercise_read_dispatch(
         td_mta::wire::encode_id(td_mta::ids::EmailId::from_bytes([0xfe; 16]), &mut id_bytes)
             .unwrap()
             .to_owned();
+    let (low, high) = if first_id.as_bytes() < second_id.as_bytes() {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
     let input = format!(
         r##"{{"using":["{CORE}","{MAIL}"],"methodCalls":[
         ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],
         ["Mailbox/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"Mailbox/get","path":"/list/*/id"}},"properties":["id"]}},"b"],
         ["Mailbox/get",{{"accountId":"{account}","ids":null,"properties":["name"]}},"c"],
         ["Mailbox/get",{{"accountId":"{account}","properties":["unsupported"]}},"d"],
-        ["Email/query",{{"accountId":"{account}"}},"e"],
+        ["Thread/get",{{"accountId":"{account}"}},"e"],
         ["Core/echo",{{"after":true}},"f"],
         ["Email/get",{{"accountId":"{account}","ids":["{second}","{first}","{second}","{absent_email}"],"fetchTextBodyValues":true}},"g"],
         ["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"g","name":"Email/get","path":"/list/*/id"}},"properties":["id"]}},"h"],
-        ["Email/get",{{"accountId":"{account}","ids":null,"properties":["id"]}},"i"]
+        ["Email/get",{{"accountId":"{account}","ids":null,"properties":["id"]}},"i"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"inMailbox":"{mailbox}"}},"limit":1,"calculateTotal":true}},"j"],
+        ["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"j","name":"Email/query","path":"/ids"}},"properties":["id"]}},"k"],
+        ["Email/query",{{"accountId":"{account}","sort":[{{"property":"receivedAt","isAscending":true}}],"position":1,"limit":1}},"l"],
+        ["Email/query",{{"accountId":"{account}","filter":{{"text":"unsupported"}}}},"m"],
+        ["Email/query",{{"accountId":"{account}","limit":0,"calculateTotal":true}},"n"]
     ]}}"##
     );
     let limits = Limits::default();
@@ -5325,7 +5335,7 @@ fn exercise_read_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 9);
+    assert_eq!(complete.responses().len(), 14);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -5361,7 +5371,13 @@ fn exercise_read_dispatch(
     assert!(output.contains(&format!(
         r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[]}},"h""#
     )));
-    assert_eq!(output.matches(r#"["Email/get","#).count(), 3);
+    assert_eq!(output.matches(r#"["Email/get","#).count(), 4);
+    assert_eq!(output.matches(r#"["Email/query","#).count(), 3);
+    assert!(output.contains(&format!(r#""position":0,"total":2,"ids":["{low}"]}},"j""#)));
+    assert!(output.contains(&format!(r#""list":[{{"id":"{low}"}}],"notFound":[]}},"k""#)));
+    assert!(output.contains(&format!(r#""position":1,"ids":["{high}"]}},"l""#)));
+    assert!(output.contains(r#"["error",{"type":"unsupportedFilter"},"m"]"#));
+    assert!(output.contains(r#""position":0,"total":2,"ids":[]},"n""#));
     assert_eq!(output.matches(r#""subject":"Snapshot""#).count(), 2);
     assert_eq!(output.matches(r#""preview":"snapshot text""#).count(), 2);
     assert_eq!(output.matches(r#""attachments":[]"#).count(), 2);
@@ -5431,6 +5447,11 @@ fn exercise_read(
     };
     let first = create("first@example.test");
     let second = create("second@example.test");
+    // Pin equal dates so both sort directions must use ascending-ID ties.
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.emails SET received_at=0 WHERE account=decode('{account}','hex')"),
+    );
     let slots = read::ReadSlots::new(1).unwrap();
     let mut owned =
         read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
