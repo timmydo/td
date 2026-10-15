@@ -15,6 +15,9 @@ use td_mta::postgres_probe::{probe, Error, Request};
 #[path = "support/tls_certificate_fixture.rs"]
 mod certificate;
 
+#[path = "support/postgres_mail_client.rs"]
+mod mail_client;
+
 const PASSWORD: &[u8] = b"disposable-postgres-fixture-password";
 
 struct Fixture {
@@ -61,10 +64,9 @@ impl Fixture {
         let mut raw = [0; P256_PKCS8_CAPACITY];
         let count = provider.generate_p256(&mut raw).unwrap();
         let root_key = provider.load_p256(&raw[..count]).unwrap();
-        fixture.ca = certificate::pem(
-            "CERTIFICATE",
-            &certificate::certificate_names(&root_key, &root_key, true, 1, &[], false),
-        );
+        let root_der = certificate::certificate_names(&root_key, &root_key, true, 1, &[], false);
+        fs::write(fixture.root.join("root.der"), &root_der).unwrap();
+        fixture.ca = certificate::pem("CERTIFICATE", &root_der);
         let count = provider.generate_p256(&mut raw).unwrap();
         let key = provider.load_p256(&raw[..count]).unwrap();
         let leaf = certificate::pem(
@@ -2177,7 +2179,14 @@ fn real_postgres_deletion_releases_last_owner_bodies_and_retains_outcomes() {
     exercise_configuration(ConfigurationExercise::Deletion);
 }
 
+#[test]
+#[ignore = "real PostgreSQL 17, td-mail and isolated td-fetch fixture executables required"]
+fn real_postgres_td_mail_reads_and_downloads() {
+    exercise_configuration(ConfigurationExercise::Client);
+}
+
 enum ConfigurationExercise {
+    Client,
     Submissions,
     SubmissionInput,
     Receiving,
@@ -2270,6 +2279,19 @@ certificate = "public"
         key = Version::from_bytes([3; 16]),
         ca = Version::from_bytes([4; 16])
     );
+    let mut https_socket = matches!(exercise, ConfigurationExercise::Client)
+        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let desktop = if let Some(socket) = &https_socket {
+        let address = socket.local_addr().unwrap();
+        desktop
+            .replace(
+                "https://localhost",
+                &format!("https://localhost:{}", address.port()),
+            )
+            .replace("127.0.0.1:443", &address.to_string())
+    } else {
+        desktop
+    };
     let desktop = if matches!(exercise, ConfigurationExercise::Submissions) {
         desktop + "[limits]\nsmtp_recipients = 1000\nindex_cache_bytes = 2097152\n"
     } else {
@@ -2764,7 +2786,7 @@ per_peer_limit = 1
     serving.mode = td_mta::postgres_probe::Mode::Runtime;
     let profile_request = if matches!(
         exercise,
-        ConfigurationExercise::Flags | ConfigurationExercise::Read
+        ConfigurationExercise::Flags | ConfigurationExercise::Read | ConfigurationExercise::Client
     ) {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
@@ -2822,6 +2844,7 @@ per_peer_limit = 1
         assert!(!format!("{:?}", prepared.binding()).contains("main@example.test"));
         if name == "desktop" {
             match exercise {
+                ConfigurationExercise::Client => {}
                 ConfigurationExercise::Submissions => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), true)
                 }
@@ -2867,7 +2890,7 @@ per_peer_limit = 1
         if name == "cloud" && matches!(exercise, ConfigurationExercise::Receiving) {
             exercise_receiving(&fixture, &request, &trust, prepared.binding());
         }
-        let (_, configuration, policies) = prepared.into_parts();
+        let (binding, configuration, policies) = prepared.into_parts();
         assert_eq!(
             configuration
                 .candidate()
@@ -2880,6 +2903,18 @@ per_peer_limit = 1
         );
         drop(domain.publish(policies).unwrap());
         let active = domain.current().unwrap();
+        if name == "desktop" && matches!(exercise, ConfigurationExercise::Client) {
+            mail_client::exercise(
+                &fixture,
+                profile_request,
+                &trust,
+                &binding,
+                &configuration,
+                &active,
+                https_socket.take().unwrap(),
+            );
+            return;
+        }
         let https = TlsPolicies::listener(&active, "https").unwrap();
         assert_eq!(
             TlsPolicies::role(&active, https).unwrap(),

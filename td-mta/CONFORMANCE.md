@@ -392,3 +392,21 @@ failed creations, partial folder results, omitted and empty maps, and narrow
 output chunks. Attachments are refused, and
 sending remains unavailable. The existing real td-mail read fixture runs
 unchanged beside this endpoint fixture.
+
+## Prepared PostgreSQL real-client fixture
+
+The ignored `real_postgres_td_mail_reads_and_downloads` fixture requires
+local PostgreSQL 17 tools plus the native-built td-mail and isolated td-fetch
+test executables. It creates an empty database, publishes database profiles
+and TLS materials, delivers a multipart message under the cloud profile and
+serves the same account through the desktop profile's prepared HTTPS backend.
+The fixture drives discovery, mailbox listing, Email/query and Email/get,
+body display, decoded attachment download and raw-message download with the
+real client. Authentication and API/download work run on the fixed HTTPS
+workers. Its private CA enters only the existing test-only fetch process.
+
+This is an explicit PostgreSQL qualification command, separate from the
+SQLite native fixture. It does not activate a production PostgreSQL service
+or qualify flags, folder mutations, threads, submission, cloud-provider
+failover or managed-database deployment. Process and file cleanup belong to
+the fixture; no public endpoint is contacted.
