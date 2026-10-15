@@ -38,6 +38,7 @@ pub struct Binding {
     quotas: configuration::SharedQuotas,
     upload_maximum: usize,
     upload_expiry_seconds: usize,
+    work: crate::admission::WorkLimits,
 }
 impl Binding {
     pub fn epoch(&self) -> StoreEpoch {
@@ -60,6 +61,9 @@ impl Binding {
     }
     pub fn quotas(&self) -> configuration::SharedQuotas {
         self.quotas
+    }
+    pub fn work(&self) -> crate::admission::WorkLimits {
+        self.work
     }
     pub fn roles(&self) -> Roles {
         self.roles
@@ -156,6 +160,7 @@ pub fn load(
     let limits = configuration.candidate().resources().resources().limits();
     let upload_maximum = limits.message_bytes;
     let upload_expiry_seconds = limits.upload_expiry_seconds;
+    let work = *configuration.candidate().resources().admission().work();
     drop(candidate);
     if selection::observe(request, trust, deadline, epoch).map_err(Error::Selection)?
         != Some(selected)
@@ -175,6 +180,7 @@ pub fn load(
             quotas,
             upload_maximum,
             upload_expiry_seconds,
+            work,
         },
         configuration,
         policies,

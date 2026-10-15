@@ -4,6 +4,7 @@ use crate::{
     ids::{BlobId, DeviceId, UploadOperationId},
     postgres_devices,
     postgres_probe::{self, Request},
+    postgres_publication as publication,
     postgres_runtime_profile::Binding,
     postgres_schema,
 };
@@ -19,7 +20,7 @@ use tokio_postgres::Client;
 
 pub const MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RECEIPTS: i64 = 1024;
-const CHUNK: usize = 65536;
+use publication::CHUNK;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -283,38 +284,20 @@ pub fn publish(
             if count >= MAX_RECEIPTS {
                 return Err(Error::Capacity);
             }
-            let usage = client.query_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[&account]).await.map_err(|_| Error::Database)?;
-            let caps = upload.binding.quotas();
-            let limits = [
-                caps.body_bytes,
-                caps.blob_count,
-                caps.upload_bytes,
-                caps.queue_bytes,
-                caps.queue_submissions,
-            ];
-            let charges = [
-                upload.bytes.len() as u64,
-                1,
-                upload.bytes.len() as u64,
-                0,
-                0,
-            ];
-            let mut totals = [0i64; 5];
-            for (index, ((limit, charge), total)) in limits
-                .into_iter()
-                .zip(charges)
-                .zip(totals.iter_mut())
-                .enumerate()
-            {
-                let used: i64 = usage.try_get(index).map_err(|_| Error::Integrity)?;
-                let used = u64::try_from(used).map_err(|_| Error::Integrity)?;
-                let value = used
-                    .checked_add(charge)
-                    .filter(|value| *value <= limit)
-                    .ok_or(Error::Quota)?;
-                *total = i64::try_from(value).map_err(|_| Error::Integrity)?;
-            }
-            let [body_bytes, blob_count, upload_bytes, _, _] = totals;
+            let usage = publication::charge(
+                client,
+                upload.binding.account(),
+                upload.binding.quotas(),
+                [
+                    upload.bytes.len() as u64,
+                    1,
+                    upload.bytes.len() as u64,
+                    0,
+                    0,
+                ],
+            )
+            .await
+            .map_err(publication_error)?;
             let created_at: i64 = client
                 .query_one(
                     "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
@@ -329,49 +312,20 @@ pub fn publish(
                 .ok_or(Error::Integrity)?;
             let blob = upload.blob.as_bytes().as_slice();
             let length = i64::try_from(upload.bytes.len()).map_err(|_| Error::Capacity)?;
-            let chunks =
-                i64::try_from(upload.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
-            if client
-                .execute(
-                    "INSERT INTO td_mta.blob_ids VALUES($1,$2) ON CONFLICT DO NOTHING",
-                    &[&account, &blob],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Conflict);
-            }
-            if client
-                .execute(
-                    "INSERT INTO td_mta.blobs VALUES($1,$2,$3,$4,$5,$6,$7)",
-                    &[
-                        &account,
-                        &blob,
-                        &length,
-                        &upload.body_digest.as_slice(),
-                        &created_at,
-                        &next.to_be_bytes().as_slice(),
-                        &chunks,
-                    ],
-                )
-                .await
-                .map_err(|_| Error::Database)?
-                != 1
-            {
-                return Err(Error::Integrity);
-            }
-            let mut batch = Vec::new();
-            batch.try_reserve_exact(8).map_err(|_| Error::Capacity)?;
-            for (index, bytes) in upload.bytes.chunks(CHUNK * 8).enumerate() {
-                if Instant::now() >= deadline {
-                    return Err(Error::Connection(postgres_probe::Error::Deadline));
-                }
-                batch.clear();
-                batch.extend(bytes.chunks(CHUNK));
-                let ordinal = i64::try_from(index * 8).map_err(|_| Error::Capacity)?;
-                if client.execute("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[&account,&blob,&ordinal,&batch]).await.map_err(|_| Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
-            }
+            publication::write_blob(
+                client,
+                publication::Blob {
+                    account: upload.binding.account(),
+                    id: upload.blob,
+                    bytes: &upload.bytes,
+                    digest: &upload.body_digest,
+                    created_at,
+                    changed: next,
+                },
+                deadline,
+            )
+            .await
+            .map_err(publication_error)?;
             if client
                 .execute(
                     "INSERT INTO td_mta.leases VALUES($1,$2,$3,$4,3,$5)",
@@ -389,7 +343,10 @@ pub fn publish(
             {
                 return Err(Error::Integrity);
             }
-            if client.execute("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4 WHERE account=$1", &[&account,&body_bytes,&blob_count,&upload_bytes]).await.map_err(|_| Error::Database)?!=1 { return Err(Error::Integrity); }
+            usage
+                .publish(client, upload.binding.account())
+                .await
+                .map_err(publication_error)?;
             if client
                 .execute(
                     "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
@@ -441,5 +398,16 @@ pub fn publish(
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),
         Err(error) => Err(Error::Connection(error)),
+    }
+}
+
+fn publication_error(error: publication::Error) -> Error {
+    match error {
+        publication::Error::Capacity => Error::Capacity,
+        publication::Error::Quota => Error::Quota,
+        publication::Error::Integrity => Error::Integrity,
+        publication::Error::Conflict => Error::Conflict,
+        publication::Error::Database => Error::Database,
+        publication::Error::Deadline => Error::Connection(postgres_probe::Error::Deadline),
     }
 }

@@ -554,8 +554,8 @@ src/postgres_mail.sql; version 4 adds src/postgres_devices.sql, and version 5
 adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
 version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
-Version 10 adds src/postgres_uploads.sql.
-New initialization applies all ten in
+Version 10 adds src/postgres_uploads.sql; version 11 adds
+src/postgres_drafts.sql. New initialization applies all eleven in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -573,7 +573,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the ten migrations and their ledger writes;
+permits 512 input frames for the eleven migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -588,8 +588,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently eleven rows); it requires
-exactly the ten ordered migration versions, their compiled DDL checksums and
+count plus one (currently twelve rows); it requires
+exactly the eleven ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -1454,7 +1454,7 @@ Body and upload byte charges and the blob count advance atomically, with no
 process-local fallback. Lowered limits refuse additional publication when any
 current usage exceeds its cap. Logical counters do not reserve server disk.
 Runtime ingress reservations, cleanup with fenced reclaim, HTTPS download
-dispatch, td-mail Email/set creation, SMTP publication and serving activation
+dispatch, SMTP publication and serving activation
 remain cutover work. This API does not make the SQLite/file-backed server use PostgreSQL.
 
 ## 36. Authenticated blob downloads
@@ -1481,3 +1481,41 @@ each retains its existing finite frame and byte budgets. Callback errors,
 swallowed reader errors, expired deadlines and failed snapshot connections
 cannot become success. This cold boundary does not yet connect production
 HTTPS dispatch or replace runtime connection and worker admission.
+
+
+## 37. Retained td-mail draft creation
+
+Schema version 11 adds bounded historical `draft_receipts` and an index for
+Email/Thread identity collision checks against retained history. Each account
+retains at most 1024 draft receipts until runtime retry and retention policy
+are activated. Explicit PUBLIC revocation also applies when the operator has
+permissive default table privileges.
+
+`postgres_drafts` prepares the plain-text structured draft used by td-mail's
+Email/set creation. It reuses the existing composer, selected profile work
+limits and at-most-32-MiB message limit. Composition and SHA-256 finish before
+opening the publication transaction. The immutable prepared object retains
+body bytes, operation/object IDs and a digest binding the selected policy,
+account, device, mailbox, optional expected state and exact body. No app
+password is retained. Preparation and publication each have an original
+at-most-ten-second deadline; retry never extends an in-flight operation.
+
+Publication follows selection FOR SHARE then account FOR UPDATE, rechecks
+current policy and device authorization, and requires the selected mailbox
+and optional account state. It publishes body chunks, Email, one membership,
+$draft/$seen keywords, thread anchor, quota counters, account sequence and
+receipt in one synchronous transaction. Body and blob-count usage increase;
+no upload lease or queue charge is created. Upload and draft publication
+share the same private chunk writer and quota calculation. Thread selection
+checks nearest References, then In-Reply-To, then own Message-ID, with at
+most 32 entries per reference list and lowest Email ID for an anchor tie.
+Existing threads are never merged. The one new account sequence records
+Email creation, Thread creation/update and Mailbox update.
+
+Receipt inspection excludes a still-committing operation with an account
+shared lock. Matching historical success survives policy replacement and
+credential revocation without authorizing a new write. Lost COMMIT response
+requires retaining and resolving that same operation. Failure before commit
+rolls back bodies, ID reservation, metadata, usage and receipt together.
+This remains a cold storage API: HTTP dispatch, sender-identity policy,
+submission, runtime admission and the atomic production cutover remain work.

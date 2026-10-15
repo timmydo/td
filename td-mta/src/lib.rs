@@ -206,5 +206,7 @@ mod device_credentials;
 pub mod postgres_configuration;
 pub mod postgres_configuration_store;
 pub mod postgres_devices;
+pub mod postgres_drafts;
 pub mod postgres_flags;
+mod postgres_publication;
 pub mod postgres_uploads;

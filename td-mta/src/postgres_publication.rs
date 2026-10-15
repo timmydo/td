@@ -1,0 +1,130 @@
+//! Shared body and quota writes inside an already fenced account transaction.
+use crate::{
+    ids::{AccountId, BlobId},
+    postgres_configuration::SharedQuotas,
+};
+use std::time::Instant;
+use tokio_postgres::Client;
+
+pub(crate) const CHUNK: usize = 65536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Error {
+    Capacity,
+    Quota,
+    Integrity,
+    Conflict,
+    Database,
+    Deadline,
+}
+
+pub(crate) struct Usage([i64; 5]);
+
+/// The caller holds the account row FOR UPDATE until commit or rollback.
+pub(crate) async fn charge(
+    client: &Client,
+    account: AccountId,
+    caps: SharedQuotas,
+    charges: [u64; 5],
+) -> Result<Usage, Error> {
+    let usage = client.query_one("SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage WHERE account=$1", &[&account.as_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+    let limits = [
+        caps.body_bytes,
+        caps.blob_count,
+        caps.upload_bytes,
+        caps.queue_bytes,
+        caps.queue_submissions,
+    ];
+    let mut totals = [0; 5];
+    for (index, ((limit, charge), total)) in limits
+        .into_iter()
+        .zip(charges)
+        .zip(totals.iter_mut())
+        .enumerate()
+    {
+        let used: i64 = usage.try_get(index).map_err(|_| Error::Integrity)?;
+        let used = u64::try_from(used).map_err(|_| Error::Integrity)?;
+        let value = used
+            .checked_add(charge)
+            .filter(|value| *value <= limit)
+            .ok_or(Error::Quota)?;
+        *total = i64::try_from(value).map_err(|_| Error::Integrity)?;
+    }
+    Ok(Usage(totals))
+}
+
+impl Usage {
+    /// Publish only in the same account transaction that computed the charge.
+    pub(crate) async fn publish(self, client: &Client, account: AccountId) -> Result<(), Error> {
+        let [body, blobs, uploads, queue, submissions] = self.0;
+        if client.execute("UPDATE td_mta.account_usage SET body_bytes=$2,blob_count=$3,upload_bytes=$4,queue_bytes=$5,queue_submissions=$6 WHERE account=$1", &[&account.as_bytes().as_slice(),&body,&blobs,&uploads,&queue,&submissions]).await.map_err(|_|Error::Database)?!=1 { return Err(Error::Integrity); }
+        Ok(())
+    }
+}
+
+/// Prepared immutable bytes and their verified digest; no input is read from a
+/// remote peer while this transaction holds its account lock.
+pub(crate) struct Blob<'a> {
+    pub account: AccountId,
+    pub id: BlobId,
+    pub bytes: &'a [u8],
+    pub digest: &'a [u8; 32],
+    pub created_at: i64,
+    pub changed: u64,
+}
+
+pub(crate) async fn write_blob(
+    client: &Client,
+    value: Blob<'_>,
+    deadline: Instant,
+) -> Result<(), Error> {
+    if value.bytes.len() > 32 * 1024 * 1024 {
+        return Err(Error::Capacity);
+    }
+    let account = value.account.as_bytes().as_slice();
+    let blob = value.id.as_bytes().as_slice();
+    let length = i64::try_from(value.bytes.len()).map_err(|_| Error::Capacity)?;
+    let chunks = i64::try_from(value.bytes.len().div_ceil(CHUNK)).map_err(|_| Error::Capacity)?;
+    if client
+        .execute(
+            "INSERT INTO td_mta.blob_ids VALUES($1,$2) ON CONFLICT DO NOTHING",
+            &[&account, &blob],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        != 1
+    {
+        return Err(Error::Conflict);
+    }
+    if client
+        .execute(
+            "INSERT INTO td_mta.blobs VALUES($1,$2,$3,$4,$5,$6,$7)",
+            &[
+                &account,
+                &blob,
+                &length,
+                &value.digest.as_slice(),
+                &value.created_at,
+                &value.changed.to_be_bytes().as_slice(),
+                &chunks,
+            ],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        != 1
+    {
+        return Err(Error::Integrity);
+    }
+    let mut batch = Vec::new();
+    batch.try_reserve_exact(8).map_err(|_| Error::Capacity)?;
+    for (index, bytes) in value.bytes.chunks(CHUNK * 8).enumerate() {
+        if Instant::now() >= deadline {
+            return Err(Error::Deadline);
+        }
+        batch.clear();
+        batch.extend(bytes.chunks(CHUNK));
+        let ordinal = i64::try_from(index * 8).map_err(|_| Error::Capacity)?;
+        if client.execute("INSERT INTO td_mta.blob_chunks SELECT $1,$2,$3+ordinality-1,bytes FROM unnest($4::bytea[]) WITH ORDINALITY chunks(bytes,ordinality)", &[&account,&blob,&ordinal,&batch]).await.map_err(|_|Error::Database)?!=batch.len() as u64 { return Err(Error::Integrity); }
+    }
+    Ok(())
+}

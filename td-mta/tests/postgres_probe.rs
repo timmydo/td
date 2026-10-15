@@ -337,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 10);
+    assert_eq!(receipt.version, 11);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -414,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        10
+        11
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -539,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":10"));
+    assert!(initialized.contains("\"schema_version\":11"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -710,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 10);
+    assert_eq!(receipt.version, 11);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1212,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "28");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "29");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1306,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1319,6 +1319,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_selection.sql"),
             include_str!("../src/postgres_flags.sql"),
             include_str!("../src/postgres_flag_batches.sql"),
+            include_str!("../src/postgres_uploads.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1350,6 +1351,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             5 => "account_bootstraps",
             6 => "config_selection",
             9 => "account_usage",
+            10 => "draft_receipts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1383,7 +1385,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 10);
+        assert_eq!(receipt.version, 11);
         if previous_version == 9 {
             assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"3|2|3|3|2");
         }
@@ -1883,10 +1885,17 @@ fn real_postgres_blob_downloads_enforce_device_leases_and_verify_snapshots() {
     exercise_configuration(ConfigurationExercise::Downloads);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_drafts_publish_body_threads_history_and_retained_outcomes() {
+    exercise_configuration(ConfigurationExercise::Drafts);
+}
+
 enum ConfigurationExercise {
     Flags,
     Uploads,
     Downloads,
+    Drafts,
 }
 
 fn exercise_configuration(exercise: ConfigurationExercise) {
@@ -2423,6 +2432,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Drafts => {
+                    exercise_drafts(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Downloads => {
                     exercise_downloads(&fixture, &request, &trust, prepared.binding())
@@ -4227,4 +4239,222 @@ fn exercise_uploads(
         uploads::inspect(request, trust, deadline(), &first),
         Err(uploads::Error::Integrity)
     );
+}
+
+fn exercise_drafts(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use td_mta::{
+        compose_text::{Address, Message},
+        ids::MailboxId,
+        postgres_body as body, postgres_devices as devices, postgres_drafts as drafts,
+    };
+    let account = binding.account();
+    let creation = devices::prepare_creation(binding.epoch(), account, "draft fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &creation).unwrap();
+    let device = creation.device_id();
+    let password = creation.password();
+    let mailbox = MailboxId::from_bytes([0x21; 16]);
+    sql(fixture, &format!("INSERT INTO td_mta.mailboxes SELECT id,decode('{mailbox}','hex'),'Drafts',NULL,NULL,0,1,sequence FROM td_mta.accounts"));
+    let message = |id, refs| Message {
+        from: Address {
+            name: "Sender",
+            email: "sender@example.test",
+        },
+        to: &[],
+        cc: &[],
+        bcc: &[],
+        reply_to: &[],
+        subject: "Draft subject",
+        message_id: id,
+        in_reply_to: &[],
+        references: refs,
+        sent_at_ms: 0,
+        text: "hello\nworld",
+    };
+    let prepare = |message: &Message<'_>, expected| {
+        drafts::prepare(
+            drafts::DraftRequest {
+                binding,
+                device,
+                mailbox,
+                expected,
+            },
+            message,
+            deadline(),
+        )
+        .unwrap()
+    };
+    let publish =
+        |draft: &drafts::Draft| drafts::publish(request, trust, deadline(), draft, password);
+    let first = prepare(&message("first@example.test", &[]), Some(1));
+    assert_eq!(
+        drafts::inspect(request, trust, deadline(), &first).unwrap(),
+        None
+    );
+    assert_eq!(
+        drafts::publish(request, trust, deadline(), &first, b"invalid"),
+        Err(drafts::Error::Unauthenticated)
+    );
+    let outcome = publish(&first).unwrap();
+    assert_eq!((outcome.old_sequence, outcome.new_sequence), (1, 2));
+    assert_eq!(publish(&first).unwrap(), outcome);
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.draft_receipts"),
+        "1"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT string_agg(keyword,',' ORDER BY keyword) FROM td_mta.keywords"
+        ),
+        "$draft,$seen"
+    );
+    assert_eq!(sql(fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),format!("{}|1|0|0|0",outcome.length));
+    assert_eq!(sql(fixture,"SELECT string_agg(kind::text || ':' || action::text,',' ORDER BY operation) FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex')"),"3:1,2:1,1:2");
+    let bytes = body::with_email(
+        request,
+        trust,
+        deadline(),
+        body::ReadRequest {
+            epoch: binding.epoch(),
+            account,
+            email: outcome.email,
+            maximum: 32 * 1024 * 1024,
+        },
+        password,
+        |metadata, reader| {
+            assert_eq!(metadata.blob, outcome.blob);
+            assert_eq!(metadata.thread, outcome.thread);
+            let mut bytes = vec![0; outcome.length as usize];
+            let mut position = 0;
+            while position < bytes.len() {
+                let n = reader.read_at(position as u64, &mut bytes[position..])?;
+                assert!(n > 0);
+                position += n;
+            }
+            Ok(bytes)
+        },
+    )
+    .unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("Message-ID:\r\n <first@example.test>"));
+    assert!(text.ends_with("aGVsbG8NCndvcmxk\r\n"));
+    let reply_refs = ["first@example.test"];
+    let reply = prepare(&message("reply@example.test", &reply_refs), Some(2));
+    let reply_outcome = publish(&reply).unwrap();
+    assert_eq!(reply_outcome.thread, outcome.thread);
+    assert_eq!(sql(fixture,"SELECT string_agg(kind::text || ':' || action::text,',' ORDER BY operation) FROM td_mta.changes WHERE sequence=decode('0000000000000003','hex')"),"3:1,2:2,1:2");
+    let other = prepare(&message("other@example.test", &[]), None);
+    let other_outcome = publish(&other).unwrap();
+    assert_ne!(other_outcome.thread, outcome.thread);
+    let nearest_refs = ["first@example.test", "other@example.test"];
+    let nearest = prepare(&message("nearest@example.test", &nearest_refs), None);
+    assert_eq!(publish(&nearest).unwrap().thread, other_outcome.thread);
+    let duplicate = prepare(&message("first@example.test", &[]), None);
+    assert_eq!(publish(&duplicate).unwrap().thread, outcome.thread);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.threads"), "2");
+    let stale = prepare(&message("stale@example.test", &[]), Some(1));
+    assert_eq!(publish(&stale), Err(drafts::Error::State));
+    let missing = drafts::prepare(
+        drafts::DraftRequest {
+            binding,
+            device,
+            mailbox: MailboxId::from_bytes([0x22; 16]),
+            expected: None,
+        },
+        &message("missing@example.test", &[]),
+        deadline(),
+    )
+    .unwrap();
+    assert_eq!(publish(&missing), Err(drafts::Error::MissingMailbox));
+    assert!(matches!(
+        drafts::prepare(
+            drafts::DraftRequest {
+                binding,
+                device,
+                mailbox,
+                expected: None
+            },
+            &message("bad\r\nid@example.test", &[]),
+            deadline()
+        ),
+        Err(drafts::Error::Compose(_))
+    ));
+    let pending = prepare(&message("pending@example.test", &[]), None);
+    let usage=sql(fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage");
+    let restore="UPDATE td_mta.account_usage SET body_bytes=(SELECT sum(length) FROM td_mta.blobs),blob_count=(SELECT count(*) FROM td_mta.blobs)";
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.account_usage SET blob_count={}",
+            binding.quotas().blob_count
+        ),
+    );
+    assert_eq!(publish(&pending), Err(drafts::Error::Quota));
+    sql(fixture, restore);
+    sql(fixture,"CREATE FUNCTION public.reject_draft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject draft'; END $$; CREATE TRIGGER reject_draft BEFORE INSERT ON td_mta.draft_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_draft()");
+    assert_eq!(publish(&pending), Err(drafts::Error::Database));
+    assert_eq!(sql(fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),usage);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.blob_ids"), "5");
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "5");
+    assert_eq!(
+        drafts::inspect(request, trust, deadline(), &pending).unwrap(),
+        None
+    );
+    sql(fixture,"DROP TRIGGER reject_draft ON td_mta.draft_receipts; UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
+    assert_eq!(publish(&pending), Err(drafts::Error::Policy));
+    assert_eq!(publish(&first).unwrap(), outcome);
+    sql(fixture,"UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex'); CREATE FUNCTION public.delay_draft() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_draft AFTER INSERT ON td_mta.draft_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_draft()");
+    assert_eq!(
+        drafts::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_secs(2),
+            &pending,
+            password
+        ),
+        Err(drafts::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(fixture, "DROP TRIGGER delay_draft ON td_mta.draft_receipts");
+    let recovered = drafts::inspect(request, trust, deadline(), &pending)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.new_sequence, 7);
+    assert_eq!(publish(&pending).unwrap(), recovered);
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.emails"), "6");
+    let capacity = prepare(&message("capacity@example.test", &[]), None);
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')",
+    );
+    assert_eq!(publish(&capacity), Err(drafts::Error::Capacity));
+    assert_eq!(publish(&first).unwrap(), outcome);
+    sql(
+        fixture,
+        "UPDATE td_mta.accounts SET sequence=decode('0000000000000007','hex')",
+    );
+    sql(fixture,&format!("INSERT INTO td_mta.draft_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),decode(repeat('00',16),'hex'),0,0,decode('0000000000000000','hex'),decode('0000000000000001','hex') FROM generate_series(1,1024) n"));
+    assert_eq!(publish(&capacity), Err(drafts::Error::Capacity));
+    assert_eq!(publish(&first).unwrap(), outcome);
+    sql(
+        fixture,
+        "DELETE FROM td_mta.draft_receipts WHERE request_digest=decode(repeat('00',32),'hex')",
+    );
+    let revoke = devices::prepare_revocation(binding.epoch(), account, device, 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(publish(&capacity), Err(drafts::Error::Unauthenticated));
+    assert_eq!(publish(&first).unwrap(), outcome);
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.draft_receipts SET length=length+1 WHERE operation=decode('{}','hex')",
+            first.operation()
+        ),
+    );
+    assert_eq!(publish(&first), Err(drafts::Error::Integrity));
 }
