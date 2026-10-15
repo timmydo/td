@@ -556,7 +556,8 @@ version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
 Version 10 adds src/postgres_uploads.sql; version 11 adds
 src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
-src/postgres_receiving.sql. New initialization applies all thirteen in
+src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql.
+New initialization applies all fourteen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1786,10 +1787,37 @@ share it; at most 1000 copied recipient mailboxes are retained. Original
 stored bytes remain unchanged.
 
 The result contains passive policy/source evidence and no password or live
-snapshot. It grants no continuing device authority. Future publication must
+snapshot. It grants no continuing device authority. Publication must
 recheck the source identity, optional state, selected generation and device
 under the account transaction, enforce shared quotas, and atomically publish
 the outgoing blob, submission, recipients, history and operation receipt.
 Deletion, revocation or a configuration change after preparation can therefore
-refuse publication. Runtime memory admission and atomic enqueueing remain
-separate work.
+refuse publication. Section 48 supplies the owner-side enqueue transaction;
+runtime memory admission remains separate work.
+
+
+## 48. Retained submission publication
+
+Schema version 14 adds owner-private submission_receipts. The inert
+postgres_submissions worker assigns random operation, submission and blob IDs
+to a verified prepared input, retaining its bytes and a domain-separated
+request digest across retries. No client endpoint or relay worker is enabled.
+
+Publication locks configuration before the account, then freshly checks the
+selected generation/version, JMAP role, device and optional state. The source
+Email must still reference the verified blob/thread and manifest. It charges
+one outgoing body/blob, queue bytes and one submission against shared quotas.
+A database UTC timestamp supplies sendAt and checked five-day expiresAt.
+Outgoing chunks, submission, ordered initially Queued recipients, account
+sequence, submission-created history, usage and receipt commit together.
+The visible Email and its blind-recipient headers remain unchanged.
+
+Receipts are bounded to 1024 per account and retained independently of the
+source Email or queued submission. Concurrent publication of one retained
+operation serializes through the account row. Lost COMMIT responses remain
+indeterminate until primary receipt inspection resolves them; a digest
+mismatch refuses replay. Historical success survives later revocation, source
+deletion or configuration replacement. Deleting the source after enqueueing
+does not cancel delivery or retire its separately owned outgoing body.
+Runtime admission, receipt reclamation, dispatch, fenced multi-instance queue
+ownership and activation remain cutover work.

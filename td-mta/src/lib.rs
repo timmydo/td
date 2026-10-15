@@ -129,6 +129,7 @@ pub mod postgres_schema;
 pub mod postgres_selection;
 mod postgres_snapshot;
 pub mod postgres_submission_input;
+pub mod postgres_submissions;
 pub mod preview_json;
 pub mod property_selection;
 pub mod recipient_sweep;

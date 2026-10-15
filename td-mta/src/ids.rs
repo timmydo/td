@@ -79,6 +79,7 @@ object_ids!(
     UploadOperationId,
     DraftOperationId,
     ReceivingOperationId,
+    SubmissionOperationId,
     MailboxOperationId,
     StoreEpoch,
     MaterialVersion,
