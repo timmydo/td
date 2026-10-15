@@ -31,6 +31,7 @@ pub enum Error {
     Body(postgres_body::Error),
     Mailboxes(postgres_mailboxes::Error),
     Output(ports::Error),
+    Changes(crate::jmap_changes::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -338,6 +339,38 @@ impl Snapshot<'_> {
         }
         self.check()?;
         result
+    }
+    /// Fold a transaction-aligned page on this snapshot, charging each history
+    /// poll to the caller's original request allowance.
+    pub fn changes(
+        &mut self,
+        kind: crate::sync::DataType,
+        since: crate::sync::DataState,
+        maximum: usize,
+        before_poll: &mut dyn FnMut() -> Result<(), ports::Error>,
+    ) -> Result<crate::jmap_changes::Page, Error> {
+        self.check()?;
+        let result = crate::postgres_changes::read_snapshot(
+            &mut self.worker,
+            self.identity,
+            kind,
+            since,
+            maximum,
+            before_poll,
+        )
+        .map_err(Error::Changes);
+        if matches!(
+            result,
+            Err(Error::Changes(
+                crate::jmap_changes::Error::CannotCalculateChanges
+                    | crate::jmap_changes::Error::Invalid
+            ))
+        ) {
+            self.check()?;
+            result
+        } else {
+            self.retain(result)
+        }
     }
     /// Names, hierarchy and counts share this view's policy/device admission,
     /// state and deadline. Returned rows confer no later read authority.

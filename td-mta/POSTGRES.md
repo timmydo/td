@@ -2447,3 +2447,19 @@ td-mail supplies explicit IDs, and account-wide thread enumeration is outside
 this increment. Production remains on the local backend until atomic cutover.
 The real-client PostgreSQL fixture also retrieves the delivered message by
 its thread ID and checks the returned ID and body.
+
+## 76. Prepared PostgreSQL object changes
+
+Mailbox/changes, Email/changes and Thread/changes use the existing
+transaction-aligned history merger on the authenticated batch snapshot.
+The shared argument parser, state validation, page encoding and errors stay
+unchanged. The PostgreSQL reader does not open another connection or refresh
+its snapshot between methods. Each history poll charges the original HTTP
+response work allowance and checks the execution deadline; the existing
+4096-poll history bound also applies.
+
+A foreign, stale or wrong-kind state returns cannotCalculateChanges without
+poisoning a healthy snapshot, so later methods can continue. Database,
+integrity, work and deadline failures remain terminal for this prepared read
+batch. Final snapshot checks precede publication. Production activation and
+mutation coordination remain separate.

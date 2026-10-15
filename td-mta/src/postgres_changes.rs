@@ -8,7 +8,7 @@ use crate::{
     postgres_probe::{self, Request, Worker},
     postgres_runtime_profile::Binding,
     postgres_schema, postgres_snapshot,
-    sync::DataState,
+    sync::{DataState, DataType},
 };
 use std::{collections::VecDeque, io::ErrorKind, time::Instant};
 use td_crypto::TrustStore;
@@ -58,25 +58,36 @@ pub fn read(
                 })
             })
             .map_err(Error::Connection)??;
-        let mut view = View {
-            worker,
-            identity,
-            kind: since.kind.object_type(),
-            batch: VecDeque::new(),
-            complete: false,
-        };
-        let mut cursor = jmap_changes::Cursor::new(&mut view, since.kind, since, maximum)
-            .map_err(Error::Page)?;
-        for _ in 0..MAX_HISTORY_POLLS {
-            if cursor.poll().map_err(Error::Page)? {
-                return cursor.finish().map_err(Error::Page);
-            }
-        }
-        // A stable work-limit failure must let the client refresh its state,
-        // rather than retrying the same oversized folding history forever.
-        Err(Error::Page(jmap_changes::Error::CannotCalculateChanges))
+        read_snapshot(worker, identity, since.kind, since, maximum, &mut || Ok(()))
+            .map_err(Error::Page)
     })
     .map_err(Error::Connection)?
+}
+
+/// Consume history without opening a second transaction or refreshing authority.
+pub(crate) fn read_snapshot(
+    worker: &mut Worker,
+    identity: ViewIdentity,
+    kind: DataType,
+    since: DataState,
+    maximum: usize,
+    before_poll: &mut dyn FnMut() -> Result<(), ports::Error>,
+) -> Result<Page, jmap_changes::Error> {
+    let mut view = View {
+        worker,
+        identity,
+        kind: kind.object_type(),
+        batch: VecDeque::new(),
+        complete: false,
+    };
+    let mut cursor = jmap_changes::Cursor::new(&mut view, kind, since, maximum)?;
+    for _ in 0..MAX_HISTORY_POLLS {
+        before_poll()?;
+        if cursor.poll()? {
+            return cursor.finish();
+        }
+    }
+    Err(jmap_changes::Error::CannotCalculateChanges)
 }
 
 struct View<'a> {

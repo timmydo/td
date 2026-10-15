@@ -239,6 +239,13 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
         &mut self,
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn changes(
+        &mut self,
+        kind: crate::sync::DataType,
+        since: crate::sync::DataState,
+        maximum: usize,
+        before_poll: &mut dyn FnMut() -> Result<(), ports::Error>,
+    ) -> Result<crate::jmap_changes::Page, Error>;
     fn thread_emails(
         &mut self,
         thread: crate::ids::ThreadId,
@@ -267,6 +274,16 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         self.query_emails(query).map_err(postgres_read_error)
+    }
+    fn changes(
+        &mut self,
+        kind: crate::sync::DataType,
+        since: crate::sync::DataState,
+        maximum: usize,
+        before_poll: &mut dyn FnMut() -> Result<(), ports::Error>,
+    ) -> Result<crate::jmap_changes::Page, Error> {
+        self.changes(kind, since, maximum, before_poll)
+            .map_err(postgres_read_error)
     }
     fn thread_emails(
         &mut self,
@@ -322,6 +339,7 @@ fn postgres_read_error(error: crate::postgres_read::Error) -> Error {
         | Read::Mailboxes(crate::postgres_mailboxes::Error::Capacity)
         | Read::Body(crate::postgres_body::Error::Capacity) => Error::StorageCapacity,
         Read::Output(error) => mailbox_get::storage(error),
+        Read::Changes(error) => object_changes::changes(error),
         _ => Error::Storage(ports::Error::Invalid),
     }
 }
@@ -600,7 +618,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if self.read.is_some()
             && !matches!(
                 call.name,
-                b"Core/echo" | b"Mailbox/get" | b"Email/get" | b"Email/query" | b"Thread/get"
+                b"Core/echo"
+                    | b"Mailbox/get"
+                    | b"Email/get"
+                    | b"Email/query"
+                    | b"Thread/get"
+                    | b"Mailbox/changes"
+                    | b"Email/changes"
+                    | b"Thread/changes"
             )
         {
             return Err(Error::UnknownMethod);

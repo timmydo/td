@@ -38,7 +38,7 @@ impl ChangesKind {
         .map_err(|_| Error::State)
     }
 }
-fn changes(error: jmap_changes::Error) -> Error {
+pub(super) fn changes(error: jmap_changes::Error) -> Error {
     match error {
         jmap_changes::Error::CannotCalculateChanges => Error::CannotCalculateChanges,
         jmap_changes::Error::Store(error) => storage(error),
@@ -78,72 +78,94 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         }
         let since = since.ok_or(Error::CannotCalculateChanges)?;
         self.check()?;
-        let mut view = self
-            .retention
-            .method_view(self.account, self.execution)
-            .map_err(storage)?;
-        let mut cursor = jmap_changes::Cursor::new(&mut view, kind.data_type(), since, maximum)
-            .map_err(changes)?;
-        loop {
+        let mut read = self.read.take();
+        let result = (|| {
+            let mut native = None;
+            let page = if let Some(view) = read.as_mut() {
+                view.changes(kind.data_type(), since, maximum, &mut || {
+                    if self.retention.admit_before(self.execution)? {
+                        Ok(())
+                    } else {
+                        Err(crate::ports::Error::Deadline)
+                    }
+                })?
+            } else {
+                let view = self
+                    .retention
+                    .method_view(self.account, self.execution)
+                    .map_err(storage)?;
+                let view = native.insert(view);
+                let mut cursor = jmap_changes::Cursor::new(view, kind.data_type(), since, maximum)
+                    .map_err(changes)?;
+                loop {
+                    self.check()?;
+                    if cursor.poll().map_err(changes)? {
+                        break;
+                    }
+                }
+                cursor.finish().map_err(changes)?
+            };
+            let start = self.retention.len();
+            self.append(br#"{"accountId":"#)?;
+            self.push_id(&account)?;
+            let mut state = [0; DataState::WIRE_BYTES];
+            self.append(br#","oldState":""#)?;
+            self.append(
+                page.old_state
+                    .encode(&mut state)
+                    .map_err(|_| Error::State)?
+                    .as_bytes(),
+            )?;
+            self.append(br#"","newState":""#)?;
+            self.append(
+                page.new_state
+                    .encode(&mut state)
+                    .map_err(|_| Error::State)?
+                    .as_bytes(),
+            )?;
+            self.append(br#"","hasMoreChanges":"#)?;
+            self.append(if page.has_more { b"true" } else { b"false" })?;
+            for (name, action) in [
+                (b"created".as_slice(), ChangeAction::Created),
+                (b"updated".as_slice(), ChangeAction::Updated),
+                (b"destroyed".as_slice(), ChangeAction::Destroyed),
+            ] {
+                self.append(b",\"")?;
+                self.append(name)?;
+                self.append(b"\":[")?;
+                let mut first = true;
+                let mut id = [0; wire::IdKind::WIRE_BYTES];
+                for change in &page.changes {
+                    self.check()?;
+                    if change.action != action {
+                        continue;
+                    }
+                    if !first {
+                        self.append(b",")?;
+                    }
+                    first = false;
+                    self.append(b"\"")?;
+                    self.append(kind.encode(change.id, &mut id)?.as_bytes())?;
+                    self.append(b"\"")?;
+                }
+                self.append(b"]")?;
+            }
+            if kind == ChangesKind::Mailbox {
+                self.append(br#","updatedProperties":null"#)?;
+            }
+            self.append(b"}")?;
+            if let Some(view) = read.as_mut() {
+                view.check()?;
+            }
+            if let Some(view) = native.as_mut() {
+                view.check_snapshot().map_err(storage)?;
+            }
             self.check()?;
-            if cursor.poll().map_err(changes)? {
-                break;
-            }
-        }
-        let page = cursor.finish().map_err(changes)?;
-        let start = self.retention.len();
-        self.append(br#"{"accountId":"#)?;
-        self.push_id(&account)?;
-        let mut state = [0; DataState::WIRE_BYTES];
-        self.append(br#","oldState":""#)?;
-        self.append(
-            page.old_state
-                .encode(&mut state)
-                .map_err(|_| Error::State)?
-                .as_bytes(),
-        )?;
-        self.append(br#"","newState":""#)?;
-        self.append(
-            page.new_state
-                .encode(&mut state)
-                .map_err(|_| Error::State)?
-                .as_bytes(),
-        )?;
-        self.append(br#"","hasMoreChanges":"#)?;
-        self.append(if page.has_more { b"true" } else { b"false" })?;
-        for (name, action) in [
-            (b"created".as_slice(), ChangeAction::Created),
-            (b"updated".as_slice(), ChangeAction::Updated),
-            (b"destroyed".as_slice(), ChangeAction::Destroyed),
-        ] {
-            self.append(b",\"")?;
-            self.append(name)?;
-            self.append(b"\":[")?;
-            let mut first = true;
-            let mut id = [0; wire::IdKind::WIRE_BYTES];
-            for change in &page.changes {
-                self.check()?;
-                if change.action != action {
-                    continue;
-                }
-                if !first {
-                    self.append(b",")?;
-                }
-                first = false;
-                self.append(b"\"")?;
-                self.append(kind.encode(change.id, &mut id)?.as_bytes())?;
-                self.append(b"\"")?;
-            }
-            self.append(b"]")?;
-        }
-        if kind == ChangesKind::Mailbox {
-            self.append(br#","updatedProperties":null"#)?;
-        }
-        self.append(b"}")?;
-        view.check_snapshot().map_err(storage)?;
-        self.check()?;
-        let end = self.retention.publish().map_err(Error::Storage)?;
-        Ok(start..end)
+            let end = self.retention.publish().map_err(Error::Storage)?;
+            Ok(start..end)
+        })();
+        self.read = read;
+        result
     }
     fn changes_state(&mut self, item: &Item) -> Result<Option<DataState>, Error> {
         if item.kind != scan::Kind::String {

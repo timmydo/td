@@ -5635,7 +5635,7 @@ fn exercise_http_read(
         .unwrap();
     let thread_id = emails[0]["threadId"].as_str().unwrap();
     let thread_body = format!(
-        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/get",{{"accountId":"{account}","ids":["{thread_id}","{thread_id}"]}},"t"],["Thread/get",{{"accountId":"{account}","#ids":{{"resultOf":"t","name":"Thread/get","path":"/list/*/id"}},"properties":["id"]}},"p"],["Thread/get",{{"accountId":"{account}","ids":null}},"n"],["Thread/get",{{"accountId":"{account}","ids":[]}},"e"],["Email/changes",{{"accountId":"{account}"}},"u"]]}}"##
+        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/get",{{"accountId":"{account}","ids":["{thread_id}","{thread_id}"]}},"t"],["Thread/get",{{"accountId":"{account}","#ids":{{"resultOf":"t","name":"Thread/get","path":"/list/*/id"}},"properties":["id"]}},"p"],["Thread/get",{{"accountId":"{account}","ids":null}},"n"],["Thread/get",{{"accountId":"{account}","ids":[]}},"e"],["EmailSubmission/get",{{"accountId":"{account}"}},"u"]]}}"##
     );
     let (result, wire) = call(&thread_body, password, device, false, false, false);
     result.unwrap();
@@ -5652,6 +5652,77 @@ fn exercise_http_read(
     assert_eq!(replies[2][1]["type"].as_str(), Some("invalidArguments"));
     assert_eq!(replies[3][1]["list"].as_array().unwrap().len(), 0);
     assert_eq!(replies[4][1]["type"].as_str(), Some("unknownMethod"));
+    let current = td_mta::sync::DataState::decode(
+        response["methodResponses"][0][1]["state"].as_str().unwrap(),
+    )
+    .unwrap();
+    let mut states = Vec::new();
+    for kind in [
+        td_mta::sync::DataType::Mailbox,
+        td_mta::sync::DataType::Email,
+        td_mta::sync::DataType::Thread,
+    ] {
+        let state = td_mta::sync::DataState {
+            kind,
+            sequence: td_mta::format::Sequence::from_u64(0),
+            ..current
+        };
+        let mut encoded = [0; td_mta::sync::DataState::WIRE_BYTES];
+        states.push(state.encode(&mut encoded).unwrap().to_owned());
+    }
+    let changes_body = td_json::json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"], "methodCalls":[
+        ["Mailbox/changes", {"accountId":account,"sinceState":states[0]},"m"],
+        ["Email/changes", {"accountId":account,"sinceState":states[1]},"e"],
+        ["Thread/changes", {"accountId":account,"sinceState":states[2]},"t"],
+        ["Email/changes", {"accountId":account,"sinceState":states[0]},"wrong"],
+        ["Core/echo", {"after":true},"echo"]
+    ]}).to_string();
+    let (result, wire) = call(&changes_body, password, device, false, false, false);
+    result.unwrap();
+    let changes = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let replies = changes["methodResponses"].as_array().unwrap();
+    for (i, name) in ["Mailbox/changes", "Email/changes", "Thread/changes"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(replies[i][0].as_str(), Some(*name), "{changes}");
+        assert_eq!(replies[i][1]["oldState"].as_str(), Some(states[i].as_str()));
+        assert!(!replies[i][1]["hasMoreChanges"].is_true());
+        assert_eq!(replies[i][1]["destroyed"].as_array().unwrap().len(), 0);
+    }
+    assert_eq!(replies[1][1]["created"].as_array().unwrap().len(), 2);
+    assert_eq!(replies[2][1]["created"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        replies[3][1]["type"].as_str(),
+        Some("cannotCalculateChanges")
+    );
+    assert!(replies[4][1]["after"].is_true());
+    let mut exhausted = td_mta::postgres_read::Snapshot::open_resolved(
+        &slots,
+        &loaded,
+        service.executable,
+        deadline(),
+        binding,
+        password,
+    )
+    .unwrap();
+    let since = td_mta::sync::DataState::decode(&states[1]).unwrap();
+    assert!(matches!(
+        exhausted.changes(td_mta::sync::DataType::Email, since, 256, &mut || Err(
+            Error::Capacity
+        )),
+        Err(td_mta::postgres_read::Error::Changes(
+            td_mta::jmap_changes::Error::Store(Error::Capacity)
+        ))
+    ));
+    assert!(matches!(
+        exhausted.check(),
+        Err(td_mta::postgres_read::Error::Changes(
+            td_mta::jmap_changes::Error::Store(Error::Capacity)
+        ))
+    ));
+    drop(exhausted);
+
     let (result, wire) = call("{", password, device, false, false, false);
     result.unwrap();
     assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));
