@@ -1336,8 +1336,10 @@ most 254 bytes are copied from the validated configuration; binding clones
 share that immutable catalog. Diagnostic formatting redacts the mailboxes.
 The header and SMTP recipient limits come from the same selected profile.
 Identity lookup is configuration evidence, not sending authority: submission
-publication must freshly fence the selection and current device. No relay
-credentials or signature material enter the binding.
+publication must freshly fence the selection and current device. JMAP bindings
+also share the bounded visible Identity catalog, including public text/HTML
+signature bytes. No relay credentials or signature source paths enter the
+binding; diagnostic formatting redacts the visible catalog.
 
 Before returning, a final primary observation rejects a selection already
 superseded during preparation. This does not freeze future changes: runtime
@@ -2743,3 +2745,24 @@ publication, the submitting route, prepublication budget/device/deadline
 refusals, rollback, delayed COMMIT fencing, and exact receipt settlement while
 foreground capacity is occupied. JMAP dispatch, implicit success filing,
 durable startup ownership and capability activation remain separate work.
+
+## 90. Prepared PostgreSQL Identity/get
+
+Cold JMAP-profile preparation retains the existing bounded visible Identity
+catalog beside the immutable selected binding. Other role profiles do not
+allocate this catalog. The same resolved PostgreSQL identity/signature text
+drives the existing canonical visible-state digest and object encoder; no
+local-file fallback or second representation is introduced.
+
+Prepared read dispatch serves Identity/get through its freshly authenticated
+PostgreSQL snapshot and checks that snapshot before publishing the result.
+It does not open a local SQLite view. Account, epoch, selected configuration
+and deadline remain bound to that snapshot, while identity state depends on
+the visible configuration digest rather than the mail sequence. Catalog
+handles alone confer no live authorization.
+
+The read-dispatch fixture explicitly admits Submission to test identity
+listing, selected/missing IDs, result-reference lookup, signature bytes and
+foreign-account refusal alongside the normal Mail methods. HTTPS capability
+admission and the Session remain unchanged: this increment does not advertise
+Submission before sending and reconciliation are connected.

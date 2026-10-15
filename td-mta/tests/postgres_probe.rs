@@ -2852,6 +2852,10 @@ per_peer_limit = 1
             Some("main@example.test")
         );
         assert!(!format!("{:?}", prepared.binding()).contains("main@example.test"));
+        assert_eq!(
+            prepared.binding().identity_catalog().is_some(),
+            roles & 2 != 0
+        );
         if name == "desktop" {
             match exercise {
                 ConfigurationExercise::Client => {}
@@ -5308,7 +5312,7 @@ fn exercise_read_dispatch(
     use std::sync::Arc;
     use td_mta::{
         admission::{DiskLimits, ViewMode, WorkLimits},
-        jmap_request::{dispatch, response, OwnedValidation, CORE, MAIL},
+        jmap_request::{dispatch, response, OwnedValidation, CORE, MAIL, SUBMISSION},
         limits::Limits,
         ports::{Clock, Deadline, Tick},
         store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
@@ -5343,7 +5347,7 @@ fn exercise_read_dispatch(
         (&second, &first)
     };
     let input = format!(
-        r##"{{"using":["{CORE}","{MAIL}"],"methodCalls":[
+        r##"{{"using":["{CORE}","{MAIL}","{SUBMISSION}"],"methodCalls":[
         ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],
         ["Mailbox/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"Mailbox/get","path":"/list/*/id"}},"properties":["id"]}},"b"],
         ["Mailbox/get",{{"accountId":"{account}","ids":null,"properties":["name"]}},"c"],
@@ -5357,10 +5361,17 @@ fn exercise_read_dispatch(
         ["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"j","name":"Email/query","path":"/ids"}},"properties":["id"]}},"k"],
         ["Email/query",{{"accountId":"{account}","sort":[{{"property":"receivedAt","isAscending":true}}],"position":1,"limit":1}},"l"],
         ["Email/query",{{"accountId":"{account}","filter":{{"text":"unsupported"}}}},"m"],
-        ["Email/query",{{"accountId":"{account}","limit":0,"calculateTotal":true}},"n"]
+        ["Email/query",{{"accountId":"{account}","limit":0,"calculateTotal":true}},"n"],
+        ["Identity/get",{{"accountId":"{account}"}},"o"],
+        ["Identity/get",{{"accountId":"{account}","ids":["ibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ifefefefefefefefefefefefefefefefe"]}},"p"],
+        ["Identity/get",{{"accountId":"{account}","#ids":{{"resultOf":"o","name":"Identity/get","path":"/list/*/id"}}}},"q"],
+        ["Identity/get",{{"accountId":"afefefefefefefefefefefefefefefefe"}},"r"]
     ]}}"##
     );
-    let limits = Limits::default();
+    let limits = Limits {
+        json_methods: 18,
+        ..Limits::default()
+    };
     let mut bytes = vec![0; limits.json_bytes].into_boxed_slice();
     bytes[..input.len()].copy_from_slice(input.as_bytes());
     let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
@@ -5377,8 +5388,12 @@ fn exercise_read_dispatch(
     .unwrap();
     while !parser.step().unwrap() {}
     let resources = limits.plan().unwrap();
-    let mut validation =
-        OwnedValidation::new(parser.finish().unwrap(), &resources, &[CORE, MAIL]).unwrap();
+    let mut validation = OwnedValidation::new(
+        parser.finish().unwrap(),
+        &resources,
+        &[CORE, MAIL, SUBMISSION],
+    )
+    .unwrap();
     while !validation.step().unwrap() {}
     let request = validation.finish().unwrap();
     let directory = fixture.root.join(if blocked {
@@ -5461,7 +5476,7 @@ fn exercise_read_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 14);
+    assert_eq!(complete.responses().len(), 18);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -5516,6 +5531,14 @@ fn exercise_read_dispatch(
     );
     assert!(output.contains(r#""email":"sender@example.test""#));
 
+    assert_eq!(output.matches(r#"["Identity/get","#).count(), 3);
+    assert_eq!(output.matches(r#""email":"main@example.test""#).count(), 3);
+    assert_eq!(
+        output.matches(r#""textSignature":"signature\r\n""#).count(),
+        3
+    );
+    assert!(output.contains(r#""notFound":["ifefefefefefefefefefefefefefefefe"]},"p""#));
+    assert!(output.contains(r#"["error",{"type":"accountNotFound"},"r"]"#));
     drop(complete);
     assert_eq!(owner.used().unwrap(), 0);
     assert!(!owner.admission_stopped());

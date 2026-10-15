@@ -404,6 +404,9 @@ impl Snapshot<'_> {
     pub fn identity(&self) -> ViewIdentity {
         self.identity
     }
+    pub fn identity_catalog(&self) -> Option<std::sync::Arc<crate::identity_catalog::Catalog>> {
+        self.binding.identity_catalog()
+    }
     pub fn check(&mut self) -> Result<(), Error> {
         if let Some(error) = self.failed {
             return Err(error);

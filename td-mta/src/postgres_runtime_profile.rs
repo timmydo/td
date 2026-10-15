@@ -21,6 +21,7 @@ pub enum Error {
     MissingProfile,
     Capacity,
     Account,
+    IdentityCatalog(crate::identity_catalog::PreparationError),
     Selection(selection::Error),
     Configuration(configuration::Error),
     Bootstrap(postgres_accounts::Error),
@@ -43,6 +44,7 @@ pub struct Binding {
     header_maximum: usize,
     recipient_maximum: usize,
     identities: Arc<Vec<SendingIdentity>>,
+    identity_catalog: Option<Arc<crate::identity_catalog::Catalog>>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -93,6 +95,10 @@ impl Binding {
             .iter()
             .find(|identity| identity.id == id)
             .map(|identity| identity.email.as_str())
+    }
+    /// Visible configuration only; serving requires a fresh authenticated snapshot.
+    pub fn identity_catalog(&self) -> Option<Arc<crate::identity_catalog::Catalog>> {
+        self.identity_catalog.clone()
     }
     pub fn route(&self) -> &crate::postgres_routes::Route {
         &self.route
@@ -212,6 +218,17 @@ pub fn load(
     postgres_accounts::inspect(request, trust, deadline, epoch, account)
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
+    let identity_catalog = if roles.jmap() {
+        Some(Arc::new(
+            crate::identity_catalog::Catalog::prepare(
+                configuration.resolved_text(),
+                &td_crypto::Provider,
+            )
+            .map_err(Error::IdentityCatalog)?,
+        ))
+    } else {
+        None
+    };
     let route = candidate
         .route(profile)
         .ok_or(Error::MissingProfile)?
@@ -247,6 +264,7 @@ pub fn load(
             header_maximum,
             recipient_maximum,
             identities,
+            identity_catalog,
         },
         configuration,
         policies,

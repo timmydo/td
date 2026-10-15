@@ -35,12 +35,14 @@ impl std::fmt::Display for PreparationError {
     }
 }
 impl std::error::Error for PreparationError {}
+#[derive(Eq, PartialEq)]
 struct Entry {
     id: IdentityId,
     bytes: Range<usize>,
 }
 /// Immutable visible data only. Preparation requires trusted resolved config;
 /// this owner confers no authentication or submission authority.
+#[derive(Eq, PartialEq)]
 pub struct Catalog {
     account: AccountId,
     digest: [u8; 32],

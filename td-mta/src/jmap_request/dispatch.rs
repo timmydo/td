@@ -318,6 +318,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
         )
         .map_err(postgres_read_error)?;
     let account = snapshot.identity().account;
+    let identities = snapshot.identity_catalog();
     let complete = run_inner(
         plan,
         retention,
@@ -325,6 +326,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         Profile {
             read: Some(snapshot),
+            identities: identities.as_deref(),
             email_updates,
             ..Profile::default()
         },
@@ -732,6 +734,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             && !matches!(
                 call.name,
                 b"Core/echo"
+                    | b"Identity/get"
                     | b"Mailbox/get"
                     | b"Email/get"
                     | b"Email/query"

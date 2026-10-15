@@ -35,11 +35,21 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::State);
         }
         self.check()?;
-        let mut view = self
-            .retention
-            .method_view(self.account, self.execution)
-            .map_err(storage)?;
-        let state = catalog.state(view.identity()).map_err(|_| Error::State)?;
+        let mut view = if self.read.is_none() {
+            Some(
+                self.retention
+                    .method_view(self.account, self.execution)
+                    .map_err(storage)?,
+            )
+        } else {
+            None
+        };
+        let identity = match (self.read.as_ref(), view.as_ref()) {
+            (Some(read), None) => read.identity(),
+            (None, Some(view)) => view.identity(),
+            _ => return Err(Error::State),
+        };
+        let state = catalog.state(identity).map_err(|_| Error::State)?;
         if all {
             if catalog.ids().len() > maximum {
                 return Err(Error::RequestTooLarge);
@@ -80,7 +90,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         self.append(br#"],"notFound":["#)?;
         self.get_not_found(&requested)?;
         self.append(b"]}")?;
-        view.check_snapshot().map_err(storage)?;
+        if let Some(view) = view.as_mut() {
+            view.check_snapshot().map_err(storage)?;
+        }
+        if let Some(read) = self.read.as_mut() {
+            read.check()?;
+        }
         self.check()?;
         let end = self.retention.publish().map_err(Error::Storage)?;
         Ok(start..end)
