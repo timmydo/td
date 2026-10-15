@@ -10,6 +10,37 @@ use crate::{
 };
 use std::ops::Range;
 use td_json::scan;
+enum View<'v, 's, 'r> {
+    Native(&'v mut crate::store_fs::IndexReadView<'s, 'r>),
+    Postgres(&'v mut dyn super::MailRead),
+}
+impl View<'_, '_, '_> {
+    fn identity(&self) -> crate::ports::ViewIdentity {
+        match self {
+            Self::Native(view) => view.identity(),
+            Self::Postgres(view) => view.identity(),
+        }
+    }
+    fn check(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Native(view) => view.check_snapshot().map_err(storage),
+            Self::Postgres(view) => view.check(),
+        }
+    }
+    fn thread_emails(
+        &mut self,
+        thread: ThreadId,
+        after: Option<crate::ports::ThreadEmail>,
+        maximum: usize,
+    ) -> Result<Option<crate::ports::ThreadEmails>, Error> {
+        match self {
+            Self::Native(view) => view
+                .thread_emails(thread, after, maximum, &mut [])
+                .map_err(storage),
+            Self::Postgres(view) => view.thread_emails(thread, after, maximum),
+        }
+    }
+}
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     pub(super) fn thread_get(
         &mut self,
@@ -49,139 +80,152 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::AccountNotFound);
         }
         self.check()?;
-        let mut view = self
-            .retention
-            .method_view(self.account, self.execution)
-            .map_err(storage)?;
-        if all {
-            let mut after = None::<[u8; 16]>;
-            let mut key = [0; 16];
-            while let Some(record) = view
-                .next(
-                    Table::Threads,
-                    after.as_ref().map(|bytes| bytes.as_slice()),
-                    &mut key,
-                    &mut [],
-                )
-                .map_err(storage)?
-            {
+        if all && self.read.is_some() {
+            return Err(Error::InvalidArguments);
+        }
+        let mut read = self.read.take();
+        let result = (|| {
+            let mut native;
+            let mut view = match read.as_mut() {
+                Some(view) => View::Postgres(super::reborrow_read(&mut **view)),
+                None => {
+                    native = self
+                        .retention
+                        .method_view(self.account, self.execution)
+                        .map_err(storage)?;
+                    View::Native(&mut native)
+                }
+            };
+            if let View::Native(view) = &mut view {
+                if all {
+                    let mut after = None::<[u8; 16]>;
+                    let mut key = [0; 16];
+                    while let Some(record) = view
+                        .next(
+                            Table::Threads,
+                            after.as_ref().map(|bytes| bytes.as_slice()),
+                            &mut key,
+                            &mut [],
+                        )
+                        .map_err(storage)?
+                    {
+                        self.check()?;
+                        let Key::Thread(id) = record.key else {
+                            return Err(Error::State);
+                        };
+                        after = Some(*id.as_bytes());
+                        let page = view
+                            .thread_emails(id, None, 1, &mut [])
+                            .map_err(storage)?
+                            .ok_or(Error::State)?;
+                        if page.emails.is_empty() {
+                            if page.has_more {
+                                return Err(Error::State);
+                            }
+                            continue;
+                        }
+                        if requested.len() == maximum {
+                            return Err(Error::RequestTooLarge);
+                        }
+                        requested.push(Requested {
+                            name: None,
+                            id: Some(id),
+                            found: false,
+                        });
+                    }
+                }
+            }
+            let identity = view.identity();
+            let mut state_bytes = [0; DataState::WIRE_BYTES];
+            let state = DataState {
+                account: identity.account,
+                epoch: identity.epoch,
+                kind: DataType::Thread,
+                sequence: identity.committed_sequence,
+            }
+            .encode(&mut state_bytes)
+            .map_err(|_| Error::State)?;
+            let start = self.retention.len();
+            self.append(br#"{"accountId":"#)?;
+            self.push_id(&account)?;
+            self.append(br#","state":""#)?;
+            self.append(state.as_bytes())?;
+            self.append(br#"","list":["#)?;
+            let mut first = true;
+            let mut encoded = [0; wire::IdKind::WIRE_BYTES];
+            let window = if members { MAX_THREAD_EMAILS } else { 1 };
+            // Stored Thread values are empty; no row-value scratch is needed.
+            for item in &mut requested {
                 self.check()?;
-                let Key::Thread(id) = record.key else {
-                    return Err(Error::State);
+                let Some(id) = item.id else {
+                    continue;
                 };
-                after = Some(*id.as_bytes());
-                let page = view
-                    .thread_emails(id, None, 1, &mut [])
-                    .map_err(storage)?
-                    .ok_or(Error::State)?;
+                let Some(mut page) = view.thread_emails(id, None, window)? else {
+                    continue;
+                };
+                // Stored empty rows are not visible JMAP threads.
                 if page.emails.is_empty() {
                     if page.has_more {
                         return Err(Error::State);
                     }
                     continue;
                 }
-                if requested.len() == maximum {
-                    return Err(Error::RequestTooLarge);
+                if !first {
+                    self.append(b",")?;
                 }
-                requested.push(Requested {
-                    name: None,
-                    id: Some(id),
-                    found: false,
-                });
-            }
-        }
-        let identity = view.identity();
-        let mut state_bytes = [0; DataState::WIRE_BYTES];
-        let state = DataState {
-            account: identity.account,
-            epoch: identity.epoch,
-            kind: DataType::Thread,
-            sequence: identity.committed_sequence,
-        }
-        .encode(&mut state_bytes)
-        .map_err(|_| Error::State)?;
-        let start = self.retention.len();
-        self.append(br#"{"accountId":"#)?;
-        self.push_id(&account)?;
-        self.append(br#","state":""#)?;
-        self.append(state.as_bytes())?;
-        self.append(br#"","list":["#)?;
-        let mut first = true;
-        let mut encoded = [0; wire::IdKind::WIRE_BYTES];
-        let window = if members { MAX_THREAD_EMAILS } else { 1 };
-        // Stored Thread values are empty; no row-value scratch is needed.
-        for item in &mut requested {
-            self.check()?;
-            let Some(id) = item.id else {
-                continue;
-            };
-            let Some(mut page) = view
-                .thread_emails(id, None, window, &mut [])
-                .map_err(storage)?
-            else {
-                continue;
-            };
-            // Stored empty rows are not visible JMAP threads.
-            if page.emails.is_empty() {
-                if page.has_more {
-                    return Err(Error::State);
-                }
-                continue;
-            }
-            if !first {
-                self.append(b",")?;
-            }
-            first = false;
-            self.append(br#"{"id":""#)?;
-            self.append(
-                wire::encode_id(id, &mut encoded)
-                    .map_err(|_| Error::State)?
-                    .as_bytes(),
-            )?;
-            self.append(b"\"")?;
-            if members {
-                self.append(br#","emailIds":["#)?;
-                let mut first_email = true;
-                loop {
-                    for email in &page.emails {
-                        self.check()?;
-                        if !first_email {
-                            self.append(b",")?;
+                first = false;
+                self.append(br#"{"id":""#)?;
+                self.append(
+                    wire::encode_id(id, &mut encoded)
+                        .map_err(|_| Error::State)?
+                        .as_bytes(),
+                )?;
+                self.append(b"\"")?;
+                if members {
+                    self.append(br#","emailIds":["#)?;
+                    let mut first_email = true;
+                    loop {
+                        for email in &page.emails {
+                            self.check()?;
+                            if !first_email {
+                                self.append(b",")?;
+                            }
+                            first_email = false;
+                            self.append(b"\"")?;
+                            self.append(
+                                wire::encode_id(email.email, &mut encoded)
+                                    .map_err(|_| Error::State)?
+                                    .as_bytes(),
+                            )?;
+                            self.append(b"\"")?;
                         }
-                        first_email = false;
-                        self.append(b"\"")?;
-                        self.append(
-                            wire::encode_id(email.email, &mut encoded)
-                                .map_err(|_| Error::State)?
-                                .as_bytes(),
-                        )?;
-                        self.append(b"\"")?;
+                        if !page.has_more {
+                            break;
+                        }
+                        let after = page.emails.last().copied().ok_or(Error::State)?;
+                        self.check()?;
+                        page = view
+                            .thread_emails(id, Some(after), window)?
+                            .ok_or(Error::State)?;
+                        if page.emails.is_empty() {
+                            return Err(Error::State);
+                        }
                     }
-                    if !page.has_more {
-                        break;
-                    }
-                    let after = page.emails.last().copied().ok_or(Error::State)?;
-                    self.check()?;
-                    page = view
-                        .thread_emails(id, Some(after), window, &mut [])
-                        .map_err(storage)?
-                        .ok_or(Error::State)?;
-                    if page.emails.is_empty() {
-                        return Err(Error::State);
-                    }
+                    self.append(b"]")?;
                 }
-                self.append(b"]")?;
+                self.append(b"}")?;
+                item.found = true;
             }
-            self.append(b"}")?;
-            item.found = true;
-        }
-        self.append(br#"],"notFound":["#)?;
-        self.get_not_found(&requested)?;
-        self.append(b"]}")?;
-        view.check_snapshot().map_err(storage)?;
-        self.check()?;
-        let end = self.retention.publish().map_err(Error::Storage)?;
-        Ok(start..end)
+            self.append(br#"],"notFound":["#)?;
+            self.get_not_found(&requested)?;
+            self.append(b"]}")?;
+            view.check()?;
+            self.check()?;
+            let end = self.retention.publish().map_err(Error::Storage)?;
+            Ok(start..end)
+        })();
+        self.read = read;
+        result
     }
 }
 

@@ -2432,3 +2432,18 @@ replay; no full-message resident buffer is introduced. Both connection
 reservations survive callback output and are released after their sockets
 drop, including failed writes. A pool with fewer than two free slots refuses
 immediately. Uploads and production activation remain unimplemented.
+
+## 75. Prepared PostgreSQL Thread/get dispatch
+
+The prepared read dispatcher accepts td-mail's explicit Thread/get IDs using
+its existing argument validation, projection, result references and response
+encoder. Ordered membership windows come from the same authenticated
+PostgreSQL snapshot. Missing or empty threads are notFound; state and final
+snapshot checks bind the complete retained result to that view. The original
+execution deadline and output allowance cover every page.
+
+Omitted or null IDs are refused as invalidArguments on this prepared path;
+td-mail supplies explicit IDs, and account-wide thread enumeration is outside
+this increment. Production remains on the local backend until atomic cutover.
+The real-client PostgreSQL fixture also retrieves the delivered message by
+its thread ID and checks the returned ID and body.

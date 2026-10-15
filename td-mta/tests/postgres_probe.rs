@@ -5398,7 +5398,7 @@ fn exercise_read_dispatch(
         r#""list":[{{"id":"{mailbox}"}}],"notFound":[]}},"b""#
     )));
     assert!(output.contains(r#"["error",{"type":"invalidArguments"},"d"]"#));
-    assert!(output.contains(r#"["error",{"type":"unknownMethod"},"e"]"#));
+    assert!(output.contains(r#"["error",{"type":"invalidArguments"},"e"]"#));
     assert!(output.contains(r#"["Core/echo",{"after":true},"f"]"#));
     assert_eq!(output.matches(r#""name":"Drafts""#).count(), 2);
     assert!(
@@ -5570,7 +5570,7 @@ fn exercise_http_read(
     let mut id = [0; td_mta::wire::IdKind::WIRE_BYTES];
     let account = td_mta::wire::encode_id(binding.account(), &mut id).unwrap();
     let body = format!(
-        r##"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}","properties":["name"]}},"m"],["Email/query",{{"accountId":"{account}","calculateTotal":true}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","blobId","subject","textBody","bodyValues"],"fetchTextBodyValues":true}},"g"]]}}"##
+        r##"{{"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{{"accountId":"{account}","properties":["name"]}},"m"],["Email/query",{{"accountId":"{account}","calculateTotal":true}},"q"],["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"q","name":"Email/query","path":"/ids"}},"properties":["id","blobId","threadId","subject","textBody","bodyValues"],"fetchTextBodyValues":true}},"g"]]}}"##
     );
     td_json::parse(&body).unwrap();
     let control = td_mta::smtp_receiving::Control::default();
@@ -5628,6 +5628,30 @@ fn exercise_http_read(
         );
         assert!(json.contains("snapshot text"));
     }
+    let (_, wire) = call(&body, password, device, false, false, false);
+    let response = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let emails = response["methodResponses"][2][1]["list"]
+        .as_array()
+        .unwrap();
+    let thread_id = emails[0]["threadId"].as_str().unwrap();
+    let thread_body = format!(
+        r##"{{"using":["urn:ietf:params:jmap:mail"],"methodCalls":[["Thread/get",{{"accountId":"{account}","ids":["{thread_id}","{thread_id}"]}},"t"],["Thread/get",{{"accountId":"{account}","#ids":{{"resultOf":"t","name":"Thread/get","path":"/list/*/id"}},"properties":["id"]}},"p"],["Thread/get",{{"accountId":"{account}","ids":null}},"n"],["Thread/get",{{"accountId":"{account}","ids":[]}},"e"],["Email/changes",{{"accountId":"{account}"}},"u"]]}}"##
+    );
+    let (result, wire) = call(&thread_body, password, device, false, false, false);
+    result.unwrap();
+    let response = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let replies = response["methodResponses"].as_array().unwrap();
+    assert_eq!(replies[0][0].as_str(), Some("Thread/get"), "{response}");
+    assert_eq!(replies[0][1]["list"].as_array().unwrap().len(), 1);
+    assert!(replies[0][1]["list"][0]["emailIds"]
+        .as_array()
+        .unwrap()
+        .contains(&emails[0]["id"]));
+    assert_eq!(replies[1][1]["list"][0]["id"].as_str(), Some(thread_id));
+    assert!(replies[1][1]["list"][0]["emailIds"].is_null());
+    assert_eq!(replies[2][1]["type"].as_str(), Some("invalidArguments"));
+    assert_eq!(replies[3][1]["list"].as_array().unwrap().len(), 0);
+    assert_eq!(replies[4][1]["type"].as_str(), Some("unknownMethod"));
     let (result, wire) = call("{", password, device, false, false, false);
     result.unwrap();
     assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));

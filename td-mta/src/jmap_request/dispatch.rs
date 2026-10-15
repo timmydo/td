@@ -239,6 +239,12 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
         &mut self,
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn thread_emails(
+        &mut self,
+        thread: crate::ids::ThreadId,
+        after: Option<ports::ThreadEmail>,
+        maximum: usize,
+    ) -> Result<Option<ports::ThreadEmails>, Error>;
     fn email_body(
         &mut self,
         email: crate::ids::EmailId,
@@ -261,6 +267,15 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         self.query_emails(query).map_err(postgres_read_error)
+    }
+    fn thread_emails(
+        &mut self,
+        thread: crate::ids::ThreadId,
+        after: Option<ports::ThreadEmail>,
+        maximum: usize,
+    ) -> Result<Option<ports::ThreadEmails>, Error> {
+        self.thread_emails(thread, after, maximum)
+            .map_err(postgres_read_error)
     }
     fn email_body(
         &mut self,
@@ -585,7 +600,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if self.read.is_some()
             && !matches!(
                 call.name,
-                b"Core/echo" | b"Mailbox/get" | b"Email/get" | b"Email/query"
+                b"Core/echo" | b"Mailbox/get" | b"Email/get" | b"Email/query" | b"Thread/get"
             )
         {
             return Err(Error::UnknownMethod);

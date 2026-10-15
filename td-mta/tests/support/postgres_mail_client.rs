@@ -281,6 +281,12 @@ pub(super) fn exercise(
             let email = &emails[0];
             assert_eq!(email["subject"].as_str(), Some("PostgreSQL client"));
             assert_eq!(email["body"].as_str(), Some("Hello PostgreSQL client"));
+            let thread = client.ask(json!({"command":"get_thread", "thread_id":email["thread_id"]}));
+            assert!(thread["ok"].is_true(), "{thread}");
+            let members = thread["emails"].as_array().unwrap();
+            assert_eq!(members.len(), 1, "{thread}");
+            assert_eq!(members[0]["id"], email["id"]);
+            assert_eq!(members[0]["body"], email["body"]);
             let attachment = &email["attachments"][0];
             let download = client.ask(json!({"command":"download_attachment", "blob_id":attachment["blob_id"], "name":"bytes.bin"}));
             assert!(download["ok"].is_true(), "{download}");
