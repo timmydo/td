@@ -100,6 +100,11 @@ impl Drop for Stop<'_> {
     }
 }
 
+pub(super) enum Mode {
+    Read(TcpListener),
+    Send(TcpListener),
+}
+
 pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
@@ -107,8 +112,12 @@ pub(super) fn exercise(
     binding: &Binding,
     configuration: &ResolvedProfile,
     policies: &GenerationLease<TlsPolicies>,
-    socket: TcpListener,
+    mode: Mode,
 ) {
+    let (socket, sending) = match mode {
+        Mode::Read(socket) => (socket, false),
+        Mode::Send(socket) => (socket, true),
+    };
     use td_mta::{
         format::row::{ReceiptRecipients, ReceiptTls, SmtpReceipt},
         postgres_devices, postgres_receiving,
@@ -186,7 +195,12 @@ pub(super) fn exercise(
         ResponseCoordinator::new(spool, &admission, &mut states, &mut cells, clock.clone())
             .unwrap();
     let origin = format!("https://localhost:{}", socket.local_addr().unwrap().port());
-    let session = td_mta::jmap_session::Session::mail_access(
+    let make_session = if sending {
+        td_mta::jmap_session::Session::mail_submission
+    } else {
+        td_mta::jmap_session::Session::mail_access
+    };
+    let session = make_session(
         Origin::parse(&origin).unwrap(),
         configuration
             .candidate()
@@ -281,6 +295,13 @@ pub(super) fn exercise(
             let mut client = Client::start(&config, &runtime);
             let connected = client.ask(json!({"command":"connect", "account":"test"}));
             assert!(connected["ok"].is_true(), "{connected}");
+            if sending {
+                exercise_send(&mut client, fixture, binding, &runtime);
+                drop(client);
+                drop(stop);
+                worker.join().unwrap().unwrap();
+                return;
+            }
             let mailboxes = client.ask(json!({"command":"list_mailboxes"}));
             assert!(mailboxes["ok"].is_true(), "{mailboxes}");
             let folders = mailboxes["mailboxes"].as_array().unwrap();
@@ -385,6 +406,13 @@ pub(super) fn exercise(
             worker.join().unwrap().unwrap();
         });
     }).unwrap();
+    if sending {
+        assert_eq!(pending.submissions.operation().unwrap(), None);
+        assert_eq!(pending.drafts.operation().unwrap(), None);
+        assert_eq!(pending.operation().unwrap(), None);
+        assert_eq!(responses.used().unwrap(), 0);
+        return;
+    }
     // A separate owner exercises a lost acknowledgement whose receipt commits.
     // The HTTP owner's absent receipt above remains fenced.
     let confirmed = td_mta::postgres_http_updates::Pending::default();
@@ -587,4 +615,76 @@ pub(super) fn exercise(
         ),
         "1"
     );
+}
+
+fn exercise_send(
+    client: &mut Client,
+    fixture: &Fixture,
+    binding: &Binding,
+    runtime: &std::path::Path,
+) {
+    let drafts = runtime.join("drafts");
+    fs::create_dir(&drafts).unwrap();
+    fs::set_permissions(&drafts, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = drafts.join("td-mail-draft-1-2.eml");
+    fs::write(&path, "From: main@example.test\nTo: recipient@example.test\nSubject: Real PostgreSQL send\n\nHello from td-mail through PostgreSQL.\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    // Keep a successful draft locally once, then exercise td-mail's retained
+    // send record and server reconciliation instead of publishing it twice.
+    let blocked_retirement = runtime.join("sent");
+    fs::write(&blocked_retirement, b"fixture blocks retirement").unwrap();
+    let sent = client.ask(json!({"command":"send_draft","path":path.to_str().unwrap()}));
+    assert!(sent["ok"].is_true(), "{sent}");
+    let email = sent["email_id"].as_str().unwrap();
+    let submission: td_mta::ids::SubmissionId =
+        td_mta::wire::Id::parse(sent["submission_id"].as_str().unwrap())
+            .unwrap()
+            .local()
+            .unwrap();
+    assert!(path.exists());
+    assert!(sent["retired_to"].is_null());
+    assert!(sent["warning"].as_str().is_some());
+    fs::remove_file(&blocked_retirement).unwrap();
+    let reconciled = client.ask(json!({"command":"send_draft","path":path.to_str().unwrap()}));
+    assert!(reconciled["ok"].is_true(), "{reconciled}");
+    assert_eq!(reconciled["submission_id"], sent["submission_id"]);
+    assert_eq!(reconciled["email_id"], sent["email_id"]);
+    assert!(!path.exists());
+    assert!(std::path::Path::new(reconciled["retired_to"].as_str().unwrap()).is_file());
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.submissions"), "1");
+    assert_eq!(sql(fixture, &format!("SELECT submitting_profile||':'||route_name FROM td_mta.submission_routes WHERE submission_id=decode('{submission}','hex')")), format!("{}:personal-smarthost",binding.profile()));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.keywords WHERE keyword='$draft'"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(fixture, "SELECT address FROM td_mta.recipients"),
+        "recipient@example.test"
+    );
+    let mailboxes = client.ask(json!({"command":"list_mailboxes"}));
+    assert!(mailboxes["ok"].is_true(), "{mailboxes}");
+    let mailbox = mailboxes["mailboxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == reconciled["kept_in"])
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let listing = client.ask(json!({"command":"query_emails","mailbox_id":mailbox,"limit":50}));
+    assert!(listing["ok"].is_true(), "{listing}");
+    let stored = listing["emails"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"].as_str() == Some(email))
+        .unwrap();
+    assert_eq!(stored["subject"].as_str(), Some("Real PostgreSQL send"));
+    assert!(stored["body"]
+        .as_str()
+        .unwrap()
+        .contains("Hello from td-mail through PostgreSQL."));
 }

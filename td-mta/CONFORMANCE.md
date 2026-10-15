@@ -422,3 +422,11 @@ the prepared HTTP body adapter with the td-mail structured plain-text shape.
 It checks creation, stale-state refusal, body retrieval, raw download and
 delayed-COMMIT receipt settlement. It does not exercise td-mail sending or
 advertise Submission.
+
+The separate `real_postgres_td_mail_sends_plain_text` fixture uses the prepared
+Submission Session and the real td-mail/fetch processes. It covers plain-text
+sending, identity discovery, folder creation, draft/submission/filing replies,
+stored message retrieval and retained-send reconciliation after failed local
+draft retirement. The second client attempt must return the original
+submission ID with exactly one queued submission. It does not deliver via
+SMTP, test attachment sending, or activate the production backend.

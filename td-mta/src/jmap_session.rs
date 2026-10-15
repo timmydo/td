@@ -47,6 +47,25 @@ impl Session {
         resources: &ResourcePlan,
         concurrency: Concurrency,
     ) -> Result<Self, Error> {
+        Self::prepare(origin, account, resources, concurrency, false)
+    }
+    /// Prepared PostgreSQL sending profile; caller must implement the td-mail
+    /// send and reconciliation flows before exposing this Session.
+    pub fn mail_submission(
+        origin: Origin<'_>,
+        account: AccountView<'_>,
+        resources: &ResourcePlan,
+        concurrency: Concurrency,
+    ) -> Result<Self, Error> {
+        Self::prepare(origin, account, resources, concurrency, true)
+    }
+    fn prepare(
+        origin: Origin<'_>,
+        account: AccountView<'_>,
+        resources: &ResourcePlan,
+        concurrency: Concurrency,
+        submission: bool,
+    ) -> Result<Self, Error> {
         let limits = resources.limits();
         if account.username.len() > 254
             || account.name.len() > MAX_NAME_BYTES
@@ -85,7 +104,7 @@ impl Session {
                 ",\"maxCallsInRequest\":{}",
                 ",\"maxObjectsInGet\":{}",
                 ",\"maxObjectsInSet\":{}",
-                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}}}}",
+                ",\"collationAlgorithms\":[]}},\"urn:ietf:params:jmap:mail\":{{}}{submission_global}}}",
                 ",\"accounts\":{{\"{}\":{{\"name\":",
             ),
             limits.message_bytes,
@@ -100,6 +119,7 @@ impl Session {
                 .min(crate::store_fs::MAX_MAILBOX_CREATES)
                 .min(crate::store_fs::MAX_EMAIL_DESTROYS),
             id,
+            submission_global = if submission { ",\"urn:ietf:params:jmap:submission\":{}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
         quoted(&mut out, account.name)?;
@@ -109,14 +129,22 @@ impl Session {
             "\"urn:ietf:params:jmap:core\":{{}},\"urn:ietf:params:jmap:mail\":{{",
             "\"maxMailboxesPerEmail\":null,\"maxMailboxDepth\":null,",
             "\"maxSizeMailboxName\":{},\"maxSizeAttachmentsPerEmail\":{},",
-            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}}}}}}}}",
-            ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\"}},\"username\":"
+            "\"emailQuerySortOptions\":[\"receivedAt\"],\"mayCreateTopLevelMailbox\":true}}{submission_account}}}}}}}",
+            ",\"primaryAccounts\":{{\"urn:ietf:params:jmap:mail\":\"{}\""
         ),
             crate::format::row::MAX_MAILBOX_NAME,
             limits.message_bytes,
-            id
+            id,
+            submission_account = if submission { ",\"urn:ietf:params:jmap:submission\":{\"maxDelayedSend\":0,\"submissionExtensions\":{}}" } else { "" },
         ))
         .map_err(|_| Error::Capacity)?;
+        if submission {
+            out.format(format_args!(
+                ",\"urn:ietf:params:jmap:submission\":\"{id}\""
+            ))
+            .map_err(|_| Error::Capacity)?;
+        }
+        out.append("},\"username\":").map_err(|_| Error::Capacity)?;
         quoted(&mut out, account.username)?;
         for (field, suffix) in [
             ("apiUrl", API_PATH),
@@ -278,6 +306,35 @@ mod tests {
         assert_eq!(value["state"].as_str(), Some(session.state().unwrap()));
         assert_eq!(value.as_object().unwrap().len(), 9);
         assert!(!format!("{session:?}").contains("reader"));
+    }
+    #[test]
+    fn prepared_submission_metadata_changes_capabilities_and_session_state() {
+        let limits = Limits::default();
+        let read = build("https://mail.test", account(), limits, 1, 2);
+        let send = Session::mail_submission(
+            Origin::parse("https://mail.test").unwrap(),
+            account(),
+            &limits.plan().unwrap(),
+            Concurrency {
+                uploads: 1,
+                requests: 2,
+            },
+        )
+        .unwrap();
+        let value = td_json::parse_slice(send.bytes()).unwrap();
+        let capability = crate::jmap_request::SUBMISSION;
+        assert!(value["capabilities"].get(capability).is_some());
+        let id = "a07070707070707070707070707070707";
+        let settings = &value["accounts"][id]["accountCapabilities"][capability];
+        assert_eq!(settings["maxDelayedSend"].as_u64(), Some(0));
+        assert!(settings["submissionExtensions"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+        assert_eq!(value["primaryAccounts"][capability].as_str(), Some(id));
+        assert_ne!(read.state().unwrap(), send.state().unwrap());
+        let read = td_json::parse_slice(read.bytes()).unwrap();
+        assert!(read["capabilities"].get(capability).is_none());
     }
     #[test]
     fn state_tracks_all_variable_metadata_and_canonical_origin() {

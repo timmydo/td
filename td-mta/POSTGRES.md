@@ -2898,3 +2898,21 @@ and uses the shared pending owners for draft, submission and filing. Read
 requests can use Identity/get and submission reconciliation through the same
 admission path. Session metadata and the active SQLite HTTP adapter remain
 unchanged; production activation still requires atomic backend cutover.
+
+## 99. Prepared plain-text sending Session and real-client qualification
+
+A separate Session constructor describes the prepared PostgreSQL td-mail
+sending profile: Submission appears in global and account capabilities and
+primaryAccounts, delayed sending is zero and submission extensions are
+empty. The active mail-access constructor stays unchanged. Capability bytes
+participate in the Session state digest. The constructor itself grants no
+authority and activates no production listener.
+
+The real-client sending fixture exercises discovery, Identity/get, Sent
+folder selection/creation, plain-text draft creation, durable submission,
+independent success filing and message retrieval through the native td-mail
+and isolated fetch processes. A deliberately failed local draft retirement
+leaves td-mail's send record in place; its next attempt reconciles through
+submission query/get and retires the draft without adding a submission.
+Queue rows retain the desktop submitting profile's smarthost route. No SMTP
+relay, attachments, cloud-provider failover or production cutover is claimed.

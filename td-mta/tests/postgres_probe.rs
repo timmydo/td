@@ -2191,9 +2191,16 @@ fn real_postgres_http_drafts_create_read_and_settle() {
     exercise_configuration(ConfigurationExercise::HttpDrafts);
 }
 
+#[test]
+#[ignore = "real PostgreSQL 17, td-mail and isolated td-fetch fixture executables required"]
+fn real_postgres_td_mail_sends_plain_text() {
+    exercise_configuration(ConfigurationExercise::SendClient);
+}
+
 enum ConfigurationExercise {
     HttpDrafts,
     Client,
+    SendClient,
     Submissions,
     SubmissionInput,
     Receiving,
@@ -2286,8 +2293,11 @@ certificate = "public"
         key = Version::from_bytes([3; 16]),
         ca = Version::from_bytes([4; 16])
     );
-    let mut https_socket = matches!(exercise, ConfigurationExercise::Client)
-        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let mut https_socket = matches!(
+        exercise,
+        ConfigurationExercise::Client | ConfigurationExercise::SendClient
+    )
+    .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let desktop = if let Some(socket) = &https_socket {
         let address = socket.local_addr().unwrap();
         desktop
@@ -2797,6 +2807,7 @@ per_peer_limit = 1
             | ConfigurationExercise::Read
             | ConfigurationExercise::HttpDrafts
             | ConfigurationExercise::Client
+            | ConfigurationExercise::SendClient
     ) {
         create_runtime_login(&fixture);
         grant_runtime_mail(&fixture);
@@ -2858,7 +2869,7 @@ per_peer_limit = 1
         );
         if name == "desktop" {
             match exercise {
-                ConfigurationExercise::Client => {}
+                ConfigurationExercise::Client | ConfigurationExercise::SendClient => {}
                 ConfigurationExercise::Submissions => {
                     exercise_submission_input(&fixture, &request, &trust, prepared.binding(), true)
                 }
@@ -2920,7 +2931,12 @@ per_peer_limit = 1
         );
         drop(domain.publish(policies).unwrap());
         let active = domain.current().unwrap();
-        if name == "desktop" && matches!(exercise, ConfigurationExercise::Client) {
+        if name == "desktop"
+            && matches!(
+                exercise,
+                ConfigurationExercise::Client | ConfigurationExercise::SendClient
+            )
+        {
             mail_client::exercise(
                 &fixture,
                 profile_request,
@@ -2928,7 +2944,11 @@ per_peer_limit = 1
                 &binding,
                 &configuration,
                 &active,
-                https_socket.take().unwrap(),
+                if matches!(exercise, ConfigurationExercise::SendClient) {
+                    mail_client::Mode::Send(https_socket.take().unwrap())
+                } else {
+                    mail_client::Mode::Read(https_socket.take().unwrap())
+                },
             );
             return;
         }
