@@ -5356,6 +5356,7 @@ fn exercise_read_dispatch(
         execution,
         snapshot,
         &clock,
+        false,
     );
     if let Some((mut child, mut input)) = blocker {
         use std::io::Write;
@@ -5554,11 +5555,13 @@ fn exercise_http_read(
         },
     )
     .unwrap();
+    let pending = td_mta::postgres_http_updates::Pending::default();
     let service = td_mta::postgres_http_api::Service {
         loaded: &loaded,
         executable: std::path::Path::new(env!("CARGO_BIN_EXE_td-mta")),
         binding,
         slots: &slots,
+        pending: &pending,
         responses: &responses,
         resources: &resources,
         session: &session,
@@ -5611,6 +5614,15 @@ fn exercise_http_read(
         assert!(!responses.admission_stopped());
         (result, String::from_utf8(wire.output).unwrap())
     };
+    let rights_body = td_json::json!({"using":["urn:ietf:params:jmap:mail"], "methodCalls":[["Mailbox/get",{"accountId":account,"properties":["myRights"]},"rights"]]}).to_string();
+    let (result, wire) = call(&rights_body, password, device, false, false, false);
+    result.unwrap();
+    let rights = td_json::parse(wire.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let rights = &rights["methodResponses"][0][1]["list"][0]["myRights"];
+    assert!(rights["maySetSeen"].is_true());
+    assert!(rights["maySetKeywords"].is_true());
+    assert!(!rights["mayAddItems"].is_true());
+    assert!(!rights["mayRemoveItems"].is_true());
     for chunked in [false, true] {
         let (result, wire) = call(&body, password, device, chunked, false, false);
         result.unwrap();

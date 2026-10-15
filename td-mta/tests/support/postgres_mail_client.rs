@@ -35,17 +35,25 @@ struct Client {
 }
 impl Client {
     fn start(config: &std::path::Path, root: &std::path::Path) -> Self {
+        Self::start_with_state(config, root, root)
+    }
+    fn start_with_state(
+        config: &std::path::Path,
+        root: &std::path::Path,
+        state: &std::path::Path,
+    ) -> Self {
+        fs::create_dir_all(state).unwrap();
         let mut process = Process(
             Command::new(std::env::var_os("TD_MTA_TEST_MAIL").unwrap())
                 .arg("--cli")
                 .arg(format!("--config={}", config.display()))
                 .env("XDG_RUNTIME_DIR", root)
-                .env("HOME", root)
-                .env("XDG_CONFIG_HOME", root.join("config"))
-                .env("XDG_STATE_HOME", root.join("state"))
-                .env("XDG_CACHE_HOME", root.join("cache"))
-                .env("XDG_DATA_HOME", root.join("data"))
-                .env("XDG_DOWNLOAD_DIR", root.join("downloads"))
+                .env("HOME", state)
+                .env("XDG_CONFIG_HOME", state.join("config"))
+                .env("XDG_STATE_HOME", state.join("state"))
+                .env("XDG_CACHE_HOME", state.join("cache"))
+                .env("XDG_DATA_HOME", state.join("data"))
+                .env("XDG_DOWNLOAD_DIR", state.join("downloads"))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -209,11 +217,13 @@ pub(super) fn exercise(
     let authentication =
         td_mta::postgres_http_auth::Authentication::new(&loaded, executable, binding, &clock)
             .unwrap();
+    let pending = td_mta::postgres_http_updates::Pending::default();
     let backend = td_mta::postgres_http_api::Service {
         loaded: &loaded,
         executable,
         binding,
         slots: &slots,
+        pending: &pending,
         responses: &responses,
         resources,
         session: &session,
@@ -287,6 +297,34 @@ pub(super) fn exercise(
             assert_eq!(members.len(), 1, "{thread}");
             assert_eq!(members[0]["id"], email["id"]);
             assert_eq!(members[0]["body"], email["body"]);
+            for (command, seen, flagged) in [("mark_read", true, false), ("flag", true, true), ("mark_unread", false, true), ("unflag", false, false)] {
+                let changed = client.ask(json!({"command":command, "id":email["id"]}));
+                assert!(changed["ok"].is_true(), "{changed}");
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$seen'"), if seen { "1" } else { "0" });
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"), if flagged { "1" } else { "0" });
+                let fresh = client.ask(json!({"command":"query_emails", "mailbox_id":folders[0]["id"], "limit":50}));
+                assert!(fresh["ok"].is_true(), "{fresh}");
+                assert_eq!(fresh["emails"][0]["is_read"].as_bool(), Some(seen), "{fresh}");
+                assert_eq!(fresh["emails"][0]["is_flagged"].as_bool(), Some(flagged), "{fresh}");
+            }
+            assert_eq!(pending.operation().unwrap(), None);
+            sql(fixture, "CREATE FUNCTION public.refuse_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit uncertainty'; END $$; CREATE CONSTRAINT TRIGGER refuse_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refuse_client_commit()");
+            let uncertain = client.ask(json!({"command":"flag", "id":email["id"]}));
+            assert!(uncertain["ok"].is_true(), "queued intention: {uncertain}");
+            let operation = pending.operation().unwrap().unwrap();
+            let blocked = client.ask(json!({"command":"flag", "id":email["id"]}));
+            assert!(blocked["ok"].is_true(), "queued intention: {blocked}");
+            assert_eq!(pending.operation().unwrap(), Some(operation));
+            assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword='$flagged'"), "0");
+            drop(client);
+            let mut client = Client::start_with_state(&config, &runtime, &runtime.join("fresh-reader"));
+            let connected = client.ask(json!({"command":"connect", "account":"test"}));
+            assert!(connected["ok"].is_true(), "{connected}");
+            let fresh = client.ask(json!({"command":"query_emails", "mailbox_id":folders[0]["id"], "limit":50}));
+            assert!(fresh["ok"].is_true(), "{fresh}");
+            assert!(!fresh["emails"][0]["is_flagged"].is_true());
+            sql(fixture, "DROP TRIGGER refuse_client_commit ON td_mta.flag_receipts; DROP FUNCTION public.refuse_client_commit()");
+
             let attachment = &email["attachments"][0];
             let download = client.ask(json!({"command":"download_attachment", "blob_id":attachment["blob_id"], "name":"bytes.bin"}));
             assert!(download["ok"].is_true(), "{download}");

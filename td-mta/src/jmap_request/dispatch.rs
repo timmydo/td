@@ -146,6 +146,36 @@ pub fn run_with_email_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
+/// Prepared singleton Email/set. Refuse mixed requests before any effect;
+/// this path has no native read adapter or draft/deletion implementation.
+pub fn run_with_postgres_updates<'state, 'c, 's, 'r, 'sr, 'a, P>(
+    plan: response::Plan<'state>,
+    retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
+    execution: ports::Deadline,
+    account: AccountId,
+    device: crate::ids::DeviceId,
+    flags: &dyn EmailMutator,
+) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
+    let request = plan.request().map_err(|_| Error::State)?;
+    if request.call_count() != 1
+        || request
+            .calls()
+            .next()
+            .is_none_or(|call| call.name != b"Email/set")
+    {
+        return Err(Error::InvalidArguments);
+    }
+    run_inner(
+        plan,
+        retention,
+        execution,
+        account,
+        Profile {
+            flags: Some((flags, device)),
+            ..Profile::default()
+        },
+    )
+}
 /// Authenticated td-mail mutations, including root-folder creation.
 pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
@@ -167,6 +197,7 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
             drafts: drafts.map(|creator| (creator, device)),
             identities: None,
             read: None,
+            keyword_updates: false,
         },
     )
 }
@@ -201,6 +232,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     snapshot: &mut crate::postgres_read::Snapshot<'_>,
     clock: &crate::clock::RuntimeClock,
+    keyword_updates: bool,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     snapshot
         .constrain_deadline(
@@ -217,6 +249,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         Profile {
             read: Some(snapshot),
+            keyword_updates,
             ..Profile::default()
         },
     )?;
@@ -357,6 +390,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         drafts,
         identities,
         read,
+        keyword_updates,
     } = profile;
     if identities.is_some_and(|catalog| catalog.account() != account) {
         return Err(Error::State);
@@ -403,6 +437,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         drafts,
         identities,
         read: read.as_mut().map(|view| reborrow_read(&mut **view)),
+        keyword_updates,
         submission,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
@@ -478,6 +513,7 @@ struct Profile<'a> {
     drafts: Option<(&'a dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'a crate::identity_catalog::Catalog>,
     read: Option<&'a mut dyn MailRead>,
+    keyword_updates: bool,
 }
 struct Resolved {
     value: usize,
@@ -494,6 +530,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     drafts: Option<(&'io dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'io crate::identity_catalog::Catalog>,
     read: Option<&'io mut dyn MailRead>,
+    keyword_updates: bool,
     submission: bool,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
@@ -1224,6 +1261,7 @@ pub(super) mod tests {
                 drafts: None,
                 identities: None,
                 read: None,
+                keyword_updates: false,
                 submission: false,
             };
             assert_eq!(
@@ -1633,6 +1671,7 @@ pub(super) mod tests {
                 drafts: None,
                 identities: None,
                 read: None,
+                keyword_updates: false,
                 submission: false,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));

@@ -33,12 +33,8 @@ impl EmailMutator for Flags {
             return Err(ports::Error::Conflict.into());
         }
         Ok(EmailUpdateCompletion {
-            before: ViewIdentity {
-                account: ACCOUNT,
-                epoch: StoreEpoch::from_bytes([7; 16]),
-                committed_sequence: Sequence::from_u64(3),
-                history_floor: Sequence::from_u64(0),
-            },
+            before_epoch: StoreEpoch::from_bytes([7; 16]),
+            before_sequence: Sequence::from_u64(3),
             outcome: self.commit_error.map_or(Ok(Sequence::from_u64(4)), Err),
             results: if self.broken {
                 vec![EmailUpdateResult::Updated]
@@ -621,4 +617,41 @@ fn destroy_preserves_known_commit_after_deadline_and_refuses_uncertain_or_broken
         );
         assert!(result["methodResponses"][1][1].get("destroyed").is_none());
     }
+}
+
+#[test]
+fn postgres_mutation_dispatch_refuses_mixed_or_read_calls_before_effects() {
+    let flags = Flags::default();
+    for calls in [
+        td_json::json!([["Email/get", {}, "read"]]),
+        td_json::json!([["Email/set", {}, "write"], ["Core/echo", {}, "echo"]]),
+    ] {
+        resolution::tests::run(|coordinator, spool, _, _| {
+            let retention = coordinator
+                .retain_response(spool, Deadline::after(Tick(0), 100).unwrap())
+                .unwrap();
+            let input = td_json::json!({"using":[CORE, MAIL], "methodCalls":calls}).to_string();
+            let request = dispatch::tests::request_with_capabilities(
+                &input,
+                Limits::default(),
+                &[CORE, MAIL],
+            );
+            let mut plan =
+                response::Preflight::new(request, "session", retention.maximum()).unwrap();
+            while !plan.step(&mut [0; 4096]).unwrap() {}
+            assert!(matches!(
+                dispatch::run_with_postgres_updates(
+                    plan.finish().unwrap(),
+                    retention,
+                    Deadline::after(Tick(0), 90).unwrap(),
+                    ACCOUNT,
+                    DEVICE,
+                    &flags
+                ),
+                Err(Error::InvalidArguments)
+            ));
+        });
+    }
+    assert!(flags.calls.borrow().is_empty());
+    assert!(flags.destroys.borrow().is_empty());
 }

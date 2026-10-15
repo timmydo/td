@@ -28,6 +28,7 @@ pub struct Service<'s, 'sr, 'a> {
     pub executable: &'s Path,
     pub binding: &'s Binding,
     pub slots: &'s ReadSlots,
+    pub pending: &'s crate::postgres_http_updates::Pending,
     pub responses: &'s ResponseCoordinator<'sr, 'a>,
     pub resources: &'s ResourcePlan,
     pub session: &'s Session,
@@ -245,6 +246,15 @@ impl Service<'_, '_, '_> {
         let (plan, execution) =
             exchange.receive(request, sender, start, &mut retention, |_| Ok(()))?;
         retention.admit_work_turn()?;
+        let execution = execution.min(crate::ports::Deadline::after(sender.last, 10_000)?);
+        let updates_only = {
+            let request = plan.request().map_err(|_| ApiError::Io(Error::Invalid))?;
+            request.call_count() == 1
+                && request
+                    .calls()
+                    .next()
+                    .is_some_and(|call| call.name == b"Email/set")
+        };
         let mut snapshot = Snapshot::open_resolved(
             self.slots,
             self.loaded,
@@ -254,20 +264,50 @@ impl Service<'_, '_, '_> {
             request.credentials.password(),
         )
         .map_err(|error| ApiError::Io(read_error(error)))?;
-        let complete =
-            dispatch::run_with_postgres_read(plan, retention, execution, &mut snapshot, self.clock)
-                .map_err(|error| {
-                    ApiError::Io(match error {
-                        dispatch::Error::Storage(error) => error,
-                        dispatch::Error::ExecutionDeadline => Error::Deadline,
-                        dispatch::Error::StorageBusy => Error::Busy,
-                        dispatch::Error::Forbidden => Error::Forbidden,
-                        _ => Error::Capacity,
-                    })
-                })?;
-        // All response bytes are retained and the final snapshot check passed.
-        // A slow client must not hold a database transaction or read slot.
-        drop(snapshot);
+        let complete = if updates_only {
+            drop(
+                snapshot
+                    .finish_method()
+                    .map_err(|error| ApiError::Io(read_error(error)))?,
+            );
+            let updates = crate::postgres_http_updates::Updates {
+                loaded: self.loaded,
+                executable: self.executable,
+                binding: self.binding,
+                slots: self.slots,
+                clock: self.clock,
+                pending: self.pending,
+                password: request.credentials.password(),
+            };
+            dispatch::run_with_postgres_updates(
+                plan,
+                retention,
+                execution,
+                self.binding.account(),
+                request.device,
+                &updates,
+            )
+        } else {
+            let result = dispatch::run_with_postgres_read(
+                plan,
+                retention,
+                execution,
+                &mut snapshot,
+                self.clock,
+                true,
+            );
+            drop(snapshot);
+            result
+        }
+        .map_err(|error| {
+            ApiError::Io(match error {
+                dispatch::Error::Storage(error) => error,
+                dispatch::Error::ExecutionDeadline => Error::Deadline,
+                dispatch::Error::StorageBusy => Error::Busy,
+                dispatch::Error::Forbidden => Error::Forbidden,
+                _ => Error::Capacity,
+            })
+        })?;
         https_api::send_response(complete, sender)
     }
 }

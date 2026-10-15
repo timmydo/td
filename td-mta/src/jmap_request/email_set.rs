@@ -279,9 +279,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         let mut after = [0; DataState::WIRE_BYTES];
         let old = DataState {
             account: self.account,
-            epoch: completion.before.epoch,
+            epoch: completion.before_epoch,
             kind: DataType::Email,
-            sequence: completion.before.committed_sequence,
+            sequence: completion.before_sequence,
         };
         let new = DataState { sequence, ..old };
         let old = old.encode(&mut before).map_err(|_| Error::State)?;

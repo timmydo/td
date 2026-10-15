@@ -42,7 +42,8 @@ pub struct EmailUpdateRequest<'a> {
 #[derive(Debug)]
 #[must_use = "preserve the durable result even when admission has stopped"]
 pub struct EmailUpdateCompletion {
-    pub before: ViewIdentity,
+    pub before_epoch: StoreEpoch,
+    pub before_sequence: Sequence,
     pub outcome: Result<Sequence, CommitError>,
     /// In request order; refused objects have no writes or history.
     pub results: Vec<EmailUpdateResult>,
@@ -291,7 +292,8 @@ impl<P: EmailUpdateAuthorization> StoreCoordinator<'_, '_, P> {
         }
         if operations.is_empty() {
             return Ok(EmailUpdateCompletion {
-                before,
+                before_epoch: before.epoch,
+                before_sequence: before.committed_sequence,
                 outcome: Ok(before.committed_sequence),
                 results,
                 admission_stopped: false,
@@ -307,7 +309,8 @@ impl<P: EmailUpdateAuthorization> StoreCoordinator<'_, '_, P> {
         )?;
         drop(guard);
         Ok(EmailUpdateCompletion {
-            before,
+            before_epoch: before.epoch,
+            before_sequence: before.committed_sequence,
             outcome,
             results,
             admission_stopped: state.stopped,

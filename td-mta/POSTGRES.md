@@ -2302,8 +2302,9 @@ uses its identity for state, and uses the shared object encoder. Explicit
 IDs retain request order and duplicate/notFound behavior; null IDs select
 the bounded mailbox list. Snapshot checks precede and follow the operation
 and the batch. All response bytes remain provisional until those checks
-succeed. The prepared profile has no mutations and advertises read-only
-rights. The temporary read seam and native path are removed at cutover.
+succeed. Read-only fixtures advertise read-only rights; the prepared HTTP
+flag endpoint in §78 advertises seen/keyword rights explicitly. The temporary
+read seam and native path are removed at cutover.
 
 The dispatcher converts its execution tick using the response owner's
 RuntimeClock and tightens both the snapshot and SQL worker deadlines before
@@ -2482,3 +2483,28 @@ its capacity. A failed snapshot cannot produce a reservation.
 This supplies a boundary for future mixed read/write batches. Existing
 read-only HTTP dispatch retains its single snapshot; no mutation endpoint
 or production PostgreSQL service is activated here.
+
+## 78. Prepared singleton flag requests
+
+The prepared HTTPS backend admits td-mail's standalone Email/set keyword
+updates through the shared bounded request parser and response reservation.
+It closes its authenticated read snapshot before mutation and reserves a
+connection slot before fresh DNS. Runtime connections check the selected
+profile, account, device secret and optional Email state under transaction
+locks. Read-only batches retain their existing single snapshot. Mixed batches
+cannot invoke this mutation adapter. Mailbox moves, draft creation and
+deletion remain outside this prepared endpoint.
+
+One process-lifetime Pending owner serializes flag mutations without waiting.
+An uncertain COMMIT retains the exact Change and refuses new flag writes
+with a nonfatal busy response while reads continue;
+no new operation ID or transparent replay replaces it. Known outcomes survive
+late local deadline expiry. The owner contains no password. Production
+startup, receipt settlement/reclamation and restart recovery remain cutover
+requirements; this adapter is not a production serving entry point.
+
+The real td-mail PostgreSQL fixture now marks read, stars, marks unread and
+unstars the delivered message, querying fresh state after every result. It
+also forces a COMMIT error and verifies a later write refuses without losing
+the original operation or stopping reads. Mailbox rights advertise seen and
+keyword updates while unsupported membership and structural rights stay false.

@@ -2923,7 +2923,8 @@ fn flag_batch_records_email_and_mailbox_history_without_rewriting_body() {
             .unwrap();
         let sequence = complete.outcome.unwrap();
         assert!(sequence > before.committed_sequence);
-        assert_eq!(complete.before, before);
+        assert_eq!(complete.before_epoch, before.epoch);
+        assert_eq!(complete.before_sequence, before.committed_sequence);
         assert_eq!(
             complete.results,
             [EmailUpdateResult::Updated, EmailUpdateResult::NotFound]
@@ -3161,7 +3162,7 @@ fn committed_move_and_flags_reopen_with_the_same_history_endpoint() {
     let ChangeStep::Record(change) = view
         .next_change(
             ChangeCursor {
-                sequence: complete.before.committed_sequence,
+                sequence: complete.before_sequence,
                 operation: u32::MAX,
             },
             ObjectType::Email,
@@ -3546,7 +3547,7 @@ fn mixed_moves_commit_only_valid_objects_and_track_retained_unread_counts() {
             }
             for (kind, expected) in [(ObjectType::Email, 1), (ObjectType::Mailbox, 22)] {
                 let mut cursor = ChangeCursor {
-                    sequence: done.before.committed_sequence,
+                    sequence: done.before_sequence,
                     operation: u32::MAX,
                 };
                 let mut count = 0;
