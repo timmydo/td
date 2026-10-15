@@ -18,6 +18,14 @@ impl RuntimeClock {
         }
     }
 
+    /// Convert only deadlines created in this runtime's tick domain. Keeping
+    /// the original origin avoids renewing a budget at a blocking adapter.
+    pub fn deadline_instant(&self, deadline: crate::ports::Deadline) -> Result<Instant, Error> {
+        self.origin
+            .checked_add(std::time::Duration::from_millis(deadline.tick().0))
+            .ok_or(Error::Invalid)
+    }
+
     fn sample_at(&self, utc: SystemTime, monotonic: Instant) -> Result<Time, Error> {
         let elapsed = monotonic
             .checked_duration_since(self.origin)
@@ -83,6 +91,14 @@ mod tests {
             .origin
             .checked_add(Duration::from_millis(1234))
             .unwrap();
+        assert_eq!(
+            clock.deadline_instant(crate::ports::Deadline::after(Tick(1000), 234).unwrap()),
+            Ok(future)
+        );
+        assert_eq!(
+            clock.deadline_instant(crate::ports::Deadline::after(Tick(0), 0).unwrap()),
+            Ok(clock.origin)
+        );
         assert_eq!(
             clock.sample_at(UNIX_EPOCH + Duration::from_millis(5678), future),
             Ok(Time {

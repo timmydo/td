@@ -2237,3 +2237,29 @@ The active local backend still uses its device registry guard. The HTTPS
 fixture checks the presented password against the observed device on the
 body worker for all three operations, including its second-device requests.
 This handoff prepares PostgreSQL operation adapters without activating them.
+
+## 65. PostgreSQL HTTPS authentication adapter
+
+The prepared `postgres_http_auth::Authentication` implements the fixed HTTPS
+worker's credential interface. It resolves the protected bootstrap hostname
+anew on each lookup, forces runtime mode on every connection, and checks the
+selected profile, store epoch and device under one fresh primary snapshot.
+Only transport failures try another bounded resolved address. The connection
+and snapshot close before returning a device observation; later operations
+still require their own fresh authorization and publication fence.
+
+One atomic permit bounds concurrent lookup, including DNS; contention returns
+Busy without a queue. The original HTTPS deadline converts through the same
+RuntimeClock origin without a fresh allowance. A ten-second lookup ceiling
+and five-second DNS ceiling only shorten it. Results are refused after expiry.
+Malformed and inactive/wrong credentials return no device; configuration,
+schema, privilege and connection failures remain service errors, not invalid
+password observations. Errors carry no endpoint, secret or provider text.
+
+This adapter remains inactive until the atomic service cutover supplies its
+bootstrap, binding and shared clock. Service readiness/backoff and independent
+health/settlement capacity remain cutover obligations. The real PostgreSQL
+read fixture checks valid, malformed, wrong and revoked credentials, expired
+deadlines, rejection of owner credentials and subsequent successful lookup.
+A held table lock checks concurrent Busy refusal, finite lock failure and
+in-flight deadline expiry, followed by successful lookup after release.
