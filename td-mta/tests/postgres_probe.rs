@@ -2235,7 +2235,14 @@ fn real_postgres_smtp_worker_receives_and_drains() {
 #[path = "postgres_probe/smtp_transport.rs"]
 mod smtp_transport;
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_smtp_worker_preserves_starttls_receipts() {
+    exercise_configuration(ConfigurationExercise::ReceivingTls);
+}
+
 enum ConfigurationExercise {
+    ReceivingTls,
     ReceivingTransport,
     ReceivingOwner,
     HttpUploads,
@@ -2364,8 +2371,11 @@ certificate = "public"
 session_limit = 1
 per_peer_limit = 1
 "#;
-    let mut smtp_socket = matches!(exercise, ConfigurationExercise::ReceivingTransport)
-        .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+    let mut smtp_socket = matches!(
+        exercise,
+        ConfigurationExercise::ReceivingTransport | ConfigurationExercise::ReceivingTls
+    )
+    .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
     let cloud = if let Some(socket) = &smtp_socket {
         cloud.replace("0.0.0.0:25", &socket.local_addr().unwrap().to_string())
     } else {
@@ -2857,6 +2867,7 @@ per_peer_limit = 1
             | ConfigurationExercise::HttpUploads
             | ConfigurationExercise::ReceivingOwner
             | ConfigurationExercise::ReceivingTransport
+            | ConfigurationExercise::ReceivingTls
             | ConfigurationExercise::Client
             | ConfigurationExercise::SendClient
     ) {
@@ -2929,7 +2940,8 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Receiving
                 | ConfigurationExercise::ReceivingOwner
-                | ConfigurationExercise::ReceivingTransport => {}
+                | ConfigurationExercise::ReceivingTransport
+                | ConfigurationExercise::ReceivingTls => {}
                 ConfigurationExercise::Deletion => {
                     exercise_deletion(&fixture, &request, &trust, prepared.binding())
                 }
@@ -3012,13 +3024,19 @@ per_peer_limit = 1
             );
             return;
         }
-        if name == "cloud" && matches!(exercise, ConfigurationExercise::ReceivingTransport) {
+        if name == "cloud"
+            && matches!(
+                exercise,
+                ConfigurationExercise::ReceivingTransport | ConfigurationExercise::ReceivingTls
+            )
+        {
             smtp_transport::exercise(
                 &fixture,
                 &binding,
                 &configuration,
                 &active,
                 smtp_socket.take().unwrap(),
+                matches!(exercise, ConfigurationExercise::ReceivingTls),
             );
             return;
         }

@@ -3101,3 +3101,21 @@ DATA, joins the workers and leaves no additional message or receipt.
 This qualifies the plaintext direct-SMTP transport path in the prepared
 runtime. It does not activate a production PostgreSQL listener, qualify a new
 STARTTLS path or replace the existing native TLS and shutdown fixtures.
+
+## 109. PostgreSQL receiving over STARTTLS
+
+The explicit STARTTLS worker fixture upgrades the same real SMTP listener
+using td-crypto's verified localhost client and the fixture's private trust
+root. It checks that STARTTLS refuses an active envelope, then upgrades
+after RSET and requires a fresh EHLO before MAIL. Both committed
+messages retain the negotiated TLS version and post-upgrade EHLO/reverse
+path in PostgreSQL; the plaintext variant checks Plain receipt provenance.
+The same rollback/recovery and open-DATA shutdown cases run over both
+transports. Abrupt shutdown may end encrypted input without close_notify;
+the fixture distinguishes that closure from a timeout and accepts no final
+message receipt for unfinished DATA.
+
+The test uses bounded TLS wire buffers and per-I/O waits, verifies the server
+name and does not change production trust, client authentication or gateway
+policy. This is prepared PostgreSQL integration evidence; production backend
+selection and deployment qualification remain unchanged.
