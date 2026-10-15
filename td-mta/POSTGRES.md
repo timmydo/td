@@ -3202,3 +3202,28 @@ retry bounds, uncertainty preservation and final completion after expiry.
 This prepares final DATA results only. RCPT/MAIL/DATA-command refusals,
 transport failures, retry dispatch, capacity reservation and production
 activation remain separate work.
+
+
+## 113. Durable negative RCPT subsets
+
+Schema 22 adds at most 1024 RCPT-result receipts per account. The prepared
+publisher retains one ordered set of negative RCPT replies per attempt, at
+most 100 distinct 4096-byte replies. Each selected recipient must still be
+Prepared under the exact current attempt fence. Its new RCPT reply replaces
+prior RCPT history and clears prior DATA history. Temporary/permanent states,
+retry jitter, uncertainty preservation, expiry hold and completion follow the
+final-refusal rules above, independently for each reply.
+
+Unselected Prepared recipients remain in the active attempt and can enter
+Body as the accepted RCPT subset. An all-refused batch retires the attempt;
+a partially refused batch retires only after the remaining recipients finish.
+One receipt binds the complete refused subset, so the worker must collect its
+negative RCPT replies before publication instead of publishing one per call.
+Historical replay preserves retry times and never repeats account changes.
+
+The runtime-role fixture checks mixed temporary/permanent replies with and
+without prior uncertainty, retained-reply replacement, a partially accepted
+batch proceeding through DATA, 100 distinct maximum-length refusals,
+rollback, delayed COMMIT settlement, conflicting replay, attempt retirement
+and final completion. MAIL and DATA-command refusals, transport failures,
+retry dispatch and final-outcome capacity admission remain separate work.

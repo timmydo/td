@@ -107,6 +107,17 @@ pub fn refused(
     )
 }
 
+/// Retain all negative RCPT replies collected for one attempt, as one ordered
+/// subset. Other Prepared recipients may subsequently enter Body.
+pub fn refused_rcpt(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    recipients: &[(u32, &str)],
+) -> Result<Change, Error> {
+    prepare(claim, generation, attempt, 6, recipients.iter().copied())
+}
+
 fn prepare<'a>(
     claim: &Claim,
     generation: u64,
@@ -146,7 +157,7 @@ fn prepare<'a>(
         if ordinals.len() == 100
             || ordinal >= 1000
             || ordinals.last().is_some_and(|last| *last >= ordinal)
-            || (phase != 3 && !valid_reply(reply, phase == 5))
+            || (phase != 3 && !valid_reply(reply, phase >= 5))
         {
             return Err(Error::Integrity);
         }
@@ -194,7 +205,9 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
     ))
 }
 async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
-    let query = if value.phase == 5 {
+    let query = if value.phase == 6 {
+        "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_rcpt_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
+    } else if value.phase == 5 {
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_refusal_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
     } else if value.phase == 4 {
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_acceptance_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
@@ -322,7 +335,9 @@ pub fn publish(
             {
                 return Err(Error::Integrity);
             }
-            let (count_query, ceiling) = if value.phase == 5 {
+            let (count_query, ceiling) = if value.phase == 6 {
+                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_rcpt_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+            } else if value.phase == 5 {
                 ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_refusal_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
             } else if value.phase == 4 {
                 ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_acceptance_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
@@ -342,13 +357,23 @@ pub fn publish(
             if rows.is_empty() || rows.len() > 100 {
                 return Err(Error::Integrity);
             }
-            let prior_phase = if value.phase >= 4 { 3 } else { value.phase - 1 };
-            let mut entropy = if value.phase == 5 {
+            let prior_phase = if value.phase == 6 {
+                1
+            } else if value.phase >= 4 {
+                3
+            } else {
+                value.phase - 1
+            };
+            let mut entropy = if value.phase >= 5 {
                 Some(SystemEntropy::try_new().map_err(|_| Error::Crypto)?)
             } else {
                 None
             };
             let mut states = Vec::new();
+            let mut reasons = Vec::new();
+            reasons
+                .try_reserve_exact(value.ordinals.len())
+                .map_err(|_| Error::Capacity)?;
             let mut retries: Vec<Option<i64>> = Vec::new();
             states
                 .try_reserve_exact(value.ordinals.len())
@@ -385,7 +410,7 @@ pub fn publish(
                 if phase == prior_phase {
                     prior_count += 1;
                 }
-                if value.ordinals.binary_search(&ordinal).is_ok() {
+                if let Ok(index) = value.ordinals.binary_search(&ordinal) {
                     selected += 1;
                     if phase != prior_phase
                         || (phase >= 2
@@ -393,8 +418,8 @@ pub fn publish(
                     {
                         return Err(Error::Conflict);
                     }
-                    if value.phase == 5 {
-                        let reply = value.replies.first().ok_or(Error::Integrity)?;
+                    if value.phase >= 5 {
+                        let reply = value.replies.get(index).ok_or(Error::Integrity)?;
                         let permanent = crate::recipient_sweep::reply_class(Some(reply)) == Some(5);
                         let retry = if permanent {
                             None
@@ -424,22 +449,28 @@ pub fn publish(
                             3i64
                         });
                         retries.push(retry);
+                        reasons.push(if permanent { 2i64 } else { 1i64 });
                     }
                 } else if phase != 1 {
                     return Err(Error::Conflict);
                 }
             }
-            if selected != value.ordinals.len() || (value.phase >= 3 && prior_count != selected) {
+            if selected != value.ordinals.len()
+                || ((3..=5).contains(&value.phase) && prior_count != selected)
+            {
                 return Err(Error::Conflict);
             }
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
             let affected = if value.phase == 2 {
             client.execute("UPDATE td_mta.recipients r SET phase=2,rcpt_reply=u.reply,data_reply=NULL,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
-        } else if value.phase == 5 {
-            let reply = value.replies.first().ok_or(Error::Integrity)?;
-            let reason = if crate::recipient_sweep::reply_class(Some(reply)) == Some(5) { 2i64 } else { 1i64 };
-            client.execute("UPDATE td_mta.recipients r SET state=u.state,phase=4,data_reply=u.reply,next_attempt_at=u.retry,reason=$8,diagnostic='',changed=$7 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[]) u(ordinal,state,reply,retry) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&changed,&reason]).await
+        } else if value.phase >= 5 {
+            let query = if value.phase == 6 {
+                "UPDATE td_mta.recipients r SET state=u.state,phase=4,rcpt_reply=u.reply,data_reply=NULL,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[]) u(ordinal,state,reply,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal"
+            } else {
+                "UPDATE td_mta.recipients r SET state=u.state,phase=4,data_reply=u.reply,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::text[],$6::bigint[],$7::bigint[]) u(ordinal,state,reply,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal"
+            };
+            client.execute(query, &[&account,&submission,&value.ordinals,&states,&value.replies,&retries,&reasons,&changed]).await
         } else if value.phase == 4 {
             client.execute("UPDATE td_mta.recipients r SET state=4,phase=4,data_reply=u.reply,changed=$5 FROM unnest($3::bigint[],$4::text[]) u(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&value.ordinals,&value.replies,&changed]).await
         } else {
@@ -506,7 +537,9 @@ pub fn publish(
                 return Err(Error::Integrity);
             }
             let recipients = i64::try_from(value.ordinals.len()).map_err(|_| Error::Capacity)?;
-            let insert = if value.phase == 5 {
+            let insert = if value.phase == 6 {
+                "INSERT INTO td_mta.attempt_rcpt_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
+            } else if value.phase == 5 {
                 "INSERT INTO td_mta.attempt_refusal_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
             } else if value.phase == 4 {
                 "INSERT INTO td_mta.attempt_acceptance_receipts VALUES($1,$2,$3,$4,$5,$6,$7)"
