@@ -337,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 11);
+    assert_eq!(receipt.version, 12);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -414,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        11
+        12
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -539,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":11"));
+    assert!(initialized.contains("\"schema_version\":12"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -710,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 11);
+    assert_eq!(receipt.version, 12);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1212,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "29");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "30");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1306,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1320,6 +1320,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_flags.sql"),
             include_str!("../src/postgres_flag_batches.sql"),
             include_str!("../src/postgres_uploads.sql"),
+            include_str!("../src/postgres_drafts.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1352,6 +1353,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             6 => "config_selection",
             9 => "account_usage",
             10 => "draft_receipts",
+            11 => "mailbox_create_receipts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1385,7 +1387,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 11);
+        assert_eq!(receipt.version, 12);
         if previous_version == 9 {
             assert_eq!(sql(&fixture,"SELECT body_bytes,blob_count,upload_bytes,queue_bytes,queue_submissions FROM td_mta.account_usage"),"3|2|3|3|2");
         }
@@ -1915,7 +1917,14 @@ fn real_postgres_thread_windows_retain_order_membership_and_snapshot() {
     exercise_configuration(ConfigurationExercise::Threads);
 }
 
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_folders_publish_names_history_and_retained_outcomes() {
+    exercise_configuration(ConfigurationExercise::Folders);
+}
+
 enum ConfigurationExercise {
+    Folders,
     Threads,
     Query,
     Flags,
@@ -2460,6 +2469,9 @@ per_peer_limit = 1
                 }
                 ConfigurationExercise::Uploads => {
                     exercise_uploads(&fixture, &request, &trust, prepared.binding())
+                }
+                ConfigurationExercise::Folders => {
+                    exercise_folders(&fixture, &request, &trust, prepared.binding())
                 }
                 ConfigurationExercise::Threads => {
                     exercise_threads(&fixture, &request, &trust, prepared.binding())
@@ -4993,5 +5005,244 @@ fn exercise_threads(
             Ok(())
         }),
         Err(read::Error::Integrity)
+    );
+}
+
+fn exercise_folders(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+) {
+    use folders::{Error, ResultEntry};
+    use td_mta::{postgres_devices as devices, postgres_mailbox_create as folders};
+    let account = binding.account();
+    let device = devices::prepare_creation(binding.epoch(), account, "folder fixture", 1).unwrap();
+    devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    let password = device.password();
+    let prepare = |names: &[&str], expected| {
+        folders::prepare(binding, device.device_id(), expected, names, deadline()).unwrap()
+    };
+    let mixed = prepare(
+        &[
+            "Inbox", "Projects", "Projects", "", "e\u{301}", "é", "bad\n",
+        ],
+        Some(1),
+    );
+    assert_eq!(
+        folders::inspect(request, trust, deadline(), &mixed).unwrap(),
+        None
+    );
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &mixed, b"bad"),
+        Err(Error::Unauthenticated)
+    );
+    let result = folders::publish(request, trust, deadline(), &mixed, password).unwrap();
+    assert_eq!((result.old_sequence, result.new_sequence), (1, 2));
+    assert!(matches!(
+        result.results.as_slice(),
+        [
+            ResultEntry::AlreadyExists,
+            ResultEntry::Created(_),
+            ResultEntry::AlreadyExists,
+            ResultEntry::InvalidName,
+            ResultEntry::InvalidName,
+            ResultEntry::Created(_),
+            ResultEntry::InvalidName
+        ]
+    ));
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &mixed, b"bad").unwrap(),
+        result
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes"), "3");
+    assert_eq!(sql(fixture,"SELECT count(*) FROM td_mta.changes WHERE sequence=decode('0000000000000002','hex') AND kind=1 AND action=1"),"2");
+    let noop = prepare(&["Projects", ""], Some(2));
+    let noop = folders::publish(request, trust, deadline(), &noop, password).unwrap();
+    assert_eq!((noop.old_sequence, noop.new_sequence), (2, 2));
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            deadline(),
+            &prepare(&["stale"], Some(1)),
+            password
+        ),
+        Err(Error::State)
+    );
+    let left = prepare(&["Concurrent"], None);
+    let right = prepare(&["Concurrent"], None);
+    let (left, right) = thread::scope(|scope| {
+        let a = scope.spawn(|| folders::publish(request, trust, deadline(), &left, password));
+        let b = scope.spawn(|| folders::publish(request, trust, deadline(), &right, password));
+        (a.join().unwrap().unwrap(), b.join().unwrap().unwrap())
+    });
+    let created =
+        |result: &folders::Outcome| matches!(result.results.as_slice(), [ResultEntry::Created(_)]);
+    assert_ne!(created(&left), created(&right));
+    assert!(
+        left.results == [ResultEntry::AlreadyExists]
+            || right.results == [ResultEntry::AlreadyExists]
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='Concurrent'"
+        ),
+        "1"
+    );
+    let names: Vec<String> = (0..256)
+        .map(|n| format!("f{n:03}-{}", "x".repeat(1019)))
+        .collect();
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    let oversized = prepare(&borrowed, None);
+    let overflow = folders::publish(request, trust, deadline(), &oversized, password);
+    assert!(
+        matches!(overflow, Err(Error::Capacity)),
+        "oversized folder publication: {overflow:?}"
+    );
+    assert_eq!(
+        folders::inspect(request, trust, deadline(), &oversized).unwrap(),
+        None
+    );
+    assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.mailboxes"), "4");
+    assert!(matches!(
+        folders::prepare(
+            binding,
+            device.device_id(),
+            None,
+            &vec!["x"; 257],
+            deadline()
+        ),
+        Err(Error::Capacity)
+    ));
+    let rejected = prepare(&["rollback"], None);
+    sql(fixture,"CREATE FUNCTION public.reject_folder() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'reject folder'; END $$; CREATE TRIGGER reject_folder BEFORE INSERT ON td_mta.mailbox_create_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_folder()");
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &rejected, password),
+        Err(Error::Database)
+    );
+    assert_eq!(
+        folders::inspect(request, trust, deadline(), &rejected).unwrap(),
+        None
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='rollback'"
+        ),
+        "0"
+    );
+    sql(fixture,"DROP TRIGGER reject_folder ON td_mta.mailbox_create_receipts; CREATE FUNCTION public.delay_folder() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_folder AFTER INSERT ON td_mta.mailbox_create_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_folder()");
+    let uncertain = prepare(&["uncertain"], None);
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_secs(1),
+            &uncertain,
+            password
+        ),
+        Err(Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(3));
+    let retained = folders::inspect(request, trust, deadline(), &uncertain)
+        .unwrap()
+        .unwrap();
+    sql(
+        fixture,
+        "DROP TRIGGER delay_folder ON td_mta.mailbox_create_receipts",
+    );
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &uncertain, password).unwrap(),
+        retained
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.mailboxes WHERE name='uncertain'"
+        ),
+        "1"
+    );
+    let count: usize = sql(fixture, "SELECT count(*) FROM td_mta.mailboxes")
+        .parse()
+        .unwrap();
+    let available = td_mta::postgres_mailboxes::MAX_MAILBOXES - count;
+    let names: Vec<String> = (0..256)
+        .map(|n| format!("f{:03}-{}", n % available, "x".repeat(1019)))
+        .collect();
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    let maximum = prepare(&borrowed, None);
+    let maximum = folders::publish(request, trust, deadline(), &maximum, password).unwrap();
+    assert_eq!(maximum.results.len(), 256);
+    assert_eq!(
+        maximum
+            .results
+            .iter()
+            .filter(|entry| matches!(entry, ResultEntry::Created(_)))
+            .count(),
+        available
+    );
+    assert_eq!(
+        td_mta::postgres_mailboxes::list(
+            request,
+            trust,
+            deadline(),
+            binding.epoch(),
+            account,
+            password
+        )
+        .unwrap()
+        .mailboxes
+        .len(),
+        256
+    );
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            deadline(),
+            &prepare(&["one more"], None),
+            password
+        ),
+        Err(Error::Capacity)
+    );
+    sql(fixture,&format!("INSERT INTO td_mta.mailbox_create_receipts SELECT decode('{account}','hex'),decode(lpad(to_hex(n),32,'0'),'hex'),decode(repeat('00',32),'hex'),decode(repeat('00',8),'hex'),decode(repeat('00',8),'hex'),decode('','hex') FROM generate_series(1,1024) n"));
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        Err(Error::Capacity)
+    );
+    sql(fixture,"DELETE FROM td_mta.mailbox_create_receipts WHERE request_digest=decode(repeat('00',32),'hex'); UPDATE td_mta.config_selection SET generation=decode('0000000000000002','hex')");
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        Err(Error::Policy)
+    );
+    sql(fixture,"UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex'); UPDATE td_mta.accounts SET sequence=decode('ffffffffffffffff','hex')");
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &prepare(&[], None), password)
+            .unwrap()
+            .new_sequence,
+        u64::MAX
+    );
+    assert_eq!(
+        folders::publish(
+            request,
+            trust,
+            deadline(),
+            &prepare(&["overflow"], None),
+            password
+        ),
+        Err(Error::Capacity)
+    );
+    let revoke =
+        devices::prepare_revocation(binding.epoch(), account, device.device_id(), 2).unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revoke).unwrap();
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &prepare(&[], None), password),
+        Err(Error::Unauthenticated)
+    );
+    assert_eq!(
+        folders::publish(request, trust, deadline(), &mixed, password).unwrap(),
+        result
     );
 }

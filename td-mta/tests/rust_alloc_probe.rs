@@ -54,6 +54,8 @@ mod measured_reference_sweep;
 pub use td_mta::smtp_wire;
 #[path = "../src/device_credentials.rs"]
 mod device_credentials;
+#[path = "../src/mailbox_name.rs"]
+mod mailbox_name;
 #[path = "../src/smtp_session.rs"]
 #[allow(unused)] // Keep the receiving context with the recompiled storage core.
 mod smtp_session;

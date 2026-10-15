@@ -260,35 +260,7 @@ fn valid_name(
     scratch: &mut td_mime::nfc::Scratch,
     name: &str,
 ) -> Result<bool, ports::Error> {
-    if name.is_empty()
-        || name.len() > format::row::MAX_MAILBOX_NAME
-        || name
-            .chars()
-            .any(|value| value.is_control() || td_mime::unicode::is_noncharacter(value))
-    {
-        return Ok(false);
-    }
-    let mut expected = name.chars();
-    let mut cursor = td_mime::nfc::Cursor::new(name, scratch, meter, budget);
-    loop {
-        let time = check_time(store, deadline, last)?;
-        match cursor.poll(time.monotonic).map_err(|error| match error {
-            td_mime::nfc::Error::Work(crate::admission::work::Stop::Deadline) => {
-                ports::Error::Deadline
-            }
-            td_mime::nfc::Error::Work(_) | td_mime::nfc::Error::InterpretationLimit => {
-                ports::Error::Capacity
-            }
-            _ => ports::Error::Invalid,
-        })? {
-            td_mime::nfc::Status::Scalar(value) if expected.next() != Some(value) => {
-                return Ok(false)
-            }
-            td_mime::nfc::Status::Scalar(_) | td_mime::nfc::Status::Yield => (),
-            td_mime::nfc::Status::Complete => {
-                check_time(store, deadline, last)?;
-                return Ok(expected.next().is_none());
-            }
-        }
-    }
+    crate::mailbox_name::valid(name, meter, budget, scratch, || {
+        Ok(check_time(store, deadline, last)?.monotonic)
+    })
 }

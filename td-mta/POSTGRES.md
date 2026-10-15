@@ -555,7 +555,8 @@ adds src/postgres_configuration.sql; version 6 adds src/postgres_accounts.sql,
 version 7 adds src/postgres_selection.sql, and version 8 adds
 src/postgres_flags.sql. Version 9 adds src/postgres_flag_batches.sql.
 Version 10 adds src/postgres_uploads.sql; version 11 adds
-src/postgres_drafts.sql. New initialization applies all eleven in
+src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql.
+New initialization applies all twelve in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -573,7 +574,7 @@ rule as initialization.
 
 The client shares the original ten-second worker limit, configured
 statement/lock timeouts and protocol byte caps. Owner initialization/upgrade
-permits 512 input frames for the eleven migrations and their ledger writes;
+permits 512 input frames for the twelve migrations and their ledger writes;
 probe, inspection and material operations retain 128. The per-frame 128 KiB
 and total 1 MiB input bounds, 64 KiB schema output bound, authentication
 checks and terminal budget refusal are unchanged. Fixed SQL and typed
@@ -588,8 +589,8 @@ resolve database state before another initialization.
 
 `postgres_schema::inspect` takes the conflicting shared session-level
 try-lock before reading the ledger. Its bound is the compiled migration
-count plus one (currently twelve rows); it requires
-exactly the eleven ordered migration versions, their compiled DDL checksums and
+count plus one (currently thirteen rows); it requires
+exactly the twelve ordered migration versions, their compiled DDL checksums and
 one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
@@ -1620,3 +1621,33 @@ the snapshot. All reads, including repeated windows after concurrent deletion,
 retain the same account state, worker budget and deadline. Invalid limits or
 other read errors retire the view. This supplies storage for td-mail's
 Thread/get without activating PostgreSQL production dispatch.
+
+## 42. Retained root-folder creation
+
+Schema version 12 adds `mailbox_create_receipts`. The
+`postgres_mailbox_create` adapter prepares at most 256 root-folder names,
+using the same bounded NFC/control/noncharacter validator as the existing
+SQLite adapter. Invalid names become the existing empty-name marker before
+retaining and hashing the canonical request. Preparation retains random
+operation/object IDs and no device password. It runs outside the transaction
+under the selected profile's work limits and original deadline.
+
+Publication fences selected policy, account state and current device in the
+same order as flag writes. A locked account serializes exact root-name
+uniqueness; existing names and later duplicates in the batch report
+AlreadyExists, while invalid names report InvalidName. Successful rows use
+no parent or role, sort order zero and subscribed true. IDs must not collide
+with current mailboxes or retained mailbox history. All created rows,
+Mailbox/created history, one account-sequence increment and ordered results
+commit atomically. A batch with no created rows retains an unchanged state.
+The same account lock enforces the listing limit of 256 total mailboxes.
+A batch exceeding that limit refuses without retaining a receipt or changing
+any mailbox. No generic hierarchy, rename or destroy flow is introduced.
+
+The complete receipt binds the canonical request and generated IDs and is
+checked before reauthorizing a fresh write. Owner-side inspection waits
+behind account publication; lost COMMIT response remains indeterminate until
+resolved with that same operation. Each account retains at most 1024 receipts;
+expiry/reclamation remains part of cutover work. Folder transactions have a
+one-MiB output ceiling for bounded names and a one-MiB/1024-frame input budget.
+Preparation, publication and replay do not enable PostgreSQL serving.

@@ -213,3 +213,6 @@ pub mod postgres_drafts;
 pub mod postgres_flags;
 mod postgres_publication;
 pub mod postgres_uploads;
+
+mod mailbox_name;
+pub mod postgres_mailbox_create;

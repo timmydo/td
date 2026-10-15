@@ -78,6 +78,7 @@ object_ids!(
     FlagOperationId,
     UploadOperationId,
     DraftOperationId,
+    MailboxOperationId,
     StoreEpoch,
     MaterialVersion,
     ConfigurationVersion,
