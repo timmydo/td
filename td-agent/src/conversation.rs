@@ -4003,15 +4003,16 @@ impl Session {
             crate::egress::relay_here(),
         );
         self.network_rules();
+        let mut shared = client.shared_for(workspace).to_vec();
+        for grant in &meta.directory_grants {
+            match crate::access::admitted(&state, std::slice::from_ref(grant)) {
+                Ok(admitted) => shared.extend(admitted),
+                Err(why) => eprintln!("td-agent: directory grant not mounted: {why}"),
+            }
+        }
         let policy = self
             .bench
-            .prepare(
-                workspace,
-                &state,
-                &meta.id,
-                client.shared_for(workspace),
-                &meta.prepared,
-            )
+            .prepare(workspace, &state, &meta.id, &shared, &meta.prepared)
             .map_err(|e| format!("the workspace could not be prepared: {e}"))?;
         // Named whether or not they are ready, so the prefix holds.
         let repositories = match workspace {
@@ -4035,6 +4036,7 @@ impl Session {
             network,
             allowlist: &client.network_allowlist,
             system: client.system_for(workspace) && !self.system_revoked,
+            host_commands: client.host_commands,
         };
         Ok(made(meta.created, Some(&place)))
     }
@@ -5559,6 +5561,199 @@ impl Session {
         }
     }
 
+    /// A host crossing always needs a fresh human decision; no rule or mode
+    /// can release the card. Deny rules are checked before and after it.
+    fn explicit_access(
+        &mut self,
+        started: u64,
+        name: &str,
+        command: Option<&str>,
+        title: String,
+        details: Vec<String>,
+    ) -> Result<Result<(), String>, String> {
+        let judged = Judged::Host {
+            name,
+            command,
+            acts: true,
+            repeated: false,
+        };
+        if let Ruling::Deny(why) = self.ruling(&judged) {
+            return Ok(Err(ruled(&why)));
+        }
+        if !matches!(
+            self.decide(
+                started,
+                title,
+                details,
+                Some("explicit host access"),
+                None,
+                None
+            )?,
+            Decided::Allowed
+        ) {
+            return Ok(Err(CALL_REFUSED.into()));
+        }
+        self.hear();
+        if self.interrupt {
+            return Ok(Err(CALL_SKIPPED.into()));
+        }
+        if let Ruling::Deny(why) = self.ruling(&judged) {
+            return Ok(Err(ruled(&why)));
+        }
+        Ok(Ok(()))
+    }
+
+    fn host_shell(
+        &mut self,
+        started: u64,
+        command: String,
+        workdir: String,
+        timeout_ms: Option<u64>,
+    ) -> Result<Result<String, String>, String> {
+        if !self
+            .setup
+            .as_ref()
+            .is_some_and(|(_, client)| client.host_commands)
+        {
+            return Ok(Err(
+                "host_shell is disabled; the person may enable host_commands in configuration"
+                    .into(),
+            ));
+        }
+        let workdir = match std::fs::canonicalize(&workdir) {
+            Ok(path) if path.is_dir() => path,
+            _ => {
+                return Ok(Err(
+                    "host working directory is not an existing directory".into()
+                ))
+            }
+        };
+        let timeout = match crate::shell::timeout(timeout_ms) {
+            Ok(timeout) => timeout,
+            Err(why) => return Ok(Err(why)),
+        };
+        if let Err(why) = self.explicit_access(started, "host_shell", Some(&command), "Run on host with full access".into(), vec![
+            tools::visible(&command), format!("Directory: {}", tools::visible(&workdir.display().to_string())),
+            "This command can read and change your home, credentials and host files, and use host services. It runs outside the filesystem and process boundaries. Stopping the shell cannot guarantee that its descendants stop.".into(),
+        ])? { return Ok(Err(why)); }
+        if !self
+            .setup
+            .as_ref()
+            .is_some_and(|(_, client)| client.host_commands)
+        {
+            return Ok(Err("host_commands was disabled before execution".into()));
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = cancel.clone();
+        let (send, receive) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("approved-host-command".into())
+            .spawn(move || {
+                let answer = crate::shell::run(
+                    crate::shell::shell(&command, &workdir, false),
+                    timeout,
+                    &stop,
+                    &mut |_| {},
+                )
+                .map(|exit| exit.render());
+                let _ = send.send(answer);
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(why) => return Ok(Err(why.to_string())),
+        };
+        let answer = loop {
+            self.hear();
+            if self.interrupt {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            match receive.recv_timeout(HOST_POLL) {
+                Ok(answer) => break answer,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err("host command worker ended without a result".into())
+                }
+            }
+        };
+        let _ = thread.join();
+        Ok(answer)
+    }
+
+    fn request_directory(
+        &mut self,
+        started: u64,
+        path: String,
+        access: String,
+    ) -> Result<Result<String, String>, String> {
+        let meta = self.conversation.meta().clone();
+        let Some(workspace) = &meta.workspace else {
+            return Ok(Err("no workspace".into()));
+        };
+        let Some((_, client)) = &self.setup else {
+            return Ok(Err("workspace is not configured".into()));
+        };
+        let client = client.clone();
+        let state = StateDir::at(self.state.clone());
+        let path = if access == "revoke" {
+            crate::access::revoke_path(Path::new(&path), &meta.directory_grants)
+        } else {
+            match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                Err(why) => return Ok(Err(why.to_string())),
+            }
+        };
+        let mut grants = meta.directory_grants.clone();
+        grants.retain(|grant| grant.path != path);
+        if access == "revoke" && grants.len() == meta.directory_grants.len() {
+            return Ok(Err("no directory grant matches this path".into()));
+        }
+        if access != "revoke" {
+            grants.push(crate::workspace::Shared {
+                path: path.clone(),
+                write: access == "write",
+            });
+            if let Err(why) = crate::access::admitted(&state, &grants) {
+                return Ok(Err(why));
+            }
+            let (policy, _) = match crate::workspace::policy(
+                workspace,
+                &state,
+                &meta.id,
+                client.shared_for(workspace),
+                &meta.prepared,
+            ) {
+                Ok(policy) => policy,
+                Err(why) => return Ok(Err(why)),
+            };
+            let mut paths = policy.roots();
+            paths.extend(policy.repositories);
+            paths.extend(policy.objects);
+            paths.push(policy.home);
+            paths.extend(policy.scratch);
+            if let Err(why) = crate::access::disjoint(&grants, &paths) {
+                return Ok(Err(why));
+            }
+            let mut combined = client.shared_for(workspace).to_vec();
+            combined.extend(grants.clone());
+            if let Err(why) =
+                crate::workspace::policy(workspace, &state, &meta.id, &combined, &meta.prepared)
+            {
+                return Ok(Err(why));
+            }
+            if let Err(why) = self.explicit_access(started, "request_directory", None,
+                format!("Grant {access} directory access"), vec![tools::visible(&path.display().to_string()),
+                "This conversation's commands and tools will retain this directory grant until revoked or deleted. Programs in it can run with the workspace's authority.".into()])? { return Ok(Err(why)); }
+            if let Err(why) = crate::access::admitted(&state, &grants) {
+                return Ok(Err(why));
+            }
+        }
+        self.conversation.set_directory_grants(grants)?;
+        if let Err(why) = self.placed(&client, |_, _| ()) {
+            return Ok(Err(why));
+        }
+        Ok(Ok(format!("Directory {}: {access}. New jobs use the updated grants; stop existing background jobs to revoke their mounts. Previously granted paths remain excluded from local remotes and diagnostics exports until this conversation is deleted.", path.display())))
+    }
+
     /// Runs one call, the `ToolCall` record `started`: the tool's answer,
     /// or why it failed, which the model is told; an error of the log's
     /// own ends the process.
@@ -5575,6 +5770,14 @@ impl Session {
                 max_bytes,
             } => self.web_fetch(started, url, offset, max_bytes, repeated)?,
             Args::Question { question, options } => self.question(started, question, options),
+            Args::HostShell {
+                command,
+                workdir,
+                timeout_ms,
+            } => self.host_shell(started, command, workdir, timeout_ms)?,
+            Args::RequestDirectory { path, access } => {
+                self.request_directory(started, path, access)?
+            }
             // The template's standing decision: no card asks (DESIGN.md
             // §8, System view).
             Args::SystemStatus(ask) => Ok(crate::sysview::status(&ask)),

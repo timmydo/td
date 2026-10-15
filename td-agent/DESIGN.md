@@ -160,8 +160,9 @@ There are four parties, and the design is the separation between them:
    process per running conversation, the same binary under two
    personalities. Together they own the window, the conversation store,
    the model client, the API key, the fetch grant, the repository store
-   and every decision of §11. They never execute anything a model wrote
-   and never read or write workspace file content. A reply's link the
+   and every decision of §11. Ordinary workspace content and execution
+   stay in the tool host; the explicit, human-approved `host_shell` is
+   the exception, running a command with the human's host authority. A reply's link the
    person clicks is handed to their browser (§4, "Markdown") as data:
    one `http` or `https` URL that td-ui's `open::url` checks is one word
    and no option, run without a shell; its target, host first, shows
@@ -4774,10 +4775,10 @@ flag lets injected text lower its own bar.
 | `web_fetch` to another destination, policy `allowlist` | human | classifier |
 | git_push, unprotected branch, no force, clean scan | human | classifier |
 | git_push to a protected branch, forced, or a scan match | human | human |
-| `request_directory`, read-only | human | classifier |
+| `request_directory`, read-only | human | human |
 | `request_directory`, read-write | human | human |
 | network policy `open`, shared directories, limits, remotes, rules, modes | human | human |
-| anything in an unconfined workspace, reads included | human | human |
+| `host_shell` (only when configured) | human | human |
 
 Creating a conversation and its workspace from a template, and archiving
 or deleting one, are the human's own acts (§7), never a model's, so the
@@ -5418,9 +5419,36 @@ directory and git tools, as far as the workspace has what they act on.
   (As built (`question`), below).
 - **`skill {name, file?}`**: one of the person's skills, which the
   prefix lists, or one of its files (As built (skills), below).
-- **`request_directory {path, write?}`**: asks for an extra host directory
-  bound into this workspace's later instances, admitted per §8 and decided
-  per §11.
+- **`request_directory {path, access?}`**: asks for an extra host directory
+  bound into this conversation's later instances. `access` is `read` by
+  default, `write`, or `revoke`. At most 16 grants are retained in trusted
+  conversation metadata. New or changed access always requires a fresh human
+  card, including in auto mode; rules cannot release it. Revocation narrows
+  access without a card. Grants are checked against sensitive places and
+  admitted local remotes before/after consent and on each preparation, then
+  pass td-jail's mount admission. Paths are canonical; a replaced symlink
+  never redirects a retained grant. Unavailable grants are omitted with a
+  diagnostic so they can still be revoked. Configured shares and workspace
+  mounts must not overlap new grants. The window includes these grants when
+  checking whether a local remote remains outside writable workspace access.
+  Trusted metadata also retains every previously granted path for the
+  conversation lifetime. Local-remote admission and diagnostic-export exclusions
+  include this history, including after revocation, so surviving jobs cannot
+  regain access to newly trusted host inputs.
+  Existing background jobs retain their old mounts until stopped; later jobs
+  and the file-tool instance use the updated grants. Development shared
+  directories are executable, retaining host noexec flags if present.
+- **`host_shell {command, workdir, timeout_ms?}`**: available only to the
+  main workspace conversation, disabled unless the person configures
+  `host_commands = true`. The status row and prompt show that it is enabled.
+  Each exact command requires a fresh human card showing full home, credential
+  and host-service authority, even in auto mode or under an allow rule. Deny
+  rules still refuse it. There is no automatic host fallback after a jail
+  failure. It runs outside filesystem and process namespaces with the normal
+  scrubbed shell environment and bounded output/timeout (at most ten minutes).
+  Cancellation/timeout stops the direct shell, not guaranteed descendants;
+  host commands can deliberately escape supervision. There is no background
+  option. Reviews, explore and task subagents never receive these two tools.
 - **`git_fetch`** and **`git_push`**: §9.
 - **`task {prompt, agent?, model?, effort?, routing?}`**: hands a piece
   of work to a sub-agent, a

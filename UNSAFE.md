@@ -2077,7 +2077,7 @@ synthesized files and a compiled allowlist of host entries, bound
 read-only and `noexec`; at most four admitted program files, read-only
 and executable, device and inode checked; and the admitted directories
 at their real paths through the same grant bind and hardening loop,
-`noexec` but for worktrees and the development private home, which keeps
+`noexec` but for worktrees and development's private home and shared trees, which keeps
 a flag the host set on a row. Development may replace the ephemeral scratch
 mounts with four admitted persistent directory binds at compiled targets
 `/tmp`, `/var/tmp`, `/dev/shm`, `/run`; only `/dev/shm` is noexec. These use

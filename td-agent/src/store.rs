@@ -885,6 +885,10 @@ pub struct Meta {
     /// process writes it, never from what a jail could have written.
     /// Absent and empty in a meta written before.
     pub prepared: Vec<PathBuf>,
+    /// Paths ever granted, excluded from trusted host uses until deletion.
+    pub directory_exposures: Vec<PathBuf>,
+    /// Current explicit human-approved directory grants.
+    pub directory_grants: Vec<crate::workspace::Shared>,
     /// Its repository workspace went with its archive (DESIGN.md §7): its
     /// process asks for no store and refuses the workspace tools. Only
     /// the window writes it, and never clears it; absent and false in a
@@ -928,6 +932,29 @@ impl Meta {
             ("routing".into(), or_null(&self.routing)),
             ("archived".into(), Json::Bool(self.archived)),
             ("removed".into(), Json::Bool(self.removed)),
+            (
+                "directory_exposures".into(),
+                Json::Arr(
+                    self.directory_exposures
+                        .iter()
+                        .map(|path| Json::Str(path.display().to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                "directory_grants".into(),
+                Json::Arr(
+                    self.directory_grants
+                        .iter()
+                        .map(|grant| {
+                            Json::Obj(vec![
+                                ("path".into(), Json::Str(grant.path.display().to_string())),
+                                ("write".into(), Json::Bool(grant.write)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
             (
                 "tracked".into(),
                 Json::Arr(
@@ -1019,6 +1046,21 @@ impl Meta {
                         }
                     })
                     .collect::<Result<_, _>>()?,
+            },
+            directory_exposures: match value.get("directory_exposures") {
+                None => Vec::new(),
+                Some(value) => value.as_arr().ok_or("directory_exposures is not a list")?.iter().map(|path| {
+                    path.as_str().map(PathBuf::from).filter(|path| path.is_absolute()).ok_or("exposure path is not absolute")
+                }).collect::<Result<Vec<_>, _>>()?,
+            },
+            directory_grants: match value.get("directory_grants") {
+                None => Vec::new(),
+                Some(value) => value.as_arr().ok_or("directory_grants is not a list")?.iter().map(|grant| {
+                    let path = grant.get("path").and_then(Json::as_str).ok_or("grant path missing")?;
+                    let write = grant.get("write").and_then(Json::as_bool).ok_or("grant mode missing")?;
+                    if !Path::new(path).is_absolute() { return Err("grant path is not absolute"); }
+                    Ok(crate::workspace::Shared { path: path.into(), write })
+                }).collect::<Result<Vec<_>, _>>()?,
             },
             prepared: match value.get("prepared") {
                 None => Vec::new(),
@@ -2493,6 +2535,8 @@ impl Conversation {
                     workspace,
                     archived: false,
                     prepared: Vec::new(),
+                    directory_grants: Vec::new(),
+                    directory_exposures: Vec::new(),
                     removed: false,
                     tracked: Vec::new(),
                 };
@@ -2860,6 +2904,22 @@ impl Conversation {
         let text = instructions_json(&all).to_string();
         replace(&self.dir, INSTRUCTIONS, text.as_bytes())?;
         self.instructions = all;
+        Ok(())
+    }
+
+    pub fn set_directory_grants(
+        &mut self,
+        grants: Vec<crate::workspace::Shared>,
+    ) -> Result<(), String> {
+        let mut meta = self.meta.clone();
+        for grant in meta.directory_grants.iter().chain(&grants) {
+            if !meta.directory_exposures.contains(&grant.path) {
+                meta.directory_exposures.push(grant.path.clone());
+            }
+        }
+        meta.directory_grants = grants;
+        replace(&self.dir, "meta", bounded(&meta)?.as_bytes())?;
+        self.meta = meta;
         Ok(())
     }
 
@@ -4340,6 +4400,28 @@ pub mod tests {
         std::fs::write(state.root().join(ADMITTED), many).unwrap();
         let e = state.load_admitted().unwrap_err();
         assert!(e.contains("more than 256"), "{e}");
+    }
+
+    #[test]
+    fn revoked_directory_grants_remain_reachable() {
+        let owned = td_fs::TempDir::new("grant-history").unwrap();
+        let state = StateDir::at(owned.path().to_path_buf());
+        state.ensure().unwrap();
+        let id = Id::random().unwrap();
+        let (mut conversation, _) =
+            Conversation::open(&state, &id, Some(Role::Conversation), LOCK_WAIT).unwrap();
+        let grant = crate::workspace::Shared {
+            path: "/home/person/Downloads".into(),
+            write: true,
+        };
+        conversation
+            .set_directory_grants(vec![grant.clone()])
+            .unwrap();
+        conversation.set_directory_grants(Vec::new()).unwrap();
+        drop(conversation);
+        let (conversation, _) = Conversation::open(&state, &id, None, LOCK_WAIT).unwrap();
+        assert!(conversation.meta().directory_grants.is_empty());
+        assert_eq!(conversation.meta().directory_exposures, [grant.path]);
     }
 
     #[test]

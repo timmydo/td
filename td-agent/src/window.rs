@@ -3095,6 +3095,17 @@ fn reached(metas: &[crate::store::Meta], client: &Client) -> Vec<PathBuf> {
             Some(Workspace::Directory(path)) => Some(path.clone()),
             _ => None,
         })
+        .chain(
+            metas
+                .iter()
+                .flat_map(|meta| meta.directory_grants.iter())
+                .map(|grant| grant.path.clone()),
+        )
+        .chain(
+            metas
+                .iter()
+                .flat_map(|meta| meta.directory_exposures.iter().cloned()),
+        )
         .chain(client.shared.iter().map(|shared| shared.path.clone()))
         .chain(
             client
@@ -3566,6 +3577,8 @@ mod tests {
             workspace,
             archived: false,
             prepared: Vec::new(),
+            directory_grants: Vec::new(),
+            directory_exposures: Vec::new(),
             removed: false,
             tracked: Vec::new(),
         };
@@ -3614,6 +3627,8 @@ mod tests {
             workspace: Some(Workspace::Directory(root.join("srv"))),
             archived: false,
             prepared: Vec::new(),
+            directory_grants: Vec::new(),
+            directory_exposures: Vec::new(),
             removed: false,
             tracked: Vec::new(),
         };

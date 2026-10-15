@@ -1457,7 +1457,15 @@ impl App {
             kind: StatusKind::Mode,
         });
         parts.push(part(
-            format!("network host; web {}", self.shown_network().name()),
+            format!(
+                "network host; web {}{}",
+                self.shown_network().name(),
+                if self.networks.host_commands {
+                    "; host execution enabled"
+                } else {
+                    ""
+                }
+            ),
             2,
         ));
         parts.push(StatusPart {

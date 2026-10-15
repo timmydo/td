@@ -6949,7 +6949,7 @@ fn prepare_workspace_mount_plan(plan: &WorkspacePlan, identity: Identity) -> io:
         mount_grant(tree, true)?;
     }
     for grant in &plan.shared {
-        mount_grant(grant, false)?;
+        mount_grant(grant, plan.development)?;
     }
     for repository in &plan.repositories {
         mount_grant(repository, false)?;
@@ -7300,7 +7300,7 @@ fn require_workspace_mount_plan(plan: &Stage2Workspace, token: &[u8; TOKEN_LEN])
         require_tree_mount_policy(&mountinfo, &tree, true)?;
     }
     for grant in &plan.shared {
-        require_tree_mount_policy(&mountinfo, grant, false)?;
+        require_tree_mount_policy(&mountinfo, grant, plan.development)?;
     }
     for repository in &plan.repositories {
         let repository = Stage2Filesystem {

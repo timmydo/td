@@ -30,6 +30,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod accounts;
 pub mod activity;
 pub mod assemble;

@@ -72,6 +72,8 @@ pub struct Client {
     pub template_shared: Vec<TemplateShared>,
     /// The most background processes a conversation runs at once.
     pub max_background: u32,
+    /// Enable per-command, human-approved execution outside filesystem confinement.
+    pub host_commands: bool,
     /// Whether a conversation past `compact_at` is compacted, or its turn
     /// stopped (DESIGN.md §14).
     pub auto_compact: bool,
@@ -305,6 +307,7 @@ impl Default for Client {
             shared: Vec::new(),
             template_shared: Vec::new(),
             max_background: DEFAULT_MAX_BACKGROUND,
+            host_commands: false,
             auto_compact: true,
             compact_at: DEFAULT_COMPACT_AT,
             compact_keep_tokens: DEFAULT_COMPACT_KEEP_TOKENS,
@@ -525,6 +528,7 @@ impl Client {
                 "max_background".into(),
                 Json::from(u64::from(self.max_background)),
             ),
+            ("host_commands".into(), Json::Bool(self.host_commands)),
             ("auto_compact".into(), Json::Bool(self.auto_compact)),
             ("compact_at".into(), Json::from(u64::from(self.compact_at))),
             (
@@ -722,6 +726,10 @@ impl Client {
                         .filter(|n| COLD_RESUME_TOKENS.contains(n))
                         .ok_or("cold_resume_tokens is out of range")?,
                 ),
+            },
+            host_commands: match value.get("host_commands") {
+                None => false,
+                Some(value) => value.as_bool().ok_or("host_commands is not a boolean")?,
             },
             max_background: match value.get("max_background") {
                 None => DEFAULT_MAX_BACKGROUND,
@@ -1050,6 +1058,7 @@ const KEYS: &[(&str, Use)] = &[
     ("fetch_interval", Use::Read),
     ("fetch_concurrency", Use::Later(11)),
     ("max_background", Use::Read),
+    ("host_commands", Use::Read),
     ("background_output_bytes", Use::Read),
     ("auto_compact", Use::Read),
     ("compact_at", Use::Read),
@@ -2184,6 +2193,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     .ok_or_else(|| cold_resume_refused(value))?,
             ),
             _ => return Err(cold_resume_refused(value)),
+        };
+    }
+    if let Some(value) = table.get("host_commands") {
+        config.client.host_commands = match value {
+            Toml::Bool(value) => *value,
+            _ => return Err("`host_commands` must be a boolean".into()),
         };
     }
     if let Some(value) = table.get("max_background") {

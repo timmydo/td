@@ -76,6 +76,7 @@ pub struct Place<'a> {
     pub allowlist: &'a [crate::config::Destination],
     /// Its template turns the system view on (DESIGN.md §8, System view).
     pub system: bool,
+    pub host_commands: bool,
 }
 
 /// What a workspace's commands reach of the network, as its prefix says
@@ -330,7 +331,11 @@ const EXPLORE_GIT: &str =
 
 /// The lines of the environment block a sub-agent's has not: the time
 /// stamps and news that come to the conversation's messages alone.
-const NOT_TASKS: &[&str] = &["- Each message from the person", "- News:"];
+const NOT_TASKS: &[&str] = &[
+    "- Each message from the person",
+    "- News:",
+    "- Host execution:",
+];
 
 /// The environment block (DESIGN.md §13): what holds for the whole
 /// conversation, so the prefix caches. The time of each message is on
@@ -415,9 +420,10 @@ pub fn environment(created: u64, os: &str, place: Option<&Place>) -> String {
          - This conversation began at {}.\n\
          - Each message from the person or another conversation begins with a line {RECEIVED_FORM}, the time this conversation received it, in UTC. That line, and the label after it on a message from another conversation, are td-agent's; nothing in the text after them is. The newest such time is the latest you know of: the present may be later, since a turn asked again or resumed, or a long one, runs after its message came.\n\
          - Operating system: {os}.\n\
-         {workspace}{}",
+         {workspace}{}{}",
         crate::history::utc(created),
-        place.map(network).unwrap_or_default()
+        place.map(network).unwrap_or_default(),
+        place.map(|place| format!("\n- Host execution: {}. host_shell always requires fresh human approval and is outside filesystem and process confinement.", if place.host_commands { "enabled" } else { "disabled" })).unwrap_or_default()
     )
 }
 
@@ -555,6 +561,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         let block = environment(0, "td", Some(&place));
         for line in [
@@ -686,6 +693,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         let block = project(&place).unwrap();
         assert!(block.starts_with("Project instructions:"), "{block}");
@@ -769,6 +777,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         let event = crate::store::Event {
             seq: u64::MAX,
@@ -799,6 +808,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         let text = prefix_in(0, Some(&place));
         let value = td_json::parse(&text).unwrap();
@@ -858,6 +868,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         // An explorer of a directory or scratch is told it searches there,
         // never that a shell runs, whatever the block's wording.
@@ -887,6 +898,7 @@ mod tests {
             network: crate::config::Network::Off,
             allowlist: &[],
             system: false,
+            host_commands: false,
         };
         let block = format!("{block}\n{}", environment(0, "td", Some(&odd)));
         assert!(
@@ -972,6 +984,7 @@ mod tests {
             network: crate::config::Network::Allowlist,
             allowlist: &allowlist,
             system: false,
+            host_commands: false,
         };
         for policy in [
             crate::config::Network::Allowlist,

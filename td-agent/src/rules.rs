@@ -35,6 +35,8 @@ pub const TOOLS: &[&str] = &[
     "grep",
     "sed",
     "shell",
+    "host_shell",
+    "request_directory",
     "git_push",
     "network",
     "mcp",
@@ -2301,6 +2303,12 @@ mod tests {
             rule: rule(line),
             from: "the repository at /w/td".into(),
         };
+        for tool in ["host_shell", "request_directory"] {
+            assert!(matches!(
+                judge(&[from(&format!("deny {tool}"))], &[], tool, None, true),
+                Verdict::Deny(_)
+            ));
+        }
         let rules = [from("ask shell git"), from("deny shell git push")];
         assert_eq!(
             judge(&rules, &[], "shell", Some("git status && git push"), true),

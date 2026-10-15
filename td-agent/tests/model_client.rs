@@ -472,6 +472,9 @@ fn spawn(
         command.args(["--workspace", workspace]);
     }
     if jailed {
+        if let Some(home) = std::env::var_os("HOME") {
+            command.env("HOME", home);
+        }
         for var in [td_agent::jail::JAIL_VAR, td_agent::jail::TXT_VAR] {
             command.env(
                 var,
@@ -10057,4 +10060,175 @@ fn an_mcp_server_starts_without_a_destination_card() {
         .iter()
         .all(|event| !matches!(&event.kind,
         Kind::Approval { reason: Some(reason), .. } if reason.contains("connecting to"))));
+}
+
+fn access_reply(name: &str, arguments: td_json::Json) -> Reply {
+    let mut reply = Reply::sse("stream-tool-network.sse");
+    let Reply::Stream { body, .. } = &mut reply else {
+        panic!("expected stream");
+    };
+    let original = td_json::Json::Str("{\"command\":\"git ls-remote http://other.test/r.git 2>&1; git ls-remote http://third.test/r.git 2>&1\"}".into()).to_string();
+    let replacement = td_json::Json::Str(arguments.to_string()).to_string();
+    let text = String::from_utf8(body.clone())
+        .unwrap()
+        .replace("\"name\":\"shell\"", &format!("\"name\":\"{name}\""))
+        .replace(&original, &replacement);
+    *body = text.into_bytes();
+    reply
+}
+
+#[test]
+fn host_execution_is_disabled_by_default() {
+    let reply = access_reply(
+        "host_shell",
+        td_json::Json::Obj(vec![
+            ("command".into(), "echo should-not-run".into()),
+            ("workdir".into(), "/".into()),
+        ]),
+    );
+    let mut h = Harness::new_in(
+        "host-off",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            reply,
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+        ],
+    );
+    h.setup(Client::default());
+    h.say("Run it.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(results(&events)
+        .iter()
+        .any(|(_, result, error)| *error && result.contains("host_shell is disabled")));
+}
+
+#[test]
+fn host_execution_requires_a_human_even_in_auto_and_can_be_refused() {
+    let owned = td_fs::TempDir::new("host-command").unwrap();
+    let root = std::fs::canonicalize(owned.path()).unwrap();
+    let reply = access_reply(
+        "host_shell",
+        td_json::Json::Obj(vec![
+            ("command".into(), "echo reached > proof".into()),
+            ("workdir".into(), root.display().to_string().into()),
+        ]),
+    );
+    let mut h = Harness::new_in(
+        "host-ask",
+        Role::Conversation,
+        Some("scratch"),
+        false,
+        vec![
+            reply.clone(),
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            reply,
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client {
+        host_commands: true,
+        ..Client::default()
+    });
+    h.down(&auto_with("[everywhere]\nallow shell echo\n"));
+    h.say("Run it.");
+    let (call, title, details) = h.until_ask();
+    assert_eq!(title, "Run on host with full access");
+    assert!(details.iter().any(|line| line.contains("credentials")));
+    assert!(!root.join("proof").exists());
+    h.down(&Down::Decision {
+        call,
+        allow: false,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(!root.join("proof").exists());
+    h.say("Run it now.");
+    let (call, title, _) = h.until_ask();
+    assert_eq!(title, "Run on host with full access");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (_, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert_eq!(
+        std::fs::read_to_string(root.join("proof")).unwrap(),
+        "reached\n"
+    );
+}
+
+#[test]
+#[ignore = "needs user namespaces, TD_AGENT_JAIL and TD_AGENT_TXT"]
+fn directory_grants_require_human_consent_and_persist() {
+    let owned = td_fs::TempDir::new("directory-grant").unwrap();
+    let root = std::fs::canonicalize(owned.path()).unwrap();
+    std::fs::write(root.join("given"), "private input").unwrap();
+    let reply = access_reply(
+        "request_directory",
+        td_json::Json::Obj(vec![("path".into(), root.display().to_string().into())]),
+    );
+    let mut h = Harness::new_in(
+        "grant",
+        Role::Conversation,
+        Some("scratch"),
+        true,
+        vec![
+            reply,
+            Reply::sse("stream-sonnet.sse"),
+            Reply::ok("title.json"),
+            access_reply("shell", td_json::Json::Obj(vec![("command".into(), format!("cat '{}/given'; if touch '{}/forbidden'; then echo write-allowed; else echo write-blocked; fi", root.display(), root.display()).into())])),
+            Reply::sse("stream-sonnet.sse"),
+        ],
+    );
+    h.setup(Client::default());
+    h.down(&auto_with(""));
+    h.say("Use the additional directory.");
+    let (call, title) = h.until(|up| match up {
+        Up::Ask { call, title, .. } => Some((*call, title.clone())),
+        Up::Event(event) => {
+            if let Kind::ToolResult { error: true, .. } = &event.kind {
+                panic!("grant refused: {event:?}");
+            }
+            None
+        }
+        _ => None,
+    });
+    assert_eq!(title, "Grant read directory access");
+    h.down(&Down::Decision {
+        call,
+        allow: true,
+        always: None,
+    });
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(
+        results(&events).iter().all(|(_, _, error)| !error),
+        "{events:?}"
+    );
+    h.say("Read the granted input.");
+    let (events, outcome, _) = h.turn();
+    assert_eq!(outcome, "replied", "{}", h.said());
+    assert!(
+        results(&events)
+            .iter()
+            .any(|(_, result, _)| result.contains("private input")
+                && result.contains("write-blocked")),
+        "{events:?}"
+    );
+    assert!(!root.join("forbidden").exists());
+    let (conversation, _) = h.close();
+    assert_eq!(
+        conversation.meta().directory_grants,
+        vec![td_agent::workspace::Shared {
+            path: root,
+            write: false
+        }]
+    );
 }

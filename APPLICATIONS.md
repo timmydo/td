@@ -3674,7 +3674,7 @@ with the kind's own departures:
   worktree is a `checkout`, whose `.git` is protected.
 - **Mount flags.** Every directory is `nosuid,nodev`. The home and the
   shared directories are `noexec` in the isolated profile; development's
-  private home is executable, while shared directories remain noexec.
+  private home and admitted shared directories are executable.
   Worktrees are executable, because the
   agent's shell runs what it builds there. `read` directories are
   read-only. The hardening loop keeps a flag the host already set on a

@@ -73,6 +73,8 @@ pub enum Tool {
     Grep,
     Sed,
     Shell,
+    HostShell,
+    RequestDirectory,
     ProcessList,
     ProcessOutput,
     ProcessWait,
@@ -179,6 +181,8 @@ const WORKSPACE: &[Tool] = &[
     Tool::Grep,
     Tool::Sed,
     Tool::Shell,
+    Tool::HostShell,
+    Tool::RequestDirectory,
     Tool::ProcessList,
     Tool::ProcessOutput,
     Tool::ProcessWait,
@@ -240,6 +244,8 @@ impl Tool {
             Self::Grep => "grep",
             Self::Sed => "sed",
             Self::Shell => "shell",
+            Self::HostShell => "host_shell",
+            Self::RequestDirectory => "request_directory",
             Self::ProcessList => "process_list",
             Self::ProcessOutput => "process_output",
             Self::ProcessWait => "process_wait",
@@ -286,7 +292,13 @@ impl Tool {
     pub fn acts(self) -> bool {
         matches!(
             self,
-            Self::WriteFile | Self::EditFile | Self::ApplyPatch | Self::Sed | Self::Shell
+            Self::WriteFile
+                | Self::EditFile
+                | Self::ApplyPatch
+                | Self::Sed
+                | Self::Shell
+                | Self::HostShell
+                | Self::RequestDirectory
         )
     }
 
@@ -561,6 +573,21 @@ pub(crate) fn definition(tool: Tool) -> Json {
                 &["command"],
             ),
         ),
+        Tool::HostShell => (
+            "Run sh -c outside filesystem confinement with the person's host authority, including their home, credentials and host services. Requires host_commands=true and a fresh human approval for this exact command, even in auto mode; never an automatic retry of a jailed failure. No background option. Timeout or cancellation stops the direct shell; descendants may outlive it. Prefer shell and request_directory when sufficient.".into(),
+            schema(vec![
+                ("command", property("string", "The exact host command to approve.")),
+                ("workdir", property("string", "The absolute host working directory.")),
+                ("timeout_ms", integer("Timeout in milliseconds, at most 600000.", 1, Some(600000))),
+            ], &["command", "workdir"]),
+        ),
+        Tool::RequestDirectory => (
+            "Ask the person to grant this conversation an additional directory at its real path, read-only by default. Human approval is required in every mode. Home roots, secrets, agent state and protected repository paths remain refused. Grants persist until revoked or the conversation is deleted. Revocation affects new jobs; existing background jobs retain their mounts until stopped.".into(),
+            schema(vec![
+                ("path", property("string", "An absolute directory path.")),
+                ("access", property("string", "read (default), write, or revoke.")),
+            ], &["path"]),
+        ),
         Tool::ProcessList => (
             "List this conversation's background processes, the latest 50: each one's id, state (running, or how it ended: its exit status, killed, timed out, failed, or lost when td-agent stopped while it ran), start time, the bytes of output it wrote and command.".to_string(),
             schema(Vec::new(), &[]),
@@ -795,6 +822,15 @@ pub enum Args {
         prompt: String,
         agent: SubAgent,
         options: TaskOptions,
+    },
+    HostShell {
+        command: String,
+        workdir: String,
+        timeout_ms: Option<u64>,
+    },
+    RequestDirectory {
+        path: String,
+        access: String,
     },
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
@@ -1399,6 +1435,46 @@ pub fn parse_offered(
                     .map_or(crate::sysview::LIMIT, |n| n as usize),
                 filter,
             })
+        }
+        Tool::HostShell => {
+            let m = members(tool_name, &value, &["command", "workdir", "timeout_ms"])?;
+            let command = required(m, "command")?;
+            let workdir = required(m, "workdir")?;
+            if command.is_empty()
+                || command.contains('\0')
+                || !std::path::Path::new(workdir).is_absolute()
+                || workdir.contains('\0')
+            {
+                return Err(
+                    "host_shell needs a nonempty command and absolute working directory".into(),
+                );
+            }
+            Args::HostShell {
+                command: command.into(),
+                workdir: workdir.into(),
+                timeout_ms: number(m, "timeout_ms", 1, 600000)?,
+            }
+        }
+        Tool::RequestDirectory => {
+            let m = members(tool_name, &value, &["path", "access"])?;
+            let path = required(m, "path")?;
+            let access = match member(m, "access") {
+                None => "read",
+                Some(value) => value.as_str().ok_or("access is not a string")?,
+            };
+            if !std::path::Path::new(path).is_absolute()
+                || path.contains('\0')
+                || !matches!(access, "read" | "write" | "revoke")
+            {
+                return Err(
+                    "request_directory needs an absolute path and read, write or revoke access"
+                        .into(),
+                );
+            }
+            Args::RequestDirectory {
+                path: path.into(),
+                access: access.into(),
+            }
         }
         Tool::GitFetch => {
             let m = members(tool_name, &value, &["worktree"])?;
@@ -2211,6 +2287,27 @@ mod tests {
     /// Every tool of either set is known by its name, and nothing else
     /// a model might call one.
     #[test]
+    fn host_access_tools_are_conversation_only_and_have_bounded_arguments() {
+        for kit in [Kit::Review, Kit::Task, Kit::Explore, Kit::Conversation] {
+            assert!(parse_in(kit, "host_shell", r#"{"command":"true","workdir":"/"}"#).is_err());
+            assert!(parse_in(kit, "request_directory", r#"{"path":"/data"}"#).is_err());
+        }
+        for args in [
+            r#"{"command":"true","workdir":"relative"}"#,
+            r#"{"command":"true","workdir":"/","background":true}"#,
+            r#"{"command":"true","workdir":"/","timeout_ms":600001}"#,
+        ] {
+            assert!(parse_in(Kit::Workspace, "host_shell", args).is_err());
+        }
+        assert!(parse_in(
+            Kit::Workspace,
+            "request_directory",
+            r#"{"path":"/data","access":"execute"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn only_td_agents_tools_are_known() {
         for tool in CONVERSATION.iter().chain(WORKSPACE) {
             assert!(known(tool.name()), "{}", tool.name());
@@ -2701,7 +2798,7 @@ mod tests {
     fn a_workspace_adds_its_tools_and_their_calls_go_to_the_host() {
         let names: Vec<&str> = Tool::all(Kit::Workspace).iter().map(|t| t.name()).collect();
         assert_eq!(
-            names[names.len() - 13..],
+            names[names.len() - 15..],
             [
                 "read_file",
                 "write_file",
@@ -2711,6 +2808,8 @@ mod tests {
                 "grep",
                 "sed",
                 "shell",
+                "host_shell",
+                "request_directory",
                 "process_list",
                 "process_output",
                 "process_wait",

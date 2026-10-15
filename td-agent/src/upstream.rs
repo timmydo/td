@@ -141,6 +141,8 @@ mod tests {
             workspace,
             archived,
             prepared: Vec::new(),
+            directory_grants: Vec::new(),
+            directory_exposures: Vec::new(),
             removed,
             tracked: Vec::new(),
         }
