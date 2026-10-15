@@ -339,10 +339,12 @@ boundaries are:
 
 # Code review
 
-- Each commit receives two independent reviews: `opus-latest` and
-  `gpt-sol-latest`, both at high effort. Invoke a fresh harness subagent
-  with the required model when supported; otherwise use `td-agent review`.
-  `DEVELOPMENT.md` defines the command and durable record. One panel cycle
+- Each commit receives two independent reviews at high effort, using
+  `opus-latest` and `gpt-sol-latest` or the approved subscription
+  alternatives in `DEVELOPMENT.md`. Invoke a fresh harness subagent
+  with the required model when supported; otherwise use the subscription
+  alternatives or `td-agent review` defined in `DEVELOPMENT.md`. That
+  document defines the standing approval and durable record. One panel cycle
   is scheduled per commit; later passes use the review subagent alone,
   and re-running the panel needs a named escalation trigger. Stop and ask
   when the passes stop converging.

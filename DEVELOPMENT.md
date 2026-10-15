@@ -951,13 +951,62 @@ Every increment receives two independent reviews of one exact commit:
 `opus-latest` and `gpt-sol-latest`, both at **high** effort. Select the
 newest available frontier release in each family and record the concrete
 versions actually used. An unresolved `latest` alias is not a receipt.
+The subscription alternatives below may replace one of these models.
 
 Use a fresh review subagent in the current harness when it can select the
 required model and high effort. Give it the repository and full commit id,
 ask it to inspect the complete commit, relevant instructions and surrounding
 code, and return prioritized findings with file locations. It must not edit
-or inherit the acting agent's conclusions. When the harness cannot invoke
-that model, run the following from the change's worktree:
+or inherit the acting agent's conclusions.
+
+## Subscription alternatives
+
+To preserve API credits when subscription credits are available, prefer these
+user-approved alternatives to a paid td-agent review:
+
+- Codex keeps the independent GPT Sol review and may use a fresh Astra
+  subagent instead of the td-agent Opus review.
+- Claude keeps the independent Opus review and may use a fresh Fable
+  subagent instead of the td-agent GPT Sol review.
+
+Both reviews still inspect the exact commit independently at high effort;
+the acting agent's own assessment does not count as either review. Select
+the newest available release in the chosen family and record the concrete
+model actually used. Use a fresh context without the acting agent's
+conclusions. The same reconciliation and confirmation rules apply.
+
+This is standing approval from the repository user until revoked; do not
+ask again for each commit. It permits the substitution, not omission of
+the second review. If the alternative is unavailable, follow the ordinary
+review route unless the user has prohibited paid API calls; in that case
+ask before spending API credits.
+
+The current verifier recognizes Opus and GPT Sol receipts. Record Astra or
+Fable's concrete identity, high effort, reviewed commit, findings and
+dispositions in the commit body, and use the existing waiver for the
+replaced slot. Do not mislabel an alternative as Opus or GPT Sol, or put
+its unsupported model in a Reviewed-by trailer. Keep the other review's
+normal Reviewed-by trailer. For Codex:
+
+```text
+Reviewed-by: subagent/gpt-6.1-sol
+Review-waiver: opus — Astra substitution to preserve API credits; approved by repository user
+Checks: <checks actually run>
+```
+
+For Claude, retain the concrete Opus Reviewed-by trailer and use:
+
+```text
+Review-waiver: gpt-sol — Fable substitution to preserve API credits; approved by repository user
+```
+
+These trailers record this standing human approval; they do not claim the
+verifier independently checks the replacement review.
+
+## API review route
+
+When the harness cannot invoke the required model and the subscription
+alternative is not used, run the following from the change's worktree:
 
 ```text
 td-agent review --commit COMMIT_ID --model opus-latest
@@ -973,8 +1022,11 @@ completion or error. No remote, caller-written prompt or prepared diff is
 needed. The command defaults to high effort and resolves the model alias to
 its concrete API identity. See `td-agent/DESIGN.md` §2 for confinement, cost
 limits and retained traces. A nonzero exit or incomplete report is not a
-review. Both transports fill the same reviewer slots; there is no quota
-fallback protocol or separate CLI review step.
+review. Both transports fill the same reviewer slots; the subscription
+alternatives above use an explicit waiver for the replaced slot. There is
+no separate CLI review step.
+
+## Review records and follow-up
 
 Store reports under `.td-build-cache/agent-scratch/` in the owned worktree.
 Summarize their findings and dispositions in the commit, then delete owned
@@ -1014,8 +1066,9 @@ dispositions and confirmation passes. `ready` and `td-review` share the same
 record verifier. Historical CLI receipts remain readable, but the current
 workflow invokes only harness subagents or `td-agent review`.
 
-An unavailable model may be waived only with a reason and a named human's
-explicit approval. At most one frontier reviewer may be waived:
+Outside the standing subscription approval above, an unavailable model may
+be waived only with a reason and a named human's explicit approval. At most
+one frontier reviewer may be waived:
 
 ```text
 Review-waiver: opus — <reason>; approved by <human name>
