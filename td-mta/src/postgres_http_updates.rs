@@ -142,14 +142,6 @@ impl Updates<'_> {
         {
             return Err(Error::Capacity);
         }
-        // This milestone admits only td-mail's keyword assignments.
-        if request
-            .updates
-            .iter()
-            .any(|update| update.mailbox.is_some())
-        {
-            return Err(Error::Forbidden);
-        }
         let now = self.clock.sample()?.monotonic;
         let until = Deadline::after(now, 10_000)?.min(request.deadline);
         meter
@@ -185,7 +177,7 @@ impl Updates<'_> {
             .map_err(|_| Error::Capacity)?;
         for update in request.updates {
             updates.push(changes::Update {
-                mailbox: None,
+                mailbox: update.mailbox,
                 email: update.email,
                 seen: update.seen,
                 flagged: update.flagged,

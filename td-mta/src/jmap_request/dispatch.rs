@@ -197,7 +197,7 @@ pub fn run_with_mail_access<'state, 'c, 's, 'r, 'sr, 'a, P>(
             drafts: drafts.map(|creator| (creator, device)),
             identities: None,
             read: None,
-            keyword_updates: false,
+            email_updates: false,
         },
     )
 }
@@ -232,7 +232,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
     execution: ports::Deadline,
     snapshot: &mut crate::postgres_read::Snapshot<'_>,
     clock: &crate::clock::RuntimeClock,
-    keyword_updates: bool,
+    email_updates: bool,
 ) -> Result<Completed<'state, 'c, 's, 'r, 'sr, 'a, P>, Error> {
     snapshot
         .constrain_deadline(
@@ -249,7 +249,7 @@ pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
         account,
         Profile {
             read: Some(snapshot),
-            keyword_updates,
+            email_updates,
             ..Profile::default()
         },
     )?;
@@ -390,7 +390,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         drafts,
         identities,
         read,
-        keyword_updates,
+        email_updates,
     } = profile;
     if identities.is_some_and(|catalog| catalog.account() != account) {
         return Err(Error::State);
@@ -437,7 +437,7 @@ fn run_inner<'state, 'c, 's, 'r, 'sr, 'a, P>(
         drafts,
         identities,
         read: read.as_mut().map(|view| reborrow_read(&mut **view)),
-        keyword_updates,
+        email_updates,
         submission,
     };
     for (ordinal, token) in calls.into_iter().enumerate() {
@@ -513,7 +513,7 @@ struct Profile<'a> {
     drafts: Option<(&'a dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'a crate::identity_catalog::Catalog>,
     read: Option<&'a mut dyn MailRead>,
-    keyword_updates: bool,
+    email_updates: bool,
 }
 struct Resolved {
     value: usize,
@@ -530,7 +530,7 @@ struct Worker<'io, 'c, 's, 'r, 'sr, 'a, P> {
     drafts: Option<(&'io dyn DraftCreator, crate::ids::DeviceId)>,
     identities: Option<&'io crate::identity_catalog::Catalog>,
     read: Option<&'io mut dyn MailRead>,
-    keyword_updates: bool,
+    email_updates: bool,
     submission: bool,
 }
 impl<P> super::children::Source for Worker<'_, '_, '_, '_, '_, '_, P> {
@@ -1261,7 +1261,7 @@ pub(super) mod tests {
                 drafts: None,
                 identities: None,
                 read: None,
-                keyword_updates: false,
+                email_updates: false,
                 submission: false,
             };
             assert_eq!(
@@ -1671,7 +1671,7 @@ pub(super) mod tests {
                 drafts: None,
                 identities: None,
                 read: None,
-                keyword_updates: false,
+                email_updates: false,
                 submission: false,
             };
             assert_eq!(worker.blob_copy(0..end), Err(Error::ExecutionDeadline));

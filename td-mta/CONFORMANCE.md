@@ -402,11 +402,12 @@ and TLS materials, delivers a multipart message under the cloud profile and
 serves the same account through the desktop profile's prepared HTTPS backend.
 The fixture drives discovery, mailbox listing, Email/query and Email/get,
 body display, explicit Thread/get, read/unread and star/unstar updates,
+moves between existing folders,
 decoded attachment download and raw-message download with the real client. Authentication and API/download work run on the fixed HTTPS
 workers. Its private CA enters only the existing test-only fetch process.
 
 This is an explicit PostgreSQL qualification command, separate from the
 SQLite native fixture. It does not activate a production PostgreSQL service
-or qualify folder mutations, submission, cloud-provider
+or qualify folder creation/deletion, submission, cloud-provider
 failover or managed-database deployment. Process and file cleanup belong to
 the fixture; no public endpoint is contacted.

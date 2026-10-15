@@ -307,6 +307,24 @@ pub(super) fn exercise(
                 assert_eq!(fresh["emails"][0]["is_read"].as_bool(), Some(seen), "{fresh}");
                 assert_eq!(fresh["emails"][0]["is_flagged"].as_bool(), Some(flagged), "{fresh}");
             }
+            let archive = td_mta::postgres_mailbox_create::prepare(binding, device.device_id(), None, &["Archive"], deadline()).unwrap();
+            let created = td_mta::postgres_mailbox_create::publish(request, trust, deadline(), &archive, device.password()).unwrap();
+            let td_mta::postgres_mailbox_create::ResultEntry::Created(archive) = created.results[0] else { panic!("archive fixture creation"); };
+            let mut archive_wire = [0; td_mta::wire::IdKind::WIRE_BYTES];
+            let archive_wire = td_mta::wire::encode_id(archive, &mut archive_wire).unwrap();
+            let inbox_wire = folders[0]["id"].as_str().unwrap();
+            let inbox = sql(fixture, "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships");
+            for (destination, expected) in [(archive_wire, archive.to_string()), (inbox_wire, inbox)] {
+                let moved = client.ask(json!({"command":"move_email", "id":email["id"], "to_mailbox_id":destination}));
+                assert!(moved["ok"].is_true(), "{moved}");
+                assert_eq!(sql(fixture, "SELECT encode(mailbox_id,'hex') FROM td_mta.memberships"), expected);
+                assert_eq!(sql(fixture, "SELECT count(*) FROM td_mta.keywords WHERE keyword IN ('$seen','$flagged')"), "0");
+                let listing = client.ask(json!({"command":"query_emails", "mailbox_id":destination, "limit":50}));
+                assert!(listing["ok"].is_true(), "{listing}");
+                assert_eq!(listing["emails"].as_array().unwrap().len(), 1, "{listing}");
+                assert_eq!(listing["emails"][0]["id"], email["id"]);
+                assert_eq!(listing["emails"][0]["blob_id"], email["blob_id"]);
+            }
             assert_eq!(pending.operation().unwrap(), None);
             sql(fixture, "CREATE FUNCTION public.refuse_client_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture commit uncertainty'; END $$; CREATE CONSTRAINT TRIGGER refuse_client_commit AFTER INSERT ON td_mta.flag_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refuse_client_commit()");
             let uncertain = client.ask(json!({"command":"flag", "id":email["id"]}));

@@ -5621,8 +5621,8 @@ fn exercise_http_read(
     let rights = &rights["methodResponses"][0][1]["list"][0]["myRights"];
     assert!(rights["maySetSeen"].is_true());
     assert!(rights["maySetKeywords"].is_true());
-    assert!(!rights["mayAddItems"].is_true());
-    assert!(!rights["mayRemoveItems"].is_true());
+    assert!(rights["mayAddItems"].is_true());
+    assert!(rights["mayRemoveItems"].is_true());
     for chunked in [false, true] {
         let (result, wire) = call(&body, password, device, chunked, false, false);
         result.unwrap();

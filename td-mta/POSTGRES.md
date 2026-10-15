@@ -2492,8 +2492,8 @@ It closes its authenticated read snapshot before mutation and reserves a
 connection slot before fresh DNS. Runtime connections check the selected
 profile, account, device secret and optional Email state under transaction
 locks. Read-only batches retain their existing single snapshot. Mixed batches
-cannot invoke this mutation adapter. Mailbox moves, draft creation and
-deletion remain outside this prepared endpoint.
+cannot invoke this mutation adapter. Draft creation and deletion remain
+outside this prepared endpoint; §80 connects mailbox moves.
 
 One process-lifetime Pending owner serializes flag mutations without waiting.
 An uncertain COMMIT retains the exact Change and refuses new flag writes
@@ -2507,7 +2507,7 @@ The real td-mail PostgreSQL fixture now marks read, stars, marks unread and
 unstars the delivered message, querying fresh state after every result. It
 also forces a COMMIT error and verifies a later write refuses without losing
 the original operation or stopping reads. Mailbox rights advertise seen and
-keyword updates while unsupported membership and structural rights stay false.
+keyword updates; §80 adds membership rights while structural rights stay false.
 
 ## 79. Prepared flag receipt settlement
 
@@ -2528,3 +2528,21 @@ The real-client fixture checks absence does not clear uncertainty. A second
 prepared owner loses a COMMIT acknowledgement to a deadline and later settles
 the committed receipt while both foreground read slots are held, proving that
 settlement has separate connection admission.
+
+
+## 80. Prepared moves between existing mailboxes
+
+The singleton Email/set adapter also accepts td-mail's mailboxIds replacement.
+It forwards the one selected mailbox to the existing bounded PostgreSQL batch
+transaction. Device/profile/state fences, mailbox existence checks, membership
+replacement, Email and affected Mailbox history, and the original receipt
+remain atomic. Unknown destinations are per-object invalidProperties, and
+membership changes retain the original Email, Thread and body identities.
+
+Prepared HTTP mailbox rights advertise add/remove alongside seen/keyword
+updates. Folder creation, rename, deletion and submission stay unadvertised.
+The same uncertainty owner and settlement mechanism cover combined flag/move
+requests without new retry identities. The real-client fixture prepares an
+Archive folder through the existing storage helper, moves Inbox to Archive
+and back, checks database membership and unchanged flags, and queries the
+same Email/body ID after each move. This does not activate production serving.

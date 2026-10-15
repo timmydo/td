@@ -367,7 +367,7 @@ fn insufficient_response_space_refuses_before_calling_the_creator() {
             drafts: Some((&creator, DEVICE)),
             identities: None,
             read: None,
-            keyword_updates: false,
+            email_updates: false,
             submission: false,
         };
         let mut bytes = br#"{"draft":{"literal":true}}"#.to_vec();
