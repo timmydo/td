@@ -8977,6 +8977,7 @@ fn exercise_submission_reads(
     assert_eq!(record.identity, input.identity());
     assert_eq!(record.submission, first);
     assert_eq!(record.email.to_string(), sql(fixture, &format!("SELECT encode(email_id,'hex') FROM td_mta.submissions WHERE id=decode('{first}','hex')")));
+    exercise_submission_get_dispatch(fixture, &mut view, first, record.email);
     let absent = SubmissionId::from_bytes([0xfe; 16]);
     assert!(view.submission(absent).unwrap().is_none());
     let same_time = view
@@ -9048,6 +9049,184 @@ fn exercise_submission_reads(
         Err(Error::Capacity)
     ));
     assert_eq!(view.submission(first), Err(Error::Capacity));
+}
+
+fn exercise_submission_get_dispatch(
+    fixture: &Fixture,
+    snapshot: &mut td_mta::postgres_read::Snapshot<'_>,
+    submission: td_mta::ids::SubmissionId,
+    email: td_mta::ids::EmailId,
+) {
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{DiskLimits, ViewMode, WorkLimits},
+        jmap_request::{dispatch, response, OwnedValidation, CORE, SUBMISSION},
+        limits::Limits,
+        ports::{Clock, Deadline, Tick},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
+    };
+    let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(snapshot.identity().account, &mut bytes)
+        .unwrap()
+        .to_owned();
+    let submission = td_mta::wire::encode_id(submission, &mut bytes)
+        .unwrap()
+        .to_owned();
+    let email = td_mta::wire::encode_id(email, &mut bytes)
+        .unwrap()
+        .to_owned();
+    let missing = td_mta::wire::encode_id(
+        td_mta::ids::SubmissionId::from_bytes([0xfe; 16]),
+        &mut bytes,
+    )
+    .unwrap()
+    .to_owned();
+    for capability in [true, false] {
+        let using = if capability {
+            format!("\"{CORE}\",\"{SUBMISSION}\"")
+        } else {
+            format!("\"{CORE}\"")
+        };
+        let input = format!(
+            r##"{{"using":[{using}],"methodCalls":[
+            ["EmailSubmission/get",{{"accountId":"{account}","ids":["{submission}","{missing}","foreign","{submission}"],"properties":["id","emailId"]}},"a"],
+            ["EmailSubmission/get",{{"accountId":"{account}","ids":["{submission}"],"properties":[]}},"b"],
+            ["EmailSubmission/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"EmailSubmission/get","path":"/list/*/id"}},"properties":["emailId"]}},"c"],
+            ["EmailSubmission/get",{{"accountId":"afefefefefefefefefefefefefefefefe","ids":[],"properties":["id"]}},"d"],
+            ["EmailSubmission/get",{{"accountId":"{account}","ids":[]}},"e"],
+            ["EmailSubmission/get",{{"accountId":"{account}","ids":null,"properties":["id"]}},"f"],
+            ["EmailSubmission/get",{{"accountId":"{account}","ids":[],"properties":["undoStatus"]}},"g"],
+            ["Core/echo",{{"after":true}},"h"]
+        ]}}"##
+        );
+        let limits = Limits::default();
+        let mut input_bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        input_bytes[..input.len()].copy_from_slice(input.as_bytes());
+        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let mut parser = td_json::arena::OwnedCursor::with_input_length(
+            input_bytes,
+            tokens,
+            input.len(),
+            td_json::arena::ParseLimits {
+                max_bytes: limits.json_bytes,
+                max_depth: limits.json_depth,
+                max_tokens: limits.json_tokens,
+            },
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        let resources = limits.plan().unwrap();
+        let mut validation =
+            OwnedValidation::new(parser.finish().unwrap(), &resources, &[CORE, SUBMISSION])
+                .unwrap();
+        while !validation.step().unwrap() {}
+        let request = validation.finish().unwrap();
+        let directory = fixture.root.join(if capability {
+            "submission-get-responses"
+        } else {
+            "submission-get-no-using"
+        });
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root = PrivateRoot::open(directory.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let clock = Arc::new(td_mta::clock::RuntimeClock::new());
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let spool = RequestSpool::open(&mut root, clock.clone(), until).unwrap();
+        let disk = DiskLimits::default()
+            .plan(
+                &resources,
+                WorkLimits::default(),
+                ViewMode::OnlineBackground,
+            )
+            .unwrap();
+        let mut states = [const { td_mta::ownership::SlotState::EMPTY }; 4];
+        let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
+        let owner =
+            ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
+        let retention = owner.retain_response(until).unwrap();
+        let mut preflight =
+            response::Preflight::new(request, "session", retention.maximum()).unwrap();
+        while !preflight.step(&mut [0; 4096]).unwrap() {}
+        let execution = Deadline::after(Tick(0), until.tick().0 - 1).unwrap();
+        let mut complete = dispatch::run_with_postgres_read(
+            preflight.finish().unwrap(),
+            retention,
+            execution,
+            snapshot,
+            &clock,
+            false,
+        )
+        .unwrap();
+        assert_eq!(complete.responses().len(), 8);
+        let mut encoder = complete.encoder().unwrap();
+        while !encoder.count_step(&mut [0; 4096]).unwrap() {}
+        let length = encoder.begin_output().unwrap();
+        let mut output = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let progress = encoder.poll_output(&mut chunk).unwrap();
+            output.extend_from_slice(&chunk[..progress.written]);
+            if progress.complete {
+                break;
+            }
+        }
+        assert_eq!(encoder.finish().unwrap(), length);
+        assert_eq!(output.len() as u64, length);
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(r#"["Core/echo",{"after":true},"h"]"#),
+            "{output}"
+        );
+        if capability {
+            assert_eq!(
+                output.matches(r#"["EmailSubmission/get","#).count(),
+                3,
+                "{output}"
+            );
+            assert_eq!(
+                output
+                    .matches(&format!(r#""id":"{submission}","emailId":"{email}""#))
+                    .count(),
+                2,
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(r#""notFound":["{missing}","foreign"]"#)),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(
+                    r#""list":[{{"id":"{submission}"}}],"notFound":[]}},"b""#
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"accountNotFound"},"d"]"#),
+                "{output}"
+            );
+            for call in ["e", "f", "g"] {
+                assert!(
+                    output.contains(&format!(
+                        r#"["error",{{"type":"invalidArguments"}},"{call}"]"#
+                    )),
+                    "{output}"
+                );
+            }
+        } else {
+            assert_eq!(
+                output.matches(r#""type":"unknownMethod""#).count(),
+                6,
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"invalidResultReference"},"c"]"#),
+                "{output}"
+            );
+        }
+    }
 }
 
 fn exercise_http_filing_owner(

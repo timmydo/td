@@ -40,6 +40,8 @@ mod thread_get;
 use super::{MAIL, SUBMISSION};
 #[path = "identity_get.rs"]
 mod identity_get;
+#[path = "submission_get.rs"]
+mod submission_get;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -350,6 +352,10 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
         &mut self,
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn submission(
+        &mut self,
+        id: crate::ids::SubmissionId,
+    ) -> Result<Option<crate::postgres_read::SubmissionMetadata>, Error>;
     fn changes(
         &mut self,
         kind: crate::sync::DataType,
@@ -385,6 +391,12 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         self.query_emails(query).map_err(postgres_read_error)
+    }
+    fn submission(
+        &mut self,
+        id: crate::ids::SubmissionId,
+    ) -> Result<Option<crate::postgres_read::SubmissionMetadata>, Error> {
+        self.submission(id).map_err(postgres_read_error)
     }
     fn changes(
         &mut self,
@@ -735,6 +747,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 call.name,
                 b"Core/echo"
                     | b"Identity/get"
+                    | b"EmailSubmission/get"
                     | b"Mailbox/get"
                     | b"Email/get"
                     | b"Email/query"
@@ -747,6 +760,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::UnknownMethod);
         }
         let name = match call.name {
+            b"EmailSubmission/get" if self.submission && self.read.is_some() => {
+                "EmailSubmission/get"
+            }
             b"Identity/get" if self.submission && self.identities.is_some() => "Identity/get",
             b"Core/echo" if core => "Core/echo",
             b"Blob/copy" if core => "Blob/copy",
@@ -773,7 +789,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "Identity/get" {
+        let result = if name == "EmailSubmission/get" {
+            self.submission_get(start..end, responses.request().envelope.maximum_objects)
+        } else if name == "Identity/get" {
             self.identity_get(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Mailbox/set" {
             self.mailbox_set(start..end, responses.request().envelope.maximum_objects)

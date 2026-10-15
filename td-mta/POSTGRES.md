@@ -2803,3 +2803,19 @@ and account/epoch/sequence/interpretation-bound Submission query state. The
 original read slot, SQL worker, authenticated snapshot and absolute deadline
 remain in force; a failure poisons the view. No JMAP dispatch, capability,
 recipient status projection or production PostgreSQL cutover is activated.
+
+## 93. Prepared td-mail submission-get projection
+
+Prepared PostgreSQL read dispatch accepts EmailSubmission/get only with
+Submission in the admitted request's using list. Its implemented shape is
+td-mail's explicit IDs and explicit id/emailId properties; id is always
+returned. Missing and opaque foreign IDs appear in notFound, duplicate IDs
+are coalesced, foreign accounts are refused, and bounded result references
+retain their normal request semantics. Omitted/null IDs or properties and
+other properties are explicitly invalidArguments, not a partial full-object
+projection. Enumeration and recipient/status properties remain unconnected.
+
+The projection uses the same fresh authenticated Snapshot and original
+response/work allowance, returns its Submission data state and historical
+Email IDs, and checks the view before publishing. HTTPS capability admission
+and Session advertising remain unchanged; this is not sending activation.
