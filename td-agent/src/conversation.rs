@@ -149,17 +149,21 @@ fn fetched(
     let lines: Vec<String> = resolved
         .iter()
         .zip(was)
-        .map(|((base, id), was)| match (id, was) {
-            (Err(why), _) => format!("- {base}: not found upstream: {why}"),
-            (Ok(id), Some(was)) if was == id => {
-                format!("- origin/{base} at {}, unchanged", short(id))
+        .map(|((base, id), was)| {
+            let label = match base.strip_prefix(':') {
+                Some(name) => format!("refs/td-agent/fetched/{name}"),
+                None => format!("origin/{base}"),
+            };
+            match (id, was) {
+                (Err(why), _) => format!("- {base}: not found upstream: {why}"),
+                (Ok(id), Some(was)) if was == id => {
+                    format!("- {label} at {}, unchanged", short(id))
+                }
+                (Ok(id), Some(was)) => {
+                    format!("- {label} at {}, moved from {}", short(id), short(was))
+                }
+                (Ok(id), None) => format!("- {label} at {}", short(id)),
             }
-            (Ok(id), Some(was)) => format!(
-                "- origin/{base} at {}, moved from {}",
-                short(id),
-                short(was)
-            ),
-            (Ok(id), None) => format!("- origin/{base} at {}", short(id)),
         })
         .collect();
     format!(
@@ -3414,7 +3418,11 @@ impl Session {
     /// this workspace names set as its remote-tracking ref in every
     /// worktree of that remote; what came said. The outer error is the
     /// log's; the inner, the model's.
-    fn git_fetch(&mut self, worktree: &str) -> Result<Result<String, String>, String> {
+    fn git_fetch(
+        &mut self,
+        worktree: &str,
+        refs: &[String],
+    ) -> Result<Result<String, String>, String> {
         let meta = self.conversation.meta().clone();
         let (repositories, entry) = match prepared_entry(&meta, "git_fetch", worktree) {
             Ok(found) => found,
@@ -3425,6 +3433,11 @@ impl Session {
         for entry in &repositories.entries {
             if entry.remote == remote && !bases.contains(&entry.base) {
                 bases.push(entry.base.clone());
+            }
+        }
+        for name in refs {
+            if !bases.contains(name) {
+                bases.push(name.clone());
             }
         }
         let call = self.ask_id();
@@ -3507,7 +3520,8 @@ impl Session {
         }
         let mut moved: Vec<(String, String, Option<String>)> = Vec::new();
         for (base, id) in bases.iter().zip(ids) {
-            let named = entries.iter().any(|entry| entry.base == *base);
+            let named = entries.iter().any(|entry| entry.base == *base)
+                || (!tell && crate::git::tracking_ref(base).is_ok());
             if !named || !crate::git::object_id(id) || moved.iter().any(|(b, _, _)| b == base) {
                 continue;
             }
@@ -5786,7 +5800,7 @@ impl Session {
                 agent,
                 options,
             } => self.task(started, prompt, agent, options)?,
-            Args::GitFetch { worktree } => self.git_fetch(&worktree)?,
+            Args::GitFetch { worktree, refs } => self.git_fetch(&worktree, &refs)?,
             Args::GitPush {
                 worktree,
                 remote_branch,

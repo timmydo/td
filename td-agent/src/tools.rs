@@ -647,9 +647,10 @@ pub(crate) fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::GitFetch => (
-            "Fetch a worktree's remote now, outside the jail, and set refs/remotes/origin/<base> in each of this workspace's worktrees of that remote to where its base is upstream. It changes no branch and no file: merge or rebase in the worktree with shell afterwards if you want what came. td-agent also fetches in the background and tells you when a base moves, so call this only when you need the newest upstream at once.".to_string(),
+            "Fetch a worktree's admitted remote now. Optional refs names up to 16 additional branches or full refs such as refs/tags/v1 or refs/pull/12/head. Branch refs/heads/foo becomes origin/foo; other full refs become refs/td-agent/fetched/refs/tags/v1 etc. Only commit-bearing refs are exposed. Outside the jail, set refs/remotes/origin/<base> in each of this workspace's worktrees of that remote to where its base is upstream. It changes no branch and no file: merge or rebase in the worktree with shell afterwards if you want what came. td-agent also fetches in the background and tells you when a base moves, so call this only when you need the newest upstream at once.".to_string(),
             schema(
-                vec![("worktree", property("string", "The worktree's absolute path, as the environment names it."))],
+                vec![("worktree", property("string", "The worktree's absolute path, as the environment names it.")),
+                    ("refs", Json::Obj(vec![("type".into(), "array".into()), ("items".into(), property("string", "Literal branch or full remote ref.")), ("maxItems".into(), Json::from(16u64))]))],
                 &["worktree"],
             ),
         ),
@@ -835,6 +836,7 @@ pub enum Args {
     /// `git_fetch`, of the worktree at this path.
     GitFetch {
         worktree: String,
+        refs: Vec<String>,
     },
     /// `git_push`, of the worktree at this path, to the remote's
     /// `remote_branch`, or the worktree's own, forced or not.
@@ -1477,9 +1479,26 @@ pub fn parse_offered(
             }
         }
         Tool::GitFetch => {
-            let m = members(tool_name, &value, &["worktree"])?;
+            let m = members(tool_name, &value, &["worktree", "refs"])?;
+            let refs = match value.get("refs") {
+                None => Vec::new(),
+                Some(value) => {
+                    let list = value.as_arr().ok_or("refs must be a list")?;
+                    if list.len() > 16 {
+                        return Err("at most 16 refs per fetch".into());
+                    }
+                    list.iter()
+                        .map(|value| {
+                            crate::git::fetch_ref(
+                                value.as_str().ok_or("refs must contain strings")?,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+            };
             Args::GitFetch {
                 worktree: required(m, "worktree")?.to_string(),
+                refs,
             }
         }
         Tool::GitPush => {
@@ -2388,10 +2407,28 @@ mod tests {
         assert_eq!(
             parse_in(Kit::Repositories, "git_fetch", args).unwrap(),
             Args::GitFetch {
-                worktree: "/home/me/td-agent/w/td".into()
+                worktree: "/home/me/td-agent/w/td".into(),
+                refs: Vec::new()
             }
         );
-        for wrong in ["{}", r#"{"worktree":"/a","force":true}"#] {
+        assert_eq!(
+            parse_in(
+                Kit::Repositories,
+                "git_fetch",
+                r#"{"worktree":"/a","refs":["refs/heads/topic","refs/tags/v1"]}"#
+            )
+            .unwrap(),
+            Args::GitFetch {
+                worktree: "/a".into(),
+                refs: vec!["topic".into(), ":refs/tags/v1".into()]
+            }
+        );
+        for wrong in [
+            "{}",
+            r#"{"worktree":"/a","force":true}"#,
+            r#"{"worktree":"/a","refs":["HEAD~1"]}"#,
+            r#"{"worktree":"/a","refs":"topic"}"#,
+        ] {
             assert!(
                 parse_in(Kit::Repositories, "git_fetch", wrong).is_err(),
                 "{wrong}"

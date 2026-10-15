@@ -688,7 +688,7 @@ impl Task {
                 if (word == "track" || word == "track-new")
                     && !heads.is_empty()
                     && heads.len() % 2 == 0
-                    && heads.len() / 2 <= MAX_WORKTREES =>
+                    && heads.len() / 2 <= MAX_WORKTREES + 16 =>
             {
                 let heads = heads
                     .as_chunks::<2>()
@@ -698,7 +698,8 @@ impl Task {
                         if !git::object_id(commit) {
                             return Err(format!("{commit:?} is not a full commit id"));
                         }
-                        Ok((git::branch_name(base)?.to_string(), commit.clone()))
+                        git::tracking_ref(base)?;
+                        Ok((base.clone(), commit.clone()))
                     })
                     .collect::<Result<_, String>>()?;
                 Ok(Self::Track {
@@ -893,11 +894,16 @@ impl Task {
                 heads,
                 preparing,
             } => {
+                let refs = heads
+                    .iter()
+                    .map(|(base, commit)| Ok((git::tracking_ref(base)?, commit)))
+                    .collect::<Result<Vec<_>, String>>()?;
                 if *preparing {
                     let mut locks = vec![repository.join("packed-refs.lock")];
-                    locks.extend(heads.iter().map(|(base, _)| {
-                        repository.join(format!("refs/remotes/origin/{base}.lock"))
-                    }));
+                    locks.extend(
+                        refs.iter()
+                            .map(|(reference, _)| repository.join(format!("{reference}.lock"))),
+                    );
                     for lock in locks {
                         match fs::remove_file(&lock) {
                             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -909,9 +915,9 @@ impl Task {
                 }
                 // One transaction: every ref is set, or none is, so the
                 // record of them is never half right.
-                let script: String = heads
+                let script: String = refs
                     .iter()
-                    .map(|(base, commit)| format!("update refs/remotes/origin/{base} {commit}\n"))
+                    .map(|(reference, commit)| format!("update {reference} {commit}\n"))
                     .collect();
                 git::run_fed(
                     jailed(git, repository, id, checkout).args([
@@ -1162,6 +1168,35 @@ pub(crate) mod tests {
             branch: "agent/one".into(),
             sparse: sparse.map(|paths| paths.iter().map(|p| p.to_string()).collect()),
         }
+    }
+
+    #[test]
+    fn tracking_accepts_all_bases_and_explicit_refs_but_is_bounded() {
+        let task = |count| Task::Track {
+            git: "/usr/bin/git".into(),
+            repository: "/w/repo".into(),
+            id: "r".into(),
+            checkout: "/w/tree".into(),
+            heads: (0..count)
+                .map(|n| (format!(":refs/tags/v{n}"), "a".repeat(40)))
+                .collect(),
+            preparing: false,
+        };
+        for count in [1, 32, 33, 48] {
+            let expected = task(count);
+            let words: Vec<_> = expected
+                .args()
+                .iter()
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(Task::parse(&words).unwrap(), expected);
+        }
+        let words: Vec<_> = task(49)
+            .args()
+            .iter()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect();
+        assert!(Task::parse(&words).is_err());
     }
 
     #[test]

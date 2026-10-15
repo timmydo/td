@@ -499,6 +499,39 @@ pub fn branch_name(name: &str) -> Result<&str, String> {
     ok.then_some(name).ok_or_else(refuse)
 }
 
+/// Parse tool input once. A colon marks a non-head ref internally; it
+/// cannot collide with any literal branch name accepted by branch_name.
+pub fn fetch_ref(name: &str) -> Result<String, String> {
+    branch_name(name)?;
+    if let Some(branch) = name.strip_prefix("refs/heads/") {
+        return branch_name(branch).map(str::to_string);
+    }
+    if name.starts_with("refs/") {
+        if name.split('/').count() < 3 {
+            return Err("a full remote ref needs a namespace and name".into());
+        }
+        return Ok(format!(":{name}"));
+    }
+    Ok(name.to_string())
+}
+
+/// Validate an internal tracking key and return its workspace destination.
+pub fn tracking_ref(key: &str) -> Result<String, String> {
+    if let Some(name) = key.strip_prefix(':') {
+        branch_name(name)?;
+        if !name.starts_with("refs/")
+            || name.starts_with("refs/heads/")
+            || name.split('/').count() < 3
+        {
+            return Err("invalid non-head tracking ref".into());
+        }
+        Ok(format!("refs/td-agent/fetched/{name}"))
+    } else {
+        branch_name(key)?;
+        Ok(format!("refs/remotes/origin/{key}"))
+    }
+}
+
 /// The git worker's outside half: the fixed shape of every git it runs
 /// on a repository no jail can write.
 #[derive(Clone, Debug)]
@@ -831,8 +864,53 @@ impl Worker {
             .map_err(|e| format!("fetching {}: {e}", remote.url()))
     }
 
+    /// Fetch literal non-head refs into a private namespace. A missing ref
+    /// fails this request; an older cached destination is never published.
+    fn fetch_named(&self, store: &Path, remote: &Remote, bases: &[String]) -> Result<(), String> {
+        for base in bases {
+            tracking_ref(base)?;
+        }
+        let refs: Vec<_> = bases
+            .iter()
+            .filter_map(|base| base.strip_prefix(':'))
+            .collect();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let mut fetch = self.over(store, remote);
+        fetch
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                "--end-of-options",
+            ])
+            .arg(remote.url());
+        for name in refs {
+            fetch.arg(format!("+{name}:refs/td-agent/fetched/{name}"));
+        }
+        run(&mut fetch, 64 * 1024, FETCH_TIME)
+            .map(drop)
+            .map_err(|why| format!("fetching named refs: {why}"))
+    }
+
     /// The commit the store's branch `base` names.
     pub fn resolve(&self, store: &Path, base: &str) -> Result<String, String> {
+        tracking_ref(base)?;
+        if let Some(base) = base.strip_prefix(':') {
+            let mut parse = self.command(store);
+            parse
+                .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+                .arg(format!("refs/td-agent/fetched/{base}^{{commit}}"));
+            let out = run(&mut parse, 256, LOCAL_TIME)
+                .map_err(|why| format!("resolving {base}: {why}"))?;
+            let id = String::from_utf8_lossy(&out).trim().to_string();
+            return object_id(&id)
+                .then_some(id)
+                .ok_or_else(|| "remote ref does not name a commit".into());
+        }
         self.branch_tip(store, base)?
             .ok_or_else(|| format!("the remote has no branch {base:?}"))
     }
@@ -1545,6 +1623,7 @@ impl Worker {
     ) -> Result<Vec<Result<String, String>>, String> {
         let store = self.store(stores, remote)?;
         self.fetch(&store, remote)?;
+        self.fetch_named(&store, remote, bases)?;
         Ok(bases
             .iter()
             .map(|base| self.resolve(&store, base))
@@ -3277,6 +3356,59 @@ pub(crate) mod tests {
             eprintln!("skipped: no git on PATH; the host preflight runs this test");
         }
         found
+    }
+
+    #[test]
+    fn named_fetch_exposes_extra_branches_and_commit_refs() {
+        if !have_git() {
+            return;
+        }
+        let owned = td_fs::TempDir::new("named-fetch").unwrap();
+        let root = std::fs::canonicalize(owned.path()).unwrap();
+        let up = root.join("up");
+        std::fs::create_dir(&up).unwrap();
+        upstream(&up, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(up.join("file"), "one").unwrap();
+        upstream(&up, &["add", "."]);
+        upstream(&up, &["commit", "--quiet", "-m", "one"]);
+        let id = said(&up, &["rev-parse", "HEAD"]);
+        upstream(&up, &["branch", "quit-shortcut"]);
+        upstream(&up, &["branch", "refs/heads/topic"]);
+        upstream(&up, &["branch", "refs/tags/release"]);
+        upstream(&up, &["tag", "-a", "v1", "-m", "release"]);
+        upstream(&up, &["update-ref", "refs/pull/12/head", &id]);
+        let worker = Worker::new(&root.join("worker"), &kept_env()).unwrap();
+        let remote = local(&up);
+        let stores = root.join("stores");
+        let bases = ["quit-shortcut", ":refs/tags/v1", ":refs/pull/12/head"].map(str::to_string);
+        let result = worker.refresh(&stores, &remote, &bases).unwrap();
+        assert_eq!(result, vec![Ok(id.clone()); 3]);
+        let store = worker.store(&stores, &remote).unwrap();
+        assert_eq!(worker.resolve(&store, "refs/heads/topic").unwrap(), id);
+        assert_eq!(worker.resolve(&store, "refs/tags/release").unwrap(), id);
+        let literal = fetch_ref("refs/heads/refs/heads/topic").unwrap();
+        assert_eq!(literal, "refs/heads/topic");
+        assert_eq!(worker.resolve(&store, &literal).unwrap(), id);
+        assert_ne!(
+            tracking_ref("refs/tags/v1").unwrap(),
+            tracking_ref(":refs/tags/v1").unwrap()
+        );
+        upstream(&up, &["update-ref", "-d", "refs/pull/12/head"]);
+        assert!(worker.refresh(&stores, &remote, &bases).is_err());
+        assert_eq!(
+            fetch_ref("refs/heads/quit-shortcut").unwrap(),
+            "quit-shortcut"
+        );
+        for bad in [
+            "--upload-pack=evil",
+            "+refs/heads/a:refs/heads/b",
+            "HEAD~1",
+            "refs/*",
+            "refs/tag",
+            "refs/heads/",
+        ] {
+            assert!(fetch_ref(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

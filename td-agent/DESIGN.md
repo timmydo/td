@@ -4353,7 +4353,21 @@ the human. Another push is the classifier's in `auto` mode and the
 human's in `ask` mode. The tool pushes only `refs/heads/`, so branch
 deletion and tags are not expressible through it.
 
-**Fetching** is `git_fetch {worktree}`, a repository workspace's tool:
+**Fetching** is `git_fetch {worktree, refs?}`. The optional list names up to
+16 additional literal branches or full refs on that worktree's admitted remote.
+`refs/heads/foo` normalizes to `foo`; other full refs (tags, pull-request refs)
+are fetched into a private store namespace and must peel to commits. The
+conversation exposes branches as `refs/remotes/origin/<branch>` and other
+refs as `refs/td-agent/fetched/<full-ref>` without
+changing its branch or files. Missing full refs fail the request rather than
+publishing cached values. Ordinary background fetches still track template
+bases only. Literal template branch names keep branch semantics, including
+names beginning `refs/`. Internal non-head keys carry a colon prefix (illegal
+in branch names), validated at the window and maintenance boundaries. Tracking
+accepts up to 48 updates (32 bases plus 16 explicit refs) in one transaction.
+Remote admission and local-remote exclusion are unchanged.
+
+The tool is, a repository workspace's tool:
 an immediate store fetch and remote-tracking update for that workspace,
 which moves data in from an admitted remote and needs no approval. It is
 the only fetch a model asks for; the background fetch of §7 does the

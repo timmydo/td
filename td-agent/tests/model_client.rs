@@ -9425,11 +9425,8 @@ fn a_push_is_exported_staged_asked_and_sent() {
 /// with no jail), and an interrupt while it waits.
 #[test]
 fn git_fetch_asks_the_window_and_says_what_came() {
-    let base = std::env::temp_dir().join(format!(
-        "td-agent-model-fetch-{}-{}",
-        std::process::id(),
-        td_agent::store::random_hex(4).unwrap()
-    ));
+    let owned = td_fs::TempDir::new("model-fetch").unwrap();
+    let base = owned.path().to_path_buf();
     let remote = "https://example.org/a/td";
     let template = td_agent::config::Template {
         mcp: Vec::new(),
@@ -9457,7 +9454,18 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     let checkout = made.entries[0].checkout.display().to_string();
     let repository = made.entries[0].repository.clone();
     let argument = td_agent::workspace::Workspace::Repositories(made).argument();
-    let fetch = || Reply::sse_with("stream-tool-git-fetch.sse", "WORKTREE", &checkout);
+    let fetch = || {
+        access_reply(
+            "git_fetch",
+            td_json::Json::Obj(vec![
+                ("worktree".into(), checkout.clone().into()),
+                (
+                    "refs".into(),
+                    td_json::Json::Arr(vec!["quit-shortcut".into(), "refs/tags/v1".into()]),
+                ),
+            ]),
+        )
+    };
     let mut h = Harness::new_in(
         "fetch",
         Role::Conversation,
@@ -9507,7 +9515,17 @@ fn git_fetch_asks_the_window_and_says_what_came() {
         |h: &mut Harness, stale: bool, result: Result<td_agent::protocol::Resolved, String>| {
             h.say("Fetch.");
             let (call, asked, bases) = h.until_refetch();
-            assert_eq!((asked.as_str(), bases), (remote, vec!["main".to_string()]));
+            assert_eq!(
+                (asked.as_str(), bases),
+                (
+                    remote,
+                    vec![
+                        "main".to_string(),
+                        "quit-shortcut".to_string(),
+                        ":refs/tags/v1".to_string()
+                    ]
+                )
+            );
             // Where a background fetch found main earlier, told meanwhile.
             if stale {
                 h.down(&Down::Heads {
@@ -9539,7 +9557,10 @@ fn git_fetch_asks_the_window_and_says_what_came() {
     unset(answered(
         &mut h,
         false,
-        Ok(vec![("main".into(), Ok(at.clone()))]),
+        Ok(vec![
+            ("quit-shortcut".into(), Ok(at.clone())),
+            (":refs/tags/v1".into(), Ok(at.clone())),
+        ]),
     ));
     assert_eq!(
         answered(&mut h, false, Err("the remote is not admitted".into())),
@@ -9605,7 +9626,6 @@ fn git_fetch_asks_the_window_and_says_what_came() {
         tracked[0].id, at,
         "not moved by a fetch whose refs were not set"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A small MCP server in `sh`: it answers `initialize`, lists one tool,

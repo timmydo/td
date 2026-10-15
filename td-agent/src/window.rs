@@ -1424,7 +1424,14 @@ impl Session {
         remote: &str,
         bases: &[String],
     ) -> Result<(), String> {
-        let parsed = self.admitted(id, remote, bases)?;
+        if bases.len() > 48
+            || bases
+                .iter()
+                .any(|base| crate::git::tracking_ref(base).is_err())
+        {
+            return Err("invalid or excessive fetch refs".into());
+        }
+        let parsed = self.admitted(id, remote, &[])?;
         let stores = self.stores()?;
         stores.fetch_now(id.clone(), call, parsed, bases.to_vec())
     }
