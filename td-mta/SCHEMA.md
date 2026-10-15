@@ -287,11 +287,15 @@ required server-selected default identity.
 
 ## 5. Smart host
 
-Exactly one unlabelled `[relay]` section is required. There is no recipient-MX
-fallback or plaintext mode.
+Exactly one unlabelled `[relay]` section is required. Optional `route` is a
+profile-name identifier (at most 64 lowercase ASCII letters, digits, `_` or
+`-`, starting with a letter). PostgreSQL profiles default it to their own
+name; its distributed meaning is specified in POSTGRES.md. There is no
+recipient-MX fallback or plaintext mode.
 
 | Field | Type/default | Constraint |
 | --- | --- | --- |
+| `route` | Profile name, absent | Stable named route; defaults to PostgreSQL profile name |
 | `host` | DNS text, required | TLS verification name and DNS resolution target |
 | `port` | Integer, required | 1..65535 |
 | `transport` | Text, `implicit_tls` | `implicit_tls` or `required_starttls` |
@@ -648,7 +652,7 @@ retained text for the larger variants is:
 | --- | ---: |
 | Identity: label/account IDs, display name, email and two signature paths | 12604 |
 | Paths: three root paths | 12285 |
-| Relay: host, username, transport and two paths | 8704 |
+| Relay: route, host, username, transport and two paths | 8768 |
 | ACME: directory, contact and CA path | 8445 |
 | Files certificate: label, mode and two paths | 8259 |
 | Identity address: label, kind, display name and email | 4390 |

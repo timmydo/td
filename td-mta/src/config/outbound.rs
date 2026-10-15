@@ -28,6 +28,7 @@ pub enum Code {
     MissingResolvers,
     MissingRelay,
     Hostname,
+    Route,
     Port,
     Username,
     PasswordPath,
@@ -48,6 +49,7 @@ impl Code {
             Self::MissingResolvers => "config_outbound_missing_resolvers",
             Self::MissingRelay => "config_outbound_missing_relay",
             Self::Hostname => "config_outbound_hostname",
+            Self::Route => "config_outbound_route",
             Self::Port => "config_outbound_port",
             Self::Username => "config_outbound_username",
             Self::PasswordPath => "config_outbound_password_path",
@@ -105,6 +107,8 @@ struct ResolverSlot {
 }
 #[derive(Clone, Copy)]
 struct RelaySlot {
+    route: text::Span,
+    has_route: bool,
     host: text::Span,
     username: text::Span,
     password: text::Span,
@@ -116,6 +120,7 @@ struct RelaySlot {
 }
 #[derive(Clone, Copy)]
 pub struct RelayInput<'a> {
+    pub route: Option<&'a str>,
     pub host: &'a str,
     pub port: u64,
     pub transport: Transport,
@@ -231,6 +236,9 @@ impl Builder {
             if let Some(old) = this.relay {
                 return Err(duplicate(Code::DuplicateRelay, at, old.location));
             }
+            if let Some(route) = input.route {
+                values::profile_name(route).map_err(|_| err(Code::Route, Some(at)))?;
+            }
             values::dns_name(input.host).map_err(|_| err(Code::Hostname, Some(at)))?;
             let port = u16::try_from(input.port)
                 .ok()
@@ -257,7 +265,13 @@ impl Builder {
                 Some(ca) => store(arena, ca, at)?,
                 None => text::Span::EMPTY,
             };
+            let route = match input.route {
+                Some(route) => store(arena, route, at)?,
+                None => text::Span::EMPTY,
+            };
             this.relay = Some(RelaySlot {
+                route,
+                has_route: input.route.is_some(),
                 host,
                 username,
                 password,
@@ -340,6 +354,7 @@ impl fmt::Debug for Resolver<'_> {
 }
 #[derive(Clone, Copy)]
 pub struct Relay<'t> {
+    pub route: Option<&'t str>,
     pub location: Location,
     pub host: &'t str,
     pub port: u16,
@@ -377,6 +392,11 @@ impl<'t> View<'_, 't> {
         let slot = &self.records.relay;
         let owner = self.records.owner;
         Ok(Relay {
+            route: if slot.has_route {
+                Some(read(self.text, owner, slot.route)?)
+            } else {
+                None
+            },
             location: slot.location,
             host: read(self.text, owner, slot.host)?,
             port: slot.port,
@@ -414,6 +434,7 @@ mod tests {
     }
     fn relay() -> RelayInput<'static> {
         RelayInput {
+            route: None,
             host: "Relay.Example.test",
             port: 465,
             transport: Transport::default(),
@@ -421,6 +442,51 @@ mod tests {
             password_file: "/does-not-exist/Password",
             ca_file: None,
         }
+    }
+    #[test]
+    fn route_names_are_bounded_and_validate_before_retention() {
+        let _serial = lock();
+        for name in ["", "Personal", "../route", "a b", &"a".repeat(65)] {
+            let mut bytes = vec![0; 16384];
+            let mut arena = text::Builder::new(&mut bytes).unwrap();
+            let mut builder = Builder::new(&arena);
+            assert_eq!(
+                builder
+                    .relay(
+                        &mut arena,
+                        RelayInput {
+                            route: Some(name),
+                            ..relay()
+                        },
+                        at(1)
+                    )
+                    .unwrap_err()
+                    .code,
+                Code::Route
+            );
+        }
+        let name = "a".repeat(64);
+        let mut bytes = vec![0; 16384];
+        let mut arena = text::Builder::new(&mut bytes).unwrap();
+        let mut builder = Builder::new(&arena);
+        builder
+            .resolver(&mut arena, "local", "127.0.0.1:53", at(1))
+            .unwrap();
+        builder
+            .relay(
+                &mut arena,
+                RelayInput {
+                    route: Some(&name),
+                    ..relay()
+                },
+                at(2),
+            )
+            .unwrap();
+        let records = builder.finish().unwrap();
+        assert_eq!(
+            records.view_live(&arena).unwrap().relay().unwrap().route,
+            Some(name.as_str())
+        );
     }
     fn complete(arena: &mut text::Builder<'_>) -> Records {
         let mut b = Builder::new(arena);

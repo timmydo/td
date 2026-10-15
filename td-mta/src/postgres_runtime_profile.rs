@@ -35,6 +35,7 @@ pub struct Binding {
     account: AccountId,
     profile: String,
     roles: Roles,
+    route: crate::postgres_routes::Route,
     quotas: configuration::SharedQuotas,
     upload_maximum: usize,
     upload_expiry_seconds: usize,
@@ -92,6 +93,15 @@ impl Binding {
             .iter()
             .find(|identity| identity.id == id)
             .map(|identity| identity.email.as_str())
+    }
+    pub fn route(&self) -> &crate::postgres_routes::Route {
+        &self.route
+    }
+    /// Passive eligibility only; dispatch must recheck policy and ownership.
+    pub fn serves_route(&self, route: &crate::postgres_routes::Route) -> bool {
+        self.roles.relay()
+            && self.route.name() == route.name()
+            && self.route.destination() == route.destination()
     }
     pub fn roles(&self) -> Roles {
         self.roles
@@ -202,6 +212,10 @@ pub fn load(
     postgres_accounts::inspect(request, trust, deadline, epoch, account)
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
+    let route = candidate
+        .route(profile)
+        .ok_or(Error::MissingProfile)?
+        .clone();
     let quotas = candidate.quotas();
     let limits = configuration.candidate().resources().resources().limits();
     let header_maximum = limits.header_bytes;
@@ -225,6 +239,7 @@ pub fn load(
             account,
             profile: name,
             roles,
+            route,
             quotas,
             upload_maximum,
             upload_expiry_seconds,

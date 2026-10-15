@@ -180,6 +180,7 @@ impl Section {
                 field!("email", Text, true),
             ],
             Self::Relay => &[
+                field!("route", Text, false),
                 field!("host", Text, true),
                 field!("port", Integer, true),
                 field!("transport", Text, false),
@@ -754,6 +755,7 @@ kind = "reply_to"
 name = ""
 email = "reply@example.test"
 [relay]
+route = "personal"
 host = "relay.example.test"
 port = 465
 transport = "implicit_tls"
@@ -827,7 +829,7 @@ per_peer_limit = 1
         }
         let stanza = p.finish().unwrap();
         assert_eq!(assigned, stanza.section().unwrap().fields().len());
-        assert_eq!(total_assigned, 52);
+        assert_eq!(total_assigned, 53);
         assert_eq!(count, 15);
     }
     #[test]

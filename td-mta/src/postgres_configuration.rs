@@ -20,6 +20,8 @@ pub enum Error {
     Name,
     DuplicateProfile,
     SharedQuotas,
+    RouteConflict,
+    Route(crate::postgres_routes::Error),
     Composition(composition::Error),
     Profile,
     Text,
@@ -60,6 +62,7 @@ impl SharedQuotas {
 }
 
 struct OwnedProfile {
+    route: crate::postgres_routes::Route,
     name: String,
     roles: Roles,
     source: Vec<u8>,
@@ -94,6 +97,12 @@ impl Candidate {
     }
     pub fn shared(&self) -> &[u8] {
         &self.shared
+    }
+    pub fn route(&self, profile: &str) -> Option<&crate::postgres_routes::Route> {
+        self.profiles
+            .iter()
+            .find(|entry| entry.name == profile)
+            .map(|entry| &entry.route)
     }
     pub fn profile_count(&self) -> usize {
         self.profiles.len()
@@ -164,7 +173,7 @@ pub fn prepare(
             }
         }
     }
-    let mut profiles = Vec::new();
+    let mut profiles: Vec<OwnedProfile> = Vec::new();
     profiles
         .try_reserve_exact(ordered.len())
         .map_err(|_| Error::Capacity)?;
@@ -205,9 +214,21 @@ pub fn prepare(
             return Err(Error::SharedQuotas);
         }
         quotas = Some(current);
+        let relay = resolved
+            .candidate()
+            .outbound()
+            .map_err(|_| Error::Profile)?
+            .relay()
+            .map_err(|_| Error::Profile)?;
+        let route =
+            crate::postgres_routes::Route::from_relay(profile.name, relay).map_err(Error::Route)?;
+        if profiles.iter().any(|old| !route.compatible(&old.route)) {
+            return Err(Error::RouteConflict);
+        }
         storage = resolved.into_storage();
         let name = String::from_utf8(copy(profile.name.as_bytes())?).map_err(|_| Error::Name)?;
         profiles.push(OwnedProfile {
+            route,
             name,
             roles: profile.roles,
             source: copy(profile.source)?,

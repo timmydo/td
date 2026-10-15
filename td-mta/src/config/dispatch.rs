@@ -665,6 +665,7 @@ impl<'a> Context<'a> {
             Cause::Outbound(e) => match e.code {
                 outbound::Code::Endpoint | outbound::Code::DuplicateResolverEndpoint => Some("address"),
                 outbound::Code::Hostname => Some("host"),
+                outbound::Code::Route => Some("route"),
                 outbound::Code::Port => Some("port"),
                 outbound::Code::Username => Some("username"),
                 outbound::Code::PasswordPath => Some("password_file"),
@@ -910,6 +911,7 @@ fn apply_context(
                 .relay(
                     arena,
                     outbound::RelayInput {
+                        route: c.text("route")?,
                         host: c.required_text("host")?,
                         port: c.integer("port")?.ok_or_else(invariant)?,
                         transport,
@@ -1186,6 +1188,7 @@ certificate = "public"
         );
         let relay = outbound.relay().unwrap();
         assert_eq!(relay.transport, outbound::Transport::ImplicitTls);
+        assert!(relay.route.is_none());
         assert_eq!(relay.password_file, "/password");
         assert!(relay.ca_file.is_none());
         assert_eq!(parsed.globals.minimum_severity(), globals::DEFAULT_SEVERITY);
@@ -1211,7 +1214,7 @@ certificate = "public"
         let source = (prefix + &sections.concat())
             .replace("email = \"operator@example.test\"", "email = \"operator@example.test\"\nreply_to = true\ntext_signature_file = \"/signature\"")
             .replace("[server]\n", "[server]\nonline_background = false\npublic_ipv4 = \"127.0.0.1\"\npublic_ipv6 = \"::1\"\n")
-            .replace("[relay]\n", "[relay]\ntransport = \"required_starttls\"\nca_file = \"/relay-ca\"\n")
+            .replace("[relay]\n", "[relay]\nroute = \"personal\"\ntransport = \"required_starttls\"\nca_file = \"/relay-ca\"\n")
             + "[paths]\ndata = \"/data\"\nruntime = \"/runtime\"\nlogs = \"/logs\"\n[logging]\nminimum_severity = \"warning\"\n[resolver \"second\"]\naddress = \"[::1]:53\"\n";
         let mut storage = Backing::new();
         let parsed = parse(&mut storage, &source).unwrap();
@@ -1236,6 +1239,7 @@ certificate = "public"
             outbound.relay().unwrap().transport,
             outbound::Transport::RequiredStartTls
         );
+        assert_eq!(outbound.relay().unwrap().route, Some("personal"));
     }
     #[test]
     fn certificate_mode_presence_matrix_is_checked_before_typed_conversion() {

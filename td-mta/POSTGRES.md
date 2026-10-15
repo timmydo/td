@@ -189,6 +189,24 @@ not transparent continuation under the same store epoch.
 
 ## 4. Distributed delivery ownership
 
+Outgoing submissions select the submitting profile's named route at enqueue.
+`[relay] route = "personal-smarthost"` gives that route a stable name; omission
+uses the profile name. Profiles may share a route, but one configuration
+version must give each route identical host, port, transport, authentication
+identity and credential/trust references. Each current profile selects one
+outgoing route and, when its relay role is enabled, serves that route.
+The name is not a machine identity: any instance serving the same route can
+compete for delivery ownership. With no eligible worker, queued mail waits.
+
+The queued route name and destination fingerprint remain fixed across retries.
+The fingerprint covers canonical host, port, transport and authentication
+identity. Credential and trust versions may rotate through validated
+configuration; destination changes do not silently redirect existing mail.
+A worker must match both the stored name and destination under fresh policy
+and ownership fences. Rerouting queued responsibility needs a separate
+explicit operation; no automatic fallback to another profile's route exists.
+
+
 Preserve QUEUE.md's immutable outgoing bytes/envelope, per-recipient states,
 uncertainty latch, retry limits, cancellation and retained failure notices.
 Replace its process-local worker fence with durable route/attempt ownership.
@@ -1821,3 +1839,13 @@ deletion or configuration replacement. Deleting the source after enqueueing
 does not cancel delivery or retire its separately owned outgoing body.
 Runtime admission, receipt reclamation, dispatch, fenced multi-instance queue
 ownership and activation remain cutover work.
+
+## 49. Selected named-route evidence
+
+`postgres_routes` builds bounded, redacted route evidence from a validated
+profile. Whole-generation preparation rejects conflicting definitions of a
+shared name; profile loading retains the selected route in its binding.
+`serves_route` is only passive eligibility evidence and requires the relay
+role plus matching name and destination. It grants no lease or continuing
+policy authority. Queue persistence and worker ownership remain subsequent
+increments; the production single-process backend is unchanged.

@@ -2012,6 +2012,7 @@ jmap_origin = "https://localhost"
 [resolver "primary"]
 address = "127.0.0.1:53"
 [relay]
+route = "personal-smarthost"
 host = "localhost"
 port = 465
 username = "relay-user"
@@ -2074,6 +2075,40 @@ per_peer_limit = 1
     assert_eq!(candidate.profile(0).unwrap().roles.bits(), 3);
     assert!(candidate.profile(2).is_none());
     assert_eq!(candidate.digest(), prepare(&[one, two]).unwrap().digest());
+    assert_eq!(
+        candidate.route("desktop").unwrap(),
+        candidate.route("cloud").unwrap()
+    );
+    assert_eq!(
+        candidate.route("desktop").unwrap().name(),
+        "personal-smarthost"
+    );
+    assert!(candidate.route("unknown").is_none());
+    let conflicting = cloud.replace("username = \"relay-user\"", "username = \"relay-other\"");
+    assert_eq!(
+        prepare(&[
+            two,
+            Profile {
+                source: conflicting.as_bytes(),
+                ..one
+            }
+        ])
+        .err(),
+        Some(configuration::Error::RouteConflict)
+    );
+    let separate = conflicting.replace(
+        "route = \"personal-smarthost\"",
+        "route = \"other-smarthost\"",
+    );
+    assert!(prepare(&[
+        two,
+        Profile {
+            source: separate.as_bytes(),
+            ..one
+        }
+    ])
+    .is_ok());
+
     assert_eq!(
         candidate.quotas(),
         configuration::SharedQuotas {
@@ -2493,6 +2528,10 @@ per_peer_limit = 1
         assert_eq!(prepared.binding().account(), account);
         assert_eq!(prepared.binding().profile(), name);
         assert_eq!(prepared.binding().roles().bits(), roles);
+        assert_eq!(prepared.binding().route(), candidate.route(name).unwrap());
+        assert!(!prepared
+            .binding()
+            .serves_route(candidate.route(name).unwrap()));
         assert_eq!(prepared.binding().quotas(), candidate.quotas());
         assert_eq!(prepared.configuration().roles().bits(), roles);
         let limits = prepared

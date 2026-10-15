@@ -809,7 +809,10 @@ DNS hostname, port 1..65535, mandatory password path and optional CA path.
 Relay usernames preserve case and printable ASCII spaces/colons, unlike
 account usernames; the limit is 254 bytes. Transport is either implicit TLS
 or required STARTTLS. `Transport::name` supplies the canonical schema spelling.
-No plaintext/downgrade option exists.
+No plaintext/downgrade option exists. Optional `route` names use the same
+lowercase ASCII identifier grammar and 64-byte ceiling as profile names.
+They are passive metadata in the existing single-process backend;
+POSTGRES.md owns shared route selection and takeover semantics.
 
 Resolver and relay cells are inline in their records, with a compile-time
 1 KiB ceiling charged to global settings/headroom. The builder has a separate
