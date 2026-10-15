@@ -16,6 +16,7 @@ enum Operation {
     Initialize,
     Upgrade,
     Inspect,
+    RuntimeCheck,
 }
 impl Operation {
     fn parse(value: &OsStr) -> Option<Self> {
@@ -24,6 +25,7 @@ impl Operation {
             "schema-init" => Some(Self::Initialize),
             "schema-upgrade" => Some(Self::Upgrade),
             "schema-inspect" => Some(Self::Inspect),
+            "runtime-check" => Some(Self::RuntimeCheck),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl Operation {
             Self::Initialize => "postgres-schema-init",
             Self::Upgrade => "postgres-schema-upgrade",
             Self::Inspect => "postgres-schema-inspect",
+            Self::RuntimeCheck => "postgres-runtime-check",
         }
     }
 }
@@ -102,6 +105,10 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<ExitCode> {
             writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{encoded}\",\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false}}", receipt.version)?;
             Ok(ExitCode::SUCCESS)
         }
+        Ok(Outcome::Runtime(receipt)) => {
+            writeln!(io::stdout().lock(), "{{\"schema\":1,\"command\":\"{name}\",\"status\":\"ok\",\"schema_version\":{},\"store_epoch\":\"{}\",\"runtime_privileges_checked\":true,\"profile_checked\":false}}", receipt.version, receipt.store_epoch)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Err((stage, code)) => {
             report_error(name, stage, code)?;
             Ok(ExitCode::FAILURE)
@@ -116,10 +123,31 @@ fn report_error(command: &str, stage: &str, code: &str) -> io::Result<()> {
 enum Outcome {
     Probe(postgres_probe::Status),
     Schema(postgres_schema::Receipt),
+    Runtime(postgres_schema::Receipt),
 }
 
 fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str, &'static str)> {
     with_addresses(loaded, |request, deadline| {
+        if operation == Operation::RuntimeCheck {
+            return td_mta::postgres_runtime_access::inspect(request, &loaded.trust, deadline)
+                .map(Outcome::Runtime)
+                .map_err(|error| {
+                    use td_mta::postgres_runtime_access::Error;
+                    match error {
+                        Error::Connection(error) => {
+                            AttemptError::from(postgres_schema::Error::Connection(error))
+                        }
+                        Error::Schema(error) => AttemptError::from(error),
+                        Error::Role => AttemptError::Failed("runtime", "owner-or-privileged-role"),
+                        Error::Privileges => {
+                            AttemptError::Failed("runtime", "incorrect-data-privileges")
+                        }
+                        Error::Database => {
+                            AttemptError::Failed("runtime", "privilege-check-failed")
+                        }
+                    }
+                });
+        }
         match operation {
             Operation::Probe => postgres_probe::probe(request, &loaded.trust, deadline)
                 .map(Outcome::Probe)
@@ -133,6 +161,7 @@ fn check(loaded: &Loaded, operation: Operation) -> Result<Outcome, (&'static str
             Operation::Inspect => {
                 postgres_schema::inspect(request, &loaded.trust, deadline).map(Outcome::Schema)
             }
+            Operation::RuntimeCheck => Err(postgres_schema::Error::Invalid),
         }
         .map_err(AttemptError::from)
     })
@@ -233,7 +262,12 @@ mod tests {
     }
     #[test]
     fn schema_operations_do_not_take_a_profile() {
-        for operation in ["schema-init", "schema-inspect", "schema-upgrade"] {
+        for operation in [
+            "schema-init",
+            "schema-inspect",
+            "schema-upgrade",
+            "runtime-check",
+        ] {
             assert!(parse(&[operation, "--connection-file", "/private/db"]).is_some());
             assert!(parse(&[
                 operation,

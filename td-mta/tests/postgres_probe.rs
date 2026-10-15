@@ -568,7 +568,12 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
 #[test]
 fn schema_commands_refuse_profiles_and_secret_arguments_without_echoing_them() {
     let root = TempDir::new("pg-schema-command-refusal").unwrap();
-    for operation in ["schema-init", "schema-inspect", "schema-upgrade"] {
+    for operation in [
+        "schema-init",
+        "schema-inspect",
+        "schema-upgrade",
+        "runtime-check",
+    ] {
         for flags in [
             vec!["--password", "private-secret"],
             vec![
@@ -596,6 +601,183 @@ fn schema_commands_refuse_profiles_and_secret_arguments_without_echoing_them() {
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+#[test]
+#[ignore = "real local PostgreSQL 17 tools, including psql, required"]
+fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority() {
+    use td_mta::{postgres_runtime_access as access, postgres_schema as schema};
+    let fixture = Fixture::new();
+    let trust = TrustStore::from_pem(&fixture.ca).unwrap();
+    let owner = fixture.request();
+    let receipt = schema::initialize(&owner, &trust, deadline()).unwrap();
+    assert_eq!(
+        access::inspect(&owner, &trust, deadline()),
+        Err(access::Error::Role)
+    );
+    sql(&fixture, "CREATE ROLE mail_runtime LOGIN PASSWORD 'disposable-postgres-fixture-password'; GRANT USAGE ON SCHEMA td_mta TO mail_runtime; GRANT SELECT ON ALL TABLES IN SCHEMA td_mta TO mail_runtime");
+    let mut runtime = fixture.request();
+    runtime.user = "mail_runtime";
+    assert_eq!(
+        access::inspect(&runtime, &trust, deadline()),
+        Err(access::Error::Privileges)
+    );
+    sql(&fixture, "GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA td_mta TO mail_runtime; REVOKE INSERT,UPDATE,DELETE ON td_mta.schema_migrations,td_mta.config_materials,td_mta.config_material_chunks,td_mta.config_versions,td_mta.config_version_chunks,td_mta.config_selection,td_mta.config_selection_receipts,td_mta.account_bootstraps,td_mta.leases,td_mta.imports FROM mail_runtime; GRANT UPDATE(singleton) ON td_mta.config_selection TO mail_runtime");
+    assert_eq!(
+        access::inspect(&runtime, &trust, deadline()).unwrap(),
+        receipt
+    );
+    sql(&fixture, "ALTER DATABASE postgres OWNER TO mail_runtime; REVOKE CREATE ON DATABASE postgres FROM mail_runtime");
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT pg_catalog.has_database_privilege('mail_runtime','postgres','CREATE')"
+        ),
+        "f"
+    );
+    assert_eq!(
+        access::inspect(&runtime, &trust, deadline()),
+        Err(access::Error::Role)
+    );
+    sql(&fixture, "ALTER DATABASE postgres OWNER TO td_probe");
+    assert_eq!(
+        access::inspect(&runtime, &trust, deadline()).unwrap(),
+        receipt
+    );
+    for (grant, revoke, error) in [
+        (
+            "GRANT CREATE ON SCHEMA td_mta TO mail_runtime",
+            "REVOKE CREATE ON SCHEMA td_mta FROM mail_runtime",
+            access::Error::Role,
+        ),
+        (
+            "GRANT CREATE ON DATABASE postgres TO mail_runtime",
+            "REVOKE CREATE ON DATABASE postgres FROM mail_runtime",
+            access::Error::Role,
+        ),
+        (
+            "ALTER ROLE mail_runtime CREATEDB",
+            "ALTER ROLE mail_runtime NOCREATEDB",
+            access::Error::Role,
+        ),
+        (
+            "ALTER ROLE mail_runtime CREATEROLE",
+            "ALTER ROLE mail_runtime NOCREATEROLE",
+            access::Error::Role,
+        ),
+        (
+            "ALTER ROLE mail_runtime REPLICATION",
+            "ALTER ROLE mail_runtime NOREPLICATION",
+            access::Error::Role,
+        ),
+        (
+            "ALTER ROLE mail_runtime BYPASSRLS",
+            "ALTER ROLE mail_runtime NOBYPASSRLS",
+            access::Error::Role,
+        ),
+        (
+            "GRANT td_probe TO mail_runtime",
+            "REVOKE td_probe FROM mail_runtime",
+            access::Error::Role,
+        ),
+        (
+            "GRANT UPDATE(generation) ON td_mta.config_selection TO mail_runtime",
+            "REVOKE UPDATE(generation) ON td_mta.config_selection FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "GRANT UPDATE(version) ON td_mta.schema_migrations TO mail_runtime",
+            "REVOKE UPDATE(version) ON td_mta.schema_migrations FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "GRANT TRUNCATE ON td_mta.emails TO mail_runtime",
+            "REVOKE TRUNCATE ON td_mta.emails FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "GRANT SELECT ON td_mta.emails TO mail_runtime WITH GRANT OPTION",
+            "REVOKE GRANT OPTION FOR SELECT ON td_mta.emails FROM mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
+            "ALTER TABLE td_mta.emails ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE td_mta.emails DISABLE ROW LEVEL SECURITY",
+            access::Error::Privileges,
+        ),
+    ] {
+        sql(&fixture, grant);
+        assert_eq!(
+            access::inspect(&runtime, &trust, deadline()),
+            Err(error),
+            "{grant}"
+        );
+        sql(&fixture, revoke);
+        assert_eq!(
+            access::inspect(&runtime, &trust, deadline()).unwrap(),
+            receipt
+        );
+    }
+    // Column-only UPDATE permits policy locking without pointer mutation.
+    let execute = |statement: &str, expected: bool| {
+        let mut child = ProbeChild(
+            sql_command(&fixture)
+                .args(["-U", "mail_runtime", "-c", statement])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stop = deadline();
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert_eq!(status.success(), expected, "{statement}");
+                break;
+            }
+            assert!(Instant::now() < stop, "runtime SQL did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    execute("BEGIN; SELECT singleton FROM td_mta.config_selection FOR SHARE; UPDATE td_mta.accounts SET sequence=sequence; ROLLBACK", true);
+    for statement in [
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000001','hex')",
+        "CREATE TABLE td_mta.forbidden(id integer)",
+        "DELETE FROM td_mta.schema_migrations",
+    ] {
+        execute(statement, false);
+    }
+    fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let ca = fixture.root.join("runtime-ca.pem");
+    fs::write(&ca, &fixture.ca).unwrap();
+    let connection = fixture.root.join("runtime-connection");
+    fs::write(
+        &connection,
+        format!(
+            "postgresql://mail_runtime:{}@localhost:{}/postgres?sslrootcert={}\n",
+            std::str::from_utf8(PASSWORD).unwrap(),
+            fixture.port,
+            ca.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600)).unwrap();
+    let invoke = |status| {
+        command_output(
+            &[
+                "postgres",
+                "runtime-check",
+                "--connection-file",
+                connection.to_str().unwrap(),
+            ],
+            fixture.root.path(),
+            status,
+        )
+    };
+    let output = invoke(0);
+    assert!(output.contains("\"runtime_privileges_checked\":true"));
+    assert!(!output.contains(std::str::from_utf8(PASSWORD).unwrap()));
+    sql(&fixture, "REVOKE DELETE ON td_mta.emails FROM mail_runtime");
+    assert!(invoke(1).contains("incorrect-data-privileges"));
 }
 
 #[test]
@@ -2117,14 +2299,14 @@ per_peer_limit = 1
         "route = \"personal-smarthost\"",
         "route = \"other-smarthost\"",
     );
-    assert!(prepare(&[
+    prepare(&[
         two,
         Profile {
             source: separate.as_bytes(),
             ..one
-        }
+        },
     ])
-    .is_ok());
+    .unwrap();
 
     assert_eq!(
         candidate.quotas(),

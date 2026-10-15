@@ -128,6 +128,7 @@ pub mod postgres_read;
 pub mod postgres_resolver;
 pub mod postgres_route_owners;
 pub mod postgres_routes;
+pub mod postgres_runtime_access;
 pub mod postgres_runtime_profile;
 pub mod postgres_schema;
 pub mod postgres_selection;

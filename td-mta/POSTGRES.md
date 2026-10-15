@@ -1973,3 +1973,61 @@ separate activation prerequisite. A backwards last-attempt timestamp refuses.
 Runtime clock discontinuity validation and the five-minute monotonic restart
 guard still precede any actual retry. Receipt storage has a 1024-per-account
 cap. No SMTP, scheduler or retry dispatcher is activated by this worker.
+
+## 55. Runtime database credential preparation
+
+`postgres runtime-check --connection-file PATH` checks the current schema and
+one dedicated runtime login's effective data privileges. It closes the
+connection before returning and neither grants privileges nor activates a
+profile. Startup/reconnect integration remains cutover work; a successful
+cold check is not authority for a later connection.
+
+The initial runtime login must be separate from the owner, have no role
+memberships, and have none of SUPERUSER, CREATEDB, CREATEROLE, REPLICATION or
+BYPASSRLS. It must not own the database or application objects or have database CREATE or
+application-schema CREATE privileges. This dedicated-login policy also
+refuses membership that currently disables inheritance or SET ROLE, rather
+than depending on those options remaining unchanged. Database TEMP privileges
+are outside this application-schema boundary. Provider administration and
+arbitrary externally installed SECURITY DEFINER functions are not audited by
+this check; database administrators remain trusted.
+
+The exact table privilege roster lives in `postgres_runtime_access::TABLES`.
+All current tables require SELECT. Mail data and receipt tables require
+INSERT, UPDATE and DELETE, while schema, immutable configuration, selection
+receipts, bootstrap receipts and reserved import/lease tables are read-only.
+The selection singleton permits only column-level UPDATE on `singleton`,
+which allows FOR SHARE policy fencing without changing its generation/version.
+Application tables must be ordinary logged tables without row security.
+Extra/missing tables, grant options, TRUNCATE, REFERENCES, TRIGGER and MAINTAIN
+privileges refuse. Column grants are checked as well as table grants.
+
+Provision the dedicated login through PostgreSQL/provider administration;
+keep its password out of argv. For a fresh `td_mta_runtime` login, the owner
+can grant the schema-18 privileges atomically as follows:
+
+```sql
+BEGIN;
+GRANT USAGE ON SCHEMA td_mta TO td_mta_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA td_mta
+    TO td_mta_runtime;
+REVOKE INSERT, UPDATE, DELETE ON
+    td_mta.schema_migrations, td_mta.config_materials,
+    td_mta.config_material_chunks, td_mta.config_versions,
+    td_mta.config_version_chunks, td_mta.config_selection,
+    td_mta.config_selection_receipts, td_mta.account_bootstraps,
+    td_mta.leases, td_mta.imports FROM td_mta_runtime;
+GRANT UPDATE (singleton) ON td_mta.config_selection TO td_mta_runtime;
+COMMIT;
+```
+
+This is a fresh-role setup, not repair of inherited or preexisting grants.
+Validate with the runtime connection specification afterward. Owner commands
+retain their separate credential. Before a schema upgrade, drain/stop all
+instances and revoke runtime schema/table/column grants; the existing private
+migration ACL check still applies. Reapply the new version's exact grants and
+recheck before restart. Do not install default privileges on future tables.
+
+The cold check uses the existing bounded listing transport (512 frames,
+1 MiB input, 64 KiB output), retaining the original ten-second maximum
+operation deadline and the shared migration lock through inspection.
