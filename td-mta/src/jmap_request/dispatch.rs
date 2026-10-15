@@ -13,6 +13,9 @@ pub use email_create::{DraftCreator, DraftError, DraftInput};
 mod mailbox_set;
 pub use mailbox_set::MailboxMutator;
 
+#[path = "submission_query.rs"]
+mod submission_query;
+
 #[path = "email_query.rs"]
 mod email_query;
 
@@ -352,6 +355,10 @@ trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Erro
         &mut self,
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn query_submissions(
+        &mut self,
+        query: crate::postgres_read::SubmissionQuery,
+    ) -> Result<crate::postgres_read::SubmissionPage, Error>;
     fn submission(
         &mut self,
         id: crate::ids::SubmissionId,
@@ -391,6 +398,12 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
         query: crate::postgres_read::EmailQuery,
     ) -> Result<crate::postgres_read::EmailPage, Error> {
         self.query_emails(query).map_err(postgres_read_error)
+    }
+    fn query_submissions(
+        &mut self,
+        query: crate::postgres_read::SubmissionQuery,
+    ) -> Result<crate::postgres_read::SubmissionPage, Error> {
+        self.query_submissions(query).map_err(postgres_read_error)
     }
     fn submission(
         &mut self,
@@ -748,6 +761,7 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 b"Core/echo"
                     | b"Identity/get"
                     | b"EmailSubmission/get"
+                    | b"EmailSubmission/query"
                     | b"Mailbox/get"
                     | b"Email/get"
                     | b"Email/query"
@@ -760,6 +774,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
             return Err(Error::UnknownMethod);
         }
         let name = match call.name {
+            b"EmailSubmission/query" if self.submission && self.read.is_some() => {
+                "EmailSubmission/query"
+            }
             b"EmailSubmission/get" if self.submission && self.read.is_some() => {
                 "EmailSubmission/get"
             }
@@ -789,7 +806,9 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if name == "Core/echo" {
             return Ok((name, start..end));
         }
-        let result = if name == "EmailSubmission/get" {
+        let result = if name == "EmailSubmission/query" {
+            self.submission_query(start..end, responses.request().envelope.query_page)
+        } else if name == "EmailSubmission/get" {
             self.submission_get(start..end, responses.request().envelope.maximum_objects)
         } else if name == "Identity/get" {
             self.identity_get(start..end, responses.request().envelope.maximum_objects)

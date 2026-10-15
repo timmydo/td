@@ -2819,3 +2819,19 @@ The projection uses the same fresh authenticated Snapshot and original
 response/work allowance, returns its Submission data state and historical
 Email IDs, and checks the view before publishing. HTTPS capability admission
 and Session advertising remain unchanged; this is not sending activation.
+
+## 94. Prepared td-mail submission query
+
+Prepared PostgreSQL read dispatch accepts EmailSubmission/query with
+Submission in using. Its bounded filter is one identityIds entry and
+mandatory after/before UTC whole-second dates, inclusive/exclusive against
+sendAt. Opaque foreign identities match nothing. Unsupported filter forms,
+sorts, malformed dates and negative positions refuse explicitly. Sorting
+supports sendAt in either direction; ascending raw SubmissionId breaks ties.
+
+Pages respect the configured query bound and the storage maximum of 1024,
+return the pinned Submission query state and optional same-snapshot total,
+and support result references into subsequent explicit Submission/get calls.
+The original snapshot, SQL deadline and response meter cover every page;
+publication checks the snapshot again. This preparation does not advertise
+Submission or activate sending, generic query filters or queryChanges.

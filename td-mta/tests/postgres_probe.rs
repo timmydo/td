@@ -8942,6 +8942,7 @@ fn exercise_submission_reads(
         calculate_total: true,
     };
     let all = view.query_submissions(query).unwrap();
+    exercise_submission_query_dispatch(fixture, &mut view, input.identity(), &all.ids);
     assert!(all.ids.len() >= 2);
     assert_eq!(all.total, Some(all.ids.len() as u64));
     assert!(!all.has_more);
@@ -9975,4 +9976,185 @@ fn exercise_attempt_recovery(
     let next = td_mta::postgres_attempts::publish(request, trust, deadline(), &next).unwrap();
     assert_eq!(next.ordinals, (100..200).collect::<Vec<_>>());
     owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+}
+
+fn exercise_submission_query_dispatch(
+    fixture: &Fixture,
+    snapshot: &mut td_mta::postgres_read::Snapshot<'_>,
+    identity: td_mta::ids::IdentityId,
+    ids: &[td_mta::ids::SubmissionId],
+) {
+    use std::sync::Arc;
+    use td_mta::{
+        admission::{DiskLimits, ViewMode, WorkLimits},
+        jmap_request::{dispatch, response, OwnedValidation, CORE, SUBMISSION},
+        limits::Limits,
+        ports::{Clock, Deadline, Tick},
+        store_fs::{PrivateRoot, RequestSpool, ResponseCoordinator},
+    };
+    let mut bytes = [0; td_mta::wire::IdKind::WIRE_BYTES];
+    let account = td_mta::wire::encode_id(snapshot.identity().account, &mut bytes)
+        .unwrap()
+        .to_owned();
+    let identity = td_mta::wire::encode_id(identity, &mut bytes)
+        .unwrap()
+        .to_owned();
+    let first = td_mta::wire::encode_id(ids[0], &mut bytes)
+        .unwrap()
+        .to_owned();
+    let second = td_mta::wire::encode_id(ids[1], &mut bytes)
+        .unwrap()
+        .to_owned();
+    let total = ids.len();
+    let filter = format!(
+        r#"{{"identityIds":["{identity}"],"after":"1900-01-01T00:00:00Z","before":"9999-01-01T00:00:00Z"}}"#
+    );
+    for capability in [true, false] {
+        let using = if capability {
+            format!("\"{CORE}\",\"{SUBMISSION}\"")
+        } else {
+            format!("\"{CORE}\"")
+        };
+        let input = format!(
+            r##"{{"using":[{using}],"methodCalls":[
+            ["EmailSubmission/query",{{"accountId":"{account}","filter":{filter},"sort":[{{"property":"sendAt","isAscending":true}}],"position":0,"limit":1,"calculateTotal":true}},"a"],
+            ["EmailSubmission/query",{{"accountId":"{account}","filter":{filter},"sort":[{{"property":"sendAt","isAscending":true}}],"position":1,"limit":1,"calculateTotal":true}},"b"],
+            ["EmailSubmission/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"EmailSubmission/query","path":"/ids"}},"properties":["id"]}},"c"],
+            ["EmailSubmission/query",{{"accountId":"foreign","filter":{filter}}},"d"],
+            ["EmailSubmission/query",{{"accountId":"{account}","filter":{{"emailIds":[]}}}},"e"],
+            ["EmailSubmission/query",{{"accountId":"{account}","filter":{{"identityIds":["{identity}"],"after":"2025-02-29T00:00:00Z","before":"9999-01-01T00:00:00Z"}}}},"f"],
+            ["EmailSubmission/query",{{"accountId":"{account}","filter":{{"identityIds":["foreign"],"after":"1900-01-01T00:00:00Z","before":"9999-01-01T00:00:00Z"}},"calculateTotal":true}},"g"],
+            ["Core/echo",{{"after":true}},"h"]
+        ]}}"##
+        );
+        let limits = Limits::default();
+        let mut input_bytes = vec![0; limits.json_bytes].into_boxed_slice();
+        input_bytes[..input.len()].copy_from_slice(input.as_bytes());
+        let tokens = vec![td_json::arena::Token::EMPTY; limits.json_tokens].into_boxed_slice();
+        let mut parser = td_json::arena::OwnedCursor::with_input_length(
+            input_bytes,
+            tokens,
+            input.len(),
+            td_json::arena::ParseLimits {
+                max_bytes: limits.json_bytes,
+                max_depth: limits.json_depth,
+                max_tokens: limits.json_tokens,
+            },
+        )
+        .unwrap();
+        while !parser.step().unwrap() {}
+        let resources = limits.plan().unwrap();
+        let mut validation =
+            OwnedValidation::new(parser.finish().unwrap(), &resources, &[CORE, SUBMISSION])
+                .unwrap();
+        while !validation.step().unwrap() {}
+        let request = validation.finish().unwrap();
+        let directory = fixture.root.join(if capability {
+            "submission-query-responses"
+        } else {
+            "submission-query-no-using"
+        });
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut root = PrivateRoot::open(directory.to_str().unwrap())
+            .unwrap()
+            .try_lock()
+            .unwrap();
+        let clock = Arc::new(td_mta::clock::RuntimeClock::new());
+        let until = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        let spool = RequestSpool::open(&mut root, clock.clone(), until).unwrap();
+        let disk = DiskLimits::default()
+            .plan(
+                &resources,
+                WorkLimits::default(),
+                ViewMode::OnlineBackground,
+            )
+            .unwrap();
+        let mut states = [const { td_mta::ownership::SlotState::EMPTY }; 4];
+        let mut cells = [const { td_mta::admission::logical::Cell::EMPTY }; 4];
+        let owner =
+            ResponseCoordinator::new(spool, &disk, &mut states, &mut cells, clock.clone()).unwrap();
+        let retention = owner.retain_response(until).unwrap();
+        let mut preflight =
+            response::Preflight::new(request, "session", retention.maximum()).unwrap();
+        while !preflight.step(&mut [0; 4096]).unwrap() {}
+        let execution = Deadline::after(Tick(0), until.tick().0 - 1).unwrap();
+        let mut complete = dispatch::run_with_postgres_read(
+            preflight.finish().unwrap(),
+            retention,
+            execution,
+            snapshot,
+            &clock,
+            false,
+        )
+        .unwrap();
+        assert_eq!(complete.responses().len(), 8);
+        let mut encoder = complete.encoder().unwrap();
+        while !encoder.count_step(&mut [0; 4096]).unwrap() {}
+        let length = encoder.begin_output().unwrap();
+        let mut output = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let progress = encoder.poll_output(&mut chunk).unwrap();
+            output.extend_from_slice(&chunk[..progress.written]);
+            if progress.complete {
+                break;
+            }
+        }
+        assert_eq!(encoder.finish().unwrap(), length);
+        assert_eq!(output.len() as u64, length);
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains(r#"["Core/echo",{"after":true},"h"]"#),
+            "{output}"
+        );
+        if capability {
+            assert_eq!(
+                output.matches(r#"["EmailSubmission/query","#).count(),
+                3,
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(
+                    r#""position":0, "total":{total}, "ids":["{first}"]}},"a""#
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(
+                    r#""position":1, "total":{total}, "ids":["{second}"]}},"b""#
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(
+                    r#""list":[{{"id":"{first}"}}],"notFound":[]}},"c""#
+                )),
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"accountNotFound"},"d"]"#),
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"unsupportedFilter"},"e"]"#),
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"invalidArguments"},"f"]"#),
+                "{output}"
+            );
+            assert!(output.contains(r#""total":0, "ids":[]},"g""#), "{output}");
+        } else {
+            assert_eq!(
+                output.matches(r#""type":"unknownMethod""#).count(),
+                6,
+                "{output}"
+            );
+            assert!(
+                output.contains(r#"["error",{"type":"invalidResultReference"},"c"]"#),
+                "{output}"
+            );
+        }
+    }
 }
