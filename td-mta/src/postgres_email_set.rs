@@ -1,7 +1,7 @@
-//! Retained bounded Email flag and mailbox writes. No production JMAP dispatch is enabled.
+//! Retained bounded Email mutations. No production JMAP dispatch is enabled.
 use crate::{
     device_credentials::Presented,
-    ids::{DeviceId, EmailId, FlagOperationId, MailboxId},
+    ids::{DeviceId, EmailId, EmailOperationId, MailboxId},
     postgres_devices,
     postgres_probe::{self, Request},
     postgres_runtime_profile::Binding,
@@ -16,6 +16,8 @@ use std::{
 };
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
+
+pub mod deletion;
 
 pub const MAX_RECEIPTS: i64 = 1024;
 pub const MAX_UPDATES: usize = 256;
@@ -55,6 +57,7 @@ pub enum UpdateResult {
     Updated,
     NotFound,
     InvalidMailbox,
+    Destroyed,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchOutcome {
@@ -65,15 +68,16 @@ pub struct BatchOutcome {
 #[derive(Clone)]
 pub struct Change {
     binding: Binding,
-    operation: FlagOperationId,
+    operation: EmailOperationId,
     device: DeviceId,
     updates: Vec<Update>,
     single: bool,
+    destroy: bool,
     expected: Option<u64>,
     digest: [u8; 32],
 }
 impl Change {
-    pub fn operation(&self) -> FlagOperationId {
+    pub fn operation(&self) -> EmailOperationId {
         self.operation
     }
 }
@@ -117,7 +121,7 @@ pub fn prepare(
     }
     Ok(Change {
         binding: binding.clone(),
-        operation: FlagOperationId::from_bytes(id),
+        operation: EmailOperationId::from_bytes(id),
         device,
         updates: copy_updates(&[Update {
             mailbox: None,
@@ -126,6 +130,7 @@ pub fn prepare(
             flagged,
         }])?,
         single: true,
+        destroy: false,
         expected,
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -139,6 +144,15 @@ pub fn prepare_batch(
     device: DeviceId,
     updates: &[Update],
     expected: Option<u64>,
+) -> Result<Change, Error> {
+    prepare_batch_kind(binding, device, updates, expected, false)
+}
+fn prepare_batch_kind(
+    binding: &Binding,
+    device: DeviceId,
+    updates: &[Update],
+    expected: Option<u64>,
+    destroy: bool,
 ) -> Result<Change, Error> {
     if !binding.roles().jmap() {
         return Err(Error::Policy);
@@ -161,7 +175,11 @@ pub fn prepare_batch(
     let selected = binding.selection();
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for part in [
-        b"td-mta PostgreSQL Email update batch v2\0".as_slice(),
+        if destroy {
+            b"td-mta PostgreSQL Email destroy batch v1\0".as_slice()
+        } else {
+            b"td-mta PostgreSQL Email update batch v2\0".as_slice()
+        },
         binding.epoch().as_bytes().as_slice(),
         binding.account().as_bytes().as_slice(),
         &selected.generation.to_be_bytes(),
@@ -190,10 +208,11 @@ pub fn prepare_batch(
     }
     Ok(Change {
         binding: binding.clone(),
-        operation: FlagOperationId::from_bytes(id),
+        operation: EmailOperationId::from_bytes(id),
         device,
         updates,
         single: false,
+        destroy,
         expected,
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -265,11 +284,19 @@ async fn receipt(client: &Client, change: &Change) -> Result<Option<BatchOutcome
         .map_err(|_| Error::Capacity)?;
     for (byte, update) in bytes.iter().zip(&change.updates) {
         results.push(match byte {
-            1 => UpdateResult::Updated,
+            1 if !change.destroy => UpdateResult::Updated,
             2 if !change.single => UpdateResult::NotFound,
-            3 if !change.single && update.mailbox.is_some() => UpdateResult::InvalidMailbox,
+            3 if !change.single && !change.destroy && update.mailbox.is_some() => {
+                UpdateResult::InvalidMailbox
+            }
+            4 if change.destroy => UpdateResult::Destroyed,
             _ => return Err(Error::Integrity),
         });
+    }
+    if change.destroy
+        && results.contains(&UpdateResult::Destroyed) != (new_sequence != old_sequence)
+    {
+        return Err(Error::Integrity);
     }
     Ok(Some(BatchOutcome {
         state: Outcome {
@@ -301,7 +328,7 @@ pub fn inspect_batch(
     deadline: Instant,
     change: &Change,
 ) -> Result<Option<BatchOutcome>, Error> {
-    if change.single {
+    if change.single || change.destroy {
         return Err(Error::Invalid);
     }
     inspect_record(request, trust, deadline, change)
@@ -361,7 +388,7 @@ pub fn publish_batch(
     change: &Change,
     password: &[u8],
 ) -> Result<BatchOutcome, Error> {
-    if change.single {
+    if change.single || change.destroy {
         return Err(Error::Invalid);
     }
     publish_record(request, trust, deadline, change, password)
@@ -444,191 +471,197 @@ fn publish_record(
             if count >= MAX_RECEIPTS {
                 return Err(Error::Capacity);
             }
-            let mut requested = Vec::new();
-            requested
-                .try_reserve_exact(change.updates.len())
-                .map_err(|_| Error::Capacity)?;
-            let mut targets = Vec::new();
-            targets
-                .try_reserve_exact(change.updates.len())
-                .map_err(|_| Error::Capacity)?;
-            for update in &change.updates {
-                requested.push(update.email.as_bytes().as_slice());
-                targets.push(update.mailbox.as_ref().map(|id| id.as_bytes().as_slice()));
-            }
-            let rows = client.query("SELECT q.ordinality,e.changed,s.changed,f.changed,b.changed,m.n,m.present,m.valid FROM unnest($2::bytea[],$3::bytea[]) WITH ORDINALITY q(id,target,ordinality) LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=q.id LEFT JOIN td_mta.keywords s ON s.account=e.account AND s.email_id=e.id AND s.keyword='$seen' LEFT JOIN td_mta.keywords f ON f.account=e.account AND f.email_id=e.id AND f.keyword='$flagged' LEFT JOIN td_mta.mailboxes b ON b.account=e.account AND b.id=q.target LEFT JOIN LATERAL (SELECT count(*) n,coalesce(bool_or(v.mailbox_id=q.target),false) present,coalesce(bool_and(v.changed<=$4 AND v.mailbox_changed<=$4),true) valid FROM (SELECT m.mailbox_id,m.changed,b.changed mailbox_changed FROM td_mta.memberships m JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=e.account AND m.email_id=e.id AND q.target IS NOT NULL LIMIT 257) v) m ON true ORDER BY q.ordinality", &[&account.as_bytes().as_slice(), &requested, &targets, &old.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-            if rows.len() != change.updates.len() {
-                return Err(Error::Integrity);
-            }
-            let mut plans = Vec::new();
-            let mut results = Vec::new();
-            plans
-                .try_reserve_exact(rows.len())
-                .map_err(|_| Error::Capacity)?;
-            results
-                .try_reserve_exact(rows.len())
-                .map_err(|_| Error::Capacity)?;
-            for (index, (row, update)) in rows.iter().zip(&change.updates).enumerate() {
-                let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
-                if usize::try_from(ordinal).ok() != Some(index + 1) {
+            let (next, results) = if change.destroy {
+                deletion::apply(client, &change, old).await?
+            } else {
+                let mut requested = Vec::new();
+                requested
+                    .try_reserve_exact(change.updates.len())
+                    .map_err(|_| Error::Capacity)?;
+                let mut targets = Vec::new();
+                targets
+                    .try_reserve_exact(change.updates.len())
+                    .map_err(|_| Error::Capacity)?;
+                for update in &change.updates {
+                    requested.push(update.email.as_bytes().as_slice());
+                    targets.push(update.mailbox.as_ref().map(|id| id.as_bytes().as_slice()));
+                }
+                let rows = client.query("SELECT q.ordinality,e.changed,s.changed,f.changed,b.changed,m.n,m.present,m.valid FROM unnest($2::bytea[],$3::bytea[]) WITH ORDINALITY q(id,target,ordinality) LEFT JOIN td_mta.emails e ON e.account=$1 AND e.id=q.id LEFT JOIN td_mta.keywords s ON s.account=e.account AND s.email_id=e.id AND s.keyword='$seen' LEFT JOIN td_mta.keywords f ON f.account=e.account AND f.email_id=e.id AND f.keyword='$flagged' LEFT JOIN td_mta.mailboxes b ON b.account=e.account AND b.id=q.target LEFT JOIN LATERAL (SELECT count(*) n,coalesce(bool_or(v.mailbox_id=q.target),false) present,coalesce(bool_and(v.changed<=$4 AND v.mailbox_changed<=$4),true) valid FROM (SELECT m.mailbox_id,m.changed,b.changed mailbox_changed FROM td_mta.memberships m JOIN td_mta.mailboxes b ON b.account=m.account AND b.id=m.mailbox_id WHERE m.account=e.account AND m.email_id=e.id AND q.target IS NOT NULL LIMIT 257) v) m ON true ORDER BY q.ordinality", &[&account.as_bytes().as_slice(), &requested, &targets, &old.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                if rows.len() != change.updates.len() {
                     return Err(Error::Integrity);
                 }
-                let changed: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
-                let seen: Option<&[u8]> = row.try_get(2).map_err(|_| Error::Integrity)?;
-                let flagged: Option<&[u8]> = row.try_get(3).map_err(|_| Error::Integrity)?;
-                let Some(changed) = changed else {
-                    if seen.is_some() || flagged.is_some() {
-                        return Err(Error::Integrity);
-                    }
-                    if change.single {
-                        return Err(Error::Missing);
-                    }
-                    results.push(UpdateResult::NotFound);
-                    continue;
-                };
-                for value in [Some(changed), seen, flagged].into_iter().flatten() {
-                    if sequence(value)? > old {
-                        return Err(Error::Integrity);
-                    }
-                }
-                let mut mailbox = None;
-                let mut insert_target = false;
-                let mut removals = 0;
-                if let Some(target) = update.mailbox {
-                    let target_changed: Option<&[u8]> =
-                        row.try_get(4).map_err(|_| Error::Integrity)?;
-                    let Some(target_changed) = target_changed else {
-                        results.push(UpdateResult::InvalidMailbox);
-                        continue;
-                    };
-                    let count: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
-                    let count = u64::try_from(count).map_err(|_| Error::Integrity)?;
-                    let present: bool = row.try_get(6).map_err(|_| Error::Integrity)?;
-                    let valid: bool = row.try_get(7).map_err(|_| Error::Integrity)?;
-                    if !valid || sequence(target_changed)? > old {
-                        return Err(Error::Integrity);
-                    }
-                    if count > crate::postgres_mailboxes::MAX_MAILBOXES as u64 {
-                        return Err(Error::Capacity);
-                    }
-                    if count != 1 || !present {
-                        mailbox = Some(target);
-                        insert_target = !present;
-                        removals = count
-                            .checked_sub(u64::from(present))
-                            .ok_or(Error::Integrity)?;
-                    }
-                }
-                results.push(UpdateResult::Updated);
-                let seen = update.seen.filter(|value| *value != seen.is_some());
-                let flagged = update.flagged.filter(|value| *value != flagged.is_some());
-                if seen.is_some() || flagged.is_some() || mailbox.is_some() {
-                    plans.push(Plan {
-                        mailbox,
-                        insert_target,
-                        removals,
-                        email: update.email,
-                        seen,
-                        flagged,
-                    });
-                }
-            }
-            let next = if plans.is_empty() {
-                old
-            } else {
-                old.checked_add(1).ok_or(Error::Capacity)?
-            };
-            if next != old {
-                let changed = ids(&plans, |_| true)?;
-                let mut targets = Vec::new();
-                let mut seen_changes = Vec::new();
-                let mut inserts = Vec::new();
-                targets
-                    .try_reserve_exact(plans.len())
-                    .map_err(|_| Error::Capacity)?;
-                seen_changes
-                    .try_reserve_exact(plans.len())
-                    .map_err(|_| Error::Capacity)?;
-                inserts
-                    .try_reserve_exact(plans.len())
-                    .map_err(|_| Error::Capacity)?;
-                let mut removal_count = 0u64;
-                for plan in &plans {
-                    targets.push(plan.mailbox.as_ref().map(|id| id.as_bytes().as_slice()));
-                    seen_changes.push(plan.seen.is_some());
-                    inserts.push(plan.insert_target);
-                    removal_count = removal_count
-                        .checked_add(plan.removals)
-                        .ok_or(Error::Capacity)?;
-                }
-                let rows = client.query("WITH affected AS (SELECT m.mailbox_id,m.changed FROM unnest($2::bytea[],$3::bytea[],$4::bool[]) q(id,target,seen) JOIN td_mta.memberships m ON m.account=$1 AND m.email_id=q.id WHERE q.seen OR (q.target IS NOT NULL AND m.mailbox_id<>q.target) UNION ALL SELECT target,$6 FROM unnest($3::bytea[],$5::bool[]) q(target,insert_target) WHERE insert_target) SELECT a.mailbox_id,b.changed,bool_and(a.changed<=$6) FROM affected a LEFT JOIN td_mta.mailboxes b ON b.account=$1 AND b.id=a.mailbox_id GROUP BY a.mailbox_id,b.changed ORDER BY a.mailbox_id LIMIT 257", &[&account.as_bytes().as_slice(), &changed, &targets, &seen_changes, &inserts, &old.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                if rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {
-                    return Err(Error::Capacity);
-                }
-                let mut mailboxes = Vec::new();
-                mailboxes
+                let mut plans = Vec::new();
+                let mut results = Vec::new();
+                plans
                     .try_reserve_exact(rows.len())
                     .map_err(|_| Error::Capacity)?;
-                for row in &rows {
-                    let valid: bool = row.try_get(2).map_err(|_| Error::Integrity)?;
-                    if !valid || sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > old {
+                results
+                    .try_reserve_exact(rows.len())
+                    .map_err(|_| Error::Capacity)?;
+                for (index, (row, update)) in rows.iter().zip(&change.updates).enumerate() {
+                    let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+                    if usize::try_from(ordinal).ok() != Some(index + 1) {
                         return Err(Error::Integrity);
                     }
-                    let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
-                    if id.len() != 16 {
-                        return Err(Error::Integrity);
-                    }
-                    mailboxes.push(id);
-                }
-                let written = client.execute("DELETE FROM td_mta.memberships m USING unnest($2::bytea[],$3::bytea[]) q(id,target) WHERE m.account=$1 AND m.email_id=q.id AND q.target IS NOT NULL AND m.mailbox_id<>q.target", &[&account.as_bytes().as_slice(), &changed, &targets]).await.map_err(|_| Error::Database)?;
-                if written != removal_count {
-                    return Err(Error::Integrity);
-                }
-                let written = client.execute("INSERT INTO td_mta.memberships(account,email_id,mailbox_id,changed) SELECT $1,id,target,$5 FROM unnest($2::bytea[],$3::bytea[],$4::bool[]) q(id,target,insert_target) WHERE insert_target", &[&account.as_bytes().as_slice(), &changed, &targets, &inserts, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                if written != inserts.iter().filter(|value| **value).count() as u64 {
-                    return Err(Error::Integrity);
-                }
-                for (keyword, seen) in [("$seen", true), ("$flagged", false)] {
-                    for desired in [true, false] {
-                        let selected = ids(&plans, |plan| {
-                            (if seen { plan.seen } else { plan.flagged }) == Some(desired)
-                        })?;
-                        if selected.is_empty() {
-                            continue;
+                    let changed: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;
+                    let seen: Option<&[u8]> = row.try_get(2).map_err(|_| Error::Integrity)?;
+                    let flagged: Option<&[u8]> = row.try_get(3).map_err(|_| Error::Integrity)?;
+                    let Some(changed) = changed else {
+                        if seen.is_some() || flagged.is_some() {
+                            return Err(Error::Integrity);
                         }
-                        let written = if desired {
+                        if change.single {
+                            return Err(Error::Missing);
+                        }
+                        results.push(UpdateResult::NotFound);
+                        continue;
+                    };
+                    for value in [Some(changed), seen, flagged].into_iter().flatten() {
+                        if sequence(value)? > old {
+                            return Err(Error::Integrity);
+                        }
+                    }
+                    let mut mailbox = None;
+                    let mut insert_target = false;
+                    let mut removals = 0;
+                    if let Some(target) = update.mailbox {
+                        let target_changed: Option<&[u8]> =
+                            row.try_get(4).map_err(|_| Error::Integrity)?;
+                        let Some(target_changed) = target_changed else {
+                            results.push(UpdateResult::InvalidMailbox);
+                            continue;
+                        };
+                        let count: i64 = row.try_get(5).map_err(|_| Error::Integrity)?;
+                        let count = u64::try_from(count).map_err(|_| Error::Integrity)?;
+                        let present: bool = row.try_get(6).map_err(|_| Error::Integrity)?;
+                        let valid: bool = row.try_get(7).map_err(|_| Error::Integrity)?;
+                        if !valid || sequence(target_changed)? > old {
+                            return Err(Error::Integrity);
+                        }
+                        if count > crate::postgres_mailboxes::MAX_MAILBOXES as u64 {
+                            return Err(Error::Capacity);
+                        }
+                        if count != 1 || !present {
+                            mailbox = Some(target);
+                            insert_target = !present;
+                            removals = count
+                                .checked_sub(u64::from(present))
+                                .ok_or(Error::Integrity)?;
+                        }
+                    }
+                    results.push(UpdateResult::Updated);
+                    let seen = update.seen.filter(|value| *value != seen.is_some());
+                    let flagged = update.flagged.filter(|value| *value != flagged.is_some());
+                    if seen.is_some() || flagged.is_some() || mailbox.is_some() {
+                        plans.push(Plan {
+                            mailbox,
+                            insert_target,
+                            removals,
+                            email: update.email,
+                            seen,
+                            flagged,
+                        });
+                    }
+                }
+                let next = if plans.is_empty() {
+                    old
+                } else {
+                    old.checked_add(1).ok_or(Error::Capacity)?
+                };
+                if next != old {
+                    let changed = ids(&plans, |_| true)?;
+                    let mut targets = Vec::new();
+                    let mut seen_changes = Vec::new();
+                    let mut inserts = Vec::new();
+                    targets
+                        .try_reserve_exact(plans.len())
+                        .map_err(|_| Error::Capacity)?;
+                    seen_changes
+                        .try_reserve_exact(plans.len())
+                        .map_err(|_| Error::Capacity)?;
+                    inserts
+                        .try_reserve_exact(plans.len())
+                        .map_err(|_| Error::Capacity)?;
+                    let mut removal_count = 0u64;
+                    for plan in &plans {
+                        targets.push(plan.mailbox.as_ref().map(|id| id.as_bytes().as_slice()));
+                        seen_changes.push(plan.seen.is_some());
+                        inserts.push(plan.insert_target);
+                        removal_count = removal_count
+                            .checked_add(plan.removals)
+                            .ok_or(Error::Capacity)?;
+                    }
+                    let rows = client.query("WITH affected AS (SELECT m.mailbox_id,m.changed FROM unnest($2::bytea[],$3::bytea[],$4::bool[]) q(id,target,seen) JOIN td_mta.memberships m ON m.account=$1 AND m.email_id=q.id WHERE q.seen OR (q.target IS NOT NULL AND m.mailbox_id<>q.target) UNION ALL SELECT target,$6 FROM unnest($3::bytea[],$5::bool[]) q(target,insert_target) WHERE insert_target) SELECT a.mailbox_id,b.changed,bool_and(a.changed<=$6) FROM affected a LEFT JOIN td_mta.mailboxes b ON b.account=$1 AND b.id=a.mailbox_id GROUP BY a.mailbox_id,b.changed ORDER BY a.mailbox_id LIMIT 257", &[&account.as_bytes().as_slice(), &changed, &targets, &seen_changes, &inserts, &old.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                    if rows.len() > crate::postgres_mailboxes::MAX_MAILBOXES {
+                        return Err(Error::Capacity);
+                    }
+                    let mut mailboxes = Vec::new();
+                    mailboxes
+                        .try_reserve_exact(rows.len())
+                        .map_err(|_| Error::Capacity)?;
+                    for row in &rows {
+                        let valid: bool = row.try_get(2).map_err(|_| Error::Integrity)?;
+                        if !valid || sequence(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
+                        {
+                            return Err(Error::Integrity);
+                        }
+                        let id: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+                        if id.len() != 16 {
+                            return Err(Error::Integrity);
+                        }
+                        mailboxes.push(id);
+                    }
+                    let written = client.execute("DELETE FROM td_mta.memberships m USING unnest($2::bytea[],$3::bytea[]) q(id,target) WHERE m.account=$1 AND m.email_id=q.id AND q.target IS NOT NULL AND m.mailbox_id<>q.target", &[&account.as_bytes().as_slice(), &changed, &targets]).await.map_err(|_| Error::Database)?;
+                    if written != removal_count {
+                        return Err(Error::Integrity);
+                    }
+                    let written = client.execute("INSERT INTO td_mta.memberships(account,email_id,mailbox_id,changed) SELECT $1,id,target,$5 FROM unnest($2::bytea[],$3::bytea[],$4::bool[]) q(id,target,insert_target) WHERE insert_target", &[&account.as_bytes().as_slice(), &changed, &targets, &inserts, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                    if written != inserts.iter().filter(|value| **value).count() as u64 {
+                        return Err(Error::Integrity);
+                    }
+                    for (keyword, seen) in [("$seen", true), ("$flagged", false)] {
+                        for desired in [true, false] {
+                            let selected = ids(&plans, |plan| {
+                                (if seen { plan.seen } else { plan.flagged }) == Some(desired)
+                            })?;
+                            if selected.is_empty() {
+                                continue;
+                            }
+                            let written = if desired {
                         client.execute("INSERT INTO td_mta.keywords(account,email_id,keyword,changed) SELECT $1,id,$3,$4 FROM unnest($2::bytea[]) q(id)", &[&account.as_bytes().as_slice(), &selected, &keyword, &next.to_be_bytes().as_slice()]).await
                     } else {
                         client.execute("DELETE FROM td_mta.keywords WHERE account=$1 AND email_id=ANY($2::bytea[]) AND keyword=$3", &[&account.as_bytes().as_slice(), &selected, &keyword]).await
                     }.map_err(|_| Error::Database)?;
-                        if written != selected.len() as u64 {
+                            if written != selected.len() as u64 {
+                                return Err(Error::Integrity);
+                            }
+                        }
+                    }
+                    let written = client.execute("UPDATE td_mta.emails SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[])", &[&account.as_bytes().as_slice(), &changed, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                    if written != changed.len() as u64 {
+                        return Err(Error::Integrity);
+                    }
+                    client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,3,2,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account.as_bytes().as_slice(), &changed, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
+                    if !mailboxes.is_empty() {
+                        let offset = i64::try_from(changed.len()).map_err(|_| Error::Capacity)?;
+                        let written = client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id)+$4-1,1,2,id FROM changed", &[&account.as_bytes().as_slice(), &mailboxes, &next.to_be_bytes().as_slice(), &offset]).await.map_err(|_| Error::Database)?;
+                        if written != mailboxes.len() as u64 {
                             return Err(Error::Integrity);
                         }
                     }
+                    client
+                        .execute(
+                            "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
+                            &[
+                                &account.as_bytes().as_slice(),
+                                &next.to_be_bytes().as_slice(),
+                            ],
+                        )
+                        .await
+                        .map_err(|_| Error::Database)?;
                 }
-                let written = client.execute("UPDATE td_mta.emails SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[])", &[&account.as_bytes().as_slice(), &changed, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                if written != changed.len() as u64 {
-                    return Err(Error::Integrity);
-                }
-                client.execute("INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,ordinality-1,3,2,id FROM unnest($2::bytea[]) WITH ORDINALITY q(id,ordinality)", &[&account.as_bytes().as_slice(), &changed, &next.to_be_bytes().as_slice()]).await.map_err(|_| Error::Database)?;
-                if !mailboxes.is_empty() {
-                    let offset = i64::try_from(changed.len()).map_err(|_| Error::Capacity)?;
-                    let written = client.execute("WITH changed AS (UPDATE td_mta.mailboxes SET changed=$3 WHERE account=$1 AND id=ANY($2::bytea[]) RETURNING id) INSERT INTO td_mta.changes(account,sequence,operation,kind,action,object) SELECT $1,$3,row_number() OVER (ORDER BY id)+$4-1,1,2,id FROM changed", &[&account.as_bytes().as_slice(), &mailboxes, &next.to_be_bytes().as_slice(), &offset]).await.map_err(|_| Error::Database)?;
-                    if written != mailboxes.len() as u64 {
-                        return Err(Error::Integrity);
-                    }
-                }
-                client
-                    .execute(
-                        "UPDATE td_mta.accounts SET sequence=$2 WHERE id=$1",
-                        &[
-                            &account.as_bytes().as_slice(),
-                            &next.to_be_bytes().as_slice(),
-                        ],
-                    )
-                    .await
-                    .map_err(|_| Error::Database)?;
-            }
+                (next, results)
+            };
             let mut encoded = Vec::new();
             encoded
                 .try_reserve_exact(results.len())
@@ -638,6 +671,7 @@ fn publish_record(
                     UpdateResult::Updated => 1u8,
                     UpdateResult::NotFound => 2,
                     UpdateResult::InvalidMailbox => 3,
+                    UpdateResult::Destroyed => 4,
                 });
             }
             client.execute("INSERT INTO td_mta.flag_receipts(account,operation,request_digest,old_sequence,new_sequence,results) VALUES($1,$2,$3,$4,$5,$6)", &[&account.as_bytes().as_slice(), &change.operation.as_bytes().as_slice(), &change.digest.as_slice(), &old.to_be_bytes().as_slice(), &next.to_be_bytes().as_slice(), &encoded]).await.map_err(|_| Error::Database)?;

@@ -1319,7 +1319,7 @@ cutover work.
 
 ## 32. Retained single-Email flag writes
 
-Schema version 8 adds owner-private flag_receipts. The cold postgres_flags
+Schema version 8 adds owner-private flag_receipts. The cold postgres_email_set
 boundary assigns optional seen/starred values to one existing Email. It is
 not wired to production JMAP. Section 33 adds separate batch entry points;
 section 43 adds single-destination mailbox replacement.
@@ -1358,7 +1358,7 @@ single-Email receipts retain their digest and state and gain one Updated
 result. Existing DDL remains unchanged. The single-Email API preserves its
 request digest framing, missing-Email refusal and result shape.
 
-postgres_flags::prepare_batch accepts at most 256 unique Email IDs in request
+postgres_email_set::prepare_batch accepts at most 256 unique Email IDs in request
 order, with optional seen/star assignments and one optional expected state.
 The batch has one retained random operation and a separate digest domain.
 inspect_batch and publish_batch return per-Email Updated or NotFound results
@@ -1655,7 +1655,7 @@ Preparation, publication and replay do not enable PostgreSQL serving.
 
 ## 43. Atomic Email mailbox replacement
 
-The existing `postgres_flags::Update` now accepts an optional existing
+The existing `postgres_email_set::Update` now accepts an optional existing
 account mailbox alongside seen/star assignments. A batch replaces each
 successful Email's memberships with that one target. Missing Emails return
 NotFound before destination validation; missing destinations return
@@ -1678,3 +1678,38 @@ no Mailbox history unless seen changes. Changed Emails each get one history
 entry, Thread history is unchanged, and the account advances once. All rows,
 history and the ordered receipt commit together; uncertainty resolves through
 the original operation. Existing mutation-worker wire bounds are unchanged.
+
+
+## 44. Retained Email deletion
+
+`postgres_email_set` owns the single-Email flag, batch update and deletion
+adapters. `deletion::prepare` accepts at most 256 unique Email IDs and retains
+one opaque operation with a separate digest domain and no password. Its
+inspect/publish entry points return ordered Destroyed/NotFound results; empty
+or entirely missing batches retain a no-op receipt. The existing flag_receipts
+relation now covers all three modes under one 1024-receipt account limit.
+Receipt result decoding rejects values from another operation mode. No schema
+migration is needed, and production serving remains unchanged.
+
+The common transaction fences policy, account state and current device before
+fresh deletion. Bounded Email, affected-Mailbox and Thread result sets each
+admit at most 256 rows. Per-Email keyword inspection admits 256 plus one
+sentinel, and multiple thread anchors refuse. SQL work remains deadline-bound.
+Each removed Email receives destroyed history, each affected Mailbox updated
+history, and each touched Thread updated or destroyed history according to
+remaining Emails. One account sequence covers the complete batch.
+
+Memberships, keywords, anchors and receipt-recipient rows are removed with the
+Email. A body retires only after its last Email disappears and no retained
+lease or submission owns it, including expired leases and completed
+submissions. Removing a body cascades its chunks and decrements body-byte and
+blob counters in the same transaction; upload/queue counters remain charged
+for their surviving owners. Counter underflow or inconsistency refuses the
+entire transaction. Blob identity tombstones remain, preventing ID reuse.
+Existing repeatable-read snapshots retain deleted metadata and body bytes.
+
+Lost COMMIT response remains indeterminate until the same retained operation
+resolves. Historical receipts remain inspectable after later policy change,
+revocation, object deletion or body retirement. This does not grant a fresh
+write or a new body read. Reclamation of retained leases, submissions and
+operation receipts remains cutover work.
