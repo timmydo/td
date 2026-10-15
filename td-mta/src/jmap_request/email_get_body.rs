@@ -12,7 +12,7 @@ use crate::{
     mime_structure::{self, Part},
     nfc::{HeaderBudget, Scratch},
     ports::{BlobReader, Clock, Tick},
-    store_fs::IndexReadView,
+    store_fs::{IndexReadView, PinnedBlob},
 };
 
 pub(super) fn buffer<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
@@ -129,13 +129,6 @@ pub(super) fn write<P>(
     clock: &dyn Clock,
     work: &mut Meter,
 ) -> Result<(), Error> {
-    let (selected, options) = selection;
-    let mut buffered = Buffered {
-        inner: worker,
-        bytes: [0; 4096],
-        used: 0,
-    };
-    let worker = &mut buffered;
     let crypto = td_crypto::Provider;
     let mut input = view
         .open_blob_input(&crypto, blob, limits.message_bytes as u64)
@@ -157,6 +150,50 @@ pub(super) fn write<P>(
         }
     }
     let mut pin = input.finish().map_err(storage)?;
+    write_verified(worker, &mut pin, limits, selection, clock, work)
+}
+
+/// Emit the existing Email MIME/header members from verified snapshot custody.
+/// Each member starts with a comma; the caller owns object framing and stored
+/// fields. Output is provisional until this and the enclosing request succeed.
+/// The output owner must enforce original response admission and execution
+/// deadlines; this function also retains the pin and supplied work allowance.
+pub fn write_verified(
+    output: &mut impl Output,
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    selection: (&Selection, Options),
+    clock: &dyn Clock,
+    work: &mut Meter,
+) -> Result<(), Error> {
+    let result = write_verified_inner(output, pin, limits, selection, clock, work);
+    output.check()?;
+    if let Some(stop) = work.stopped() {
+        return Err(mime(stop));
+    }
+    result
+}
+fn write_verified_inner(
+    output: &mut impl Output,
+    pin: &mut PinnedBlob<'_, '_>,
+    limits: &Limits,
+    selection: (&Selection, Options),
+    clock: &dyn Clock,
+    work: &mut Meter,
+) -> Result<(), Error> {
+    output.check()?;
+    pin.check_deadline().map_err(storage)?;
+    if pin.len() > limits.message_bytes as u64 {
+        return Err(Error::StorageCapacity);
+    }
+    let (selected, options) = selection;
+    let mut buffered = Buffered {
+        inner: output,
+        bytes: [0; 4096],
+        used: 0,
+    };
+    let worker = &mut buffered;
+    let mut chunk = [0; 4096];
     let mut budget = HeaderBudget::new();
     let mut scratch = Scratch::new();
     let arena_bytes = limits
@@ -185,7 +222,7 @@ pub(super) fn write<P>(
             }
         }
         let mut reader = crate::root_headers::Cursor::new(
-            &mut pin,
+            pin,
             limits.header_bytes as u64,
             &mut arena,
             work,
@@ -234,7 +271,7 @@ pub(super) fn write<P>(
     let mut headers = buffer(limits.mime_parts)?;
     let length = pin.len();
     let mut cursor = blob_structure::Cursor::new(
-        &mut pin,
+        pin,
         blob_structure::Settings {
             extent: 0..length,
             limits: parse_limits,
@@ -531,7 +568,9 @@ fn write_part(
     worker.append(b"}")
 }
 
-trait Output {
+/// Trusted response owner: checks original admission/deadline and retains
+/// bounded provisional bytes. Implementations must not publish partial output.
+pub trait Output {
     fn check(&mut self) -> Result<(), Error>;
     fn append(&mut self, bytes: &[u8]) -> Result<(), Error>;
 }

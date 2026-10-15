@@ -18,6 +18,9 @@ mod email_query;
 
 #[path = "email_get.rs"]
 mod email_get;
+pub use email_get::{
+    write_verified as write_verified_email, Output as EmailOutput, Selection as EmailProjection,
+};
 #[path = "get_ids.rs"]
 mod get_ids;
 #[path = "mailbox_get.rs"]

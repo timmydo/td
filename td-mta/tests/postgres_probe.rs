@@ -5279,6 +5279,44 @@ fn exercise_read(
             while reader.poll(Tick(1)).unwrap() != root_headers::Status::Complete {}
             let headers = reader.finish(Tick(1)).unwrap();
             assert!(std::str::from_utf8(headers.bytes).unwrap().contains("Content-Transfer-Encoding: base64"));
+            use td_mta::jmap_request::dispatch::{self, EmailOutput, EmailProjection};
+            struct Clock;
+            impl td_mta::ports::Clock for Clock {
+                fn sample(&self) -> Result<td_mta::ports::Time, td_mta::ports::Error> {
+                    Ok(td_mta::ports::Time { utc_ms: 0, monotonic: Tick(1) })
+                }
+            }
+            struct Output { bytes: Vec<u8>, refuse: bool }
+            impl EmailOutput for Output {
+                fn check(&mut self) -> Result<(), dispatch::Error> { Ok(()) }
+                fn append(&mut self, bytes: &[u8]) -> Result<(), dispatch::Error> {
+                    if self.refuse || self.bytes.len() + bytes.len() > 32768 {
+                        return Err(dispatch::Error::ResponseCapacity);
+                    }
+                    self.bytes.extend_from_slice(bytes);
+                    Ok(())
+                }
+            }
+            let mut selected = EmailProjection::new();
+            for field in ["from", "subject", "textBody", "htmlBody", "attachments", "preview", "bodyValues"] {
+                selected.include(field, &mut work, &Clock).unwrap();
+            }
+            let options = td_mta::body_value_options::Options { fetch_text: true, ..Default::default() };
+            let mut output = Output { bytes: Vec::new(), refuse: false };
+            dispatch::write_verified_email(&mut output, body, &td_mta::limits::Limits::default(), (&selected, options), &Clock, &mut work).unwrap();
+            let text = std::str::from_utf8(&output.bytes).unwrap();
+            assert!(text.contains("\"subject\":\"Snapshot\""));
+            assert!(text.contains("sender@example.test"));
+            assert!(text.contains("\"preview\":\"snapshot text\""));
+            assert!(text.contains("\"value\":\"snapshot text\""));
+            assert!(text.contains("\"attachments\":[]"));
+            let body_list = |name: &str| text.split_once(name).unwrap().1.split_once(']').unwrap().0;
+            let plain = body_list("\"textBody\":[");
+            assert!(plain.contains("\"type\":\"text/plain\""));
+            assert_eq!(body_list("\"htmlBody\":["), plain);
+            assert!(text.contains("\"blobId\":"));
+            output.refuse = true;
+            assert_eq!(dispatch::write_verified_email(&mut output, body, &td_mta::limits::Limits::default(), (&selected, options), &Clock, &mut work), Err(dispatch::Error::ResponseCapacity));
             assert_eq!(metadata.identity.committed_sequence.number(),3);
             let mut bytes=vec![0;metadata.body.length as usize];
             let mut position=0;

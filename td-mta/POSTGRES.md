@@ -2175,3 +2175,32 @@ reader after another connection deletes the source Email/body. It checks
 pin identity/digest, original body bytes, sticky expiry even when swallowed
 by the callback, and refusal to grant a pin for corrupt bytes. The existing
 MIME/allocation fixtures continue to qualify the local representation.
+
+## 62. Shared verified Email MIME projection
+
+`jmap_request::dispatch::write_verified_email` runs the existing Email/get
+header, preview, body-list, body-value and attachment-locator encoders over
+a verified pin supplied by either storage adapter. It emits comma-prefixed
+members beside the caller's stored fields and framing, with the same bounded
+scratch, 4096-byte buffered output and original work meter. It checks source
+custody before entry and after final flush; MIME readers retain the pin
+through their own bounded turns. Message size is checked before projection.
+The shared boundary reconciles the original meter after every projection
+result, preserving deadline/capacity classification through nested MIME
+errors. There is no new HTML/MIME feature or alternate parser.
+
+`EmailProjection` retains at most 64 bounded header-property names and the
+existing field selections. Inclusion uses the original property parser and
+work allowance; `stored()` supplies the same stored-field projection used
+by the local dispatcher. The trusted `EmailOutput` owner must enforce its
+original response admission/deadline and retain provisional bytes. A failed
+projection cannot publish its partial output. PostgreSQL integrity verification
+continues to use the original body worker's finite connection budgets before
+entry; projection does not renew them or reverify/copy the whole body.
+
+The local dispatcher performs its existing funded verification then invokes
+this shared projection. The PostgreSQL snapshot fixture invokes it after a
+concurrent source deletion and checks subject/address, decoded preview/text,
+body lists and locator output, plus a refusing response sink. Full native
+validation still exercises the real td-mail client against the active local
+service. PostgreSQL protocol/service activation remains the atomic cutover.

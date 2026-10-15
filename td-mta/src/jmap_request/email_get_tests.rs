@@ -267,7 +267,7 @@ fn property_work_refusal_is_not_a_client_argument_error() {
     name.push(b"subject").unwrap();
     let mut work = Meter::new(deadline(), Charge::default());
     assert_eq!(
-        Selection::new().include(name.clone(), &mut work, &FixedClock),
+        Selection::new().include_name(name.clone(), &mut work, &FixedClock),
         Err(Error::StorageCapacity)
     );
     let mut expired = Meter::new(
@@ -275,7 +275,7 @@ fn property_work_refusal_is_not_a_client_argument_error() {
         Charge::default(),
     );
     assert_eq!(
-        Selection::new().include(name, &mut expired, &FixedClock),
+        Selection::new().include_name(name, &mut expired, &FixedClock),
         Err(Error::ExecutionDeadline)
     );
 }
@@ -374,5 +374,103 @@ fn body_work_exhaustion_is_not_an_interpretation_refusal() {
     assert_eq!(
         response["methodResponses"][1][1]["after"].as_bool(),
         Some(true)
+    );
+}
+
+#[test]
+fn shared_verified_projection_preserves_work_refusals_through_mime_phases() {
+    use crate::{
+        admission::work::{Charge, Stop},
+        ports::{Deadline, Tick, Time},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Fixed;
+    impl Clock for Fixed {
+        fn sample(&self) -> Result<Time, crate::ports::Error> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(1),
+            })
+        }
+    }
+    struct Progress(AtomicU64);
+    impl Clock for Progress {
+        fn sample(&self) -> Result<Time, crate::ports::Error> {
+            Ok(Time {
+                utc_ms: 0,
+                monotonic: Tick(self.0.fetch_add(1, Ordering::Relaxed)),
+            })
+        }
+    }
+    struct Sink;
+    impl body::Output for Sink {
+        fn check(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+        fn append(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    let limits = Limits {
+        header_bytes: 1024,
+        mime_parts: 4,
+        mime_depth: 4,
+        ..Limits::default()
+    };
+    let mut selection = Selection::new();
+    selection.text = true;
+    crate::store_fs::with_pinned_fixture(
+        b"Content-Type: text/plain\r\n\r\nhello",
+        &Fixed,
+        |mut pin| {
+            for by_deadline in [false, true] {
+                let mut refused = false;
+                let mut completed = false;
+                for allowance in (1..128).chain([4096]) {
+                    let mut work = Meter::new(
+                        Deadline::after(Tick(0), if by_deadline { allowance } else { 4096 })
+                            .unwrap(),
+                        Charge {
+                            records: if by_deadline { 65536 } else { allowance },
+                            io_bytes: 65536,
+                            output_bytes: 65536,
+                            unlinks: 0,
+                        },
+                    );
+                    let clock = Progress(AtomicU64::new(1));
+                    let result = body::write_verified(
+                        &mut Sink,
+                        &mut pin,
+                        &limits,
+                        (&selection, Options::default()),
+                        &clock,
+                        &mut work,
+                    );
+                    match work.stopped() {
+                        Some(Stop::Deadline) => {
+                            refused = true;
+                            assert_eq!(
+                                result,
+                                Err(Error::ExecutionDeadline),
+                                "deadline allowance {allowance}"
+                            );
+                        }
+                        Some(_) => {
+                            refused = true;
+                            assert_eq!(
+                                result,
+                                Err(Error::StorageCapacity),
+                                "record allowance {allowance}"
+                            );
+                        }
+                        None => {
+                            assert_eq!(result, Ok(()));
+                            completed = true;
+                        }
+                    }
+                }
+                assert!(refused && completed);
+            }
+        },
     );
 }

@@ -36,7 +36,8 @@ const DEFAULTS: &[&str] = &[
     "mailboxIds",
     "attachments",
 ];
-struct Selection {
+/// Validated, bounded fields shared by the local and PostgreSQL adapters.
+pub struct Selection {
     stored: Stored,
     headers: Vec<Name>,
     text: bool,
@@ -46,7 +47,7 @@ struct Selection {
     values: bool,
 }
 impl Selection {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             stored: Stored::id_only(),
             headers: Vec::new(),
@@ -57,7 +58,26 @@ impl Selection {
             values: false,
         }
     }
-    fn include(&mut self, name: Name, work: &mut Meter, clock: &dyn Clock) -> Result<(), Error> {
+    pub fn stored(&self) -> Stored {
+        self.stored
+    }
+    /// Validates one property under the caller's original work allowance.
+    pub fn include(
+        &mut self,
+        name: &str,
+        work: &mut Meter,
+        clock: &dyn Clock,
+    ) -> Result<(), Error> {
+        let mut bounded = Name::new();
+        bounded.push(name.as_bytes())?;
+        self.include_name(bounded, work, clock)
+    }
+    fn include_name(
+        &mut self,
+        name: Name,
+        work: &mut Meter,
+        clock: &dyn Clock,
+    ) -> Result<(), Error> {
         let text = std::str::from_utf8(name.bytes()).map_err(|_| Error::InvalidArguments)?;
         let mut parser = crate::email_property::Cursor::new(text);
         let property = loop {
@@ -104,6 +124,12 @@ impl Selection {
         self.text || self.html || self.attachments || self.preview || self.values
     }
 }
+impl Default for Selection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+pub use body::{write_verified, Output};
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     pub(super) fn email_get(
         &mut self,
@@ -137,13 +163,13 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if let Some(properties) = properties.filter(|v| v.kind != scan::Kind::Null) {
             let mut fields = Children::new(properties.range, scan::Kind::Array)?;
             while let Some(item) = fields.next(self)? {
-                selected.include(self.push_string(&item)?, &mut work, clock.as_ref())?;
+                selected.include_name(self.push_string(&item)?, &mut work, clock.as_ref())?;
             }
         } else {
             for text in DEFAULTS {
                 let mut name = Name::new();
                 name.push(text.as_bytes())?;
-                selected.include(name, &mut work, clock.as_ref())?;
+                selected.include_name(name, &mut work, clock.as_ref())?;
             }
         }
         let all = ids.as_ref().is_none_or(|v| v.kind == scan::Kind::Null);
