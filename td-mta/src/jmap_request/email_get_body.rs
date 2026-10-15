@@ -159,7 +159,7 @@ pub(super) fn write<P>(
 /// The output owner must enforce original response admission and execution
 /// deadlines; this function also retains the pin and supplied work allowance.
 pub fn write_verified(
-    output: &mut impl Output,
+    output: &mut (impl Output + ?Sized),
     pin: &mut PinnedBlob<'_, '_>,
     limits: &Limits,
     selection: (&Selection, Options),
@@ -174,7 +174,7 @@ pub fn write_verified(
     result
 }
 fn write_verified_inner(
-    output: &mut impl Output,
+    output: &mut (impl Output + ?Sized),
     pin: &mut PinnedBlob<'_, '_>,
     limits: &Limits,
     selection: (&Selection, Options),
@@ -590,12 +590,12 @@ impl<P> Output for Worker<'_, '_, '_, '_, '_, '_, P> {
         Worker::append(self, bytes)
     }
 }
-struct Buffered<'a, T> {
+struct Buffered<'a, T: ?Sized> {
     inner: &'a mut T,
     bytes: [u8; 4096],
     used: usize,
 }
-impl<T: Output> Buffered<'_, T> {
+impl<T: Output + ?Sized> Buffered<'_, T> {
     fn flush(&mut self) -> Result<(), Error> {
         if self.used != 0 {
             self.inner
@@ -605,7 +605,7 @@ impl<T: Output> Buffered<'_, T> {
         self.inner.check()
     }
 }
-impl<T: Output> Output for Buffered<'_, T> {
+impl<T: Output + ?Sized> Output for Buffered<'_, T> {
     fn check(&mut self) -> Result<(), Error> {
         self.inner.check()
     }

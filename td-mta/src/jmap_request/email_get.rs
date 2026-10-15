@@ -130,6 +130,62 @@ impl Default for Selection {
     }
 }
 pub use body::{write_verified, Output};
+pub(super) struct BodyProjection<'a> {
+    pub metadata: crate::email_response::EmailMetadata,
+    pub limits: &'a Limits,
+    pub selection: &'a Selection,
+    pub options: Options,
+    pub clock: &'a dyn Clock,
+    pub work: &'a mut Meter,
+}
+enum View<'v, 's, 'r> {
+    Native(&'v mut crate::store_fs::IndexReadView<'s, 'r>),
+    Postgres(&'v mut dyn super::MailRead),
+}
+impl View<'_, '_, '_> {
+    fn identity(&self) -> crate::ports::ViewIdentity {
+        match self {
+            Self::Native(view) => view.identity(),
+            Self::Postgres(view) => view.identity(),
+        }
+    }
+    fn check_snapshot(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Native(view) => view.check_snapshot().map_err(storage),
+            Self::Postgres(view) => view.check(),
+        }
+    }
+    fn metadata(
+        &mut self,
+        id: EmailId,
+        row: &mut [u8],
+    ) -> Result<Option<crate::email_response::EmailMetadata>, Error> {
+        match self {
+            Self::Native(view) => view.email_metadata(id, row).map_err(storage),
+            Self::Postgres(view) => view
+                .email_metadata(id, row)
+                .map_err(super::postgres_read_error),
+        }
+    }
+    fn members(
+        &mut self,
+        id: EmailId,
+        selected: Stored,
+        row: &mut [u8],
+        sink: impl FnMut(&[u8]) -> Result<(), crate::ports::Error>,
+    ) -> Result<bool, Error> {
+        match self {
+            Self::Native(view) => {
+                crate::email_response::write_members(&mut **view, id, selected, row, sink, false)
+                    .map_err(storage)
+            }
+            Self::Postgres(view) => {
+                crate::email_response::write_members(&mut **view, id, selected, row, sink, false)
+                    .map_err(super::postgres_read_error)
+            }
+        }
+    }
+}
 impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     pub(super) fn email_get(
         &mut self,
@@ -180,119 +236,179 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
         if account.wire_id()?.local() != Some(self.account) {
             return Err(Error::AccountNotFound);
         }
-        let mut view = self
-            .retention
-            .method_view(self.account, self.execution)
-            .map_err(storage)?;
-        let mut row = body::buffer(crate::format::MAX_VALUE_BYTES)?;
-        if all {
-            let mut after = None::<[u8; 16]>;
-            let mut key = [0; 16];
-            loop {
-                self.check()?;
-                let Some(record) = view
-                    .next(
-                        Table::Emails,
-                        after.as_ref().map(|v| v.as_slice()),
-                        &mut key,
-                        &mut row,
-                    )
-                    .map_err(storage)?
-                else {
-                    break;
-                };
-                let Key::Email(id) = record.key else {
-                    return Err(Error::State);
-                };
-                if requested.len() == limits.objects_per_method {
-                    return Err(Error::RequestTooLarge);
+        let mut read = self.read.take();
+        let result = (|| {
+            let mut native;
+            let mut view = match read.as_mut() {
+                Some(view) => View::Postgres(super::reborrow_read(&mut **view)),
+                None => {
+                    native = self
+                        .retention
+                        .method_view(self.account, self.execution)
+                        .map_err(storage)?;
+                    View::Native(&mut native)
                 }
-                after = Some(*id.as_bytes());
-                requested.push(Requested {
-                    name: None,
-                    id: Some(id),
-                    found: false,
-                });
-            }
-        }
-        let identity = view.identity();
-        let mut state = [0; DataState::WIRE_BYTES];
-        let state = DataState {
-            account: identity.account,
-            epoch: identity.epoch,
-            kind: DataType::Email,
-            sequence: identity.committed_sequence,
-        }
-        .encode(&mut state)
-        .map_err(|_| Error::State)?;
-        let start = self.retention.len();
-        self.append(br#"{"accountId":"#)?;
-        self.push_id(&account)?;
-        self.append(br#","state":""#)?;
-        self.append(state.as_bytes())?;
-        self.append(br#"","list":["#)?;
-        let mut first = true;
-        for item in &mut requested {
-            self.check()?;
-            let Some(id) = item.id else {
-                continue;
             };
-            let Some(metadata) = view.email_metadata(id, &mut row).map_err(storage)? else {
-                continue;
-            };
-            if !first {
-                self.append(b",")?;
+            let mut row = body::buffer(crate::format::MAX_VALUE_BYTES)?;
+            if all {
+                match &mut view {
+                    View::Postgres(view) => {
+                        let page = view.emails(limits.objects_per_method)?;
+                        if page.has_more || page.ids.len() > limits.objects_per_method {
+                            return Err(Error::RequestTooLarge);
+                        }
+                        for id in page.ids {
+                            self.check()?;
+                            requested.push(Requested {
+                                name: None,
+                                id: Some(id),
+                                found: false,
+                            });
+                        }
+                    }
+                    View::Native(view) => {
+                        let mut after = None::<[u8; 16]>;
+                        let mut key = [0; 16];
+                        loop {
+                            self.check()?;
+                            let Some(record) = view
+                                .next(
+                                    Table::Emails,
+                                    after.as_ref().map(|v| v.as_slice()),
+                                    &mut key,
+                                    &mut row,
+                                )
+                                .map_err(storage)?
+                            else {
+                                break;
+                            };
+                            let Key::Email(id) = record.key else {
+                                return Err(Error::State);
+                            };
+                            if requested.len() == limits.objects_per_method {
+                                return Err(Error::RequestTooLarge);
+                            }
+                            after = Some(*id.as_bytes());
+                            requested.push(Requested {
+                                name: None,
+                                id: Some(id),
+                                found: false,
+                            });
+                        }
+                    }
+                }
             }
-            first = false;
-            let mut sink_error = None;
-            let found = crate::email_response::write_members(
-                &mut view,
-                id,
-                selected.stored,
-                &mut row,
-                |bytes| {
+            let identity = view.identity();
+            let mut state = [0; DataState::WIRE_BYTES];
+            let state = DataState {
+                account: identity.account,
+                epoch: identity.epoch,
+                kind: DataType::Email,
+                sequence: identity.committed_sequence,
+            }
+            .encode(&mut state)
+            .map_err(|_| Error::State)?;
+            let start = self.retention.len();
+            self.append(br#"{"accountId":"#)?;
+            self.push_id(&account)?;
+            self.append(br#","state":""#)?;
+            self.append(state.as_bytes())?;
+            self.append(br#"","list":["#)?;
+            let mut first = true;
+            for item in &mut requested {
+                self.check()?;
+                let Some(id) = item.id else {
+                    continue;
+                };
+                let Some(metadata) = view.metadata(id, &mut row)? else {
+                    continue;
+                };
+                if !first {
+                    self.append(b",")?;
+                }
+                first = false;
+                let mut sink_error = None;
+                let found = view.members(id, selected.stored, &mut row, |bytes| {
                     self.append(bytes).map_err(|e| {
                         sink_error = Some(e);
                         crate::ports::Error::Invalid
                     })
-                },
-                false,
-            );
-            if let Some(error) = sink_error {
-                return Err(error);
-            }
-            if !found.map_err(storage)? {
-                return Err(Error::State);
-            }
-            if selected.body() || !selected.headers.is_empty() {
-                let result = body::write(
-                    self,
-                    &mut view,
-                    metadata.blob,
-                    limits,
-                    (&selected, options),
-                    clock.as_ref(),
-                    &mut work,
-                );
-                self.check()?;
-                if let Some(stop) = work.stopped() {
-                    return Err(match stop {
-                        crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
-                        _ => Error::StorageCapacity,
-                    });
+                });
+                if let Some(error) = sink_error {
+                    return Err(error);
                 }
-                result?;
+                if !found? {
+                    return Err(Error::State);
+                }
+                if selected.body() || !selected.headers.is_empty() {
+                    let result = match &mut view {
+                        View::Native(view) => body::write(
+                            self,
+                            view,
+                            metadata.blob,
+                            limits,
+                            (&selected, options),
+                            clock.as_ref(),
+                            &mut work,
+                        ),
+                        View::Postgres(view) => {
+                            if metadata.size > limits.message_bytes as u64 {
+                                return Err(Error::StorageCapacity);
+                            }
+                            let turns = metadata.size.div_ceil(4096);
+                            for _ in 0..turns {
+                                self.check()?;
+                            }
+                            work.charge(
+                                body::now(clock.as_ref())?,
+                                crate::admission::work::Charge {
+                                    io_bytes: turns
+                                        .checked_mul(4096)
+                                        .ok_or(Error::StorageCapacity)?,
+                                    records: turns,
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(|stop| match stop {
+                                crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
+                                _ => Error::StorageCapacity,
+                            })?;
+                            view.email_body(
+                                id,
+                                BodyProjection {
+                                    metadata,
+                                    limits,
+                                    selection: &selected,
+                                    options,
+                                    clock: clock.as_ref(),
+                                    work: &mut work,
+                                },
+                                self,
+                            )
+                        }
+                    };
+                    self.check()?;
+                    if let Some(stop) = work.stopped() {
+                        return Err(match stop {
+                            crate::admission::work::Stop::Deadline => Error::ExecutionDeadline,
+                            _ => Error::StorageCapacity,
+                        });
+                    }
+                    result?;
+                }
+                self.append(b"}")?;
+                item.found = true;
             }
-            self.append(b"}")?;
-            item.found = true;
-        }
-        self.append(br#"],"notFound":["#)?;
-        self.get_not_found(&requested)?;
-        self.append(b"]}")?;
-        view.check_snapshot().map_err(storage)?;
-        self.check()?;
-        let end = self.retention.publish().map_err(Error::Storage)?;
-        Ok(start..end)
+            self.append(br#"],"notFound":["#)?;
+            self.get_not_found(&requested)?;
+            self.append(b"]}")?;
+            view.check_snapshot()?;
+            self.check()?;
+            let end = self.retention.publish().map_err(Error::Storage)?;
+            Ok(start..end)
+        })();
+        self.read = read;
+        result
     }
 }
 

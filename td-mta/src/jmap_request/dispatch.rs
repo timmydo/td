@@ -193,8 +193,8 @@ pub fn run_with_identities<'state, 'c, 's, 'r, 'sr, 'a, P>(
 /// Prepared PostgreSQL read dispatch. The caller owns the freshly authenticated
 /// runtime snapshot and its original deadline for this batch. `clock` must be
 /// the response owner's clock; its execution instant tightens SQL as well as
-/// response work. Only Core and
-/// Mailbox/get are connected here; production activation is a separate cutover.
+/// response work. Core, Mailbox/get and Email/get are connected here;
+/// production activation is a separate cutover.
 pub fn run_with_postgres_read<'state, 'c, 's, 'r, 'sr, 'a, P>(
     plan: response::Plan<'state>,
     retention: ResponseRetention<'c, 's, 'r, 'sr, 'a, P>,
@@ -231,10 +231,17 @@ fn reborrow_read<'short, 'long: 'short>(
 }
 
 // This preparation seam disappears with the local database adapter at cutover.
-trait MailRead {
+trait MailRead: crate::email_response::Source<Error = crate::postgres_read::Error> {
     fn identity(&self) -> ports::ViewIdentity;
     fn check(&mut self) -> Result<(), Error>;
     fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error>;
+    fn emails(&mut self, maximum: usize) -> Result<crate::postgres_read::EmailPage, Error>;
+    fn email_body(
+        &mut self,
+        email: crate::ids::EmailId,
+        projection: email_get::BodyProjection<'_>,
+        output: &mut dyn EmailOutput,
+    ) -> Result<(), Error>;
 }
 impl MailRead for crate::postgres_read::Snapshot<'_> {
     fn identity(&self) -> ports::ViewIdentity {
@@ -246,6 +253,42 @@ impl MailRead for crate::postgres_read::Snapshot<'_> {
     fn mailboxes(&mut self) -> Result<Vec<crate::postgres_mailboxes::Mailbox>, Error> {
         self.mailbox_listing().map_err(postgres_read_error)
     }
+    fn emails(&mut self, maximum: usize) -> Result<crate::postgres_read::EmailPage, Error> {
+        self.query_emails(crate::postgres_read::EmailQuery {
+            scope: crate::postgres_read::EmailScope::All,
+            ascending: true,
+            position: 0,
+            limit: maximum.min(crate::postgres_read::MAX_EMAIL_PAGE),
+            calculate_total: false,
+        })
+        .map_err(postgres_read_error)
+    }
+    fn email_body(
+        &mut self,
+        email: crate::ids::EmailId,
+        projection: email_get::BodyProjection<'_>,
+        output: &mut dyn EmailOutput,
+    ) -> Result<(), Error> {
+        let mut result = Err(Error::State);
+        self.with_pinned_body(email, |metadata, pin| {
+            if metadata.blob != projection.metadata.blob
+                || metadata.body.length != projection.metadata.size
+            {
+                return Err(ports::Error::Corrupt);
+            }
+            result = write_verified_email(
+                output,
+                pin,
+                projection.limits,
+                (projection.selection, projection.options),
+                projection.clock,
+                projection.work,
+            );
+            Ok(())
+        })
+        .map_err(postgres_read_error)?;
+        result
+    }
 }
 fn postgres_read_error(error: crate::postgres_read::Error) -> Error {
     use crate::postgres_read::Error as Read;
@@ -253,11 +296,17 @@ fn postgres_read_error(error: crate::postgres_read::Error) -> Error {
         Read::Connection(crate::postgres_probe::Error::Deadline)
         | Read::Mailboxes(crate::postgres_mailboxes::Error::Connection(
             crate::postgres_probe::Error::Deadline,
-        )) => Error::ExecutionDeadline,
-        Read::Busy => Error::StorageBusy,
-        Read::Capacity | Read::Mailboxes(crate::postgres_mailboxes::Error::Capacity) => {
-            Error::StorageCapacity
+        ))
+        | Read::Body(crate::postgres_body::Error::Connection(
+            crate::postgres_probe::Error::Deadline,
+        ))
+        | Read::Body(crate::postgres_body::Error::Read(ports::Error::Deadline)) => {
+            Error::ExecutionDeadline
         }
+        Read::Busy => Error::StorageBusy,
+        Read::Capacity
+        | Read::Mailboxes(crate::postgres_mailboxes::Error::Capacity)
+        | Read::Body(crate::postgres_body::Error::Capacity) => Error::StorageCapacity,
         Read::Output(error) => mailbox_get::storage(error),
         _ => Error::Storage(ports::Error::Invalid),
     }
@@ -534,7 +583,8 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 range,
             });
         }
-        if self.read.is_some() && !matches!(call.name, b"Core/echo" | b"Mailbox/get") {
+        if self.read.is_some() && !matches!(call.name, b"Core/echo" | b"Mailbox/get" | b"Email/get")
+        {
             return Err(Error::UnknownMethod);
         }
         let name = match call.name {
@@ -926,6 +976,24 @@ pub(super) mod tests {
                 ),
             )),
             Error::ExecutionDeadline,
+        );
+    }
+    #[test]
+    fn postgres_body_deadline_and_capacity_keep_their_classification() {
+        for error in [
+            crate::postgres_body::Error::Connection(crate::postgres_probe::Error::Deadline),
+            crate::postgres_body::Error::Read(ports::Error::Deadline),
+        ] {
+            assert_eq!(
+                postgres_read_error(crate::postgres_read::Error::Body(error)),
+                Error::ExecutionDeadline
+            );
+        }
+        assert_eq!(
+            postgres_read_error(crate::postgres_read::Error::Body(
+                crate::postgres_body::Error::Capacity
+            )),
+            Error::StorageCapacity
         );
     }
     #[test]

@@ -5173,10 +5173,11 @@ fn exercise_http_auth(
     assert_eq!(auth.authenticate(password, until()), Ok(Some(device)));
 }
 
-fn exercise_mailbox_dispatch(
+fn exercise_read_dispatch(
     fixture: &Fixture,
     snapshot: &mut td_mta::postgres_read::Snapshot<'_>,
     mailbox: td_mta::ids::MailboxId,
+    emails: [td_mta::ids::EmailId; 2],
     blocked: bool,
 ) {
     use std::sync::Arc;
@@ -5200,14 +5201,28 @@ fn exercise_mailbox_dispatch(
     )
     .unwrap()
     .to_owned();
+    let [first_id, second_id] = emails;
+    let first = td_mta::wire::encode_id(first_id, &mut id_bytes)
+        .unwrap()
+        .to_owned();
+    let second = td_mta::wire::encode_id(second_id, &mut id_bytes)
+        .unwrap()
+        .to_owned();
+    let absent_email =
+        td_mta::wire::encode_id(td_mta::ids::EmailId::from_bytes([0xfe; 16]), &mut id_bytes)
+            .unwrap()
+            .to_owned();
     let input = format!(
         r##"{{"using":["{CORE}","{MAIL}"],"methodCalls":[
         ["Mailbox/get",{{"accountId":"{account}","ids":["{mailbox}","{mailbox}","{missing}"],"properties":["name","totalEmails","myRights"]}},"a"],
         ["Mailbox/get",{{"accountId":"{account}","#ids":{{"resultOf":"a","name":"Mailbox/get","path":"/list/*/id"}},"properties":["id"]}},"b"],
         ["Mailbox/get",{{"accountId":"{account}","ids":null,"properties":["name"]}},"c"],
         ["Mailbox/get",{{"accountId":"{account}","properties":["unsupported"]}},"d"],
-        ["Email/get",{{"accountId":"{account}"}},"e"],
-        ["Core/echo",{{"after":true}},"f"]
+        ["Email/query",{{"accountId":"{account}"}},"e"],
+        ["Core/echo",{{"after":true}},"f"],
+        ["Email/get",{{"accountId":"{account}","ids":["{second}","{first}","{second}","{absent_email}"],"fetchTextBodyValues":true}},"g"],
+        ["Email/get",{{"accountId":"{account}","#ids":{{"resultOf":"g","name":"Email/get","path":"/list/*/id"}},"properties":["id"]}},"h"],
+        ["Email/get",{{"accountId":"{account}","ids":null,"properties":["id"]}},"i"]
     ]}}"##
     );
     let limits = Limits::default();
@@ -5310,7 +5325,7 @@ fn exercise_mailbox_dispatch(
         return;
     }
     let mut complete = result.unwrap();
-    assert_eq!(complete.responses().len(), 6);
+    assert_eq!(complete.responses().len(), 9);
     let mut encoder = complete.encoder().unwrap();
     while !encoder.count_step(&mut [0; 4096]).unwrap() {}
     let length = encoder.begin_output().unwrap();
@@ -5339,6 +5354,26 @@ fn exercise_mailbox_dispatch(
     assert!(output.contains(r#"["error",{"type":"unknownMethod"},"e"]"#));
     assert!(output.contains(r#"["Core/echo",{"after":true},"f"]"#));
     assert_eq!(output.matches(r#""name":"Drafts""#).count(), 2);
+    assert!(
+        output.contains(&format!(r#""notFound":["{absent_email}"]}},"g""#)),
+        "{output}"
+    );
+    assert!(output.contains(&format!(
+        r#""list":[{{"id":"{second}"}},{{"id":"{first}"}}],"notFound":[]}},"h""#
+    )));
+    assert_eq!(output.matches(r#"["Email/get","#).count(), 3);
+    assert_eq!(output.matches(r#""subject":"Snapshot""#).count(), 2);
+    assert_eq!(output.matches(r#""preview":"snapshot text""#).count(), 2);
+    assert_eq!(output.matches(r#""attachments":[]"#).count(), 2);
+    assert_eq!(output.matches(r#""value":"snapshot text""#).count(), 2);
+    assert_eq!(
+        output
+            .matches(r#""keywords":{"$draft":true,"$seen":true}"#)
+            .count(),
+        2
+    );
+    assert!(output.contains(r#""email":"sender@example.test""#));
+
     drop(complete);
     assert_eq!(owner.used().unwrap(), 0);
     assert!(!owner.admission_stopped());
@@ -5400,7 +5435,13 @@ fn exercise_read(
     let mut owned =
         read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
             .unwrap();
-    exercise_mailbox_dispatch(fixture, &mut owned, mailbox, false);
+    exercise_read_dispatch(
+        fixture,
+        &mut owned,
+        mailbox,
+        [first.email, second.email],
+        false,
+    );
     assert_eq!(owned.identity().committed_sequence.number(), 3);
     assert!(owned.email(first.email).unwrap().is_some());
     assert_eq!(
@@ -5412,7 +5453,13 @@ fn exercise_read(
     let mut blocked =
         read::Snapshot::open_runtime(&slots, request, trust, deadline(), binding, password)
             .unwrap();
-    exercise_mailbox_dispatch(fixture, &mut blocked, mailbox, true);
+    exercise_read_dispatch(
+        fixture,
+        &mut blocked,
+        mailbox,
+        [first.email, second.email],
+        true,
+    );
     drop(blocked);
     let closed = deadline();
     while sql(

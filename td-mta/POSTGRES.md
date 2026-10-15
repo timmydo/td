@@ -2291,9 +2291,9 @@ the temporary owner enum and legacy hooks are preparation plumbing.
 ## 67. Prepared PostgreSQL Mailbox/get dispatch
 
 `dispatch::run_with_postgres_read` accepts a freshly authenticated runtime
-snapshot and a response retention owner. Core/echo and Mailbox/get use the
-existing whole-request admission, argument parser, result references,
-method-error handling and retained response encoder. Other methods return
+snapshot and a response retention owner. Core/echo and connected Mail methods
+use the existing whole-request admission, argument parser, result references,
+method-error handling and retained response encoder. Unconnected methods return
 unknownMethod at this preparation boundary; they never fall through to the
 local database. Production remains on the existing backend until cutover.
 
@@ -2317,3 +2317,21 @@ result and returns the deadline error. Argument and unsupported-method errors
 still produce per-method replies while the snapshot remains usable. The
 runtime HTTP adapter must settle such terminal refusal without publishing
 any prefix of the discarded batch.
+
+## 68. Prepared PostgreSQL Email/get dispatch
+
+The prepared read dispatcher also connects Email/get to its authenticated
+snapshot. The existing argument parser, selections, ID planning, result
+references, response framing and notFound handling remain shared with the
+local adapter. Stored fields use the shared Email encoder; MIME and header
+fields use the existing verified-pin encoder. No new client features or
+interpretation rules are introduced.
+
+Null IDs use one bounded PostgreSQL query page; an account larger than the
+method object allowance refuses rather than silently truncating. Requested
+IDs retain their order and deduplication. Body verification prepays the
+existing per-method byte/record allowance before obtaining the PostgreSQL
+pin. The snapshot additionally retains its connection budget and shortened
+execution deadline. A projection/output refusal does not poison a healthy
+snapshot; body integrity or connection failure remains terminal. Provisional
+bytes are published only after both projection and final snapshot checks.
