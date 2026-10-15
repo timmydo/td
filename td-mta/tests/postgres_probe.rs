@@ -4565,7 +4565,82 @@ fn exercise_uploads(
     devices::publish_creation(request, trust, deadline(), &creation).unwrap();
     let device = creation.device_id();
     let password = creation.password();
-    let prepare = |bytes: &[u8]| uploads::prepare(binding, device, bytes, deadline()).unwrap();
+    use td_mta::{
+        admission::work::{Charge, Meter},
+        clock::RuntimeClock,
+        ports::{Clock, Deadline},
+    };
+    let clock = RuntimeClock::new();
+    let allowance = || {
+        let cap = Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap();
+        Meter::new(
+            cap,
+            Charge {
+                io_bytes: 3 * uploads::MAX_BYTES as u64,
+                output_bytes: uploads::MAX_BYTES as u64,
+                records: 4096,
+                ..Charge::default()
+            },
+        )
+    };
+    let prepare = |bytes: &[u8]| {
+        let mut meter = allowance();
+        let before = meter.remaining();
+        let upload =
+            uploads::prepare_with_meter(binding, device, bytes, deadline(), &mut meter, &clock)
+                .unwrap();
+        assert!(before.io_bytes - meter.remaining().io_bytes >= 2 * bytes.len() as u64);
+        assert_eq!(
+            before.output_bytes - meter.remaining().output_bytes,
+            bytes.len() as u64
+        );
+        upload
+    };
+    for budget in [
+        Charge {
+            io_bytes: 0,
+            output_bytes: 1,
+            records: 100,
+            ..Charge::default()
+        },
+        Charge {
+            io_bytes: 1000,
+            output_bytes: 0,
+            records: 100,
+            ..Charge::default()
+        },
+        Charge {
+            io_bytes: 1000,
+            output_bytes: 1,
+            records: 0,
+            ..Charge::default()
+        },
+    ] {
+        let mut meter = Meter::new(
+            Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap(),
+            budget,
+        );
+        assert!(matches!(
+            uploads::prepare_with_meter(binding, device, b"x", deadline(), &mut meter, &clock),
+            Err(uploads::Error::Capacity)
+        ));
+        assert!(meter.stopped().is_some());
+        assert!(matches!(
+            uploads::prepare_with_meter(binding, device, b"", deadline(), &mut meter, &clock),
+            Err(uploads::Error::Capacity)
+        ));
+    }
+    let mut expired = Meter::new(
+        Deadline::after(clock.sample().unwrap().monotonic, 0).unwrap(),
+        allowance().remaining(),
+    );
+    assert!(matches!(
+        uploads::prepare_with_meter(binding, device, b"x", deadline(), &mut expired, &clock),
+        Err(uploads::Error::Connection(
+            td_mta::postgres_probe::Error::Deadline
+        ))
+    ));
+
     let publish =
         |upload: &uploads::Upload| uploads::publish(request, trust, deadline(), upload, password);
     assert_eq!(binding.upload_maximum(), uploads::MAX_BYTES);

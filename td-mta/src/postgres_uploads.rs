@@ -1,7 +1,10 @@
 //! Cold bounded upload publication; runtime ingress reservations remain separate.
 use crate::{
+    admission::work::{Charge, Meter, Stop},
+    clock::RuntimeClock,
     device_credentials::Presented,
     ids::{BlobId, DeviceId, UploadOperationId},
+    ports::{Clock, Deadline},
     postgres_devices,
     postgres_probe::{self, Request},
     postgres_publication as publication,
@@ -79,27 +82,90 @@ pub fn prepare(
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<Upload, Error> {
+    let left = preparation_time(binding, bytes.len(), deadline)?;
+    let clock = RuntimeClock::new();
+    let now = clock.sample().map_err(|_| Error::Integrity)?.monotonic;
+    let cap = Deadline::after(
+        now,
+        u64::try_from(left.as_millis()).map_err(|_| Error::Capacity)?,
+    )
+    .map_err(|_| Error::Integrity)?;
+    let work = binding.work();
+    let mut meter = Meter::new(
+        cap,
+        Charge {
+            io_bytes: work.foreground_io_bytes,
+            records: work.foreground_records,
+            output_bytes: binding.upload_maximum() as u64,
+            ..Charge::default()
+        },
+    );
+    prepare_with_meter(binding, device, bytes, deadline, &mut meter, &clock)
+}
+
+fn preparation_time(
+    binding: &Binding,
+    length: usize,
+    deadline: Instant,
+) -> Result<std::time::Duration, Error> {
     if !binding.roles().jmap() {
         return Err(Error::Policy);
     }
-    if bytes.len() > MAX_BYTES || bytes.len() > binding.upload_maximum() {
+    if length > MAX_BYTES || length > binding.upload_maximum() {
         return Err(Error::Capacity);
     }
-    if deadline
+    deadline
         .checked_duration_since(Instant::now())
-        .is_none_or(|left| left.is_zero() || left > postgres_probe::MAX_DURATION)
-    {
+        .filter(|left| !left.is_zero() && *left <= postgres_probe::MAX_DURATION)
+        .ok_or(Error::Connection(postgres_probe::Error::Deadline))
+}
+
+fn charge(
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+    deadline: Instant,
+    bytes: usize,
+    output: usize,
+) -> Result<(), Error> {
+    if Instant::now() >= deadline {
         return Err(Error::Connection(postgres_probe::Error::Deadline));
     }
+    meter
+        .charge(
+            clock.sample().map_err(|_| Error::Integrity)?.monotonic,
+            Charge {
+                io_bytes: bytes as u64,
+                output_bytes: output as u64,
+                records: 1,
+                ..Charge::default()
+            },
+        )
+        .map_err(|error| match error {
+            Stop::Deadline => Error::Connection(postgres_probe::Error::Deadline),
+            _ => Error::Capacity,
+        })
+}
+
+/// Retain completed ingress under its original work allowance and deadline.
+/// The caller still owns memory/concurrency admission; this grants no device
+/// or publication authority and never opens a database transaction.
+pub fn prepare_with_meter(
+    binding: &Binding,
+    device: DeviceId,
+    bytes: &[u8],
+    deadline: Instant,
+    meter: &mut Meter,
+    clock: &RuntimeClock,
+) -> Result<Upload, Error> {
+    preparation_time(binding, bytes.len(), deadline)?;
+    charge(meter, clock, deadline, 0, bytes.len())?;
     let ttl_ms = i64::try_from(binding.upload_expiry_seconds())
         .ok()
         .and_then(|n| n.checked_mul(1000))
         .ok_or(Error::Integrity)?;
     let mut body = Provider.sha256().map_err(|_| Error::Crypto)?;
     for chunk in bytes.chunks(CHUNK) {
-        if Instant::now() >= deadline {
-            return Err(Error::Connection(postgres_probe::Error::Deadline));
-        }
+        charge(meter, clock, deadline, chunk.len(), 0)?;
         body.update(chunk).map_err(|_| Error::Crypto)?;
     }
     let body_digest = body.finish().map_err(|_| Error::Crypto)?;
@@ -107,7 +173,10 @@ pub fn prepare(
     owned
         .try_reserve_exact(bytes.len())
         .map_err(|_| Error::Capacity)?;
-    owned.extend_from_slice(bytes);
+    for chunk in bytes.chunks(CHUNK) {
+        charge(meter, clock, deadline, chunk.len(), 0)?;
+        owned.extend_from_slice(chunk);
+    }
     let mut rng = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let mut operation = [0; 16];
     let mut blob = [0; 16];
@@ -128,11 +197,10 @@ pub fn prepare(
         &ttl_ms.to_be_bytes(),
         binding.profile().as_bytes(),
     ] {
+        charge(meter, clock, deadline, part.len(), 0)?;
         hash.update(part).map_err(|_| Error::Crypto)?;
     }
-    if Instant::now() >= deadline {
-        return Err(Error::Connection(postgres_probe::Error::Deadline));
-    }
+    charge(meter, clock, deadline, 0, 0)?;
     Ok(Upload {
         binding: binding.clone(),
         device,

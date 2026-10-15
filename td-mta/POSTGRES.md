@@ -2916,3 +2916,16 @@ leaves td-mail's send record in place; its next attempt reconciles through
 submission query/get and retires the draft without adding a submission.
 Queue rows retain the desktop submitting profile's smarthost route. No SMTP
 relay, attachments, cloud-provider failover or production cutover is claimed.
+
+
+## 100. Caller-funded upload preparation
+
+`postgres_uploads::prepare_with_meter` retains completed ingress using the
+caller's original work meter and clock. It prepays retained body bytes,
+charges bounded hashing and copying separately, and charges request-digest
+input and a final deadline check. Exhausted work remains stopped across
+retries, including a later empty body. The supplied preparation deadline can
+only shorten the meter's original deadline; no database work or new allowance
+is introduced. The cold convenience wrapper constructs its bounded meter and
+uses the same implementation. Memory/concurrency admission, HTTPS upload
+receipt ownership and production activation remain separate work.
