@@ -3045,8 +3045,8 @@ impl Session {
     }
 
     /// `git_push`, the `ToolCall` record `started` (DESIGN.md §9,
-    /// Pushing): the worktree's branch exported from its base, as the
-    /// store has it, in a maintenance instance; staged by the window's
+    /// Pushing): the worktree's current HEAD exported from its base, as
+    /// the store has it, in a maintenance instance; staged by the window's
     /// git worker, which says the remote branch's tip and the evidence;
     /// put to the person on a card; and pushed, exactly that commit, by
     /// the worker. The outer error is the log's; the inner, the model's.
@@ -3105,13 +3105,12 @@ impl Session {
         // jail can write; one an earlier push left is no longer wanted.
         let pack = StateDir::at(self.state.clone()).push_pack(&meta.id);
         let _ = std::fs::remove_file(&pack);
-        let commit = match export(&self.state, &meta.id, &entry, &base, &pack) {
+        let commit = match export_revision(&self.state, &meta.id, &entry, "HEAD", &base, &pack) {
             Ok(commit) => commit,
             Err(why) => {
                 return Ok(Err(format!(
-                    "the branch {} of {worktree} could not be exported: {why}",
-                    entry.branch
-                )))
+                    "the HEAD of {worktree} could not be exported: {why}"
+                )));
             }
         };
         // An interrupt said while it exported: nothing is staged.
@@ -8043,36 +8042,10 @@ fn prepared_entry<'a>(
     Ok((repositories, entry))
 }
 
-/// Exports `entry`'s branch from `base`, the store's commit of its base,
-/// as a pack to the new file `pack`, in a maintenance instance
-/// (DESIGN.md §9, Pushing): the commit exported.
-fn export(state: &Path, id: &Id, entry: &Entry, base: &str, pack: &Path) -> Result<String, String> {
-    let programs = crate::jail::Programs::from_env()?;
-    let git = crate::repo::host_git()?;
-    let dir = crate::workspace::jail_dir(&StateDir::at(state.to_path_buf()), id);
-    let policy =
-        crate::workspace::maintenance(&dir, &[entry]).ok_or("no worktree to export from")?;
-    let task = crate::repo::Task::Export {
-        git,
-        repository: entry.repository.clone(),
-        id: entry.id.clone(),
-        checkout: entry.checkout.clone(),
-        branch: entry.branch.clone(),
-        base: base.to_string(),
-    };
-    crate::jail::export(
-        &programs,
-        &policy,
-        &dir.join("specs"),
-        &task,
-        crate::repo::EXPORT_TASK_TIME,
-        pack,
-    )
-}
-
 /// Exports `revision` as `entry`'s worktree resolves it, from `base`,
 /// the store's commit of its base, as a pack to the new file `pack`, in
-/// a maintenance instance: the commit a `/review` stages (DESIGN.md §15).
+/// a maintenance instance: a push captures HEAD and `/review` stages its
+/// requested revision (DESIGN.md §9 and §15).
 fn export_revision(
     state: &Path,
     id: &Id,

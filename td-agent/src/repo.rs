@@ -468,22 +468,10 @@ pub enum Task {
         heads: Vec<(String, String)>,
         preparing: bool,
     },
-    /// Resolves `branch`, td-agent's record of the worktree's branch, to
-    /// its commit and sends the objects reachable from it and not from
-    /// `base`, a commit of the store, as a pack (DESIGN.md §9, Pushing):
-    /// frames of pack (`p`) and then the answer (`a`), the commit, so
-    /// nothing but objects leaves for the import. It writes nothing.
-    Export {
-        git: PathBuf,
-        repository: PathBuf,
-        id: String,
-        checkout: PathBuf,
-        branch: String,
-        base: String,
-    },
-    /// As `Export`, of `revision` as the worktree resolves it, its HEAD
-    /// the worktree's: the commit a `/review` asks for (DESIGN.md §15,
-    /// `/review`), whose objects the store lacks.
+    /// Resolves a worktree revision to a commit and streams the objects
+    /// reachable from it and not from the store's `base` as pack frames,
+    /// then an answer frame naming the commit. Push captures HEAD;
+    /// `/review` names its revision (DESIGN.md §9 and §15).
     ExportRevision {
         git: PathBuf,
         repository: PathBuf,
@@ -610,22 +598,6 @@ impl Task {
                     .flat_map(|(base, commit)| [OsString::from(base), OsString::from(commit)]),
             )
             .collect(),
-            Self::Export {
-                git,
-                repository,
-                id,
-                checkout,
-                branch,
-                base,
-            } => vec![
-                "export".into(),
-                git.into(),
-                repository.into(),
-                id.into(),
-                checkout.into(),
-                branch.into(),
-                base.into(),
-            ],
             Self::ExportRevision {
                 git,
                 repository,
@@ -676,7 +648,7 @@ impl Task {
                 })
             }
             [word, git, repository, id, checkout, branch, base]
-                if word == "checkout" || word == "export" =>
+                if word == "checkout" =>
             {
                 if !git::object_id(base) {
                     return Err(format!("{base:?} is not a full commit id"));
@@ -689,24 +661,13 @@ impl Task {
                     git::branch_name(branch)?.to_string(),
                     base.clone(),
                 );
-                Ok(if word == "export" {
-                    Self::Export {
-                        git,
-                        repository,
-                        id,
-                        checkout,
-                        branch,
-                        base,
-                    }
-                } else {
-                    Self::Checkout {
-                        git,
-                        repository,
-                        id,
-                        checkout,
-                        branch,
-                        base,
-                    }
+                Ok(Self::Checkout {
+                    git,
+                    repository,
+                    id,
+                    checkout,
+                    branch,
+                    base,
                 })
             }
             [word, git, repository, id, checkout, bases @ ..]
@@ -750,7 +711,7 @@ impl Task {
                 })
             }
             _ => Err(
-                "usage: td-agent maintain checkout (or export) GIT REPOSITORY ID CHECKOUT BRANCH BASE, survey GIT REPOSITORY ID CHECKOUT BASE..., or track (or track-new) GIT REPOSITORY ID CHECKOUT BASE COMMIT...".into(),
+                "usage: td-agent maintain checkout GIT REPOSITORY ID CHECKOUT BRANCH BASE, export-revision GIT REPOSITORY ID CHECKOUT REVISION BASE, survey GIT REPOSITORY ID CHECKOUT BASE..., or track (or track-new) GIT REPOSITORY ID CHECKOUT BASE COMMIT...".into(),
             ),
         }
     }
@@ -965,9 +926,7 @@ impl Task {
                 .map_err(|e| said("setting the remote-tracking refs", &e))?;
                 Ok(format!("{} remote-tracking refs set", heads.len()))
             }
-            Self::Export { .. } | Self::ExportRevision { .. } => {
-                Err("an export is run with its frames' writer".into())
-            }
+            Self::ExportRevision { .. } => Err("an export is run with its frames' writer".into()),
         }
     }
 
@@ -975,22 +934,6 @@ impl Task {
     /// it exported; any other task as `run`.
     pub fn export(&self, out: &mut dyn Write) -> Result<String, String> {
         let (git, repository, id, checkout, spec, what, base) = match self {
-            Self::Export {
-                git,
-                repository,
-                id,
-                checkout,
-                branch,
-                base,
-            } => (
-                git,
-                repository,
-                id,
-                checkout,
-                format!("refs/heads/{branch}^{{commit}}"),
-                format!("the branch {branch}"),
-                base,
-            ),
             Self::ExportRevision {
                 git,
                 repository,
@@ -1049,9 +992,7 @@ impl Task {
 /// run and its answer written to `out`, one line, or for an export its
 /// pack's frames and then the line as a frame of its own.
 pub fn maintain(args: &[String], out: &mut dyn Write) -> Result<(), String> {
-    let framed = args
-        .first()
-        .is_some_and(|word| word == "export" || word == "export-revision");
+    let framed = args.first().is_some_and(|word| word == "export-revision");
     let result = Task::parse(args).and_then(|task| task.export(out));
     let line = answer(&result);
     let _ = if framed {
@@ -1709,12 +1650,12 @@ pub(crate) mod tests {
             plain(&checkout, &["commit", "--quiet", "-m", file]);
             commits.push(plain(&checkout, &["rev-parse", "HEAD"]).trim().to_string());
         }
-        let export = |from: &str| Task::Export {
+        let export = |from: &str| Task::ExportRevision {
             git: git.clone(),
             repository: repository.clone(),
             id: "r".into(),
             checkout: checkout.clone(),
-            branch: "agent/one".into(),
+            revision: "HEAD".into(),
             base: from.to_string(),
         };
         // Its words cross, and the entry frames its answer after the pack.
@@ -1772,16 +1713,16 @@ pub(crate) mod tests {
         assert!(e.contains("no commit"), "{e}");
         // A branch that is not there is said.
         let mut out = Vec::new();
-        let gone = Task::Export {
+        let gone = Task::ExportRevision {
             git: git.clone(),
             repository: repository.clone(),
             id: "r".into(),
             checkout: checkout.clone(),
-            branch: "nowhere".into(),
+            revision: "nowhere".into(),
             base: base.clone(),
         };
         let e = gone.export(&mut out).unwrap_err();
-        assert!(e.starts_with("resolving the branch nowhere"), "{e}");
+        assert!(e.starts_with("resolving the revision nowhere"), "{e}");
         assert!(out.is_empty());
         // A `/review`'s revision, as the worktree resolves it: its words
         // cross framed, and its pack imports as the branch's does.
@@ -1809,6 +1750,28 @@ pub(crate) mod tests {
         worker.import(&reviewed, &file, &commits[1]).unwrap();
         let mut out = Vec::new();
         assert_eq!(revision("HEAD~1").export(&mut out).unwrap(), commits[0]);
+        // The source follows the linked worktree's HEAD after both a
+        // branch switch and a detached checkout. Its original ref stays.
+        plain(&checkout, &["switch", "-c", "review/fix"]);
+        fs::write(checkout.join("three"), "third\n").unwrap();
+        plain(&checkout, &["add", "three"]);
+        plain(&checkout, &["commit", "--quiet", "-m", "three"]);
+        let switched = plain(&checkout, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_ne!(switched, commits[1]);
+        assert_eq!(
+            plain(&checkout, &["rev-parse", "agent/one"]).trim(),
+            commits[1]
+        );
+        let mut out = Vec::new();
+        assert_eq!(export(&base).export(&mut out).unwrap(), switched);
+        fs::write(&file, unframe_pack(&out)).unwrap();
+        worker.import(&publish, &file, &switched).unwrap();
+        plain(&checkout, &["checkout", "--detach", &commits[0]]);
+        let mut out = Vec::new();
+        assert_eq!(export(&base).export(&mut out).unwrap(), commits[0]);
+        let mut obsolete = words.clone();
+        obsolete[0] = "export".into();
+        assert!(Task::parse(&obsolete).is_err());
         // One that could be taken for an option is refused before git.
         let mut bad = words.clone();
         bad[5] = "--output=/tmp/x".into();
@@ -2060,7 +2023,6 @@ pub(crate) mod tests {
             | Task::Checkout { git, .. }
             | Task::Survey { git, .. }
             | Task::Track { git, .. }
-            | Task::Export { git, .. }
             | Task::ExportRevision { git, .. } => git.clone(),
         }
     }

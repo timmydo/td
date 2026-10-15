@@ -518,7 +518,7 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
     let said = shell(
         &mut client,
         &format!(
-            "cd {checkout} && echo more >> top && {git} commit -q -a -m two && \
+            "cd {checkout} && {git} switch -c review/fix && echo more >> top && {git} commit -q -a -m two && \
              {git} log --format=log=%an:%s -1; \
              echo x >> {repository}/config 2>/dev/null || echo config=read-only; \
              {git} sparse-checkout add a && test -e a/x && echo add=widened; \
@@ -548,7 +548,13 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
     }
     drop(client);
     assert!(!said.lines().any(|got| got == "list=a"), "{said}");
-    let tip = std::fs::read_to_string(repository.join("refs/heads/agent/one")).unwrap();
+    let tip = std::fs::read_to_string(repository.join("refs/heads/review/fix")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repository.join("refs/heads/agent/one"))
+            .unwrap()
+            .trim(),
+        base
+    );
     assert_ne!(tip.trim(), base, "the commit moved the branch");
     assert_eq!(
         std::fs::read_to_string(repository.join("config")).unwrap(),
@@ -556,12 +562,12 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
     );
     // A maintenance instance exports the branch's commits from the base
     // as a pack, which the publish repository imports strictly (§9).
-    let export = Task::Export {
+    let export = Task::ExportRevision {
         git: git_path,
         repository: repository.clone(),
         id: "r".into(),
         checkout: checkout.clone(),
-        branch: "agent/one".into(),
+        revision: "HEAD".into(),
         base: base.clone(),
     };
     let pack = scratch.0.join("export.pack");
@@ -608,7 +614,7 @@ fn a_maintenance_instance_checks_out_and_a_jailed_git_commits() {
         &unmade,
     )
     .unwrap_err();
-    assert!(e.contains("resolving the branch nowhere"), "{e}");
+    assert!(e.contains("resolving the revision nowhere"), "{e}");
     assert!(!unmade.exists());
 }
 

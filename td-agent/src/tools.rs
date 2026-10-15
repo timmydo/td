@@ -657,11 +657,11 @@ pub(crate) fn definition(tool: Tool) -> Json {
             ),
         ),
         Tool::GitPush => (
-            "Push a worktree's branch to its remote, outside the jail. td-agent sends the commits from the base to the branch's tip, scans them for credential shapes and binary files, and asks for approval: a push to main or master, a forced push, and one whose scan matched always go to the person, as may any other. Commit first: only committed work is pushed, and only to refs/heads/ on the worktree's own remote. The result is what git and the remote said.".to_string(),
+            "Push a worktree's current HEAD to its configured remote, outside the jail; no shell origin remote is needed. td-agent captures HEAD, including after switching branches or detaching, and sends the commits from the base to that commit, scans them for credential shapes and binary files, and asks for approval: a push to main or master, a forced push, and one whose scan matched always go to the person, as may any other. Commit first: only committed work is pushed, and only to refs/heads/ on the worktree's own remote. The result is what git and the remote said.".to_string(),
             schema(
                 vec![
                     ("worktree", property("string", "The worktree's absolute path, as the environment names it.")),
-                    ("remote_branch", property("string", "The branch on the remote to push to; the worktree's own branch when left out.")),
+                    ("remote_branch", property("string", "The destination branch on the remote; defaults to the branch recorded when this worktree was created, even after a local branch switch.")),
                     ("force", property("boolean", "Replace the remote's branch though the push does not fast-forward it, and only if it is still where it was when the push was checked; false when left out.")),
                 ],
                 &["worktree"],
@@ -1389,7 +1389,7 @@ pub fn parse_offered(
                         "`match` is {} bytes; at most {}",
                         text.len(),
                         crate::sysview::MAX_MATCH
-                    ))
+                    ));
                 }
                 Some(text) => Some(text.to_string()),
             };

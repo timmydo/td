@@ -8790,7 +8790,7 @@ fn git_push_is_refused_until_it_can_export() {
     let unexported = said(&mut h, "Push four.");
     assert!(
         unexported.starts_with(&format!(
-            "error: the branch agent of {checkout} could not be exported: "
+            "error: the HEAD of {checkout} could not be exported: "
         )),
         "{unexported}"
     );
@@ -9416,6 +9416,19 @@ fn a_push_is_exported_staged_asked_and_sent() {
             Reply::sse("stream-sonnet.sse"),
         ]
     });
+    // Switching branches must change the source, not the configured
+    // remote destination. The old managed branch still names `tip`.
+    let recorded_tip = tip;
+    git_in(&entry.checkout, &["switch", "-c", "review/fix"]);
+    std::fs::write(entry.checkout.join("c.txt"), "new branch\n").unwrap();
+    git_in(&entry.checkout, &["add", "c.txt"]);
+    git_in(&entry.checkout, &["commit", "--quiet", "-m", "Add c"]);
+    let tip = git_in(&entry.checkout, &["rev-parse", "HEAD"]);
+    assert_ne!(tip, recorded_tip);
+    assert_eq!(
+        git_in(&entry.checkout, &["rev-parse", &entry.branch]),
+        recorded_tip
+    );
     let pack = h.state.push_pack(&h.id);
     // A pack an earlier push left is not in the way.
     std::fs::write(&pack, b"stale").unwrap();

@@ -4318,8 +4318,11 @@ prompt refused.
 **Pushing** is the `git_push {worktree, remote_branch?, force?}` tool, and
 an approval of it is bound to immutable values:
 
-1. A maintenance instance resolves the worktree's branch to a commit id
-   and exports the commits from the base to it as a pack over its pipe.
+1. A maintenance instance resolves the worktree's current `HEAD` to a
+   commit id and exports the commits from the base to it as a pack over
+   its pipe, including after a branch switch, rename or detached checkout.
+   The recorded branch remains the default remote destination;
+   `remote_branch` overrides that destination, never the source commit.
 2. The git worker imports the pack into the publish repository with
    `index-pack --strict --max-input-size`, the pipe's frames bounded too,
    so the objects are checked and nothing but objects crosses;
@@ -4463,13 +4466,12 @@ once can hold those back.
 
 **As built (increment 14, export and import).** The second step lays the
 push's first two stages, which nothing calls yet. A maintenance
-instance's `export` task resolves td-agent's record of the worktree's
-branch, never the jail's `HEAD`, to its commit with `rev-parse
---verify`, and runs `pack-objects --stdout --revs` over that commit and
-not the base, a commit of the store, so every object the branch added
-since goes, and one the store already has may too. Its
-`export-revision` twin, a `/review`'s (§15), resolves a revision the
-worktree names, `HEAD` the jail's, the same way. Its output is
+instance's `export-revision` task resolves the checkout's revision to a
+commit with `rev-parse --verify`, and runs `pack-objects --stdout --revs`
+over that immutable commit and not the base, a commit of the store. A
+push captures `HEAD`; a `/review` (§15) names its revision. Every object
+added since the base goes, and one the store already has may too. The
+recorded branch does not select the source. Its output is
 streamed as it comes, never held whole: a few pieces read ahead of the
 channel at most, so a slow reader holds git back, and once git exits its
 pipes are read for as long as its standard output still comes, a second
@@ -4598,9 +4600,9 @@ repository does not fail on it.
 **As built (increment 14, `git_push`).** A repository workspace's kit
 holds `git_push {worktree, remote_branch?, force?}` beside `git_fetch`,
 refused, asking nothing, as `git_fetch` is, and also for a branch
-`push_branch` refuses, the worktree's own when none is named, and for a
-base whose commit upstream the conversation has not recorded yet. The
-conversation exports the worktree's branch from that recorded commit,
+`push_branch` refuses, the recorded branch when none is named, and for
+a base whose commit upstream the conversation has not recorded yet. The
+conversation exports the checkout's current HEAD from that recorded commit,
 the store's, in a maintenance instance, to `push.pack` in its own
 directory, a pack an earlier push left removed first; sends the window
 `Up::Stage`, and removes the pack once it is answered, as the worker has
