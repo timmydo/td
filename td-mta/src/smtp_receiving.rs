@@ -7,19 +7,15 @@ use crate::{
     },
     format::row::ReceiptTls,
     generations::GenerationLease,
-    ids::AccountId,
     limits::ResourcePlan,
     ports::{
-        Access, Clock, CommitFailure, Deadline, Error, PeerVerification, Principal, Tick,
-        TlsPolicyId, TlsTransport, TlsVersion, Transport,
+        Clock, CommitFailure, Deadline, Error, PeerVerification, Tick, TlsPolicyId, TlsTransport,
+        TlsVersion, Transport,
     },
     smtp_network::{Network, Progress},
     smtp_session::{Pending, Settings},
     smtp_starttls::{self, Upgrade},
-    store_fs::{
-        smtp_trace_allowance, Delivery, DeliveryAuthorization, DeliveryError, DeliveryGuard,
-        DeliveryPeer, DeliveryRequest, IngressSpool, StoreCoordinator, UploadError,
-    },
+    smtp_storage::{self, Job as _, Storage},
     tls_admission::HandshakePool,
     tls_io::TLS_WIRE_BYTES,
     tls_policy::{PolicyRole, TlsConnection, TlsPolicies},
@@ -152,7 +148,7 @@ impl<'a> BoundListener<'a> {
             return Err(Error::Forbidden);
         }
         let hostname = row.server_name.ok_or(Error::Invalid)?;
-        let trace_bytes = smtp_trace_allowance(hostname)?;
+        let trace_bytes = crate::receiving_headers::trace_allowance(hostname)?;
         socket.set_nonblocking(true).map_err(Error::from)?;
         Ok(Self {
             socket,
@@ -161,38 +157,6 @@ impl<'a> BoundListener<'a> {
             hostname,
             trace_bytes,
         })
-    }
-}
-
-struct Direct {
-    access: Access,
-    peer: IpAddr,
-    tls: ReceiptTls,
-    clock: Arc<dyn Clock>,
-}
-struct DirectGuard<'a>(&'a Direct);
-impl DeliveryGuard for DirectGuard<'_> {
-    fn access(&self) -> Access {
-        self.0.access
-    }
-    fn peer(&self) -> DeliveryPeer<'_> {
-        DeliveryPeer {
-            peer: self.0.peer,
-            tls: self.0.tls,
-            gateway: None,
-        }
-    }
-}
-impl DeliveryAuthorization for Direct {
-    type Guard<'a> = DirectGuard<'a>;
-    fn authorize(&self, account: AccountId, deadline: Deadline) -> Result<DirectGuard<'_>, Error> {
-        if account != self.access.account {
-            return Err(Error::Forbidden);
-        }
-        if deadline.expired(self.clock.sample()?.monotonic) {
-            return Err(Error::Deadline);
-        }
-        Ok(DirectGuard(self))
     }
 }
 
@@ -259,16 +223,15 @@ enum Phase {
     },
     Retire,
 }
-type Job<'s, 'r, 'l, P> = Delivery<'s, 's, 'r, 'l, td_crypto::Provider, P, Direct>;
-struct Slot<'s, 'r, 'l, 'cfg, P> {
+struct Slot<'s, 'cfg, B: Storage + 's> {
     phase: Phase,
     connection: Option<Connection<'cfg>>,
-    delivery: Option<Job<'s, 'r, 'l, P>>,
+    delivery: Option<B::Job<'s>>,
     listener: usize,
     peer: IpAddr,
     final_reply: bool,
 }
-impl<'cfg, P> Slot<'_, '_, '_, 'cfg, P> {
+impl<'cfg, B: Storage> Slot<'_, 'cfg, B> {
     fn connection(&mut self) -> Result<&mut Connection<'cfg>, Error> {
         self.connection.as_mut().ok_or(Error::Conflict)
     }
@@ -282,10 +245,8 @@ impl<'cfg, P> Slot<'_, '_, '_, 'cfg, P> {
 
 /// Run with one immutable routing/TLS snapshot and a shared monotonic clock.
 /// Startup storage checks precede readiness; no gateway or reload is enabled.
-pub struct Receiving<'s, 'r, 'l, 'cfg, P> {
-    pub coordinator: &'s StoreCoordinator<'r, 'l, P>,
-    pub spool: &'s IngressSpool<'r>,
-    pub crypto: &'s td_crypto::Provider,
+pub struct Receiving<'s, 'cfg, B: Storage> {
+    pub storage: &'s B,
     pub routes: &'cfg Routing<'cfg>,
     pub resources: &'cfg ResourcePlan,
     pub admission: &'cfg crate::admission::Plan,
@@ -311,7 +272,7 @@ fn buffer() -> Result<Wire, Error> {
         .map_err(|_| Error::Capacity)
 }
 
-impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
+impl<'s, 'cfg, B: Storage> Receiving<'s, 'cfg, B> {
     pub fn run(&self, control: &Control) -> Result<(), Error> {
         self.run_with_ready(control, || Ok(()))
     }
@@ -387,9 +348,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
             )?;
             total = total.checked_add(sessions).ok_or(Error::Capacity)?;
         }
-        if total > limits.smtp_sessions
-            || limits.message_bytes as u64 > self.spool.capacity().bytes_each
-        {
+        if total > limits.smtp_sessions || limits.message_bytes as u64 > self.storage.capacity() {
             return Err(Error::Capacity);
         }
         let startup = after(
@@ -400,10 +359,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
             if startup.expired(self.clock.sample()?.monotonic) {
                 return Err(Error::Deadline);
             }
-            match self
-                .coordinator
-                .receiving_ready(self.routes.account(), startup)
-            {
+            match self.storage.ready(self.routes.account(), startup) {
                 Ok(()) => break,
                 Err(Error::Busy) => std::thread::park_timeout(SCAN),
                 Err(error) => return Err(error),
@@ -746,7 +702,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
         }
     }
 
-    fn dispatch(&self, slot: &mut Slot<'s, 'r, 'l, 'cfg, P>, now: Tick) -> Result<(), Error> {
+    fn dispatch(&self, slot: &mut Slot<'s, 'cfg, B>, now: Tick) -> Result<(), Error> {
         let network = slot.connection()?.network()?;
         let (work, seconds) = match network.session().pending() {
             Pending::BeginData { .. } => (Work::Begin, self.admission.work().admission_seconds),
@@ -767,7 +723,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
 
     fn worker(
         &self,
-        slots: &[Mutex<Slot<'s, 'r, 'l, 'cfg, P>>],
+        slots: &[Mutex<Slot<'s, 'cfg, B>>],
         tls: bool,
         finished: &AtomicBool,
         started: &AtomicU8,
@@ -798,7 +754,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                 match slot.phase {
                     Phase::Retire if !tls => {
                         slot.retire();
-                        if self.coordinator.admission_stopped() {
+                        if self.storage.stopped() {
                             control.fail();
                         }
                         progress = true;
@@ -821,7 +777,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                         };
                         if result.is_err() {
                             slot.retire();
-                            if !tls && self.coordinator.admission_stopped() {
+                            if !tls && self.storage.stopped() {
                                 control.fail();
                             }
                         }
@@ -842,7 +798,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                     slot.retire();
                 }
             }
-            if self.coordinator.admission_stopped() {
+            if self.storage.stopped() {
                 control.fail();
             }
         }
@@ -850,7 +806,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
 
     fn storage(
         &self,
-        slot: &mut Slot<'s, 'r, 'l, 'cfg, P>,
+        slot: &mut Slot<'s, 'cfg, B>,
         work: Work,
         cap: Deadline,
         random: &mut td_crypto::SystemEntropy,
@@ -865,26 +821,18 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
             Work::Begin => {
                 let connection = slot.connection.as_ref().ok_or(Error::Conflict)?;
                 let network = connection.network()?;
-                let authorization = Direct {
-                    access: Access {
+                let result = self.storage.begin(
+                    smtp_storage::Begin {
                         account: self.routes.account(),
-                        principal: Principal::Smtp,
                         config_generation: self.policies.id().get(),
-                    },
-                    peer: slot.peer,
-                    tls: connection.tls()?,
-                    clock: self.clock.clone(),
-                };
-                let result = self.coordinator.reserve_delivery(
-                    self.crypto,
-                    random,
-                    self.spool,
-                    authorization,
-                    network.session(),
-                    DeliveryRequest {
+                        peer: slot.peer,
+                        tls: connection.tls()?,
+                        clock: self.clock.clone(),
+                        session: network.session(),
                         header_bytes: self.resources.limits().header_bytes,
                         deadline: network.deadline(),
                     },
+                    random,
                 );
                 match result {
                     Ok(job) => {
@@ -896,10 +844,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                             .network_mut()?
                             .data_ready(Ok(()), clock)?;
                     }
-                    Err(DeliveryError::Storage(UploadError::Store(Error::Busy)))
-                    | Err(DeliveryError::Storage(UploadError::Ledger(
-                        crate::admission::logical::Error::Slot(crate::ownership::Error::Contended),
-                    ))) => {
+                    Err(smtp_storage::Failure::Retry) => {
                         slot.phase = Phase::Retry {
                             work,
                             deadline: cap,
@@ -944,9 +889,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                     Ok(completion) => {
                         // Preserve the native outcome even when accounting or cleanup failed.
                         let result = completion.outcome;
-                        if completion.admission_stopped
-                            || completion.cleanup_error.is_some()
-                            || matches!(result, Err(CommitFailure::Indeterminate(_)))
+                        if completion.stop || matches!(result, Err(CommitFailure::Indeterminate(_)))
                         {
                             control.fail();
                         }
@@ -954,7 +897,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
                         slot.connection()?.network_mut()?.committed(result, clock)?;
                         slot.final_reply = true;
                     }
-                    Err(DeliveryError::CoordinationBusy) => {
+                    Err(smtp_storage::Failure::Retry) => {
                         slot.phase = Phase::Retry {
                             work: Work::Commit { prepared: true },
                             deadline: cap,
@@ -967,7 +910,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
             }
             Work::Tls => return Err(Error::Conflict),
         }
-        if self.coordinator.admission_stopped() {
+        if self.storage.stopped() {
             control.fail();
         }
         slot.phase = Phase::Done;
@@ -976,24 +919,24 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
 
     fn delivery_refused(
         &self,
-        slot: &mut Slot<'s, 'r, 'l, 'cfg, P>,
+        slot: &mut Slot<'s, 'cfg, B>,
         work: Work,
-        error: DeliveryError,
+        error: smtp_storage::Failure,
         control: &Control,
     ) -> Result<(), Error> {
-        if matches!(error, DeliveryError::HeaderLimit) {
+        if matches!(error, smtp_storage::Failure::HeaderLimit) {
             slot.delivery.take();
             slot.connection()?
                 .network_mut()?
                 .message_too_large(self.clock.as_ref())?;
-            if self.coordinator.admission_stopped() {
+            if self.storage.stopped() {
                 control.fail();
             }
             slot.phase = Phase::Done;
             return Ok(());
         }
         let error = match error {
-            DeliveryError::Storage(UploadError::Store(error)) => error,
+            smtp_storage::Failure::Refused(error) => error,
             _ => Error::Busy,
         };
         self.storage_refused(slot, work, error, control)
@@ -1001,7 +944,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
 
     fn storage_refused(
         &self,
-        slot: &mut Slot<'s, 'r, 'l, 'cfg, P>,
+        slot: &mut Slot<'s, 'cfg, B>,
         work: Work,
         error: Error,
         control: &Control,
@@ -1016,7 +959,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
             }
             Work::Tls => return Err(Error::Conflict),
         }
-        if self.coordinator.admission_stopped() {
+        if self.storage.stopped() {
             control.fail();
         }
         slot.final_reply = matches!(work, Work::Commit { .. });
@@ -1024,7 +967,7 @@ impl<'s, 'r, 'l, 'cfg, P: Sync> Receiving<'s, 'r, 'l, 'cfg, P> {
         Ok(())
     }
 
-    fn tls(&self, slot: &mut Slot<'s, 'r, 'l, 'cfg, P>, cap: Deadline) -> Result<(), Error> {
+    fn tls(&self, slot: &mut Slot<'s, 'cfg, B>, cap: Deadline) -> Result<(), Error> {
         let now = self.clock.sample()?.monotonic;
         if cap.expired(now) {
             return Err(Error::Deadline);

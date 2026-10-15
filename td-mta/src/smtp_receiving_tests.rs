@@ -318,10 +318,13 @@ fn run(case: Case) {
                 }
             }
 
-            let receiving = Receiving {
+            let storage = crate::smtp_storage::native::Native {
                 coordinator: &coordinator,
                 spool: &spool,
                 crypto: &Provider,
+            };
+            let receiving = Receiving {
+                storage: &storage,
                 routes: records.routes(),
                 resources: &resources,
                 admission: &plan,

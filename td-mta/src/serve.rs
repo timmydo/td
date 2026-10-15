@@ -307,10 +307,13 @@ pub(super) fn run(path: &str, mailbox_access: bool) -> Result<(), ConfigFailure>
             } else {
                 None
             };
-            let receiving = Receiving {
+            let storage = td_mta::smtp_storage::native::Native {
                 coordinator: &coordinator,
                 spool: &spool,
                 crypto: &td_crypto::Provider,
+            };
+            let receiving = Receiving {
+                storage: &storage,
                 routes: records.routes(),
                 resources,
                 admission: plans.admission(),

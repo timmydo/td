@@ -3021,3 +3021,21 @@ restart custody, maintenance and production backend cutover are not activated.
 The PostgreSQL runtime-role fixture covers known success, rollback, delayed
 COMMIT, refusal while pending, historical settlement, absent-receipt retention
 and stale-policy refusal.
+
+
+## 105. SMTP worker storage boundary
+
+The fixed SMTP receiving worker accesses storage through `smtp_storage`.
+The boundary admits a job from the trusted connection's session, account,
+configuration generation and observed peer/TLS facts. Jobs own DATA writes,
+preparation and publication; the worker retains the existing routing, TLS,
+deadline, retry and shutdown state machine. A known durable result remains
+separate from cleanup/accounting stop flags; uncertain publication still
+retires the active service under the existing production policy.
+
+The native adapter preserves current coordinator readiness, spool capacity,
+authorization guards, contention mappings and completion behavior. Production
+continues to construct only that adapter. This is a storage interface for the
+PostgreSQL cutover, not a new SMTP feature or an activated PostgreSQL listener.
+Existing real SMTP/TLS, storage refusal and shutdown fixtures exercise the
+same production adapter through the new boundary.
