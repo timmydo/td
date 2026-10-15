@@ -337,7 +337,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 16);
+    assert_eq!(receipt.version, 17);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -414,7 +414,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        16
+        17
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -539,7 +539,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":16"));
+    assert!(initialized.contains("\"schema_version\":17"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -710,7 +710,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 16);
+    assert_eq!(receipt.version, 17);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1212,7 +1212,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "35");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "36");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1306,7 +1306,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
 fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
-    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+    for previous_version in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
         for (index, ddl) in [
@@ -1325,6 +1325,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_receiving.sql"),
             include_str!("../src/postgres_submissions.sql"),
             include_str!("../src/postgres_submission_routes.sql"),
+            include_str!("../src/postgres_route_owners.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1362,6 +1363,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             13 => "submission_receipts",
             14 => "submission_routes",
             15 => "route_owners",
+            16 => "submission_attempts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1395,7 +1397,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 16);
+        assert_eq!(receipt.version, 17);
         assert_eq!(
             sql(&fixture, "SELECT count(*) FROM td_mta.submission_routes"),
             "0"
@@ -6915,6 +6917,7 @@ fn exercise_submission_publication(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{}','hex') AND state=1",a.submission)),"2");
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
     read_outgoing().unwrap();
+    exercise_dispatch(fixture, request, trust, relay.binding(), a.submission);
 }
 
 fn exercise_route_owners(
@@ -7105,4 +7108,133 @@ fn exercise_route_owners(
         sql(fixture, "SELECT count(*) FROM td_mta.route_owners"),
         "1"
     );
+}
+
+fn exercise_dispatch(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
+    submission: td_mta::ids::SubmissionId,
+) {
+    use td_mta::{ids::BootId, postgres_attempts as attempts, postgres_route_owners as owners};
+    let claim = owners::prepare(binding, BootId::from_bytes([9; 16])).unwrap();
+    let owner = owners::acquire(request, trust, deadline(), &claim).unwrap();
+    let value = attempts::prepare(&claim, owner.generation, submission).unwrap();
+    let bad = attempts::prepare(&claim, owner.generation + 1, submission).unwrap();
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &bad),
+        Err(attempts::Error::Owner(owners::Error::Stale))
+    );
+    assert_eq!(
+        attempts::inspect(request, trust, deadline(), &value).unwrap(),
+        None
+    );
+    let before = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value),
+        Err(attempts::Error::Policy)
+    );
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex')",
+            binding.selection().generation
+        ),
+    );
+    let destination = sql(fixture, &format!("SELECT encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{submission}','hex')"));
+    sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode(repeat('00',32),'hex') WHERE submission_id=decode('{submission}','hex')"));
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value),
+        Err(attempts::Error::Missing)
+    );
+    sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode('{destination}','hex') WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at+86400000 WHERE submission_id=decode('{submission}','hex')"));
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value),
+        Err(attempts::Error::NotDue)
+    );
+    sql(fixture, &format!("UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at-86400000,uncertain=1 WHERE submission_id=decode('{submission}','hex')"));
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value),
+        Err(attempts::Error::Integrity)
+    );
+    sql(fixture, &format!("UPDATE td_mta.recipients SET uncertain=0 WHERE submission_id=decode('{submission}','hex')"));
+    // Expand one fresh submission to exercise the bounded ordinal batch.
+    sql(fixture, &format!("INSERT INTO td_mta.recipients(account,submission_id,ordinal,address,state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed) SELECT account,submission_id,n,'recipient'||n||'@example.test',state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed FROM td_mta.recipients CROSS JOIN generate_series(2,999) n WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET recipient_count=1000 WHERE id=decode('{submission}','hex')"));
+    sql(fixture, "CREATE FUNCTION public.reject_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_attempt BEFORE INSERT ON td_mta.submission_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_attempt()");
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value),
+        Err(attempts::Error::Database)
+    );
+    assert_eq!(
+        sql(fixture, "SELECT count(*) FROM td_mta.submission_attempts"),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        before
+    );
+    assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=1")),"1000");
+    sql(fixture,"DROP TRIGGER reject_attempt ON td_mta.submission_attempts; CREATE FUNCTION public.delay_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_attempt AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_attempt()");
+    assert_eq!(
+        attempts::publish(
+            request,
+            trust,
+            Instant::now() + Duration::from_millis(1500),
+            &value
+        ),
+        Err(attempts::Error::Indeterminate)
+    );
+    thread::sleep(Duration::from_secs(4));
+    let outcome = attempts::inspect(request, trust, deadline(), &value)
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.ordinals, (0..100).collect::<Vec<_>>());
+    assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
+    assert_eq!(outcome.attempt, value.attempt());
+    assert_eq!(outcome.submission, submission);
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=2 AND phase=1 AND attempt_count=1 AND next_attempt_at IS NULL AND attempt_id=decode('{}','hex')",value.attempt())),"100");
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=1")),"900");
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.changes WHERE kind=5 AND action=2 AND object=decode('{submission}','hex') AND sequence=decode('{:016x}','hex')",outcome.new_sequence)),"1");
+    let other = attempts::prepare(&claim, owner.generation, submission).unwrap();
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &other),
+        Err(attempts::Error::Busy)
+    );
+    owners::release(request, trust, deadline(), &claim, owner.generation).unwrap();
+    let replacement = owners::prepare(binding, BootId::from_bytes([10; 16])).unwrap();
+    let replacement_owner = owners::acquire(request, trust, deadline(), &replacement).unwrap();
+    let replacement_attempt =
+        attempts::prepare(&replacement, replacement_owner.generation, submission).unwrap();
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &replacement_attempt),
+        Err(attempts::Error::Busy)
+    );
+    owners::release(
+        request,
+        trust,
+        deadline(),
+        &replacement,
+        replacement_owner.generation,
+    )
+    .unwrap();
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(
+        attempts::publish(request, trust, deadline(), &value).unwrap(),
+        outcome
+    );
+    sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex'); DROP TRIGGER delay_attempt ON td_mta.submission_attempts",binding.selection().generation));
 }

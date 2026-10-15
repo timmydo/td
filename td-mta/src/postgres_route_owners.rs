@@ -42,6 +42,9 @@ pub struct Claim {
     digest: [u8; 32],
 }
 impl Claim {
+    pub(crate) fn binding(&self) -> &Binding {
+        &self.binding
+    }
     pub fn operation(&self) -> RouteClaimId {
         self.operation
     }
@@ -95,7 +98,12 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn begin(client: &Client, claim: &Claim, policy: bool, write: bool) -> Result<bool, Error> {
+pub(crate) async fn begin(
+    client: &Client,
+    claim: &Claim,
+    policy: bool,
+    write: bool,
+) -> Result<bool, Error> {
     if postgres_schema::lock_and_inspect(client)
         .await
         .map_err(Error::Schema)?
@@ -242,6 +250,18 @@ fn current(
     }
     Ok(())
 }
+/// The caller holds the configuration/account locks established by begin.
+pub(crate) async fn check_locked(
+    client: &Client,
+    claim: &Claim,
+    generation: u64,
+) -> Result<i64, Error> {
+    let owner = owner(client, claim).await?.ok_or(Error::Stale)?;
+    let timestamp = now(client).await?;
+    current(&owner, claim, generation, timestamp, true)?;
+    Ok(timestamp)
+}
+
 async fn commit(client: &Client, marker: &AtomicBool) -> Result<(), Error> {
     marker.store(true, Ordering::Relaxed);
     client

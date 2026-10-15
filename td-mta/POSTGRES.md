@@ -576,8 +576,8 @@ Version 10 adds src/postgres_uploads.sql; version 11 adds
 src/postgres_drafts.sql; version 12 adds src/postgres_mailbox_create.sql, and version 13 adds
 src/postgres_receiving.sql; version 14 adds src/postgres_submissions.sql;
 version 15 adds src/postgres_submission_routes.sql; version 16 adds
-src/postgres_route_owners.sql.
-New initialization applies all sixteen in
+src/postgres_route_owners.sql; version 17 adds src/postgres_attempts.sql.
+New initialization applies all seventeen in
 one transaction. PUBLIC grants are revoked; inherited
 schema/relation grants to other roles refuse initialization and roll back.
 Explicit runtime grants and configuration-driven service admission remain
@@ -1287,6 +1287,10 @@ unchanged.
 
 The original ten-second operation ceiling covers every connection, validation
 and transaction; none renews it. A lost COMMIT response is indeterminate.
+The publication transaction uses the bounded mutation transport profile
+(1024 input frames, 1 MiB input, 128 KiB output), including schema ledger
+qualification and COMMIT. Receipt inspection and passive observation retain
+the smaller probe profile.
 Keep the exact retained change and resolve/retry it, never generate another
 ID from an absence observation. Lock/connection failures while resolving
 leave any previous uncertainty outstanding; they are not proof of rollback.
@@ -1918,3 +1922,28 @@ validation remain activation work. No lease enables SMTP by itself; atomic
 recipient Prepared publication and every subsequent phase still need the
 same route-owner fence. Takeover recovery must preserve AcceptancePossible
 uncertainty before any replacement attempt. These workers remain inert.
+
+
+## 53. Inert first-attempt publication
+
+Schema 17 retains `submission_attempts`: one historical receipt per random
+attempt, with a unique active attempt per account and route name. The inert
+`postgres_attempts` worker rechecks selected policy, route destination and
+current unexpired owner fence under configuration/account/route locks. It
+selects at most 100 due, never-attempted Queued recipients from one supplied
+submission in ascending ordinal order. Expired, completed, mismatched and
+already attempted responsibility cannot enter this first-attempt path.
+
+Recipient InFlight/Prepared state, attempt identity, timestamp and count,
+submission/account sequence, change history and the retained attempt commit
+atomically. Receipt resolution precedes fresh policy checks; lost COMMIT
+responses resolve with the same retained Dispatch. Historical outcomes do
+not authorize transport. At most 1024 attempt receipts are retained per
+account; reclamation remains later maintenance work.
+
+An active attempt blocks another batch even after owner replacement. This
+increment never clears that block, resumes retries or opens SMTP. Fenced
+phase/result publication and conservative takeover recovery must resolve it
+before another attempt. Clock validation and monotonic retry guards remain
+runtime activation requirements. The supplied submission is selected by a
+future bounded scheduler; no unbounded due-queue scan is introduced here.
