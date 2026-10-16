@@ -43,7 +43,90 @@ pub(super) fn exercise(
             })
             .collect();
         let borrowed: Vec<_> = replies.iter().map(|(n, s)| (*n, s.as_str())).collect();
-        let refusal = phases::refused_rcpt(claim, generation, attempt.attempt, &borrowed).unwrap();
+        let mut collector =
+            phases::reserve_rcpt_replies(claim, generation, attempt.attempt, &attempt.ordinals)
+                .unwrap();
+        let first = batch * 100;
+        for invalid in [
+            String::new(),
+            "354 not RCPT".to_owned(),
+            "550 bad\ntext".to_owned(),
+            format!("550 {}", "x".repeat(4093)),
+        ] {
+            assert_eq!(
+                collector.record(first, &invalid),
+                Err(phases::Error::Integrity)
+            );
+            assert_eq!(collector.next_ordinal(), Some(first));
+        }
+        assert_eq!(
+            collector.record(first + 1, "550 wrong ordinal"),
+            Err(phases::Error::Integrity)
+        );
+        for ordinal in &attempt.ordinals {
+            if let Some((_, reply)) = borrowed.iter().find(|(n, _)| n == ordinal) {
+                collector.record(*ordinal, reply).unwrap();
+            } else {
+                collector
+                    .record(*ordinal, &format!("250 {ordinal:03}{}", "p".repeat(4089)))
+                    .unwrap();
+            }
+        }
+        assert_eq!(collector.next_ordinal(), None);
+        assert_eq!(
+            collector.record(first, "550 duplicate"),
+            Err(phases::Error::Integrity)
+        );
+        let evidence = collector.finish().unwrap();
+        assert!(evidence.is_complete());
+        assert_eq!(evidence.accepted().len(), if batch == 0 { 50 } else { 0 });
+        let refusal = evidence.refusal().unwrap();
+        let legacy = phases::refused_rcpt(claim, generation, attempt.attempt, &borrowed).unwrap();
+        if batch == 0 {
+            assert!(phases::reserve_rcpt_replies(claim, generation, attempt.attempt, &[]).is_err());
+            assert!(phases::reserve_rcpt_replies(claim, 0, attempt.attempt, &[0]).is_err());
+            assert!(
+                phases::reserve_rcpt_replies(claim, generation, attempt.attempt, &[0, 0]).is_err()
+            );
+            for positive in [true, false] {
+                let mut partial =
+                    phases::reserve_rcpt_replies(claim, generation, attempt.attempt, &[0, 1])
+                        .unwrap();
+                partial
+                    .record(
+                        0,
+                        if positive {
+                            "250 retained"
+                        } else {
+                            "550 retained"
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    partial.record(1, "354 invalid"),
+                    Err(phases::Error::Integrity)
+                );
+                assert_eq!(partial.next_ordinal(), Some(1));
+                let partial = partial.finish().unwrap();
+                assert!(!partial.is_complete());
+                assert_eq!(partial.accepted().len(), usize::from(positive));
+                assert_eq!(partial.refusal().is_some(), !positive);
+                if positive {
+                    assert_eq!(partial.accepted(), &[(0, "250 retained".to_owned())]);
+                }
+            }
+            let mut all_positive =
+                phases::reserve_rcpt_replies(claim, generation, attempt.attempt, &[0, 1]).unwrap();
+            all_positive.record(0, "250 first").unwrap();
+            all_positive.record(1, "251 second").unwrap();
+            let all_positive = all_positive.finish().unwrap();
+            assert!(all_positive.is_complete());
+            assert!(all_positive.refusal().is_none());
+            assert_eq!(
+                all_positive.accepted(),
+                &[(0, "250 first".to_owned()), (1, "251 second".to_owned())]
+            );
+        }
         assert!(
             phases::refused_rcpt(claim, generation, attempt.attempt, &[(0, "250 accepted")])
                 .is_err()
@@ -71,7 +154,7 @@ pub(super) fn exercise(
             );
             sql(fixture,"CREATE FUNCTION public.reject_rcpt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_rcpt BEFORE INSERT ON td_mta.attempt_rcpt_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_rcpt()");
             assert_eq!(
-                phases::publish(request, trust, deadline(), &refusal),
+                phases::publish(request, trust, deadline(), refusal),
                 Err(phases::Error::Database)
             );
             assert_eq!(
@@ -94,7 +177,7 @@ pub(super) fn exercise(
                     request,
                     trust,
                     Instant::now() + Duration::from_millis(1500),
-                    &refusal
+                    refusal
                 ),
                 Err(phases::Error::Indeterminate)
             );
@@ -103,14 +186,18 @@ pub(super) fn exercise(
         if batch == 2 {
             sql(fixture,&format!("UPDATE td_mta.recipients SET state=CASE WHEN uncertain=1 THEN 7 ELSE 5 END,reason=2,next_attempt_at=NULL,rcpt_reply='550 prior refused' WHERE submission_id=decode('{submission}','hex') AND ordinal<50; UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint-1 WHERE id=decode('{submission}','hex')"));
         }
-        let result = phases::publish(request, trust, deadline(), &refusal).unwrap();
+        let result = phases::publish(request, trust, deadline(), refusal).unwrap();
         assert_eq!(result.recipients, if batch == 0 { 50 } else { 100 });
         assert_eq!(
-            phases::inspect(request, trust, deadline(), &refusal).unwrap(),
+            phases::inspect(request, trust, deadline(), &legacy).unwrap(),
             Some(result)
         );
         assert_eq!(
-            phases::publish(request, trust, deadline(), &refusal).unwrap(),
+            phases::inspect(request, trust, deadline(), refusal).unwrap(),
+            Some(result)
+        );
+        assert_eq!(
+            phases::publish(request, trust, deadline(), refusal).unwrap(),
             result
         );
         let different = phases::refused_rcpt(
@@ -134,7 +221,11 @@ pub(super) fn exercise(
                 ),
                 "1"
             );
-            let positives: Vec<_> = (50..100).map(|n| (n, "250 recipient accepted")).collect();
+            let positives: Vec<_> = evidence
+                .accepted()
+                .iter()
+                .map(|(n, s)| (*n, s.as_str()))
+                .collect();
             phases::publish(
                 request,
                 trust,

@@ -4531,3 +4531,28 @@ The native SMTP/TLS fixture publishes Body from actual 354 through DataPlan,
 retains an actual negative DATA reply across database refusal and retry,
 refuses a recipient outside the retained envelope before DATA, and rejects
 an actual non-354 reply without publishing Body.
+
+## 163. Reserved per-recipient SMTP evidence
+
+RcptReplies reserves one maximum normalized reply cell for each ordered
+recipient in an initial attempt batch, at most 100. It retains the exact
+claim, generation, attempt and ordinal sequence. Recording accepts only the
+next ordinal and an actual normalized 2xx/4xx/5xx reply, moving a reserved cell
+into positive or negative storage without a new reply allocation. Invalid
+input leaves the next ordinal and all earlier evidence unchanged.
+
+Consuming finish closes collection and reports whether every planned RCPT
+received a reply. It exposes retained positive evidence and, when any negative
+replies were collected, one immutable ordinary RCPT-refusal Change with the
+existing digest encoding. A partial collection is usable only after the
+caller has fenced its interrupted session; publication cannot be followed by
+more RCPT commands for that attempt because there is only one refusal receipt.
+No positive-RCPT persistence, transport permission, database admission, or
+phase owner is created by this passive collector. The orchestration of
+interruption and positive-reply persistence remains separate work.
+
+The native PostgreSQL fixture uses the collector for mixed and all-negative
+batches, including 100 maximum-size distinct replies, and compares publication
+receipts against the existing constructor. It exercises invalid input without
+losing earlier evidence, partial collections, all-positive collections, and
+continues the positive subset through Body using its retained actual text.

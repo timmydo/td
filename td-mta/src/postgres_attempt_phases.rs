@@ -315,6 +315,141 @@ impl CommandReply {
     }
 }
 
+/// Preallocated actual RCPT evidence for an ordered initial attempt batch.
+/// This is passive storage, not permission to send or publish a phase.
+pub struct RcptReplies {
+    value: Change,
+    ordinals: Vec<i64>,
+    unused: Vec<String>,
+    accepted: Vec<(u32, String)>,
+    processed: usize,
+    negative: td_crypto::Sha256,
+}
+/// Completed or interrupted collection. Finishing closes collection: never
+/// publish this refusal and then continue RCPT commands for the same attempt.
+pub struct RcptEvidence {
+    accepted: Vec<(u32, String)>,
+    refusal: Option<Change>,
+    complete: bool,
+}
+impl RcptEvidence {
+    pub fn accepted(&self) -> &[(u32, String)] {
+        &self.accepted
+    }
+    pub fn refusal(&self) -> Option<&Change> {
+        self.refusal.as_ref()
+    }
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+/// Reserve one maximum normalized reply per planned RCPT before transmission.
+/// Identity and the ordered ordinal list cannot be replaced during collection.
+pub fn reserve_rcpt_replies(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    ordinals: &[u32],
+) -> Result<RcptReplies, Error> {
+    let mut value = acceptance_possible(claim, generation, attempt, ordinals)?;
+    let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+    inner.phase = 6;
+    let ordinals = std::mem::take(&mut inner.ordinals);
+    let mut unused = std::mem::take(&mut inner.replies);
+    for cell in &mut unused {
+        cell.try_reserve_exact(crate::format::row::MAX_SMTP_REPLY)
+            .map_err(|_| Error::Capacity)?;
+    }
+    inner
+        .ordinals
+        .try_reserve_exact(ordinals.len())
+        .map_err(|_| Error::Capacity)?;
+    inner
+        .replies
+        .try_reserve_exact(ordinals.len())
+        .map_err(|_| Error::Capacity)?;
+    let mut accepted = Vec::new();
+    accepted
+        .try_reserve_exact(ordinals.len())
+        .map_err(|_| Error::Capacity)?;
+    Ok(RcptReplies {
+        value,
+        ordinals,
+        unused,
+        accepted,
+        processed: 0,
+        negative: hash_prefix(claim, generation, attempt, 6)?,
+    })
+}
+impl RcptReplies {
+    pub fn next_ordinal(&self) -> Option<u32> {
+        self.ordinals
+            .get(self.processed)
+            .and_then(|n| u32::try_from(*n).ok())
+    }
+    /// Copy actual normalized 2xx/4xx/5xx into a reserved cell. Invalid input
+    /// leaves all earlier evidence and the expected next ordinal unchanged.
+    pub fn record(&mut self, ordinal: u32, reply: &str) -> Result<(), Error> {
+        let positive = valid_reply(reply, false);
+        if self.next_ordinal() != Some(ordinal) || (!positive && !valid_reply(reply, true)) {
+            return Err(Error::Integrity);
+        }
+        let inner = Arc::get_mut(&mut self.value.inner).ok_or(Error::Integrity)?;
+        if self
+            .unused
+            .last()
+            .is_none_or(|cell| cell.capacity() < reply.len())
+        {
+            return Err(Error::Capacity);
+        }
+        let mut cell = self.unused.pop().ok_or(Error::Integrity)?;
+        cell.push_str(reply);
+        if positive {
+            self.accepted.push((ordinal, cell));
+        } else {
+            inner.ordinals.push(i64::from(ordinal));
+            inner.replies.push(cell);
+        }
+        self.processed += 1;
+        Ok(())
+    }
+    /// Finish once after all replies or after fencing an interrupted session.
+    /// No positive-RCPT persistence or transport authority is implied.
+    pub fn finish(self) -> Result<RcptEvidence, Error> {
+        let Self {
+            mut value,
+            ordinals,
+            unused: _,
+            accepted,
+            processed,
+            mut negative,
+        } = self;
+        let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+        let refusal = if inner.ordinals.is_empty() {
+            None
+        } else {
+            for (ordinal, reply) in inner.ordinals.iter().zip(&inner.replies) {
+                negative
+                    .update(&ordinal.to_be_bytes())
+                    .map_err(|_| Error::Crypto)?;
+                negative
+                    .update(&(reply.len() as u64).to_be_bytes())
+                    .map_err(|_| Error::Crypto)?;
+                negative
+                    .update(reply.as_bytes())
+                    .map_err(|_| Error::Crypto)?;
+            }
+            inner.digest = negative.finish().map_err(|_| Error::Crypto)?;
+            Some(value)
+        };
+        Ok(RcptEvidence {
+            accepted,
+            refusal,
+            complete: processed == ordinals.len(),
+        })
+    }
+}
+
 /// Retain all negative RCPT replies collected for one attempt, as one ordered
 /// subset. Other Prepared recipients may subsequently enter Body.
 pub fn refused_rcpt(

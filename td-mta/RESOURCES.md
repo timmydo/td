@@ -5074,3 +5074,11 @@ is at most 1228800 reply bytes, plus bounded vectors, claim/envelope metadata
 and inline hash states. Consuming either result drops the unused alternative;
 no new reply-vector allocation is needed after actual 354 or refusal. Native
 database allocations and work admission remain separate.
+
+RcptReplies allocates at most 100 reply cells of 4096 bytes before any RCPT
+command, or 409600 reply bytes total. Recording moves cells from unused to
+positive or negative vectors; these three sets partition the original cells.
+Bounded ordinal and result vectors, claim metadata and one retained hash
+context are additional. Finish drops unused cells and creates no reply copies.
+The resulting refusal uses the existing phase publisher's separate database
+memory and admission bounds; positive evidence is passive retained text.
