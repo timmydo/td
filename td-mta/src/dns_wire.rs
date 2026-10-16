@@ -137,6 +137,11 @@ impl Question {
         })
     }
 
+    /// Continue an already decoded bounded name without presentation conversion.
+    pub fn from_name(name: Name, kind: AddressType, id: u16) -> Self {
+        Self { name, kind, id }
+    }
+
     pub fn name(&self) -> &Name {
         &self.name
     }

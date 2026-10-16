@@ -1437,7 +1437,9 @@ duplicates still lower the minimum chain/address TTL. A TTL with its high bit
 set becomes zero. Conflicting CNAME targets, CNAME/address coexistence and
 alias cycles refuse. An incomplete chain returns its last name, consumed hops
 and minimum TTL for the resolver owner to continue under the original global
-hop/deadline budget. Truncation, header error codes and no-data remain passive
+hop/deadline budget. Alias and terminal address results also retain the
+complete bounded local path, including the initial question name, so the
+owner can reject cross-response cycles through any intermediate name. Truncation, header error codes and no-data remain passive
 lookup results, never permanent recipient failures. The owner must match the
 network peer, retain the original configured TLS identity and treat TTL zero
 as usable only for the current lookup, without caching it.
@@ -1460,6 +1462,36 @@ an arbitrarily stalled kernel. The caller supplies an unpredictable query ID.
 This exchange does not yet activate the Resolver port, cache, configured-name
 selection or worker admission; those owners must preserve the original TLS
 identity, chain TTL and alias allowance across queries.
+
+The prepared `dns_lookup` owner combines A and AAAA for one caller-admitted
+configured host using one to four caller-admitted numeric resolvers. Each
+question tries servers in configuration order with a fresh entropy-sourced
+transaction ID. Transport or server errors may try the next server under the
+same total deadline and meter; an expired total, exhausted capacity or entropy
+failure stops. NXDOMAIN and no-data terminate that family's search, without
+inventing a negative-cache TTL. An all-empty result refuses as DNS failure,
+not a permanent recipient outcome.
+
+Each family starts at the original configured name with its own supplied
+allowance of at most eight CNAME hops. Incomplete chains consume that
+allowance across responses and retain every traversed name, including
+intermediate names hidden within a response. Join each decoded path at the
+previous response's final name and reject any other repeated name, including
+inside terminal address responses. Terminal decoding uses only the remainder. The two families share the original job/meter and
+at most 16 combined addresses. No presentation conversion or configured-host
+revalidation changes decoded alias octets: a bounded Name can directly form
+the next Question. The original configured host remains the TLS identity.
+
+Convert each accepted response TTL to an absolute monotonic expiry before
+issuing another query, and retain the earliest alias/address expiry. Never
+restart an earlier TTL at final completion. TTL zero and an empty family make
+the combined result current-lookup-only: its valid_until may already be at or
+before completion, and cannot authorize a later cache hit. An empty family
+has no decoded negative TTL, so caching that absence alongside positive data
+would be unjustified. Stage addresses privately and publish the caller prefix
+only after both families complete and the original budget still permits it;
+errors leave caller addresses unchanged. Configured-name admission, worker
+scheduling and cache integration remain separate owners.
 
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected

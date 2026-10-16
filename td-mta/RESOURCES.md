@@ -4941,7 +4941,10 @@ outside this pure wire helper.
 
 The prepared DNS answer decoder uses at most 256 16-byte record descriptors
 (4 KiB), nine fixed canonical-name slots for cycle detection, and a fixed
-16-address result. Its returned value is compile-time capped at 384 bytes.
+16-address result. The result retains those name slots as its complete local
+path and is compile-time capped at 3 KiB; the decoder moves that same path
+out rather than allocating another history. Cache entries retain only final
+addresses and expiry, not this transient path.
 These arrays belong to the existing resolver question/name/alias/result
 partition; packet bytes remain borrowed from the 64 KiB packet reservation.
 There is no heap allocation or recursion. One call frames at most 256 records
@@ -4964,3 +4967,13 @@ operations; each query send also charges output bytes. Each parse reserves
 individual names retain their fixed byte/hop bounds. Capacity refusal and
 clock expiry stop the exchange without another network attempt. These cells
 belong to the existing fixed resolver reservation, not each waiting job.
+
+The prepared DNS lookup owner keeps one fixed 16-address staging array and,
+for each serial address family, at most nine traversed-name slots and bounded
+name/question/result values. It reuses the transport's single packet cell.
+Each family admits at most eight consumed aliases plus its terminal query;
+each question tries at most four configured servers. Both families share the
+original total deadline and sticky work meter. Boundary/entropy checks charge
+record units in addition to the transport's I/O and decoder charges. No
+per-query collection grows; successful output changes only its returned
+prefix. Cache state is not allocated by this owner.

@@ -27,6 +27,7 @@ pub mod bounded;
 pub mod clock;
 pub mod compose_text;
 pub mod config;
+pub mod dns_lookup;
 pub mod dns_reply;
 pub mod dns_transport;
 pub mod dns_wire;

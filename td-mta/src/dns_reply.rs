@@ -11,14 +11,44 @@ pub enum Reply {
     Truncated,
     ResponseCode(u8),
     NoData,
-    Alias { name: Name, hops: usize, ttl: u32 },
+    Alias {
+        name: Name,
+        hops: usize,
+        ttl: u32,
+        path: Path,
+    },
     Addresses(Addresses),
+}
+/// Complete local chain, including the queried name and final target.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Path {
+    names: [Option<Name>; MAX_ALIASES + 1],
+}
+impl Path {
+    pub fn names(&self) -> impl Iterator<Item = &Name> {
+        self.names.iter().flatten()
+    }
+    fn empty() -> Self {
+        Self {
+            names: [const { None }; MAX_ALIASES + 1],
+        }
+    }
+}
+impl Reply {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Alias { path, .. } => Some(path),
+            Self::Addresses(addresses) => Some(&addresses.path),
+            _ => None,
+        }
+    }
 }
 #[derive(Debug, Eq, PartialEq)]
 pub struct Addresses {
     values: [IpAddr; MAX_ADDRESSES],
     count: usize,
     ttl: u32,
+    path: Path,
 }
 impl Addresses {
     pub fn values(&self) -> &[IpAddr] {
@@ -174,21 +204,22 @@ fn extract(
     remaining_aliases: usize,
 ) -> Result<Reply, Error> {
     let mut current = question.name().clone();
-    let mut seen: [Option<Name>; MAX_ALIASES + 1] = [const { None }; MAX_ALIASES + 1];
     let mut hops = 0usize;
     let mut ttl = u32::MAX;
+    let mut result = Addresses {
+        values: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MAX_ADDRESSES],
+        count: 0,
+        ttl,
+        path: Path::empty(),
+    };
     loop {
-        if seen.iter().flatten().any(|name| name == &current) {
+        if result.path.names().any(|name| name == &current) {
             return Err(Error::Invalid);
         }
-        *seen.get_mut(hops).ok_or(Error::Capacity)? = Some(current.clone());
+        *result.path.names.get_mut(hops).ok_or(Error::Capacity)? = Some(current.clone());
         let mut next: Option<Name> = None;
         let mut any_address = false;
-        let mut result = Addresses {
-            values: [IpAddr::V4(Ipv4Addr::UNSPECIFIED); MAX_ADDRESSES],
-            count: 0,
-            ttl,
-        };
+        result.ttl = ttl;
         for rr in records.iter().copied().filter(|rr| rr.class == 1) {
             if Name::read(packet, usize::from(rr.owner))?.0 != current {
                 continue;
@@ -236,6 +267,7 @@ fn extract(
                 name: current,
                 hops,
                 ttl,
+                path: result.path,
             });
         } else {
             return Ok(Reply::NoData);
@@ -244,7 +276,7 @@ fn extract(
 }
 
 const _: () = assert!(std::mem::size_of::<Record>() <= 16);
-const _: () = assert!(std::mem::size_of::<Reply>() <= 384);
+const _: () = assert!(std::mem::size_of::<Reply>() <= 3 * 1024);
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
@@ -367,7 +399,14 @@ mod tests {
             Ok(Reply::Alias {
                 name: Name::from_host("next.test").unwrap(),
                 hops: 1,
-                ttl: 5
+                ttl: 5,
+                path: Path {
+                    names: std::array::from_fn(|i| match i {
+                        0 => Some(Name::from_host("relay.test").unwrap()),
+                        1 => Some(Name::from_host("next.test").unwrap()),
+                        _ => None,
+                    })
+                }
             })
         );
         for rows in [
