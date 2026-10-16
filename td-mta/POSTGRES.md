@@ -3895,3 +3895,28 @@ The real PostgreSQL fixture checks preparation-mode refusal, exhausted work,
 original deadlines, startup retry hold, fresh publication and envelope access,
 unknown-COMMIT blocking, retained absence/deadline/capacity failures, and
 historical settlement without a second account-sequence increment.
+
+## 140. Bounded relay phase publication custody
+
+The prepared dispatch worker uses one shared pending-operation slot for
+attempt preparation and durable Body, AcceptancePossible or result changes.
+An uncertain commit of either kind blocks both kinds of publication. The
+retained operation includes its exact attempt, phase, subset, replies and
+digest; settlement only inspects that operation's receipt. Absence, admission
+refusal and database errors retain it. A matching receipt releases custody
+and returns a tagged historical result without a second state mutation.
+
+Phase publication and settlement prepay three MiB plus 128 KiB of I/O and
+4096 records, covering the two bounded connections, their protocol input,
+the batch writer's one-MiB output ceiling, receipt output and staging.
+Attempt preparation retains its two-MiB-plus-192-KiB allowance. Both use the
+same Runtime-only connection admission, independently reserved settlement
+slots and earliest original job/meter/ten-second deadline. No credential or
+new worker is retained in pending state.
+
+The caller supplies actual SMTP evidence from its current attempt and closes
+transport when a phase COMMIT is unknown. Known publication and recovered
+receipts remain passive: neither authorizes more SMTP output, renews a lease
+or acquires the separate final-outcome capacity required before terminator
+handoff. Current transport/ownership fencing and runtime activation remain
+separate work. No SQL, schema or persisted phase semantics change here.

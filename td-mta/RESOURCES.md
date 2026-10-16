@@ -5011,3 +5011,15 @@ is further shortened by the original job and meter deadlines. It allocates no
 per-address collection and hands success to the existing TcpTransport owner;
 refusal drops any opened socket. Only the admitted sole outbound slot may
 occupy a handshake worker for this blocking operation.
+
+The prepared relay publication worker retains at most one uncertain operation
+across attempt preparation and phase/result writes. A phase request retains
+at most 100 ordinals and its existing bounded reply vectors; DATA-command
+refusal may retain both RCPT and DATA replies, each capped at 4096 bytes per
+recipient. It adds no second pending queue or connection pool. Phase work
+conservatively prepays three MiB plus 128 KiB of protocol I/O and 4096 records
+for receipt inspection plus batch publication; settlement uses the same
+allowance without renewing the original job/meter deadline. The existing
+native phase routine's temporary clone and bounded SQL rows remain charged
+separately from the retained request. This is process work admission, not a
+database disk/WAL reservation or the final-outcome capacity for SMTP handoff.

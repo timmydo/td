@@ -39,6 +39,11 @@ pub struct Change {
     rcpt_replies: Vec<String>,
     digest: [u8; 32],
 }
+impl Change {
+    pub(crate) const fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Outcome {
     pub attempt: AttemptId,

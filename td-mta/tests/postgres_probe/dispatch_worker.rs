@@ -10,7 +10,7 @@ use td_mta::{
     clock::RuntimeClock,
     ids::SubmissionId,
     ports::{self, Clock, Deadline, Time},
-    postgres_attempts as attempts,
+    postgres_attempt_phases as phases, postgres_attempts as attempts,
     postgres_dispatch::{self as dispatch, Error},
     postgres_probe::{Mode, Request},
     postgres_read::ReadSlots,
@@ -161,6 +161,51 @@ pub(super) fn exercise(
         2
     );
     assert_eq!(pending.attempt().unwrap(), None);
+    let body = phases::body(
+        claim,
+        generation,
+        success.outcome.attempt,
+        &[(0, "250 first"), (1, "250 second")],
+    )
+    .unwrap();
+    assert_eq!(
+        forbidden.publish_phase(body.clone(), until(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Forbidden))
+    );
+    assert_eq!(
+        worker.publish_phase(body.clone(), until(0), &mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        worker.publish_phase(body.clone(), until(10_000), &mut empty),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
+    let stale = phases::body(
+        claim,
+        generation + 1,
+        success.outcome.attempt,
+        &[(0, "250 first"), (1, "250 second")],
+    )
+    .unwrap();
+    assert_eq!(
+        worker.publish_phase(stale, until(10_000), &mut meter()),
+        Err(Error::Phase(phases::Error::Owner(owners::Error::Stale)))
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
+    let published = worker
+        .publish_phase(body.clone(), until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(published.attempt, success.outcome.attempt);
+    assert_eq!(published.recipients, 2);
+    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(
+        worker
+            .publish_phase(body, until(10_000), &mut meter())
+            .unwrap(),
+        published
+    );
     cancel::publish(
         request,
         trust,
@@ -179,6 +224,20 @@ pub(super) fn exercise(
         Err(Error::Publication(attempts::Error::Indeterminate))
     );
     let attempt = pending.attempt().unwrap().unwrap();
+    assert_eq!(
+        worker.publish_phase(
+            phases::body(
+                claim,
+                generation,
+                attempt,
+                &[(0, "250 first"), (1, "250 second")]
+            )
+            .unwrap(),
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Admission(ports::Error::Busy))
+    );
     assert_eq!(
         worker
             .publish(claim, generation, input(10_000, false), &mut meter())
@@ -215,10 +274,13 @@ pub(super) fn exercise(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
-    let outcome = pending
+    let dispatch::Settlement::Dispatch(outcome) = pending
         .settle(&settle, until(10_000), &mut meter())
         .unwrap()
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("wrong retained operation");
+    };
     assert_eq!(outcome.attempt, attempt);
     assert_eq!(outcome.ordinals, vec![0, 1]);
     assert_eq!(
@@ -235,6 +297,75 @@ pub(super) fn exercise(
             .unwrap(),
         None
     );
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    let body = phases::body(
+        claim,
+        generation,
+        attempt,
+        &[(0, "250 first"), (1, "250 second")],
+    )
+    .unwrap();
+    sql(fixture,"CREATE FUNCTION public.delay_phase_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase_worker AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase_worker()");
+    assert_eq!(
+        worker.publish_phase(body.clone(), until(1500), &mut meter()),
+        Err(Error::Phase(phases::Error::Indeterminate))
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        worker.publish_phase(body, until(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(10_000, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_phase_worker ON td_mta.attempt_phase_receipts",
+    );
+    assert_eq!(
+        pending.settle(&settle, until(0), &mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        pending.settle(&settle, until(10_000), &mut empty),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    sql(fixture,&format!("CREATE TABLE public.phase_worker_receipt AS SELECT * FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex')"));
+    assert_eq!(
+        pending
+            .settle(&settle, until(10_000), &mut meter())
+            .unwrap(),
+        None
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    sql(fixture,"INSERT INTO td_mta.attempt_phase_receipts SELECT * FROM public.phase_worker_receipt; DROP TABLE public.phase_worker_receipt");
+    let sequence = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    let dispatch::Settlement::Phase(outcome) = pending
+        .settle(&settle, until(10_000), &mut meter())
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("wrong phase settlement");
+    };
+    assert_eq!(outcome.attempt, attempt);
+    assert_eq!(outcome.recipients, 2);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        sequence
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
     cancel::publish(
         request,
         trust,

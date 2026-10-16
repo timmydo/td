@@ -1,9 +1,10 @@
-//! Bounded attempt publication custody for a trusted relay worker.
+//! Bounded attempt and phase publication custody for a trusted relay worker.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     clock::RuntimeClock,
     ids::{AttemptId, SubmissionId},
     ports::{self, Clock, Deadline},
+    postgres_attempt_phases::{self as phases, Change},
     postgres_attempts::{self as attempts, Dispatch},
     postgres_probe::{Mode, Request},
     postgres_read::ReadSlots,
@@ -16,10 +17,14 @@ use std::{
 };
 use td_crypto::TrustStore;
 
+const ATTEMPT_IO: u64 = 2 * 1024 * 1024 + 192 * 1024;
+const PHASE_IO: u64 = 3 * 1024 * 1024 + 128 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Admission(ports::Error),
     Publication(attempts::Error),
+    Phase(phases::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -36,7 +41,7 @@ pub struct Connection<'a, 'r> {
     pub clock: Arc<RuntimeClock>,
 }
 impl Connection<'_, '_> {
-    fn admit(&self, until: Deadline, meter: &mut Meter) -> Result<Instant, Error> {
+    fn admit(&self, until: Deadline, meter: &mut Meter, io_bytes: u64) -> Result<Instant, Error> {
         if self.request.mode != Mode::Runtime {
             return Err(ports::Error::Forbidden.into());
         }
@@ -59,7 +64,7 @@ impl Connection<'_, '_> {
             .charge(
                 self.clock.sample()?.monotonic,
                 Charge {
-                    io_bytes: 2 * 1024 * 1024 + 192 * 1024,
+                    io_bytes,
                     records: 4096,
                     ..Default::default()
                 },
@@ -75,19 +80,37 @@ impl Connection<'_, '_> {
     }
 }
 /// Retain for the relay worker's lifetime. An unresolved COMMIT blocks another
-/// attempt; settlement only inspects its exact receipt, never republishes it.
+/// attempt or phase; settlement only inspects the exact receipt, never republishes it.
 #[derive(Default)]
 pub struct Pending {
-    dispatch: Mutex<Option<Dispatch>>,
+    operation: Mutex<Option<Operation>>,
+}
+enum Operation {
+    Dispatch(Dispatch),
+    Phase(Change),
+}
+impl Operation {
+    fn attempt(&self) -> AttemptId {
+        match self {
+            Self::Dispatch(value) => value.attempt(),
+            Self::Phase(value) => value.attempt(),
+        }
+    }
+}
+/// Historical evidence only: neither variant permits further SMTP output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Settlement {
+    Dispatch(attempts::Outcome),
+    Phase(phases::Outcome),
 }
 impl Pending {
     pub fn attempt(&self) -> Result<Option<AttemptId>, Error> {
         Ok(self
-            .dispatch
+            .operation
             .try_lock()
             .map_err(|_| ports::Error::Busy)?
             .as_ref()
-            .map(Dispatch::attempt))
+            .map(Operation::attempt))
     }
     /// Use independently reserved settlement slots. Absence and every error
     /// retain custody. A receipt is historical and cannot authorize SMTP.
@@ -96,15 +119,29 @@ impl Pending {
         connection: &Connection<'_, '_>,
         until: Deadline,
         meter: &mut Meter,
-    ) -> Result<Option<attempts::Outcome>, Error> {
-        let mut pending = self.dispatch.try_lock().map_err(|_| ports::Error::Busy)?;
-        let Some(dispatch) = pending.as_ref() else {
+    ) -> Result<Option<Settlement>, Error> {
+        let mut pending = self.operation.try_lock().map_err(|_| ports::Error::Busy)?;
+        let Some(operation) = pending.as_ref() else {
             return Ok(None);
         };
-        let limit = connection.admit(until, meter)?;
+        let io = match operation {
+            Operation::Dispatch(_) => ATTEMPT_IO,
+            Operation::Phase(_) => PHASE_IO,
+        };
+        let limit = connection.admit(until, meter, io)?;
         let _slot = connection.slots.acquire().map_err(|_| ports::Error::Busy)?;
-        let outcome = attempts::inspect(connection.request, connection.trust, limit, dispatch)
-            .map_err(Error::Publication)?;
+        let outcome = match operation {
+            Operation::Dispatch(value) => {
+                attempts::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::Publication)?
+                    .map(Settlement::Dispatch)
+            }
+            Operation::Phase(value) => {
+                phases::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::Phase)?
+                    .map(Settlement::Phase)
+            }
+        };
         if outcome.is_some() {
             *pending = None;
         }
@@ -137,13 +174,13 @@ impl Dispatches<'_, '_> {
     ) -> Result<Published, Error> {
         let mut pending = self
             .pending
-            .dispatch
+            .operation
             .try_lock()
             .map_err(|_| ports::Error::Busy)?;
         if pending.is_some() {
             return Err(ports::Error::Busy.into());
         }
-        let limit = self.connection.admit(input.deadline, meter)?;
+        let limit = self.connection.admit(input.deadline, meter, ATTEMPT_IO)?;
         let _slot = self
             .connection
             .slots
@@ -155,8 +192,10 @@ impl Dispatches<'_, '_> {
             attempts::prepare(claim, generation, input.submission)
         }
         .map_err(Error::Publication)?;
-        *pending = Some(dispatch);
-        let value = pending.as_ref().ok_or(ports::Error::Invalid)?;
+        *pending = Some(Operation::Dispatch(dispatch));
+        let Some(Operation::Dispatch(value)) = pending.as_ref() else {
+            return Err(ports::Error::Invalid.into());
+        };
         let result = attempts::publish(
             self.connection.request,
             self.connection.trust,
@@ -166,15 +205,60 @@ impl Dispatches<'_, '_> {
             self.guard.clone(),
         );
         match result {
-            Ok(outcome) => Ok(Published {
-                dispatch: pending.take().ok_or(ports::Error::Invalid)?,
-                outcome,
-            }),
+            Ok(outcome) => {
+                let Some(Operation::Dispatch(dispatch)) = pending.take() else {
+                    return Err(ports::Error::Invalid.into());
+                };
+                Ok(Published { dispatch, outcome })
+            }
             Err(error) => {
                 if error != attempts::Error::Indeterminate {
                     *pending = None;
                 }
                 Err(Error::Publication(error))
+            }
+        }
+    }
+
+    /// Publish a retained bounded phase/result request. The caller supplies
+    /// actual current-transaction SMTP evidence. Close transport on uncertain
+    /// COMMIT; even success is a passive receipt, not continuing SMTP authority.
+    /// Admission here is not the separate final-outcome reservation required
+    /// before AcceptancePossible or terminator handoff.
+    pub fn publish_phase(
+        &self,
+        value: Change,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, Error> {
+        let mut pending = self
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let limit = self.connection.admit(until, meter, PHASE_IO)?;
+        let _slot = self
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        *pending = Some(Operation::Phase(value));
+        let Some(Operation::Phase(value)) = pending.as_ref() else {
+            return Err(ports::Error::Invalid.into());
+        };
+        match phases::publish(self.connection.request, self.connection.trust, limit, value) {
+            Ok(outcome) => {
+                *pending = None;
+                Ok(outcome)
+            }
+            Err(error) => {
+                if error != phases::Error::Indeterminate {
+                    *pending = None;
+                }
+                Err(Error::Phase(error))
             }
         }
     }
