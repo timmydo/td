@@ -3274,3 +3274,28 @@ The PostgreSQL fixture covers each durable phase, mixed remaining Prepared
 recipients, earlier uncertainty, stale owners, refusal of abandoned recovery
 for the current owner, retained replies, exact replay and retry timestamps,
 rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.
+
+
+## 116. Conservative runtime queue clock guard
+
+The prepared `queue_clock::Guard` pairs database UTC with samples from one
+process-local monotonic domain. Startup permits fresh dispatch but holds
+attempted recipients for five monotonic minutes. Expiry remains held until
+an explicitly authorized queue clock-confirm operation observes at least five
+stable minutes. The caller must check database due times, ownership and route
+health separately; a status snapshot is neither a permit nor historical
+transport authority.
+
+A cumulative UTC/monotonic discrepancy greater than five minutes in either
+direction pauses all new dispatch and expiry, resets the stable interval and
+revokes confirmation. Individual sample-to-sample discontinuities are checked separately so that a
+jump cannot hide by canceling prior drift. Smaller observations do not move
+the comparison anchor.
+A database primary change forces the same hold even when its clock matches.
+Elapsed time alone never clears these holds. Invalid UTC or monotonic regression
+poisons that guard until runtime reconstruction, which repeats startup holds.
+
+This bounded, allocation-free guard supplies scheduling and health decisions
+only. Wiring database sample acquisition, failover detection, authenticated
+clock-confirm, bounded expiry and the production scheduler remains activation
+work. Existing prepared storage publishers do not imply those runtime checks.
