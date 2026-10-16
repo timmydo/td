@@ -4928,3 +4928,13 @@ checks precede and follow every turn, including read, flush and completion.
 No per-turn collection grows or heap allocation occurs in this owner.
 Output accumulates across codec turns before one bounded TLS write; only
 a full cell or completed body drains it. Partial writes retain exact offsets.
+
+The prepared DNS wire helper keeps a canonical name in at most 258 bytes
+and an address question in at most 264 bytes. Query encoding borrows at most
+271 caller bytes and never changes bytes outside the returned query prefix;
+short capacity writes nothing. Name decoding allocates no heap storage and
+uses no recursion: at most 255 expanded name bytes and 32 backward pointer
+hops bound one call. Packet input is at most 65535 bytes. These values belong
+to the resolver's existing question/name/cursor partition, not one new
+reservation per waiting lookup. Network work and its original deadline are
+outside this pure wire helper.

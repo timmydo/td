@@ -1407,6 +1407,17 @@ resolver configuration and cache policy apply within that child.
 Never perform recipient-MX lookups for outbound mail. Saturation produces SMTP
 temporary failure, HTTP/JMAP limit responses, or bounded retry, as appropriate.
 
+The prepared `dns_wire` layer emits only one recursive IN A or AAAA question
+for an already configured hostname. Its fixed name representation retains
+label boundaries and folds only ASCII letters. Reply-name decoding accepts
+at most 255 expanded bytes, 63 bytes per label and 32 backward compression
+pointers in a packet of at most 65535 bytes. It reports the original field
+extent separately from referenced suffixes. This is structural parsing, not
+proof that a pointer targets a previously parsed name field. Network peer,
+transaction/question matching, answer and CNAME limits, TTL handling, cache
+ownership and UDP/TCP deadlines remain the resolver owner's responsibility;
+the wire helper performs no lookup and supplies no authenticated identity.
+
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;
