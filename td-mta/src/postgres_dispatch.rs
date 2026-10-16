@@ -170,7 +170,7 @@ pub struct Dispatches<'a, 'r> {
     pub guard: Arc<Mutex<Guard>>,
     pub pending: &'a Pending,
 }
-impl Dispatches<'_, '_> {
+impl<'a, 'r> Dispatches<'a, 'r> {
     pub fn publish(
         &self,
         claim: &Claim,
@@ -264,7 +264,7 @@ impl Dispatches<'_, '_> {
         accepted: &[(u32, &str)],
         until: Deadline,
         meter: &mut Meter,
-    ) -> Result<BodyResult<'_, '_, '_>, Error> {
+    ) -> Result<BodyResult<'_, 'a, 'r>, Error> {
         let body = phases::body(claim, generation, attempt, accepted).map_err(Error::Phase)?;
         let (outcome, limit) =
             self.publish_phase_with(body.clone(), until, meter, Some(LivePhase::Body))?;
@@ -275,6 +275,7 @@ impl Dispatches<'_, '_> {
             worker: self,
             body,
             limit,
+            until,
             outcome,
         })
     }
@@ -364,7 +365,7 @@ impl Dispatches<'_, '_> {
         ordinals: &[u32],
         until: Deadline,
         meter: &mut Meter,
-    ) -> Result<FinalPlan<'_, '_, '_>, Error> {
+    ) -> Result<FinalPlan<'_, 'a, 'r>, Error> {
         let possible = phases::acceptance_possible(claim, generation, attempt, ordinals)
             .map_err(Error::Phase)?;
         let reply = phases::reserve_final_reply(claim, generation, attempt, ordinals)
@@ -386,7 +387,7 @@ impl Dispatches<'_, '_> {
         attempt: AttemptId,
         until: Deadline,
         meter: &mut Meter,
-    ) -> Result<FinalWork<'_, '_, '_>, Error> {
+    ) -> Result<FinalWork<'_, 'a, 'r>, Error> {
         let pending = self
             .pending
             .operation
@@ -416,9 +417,35 @@ pub struct BodyResult<'w, 'a, 'r> {
     worker: &'w Dispatches<'a, 'r>,
     body: Change,
     limit: Instant,
+    until: Deadline,
     outcome: phases::Outcome,
 }
-impl BodyResult<'_, '_, '_> {
+impl<'w, 'a, 'r> BodyResult<'w, 'a, 'r> {
+    /// Bind final publication capacity to this exact Body subset. The input
+    /// deadline and earliest retained limit cannot be replaced or extended.
+    pub fn reserve_final(self, meter: &mut Meter) -> Result<BodyPlan<'w, 'a, 'r>, Error> {
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let mut work = self
+            .worker
+            .reserve_final(self.attempt(), self.until, meter)?;
+        work.limit = work.limit.min(self.limit);
+        if Instant::now() >= work.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let (possible, reply) = self.body.body_final().map_err(Error::Phase)?;
+        let until = self.until;
+        Ok(BodyPlan {
+            body: self,
+            final_plan: FinalPlan {
+                possible,
+                reply,
+                work,
+                until,
+            },
+        })
+    }
     pub fn attempt(&self) -> AttemptId {
         self.body.attempt()
     }
@@ -430,6 +457,31 @@ impl BodyResult<'_, '_, '_> {
     pub fn check_current(&self, meter: &mut Meter) -> Result<Instant, Error> {
         self.worker
             .check_current_phase(&self.body, self.limit, meter, LivePhase::Body)
+    }
+}
+
+/// Exact Body custody paired with its own final-result capacity. The caller
+/// still owns matching immutable source, actual 354 and body completion.
+pub struct BodyPlan<'w, 'a, 'r> {
+    body: BodyResult<'w, 'a, 'r>,
+    final_plan: FinalPlan<'w, 'a, 'r>,
+}
+impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.body.attempt()
+    }
+    pub fn check_current(&self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.body.worker.check_current_phase(
+            &self.body.body,
+            self.final_plan.work.limit,
+            meter,
+            LivePhase::Body,
+        )
+    }
+    /// The trusted caller invokes this only after transferring the matching
+    /// body. Unknown COMMIT retains Pending and supplies no final owner.
+    pub fn publish_possible(self, meter: &mut Meter) -> Result<FinalResult<'w, 'a, 'r>, Error> {
+        self.final_plan.publish_possible(meter)
     }
 }
 

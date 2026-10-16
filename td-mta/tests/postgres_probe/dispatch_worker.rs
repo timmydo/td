@@ -294,12 +294,29 @@ pub(super) fn exercise(
         ),
         Err(Error::Phase(phases::Error::Conflict))
     ));
+    let plan = owner.reserve_final(&mut meter()).unwrap();
+    assert_eq!(plan.attempt(), success.outcome.attempt);
+    assert_eq!(
+        plan.check_current(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    assert!(matches!(
+        worker.reserve_final(success.outcome.attempt, until(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
     thread::sleep(Duration::from_millis(2100));
     assert_eq!(
-        owner.check_current(&mut meter()),
+        plan.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Deadline))
     );
-    drop(owner);
+    assert!(matches!(
+        plan.publish_possible(&mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    ));
+    let released = worker
+        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
+        .unwrap();
+    drop(released);
     assert_eq!(published.attempt, success.outcome.attempt);
     assert_eq!(published.recipients, 2);
     assert_eq!(pending.attempt().unwrap(), None);

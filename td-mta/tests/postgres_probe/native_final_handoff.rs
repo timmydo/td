@@ -122,16 +122,17 @@ pub(super) fn exercise(
             .unwrap();
         assert_eq!(body_owner.attempt(), published.dispatch.attempt());
         body_owner.check_current(&mut database).unwrap();
-        let plan = worker
-            .reserve_final_result(
-                claim,
-                generation,
-                published.dispatch.attempt(),
-                &[recipient.ordinal],
-                cap,
-                &mut database,
-            )
+        let plan = body_owner.reserve_final(&mut database).unwrap();
+        assert_eq!(plan.attempt(), published.dispatch.attempt());
+        let occupied = worker
+            .reserve_final(published.dispatch.attempt(), cap, &mut database)
             .unwrap();
+        assert_eq!(
+            plan.check_current(&mut database),
+            Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+        );
+        drop(occupied);
+        plan.check_current(&mut database).unwrap();
         let mut transferred = Vec::new();
         let sent = attempts::with_body(
             &runtime,
@@ -176,10 +177,22 @@ pub(super) fn exercise(
         assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
         let held = plan.publish_possible(&mut database).unwrap();
         assert_eq!(
-            body_owner.check_current(&mut database),
-            Err(dispatch::Error::Phase(phases::Error::Conflict))
+            phases::check_current_body(
+                &runtime,
+                trust,
+                job_limit,
+                &phases::body(
+                    claim,
+                    generation,
+                    published.dispatch.attempt(),
+                    &[(recipient.ordinal, &rcpt)]
+                )
+                .unwrap(),
+                clock.clone(),
+                worker.guard.clone()
+            ),
+            Err(phases::Error::Conflict)
         );
-        drop(body_owner);
         if refuse {
             sql(fixture,"CREATE FUNCTION public.reject_wire_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire fixture refusal'; END $$; CREATE TRIGGER reject_wire_final BEFORE INSERT ON td_mta.attempt_acceptance_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_final()");
         }

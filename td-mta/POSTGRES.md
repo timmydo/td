@@ -4277,3 +4277,32 @@ after AcceptancePossible it requires Body validation to refuse. This is an
 initial caller check, not yet a body transport owner enforcing every write or
 flush. Actual source matching, repeated transport fencing and scheduler/backend
 activation remain separate work.
+
+## 154. Final capacity derived from Body custody
+
+BodyResult can be consumed into a non-cloneable BodyPlan that pairs its exact
+Body operation with final-result capacity. The phase-3 change and preallocated
+final reply derive internally from that Body change's claim, generation,
+attempt and ordered recipient subset; the caller supplies no replacement
+identity or subset. Reservation uses the same worker, original input deadline
+and earliest retained Body limit, further shortened by reservation admission.
+
+BodyPlan keeps one ordinary slot for final publication while every live Body
+check acquires another and prepays its own bounded work. Its checks use the
+combined limit, so a new meter cannot extend either original Body ownership or
+a shorter reservation bound. Drop or refusal releases only local capacity.
+After the matching body is transferred, consuming the plan publishes known new
+AcceptancePossible through the existing FinalPlan path. Uncertainty remains in
+Pending and yields no FinalResult; historical settlement grants no new owner.
+
+The caller still owns actual 354, immutable source matching, body completion
+and checks before each transport write or flush. This binds the two storage
+owners; it does not yet implement the body transport wrapper or activate the
+scheduler. Existing low-level trusted APIs remain available as storage and
+protocol machinery.
+
+The real PostgreSQL worker fixture checks held-slot exclusion, inherited Body
+expiry despite a fresh meter, refusal to publish after expiry, and slot release.
+The native paired-TLS fixture derives final capacity from BodyResult, refuses
+live checks while the remaining ordinary slot is occupied, then checks Body,
+streams its immutable bytes and completes the same retained final handoff.

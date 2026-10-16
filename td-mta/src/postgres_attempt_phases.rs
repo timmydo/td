@@ -59,6 +59,23 @@ struct Fields {
     digest: [u8; 32],
 }
 impl Change {
+    pub(crate) fn body_final(&self) -> Result<(Change, FinalReply), Error> {
+        let value = &self.inner;
+        if value.phase != 2 {
+            return Err(Error::Integrity);
+        }
+        let mut ordinals = Vec::new();
+        ordinals
+            .try_reserve_exact(value.ordinals.len())
+            .map_err(|_| Error::Capacity)?;
+        for ordinal in &value.ordinals {
+            ordinals.push(u32::try_from(*ordinal).map_err(|_| Error::Integrity)?);
+        }
+        Ok((
+            acceptance_possible(&value.claim, value.generation, value.attempt, &ordinals)?,
+            reserve_final_reply(&value.claim, value.generation, value.attempt, &ordinals)?,
+        ))
+    }
     pub(crate) fn is_final_for(&self, attempt: AttemptId) -> bool {
         self.inner.attempt == attempt && matches!(self.inner.phase, 4 | 5)
     }
