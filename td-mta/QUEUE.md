@@ -251,6 +251,13 @@ If these reservations cannot be obtained, abort before handing off terminator
 bytes; do not create an uncertain outcome merely because admission is full.
 Sync/I/O failure after handoff remains inherently uncertain despite capacity.
 
+The prepared PostgreSQL publisher's durable logical final-result reservation
+is specified in POSTGRES.md §142. AcceptancePossible reserves the selected
+DATA subset's sequence and alternative receipt capacity against every competing
+writer. Recovery or expiry consumes the same durable claim atomically with its
+outcome. This does not supply the separate local runtime reservations or permit
+terminator handoff; the prepared BodySent boundary remains closed.
+
 If a SQLite COMMIT has an indeterminate I/O result, stop the writer and
 reopen for SQLite recovery. Read the durable transaction state before retry;
 the worker must not append an alternative result or continue transmitting

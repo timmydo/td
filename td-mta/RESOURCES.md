@@ -5023,3 +5023,13 @@ allowance without renewing the original job/meter deadline. The existing
 native phase routine's temporary clone and bounded SQL rows remain charged
 separately from the retained request. This is process work admission, not a
 database disk/WAL reservation or the final-outcome capacity for SMTP handoff.
+
+PostgreSQL final-result claims retain at most 1024 account rows, each holding
+one attempt key and at most 400 ordinal bytes. Under the account lock they
+preserve one sequence credit and a slot in each of four alternative receipt
+quotas. Allocation/consumption uses bounded counts and at most one selected
+100-recipient subset; expiry decodes at most 400 bytes into 100 ordinals.
+The phase/recovery/expiry transactions retain their existing connection byte,
+frame, reply and deadline bounds. These durable logical claims do not reserve
+physical database disk/WAL or the relay's future local connection, work and
+reply storage. Those local reservations remain required before SMTP handoff.

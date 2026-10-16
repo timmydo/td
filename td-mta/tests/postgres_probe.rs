@@ -348,7 +348,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 26);
+    assert_eq!(receipt.version, 27);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -425,7 +425,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        26
+        27
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -550,7 +550,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":26"));
+    assert!(initialized.contains("\"schema_version\":27"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -725,6 +725,11 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
             access::Error::Privileges,
         ),
         (
+            "REVOKE INSERT ON td_mta.attempt_final_reservations FROM mail_runtime",
+            "GRANT INSERT ON td_mta.attempt_final_reservations TO mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
             "REVOKE INSERT ON td_mta.submission_cancel_receipts FROM mail_runtime",
             "GRANT INSERT ON td_mta.submission_cancel_receipts TO mail_runtime",
             access::Error::Privileges,
@@ -790,7 +795,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=26",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=27",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -798,7 +803,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=26 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=27 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -980,7 +985,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 26);
+    assert_eq!(receipt.version, 27);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1482,7 +1487,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "47");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "48");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1688,7 +1693,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1718,6 +1723,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_attempt_command.sql"),
             include_str!("../src/postgres_queue_expiry.sql"),
             include_str!("../src/postgres_route_health.sql"),
+            include_str!("../src/postgres_submission_cancel.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1739,7 +1745,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             inspect(&fixture.request(), &trust, deadline()),
             Err(SchemaError::Version)
         );
-        if previous_version == 9 {
+        if matches!(previous_version, 9 | 26) {
             sql(&fixture,"INSERT INTO td_mta.accounts VALUES(decode(repeat('7e',16),'hex'),decode('0000000000000001','hex'),decode('0000000000000000','hex')); INSERT INTO td_mta.blob_ids SELECT decode(repeat('7e',16),'hex'),decode(repeat(n,16),'hex') FROM unnest(ARRAY['01','02']) n; INSERT INTO td_mta.blobs SELECT account,id,CASE WHEN id=decode(repeat('01',16),'hex') THEN 3 ELSE 0 END,decode(repeat('00',32),'hex'),0,decode('0000000000000001','hex'),CASE WHEN id=decode(repeat('01',16),'hex') THEN 1 ELSE 0 END FROM td_mta.blob_ids; INSERT INTO td_mta.blob_chunks VALUES(decode(repeat('7e',16),'hex'),decode(repeat('01',16),'hex'),0,decode('616263','hex')); INSERT INTO td_mta.leases VALUES(decode(repeat('7e',16),'hex'),decode(repeat('01',16),'hex'),decode(repeat('01',16),'hex'),0,3,decode('0000000000000001','hex')); INSERT INTO td_mta.submissions SELECT account,id,id,id,id,decode(repeat('01',16),'hex'),'a@example.test',0,1,1,NULL,0,NULL,decode('0000000000000001','hex') FROM td_mta.blob_ids; INSERT INTO td_mta.recipients(account,submission_id,ordinal,address,state,uncertain,attempt_count,phase,reason,diagnostic,changed) SELECT account,id,0,'a@example.test',1,0,0,0,0,'',changed FROM td_mta.submissions");
         }
         let obstruction = match previous_version {
@@ -1765,6 +1771,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             23 => "queue_expiry_progress",
             24 => "route_health_receipts",
             25 => "submission_cancel_receipts",
+            26 => "attempt_final_reservations",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1797,8 +1804,27 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
                 "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC",
             );
         }
+        if previous_version == 26 {
+            sql(&fixture,"UPDATE td_mta.recipients SET state=2,attempt_count=1,attempt_id=decode(repeat('03',16),'hex'),last_attempt_at=0,phase=3,rcpt_reply='250 accepted'");
+            assert_eq!(
+                upgrade(&fixture.request(), &trust, deadline()),
+                Err(SchemaError::Database)
+            );
+            assert_eq!(
+                sql(&fixture, "SELECT count(*) FROM td_mta.schema_migrations"),
+                "26"
+            );
+            assert_eq!(
+                sql(
+                    &fixture,
+                    "SELECT to_regclass('td_mta.attempt_final_reservations') IS NULL"
+                ),
+                "t"
+            );
+            sql(&fixture,"UPDATE td_mta.recipients SET state=7,uncertain=1,phase=4,reason=9,next_attempt_at=1");
+        }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 26);
+        assert_eq!(receipt.version, 27);
         assert_eq!(
             sql(
                 &fixture,
@@ -10404,6 +10430,8 @@ mod attempt_rcpt;
 mod attempt_refusal;
 #[path = "postgres_probe/attempt_retry.rs"]
 mod attempt_retry;
+#[path = "postgres_probe/final_capacity.rs"]
+mod final_capacity;
 
 fn exercise_dispatch(
     fixture: &Fixture,
@@ -10522,6 +10550,7 @@ fn exercise_dispatch(
         fixture,
         request,
         trust,
+        binding,
         &claim,
         owner.generation,
         value.attempt(),
@@ -10597,6 +10626,7 @@ fn exercise_attempt_recovery(
     // Independently seed all recovery phase cases after phase-publication checks.
     sql(fixture, &format!("UPDATE td_mta.recipients SET phase=1,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex') AND state=2"));
     sql(fixture,&format!("UPDATE td_mta.recipients SET phase=3,rcpt_reply='250 accepted' WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.recipients SET phase=2,rcpt_reply='250 accepted' WHERE submission_id=decode('{submission}','hex') AND ordinal=1; UPDATE td_mta.recipients SET uncertain=1 WHERE submission_id=decode('{submission}','hex') AND ordinal=2"));
+    sql(fixture,&format!("UPDATE td_mta.attempt_final_reservations SET ordinals=decode('00000000','hex') WHERE attempt_id=decode('{attempt}','hex')"));
     let expiry = sql(
         fixture,
         &format!("SELECT expires_at FROM td_mta.submissions WHERE id=decode('{submission}','hex')"),
@@ -10664,6 +10694,13 @@ fn exercise_attempt_recovery(
     )
     .parse()
     .unwrap();
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "0"
+    );
     assert_eq!(outcome.attempt, attempt);
     assert_eq!(outcome.recipients, 100);
     assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);

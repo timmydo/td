@@ -15,6 +15,7 @@ pub(super) fn exercise(
     fixture: &Fixture,
     request: &Request<'_>,
     trust: &TrustStore,
+    binding: &td_mta::postgres_runtime_profile::Binding,
     claim: &Claim,
     generation: u64,
     attempt: AttemptId,
@@ -104,6 +105,7 @@ pub(super) fn exercise(
         phases::publish(request, trust, deadline(), &other),
         Err(phases::Error::Conflict)
     );
+    super::final_capacity::before_possible(fixture, request, trust, attempt, &final_phase);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase()");
     assert_eq!(
@@ -116,6 +118,13 @@ pub(super) fn exercise(
         Err(phases::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "1"
+    );
     let settled = phases::inspect(request, trust, deadline(), &final_phase)
         .unwrap()
         .unwrap();
@@ -134,5 +143,6 @@ pub(super) fn exercise(
         Some(outcome)
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex'); DROP TRIGGER delay_phase ON td_mta.attempt_phase_receipts"));
+    super::final_capacity::competing_writer(fixture, request, trust, binding);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

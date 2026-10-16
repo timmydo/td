@@ -113,10 +113,10 @@ pub(super) fn exercise(
         ),
         Err(expiry::Error::NotDue)
     );
-    // Keep 200 pending rows and terminal rows beyond the two bounded batches.
+    // Keep 200 pending rows; the reserved subset straddles ordinary batch boundaries.
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=send_at,completed_at=NULL,notification=0 WHERE id=decode('{submission}','hex'); UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id=decode('{submission}','hex') AND ordinal<200"));
     let previous=sql(fixture,&format!("SELECT encode(attempt_id,'hex') FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=200"));
-    sql(fixture,&format!("UPDATE td_mta.recipients SET state=2,attempt_id=decode('{previous}','hex'),attempt_count=1,last_attempt_at=0,phase=3,next_attempt_at=NULL,rcpt_reply='250 actual RCPT' WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.recipients SET state=7,uncertain=1,attempt_id=decode('{previous}','hex'),attempt_count=1,last_attempt_at=0,phase=4,reason=3,rcpt_reply='250 prior RCPT',data_reply='450 prior DATA' WHERE submission_id=decode('{submission}','hex') AND ordinal=100; UPDATE td_mta.recipients SET state=5,next_attempt_at=NULL,reason=2,data_reply='550 terminal DATA' WHERE submission_id=decode('{submission}','hex') AND ordinal=203; UPDATE td_mta.submission_attempts SET active=true WHERE attempt_id=decode('{previous}','hex')"));
+    sql(fixture,&format!("UPDATE td_mta.recipients SET state=2,attempt_id=decode('{previous}','hex'),attempt_count=1,last_attempt_at=0,phase=3,next_attempt_at=NULL,rcpt_reply='250 actual RCPT' WHERE submission_id=decode('{submission}','hex') AND ordinal IN(0,150); UPDATE td_mta.recipients SET state=7,uncertain=1,attempt_id=decode('{previous}','hex'),attempt_count=1,last_attempt_at=0,phase=4,reason=3,rcpt_reply='250 prior RCPT',data_reply='450 prior DATA' WHERE submission_id=decode('{submission}','hex') AND ordinal=100; UPDATE td_mta.recipients SET state=5,next_attempt_at=NULL,reason=2,data_reply='550 terminal DATA' WHERE submission_id=decode('{submission}','hex') AND ordinal=203; UPDATE td_mta.submission_attempts SET active=true,ordinals=decode('0000000000000096','hex') WHERE attempt_id=decode('{previous}','hex'); INSERT INTO td_mta.attempt_final_reservations SELECT account,attempt_id,ordinals FROM td_mta.submission_attempts WHERE attempt_id=decode('{previous}','hex')"));
     let frozen=sql(fixture,&format!("SELECT md5(string_agg(concat_ws('|',ordinal,state,uncertain,phase,attempt_count,rcpt_reply,data_reply),',' ORDER BY ordinal)) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal>=200"));
     let before = sql(
         fixture,
@@ -199,7 +199,15 @@ pub(super) fn exercise(
         guard.clone(),
     )
     .unwrap();
-    assert_eq!(first.recipients, 100);
+    assert_eq!(first.recipients, 2);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "0"
+    );
+    assert_eq!(sql(fixture,&format!("SELECT state,uncertain,phase,reason FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=150")),"7|1|4|6");
     assert_eq!(sql(fixture, &format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{previous}','hex')")), "f");
     assert_eq!(first.new_sequence, first.old_sequence + 1);
     assert_eq!(
@@ -207,7 +215,7 @@ pub(super) fn exercise(
         Some(first)
     );
     assert_eq!(sql(fixture,&format!("SELECT state,uncertain,phase,reason,next_attempt_at IS NULL,rcpt_reply FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=0")),"7|1|4|6|t|250 actual RCPT");
-    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal BETWEEN 1 AND 99 AND state=5 AND phase=0 AND attempt_count=0 AND reason=6")),"99");
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal BETWEEN 1 AND 99 AND state=5 AND phase=0 AND attempt_count=0 AND reason=6")),"0");
     assert_eq!(sql(fixture,&format!("SELECT completed_at IS NULL,notification FROM td_mta.submissions WHERE id=decode('{submission}','hex')")),"t|0");
     sql(
         fixture,
@@ -247,6 +255,19 @@ pub(super) fn exercise(
     .unwrap();
     assert_eq!(second.recipients, 100);
     assert_eq!(sql(fixture,&format!("SELECT state,uncertain,phase,reason,next_attempt_at IS NULL,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=100")),"7|1|4|6|t|250 prior RCPT|450 prior DATA");
+    assert_eq!(sql(fixture,&format!("SELECT completed_at IS NULL FROM td_mta.submissions WHERE id=decode('{submission}','hex')")),"t");
+    thread::sleep(Duration::from_millis(1100));
+    let third = expiry::prepare(claim, generation, submission).unwrap();
+    let third = expiry::publish(
+        request,
+        trust,
+        deadline(),
+        &third,
+        other_clock.clone(),
+        other_guard.clone(),
+    )
+    .unwrap();
+    assert_eq!(third.recipients, 98);
     assert_eq!(sql(fixture,&format!("SELECT completed_at IS NOT NULL,notification FROM td_mta.submissions WHERE id=decode('{submission}','hex')")),"t|1");
     assert_eq!(sql(fixture,&format!("SELECT md5(string_agg(concat_ws('|',ordinal,state,uncertain,phase,attempt_count,rcpt_reply,data_reply),',' ORDER BY ordinal)) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal>=200")),frozen);
     // Replays settle even after an explicit clock hold.

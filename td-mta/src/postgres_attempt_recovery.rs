@@ -31,6 +31,14 @@ pub enum Error {
     Database,
     Indeterminate,
 }
+fn capacity(error: crate::postgres_final_capacity::Error) -> Error {
+    match error {
+        crate::postgres_final_capacity::Error::Capacity => Error::Capacity,
+        crate::postgres_final_capacity::Error::Integrity => Error::Integrity,
+        crate::postgres_final_capacity::Error::Database => Error::Database,
+    }
+}
+
 #[derive(Clone)]
 pub struct Recovery {
     claim: Claim,
@@ -252,13 +260,6 @@ pub fn publish(
             if number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
             }
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
             let rows=client.query("SELECT expires_at,completed_at,changed FROM td_mta.submissions WHERE account=$1 AND id=$2 FOR UPDATE", &[&account,&submission]).await.map_err(|_|Error::Database)?;
             let row = rows.first().ok_or(Error::Integrity)?;
             let expires: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
@@ -266,22 +267,18 @@ pub fn publish(
             if completed.is_some() || number(row.try_get(2).map_err(|_| Error::Integrity)?)? > old {
                 return Err(Error::Integrity);
             }
-            let count:i64=client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_recovery_receipts WHERE account=$1 LIMIT 1024) receipts", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-            if count >= 1024 {
-                return Err(Error::Capacity);
-            }
             let rows=client.query("SELECT ordinal,uncertain,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
             if rows.is_empty() || rows.len() > 100 {
                 return Err(Error::Integrity);
             }
-            let changed = next.to_be_bytes();
-            let changed = changed.as_slice();
+            let mut possible = Vec::new();
             let mut selected = Vec::new();
             let mut states = Vec::new();
             let mut uncertainties = Vec::new();
             let mut retries = Vec::new();
             let mut reasons = Vec::new();
             for buffer in [
+                &mut possible,
                 &mut selected,
                 &mut states,
                 &mut uncertainties,
@@ -329,12 +326,34 @@ pub fn publish(
                 let uncertain = i64::from(uncertain == 1 || phase == 3);
                 let state = if uncertain == 1 { 7i64 } else { 3i64 };
                 let reason = if phase == 3 { 9i64 } else { 3i64 };
+                if phase == 3 {
+                    possible.push(ordinal);
+                }
                 selected.push(ordinal);
                 states.push(state);
                 uncertainties.push(uncertain);
                 retries.push(retry);
                 reasons.push(reason);
             }
+            crate::postgres_final_capacity::consume(client, account, attempt, &possible)
+                .await
+                .map_err(capacity)?;
+            crate::postgres_final_capacity::admit_receipt(
+                client,
+                account,
+                crate::postgres_final_capacity::Receipt::Recovery,
+            )
+            .await
+            .map_err(capacity)?;
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
+            let changed = next.to_be_bytes();
+            let changed = changed.as_slice();
             if client.execute("UPDATE td_mta.recipients r SET state=u.state,uncertain=u.uncertain,phase=4,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::bigint[],$6::bigint[],$7::bigint[]) u(ordinal,state,uncertain,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&selected,&states,&uncertainties,&retries,&reasons,&changed]).await.map_err(|_|Error::Database)?!=rows.len() as u64 {return Err(Error::Integrity)}
             if client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND active", &[&account,&attempt]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity)}
             if client

@@ -131,6 +131,7 @@ pub mod postgres_attempts;
 pub mod postgres_body;
 pub mod postgres_bootstrap;
 pub mod postgres_dispatch;
+mod postgres_final_capacity;
 pub mod postgres_http_api;
 pub mod postgres_http_auth;
 pub mod postgres_http_cancellations;

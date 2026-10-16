@@ -3935,11 +3935,54 @@ sequence. Historical receipt validation does not allocate another sequence.
 The additional bounded query uses the same connection, original deadline and
 protocol ceilings. It commits nothing by itself and retains no lock beyond
 the caller's transaction. This consolidates the admission point needed for
-future durable result reservations; it does not yet reserve headroom or enable
-SMTP terminator handoff. Route revisions, configuration generations and other
+durable result reservations described below; it does not enable SMTP
+terminator handoff. Route revisions, configuration generations and other
 independent counters retain their existing checked arithmetic.
 
 The shared account-sequence query adds a bounded round trip to a changing
 publication. Mutation workers allow 1088 frames, including fixed headroom for
 statement-close and COMMIT responses, so the maximum Email deletion batch fits; aggregate bytes, per-frame/authentication limits, output
 allowances and the original deadline remain unchanged.
+
+## 142. Durable logical final-result capacity
+
+Schema version 27 adds private final-result reservations keyed by account and
+attempt, with the exact ordered DATA subset (at most 100 ordinals). Its foreign
+key to the immutable attempt binds the submission, route, destination and
+owner fence; the schema ledger binds the store epoch. Runtime mail DML grants
+include the new table. Upgrade refuses any old InFlight/AcceptancePossible
+recipient: resolve those attempts using the old binary before upgrading. It
+does not manufacture capacity promises for previously published phases.
+
+AcceptancePossible now allocates one future account-sequence increment and
+one slot in each alternative acceptance, refusal, recovery and expiry receipt
+quota, atomically with the phase change. All thirteen account-sequence writers
+preserve the aggregate outstanding claims under the account row lock. The
+shared query reads claims with sequence/floor in one round trip. Every writer
+of those four receipt classes admits actual receipts plus outstanding claims
+against its existing 1024-row ceiling. Claims are bounded by that same ceiling;
+all counts use bounded indexed account scans. These are credits for a future
+increment, not preassigned sequence values.
+
+A final positive/negative DATA result validates and consumes precisely its
+reserved subset in the same transaction as recipient state, CHANGE and receipt.
+Current-owner interruption and later-owner recovery consume the exact remaining
+AcceptancePossible subset while recovering the whole bounded attempt. Expiry
+prioritizes one reserved subset and expires it completely in one transaction,
+even when its ordinals straddle an ordinary 100-row sweep boundary. Ordinary
+pending recipients wait for later sweeps. Prepared recipients outside the DATA
+subset have no remote-acceptance obligation and no reservation promise.
+
+Consumption occurs before shared sequence/receipt admission inside the same
+transaction. A conflict, expiry hold, clock refusal or failed commit rolls it
+back. Unknown COMMIT settles the retained operation; historical replay never
+allocates or consumes a second claim. Lease expiry or owner takeover alone
+cannot release capacity. Cancellation already refuses AcceptancePossible rows.
+The attempt foreign key also prevents removal of an outstanding claim's owner
+record. Physical disk/WAL availability and database connectivity are not
+reserved, and synchronous failure after remote acceptance remains uncertain.
+
+This is durable logical capacity only. The relay must still retain independent
+local connection/work/reply capacity, its original attempt deadline and live
+ownership before terminator handoff. Passive phase receipts remain historical
+evidence; BodySent still exposes no terminator API, and no scheduler is enabled.

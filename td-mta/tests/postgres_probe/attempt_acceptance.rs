@@ -46,6 +46,15 @@ pub(super) fn exercise(
         phases::publish(request, trust, deadline(), &partial),
         Err(phases::Error::Conflict)
     );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "1"
+    );
+    // The reserved last receipt remains usable even when ordinary capacity is full.
+    sql(fixture,"INSERT INTO td_mta.attempt_acceptance_receipts SELECT id,decode(lpad(to_hex(n),32,'0'),'hex'),4,decode(repeat('fe',32),'hex'),1,decode(repeat('00',8),'hex'),decode('0000000000000001','hex') FROM td_mta.accounts CROSS JOIN generate_series(1,1023-(SELECT count(*) FROM td_mta.attempt_acceptance_receipts)) n");
     let before = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
@@ -61,6 +70,13 @@ pub(super) fn exercise(
             "SELECT encode(sequence,'hex') FROM td_mta.accounts"
         ),
         before
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "1"
     );
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=4")),"0");
     sql(fixture,"DROP TRIGGER reject_acceptance ON td_mta.attempt_acceptance_receipts; CREATE FUNCTION public.delay_acceptance() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_acceptance AFTER INSERT ON td_mta.attempt_acceptance_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_acceptance()");
@@ -80,6 +96,21 @@ pub(super) fn exercise(
     let outcome = phases::inspect(request, trust, deadline(), &accepted)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_final_reservations"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT count(*) FROM td_mta.attempt_acceptance_receipts"
+        ),
+        "1024"
+    );
+    sql(fixture,"DELETE FROM td_mta.attempt_acceptance_receipts WHERE request_digest=decode(repeat('fe',32),'hex')");
     assert_eq!(outcome.recipients, 100);
     assert_eq!(
         phases::publish(request, trust, deadline(), &accepted).unwrap(),

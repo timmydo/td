@@ -28,6 +28,14 @@ pub enum Error {
     Database,
     Indeterminate,
 }
+fn capacity(error: crate::postgres_final_capacity::Error) -> Error {
+    match error {
+        crate::postgres_final_capacity::Error::Capacity => Error::Capacity,
+        crate::postgres_final_capacity::Error::Integrity => Error::Integrity,
+        crate::postgres_final_capacity::Error::Database => Error::Database,
+    }
+}
+
 #[derive(Clone)]
 pub struct Change {
     claim: Claim,
@@ -61,8 +69,9 @@ pub fn body(
 ) -> Result<Change, Error> {
     prepare(claim, generation, attempt, 2, accepted.iter().copied())
 }
-/// Supply the entire previously committed Body subset. The caller must retain
-/// final-outcome capacity and current ownership before emitting a terminator.
+/// Supply the entire previously committed Body subset. Publication reserves
+/// durable logical result capacity; the caller still needs local capacity and
+/// current ownership before emitting a terminator.
 pub fn acceptance_possible(
     claim: &Claim,
     generation: u64,
@@ -412,13 +421,6 @@ pub fn publish(
             }
             let row = client.query_one("SELECT a.sequence,a.floor,s.changed,s.completed_at,s.expires_at FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id WHERE a.id=$1 AND s.id=$2 FOR UPDATE OF s", &[&account,&submission]).await.map_err(|_| Error::Database)?;
             let old = number(row.try_get(0).map_err(|_| Error::Integrity)?)?;
-            let next = crate::postgres_sequence::next(client, account, old)
-                .await
-                .map_err(|error| match error {
-                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
-                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
-                    crate::postgres_sequence::Error::Database => Error::Database,
-                })?;
             let completed: Option<i64> = row.try_get(3).map_err(|_| Error::Integrity)?;
             let expires: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
             if number(row.try_get(1).map_err(|_| Error::Integrity)?)? > old
@@ -428,25 +430,23 @@ pub fn publish(
             {
                 return Err(Error::Integrity);
             }
-            let (count_query, ceiling) = if value.phase >= 7 {
-                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-            } else if value.phase == 6 {
-                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_rcpt_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-            } else if value.phase == 5 {
-                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_refusal_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-            } else if value.phase == 4 {
-                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_acceptance_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
-            } else {
-                ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", 2048)
-            };
-            let count: i64 = client
-                .query_one(count_query, &[&account])
-                .await
-                .map_err(|_| Error::Database)?
-                .try_get(0)
-                .map_err(|_| Error::Integrity)?;
-            if count >= ceiling {
-                return Err(Error::Capacity);
+            if value.phase != 4 && value.phase != 5 {
+                let (count_query, ceiling) = if value.phase >= 7 {
+                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_command_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+                } else if value.phase == 6 {
+                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_rcpt_receipts WHERE account=$1 LIMIT 1024) receipts", 1024)
+                } else {
+                    ("SELECT count(*) FROM (SELECT 1 FROM td_mta.attempt_phase_receipts WHERE account=$1 LIMIT 2048) receipts", 2048)
+                };
+                let count: i64 = client
+                    .query_one(count_query, &[&account])
+                    .await
+                    .map_err(|_| Error::Database)?
+                    .try_get(0)
+                    .map_err(|_| Error::Integrity)?;
+                if count >= ceiling {
+                    return Err(Error::Capacity);
+                }
             }
             let rows = client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,last_attempt_at,uncertain,attempt_count,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101 FOR UPDATE", &[&account,&submission,&attempt]).await.map_err(|_| Error::Database)?;
             if rows.is_empty() || rows.len() > 100 {
@@ -555,6 +555,30 @@ pub fn publish(
             {
                 return Err(Error::Conflict);
             }
+            if value.phase == 3 {
+                crate::postgres_final_capacity::reserve(client, account, attempt, &value.ordinals)
+                    .await
+                    .map_err(capacity)?;
+            } else if value.phase == 4 || value.phase == 5 {
+                crate::postgres_final_capacity::consume(client, account, attempt, &value.ordinals)
+                    .await
+                    .map_err(capacity)?;
+                let kind = if value.phase == 4 {
+                    crate::postgres_final_capacity::Receipt::Accepted
+                } else {
+                    crate::postgres_final_capacity::Receipt::Refused
+                };
+                crate::postgres_final_capacity::admit_receipt(client, account, kind)
+                    .await
+                    .map_err(capacity)?;
+            }
+            let next = crate::postgres_sequence::next(client, account, old)
+                .await
+                .map_err(|error| match error {
+                    crate::postgres_sequence::Error::Capacity => Error::Capacity,
+                    crate::postgres_sequence::Error::Integrity => Error::Integrity,
+                    crate::postgres_sequence::Error::Database => Error::Database,
+                })?;
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
             let affected = if value.phase == 2 {
