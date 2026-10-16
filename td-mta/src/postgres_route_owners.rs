@@ -112,7 +112,19 @@ pub(crate) async fn begin(
     {
         return Err(Error::Epoch);
     }
-    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)?;
+    begin_transaction(client).await?;
+    lock_account_policy(client, claim, policy, write).await
+}
+pub(crate) async fn begin_transaction(client: &Client) -> Result<(), Error> {
+    client.batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|Error::Database)
+}
+// Caller owns an open transaction and a matching schema/epoch qualification.
+pub(crate) async fn lock_account_policy(
+    client: &Client,
+    claim: &Claim,
+    policy: bool,
+    write: bool,
+) -> Result<bool, Error> {
     let current_policy = if policy {
         let row = client.query_one("SELECT generation,version_id FROM td_mta.config_selection WHERE singleton=true FOR SHARE", &[]).await.map_err(|_|Error::Database)?;
         let version: Option<&[u8]> = row.try_get(1).map_err(|_| Error::Integrity)?;

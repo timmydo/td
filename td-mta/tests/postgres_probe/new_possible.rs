@@ -151,6 +151,14 @@ pub(super) fn live_state(
             guard.clone(),
         )
         .unwrap();
+        super::body_checks::exercise(
+            fixture,
+            &runtime,
+            trust,
+            change,
+            clock.clone(),
+            guard.clone(),
+        );
     }
     assert!(limit > Instant::now());
     assert!(limit <= deadline());

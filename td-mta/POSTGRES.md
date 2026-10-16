@@ -73,14 +73,20 @@ not schema ownership or DDL privileges. Explicit initialization/migration uses
 a separate owner credential, an exclusive database migration lock, and a
 version/checksum ledger. Initialize only when the application namespace is
 absent; refuse even an existing empty namespace and never replace a store.
-Incompatible upgrades require all instances to drain and stop; no mixed-version deployment is promised initially. Every
-serving database connection must acquire a shared session-level advisory
-lock on the fixed migration key before checking schema compatibility, and
-retain it until closure. The migrator takes the conflicting exclusive lock
-with a finite deadline and refuses while any serving connection remains.
-After migration, a returning old process must reacquire that shared lock and
-validate the new schema before any application SQL; stale pools cannot bypass
-the barrier. This requires direct sessions, not transaction-pooling proxies.
+Incompatible upgrades require all instances to drain and stop; no mixed-version
+deployment is promised initially. Serving database connections acquire a shared
+session-level advisory lock on the fixed migration key before checking schema
+compatibility and retain it until closure. The BodyChecks validator is the
+explicit exception (section 180): each turn takes the same key's shared
+transaction-level lock, fully revalidates schema/epoch and Runtime access before
+Body queries, and acknowledges rollback before returning. Its idle connection
+retains no migration lock and grants no authority to skip the next turn's
+qualification. The migrator takes the conflicting exclusive lock with a finite
+deadline and refuses while a serving session or validation turn holds a shared
+lock. After migration, a returning old process must reacquire the appropriate
+shared lock and validate the new schema before application SQL; stale pools
+cannot bypass the barrier. This requires direct sessions, not
+transaction-pooling proxies.
 
 Configuration has immutable validated generations and one transactional
 active-generation pointer. Shared domains, aliases, identities and routes
@@ -617,8 +623,9 @@ one common 16-byte epoch. It checks its final deadline before returning. It
 closes the session and lock before returning; the receipt grants no
 authority for later SQL on another connection. This checks the recorded
 ledger, not every catalog object or evidence against a malicious schema
-owner. The future serving connection must retain its own shared lock
-throughout its lifetime and validate the complete serving schema.
+owner. Serving connections retain their own shared lock throughout their
+lifetime and validate the complete serving schema, except for the closed
+Body-validation turns specified in sections 2 and 180.
 
 The real PostgreSQL schema fixture checks existing-namespace refusal,
 rollback after inherited-grant refusal, shared/exclusive migration
@@ -2045,8 +2052,11 @@ durability settings, acquires the shared migration lock, validates the current
 schema and checks the dedicated runtime role/table privileges before admitting
 an operation's SQL. A new connection repeats all of those checks; a previous
 cold receipt never substitutes for them. The lock and connection remain held
-through the operation. Mail helpers still enforce their own epoch, current
-configuration, device, snapshot and publication fences.
+through the operation. BodyChecks instead authenticates at open and performs
+this qualification inside every closed validation transaction (sections 2 and
+180), before any Body queries. No prior turn supplies cached qualification.
+Mail helpers still enforce their own epoch, current configuration, device,
+snapshot and publication fences.
 
 Qualification failure closes the connection before the application callback
 runs, with separate redacted schema/role/privilege errors. It performs no
@@ -4976,8 +4986,9 @@ owner, health, queue-clock and expiry checks. Unselected Prepared rows retain
 their existing handling. AcceptancePossible keeps its full positive reply
 validation and final-capacity checks.
 
-Every check still opens and qualifies a fresh connection, releasing all locks
-by closure before transport work. Body uses at most 1 MiB input, 1088 frames
+Every dispatch check still opens and qualifies a fresh connection. Body
+acknowledges transaction rollback before returning (section 180); Possible
+releases locks by connection closure. Body uses at most 1 MiB input, 1088 frames
 and 64 KiB output, including authentication and runtime qualification. The
 frame allowance is the same in preparation mode. Dispatch prepays 1 MiB plus
 128 KiB and 4096 records: both protocol byte ceilings plus the existing 64 KiB
@@ -4991,3 +5002,39 @@ tested independently of publication charges. Existing state, policy, ownership,
 clock and deadline corruption cases remain. This reduces response volume and
 per-check charging; fixed record limits and repeated connection setup still
 preclude a maximum-message throughput claim.
+
+## 180. Closed Body validation turns
+
+`BodyChecks` binds one authenticated PostgreSQL connection to the exact Body
+change, clock guard and original absolute deadline. It is non-cloneable and
+thread-bound because its worker waker targets the opening thread. It exposes
+only passive validation; it owns no SMTP authority, connection permit or work
+meter. Trusted callers retain connection capacity and admission. The dispatch
+path continues to open one such connection per check and drops it immediately
+when that check returns. No production connection reuse is activated here.
+
+Each turn begins a READ COMMITTED transaction and obtains the migration key's
+shared transaction-scoped lock before inspecting the full schema ledger and
+store epoch. Runtime mode repeats the dedicated role and privilege checks on
+every turn. It then takes the original policy/account locks and performs all
+existing Body checks from section 179. The ordinary owner begin path retains
+its session-lock behavior; this dedicated path never recursively acquires that
+session lock. Successful validation awaits ROLLBACK completion, releasing the
+migration and row locks, and checks its resulting limit again before return.
+A refused check, failed cleanup, expired deadline or broken connection closes
+the worker permanently; a later call returns the retained error without SQL.
+
+The original 1 MiB input, 1088 frames, 64 KiB output and ten-second cap span the
+entire connection, including all turns. A successful rollback replenishes no
+counter and extends no deadline. A returned limit can only tighten the next
+turn's cap. Runtime authentication is connection-bound; schema, durability,
+role, privileges and live dispatch conditions are rechecked each turn.
+
+Native fixtures verify two checks on one backend, idle state after rollback,
+and an independent connection acquiring exclusive migration and conflicting
+row locks between turns. Policy, runtime-role, privilege and reply changes refuse the
+next check and remain terminal after repair. Repetition exhausts the original
+protocol allowance; time expiry retains the original cap. Terminating the
+backend after the final live clock observation but before rollback produces
+no successful observation. This qualifies a reusable validation boundary,
+not a persistent dispatch connection, scheduler or maximum-body throughput.

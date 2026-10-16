@@ -18,7 +18,7 @@ use tokio_postgres::Client;
 
 #[path = "postgres_phase_current.rs"]
 mod current;
-pub use current::{check_current_body, check_current_possible};
+pub use current::{check_current_body, check_current_possible, BodyChecks};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

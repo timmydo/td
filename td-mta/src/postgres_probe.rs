@@ -177,25 +177,6 @@ pub(crate) fn with_batch_client<T>(
     )
 }
 
-// Compact Body checks send only bounded identity/query parameters. Possible
-// retains the batch profile; both include original qualification/frame budgets.
-pub(crate) fn with_phase_check_client<T>(
-    request: &Request<'_>,
-    trust: &TrustStore,
-    deadline: Instant,
-    compact_body: bool,
-    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
-) -> Result<T, Error> {
-    with_output_limit(
-        request,
-        trust,
-        deadline,
-        if compact_body { 64 * 1024 } else { 1024 * 1024 },
-        Input::mutations(),
-        operation,
-    )
-}
-
 // One immutable upload: at most 512 chunks in batches of eight.
 pub(crate) fn with_upload_client<T>(
     request: &Request<'_>,
@@ -279,7 +260,47 @@ pub(crate) fn body_worker(
     connect_worker(request, trust, deadline, 512 * 1024, Input::body())
 }
 
+// Only BodyChecks may use this worker: every exposed turn qualifies schema
+// and Runtime access under its own transaction-scoped migration lock.
+pub(crate) fn body_check_worker(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+) -> Result<Worker, Error> {
+    connect_authenticated(request, trust, deadline, 64 * 1024, Input::mutations())
+}
+
 fn connect_worker(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    output_limit: usize,
+    input: Input,
+) -> Result<Worker, Error> {
+    let mut worker = connect_authenticated(request, trust, deadline, output_limit, input)?;
+    if request.mode == Mode::Runtime {
+        worker.run(|client| {
+            Box::pin(async move {
+                crate::postgres_schema::lock_and_inspect(client)
+                    .await
+                    .map_err(|_| Error::RuntimeSchema)?;
+                qualify_runtime(client).await
+            })
+        })??;
+    }
+    Ok(worker)
+}
+
+pub(crate) async fn qualify_runtime(client: &tokio_postgres::Client) -> Result<(), Error> {
+    crate::postgres_runtime_access::qualify(client)
+        .await
+        .map_err(|error| match error {
+            crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
+            _ => Error::RuntimePrivileges,
+        })
+}
+
+fn connect_authenticated(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
@@ -353,30 +374,14 @@ fn connect_worker(
             thread::park_timeout(Duration::from_millis(1));
         }
     };
-    let mut worker = Worker {
+    Ok(Worker {
         client,
         connection: Box::pin(connection),
         deadline,
         waker,
         failed: None,
         activity,
-    };
-    if request.mode == Mode::Runtime {
-        worker.run(|client| {
-            Box::pin(async move {
-                crate::postgres_schema::lock_and_inspect(client)
-                    .await
-                    .map_err(|_| Error::RuntimeSchema)?;
-                crate::postgres_runtime_access::qualify(client)
-                    .await
-                    .map_err(|error| match error {
-                        crate::postgres_runtime_access::Error::Role => Error::RuntimeRole,
-                        _ => Error::RuntimePrivileges,
-                    })
-            })
-        })??;
-    }
-    Ok(worker)
+    })
 }
 
 pub(crate) struct Worker {

@@ -1,12 +1,14 @@
 //! Live phase validation; returned bounds are passive observations, not SMTP grants.
-use super::{capacity, number, receipt, valid_reply, Change, Error, Observation};
+use super::{capacity, number, receipt, valid_reply, Change, Error, Fields, Observation};
 use crate::{
     ports::Clock,
-    postgres_probe::{self, Request},
+    postgres_probe::{self, Mode, Request},
     postgres_route_owners as owners,
     queue_clock::Guard,
 };
 use std::{
+    marker::PhantomData,
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -42,8 +44,110 @@ pub fn check_current_body(
     if value.inner.phase != 2 {
         return Err(Error::Integrity);
     }
-    check_current(request, trust, deadline, value, clock, guard)
+    BodyChecks::open(request, trust, deadline, value, clock, guard)?.check()
 }
+
+/// A thread-bound, passive Body validator. Each successful turn acknowledges
+/// rollback before returning. All protocol counters and the original deadline
+/// span the entire connection; any refusal closes it permanently. The caller
+/// owns connection capacity and work admission. This is not SMTP authority.
+pub struct BodyChecks {
+    worker: Option<postgres_probe::Worker>,
+    value: Change,
+    observation: Observation,
+    mode: Mode,
+    limit: Instant,
+    failed: Option<Error>,
+    _thread: PhantomData<Rc<()>>,
+}
+impl BodyChecks {
+    pub fn open(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        value: &Change,
+        clock: Arc<dyn Clock>,
+        guard: Arc<Mutex<Guard>>,
+    ) -> Result<Self, Error> {
+        if value.inner.phase != 2 {
+            return Err(Error::Integrity);
+        }
+        let worker = postgres_probe::body_check_worker(request, trust, deadline)
+            .map_err(Error::Connection)?;
+        Ok(Self {
+            worker: Some(worker),
+            value: value.clone(),
+            observation: Observation { clock, guard },
+            mode: request.mode,
+            limit: deadline,
+            failed: None,
+            _thread: PhantomData,
+        })
+    }
+    pub fn check(&mut self) -> Result<Instant, Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        let result = self.turn();
+        if let Err(error) = result {
+            drop(self.worker.take());
+            self.failed = Some(error);
+        }
+        result
+    }
+    fn turn(&mut self) -> Result<Instant, Error> {
+        let worker = self.worker.as_mut().ok_or(Error::Integrity)?;
+        worker
+            .constrain_deadline(self.limit)
+            .map_err(Error::Connection)?;
+        let value = self.value.inner.clone();
+        let observation = Observation {
+            clock: self.observation.clock.clone(),
+            guard: self.observation.guard.clone(),
+        };
+        let deadline = self.limit;
+        let mode = self.mode;
+        let limit = worker
+            .run(move |client| {
+                Box::pin(async move {
+                    owners::begin_transaction(client).await?;
+                    let schema = crate::postgres_schema::lock_transaction_and_inspect(client)
+                        .await
+                        .map_err(|error| {
+                            if mode == Mode::Runtime {
+                                Error::Connection(postgres_probe::Error::RuntimeSchema)
+                            } else {
+                                Error::Owner(owners::Error::Schema(error))
+                            }
+                        })?;
+                    if schema.store_epoch != value.claim.binding().epoch() {
+                        return Err(owners::Error::Epoch.into());
+                    }
+                    if mode == Mode::Runtime {
+                        postgres_probe::qualify_runtime(client)
+                            .await
+                            .map_err(Error::Connection)?;
+                    }
+                    if !owners::lock_account_policy(client, &value.claim, true, false).await? {
+                        return Err(Error::Policy);
+                    }
+                    let limit = check_locked(client, deadline, &value, &observation).await?;
+                    client
+                        .batch_execute("ROLLBACK")
+                        .await
+                        .map_err(|_| Error::Database)?;
+                    Ok(limit)
+                })
+            })
+            .map_err(Error::Connection)??;
+        if Instant::now() >= limit {
+            return Err(Error::ExpiryHold);
+        }
+        self.limit = self.limit.min(limit);
+        Ok(self.limit)
+    }
+}
+
 fn check_current(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -52,89 +156,136 @@ fn check_current(
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<Instant, Error> {
-    let compact_body = value.inner.phase == 2;
     let value = value.inner.clone();
     let observation = Observation { clock, guard };
-    let limit = postgres_probe::with_phase_check_client(request, trust, deadline, compact_body, move |client| {
+    let limit = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             if !owners::begin(client, &value.claim, true, false).await? {
                 return Err(Error::Policy);
             }
-            let timestamp = observation.check(client, &value).await?;
-            crate::postgres_route_health::admit_locked(client, &value.claim, timestamp).await.map_err(Error::Health)?;
-            let published = receipt(client, &value).await?.ok_or(Error::Missing)?;
-            let binding = value.claim.binding();
-            let account_id = binding.account();
-            let account = account_id.as_bytes().as_slice();
-            let attempt = value.attempt.as_bytes().as_slice();
-            let rows = client.query("SELECT a.submission_id,s.expires_at,s.completed_at,s.changed,n.sequence,n.floor,a.ordinals FROM td_mta.submission_attempts a JOIN td_mta.submissions s ON s.account=a.account AND s.id=a.submission_id JOIN td_mta.accounts n ON n.id=a.account WHERE a.account=$1 AND a.attempt_id=$2 AND a.active AND a.route_name=$3 AND a.destination=$4 AND a.generation=$5 AND a.owner_boot=$6 AND a.owner_operation=$7", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
-            let row = rows.first().ok_or(Error::Missing)?;
-            let submission: &[u8] = row.try_get(0).map_err(|_|Error::Integrity)?;
-            let expires: i64 = row.try_get(1).map_err(|_|Error::Integrity)?;
-            let completed: Option<i64> = row.try_get(2).map_err(|_|Error::Integrity)?;
-            let sequence = number(row.try_get(4).map_err(|_|Error::Integrity)?)?;
-            let encoded:&[u8]=row.try_get(6).map_err(|_|Error::Integrity)?;
-            if encoded.is_empty() || encoded.len()>400 || !encoded.len().is_multiple_of(4) {
-                return Err(Error::Integrity);
-            }
-            if submission.len()!=16 || number(row.try_get(3).map_err(|_|Error::Integrity)?)?>sequence
-                || number(row.try_get(5).map_err(|_|Error::Integrity)?)?>sequence
-                || published.new_sequence>sequence {
-                return Err(Error::Integrity);
-            }
-            if completed.is_some() || timestamp>=expires {
-                return Err(Error::ExpiryHold);
-            }
-            if value.phase == 3 {
-                crate::postgres_final_capacity::check(client, account, attempt, &value.ordinals).await.map_err(capacity)?;
-            }
-            let query = if compact_body {
-                "SELECT ordinal,phase,pg_catalog.sha256(pg_catalog.convert_to(rcpt_reply,'UTF8')),data_reply IS NOT NULL,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
-            } else {
-                "SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
-            };
-            let rows=client.query(query, &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
-            if rows.len()>100 {return Err(Error::Integrity);}
-            let mut selected=value.ordinals.iter().enumerate();
-            for row in &rows {
-                let found:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
-                let phase:i64=row.try_get(1).map_err(|_|Error::Integrity)?;
-                let reason:i64=row.try_get(4).map_err(|_|Error::Integrity)?;
-                let next:Option<i64>=row.try_get(6).map_err(|_|Error::Integrity)?;
-                let changed=number(row.try_get(5).map_err(|_|Error::Integrity)?)?;
-                if !(0..1000).contains(&found) || !encoded.as_chunks::<4>().0.iter().any(|n|i64::from(u32::from_be_bytes(*n))==found)
-                    || reason!=0 || next.is_some() || changed>sequence {return Err(Error::Integrity);}
-                if phase==1 && value.ordinals.binary_search(&found).is_err() {continue;}
-                let (index, ordinal) = selected.next().ok_or(Error::Conflict)?;
-                if phase!=value.phase || ordinal!=&found {return Err(Error::Conflict);}
-                let reply_matches = if compact_body {
-                    let expected = reply_digest(value.replies.get(index).ok_or(Error::Integrity)?)?;
-                    let found:Option<&[u8]>=row.try_get(2).map_err(|_|Error::Integrity)?;
-                    let data:bool=row.try_get(3).map_err(|_|Error::Integrity)?;
-                    found == Some(expected.as_slice()) && !data
-                } else {
-                    let rcpt:Option<&str>=row.try_get(2).map_err(|_|Error::Integrity)?;
-                    let data:Option<&str>=row.try_get(3).map_err(|_|Error::Integrity)?;
-                    rcpt.is_some_and(|s|valid_reply(s,false)) && data.is_none()
-                };
-                if !reply_matches || changed!=published.new_sequence {
-                    return Err(Error::Integrity);
-                }
-            }
-            if selected.next().is_some() {return Err(Error::Conflict);}
-            let started = Instant::now();
-            let (finished, owner_expiry) = owners::check_locked_expiry_observed(client, &value.claim, value.generation, |utc_ms| {
-                crate::queue_clock::admit_database(observation.clock.as_ref(), &observation.guard, utc_ms, false).map_err(Error::Clock)
-            }).await?;
-            if finished<timestamp {return Err(Error::ExpiryHold);}
-            local_limit(started, deadline, finished, owner_expiry.min(expires))
+            check_locked(client, deadline, &value, &observation).await
         })
-    }).map_err(Error::Connection)??;
+    })
+    .map_err(Error::Connection)??;
     if Instant::now() >= limit {
         return Err(Error::ExpiryHold);
     }
     Ok(limit)
 }
+async fn check_locked(
+    client: &tokio_postgres::Client,
+    deadline: Instant,
+    value: &Fields,
+    observation: &Observation,
+) -> Result<Instant, Error> {
+    let compact_body = value.phase == 2;
+    let timestamp = observation.check(client, value).await?;
+    crate::postgres_route_health::admit_locked(client, &value.claim, timestamp)
+        .await
+        .map_err(Error::Health)?;
+    let published = receipt(client, value).await?.ok_or(Error::Missing)?;
+    let binding = value.claim.binding();
+    let account_id = binding.account();
+    let account = account_id.as_bytes().as_slice();
+    let attempt = value.attempt.as_bytes().as_slice();
+    let rows = client.query("SELECT a.submission_id,s.expires_at,s.completed_at,s.changed,n.sequence,n.floor,a.ordinals FROM td_mta.submission_attempts a JOIN td_mta.submissions s ON s.account=a.account AND s.id=a.submission_id JOIN td_mta.accounts n ON n.id=a.account WHERE a.account=$1 AND a.attempt_id=$2 AND a.active AND a.route_name=$3 AND a.destination=$4 AND a.generation=$5 AND a.owner_boot=$6 AND a.owner_operation=$7", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice(),&value.generation.to_be_bytes().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let row = rows.first().ok_or(Error::Missing)?;
+    let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+    let expires: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+    let completed: Option<i64> = row.try_get(2).map_err(|_| Error::Integrity)?;
+    let sequence = number(row.try_get(4).map_err(|_| Error::Integrity)?)?;
+    let encoded: &[u8] = row.try_get(6).map_err(|_| Error::Integrity)?;
+    if encoded.is_empty() || encoded.len() > 400 || !encoded.len().is_multiple_of(4) {
+        return Err(Error::Integrity);
+    }
+    if submission.len() != 16
+        || number(row.try_get(3).map_err(|_| Error::Integrity)?)? > sequence
+        || number(row.try_get(5).map_err(|_| Error::Integrity)?)? > sequence
+        || published.new_sequence > sequence
+    {
+        return Err(Error::Integrity);
+    }
+    if completed.is_some() || timestamp >= expires {
+        return Err(Error::ExpiryHold);
+    }
+    if value.phase == 3 {
+        crate::postgres_final_capacity::check(client, account, attempt, &value.ordinals)
+            .await
+            .map_err(capacity)?;
+    }
+    let query = if compact_body {
+        "SELECT ordinal,phase,pg_catalog.sha256(pg_catalog.convert_to(rcpt_reply,'UTF8')),data_reply IS NOT NULL,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
+    } else {
+        "SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
+    };
+    let rows = client
+        .query(query, &[&account, &submission, &attempt])
+        .await
+        .map_err(|_| Error::Database)?;
+    if rows.len() > 100 {
+        return Err(Error::Integrity);
+    }
+    let mut selected = value.ordinals.iter().enumerate();
+    for row in &rows {
+        let found: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
+        let phase: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
+        let reason: i64 = row.try_get(4).map_err(|_| Error::Integrity)?;
+        let next: Option<i64> = row.try_get(6).map_err(|_| Error::Integrity)?;
+        let changed = number(row.try_get(5).map_err(|_| Error::Integrity)?)?;
+        if !(0..1000).contains(&found)
+            || !encoded
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|n| i64::from(u32::from_be_bytes(*n)) == found)
+            || reason != 0
+            || next.is_some()
+            || changed > sequence
+        {
+            return Err(Error::Integrity);
+        }
+        if phase == 1 && value.ordinals.binary_search(&found).is_err() {
+            continue;
+        }
+        let (index, ordinal) = selected.next().ok_or(Error::Conflict)?;
+        if phase != value.phase || ordinal != &found {
+            return Err(Error::Conflict);
+        }
+        let reply_matches = if compact_body {
+            let expected = reply_digest(value.replies.get(index).ok_or(Error::Integrity)?)?;
+            let found: Option<&[u8]> = row.try_get(2).map_err(|_| Error::Integrity)?;
+            let data: bool = row.try_get(3).map_err(|_| Error::Integrity)?;
+            found == Some(expected.as_slice()) && !data
+        } else {
+            let rcpt: Option<&str> = row.try_get(2).map_err(|_| Error::Integrity)?;
+            let data: Option<&str> = row.try_get(3).map_err(|_| Error::Integrity)?;
+            rcpt.is_some_and(|s| valid_reply(s, false)) && data.is_none()
+        };
+        if !reply_matches || changed != published.new_sequence {
+            return Err(Error::Integrity);
+        }
+    }
+    if selected.next().is_some() {
+        return Err(Error::Conflict);
+    }
+    let started = Instant::now();
+    let (finished, owner_expiry) =
+        owners::check_locked_expiry_observed(client, &value.claim, value.generation, |utc_ms| {
+            crate::queue_clock::admit_database(
+                observation.clock.as_ref(),
+                &observation.guard,
+                utc_ms,
+                false,
+            )
+            .map_err(Error::Clock)
+        })
+        .await?;
+    if finished < timestamp {
+        return Err(Error::ExpiryHold);
+    }
+    local_limit(started, deadline, finished, owner_expiry.min(expires))
+}
+
 fn reply_digest(reply: &str) -> Result<[u8; 32], Error> {
     if !valid_reply(reply, false) {
         return Err(Error::Integrity);

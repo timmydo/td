@@ -10430,6 +10430,8 @@ mod attempt_rcpt;
 mod attempt_refusal;
 #[path = "postgres_probe/attempt_retry.rs"]
 mod attempt_retry;
+#[path = "postgres_probe/body_checks.rs"]
+mod body_checks;
 #[path = "postgres_probe/final_capacity.rs"]
 mod final_capacity;
 #[path = "postgres_probe/final_work.rs"]

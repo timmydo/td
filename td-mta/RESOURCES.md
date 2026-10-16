@@ -5201,3 +5201,12 @@ charges 1 MiB plus 128 KiB and 4096 records, preserving a 64 KiB margin over
 the protocol byte ceilings. Publication, Possible validation and final-capacity
 reservation keep their existing charges; all slot and shrinking-deadline
 rules are unchanged.
+
+The BodyChecks connection retains its original 1 MiB input, 1088-frame and
+64 KiB output ceilings over every validation turn. It shares the existing
+immutable Change through Arc and owns one worker plus clock/guard handles;
+no per-turn reply vector is retained. Its thread-bound owner closes on any
+refusal, deadline or cleanup failure. Each successful turn acknowledges
+rollback of transaction-scoped migration and row locks before returning.
+Dispatch still uses and charges one fresh connection per Body check; retaining
+this low-level validator does not supply a connection slot or work admission.

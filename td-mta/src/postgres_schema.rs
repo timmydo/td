@@ -228,6 +228,25 @@ pub(crate) async fn lock_and_inspect(client: &Client) -> Result<Receipt, Error> 
     ledger(client, true).await
 }
 
+// Caller has begun a transaction; its acknowledged rollback releases this
+// lock together with every row lock before the next transport turn.
+pub(crate) async fn lock_transaction_and_inspect(client: &Client) -> Result<Receipt, Error> {
+    version(client).await?;
+    let locked: bool = client
+        .query_one(
+            "SELECT pg_catalog.pg_try_advisory_xact_lock_shared($1)",
+            &[&MIGRATION_KEY],
+        )
+        .await
+        .map_err(|_| Error::Database)?
+        .try_get(0)
+        .map_err(|_| Error::Invalid)?;
+    if !locked {
+        return Err(Error::Busy);
+    }
+    ledger(client, true).await
+}
+
 async fn ledger(client: &Client, require_current: bool) -> Result<Receipt, Error> {
     let limit = MIGRATIONS.len().checked_add(1).ok_or(Error::Version)?;
     let limit = i64::try_from(limit).map_err(|_| Error::Version)?;
