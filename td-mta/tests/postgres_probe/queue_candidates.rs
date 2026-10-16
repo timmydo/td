@@ -121,6 +121,113 @@ pub(super) fn exercise(
         .candidates
         .iter()
         .all(|candidate| !(0..66).any(|n| candidate.submission == id(n))));
+    let expiry = || {
+        candidates::scan(
+            request,
+            trust,
+            deadline(),
+            claim,
+            generation,
+            Kind::Expiry,
+            None,
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        candidates::scan(
+            request,
+            trust,
+            deadline(),
+            claim,
+            generation,
+            Kind::Expiry,
+            Some(cursor)
+        ),
+        Err(candidates::Error::Cursor)
+    ));
+    let expired = id(67);
+    let contains = |page: &candidates::Page, submission| {
+        page.candidates.iter().any(|c| c.submission == submission)
+    };
+    let page = expiry();
+    assert!(contains(&page, expired));
+    assert_eq!(
+        page.candidates
+            .iter()
+            .find(|c| c.submission == expired)
+            .unwrap()
+            .due_at,
+        1
+    );
+    assert!(!contains(&page, id(66)));
+    assert!(!contains(&page, id(69)));
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET expires_at=1 WHERE id=decode('{}','hex')",
+            id(68)
+        ),
+    );
+    assert!(!contains(&expiry(), id(68)));
+    for (assignment,eligible) in [
+        ("state=1,next_attempt_at=9223372036854775807",true),
+        ("state=2,attempt_id=decode(repeat('5d',16),'hex'),attempt_count=1,last_attempt_at=0,phase=1,next_attempt_at=NULL",true),
+        ("state=3,phase=4,reason=3",true),
+        ("state=7,uncertain=1,reason=6,next_attempt_at=NULL",false),
+        ("next_attempt_at=300000",true),
+        ("state=4,uncertain=0,rcpt_reply='250 ok',data_reply='250 ok',next_attempt_at=NULL",false),
+        ("state=6,reason=7",false),
+    ] {
+        sql(fixture,&format!("UPDATE td_mta.recipients SET {assignment} WHERE submission_id=decode('{expired}','hex')"));
+        assert_eq!(contains(&expiry(),expired),eligible,"{assignment}");
+    }
+    sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,rcpt_reply=NULL,data_reply=NULL,reason=0 WHERE submission_id=decode('{expired}','hex'); UPDATE td_mta.submissions SET completed_at=1 WHERE id=decode('{expired}','hex')"));
+    assert!(!contains(&expiry(), expired));
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET completed_at=NULL WHERE id=decode('{expired}','hex')"
+        ),
+    );
+    // This private database has no concurrent fixture writer. Preserve all
+    // prior route health while injecting independently observable pauses.
+    sql(
+        fixture,
+        "CREATE TABLE public.candidate_health_backup AS TABLE td_mta.route_health",
+    );
+    sql(fixture,&format!("INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,(extract(epoch FROM clock_timestamp())*1000)::bigint,(extract(epoch FROM clock_timestamp())*1000)::bigint+300000,NULL FROM td_mta.submission_routes WHERE submission_id=decode('{source}','hex') ON CONFLICT(account,route_name,destination) DO UPDATE SET failure_count=1,reason=3,failed_at=EXCLUDED.failed_at,next_at=EXCLUDED.next_at,repair_generation=NULL"));
+    assert!(matches!(
+        candidates::scan(
+            request,
+            trust,
+            deadline(),
+            claim,
+            generation,
+            Kind::Fresh,
+            None
+        ),
+        Err(candidates::Error::RouteHealth(
+            td_mta::postgres_route_health::Error::Backoff
+        ))
+    ));
+    assert!(contains(&expiry(), expired));
+    sql(fixture,"UPDATE td_mta.route_health SET reason=5,repair_generation=decode('0000000000000001','hex') WHERE failure_count>0");
+    assert!(matches!(
+        candidates::scan(
+            request,
+            trust,
+            deadline(),
+            claim,
+            generation,
+            Kind::Fresh,
+            None
+        ),
+        Err(candidates::Error::RouteHealth(
+            td_mta::postgres_route_health::Error::RepairRequired
+        ))
+    ));
+    assert!(contains(&expiry(), expired));
+    sql(fixture,"DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT * FROM public.candidate_health_backup; DROP TABLE public.candidate_health_backup");
     assert_eq!(
         sql(
             fixture,
@@ -149,6 +256,16 @@ pub(super) fn exercise(
         ),
         Err(candidates::Error::Busy)
     ));
+    sql(
+        fixture,
+        &format!(
+            "UPDATE td_mta.submissions SET expires_at=1 WHERE id=decode('{}','hex')",
+            id(0)
+        ),
+    );
+    let page = expiry();
+    assert!(contains(&page, id(0)));
+    assert!(contains(&page, expired));
     let cancellation = cancel::prepare(claim, generation, id(0)).unwrap();
     cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
     let page = candidates::scan(

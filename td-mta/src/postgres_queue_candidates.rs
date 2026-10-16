@@ -13,6 +13,7 @@ pub const PAGE_SIZE: usize = 64;
 pub enum Kind {
     Fresh,
     Retry,
+    Expiry,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -49,6 +50,8 @@ pub struct Page {
 /// page is not a snapshot continuation or a reservation; restart at None on
 /// the next scheduling pass. Recheck queue-clock guards and every publication
 /// fence before preparing work, and never infer permission to send from a hint.
+/// Expiry hints bypass delivery pauses and active attempts; the expiry publisher
+/// still requires confirmed clock admission and a closed/fenced transport.
 pub fn scan(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -72,16 +75,24 @@ pub fn scan(
                 return Err(Error::Policy);
             }
             let observed_at = owners::check_locked(client, &claim, generation).await.map_err(Error::Owner)?;
-            postgres_route_health::admit_locked(client, &claim, observed_at).await.map_err(Error::RouteHealth)?;
+            if kind != Kind::Expiry {
+                postgres_route_health::admit_locked(client, &claim, observed_at).await.map_err(Error::RouteHealth)?;
+            }
             let binding = claim.binding();
             let account = binding.account();
             let account = account.as_bytes().as_slice();
-            let busy:bool = client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND active)", &[&account,&binding.route().name()]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
-            if busy { return Err(Error::Busy); }
-            let states: &[i64] = match kind { Kind::Fresh => &[1], Kind::Retry => &[3,7] };
+            if kind != Kind::Expiry {
+                let busy:bool = client.query_one("SELECT EXISTS(SELECT 1 FROM td_mta.submission_attempts WHERE account=$1 AND route_name=$2 AND active)", &[&account,&binding.route().name()]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
+                if busy { return Err(Error::Busy); }
+            }
+            let states: &[i64] = match kind { Kind::Fresh => &[1], Kind::Retry => &[3,7], Kind::Expiry => &[] };
             let after_id = after.as_ref().map(|cursor| cursor.last.submission.as_bytes().as_slice());
             let after_due = after.map_or(0, |cursor| cursor.last.due_at);
-            let rows = client.query("SELECT id,due FROM (SELECT s.id,min(p.next_attempt_at) AS due FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id JOIN td_mta.recipients p ON p.account=s.account AND p.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.send_at<=$4 AND s.expires_at>$4 AND p.state=ANY($7) AND p.next_attempt_at<=$4 GROUP BY s.id) candidates WHERE ($5::bytea IS NULL OR (due,id)>($6,$5)) ORDER BY due,id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due,&states]).await.map_err(|_|Error::Database)?;
+            let rows = if kind == Kind::Expiry {
+                client.query("SELECT s.id,s.expires_at FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.expires_at<=$4 AND EXISTS(SELECT 1 FROM td_mta.recipients p WHERE p.account=s.account AND p.submission_id=s.id AND (p.state IN (1,2,3) OR (p.state=7 AND p.next_attempt_at IS NOT NULL))) AND ($5::bytea IS NULL OR (s.expires_at,s.id)>($6,$5)) ORDER BY s.expires_at,s.id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due]).await.map_err(|_|Error::Database)?
+            } else {
+                client.query("SELECT id,due FROM (SELECT s.id,min(p.next_attempt_at) AS due FROM td_mta.submissions s JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id JOIN td_mta.recipients p ON p.account=s.account AND p.submission_id=s.id WHERE s.account=$1 AND r.route_name=$2 AND r.destination=$3 AND s.completed_at IS NULL AND s.send_at<=$4 AND s.expires_at>$4 AND p.state=ANY($7) AND p.next_attempt_at<=$4 GROUP BY s.id) candidates WHERE ($5::bytea IS NULL OR (due,id)>($6,$5)) ORDER BY due,id LIMIT 65", &[&account,&binding.route().name(),&binding.route().destination().as_slice(),&observed_at,&after_id,&after_due,&states]).await.map_err(|_|Error::Database)?
+            };
             if rows.len() > PAGE_SIZE+1 { return Err(Error::Integrity); }
             let mut candidates = Vec::new();
             candidates.try_reserve_exact(rows.len().min(PAGE_SIZE)).map_err(|_|Error::Capacity)?;

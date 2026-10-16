@@ -3741,3 +3741,31 @@ or production backend is activated by this API. The real PostgreSQL scenario
 covers multi-page discovery, eligibility filtering, separate retry discovery,
 stale generations, cursor-kind binding, active-attempt refusal and unchanged
 account state during read-only scans.
+
+
+## 135. Expiry discovery during delivery pauses
+
+The route candidate scanner also supplies expiry hints ordered by submission
+expiry time and ID under the same page, cursor, policy and ownership bounds.
+It selects uncompleted expired submissions matching the immutable route and
+destination that still have Queued, InFlight or Deferred recipients, or
+OutcomeUnknown recipients with a retained retry time. Terminal unknown,
+Accepted and Canceled recipients do not make a submission expiry-eligible.
+Recipient retry times and send times do not postpone expiry discovery.
+
+Expiry discovery bypasses delivery backoff, repair pauses and active-attempt
+refusal: those delivery conditions must not hide expired responsibility.
+This differs from fresh/retry discovery only; the read writes no state and
+still refuses a stale owner. An expired InFlight hint grants no authority to
+change its recipients or continue its transport. The expiry publisher still
+requires closed/fenced transport, confirmed queue-clock admission, current
+ownership and policy, exact recipient validation and its global rate limit.
+In particular a forward database clock jump may produce a hint while the
+clock guard correctly refuses expiry publication.
+
+The real PostgreSQL scenario covers expired hints during route backoff,
+repair and active attempts; expiry despite a future retry time; supported
+recipient states; and exclusion of terminal unknown, Accepted, Canceled,
+completed, live and destination-mismatched submissions. Pagination retains
+its independent-observation semantics and must restart for each scheduling
+pass. No background scheduler or transport is activated.
