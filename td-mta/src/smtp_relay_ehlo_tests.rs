@@ -12,7 +12,7 @@ type Failed = Refusal<Box<[u8; TLS_WIRE_BYTES]>>;
 fn cap(tick: u64) -> Deadline {
     Deadline::after(Tick(0), tick).unwrap()
 }
-fn send(peer: &mut Connection, bytes: &[u8]) {
+pub(super) fn send(peer: &mut Connection, bytes: &[u8]) {
     let mut written = 0;
     for _ in 0..100_000 {
         if written < bytes.len() {
@@ -29,7 +29,7 @@ fn send(peer: &mut Connection, bytes: &[u8]) {
     }
     panic!("fixture send did not finish");
 }
-fn drive(
+pub(super) fn drive(
     owner: Exchange<'_, Box<[u8; TLS_WIRE_BYTES]>>,
     peer: &mut Connection,
     response: &[u8],

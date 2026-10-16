@@ -13,6 +13,8 @@ mod https_tests;
 mod io_tests;
 #[path = "mail_client_tests.rs"]
 mod mail_client_tests;
+#[path = "smtp_relay_auth_tests.rs"]
+mod relay_auth_tests;
 #[path = "smtp_relay_ehlo_tests.rs"]
 mod relay_ehlo_tests;
 #[path = "smtp_receiving_tests.rs"]

@@ -1230,7 +1230,7 @@ original absolute deadline abort the socket. Each turn performs at most one
 TLS transport operation and parses at most one bounded control line; four
 caller-reserved 512-byte cells hold input, greeting, EHLO reply and command.
 The returned session has no authentication, account or queue authority.
-The production relay scheduler and credential exchange remain separate work.
+The production relay scheduler remains separate work.
 
 Each compiled relay policy retains a private domain-separated SHA-256 digest
 of the exact decoded username/password, framed by lengths. The completed EHLO
@@ -1240,8 +1240,33 @@ It retains no second plaintext password copy and sends no AUTH bytes. This is
 a local configuration-binding check, not a persisted password verifier,
 current-generation admission or successful remote authentication. Credential
 rotation changes new policies; old sessions continue to identify their old
-snapshot until the runtime retires them. The AUTH owner must perform this
-check before writing credentials and still enforce its live queue/route fences.
+snapshot until the runtime retires them. The prepared AUTH owner performs this check before writing any AUTH command;
+the runtime must still enforce live queue/route fences.
+
+The prepared AUTH exchange consumes that fresh-EHLO session and borrows the
+original work meter and credential strings. Prefer advertised PLAIN; select
+LOGIN only when PLAIN is absent. Never retry with another mechanism after
+refusal. Send AUTH without an initial response. PLAIN requires one empty,
+single-line 334 challenge, then sends the RFC 4616 empty-authorization-identity
+form. LOGIN requires two single-line 334 challenges with strictly valid padded
+base64 (empty is allowed); ignore decoded prompt contents and send username,
+then password. Both mechanisms require a complete 235 reply after the final
+credential response. Early 235, unexpected codes, malformed challenges, EOF,
+and current-input-cell reply tails refuse and tear down the connection.
+
+The shared unwrapped base64 encoder finishes each bounded response before any
+of its bytes are written. Maximum response storage is 1710 bytes including
+CRLF; it is a SASL response, not a 512-byte initial SMTP command. Each turn
+performs at most one transport operation and one reply-line parse, or one
+bounded codec poll, or one bounded credential preparation. Pre/post clock
+checks and the same borrowed meter apply throughout, including pending I/O.
+No codec, read or write receives a refreshed meter or deadline. Refusal
+releases TLS, socket and retained policy before returning reserved buffers.
+Success retains exclusive connection custody and mechanism evidence; it is
+not account, route, queue or current-generation authority. This prepares
+local protocol machinery; production relay scheduling is not activated.
+Credential cells and caller strings must not enter logs; no secure-erasure
+claim is made for caller scratch or native TLS buffers.
 
 The operator configures permitted From/envelope identities; aliases accepted
 inbound are not automatically authorized outbound by Migadu.

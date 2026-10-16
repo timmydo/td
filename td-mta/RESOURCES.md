@@ -4881,3 +4881,17 @@ cells and existing TLS wire/provider reservations are accounted separately.
 The locally scoped large-enum lint allowance preserves inline custody without
 allocating a box on each turn. Refusal destroys native TLS and the socket
 before returning only the reusable input/output reservations.
+
+The prepared AUTH owner additionally borrows four 512-byte cells (input and
+three distinct reply readers), a 1280-byte plaintext cell and a 1710-byte
+encoded response cell. These 5038 bytes are reserved before the exchange.
+Its standard boxed-TLS progress representation is compile-time capped at
+8 KiB, separately from TLS reservations and borrowed cells. Encoding and
+challenge decoding use the shared 256-transition codec turns; no turn grows
+a collection or allocates. Every turn charges a record, pending included;
+reads precharge 512 I/O bytes and writes precharge their remaining bounded
+response extent before attempting transport. Codec input/output charges use
+the original borrowed meter. These conservative reservations are consumed
+on pending attempts too. Flush turns consume a record under the same fixed
+deadline. Runtime scheduling must supply the admitted work budget and live
+queue/route fences; protocol completion grants neither.
