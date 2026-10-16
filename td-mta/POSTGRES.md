@@ -4759,3 +4759,34 @@ retry cap, verifies that extraction frees the local slot while preserving exact
 evidence, and settles through fresh admission. A delayed-COMMIT retry additionally
 keeps Pending occupied across extraction and requires independent inspection
 before exact historical replay.
+
+## 172. Bound native MAIL exchange
+
+postgres_relay_mail binds a reserved MailPlan to one authenticated relay
+Session for the duration of MAIL. The trusted caller still selects the matching
+route session; the adapter itself selects the exact admitted reverse path,
+runtime clock and original deadline. SevenBit frames MAIL FROM; EightBit frames
+BODY=8BITMIME only when the session retained the negotiated capability. It
+borrows the caller's original wire and database meters through the exchange.
+
+Every write and flush turn first rechecks the exact untouched Prepared envelope
+through the original owner. Its local cap may only shorten. Database locks and
+connections do not span transport calls. Each turn uses the existing bounded
+command parser and wire budget; before/after transport checks remain in force.
+The pause/takeover and already-buffered-byte boundary in section 4 is unchanged.
+
+An actual normalized 2xx reply returns the same session, original envelope and
+MAIL mode together. Explicit into_parts hands them to the trusted next stage;
+it does not implement RCPT ordering or grant output without fresh checks.
+An actual 4xx/5xx reply enters the preallocated negative MAIL publication before
+any further database admission. Known failure retains exact CommandFailure;
+unknown COMMIT also stays in Pending. Rejection, protocol/admission failure and
+publication failure close transport and return its buffers. Other reply classes
+refuse without invented evidence. No returned durable receipt is a live owner.
+
+The real PostgreSQL/TLS fixture exercises exact sender framing, positive MAIL,
+durable negative MAIL, negative-publication rollback and retained retry, occupied
+connection slots and changed envelope identity before output, expired local custody, unadvertised EightBit,
+and a non-final reply class. Interrupted Prepared attempts are recovered only
+after transport closes. This adapter does not activate production dispatch or
+claim complete envelope orchestration or maximum-message throughput.

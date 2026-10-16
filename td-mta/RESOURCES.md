@@ -5147,3 +5147,12 @@ same immutable request. Fresh passive publication charges PHASE_IO/4096 records
 and uses an ordinary slot; independent uncertain-COMMIT settlement retains its
 separate slot budget. The durable final-result capacity claim is unchanged by
 extraction and remains charged until its existing terminal transaction consumes it.
+
+The native MAIL adapter owns its existing MailPlan and inline TLS exchange,
+borrowing command input/line/reply/output cells and both work meters. It adds no
+reply-vector copy, per-turn wrapper allocation, connection reservation or
+background queue. Live observation retains its existing native allocation
+bounds. Each write/flush observation charges ATTEMPT_IO/4096 records and acquires
+an ordinary slot only for the database operation. Negative publication retains
+the existing preallocated MAIL evidence and PHASE_IO charge; all known and
+uncertain failure custody follows the existing CommandFailure/Pending bounds.

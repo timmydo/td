@@ -11816,3 +11816,6 @@ mod relay_wire;
 
 #[path = "postgres_probe/dispatch_recovery.rs"]
 mod dispatch_recovery;
+
+#[path = "postgres_probe/native_mail_exchange.rs"]
+mod native_mail_exchange;
