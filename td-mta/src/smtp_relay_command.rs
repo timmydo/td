@@ -57,6 +57,10 @@ pub struct Reply<'a, B: TlsWireStorage> {
     reply: NormalizedReplyReader<'a>,
 }
 impl<B: TlsWireStorage> Reply<'_, B> {
+    /// Fence transport while retaining complete normalized parser storage.
+    pub(crate) fn abort(&mut self) {
+        self.session.connection_mut().abort();
+    }
     pub fn code(&self) -> Result<u16, Error> {
         self.reply.code().ok_or(Error::Invalid)
     }

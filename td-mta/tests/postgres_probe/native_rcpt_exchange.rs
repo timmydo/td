@@ -4,7 +4,7 @@ use td_crypto::TrustStore;
 use td_mta::{
     clock::RuntimeClock,
     ids::SubmissionId,
-    ports::{Clock, Time, Transport},
+    ports::{Clock, Time},
     postgres_attempt_phases as phases, postgres_attempts as attempts,
     postgres_dispatch as dispatch,
     postgres_probe::{Mode, Request},
@@ -228,79 +228,4 @@ pub(super) fn exercise(
     }
 }
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Fixture keeps real TLS owners inline."
-)]
-enum Start<'w, 'a, 'r> {
-    Mail(td_mta::postgres_relay_mail::Accepted<'w, 'a, 'r, wire::Buffer>),
-    Cursor(rcpt::Cursor<'w, 'a, 'r, wire::Buffer>),
-}
-enum Step<'w, 'a, 'r> {
-    Next(rcpt::Cursor<'w, 'a, 'r, wire::Buffer>),
-    Ready(rcpt::Completed<'w, 'a, 'r, wire::Buffer>),
-    Closed(rcpt::Closed<'w, 'a, 'r, wire::Buffer>),
-    Refused(rcpt::Refusal<'w, 'a, 'r, wire::Buffer>),
-}
-fn command<'w, 'a, 'r>(
-    start: Start<'w, 'a, 'r>,
-    peer: &mut wire::Peer,
-    cap: td_mta::ports::Deadline,
-    database: &mut td_mta::admission::work::Meter,
-    expected: &[u8],
-    response: &[u8],
-) -> (Step<'w, 'a, 'r>, Vec<u8>) {
-    let mut input = [0; 512];
-    let mut line = [0; 512];
-    let mut reply = [0; 4096];
-    let mut output = [0; 512];
-    let mut network = wire::meter(cap);
-    let scratch = td_mta::smtp_relay_command::Scratch {
-        input: &mut input,
-        line: &mut line,
-        reply: &mut reply,
-        command: &mut output,
-    };
-    let begin = match start {
-        Start::Mail(accepted) => rcpt::begin(accepted, scratch, &mut network, database),
-        Start::Cursor(cursor) => cursor.begin_next(scratch, &mut network, database),
-    };
-    let mut exchange = match begin {
-        Ok(exchange) => exchange,
-        Err(failure) => return (Step::Refused(failure), Vec::new()),
-    };
-    let mut received = Vec::new();
-    let mut sent = 0;
-    loop {
-        let mut bytes = [0; 512];
-        if let td_mta::ports::IoProgress::Bytes(n) = peer.read(&mut bytes).unwrap() {
-            received.extend_from_slice(&bytes[..n]);
-        }
-        assert!(expected.starts_with(&received));
-        if received == expected {
-            if sent < response.len() {
-                if let td_mta::ports::IoProgress::Bytes(n) = peer.write(&response[sent..]).unwrap()
-                {
-                    sent += n;
-                }
-            }
-            let _ = peer.flush().unwrap();
-        }
-        let step = match exchange.advance() {
-            Ok(rcpt::Progress::Pending(next)) => {
-                exchange = next;
-                std::thread::yield_now();
-                continue;
-            }
-            Ok(rcpt::Progress::Next(cursor)) => Step::Next(cursor),
-            Ok(rcpt::Progress::Ready(done)) => Step::Ready(done),
-            Ok(rcpt::Progress::Closed(closed)) => Step::Closed(closed),
-            Err(failure) => Step::Refused(failure),
-        };
-        if !matches!(step, Step::Refused(_)) {
-            assert_eq!(received, expected);
-            assert_eq!(sent, response.len());
-        }
-        return (step, received);
-    }
-}
+use super::relay_wire::{rcpt_command as command, RcptStart as Start, RcptStep as Step};

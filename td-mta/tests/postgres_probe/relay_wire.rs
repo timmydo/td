@@ -363,3 +363,81 @@ pub(super) fn accepted_mail<'w, 'a, 'r>(
         std::thread::yield_now();
     }
 }
+
+use td_mta::postgres_relay_rcpt as rcpt;
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Fixture keeps real TLS owners inline."
+)]
+pub(super) enum RcptStart<'w, 'a, 'r> {
+    Mail(td_mta::postgres_relay_mail::Accepted<'w, 'a, 'r, Buffer>),
+    Cursor(rcpt::Cursor<'w, 'a, 'r, Buffer>),
+}
+pub(super) enum RcptStep<'w, 'a, 'r> {
+    Next(rcpt::Cursor<'w, 'a, 'r, Buffer>),
+    Ready(rcpt::Completed<'w, 'a, 'r, Buffer>),
+    Closed(rcpt::Closed<'w, 'a, 'r, Buffer>),
+    Refused(rcpt::Refusal<'w, 'a, 'r, Buffer>),
+}
+pub(super) fn rcpt_command<'w, 'a, 'r>(
+    start: RcptStart<'w, 'a, 'r>,
+    peer: &mut Peer,
+    cap: td_mta::ports::Deadline,
+    database: &mut td_mta::admission::work::Meter,
+    expected: &[u8],
+    response: &[u8],
+) -> (RcptStep<'w, 'a, 'r>, Vec<u8>) {
+    let mut input = [0; 512];
+    let mut line = [0; 512];
+    let mut reply = [0; 4096];
+    let mut output = [0; 512];
+    let mut network = meter(cap);
+    let scratch = td_mta::smtp_relay_command::Scratch {
+        input: &mut input,
+        line: &mut line,
+        reply: &mut reply,
+        command: &mut output,
+    };
+    let begin = match start {
+        RcptStart::Mail(accepted) => rcpt::begin(accepted, scratch, &mut network, database),
+        RcptStart::Cursor(cursor) => cursor.begin_next(scratch, &mut network, database),
+    };
+    let mut exchange = match begin {
+        Ok(exchange) => exchange,
+        Err(failure) => return (RcptStep::Refused(failure), Vec::new()),
+    };
+    let mut received = Vec::new();
+    let mut sent = 0;
+    loop {
+        let mut bytes = [0; 512];
+        if let td_mta::ports::IoProgress::Bytes(n) = peer.read(&mut bytes).unwrap() {
+            received.extend_from_slice(&bytes[..n]);
+        }
+        assert!(expected.starts_with(&received));
+        if received == expected {
+            if sent < response.len() {
+                if let td_mta::ports::IoProgress::Bytes(n) = peer.write(&response[sent..]).unwrap()
+                {
+                    sent += n;
+                }
+            }
+            let _ = peer.flush().unwrap();
+        }
+        let step = match exchange.advance() {
+            Ok(rcpt::Progress::Pending(next)) => {
+                exchange = next;
+                std::thread::yield_now();
+                continue;
+            }
+            Ok(rcpt::Progress::Next(cursor)) => RcptStep::Next(cursor),
+            Ok(rcpt::Progress::Ready(done)) => RcptStep::Ready(done),
+            Ok(rcpt::Progress::Closed(closed)) => RcptStep::Closed(closed),
+            Err(failure) => RcptStep::Refused(failure),
+        };
+        if !matches!(step, RcptStep::Refused(_)) {
+            assert_eq!(received, expected);
+            assert_eq!(sent, response.len());
+        }
+        return (step, received);
+    }
+}

@@ -287,6 +287,7 @@ pub(super) fn exercise(
     super::native_final_handoff::exercise(fixture, request, trust, claim, generation, source);
     super::native_mail_exchange::exercise(fixture, request, trust, claim, generation, source);
     super::native_rcpt_exchange::exercise(fixture, request, trust, claim, generation, source);
+    super::native_data_exchange::exercise(fixture, request, trust, claim, generation, source);
     super::dispatch_recovery::exercise(fixture, request, trust, claim, generation, source);
     super::dispatch_worker::exercise(fixture, request, trust, claim, generation, source);
     for n in 0..70 {

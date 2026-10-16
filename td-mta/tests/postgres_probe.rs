@@ -11822,3 +11822,6 @@ mod native_mail_exchange;
 
 #[path = "postgres_probe/native_rcpt_exchange.rs"]
 mod native_rcpt_exchange;
+
+#[path = "postgres_probe/native_data_exchange.rs"]
+mod native_data_exchange;

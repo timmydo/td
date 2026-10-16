@@ -818,6 +818,21 @@ pub struct RcptDataPlan<'w, 'a, 'r> {
     refusal: Option<Change>,
 }
 impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+        self.data.envelope.prepared.worker.connection.clock.clone()
+    }
+    pub(crate) fn original_deadline(&self) -> Deadline {
+        self.data.envelope.prepared.until
+    }
+    pub(crate) fn work_limit(&self) -> Instant {
+        self.data.envelope.prepared.limit
+    }
+    pub(crate) fn fenced(self, error: Error) -> RcptBodyFailure<'w, 'a, 'r> {
+        RcptBodyFailure {
+            error,
+            retained: self,
+        }
+    }
     /// Publish preceding RCPT refusal and new observed Body only after actual
     /// 354. Any failure retains evidence and requires fencing the session;
     /// the failure grants no transport retry or historical output owner.

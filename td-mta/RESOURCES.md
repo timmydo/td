@@ -5165,3 +5165,12 @@ introduced. Existing envelope observations retain their native allocation and
 ATTEMPT_IO/4096-record charges. Finishing moves cells into existing RcptResult;
 passive negative/recovery planning and publication retain their established
 reply-vector bounds and fresh admission charges.
+
+The bound DATA adapter owns the existing boxed RcptDataPlan and inline TLS
+command exchange, borrowing parser cells and both work meters. It introduces no
+reply-vector copy, queue, per-turn wrapper allocation or connection reservation.
+Fencing a negative reply aborts TLS while retaining already-normalized parser
+storage; the existing TLS buffers and policy slot remain owned until returned
+after bounded publication. Pre-output checks retain ATTEMPT_IO/4096 charges;
+ordered result publication retains PHASE_IO and existing mixed-RCPT/Body failure
+reply-vector bounds. Refusals move existing passive ownership into a typed enum.

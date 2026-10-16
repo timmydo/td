@@ -4830,3 +4830,39 @@ between commands, plus intermediate/final 421 shutdown. They verify exact
 commands, no further output on admission
 refusal, retained reply texts and fenced recovery. Production dispatch, DATA
 orchestration and maximum-message throughput remain separate work.
+
+## 174. Bound DATA exchange after complete ordered RCPT
+
+postgres_relay_data begins only from postgres_relay_rcpt::Completed, preserving
+the same authenticated session and MAIL mode. It reserves the bound DATA
+alternatives before command output and keeps the original runtime clock,
+deadline and shrinking cap. Each write/flush turn rechecks the untouched
+Prepared envelope; preceding negative RCPT replies remain unpublished until
+actual DATA completion. Existing bounded parser and work-meter checks apply.
+
+An actual complete 354 returned by the command parser enters ordered negative
+RCPT publication and new observed Body publication through RcptDataPlan. Only
+known new observed Body before the retained cap returns BodyResult, matching
+Dispatch, same session and mode. Historical receipts or uncertain commits never
+construct this handoff. The trusted body stage still owns matching immutable
+source and final-capacity reservation; explicit into_parts is that boundary.
+No body bytes or terminator are sent by this command adapter.
+
+An actual negative DATA reply fences the socket before settlement while keeping
+the parser's existing normalized reply storage readable. A crate-private abort
+on command Reply provides this ordering without a reply copy. Ordered refusal
+publication retains the exact RcptCommandFailure on failure. Other reply classes,
+wire failure, stale authority, deadline or capacity refusal close transport and
+retain the bound RCPT plan as passive RcptBodyFailure for interruption planning.
+Initial reservation failure closes and preserves RcptFailure. No refusal returns
+a live session; unknown COMMIT remains in Pending, and passive settlement uses
+its existing ordered publication and independent inspection rules.
+
+Native PostgreSQL/TLS fixtures drive actual bound MAIL and mixed RCPT into DATA.
+They cover known new Body with matching final-capacity reservation, permanent
+and 421 temporary DATA rejection, rollback at negative RCPT/Body/DATA publication,
+slot refusal before DATA output, and an invalid positive DATA status. Each path
+verifies exact reply persistence and retirement after transport closure. Shared
+RCPT fixture drivers are used by both adapters. Full body/final transfer remains
+separately qualified by its existing native fixture; production activation and
+maximum-message throughput are not claimed here.

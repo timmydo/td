@@ -148,6 +148,7 @@ pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_read;
 pub mod postgres_relay_body;
+pub mod postgres_relay_data;
 pub mod postgres_relay_finish;
 pub mod postgres_relay_mail;
 pub mod postgres_relay_rcpt;
