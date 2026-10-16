@@ -59,6 +59,32 @@ struct Fields {
     digest: [u8; 32],
 }
 impl Change {
+    pub(crate) fn interrupted_body(
+        &self,
+    ) -> Result<crate::postgres_attempt_recovery::Recovery, crate::postgres_attempt_recovery::Error>
+    {
+        use crate::postgres_attempt_recovery::{self as recovery, Error};
+        let value = &self.inner;
+        if value.phase != 2 || value.ordinals.len() != value.replies.len() {
+            return Err(Error::Integrity);
+        }
+        let mut accepted = Vec::new();
+        accepted
+            .try_reserve_exact(value.ordinals.len())
+            .map_err(|_| Error::Capacity)?;
+        for (ordinal, reply) in value.ordinals.iter().zip(&value.replies) {
+            accepted.push((
+                u32::try_from(*ordinal).map_err(|_| Error::Integrity)?,
+                reply.as_str(),
+            ));
+        }
+        recovery::interrupted_with_body_rcpt(
+            &value.claim,
+            value.generation,
+            value.attempt,
+            &accepted,
+        )
+    }
     pub(crate) fn body_final(&self) -> Result<(Change, FinalReply), Error> {
         let value = &self.inner;
         if value.phase != 2 {

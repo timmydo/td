@@ -5131,3 +5131,12 @@ cells and 409600-byte request bound. Its mode and domain-separated digest add
 constant metadata only. Publication counts Prepared updates separately and
 verifies Body cells in the existing bounded locked-row batch; it adds no query,
 reply vector, connection slot or transport owner.
+
+Bound positive-DATA publication retains the existing boxed DATA alternatives
+and optional negative-RCPT Change. The box is allocated before DATA and failures
+move it without post-reply allocation. Fenced interruption planning may overlap
+the three DATA reply vectors, disjoint negative-RCPT cells, and one copied
+positive recovery vector, at most 1638400 reply bytes plus existing bounded
+metadata and borrowed references. Successful conversion drops DATA alternatives;
+negative/recovery requests together retain at most 409600 reply bytes. Native
+publication copies and protocol buffers keep their separate bounds.

@@ -4716,3 +4716,25 @@ Body without manufacturing a transport owner from history.
 Native fixtures cover an entirely Body positive subset, mixed Body/Prepared
 members, mismatching replies, AcceptancePossible refusal, expiry hold, rollback
 of replies and sequence, delayed COMMIT inspection/replay, and attempt retirement.
+
+## 170. Positive DATA handoff retains failed publication evidence
+
+RcptDataPlan reserves its boxed DATA owner before the command. After actual
+normalized 354, its bound handoff publishes any negative RCPT subset first and
+then only a new observed Body transition, with the original minimum cap. Only
+known new publication before that cap yields BodyResult and the matching
+immutable-body request. Historical receipts never create output custody.
+
+Every failure retains the exact plan and its actual positive replies, plus any
+RCPT refusal not known committed. The caller closes or fences the SMTP session.
+The failure exposes no transport retry or owner extraction; it can only plan
+passive interruption using interrupted_with_body_rcpt. Allocation or validation
+failure preserves that custody. The recovery handles Prepared members or exact
+already-Body evidence after a known or uncertain publication; Pending still
+blocks all publication until exact unknown-COMMIT inspection. Negative RCPT
+settlement precedes recovery. No result reconstruction permits output.
+
+The paired TLS/PostgreSQL fixture uses this handoff for mixed successful DATA,
+forces known failure at either publication and delayed Body COMMIT, then fences
+the session and verifies retained actual replies and complete retirement through
+passive recovery. Production scheduling and backend activation remain deferred.

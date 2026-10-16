@@ -796,10 +796,74 @@ pub struct RcptResult<'w, 'a, 'r> {
 /// Exact negative-RCPT request paired with DATA alternatives. Actual command
 /// sequencing remains the caller's duty; negative publication retains both steps.
 pub struct RcptDataPlan<'w, 'a, 'r> {
-    data: DataPlan<'w, 'a, 'r>,
+    data: Box<DataPlan<'w, 'a, 'r>>,
     refusal: Option<Change>,
 }
 impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
+    /// Publish preceding RCPT refusal and new observed Body only after actual
+    /// 354. Any failure retains evidence and requires fencing the session;
+    /// the failure grants no transport retry or historical output owner.
+    pub fn publish_body(
+        mut self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), RcptBodyFailure<'w, 'a, 'r>> {
+        let result = self.try_body(reply, meter);
+        match result {
+            Ok((outcome, limit)) if Instant::now() < limit => {
+                let DataPlan { envelope, body, .. } = *self.data;
+                let prepared = envelope.prepared;
+                Ok((
+                    BodyResult {
+                        worker: prepared.worker,
+                        body,
+                        limit,
+                        until: prepared.until,
+                        outcome,
+                    },
+                    prepared.published.dispatch,
+                ))
+            }
+            Ok(_) => Err(RcptBodyFailure {
+                error: ports::Error::Deadline.into(),
+                retained: self,
+            }),
+            Err(error) => Err(RcptBodyFailure {
+                error,
+                retained: self,
+            }),
+        }
+    }
+    fn try_body(
+        &mut self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<(phases::Outcome, Instant), Error> {
+        if !valid_data_reply(reply) {
+            return Err(ports::Error::Invalid.into());
+        }
+        if let Some(refusal) = self.refusal.as_ref() {
+            let prepared = &mut self.data.envelope.prepared;
+            let mut retained = RetainedCommand {
+                worker: prepared.worker,
+                limit: prepared.limit,
+                until: prepared.until,
+                value: refusal.clone(),
+            };
+            let result = retained.try_publish(meter);
+            prepared.limit = retained.limit;
+            result?;
+            self.refusal = None;
+        }
+        let prepared = &self.data.envelope.prepared;
+        prepared.worker.publish_phase_with(
+            self.data.body.clone(),
+            prepared.until,
+            meter,
+            Some(LivePhase::Body),
+            Some(prepared.limit),
+        )
+    }
     pub fn attempt(&self) -> AttemptId {
         self.data.attempt()
     }
@@ -808,7 +872,7 @@ impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
     }
     /// Split for explicit caller-managed ordering and evidence retention.
     pub fn into_parts(self) -> (DataPlan<'w, 'a, 'r>, Option<Change>) {
-        (self.data, self.refusal)
+        (*self.data, self.refusal)
     }
     /// Capture actual negative DATA before admitting either database operation.
     /// The matching SMTP session must be closed/fenced before publication.
@@ -829,6 +893,38 @@ impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
             refusal: self.refusal,
         }
         .publish(meter)
+    }
+}
+/// Failed positive DATA handoff retains the original actual RCPT evidence.
+/// Close/fence the session; only passive interruption planning remains.
+pub struct RcptBodyFailure<'w, 'a, 'r> {
+    pub error: Error,
+    retained: RcptDataPlan<'w, 'a, 'r>,
+}
+impl std::fmt::Debug for RcptBodyFailure<'_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RcptBodyFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl RcptBodyFailure<'_, '_, '_> {
+    pub fn attempt(&self) -> AttemptId {
+        self.retained.attempt()
+    }
+    /// Construct only after fencing transport. Pending must settle before
+    /// ordered refusal/recovery publication; allocation failure keeps custody.
+    pub fn into_interruption(mut self) -> Result<RcptInterruption, Self> {
+        match self.retained.data.body.interrupted_body() {
+            Ok(recovery) => Ok(RcptInterruption {
+                refusal: self.retained.refusal,
+                recovery: Some(recovery),
+            }),
+            Err(error) => {
+                self.error = Error::Recovery(error);
+                Err(self)
+            }
+        }
     }
 }
 /// Exact passive command settlement requests. Publish refusal first through
@@ -938,11 +1034,11 @@ impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
         })();
         match requests {
             Ok((body, reply)) => Ok(RcptDataPlan {
-                data: DataPlan {
+                data: Box::new(DataPlan {
                     envelope: *self.envelope,
                     body,
                     reply,
-                },
+                }),
                 refusal: self.evidence.refusal().cloned(),
             }),
             Err(error) => Err(RcptFailure {
@@ -980,6 +1076,11 @@ impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
         }
     }
 }
+fn valid_data_reply(reply: &str) -> bool {
+    crate::format::row::smtp_reply_text(reply).is_ok()
+        && crate::recipient_sweep::reply_class(Some(reply)) == Some(3)
+        && reply.as_bytes().get(..3) == Some(b"354".as_slice())
+}
 fn borrowed_rcpt(replies: &[(u32, String)]) -> Result<Vec<(u32, &str)>, Error> {
     let mut accepted = Vec::new();
     accepted
@@ -1012,10 +1113,7 @@ impl<'w, 'a, 'r> DataPlan<'w, 'a, 'r> {
         reply: &str,
         meter: &mut Meter,
     ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
-        if crate::format::row::smtp_reply_text(reply).is_err()
-            || crate::recipient_sweep::reply_class(Some(reply)) != Some(3)
-            || reply.as_bytes().get(..3) != Some(b"354".as_slice())
-        {
+        if !valid_data_reply(reply) {
             return Err(ports::Error::Invalid.into());
         }
         self.envelope.prepared.publish_body_change(self.body, meter)
