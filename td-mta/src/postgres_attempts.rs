@@ -59,6 +59,12 @@ impl Dispatch {
     pub fn attempt(&self) -> AttemptId {
         self.attempt
     }
+    pub(crate) fn body(
+        &self,
+        accepted: &[(u32, &str)],
+    ) -> Result<crate::postgres_attempt_phases::Change, crate::postgres_attempt_phases::Error> {
+        crate::postgres_attempt_phases::body(&self.claim, self.generation, self.attempt, accepted)
+    }
 }
 /// Historical publication evidence, never continuing permission to transmit.
 #[derive(Clone, Debug, Eq, PartialEq)]

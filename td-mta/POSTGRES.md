@@ -4396,3 +4396,28 @@ Native worker cases cover runtime mode, budgets, slots, exact read charging,
 original expiry despite a fresh meter, Pending exclusion, uncertain commit
 retention and historical settlement. Storage cases require new-only replay to
 refuse while historical publication still returns the exact receipt.
+
+## 158. Prepared-to-Body deadline and identity continuity
+
+A PreparedResult can be consumed after actual 354 to publish Body for its own
+claim, generation and attempt. The caller supplies only the actual accepted
+RCPT replies; the native phase transaction still validates their ordered
+subset against the original batch. The worker clamps publication itself to
+the retained Prepared Instant limit and original input deadline, and any new
+BodyResult retains that same combined bound. Entering DATA cannot refresh the
+job allowance. The final reservation and body/final transport wrappers already
+carry that bound onward.
+
+Known new Body publication returns BodyResult and the matching passive
+Dispatch for immutable body reading. An error returns no Body owner; uncertain
+COMMIT retains the exact phase operation in Pending. The caller still owns
+actual SMTP evidence, the matching source/session and minimum observed lease
+bounds during earlier envelope transport. This does not implement that
+transport orchestration or activate a scheduler.
+
+The native TLS fixture uses this handoff after actual 354 and checks that Body
+admission never exceeds the earlier Prepared bound even when the supplied
+wire/input deadline is longer. It then transfers the verified immutable body
+and exercises actual final publication and retained-reply retry. Worker tests
+also require the handoff to refuse an expired Prepared owner despite a fresh
+meter.

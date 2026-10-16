@@ -190,6 +190,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         input: Input,
         meter: &mut Meter,
     ) -> Result<PreparedResult<'_, 'a, 'r>, Error> {
+        let until = input.deadline;
         let (published, limit) = self.publish_with(claim, generation, input, meter, true)?;
         if Instant::now() >= limit {
             return Err(ports::Error::Deadline.into());
@@ -198,6 +199,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
             worker: self,
             published,
             limit,
+            until,
         })
     }
     fn publish_with(
@@ -278,7 +280,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, Error> {
-        self.publish_phase_with(value, until, meter, None)
+        self.publish_phase_with(value, until, meter, None, None)
             .map(|(outcome, _)| outcome)
     }
     /// Publish only a newly committed AcceptancePossible transition. Refuse
@@ -289,7 +291,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, Error> {
-        self.publish_phase_with(value, until, meter, Some(LivePhase::Possible))
+        self.publish_phase_with(value, until, meter, Some(LivePhase::Possible), None)
             .map(|(outcome, _)| outcome)
     }
     /// Retain the exact Body operation only after known new publication.
@@ -305,7 +307,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
     ) -> Result<BodyResult<'_, 'a, 'r>, Error> {
         let body = phases::body(claim, generation, attempt, accepted).map_err(Error::Phase)?;
         let (outcome, limit) =
-            self.publish_phase_with(body.clone(), until, meter, Some(LivePhase::Body))?;
+            self.publish_phase_with(body.clone(), until, meter, Some(LivePhase::Body), None)?;
         if Instant::now() >= limit {
             return Err(ports::Error::Deadline.into());
         }
@@ -323,6 +325,7 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         until: Deadline,
         meter: &mut Meter,
         new_phase: Option<LivePhase>,
+        original: Option<Instant>,
     ) -> Result<(phases::Outcome, Instant), Error> {
         let mut pending = self
             .pending
@@ -332,7 +335,11 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         if pending.is_some() {
             return Err(ports::Error::Busy.into());
         }
-        let limit = self.connection.admit(until, meter, PHASE_IO)?;
+        if original.is_some_and(|limit| Instant::now() >= limit) {
+            return Err(ports::Error::Deadline.into());
+        }
+        let admitted = self.connection.admit(until, meter, PHASE_IO)?;
+        let limit = original.map_or(admitted, |limit| admitted.min(limit));
         let _slot = self
             .connection
             .slots
@@ -455,8 +462,44 @@ pub struct PreparedResult<'w, 'a, 'r> {
     worker: &'w Dispatches<'a, 'r>,
     published: Published,
     limit: Instant,
+    until: Deadline,
 }
-impl PreparedResult<'_, '_, '_> {
+impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
+    /// After actual 354, consume this exact Prepared identity into new Body
+    /// custody. Return its passive request for the matching immutable read.
+    /// The caller supplies actual accepted RCPT replies, never a replacement
+    /// claim, generation, attempt or deadline.
+    pub fn publish_body(
+        self,
+        accepted: &[(u32, &str)],
+        meter: &mut Meter,
+    ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
+        let body = self
+            .published
+            .dispatch
+            .body(accepted)
+            .map_err(Error::Phase)?;
+        let (outcome, limit) = self.worker.publish_phase_with(
+            body.clone(),
+            self.until,
+            meter,
+            Some(LivePhase::Body),
+            Some(self.limit),
+        )?;
+        if Instant::now() >= limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok((
+            BodyResult {
+                worker: self.worker,
+                body,
+                limit,
+                until: self.until,
+                outcome,
+            },
+            self.published.dispatch,
+        ))
+    }
     pub fn attempt(&self) -> AttemptId {
         self.published.dispatch.attempt()
     }

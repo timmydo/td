@@ -565,6 +565,12 @@ pub(super) fn exercise(
         success.observe_envelope(&mut meter()),
         Err(Error::Admission(ports::Error::Deadline))
     );
+    assert_eq!(
+        success
+            .publish_body(&[(0, "250 first")], &mut meter())
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
     super::final_work::exercise(fixture, &worker, claim, generation, attempt);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));

@@ -66,7 +66,7 @@ pub(super) fn exercise(
         let job_limit = clock.deadline_instant(cap).unwrap();
         let mut database = wire::meter(cap);
         let published = worker
-            .publish(
+            .publish_prepared(
                 claim,
                 generation,
                 dispatch::Input {
@@ -77,7 +77,9 @@ pub(super) fn exercise(
                 &mut database,
             )
             .unwrap();
-        let envelope = attempts::envelope(&runtime, trust, job_limit, &published.dispatch).unwrap();
+        let attempt = published.attempt();
+        let (envelope, prepared_limit) = published.observe_envelope(&mut database).unwrap();
+        assert!(prepared_limit < job_limit);
         assert_eq!(envelope.recipients.len(), 1);
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
         let (session, mail) = wire::command(
@@ -110,23 +112,15 @@ pub(super) fn exercise(
             b"354 send body\r\n",
         );
         assert_eq!(data, "354 send body");
-        let body_owner = worker
-            .publish_body(
-                claim,
-                generation,
-                published.dispatch.attempt(),
-                &[(recipient.ordinal, &rcpt)],
-                cap,
-                &mut database,
-            )
+        let (body_owner, body_request) = published
+            .publish_body(&[(recipient.ordinal, &rcpt)], &mut database)
             .unwrap();
-        assert_eq!(body_owner.attempt(), published.dispatch.attempt());
-        body_owner.check_current(&mut database).unwrap();
+        assert_eq!(body_owner.attempt(), attempt);
+        assert_eq!(body_request.attempt(), attempt);
+        assert!(body_owner.check_current(&mut database).unwrap() <= prepared_limit);
         let plan = body_owner.reserve_final(&mut database).unwrap();
-        assert_eq!(plan.attempt(), published.dispatch.attempt());
-        let occupied = worker
-            .reserve_final(published.dispatch.attempt(), cap, &mut database)
-            .unwrap();
+        assert_eq!(plan.attempt(), attempt);
+        let occupied = worker.reserve_final(attempt, cap, &mut database).unwrap();
         assert_eq!(
             plan.check_current(&mut database),
             Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
@@ -137,11 +131,11 @@ pub(super) fn exercise(
         let handoff = attempts::with_body(
             &runtime,
             trust,
-            job_limit,
-            &published.dispatch,
+            prepared_limit,
+            &body_request,
             postgres_body::MAX_BODY_BYTES,
             |metadata, source| {
-                assert_eq!(metadata.attempt, published.dispatch.attempt());
+                assert_eq!(metadata.attempt, attempt);
                 let mut input = [0; body::INPUT_BYTES];
                 let mut output = [0; body::OUTPUT_BYTES];
                 let mut work = wire::meter(cap);
@@ -179,14 +173,8 @@ pub(super) fn exercise(
             phases::check_current_body(
                 &runtime,
                 trust,
-                job_limit,
-                &phases::body(
-                    claim,
-                    generation,
-                    published.dispatch.attempt(),
-                    &[(recipient.ordinal, &rcpt)]
-                )
-                .unwrap(),
+                prepared_limit,
+                &phases::body(claim, generation, attempt, &[(recipient.ordinal, &rcpt)]).unwrap(),
                 clock.clone(),
                 worker.guard.clone()
             ),
@@ -246,7 +234,7 @@ pub(super) fn exercise(
                     assert!(refuse);
                     drop(failure.buffers.unwrap());
                     let retained = failure.retained.unwrap();
-                    assert_eq!(retained.attempt(), Some(published.dispatch.attempt()));
+                    assert_eq!(retained.attempt(), Some(attempt));
                     sql(
                         fixture,
                         "DROP TRIGGER reject_wire_final ON td_mta.attempt_acceptance_receipts",
@@ -267,7 +255,7 @@ pub(super) fn exercise(
         let final_value = phases::accepted(
             claim,
             generation,
-            published.dispatch.attempt(),
+            attempt,
             &[recipient.ordinal],
             "250 queued",
         )

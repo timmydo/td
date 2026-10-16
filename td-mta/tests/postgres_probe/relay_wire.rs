@@ -32,7 +32,8 @@ pub(super) fn meter(cap: Deadline) -> Meter {
     )
 }
 pub(super) fn until(clock: &RuntimeClock) -> Deadline {
-    Deadline::after(clock.sample().unwrap().monotonic, 10_000).unwrap()
+    // The Prepared worker must retain its shorter ten-second admission cap.
+    Deadline::after(clock.sample().unwrap().monotonic, 20_000).unwrap()
 }
 struct Script<'a> {
     expected: &'a [u8],
