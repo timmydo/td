@@ -3447,3 +3447,35 @@ allowance no longer fits this operation at schema version 25; exhausting it
 while reading COMMIT must remain indeterminate and settle the retained creation.
 This changes no transaction or replay semantics. Read-only account inspection
 retains the ordinary probe allowance.
+
+
+## 123. Shared route failure publication and dispatch checks
+
+The route-health publisher records Network, TLS, authentication or protocol
+failure for a retained attempt of the exact current owner, route and destination.
+The attempt ID is the operation key: preparing it again cannot double-count a
+failure or replace its classification. The request digest binds the claim,
+fence, route, attempt and failure. Historical settlement precedes current-owner
+checks and remains available after takeover or subsequent health changes.
+
+Under the current configuration/account/route lock, publication checks attempt
+identity and time, requires the attempt to remain active, refuses reports
+from before the latest route failure, and
+increments checked failure count and revision. Shared bounded retry jitter
+sets the next time. TLS/authentication failures also latch the selected
+configuration generation; ordinary later failure reports cannot clear that
+hold. Health and receipt publish atomically, with 1024-row per-account caps,
+and recheck current ownership before COMMIT. Unknown COMMIT must settle this
+same attempt operation. Route health changes no recipient or account sequence;
+recipient settlement remains a separate fenced operation after transport closes.
+Publish a fresh route failure before that settlement retires the attempt. This
+prevents delayed reports for retired attempts from undoing a later success;
+the single active attempt per route keeps that ordering across new dispatch.
+
+Fresh and retry attempt publication now inspect durable route health under
+those same locks. Backward database time, an outstanding repair latch or a
+future shared retry time refuses new dispatch. Receipt replay remains historical
+and does not acquire new transport authority. The local queue-clock guard and
+recipient due times remain separate requirements. No scheduler or transport is
+activated; explicit configuration repair and successful-route reset are the
+next publication operations, and no timer silently clears a repair latch.

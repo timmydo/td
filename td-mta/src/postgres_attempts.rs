@@ -18,6 +18,7 @@ use tokio_postgres::Client;
 pub enum Error {
     Connection(postgres_probe::Error),
     Owner(owners::Error),
+    RouteHealth(crate::postgres_route_health::Error),
     Policy,
     Missing,
     NotDue,
@@ -199,6 +200,9 @@ pub fn publish(
             let timestamp = owners::check_locked(client, &value.claim, value.generation)
                 .await
                 .map_err(Error::Owner)?;
+            crate::postgres_route_health::admit_locked(client, &value.claim, timestamp)
+                .await
+                .map_err(Error::RouteHealth)?;
             let binding = value.claim.binding();
             let account = binding.account();
             let account = account.as_bytes().as_slice();

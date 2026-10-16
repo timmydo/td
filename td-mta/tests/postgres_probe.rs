@@ -10638,7 +10638,15 @@ fn exercise_attempt_recovery(
         submission,
         next.attempt,
     );
-    owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
+    route_health::exercise(
+        fixture,
+        request,
+        trust,
+        &claim,
+        binding,
+        grant.generation,
+        submission,
+    );
 }
 
 fn exercise_submission_query_dispatch(
@@ -11661,3 +11669,6 @@ fn exercise_smtp_receiving_owner(
 
 #[path = "postgres_probe/queue_expiry.rs"]
 mod queue_expiry;
+
+#[path = "postgres_probe/route_health.rs"]
+mod route_health;
