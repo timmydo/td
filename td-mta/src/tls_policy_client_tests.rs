@@ -1,7 +1,7 @@
 use super::*;
 use crate::ports::{Deadline, Handshake, PeerVerification, TlsTransport};
 
-fn acme_source() -> String {
+pub(super) fn acme_source() -> String {
     source(false).replace(
         "mode = \"files\"\nchain_file = \"/chain\"\nkey_file = \"/key\"",
         "mode = \"acme\"",

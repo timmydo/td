@@ -36,10 +36,25 @@ fn reservation(
         .construct()
         .unwrap()
 }
-fn pair(
+pub(super) fn pair(
     material: &Material,
     lease: &GenerationLease<TlsPolicies>,
     pool: &HandshakePool,
+    server_name: &str,
+) -> (Connection, Connection) {
+    pair_for_policy(
+        material,
+        lease,
+        pool,
+        TlsPolicies::relay(lease).unwrap(),
+        server_name,
+    )
+}
+pub(super) fn pair_for_policy(
+    material: &Material,
+    lease: &GenerationLease<TlsPolicies>,
+    pool: &HandshakePool,
+    client_id: TlsPolicyId,
     server_name: &str,
 ) -> (Connection, Connection) {
     let (left, right) = sockets();
@@ -49,11 +64,11 @@ fn pair(
             .unwrap()
     };
     (
-        make(left, TlsPolicies::relay(lease).unwrap()),
+        make(left, client_id),
         make(right, TlsPolicies::listener(lease, server_name).unwrap()),
     )
 }
-fn complete(client: &mut Connection, server: &mut Connection) -> Result<(), Error> {
+pub(super) fn complete(client: &mut Connection, server: &mut Connection) -> Result<(), Error> {
     for _ in 0..100_000 {
         let c = client.handshake(cap(100))?;
         let s = server.handshake(cap(100))?;

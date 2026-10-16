@@ -1220,6 +1220,18 @@ must discard pre-TLS capabilities and obtain a fresh EHLO on the verified TLS
 transport before selecting AUTH. This parser increment does not send AUTH or
 activate the relay driver.
 
+The prepared relay EHLO owner accepts only a completed TLS connection with
+verified server-name evidence and the configured relay role. It consumes the
+initial 220 greeting for implicit TLS, or sends a fresh EHLO immediately after
+required STARTTLS. It retains supported AUTH flags together with that same
+exclusive connection. Wrong codes, malformed/overlong replies, EOF, unread
+bytes after a final reply in the current input cell, clock failure and the
+original absolute deadline abort the socket. Each turn performs at most one
+TLS transport operation and parses at most one bounded control line; four
+caller-reserved 512-byte cells hold input, greeting, EHLO reply and command.
+The returned session has no authentication, account or queue authority.
+The production relay scheduler and credential exchange remain separate work.
+
 The operator configures permitted From/envelope identities; aliases accepted
 inbound are not automatically authorized outbound by Migadu.
 

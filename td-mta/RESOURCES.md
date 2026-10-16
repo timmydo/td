@@ -4867,3 +4867,12 @@ they add no decoded copy or secret allocation. The owner is cleared as soon
 as the synchronous backend call returns, before closing or draining the
 connection. Initial lookup is still only an observation: storage authorization
 and publication fencing remain the backend's responsibility.
+
+
+The prepared relay greeting/EHLO owner retains its TLS connection inline.
+With the standard boxed TLS wire reservations, its pending/ready progress
+value has a compiled 4 KiB ceiling; the four caller-owned 512-byte control
+cells and existing TLS wire/provider reservations are accounted separately.
+The locally scoped large-enum lint allowance preserves inline custody without
+allocating a box on each turn. Refusal destroys native TLS and the socket
+before returning only the reusable input/output reservations.

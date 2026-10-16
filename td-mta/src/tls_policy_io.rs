@@ -89,6 +89,24 @@ impl<B: TlsWireStorage> SessionReservation<B> {
 }
 
 impl<B: TlsWireStorage> TlsConnection<B> {
+    /// Retained relay policy plus successful configured-host verification.
+    /// This does not establish current queue/account mutation authority.
+    pub(crate) fn verified_relay_transport(
+        &self,
+    ) -> Result<crate::config::outbound::Transport, Error> {
+        self.live()?;
+        if self
+            .info
+            .is_none_or(|info| info.peer != PeerVerification::ServerName)
+        {
+            return Err(Error::Tls);
+        }
+        match &TlsPolicies::resolve(&self.lease, self.id)?.binding {
+            super::Binding::Relay { transport, .. } => Ok(*transport),
+            _ => Err(Error::Forbidden),
+        }
+    }
+
     pub const fn policy_id(&self) -> TlsPolicyId {
         self.id
     }
