@@ -4607,3 +4607,38 @@ exact work charging, known rollback and retry, delayed COMMIT, blocked new
 work, missing-receipt retention and historical settlement while ordinary
 capacity is occupied. It verifies preserved positive replies, attempt
 retirement, and an unchanged account sequence during receipt inspection.
+
+## 166. RCPT collection bound to admitted envelope custody
+
+EnvelopePlan reserves RcptPlan from its own complete admitted ordinal batch,
+claim, generation and attempt. The plan exposes only the next retained
+recipient, records ordered actual replies through RcptReplies, and performs
+fresh untouched-envelope checks while retaining the original minimum cap.
+Actual command sequencing, session matching and pre-output checks remain
+caller responsibilities.
+
+Finishing pairs passive evidence with that same envelope owner. Only a
+complete collection with at least one accepted recipient can reserve DATA;
+it derives both DATA alternatives from retained positive replies and returns
+any exact negative-RCPT Change alongside the DataPlan. The original cap follows
+DATA custody. A planning failure retains the complete RcptResult so invalid
+partial/all-negative choices or allocation failures do not discard replies.
+
+After closing or fencing the matching session, consuming interruption planning
+instead returns the exact negative refusal and, when recipients remain, a
+current-owner recovery request carrying retained positive replies. A complete
+all-refused batch needs only its refusal, which retires the attempt. Partial
+collections cannot create DATA custody. These are passive settlement requests,
+not a renewal of transport ownership.
+
+The caller publishes negative RCPT evidence before Body, DATA refusal or
+interruption recovery, stops on unknown COMMIT, and retains actual DATA replies
+across any failed negative-RCPT publication. Untouched-envelope current checks
+remain invalid after partial publication. These planning helpers do not perform
+SMTP orchestration or activate a production scheduler/backend.
+
+The paired SMTP/TLS fixture uses the bound collector and retained positives
+for DATA, exercises mixed acceptance/refusal through final handoff, settles an
+all-refused batch without DATA, and interrupts after one positive reply while
+preserving its evidence. Failed DATA planning retains both partial and
+all-negative results for their correct settlement.

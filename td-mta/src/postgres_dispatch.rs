@@ -622,9 +622,33 @@ pub struct EnvelopePlan<'w, 'a, 'r> {
     envelope: attempts::Envelope,
 }
 impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
+    /// Reserve ordered reply storage for this exact admitted attempt batch.
+    pub fn reserve_rcpt(self) -> Result<RcptPlan<'w, 'a, 'r>, Error> {
+        let published = &self.prepared.published;
+        let replies = published
+            .dispatch
+            .reserve_rcpt_replies(&published.outcome.ordinals)
+            .map_err(Error::Phase)?;
+        Ok(RcptPlan {
+            envelope: Box::new(self),
+            replies,
+        })
+    }
+
     /// Bind actual positive RCPT replies before issuing DATA. Both alternative
     /// result requests retain this owner's exact identity and admitted subset.
     pub fn reserve_data(self, accepted: &[(u32, &str)]) -> Result<DataPlan<'w, 'a, 'r>, Error> {
+        let (body, reply) = self.data_requests(accepted)?;
+        Ok(DataPlan {
+            envelope: self,
+            body,
+            reply,
+        })
+    }
+    fn data_requests(
+        &self,
+        accepted: &[(u32, &str)],
+    ) -> Result<(Change, phases::CommandReply), Error> {
         if accepted.iter().any(|(ordinal, _)| {
             self.envelope
                 .recipients
@@ -634,15 +658,12 @@ impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
             return Err(ports::Error::Invalid.into());
         }
         let dispatch = &self.prepared.published.dispatch;
-        let body = dispatch.body(accepted).map_err(Error::Phase)?;
-        let reply = dispatch
-            .reserve_data_reply(accepted)
-            .map_err(Error::Phase)?;
-        Ok(DataPlan {
-            envelope: self,
-            body,
-            reply,
-        })
+        Ok((
+            dispatch.body(accepted).map_err(Error::Phase)?,
+            dispatch
+                .reserve_data_reply(accepted)
+                .map_err(Error::Phase)?,
+        ))
     }
 
     /// Reserve negative MAIL evidence before sending this envelope's sender.
@@ -735,6 +756,143 @@ impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
         .publish(meter)
     }
 }
+/// Exact admitted envelope and reserved ordered RCPT evidence. Actual command
+/// sequencing, session matching and fresh pre-output checks remain required.
+pub struct RcptPlan<'w, 'a, 'r> {
+    envelope: Box<EnvelopePlan<'w, 'a, 'r>>,
+    replies: phases::RcptReplies,
+}
+impl<'w, 'a, 'r> RcptPlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.envelope.attempt()
+    }
+    pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.envelope.check_current(meter)
+    }
+    pub fn next_recipient(&self) -> Option<&attempts::Recipient> {
+        let ordinal = self.replies.next_ordinal()?;
+        let recipients = &self.envelope.envelope.recipients;
+        let index = recipients
+            .binary_search_by_key(&ordinal, |recipient| recipient.ordinal)
+            .ok()?;
+        recipients.get(index)
+    }
+    pub fn record_reply(&mut self, ordinal: u32, reply: &str) -> Result<(), Error> {
+        self.replies.record(ordinal, reply).map_err(Error::Phase)
+    }
+    pub fn finish(self) -> Result<RcptResult<'w, 'a, 'r>, Error> {
+        Ok(RcptResult {
+            envelope: self.envelope,
+            evidence: self.replies.finish().map_err(Error::Phase)?,
+        })
+    }
+}
+/// Retained actual replies paired with the original envelope owner. Partial
+/// results can only plan interruption; they cannot create DATA custody.
+pub struct RcptResult<'w, 'a, 'r> {
+    envelope: Box<EnvelopePlan<'w, 'a, 'r>>,
+    evidence: phases::RcptEvidence,
+}
+/// Publish any refusal before the DATA result. Actual DATA sequencing and
+/// preserving its reply across a failed refusal publication remain caller duties.
+pub struct RcptDataPlan<'w, 'a, 'r> {
+    pub data: DataPlan<'w, 'a, 'r>,
+    pub refusal: Option<Change>,
+}
+/// Passive exact requests for an already fenced session. Publish refusal first;
+/// unknown COMMIT must settle before recovery. An all-refused complete batch
+/// needs no recovery because refusal publication itself retires the attempt.
+pub struct RcptInterruption {
+    pub refusal: Option<Change>,
+    pub recovery: Option<recovery::Recovery>,
+}
+/// Planning failure preserves the exact evidence and minimum envelope cap.
+pub struct RcptFailure<'w, 'a, 'r> {
+    pub error: Error,
+    retained: RcptResult<'w, 'a, 'r>,
+}
+impl std::fmt::Debug for RcptFailure<'_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RcptFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl<'w, 'a, 'r> RcptFailure<'w, 'a, 'r> {
+    pub fn into_retained(self) -> RcptResult<'w, 'a, 'r> {
+        self.retained
+    }
+}
+impl<'w, 'a, 'r> RcptResult<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.envelope.attempt()
+    }
+    pub fn evidence(&self) -> &phases::RcptEvidence {
+        &self.evidence
+    }
+    pub fn reserve_data(self) -> Result<RcptDataPlan<'w, 'a, 'r>, RcptFailure<'w, 'a, 'r>> {
+        let requests = (|| {
+            if !self.evidence.is_complete() || self.evidence.accepted().is_empty() {
+                return Err(ports::Error::Invalid.into());
+            }
+            let accepted = borrowed_rcpt(self.evidence.accepted())?;
+            self.envelope.data_requests(&accepted)
+        })();
+        match requests {
+            Ok((body, reply)) => Ok(RcptDataPlan {
+                data: DataPlan {
+                    envelope: *self.envelope,
+                    body,
+                    reply,
+                },
+                refusal: self.evidence.refusal().cloned(),
+            }),
+            Err(error) => Err(RcptFailure {
+                error,
+                retained: self,
+            }),
+        }
+    }
+    /// Consume only after closing/fencing the matching SMTP session. These
+    /// passive requests preserve evidence but never renew transport deadlines.
+    pub fn into_interruption(self) -> Result<RcptInterruption, RcptFailure<'w, 'a, 'r>> {
+        let recovery = (|| {
+            if self.evidence.is_complete() && self.evidence.accepted().is_empty() {
+                Ok(None)
+            } else {
+                let accepted = borrowed_rcpt(self.evidence.accepted())?;
+                self.envelope
+                    .prepared
+                    .published
+                    .dispatch
+                    .interrupted(&accepted)
+                    .map(Some)
+                    .map_err(Error::Recovery)
+            }
+        })();
+        match recovery {
+            Ok(recovery) => Ok(RcptInterruption {
+                refusal: self.evidence.refusal().cloned(),
+                recovery,
+            }),
+            Err(error) => Err(RcptFailure {
+                error,
+                retained: self,
+            }),
+        }
+    }
+}
+fn borrowed_rcpt(replies: &[(u32, String)]) -> Result<Vec<(u32, &str)>, Error> {
+    let mut accepted = Vec::new();
+    accepted
+        .try_reserve_exact(replies.len())
+        .map_err(|_| ports::Error::Capacity)?;
+    for (ordinal, reply) in replies {
+        accepted.push((*ordinal, reply.as_str()));
+    }
+    Ok(accepted)
+}
+
 /// Exact accepted RCPT subset paired with both possible DATA-command results.
 /// Actual DATA sequencing, fresh checks and session matching remain required.
 pub struct DataPlan<'w, 'a, 'r> {

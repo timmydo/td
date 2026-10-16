@@ -5098,3 +5098,15 @@ work allowance. At the maximum positive-RCPT subset, a caller retry copy,
 Pending request and native operation clone can hold three 409600-byte reply
 vectors concurrently, plus bounded metadata and existing protocol buffers.
 No second queue, wait list or transport owner is created.
+
+RcptPlan retains the existing envelope and at most 409600 RCPT reply bytes.
+Planning DATA temporarily retains that collection beside the new Body and
+CommandReply alternatives: at most four 100-by-4096 vectors, or 1638400 reply
+bytes. The source positive cells drop on successful handoff; the resulting
+DATA/negative-RCPT requests contain at most 1228800 reply bytes. Interruption
+planning temporarily retains the source cells and a copied positive subset,
+at most 819200 reply bytes; its resulting refusal/recovery requests together
+contain at most 409600 reply bytes. Bounded borrowed-reply vectors, envelope,
+claim and hash metadata are additional. Planning failures drop incomplete
+alternatives and retain the original collection. Native publication copies
+and protocol buffers retain their separately documented bounds.

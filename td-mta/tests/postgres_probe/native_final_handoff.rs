@@ -31,11 +31,17 @@ pub(super) fn exercise(
         (99, false, 0, 1),
         (100, false, 0, 2),
         (101, false, 0, 3),
+        (103, false, 0, 4),
+        (104, false, 0, 5),
+        (105, false, 0, 6),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
+        if data_case >= 4 {
+            sql(fixture,&format!("UPDATE td_mta.submissions SET recipient_count=2 WHERE id={sub}; INSERT INTO td_mta.recipients SELECT account,{sub},1,'1@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
+        }
         owners::renew(request, trust, deadline(), claim, generation).unwrap();
         let clock = Arc::new(RuntimeClock::new());
         let guard = Arc::new(Mutex::new(
@@ -94,7 +100,10 @@ pub(super) fn exercise(
         let prepared_limit = published.check_current(&mut database).unwrap();
         let envelope = published.envelope();
         assert!(prepared_limit < job_limit);
-        assert_eq!(envelope.recipients.len(), 1);
+        assert_eq!(
+            envelope.recipients.len(),
+            if data_case >= 4 { 2 } else { 1 }
+        );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
         let (session, mail) = wire::command(
             session,
@@ -185,18 +194,18 @@ pub(super) fn exercise(
         }
         assert_eq!(mail, "250 sender");
         let published = published.accepted(&mail).unwrap();
-        let recipient = &published.envelope().recipients[0];
-        let ordinal = recipient.ordinal;
-        let (session, rcpt) = wire::command(
-            session,
-            &mut peer,
-            clock.clone(),
-            cap,
-            command::Command::RcptTo(&recipient.address),
-            format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
-            b"250 recipient\r\n",
-        );
         if data_case == 2 {
+            let recipient = &published.envelope().recipients[0];
+            let (session, rcpt) = wire::command(
+                session,
+                &mut peer,
+                clock.clone(),
+                cap,
+                command::Command::RcptTo(&recipient.address),
+                format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
+                b"250 recipient\r\n",
+            );
+
             assert!(matches!(
                 published.reserve_data(&[(999, &rcpt)]),
                 Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
@@ -218,7 +227,70 @@ pub(super) fn exercise(
             sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
             continue;
         }
-        let mut published = published.reserve_data(&[(ordinal, &rcpt)]).unwrap();
+        let mut published = published.reserve_rcpt().unwrap();
+        assert_eq!(published.attempt(), attempt);
+        let mut session = session;
+        while published.next_recipient().is_some() {
+            if data_case == 6 && published.next_recipient().unwrap().ordinal == 1 {
+                break;
+            }
+            assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
+            let recipient = published.next_recipient().unwrap();
+            let ordinal = recipient.ordinal;
+            let negative = data_case == 5 || (data_case == 4 && ordinal == 1);
+            let (next, reply) = wire::command(
+                session,
+                &mut peer,
+                clock.clone(),
+                cap,
+                command::Command::RcptTo(&recipient.address),
+                format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
+                if negative {
+                    b"550 recipient refused\r\n"
+                } else {
+                    b"250 recipient\r\n"
+                },
+            );
+            session = next;
+            published.record_reply(ordinal, &reply).unwrap();
+        }
+        let result = published.finish().unwrap();
+        assert_eq!(result.attempt(), attempt);
+        if data_case == 5 || data_case == 6 {
+            let failure = result.reserve_data().err().unwrap();
+            assert_eq!(
+                failure.error,
+                dispatch::Error::Admission(td_mta::ports::Error::Invalid)
+            );
+            let result = failure.into_retained();
+            assert_eq!(result.evidence().is_complete(), data_case == 5);
+            assert_eq!(
+                result.evidence().accepted().len(),
+                usize::from(data_case == 6)
+            );
+            drop(session.into_buffers().unwrap());
+            let interruption = result.into_interruption().unwrap();
+            assert_eq!(interruption.recovery.is_some(), data_case == 6);
+            if let Some(refusal) = interruption.refusal {
+                worker.publish_phase(refusal, cap, &mut database).unwrap();
+            }
+            if let Some(recovery) = interruption.recovery {
+                worker
+                    .publish_recovery(recovery, cap, &mut database)
+                    .unwrap();
+            }
+            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 5 { "5|550 recipient refused|\n5|550 recipient refused|" } else { "3|250 recipient|\n3||" });
+            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+            assert_eq!(pending.attempt().unwrap(), None);
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
+        assert!(result.evidence().is_complete());
+        let (ordinal, rcpt) = result.evidence().accepted().first().unwrap().clone();
+        let result = result.reserve_data().unwrap();
+        let mut published = result.data;
+        let refusal = result.refusal;
         assert_eq!(published.attempt(), attempt);
         assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
         let (session, data) = wire::command(
@@ -234,6 +306,11 @@ pub(super) fn exercise(
                 _ => b"354 send body\r\n",
             },
         );
+        if let Some(refusal) = refusal {
+            let outcome = worker.publish_phase(refusal, cap, &mut database).unwrap();
+            assert_eq!(outcome.recipients, 1);
+            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")), "5|550 recipient refused|t");
+        }
         if data_case == 1 {
             assert_eq!(data, "550 data refused");
             drop(session.into_buffers().unwrap());

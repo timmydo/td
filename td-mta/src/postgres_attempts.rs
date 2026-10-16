@@ -71,6 +71,38 @@ impl Dispatch {
             ordinals,
         )
     }
+    pub(crate) fn reserve_rcpt_replies(
+        &self,
+        ordinals: &[u32],
+    ) -> Result<crate::postgres_attempt_phases::RcptReplies, crate::postgres_attempt_phases::Error>
+    {
+        crate::postgres_attempt_phases::reserve_rcpt_replies(
+            &self.claim,
+            self.generation,
+            self.attempt,
+            ordinals,
+        )
+    }
+    pub(crate) fn interrupted(
+        &self,
+        accepted: &[(u32, &str)],
+    ) -> Result<crate::postgres_attempt_recovery::Recovery, crate::postgres_attempt_recovery::Error>
+    {
+        if accepted.is_empty() {
+            crate::postgres_attempt_recovery::interrupted(
+                &self.claim,
+                self.generation,
+                self.attempt,
+            )
+        } else {
+            crate::postgres_attempt_recovery::interrupted_with_rcpt(
+                &self.claim,
+                self.generation,
+                self.attempt,
+                accepted,
+            )
+        }
+    }
     pub(crate) fn reserve_data_reply(
         &self,
         accepted: &[(u32, &str)],
