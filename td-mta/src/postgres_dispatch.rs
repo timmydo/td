@@ -234,6 +234,25 @@ impl Dispatches<'_, '_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, Error> {
+        self.publish_phase_with(value, until, meter, false)
+    }
+    /// Publish only a newly committed AcceptancePossible transition. Refuse
+    /// retained receipts; settlement never grants continuing SMTP authority.
+    pub fn publish_new_possible(
+        &self,
+        value: Change,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, Error> {
+        self.publish_phase_with(value, until, meter, true)
+    }
+    fn publish_phase_with(
+        &self,
+        value: Change,
+        until: Deadline,
+        meter: &mut Meter,
+        new_possible: bool,
+    ) -> Result<phases::Outcome, Error> {
         let mut pending = self
             .pending
             .operation
@@ -248,7 +267,7 @@ impl Dispatches<'_, '_> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        publish_phase(&self.connection, &mut pending, value, limit)
+        publish_phase(&self.connection, &mut pending, value, limit, new_possible)
     }
 
     /// Prepay one final DATA result's publication work and retain its connection
@@ -312,7 +331,13 @@ impl FinalWork<'_, '_, '_> {
         if pending.is_some() {
             return Err(ports::Error::Busy.into());
         }
-        publish_phase(&self.worker.connection, &mut pending, value, self.limit)
+        publish_phase(
+            &self.worker.connection,
+            &mut pending,
+            value,
+            self.limit,
+            false,
+        )
     }
 }
 fn publish_phase(
@@ -320,12 +345,18 @@ fn publish_phase(
     pending: &mut Option<Operation>,
     value: Change,
     limit: Instant,
+    new_possible: bool,
 ) -> Result<phases::Outcome, Error> {
     *pending = Some(Operation::Phase(value));
     let Some(Operation::Phase(value)) = pending.as_ref() else {
         return Err(ports::Error::Invalid.into());
     };
-    match phases::publish(connection.request, connection.trust, limit, value) {
+    let result = if new_possible {
+        phases::publish_new_possible(connection.request, connection.trust, limit, value)
+    } else {
+        phases::publish(connection.request, connection.trust, limit, value)
+    };
+    match result {
         Ok(outcome) => {
             *pending = None;
             Ok(outcome)

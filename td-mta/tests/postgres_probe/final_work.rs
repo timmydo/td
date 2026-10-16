@@ -134,9 +134,20 @@ pub(super) fn exercise(
     final_budget
         .charge(clock.sample().unwrap().monotonic, remaining)
         .unwrap();
-    roomy
-        .publish_phase(possible, until(10_000), &mut meter())
+    let newly_possible = roomy
+        .publish_new_possible(possible.clone(), until(10_000), &mut meter())
         .unwrap();
+    assert_eq!(
+        roomy.publish_new_possible(possible.clone(), until(10_000), &mut meter()),
+        Err(Error::Phase(phases::Error::Conflict))
+    );
+    assert_eq!(
+        roomy
+            .publish_phase(possible, until(10_000), &mut meter())
+            .unwrap(),
+        newly_possible
+    );
+
     // Occupy the remaining slot: consumption must use the one already held.
     let other = roomy
         .reserve_final(attempt, until(10_000), &mut meter())

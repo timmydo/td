@@ -447,8 +447,35 @@ pub fn publish(
     deadline: Instant,
     value: &Change,
 ) -> Result<Outcome, Error> {
+    publish_inner(request, trust, deadline, value, false)
+}
+/// Publish only a new AcceptancePossible transition. An existing receipt,
+/// including an identical one, refuses; inspect/ordinary publish remain the
+/// historical settlement path. Novelty alone does not authorize SMTP output.
+pub fn publish_new_possible(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+) -> Result<Outcome, Error> {
+    if value.inner.phase != 3 {
+        return Err(Error::Integrity);
+    }
+    publish_inner(request, trust, deadline, value, true)
+}
+fn publish_inner(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+    new_possible: bool,
+) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
-        return Ok(outcome);
+        return if new_possible {
+            Err(Error::Conflict)
+        } else {
+            Ok(outcome)
+        };
     }
     let value = value.inner.clone();
     let attempted = Arc::new(AtomicBool::new(false));
@@ -459,7 +486,11 @@ pub fn publish(
                 .await
                 .map_err(Error::Owner)?;
             if let Some(outcome) = receipt(client, &value).await? {
-                return Ok(outcome);
+                return if new_possible {
+                    Err(Error::Conflict)
+                } else {
+                    Ok(outcome)
+                };
             }
             if !policy {
                 return Err(Error::Policy);

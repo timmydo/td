@@ -47,6 +47,11 @@ pub(super) fn exercise(
     let body = phases::body(claim, generation, attempt, &accepted).unwrap();
     let final_phase = phases::acceptance_possible(claim, generation, attempt, &ordinals).unwrap();
     assert_eq!(
+        phases::publish_new_possible(request, trust, deadline(), &body),
+        Err(phases::Error::Integrity)
+    );
+
+    assert_eq!(
         phases::publish(request, trust, deadline(), &final_phase),
         Err(phases::Error::Conflict)
     );
@@ -109,7 +114,7 @@ pub(super) fn exercise(
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase()");
     assert_eq!(
-        phases::publish(
+        phases::publish_new_possible(
             request,
             trust,
             Instant::now() + Duration::from_millis(1500),
@@ -129,6 +134,11 @@ pub(super) fn exercise(
         .unwrap()
         .unwrap();
     assert_eq!(settled.old_sequence, outcome.new_sequence);
+    assert_eq!(
+        phases::publish_new_possible(request, trust, deadline(), &final_phase),
+        Err(phases::Error::Conflict)
+    );
+
     assert_eq!(sql(fixture,"SELECT count(DISTINCT rcpt_reply) FROM td_mta.recipients WHERE state=2 AND phase=3 AND octet_length(rcpt_reply)=4096 AND data_reply IS NULL"),"100");
     sql(
         fixture,
@@ -143,6 +153,7 @@ pub(super) fn exercise(
         Some(outcome)
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex'); DROP TRIGGER delay_phase ON td_mta.attempt_phase_receipts"));
+    super::new_possible::receipt_race(fixture, request, trust, attempt, &final_phase);
     super::final_capacity::competing_writer(fixture, request, trust, binding);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

@@ -4036,3 +4036,24 @@ this does not promise allocation-free database publication or physical disk/WAL
 availability. The local FinalWork allowance, durable logical claim and live
 ownership are still separate prerequisites. BodySent remains closed and no
 scheduler or terminator path is enabled.
+
+## 145. New AcceptancePossible publication
+
+The native phase API and bounded publication worker expose publish_new_possible
+for phase 3 only. It refuses every existing matching receipt, both during the
+initial lookup and again under the publication transaction's account locks.
+This closes the race where a receipt appears between those checks. Ordinary
+publish and inspect retain historical idempotent settlement behavior. Wrong
+phases refuse, and differing request digests retain their existing conflict
+behavior. The actual new transaction uses the same policy/owner checks, exact
+subset validation, durable capacity claim and synchronous COMMIT path.
+
+The worker retains uncertain COMMIT in its existing Pending slot, using the
+same original deadlines and bounded work admission. Settling that request
+returns only historical evidence; a later new-publication call still refuses
+its receipt. No retry silently turns settlement into new publication.
+
+Known new publication is a prerequisite for future handoff construction, not
+SMTP permission by itself. Independent local work/reply capacity and current
+ownership remain required. No caller-provided Outcome can authorize output;
+BodySent remains closed and no scheduler or terminator path is enabled.
