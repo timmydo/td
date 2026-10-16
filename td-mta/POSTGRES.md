@@ -3346,3 +3346,28 @@ subthreshold steps seen by another user of the shared guard. Recovery of UTC
 does not restore an older token; it cannot erase the intervening observation. The token
 is not a live transport permission. Database expiry mutation and runtime
 scheduler/authenticated confirmation wiring remain separate work.
+
+
+## 119. Prepared queue expiry storage
+
+Schema version 24 adds retained expiry-operation receipts and one database-wide
+expiry progress row. A receipt binds an account/operation to its request digest,
+submission, one-to-100 recipient count, fixed nonnegative UTC cutoff, publication
+time and old/new account sequence. It deliberately has no foreign key to the
+submission, so later retention cannot erase historical settlement evidence.
+The publisher must cap retained receipts and verify exact sequence adjacency.
+
+The progress row starts with no publication time. Its singleton key and nullable
+nonnegative timestamp prepare serialization of expiry batches across accounts
+and instances. A future publisher must lock this row after configuration,
+account and route-owner locks, require at least one database UTC second since
+the previous committed batch, and update it atomically with recipients, history
+and receipt. Missing progress is an integrity failure, never permission to reset
+the rate limit. Local monotonic admission remains separately mandatory; the
+persisted timestamp is neither clock confirmation nor transport authority.
+
+Both tables are private to the schema owner at initialization and require the
+mail runtime's ordinary DML grants. Upgrade preserves the epoch and earlier
+material, rolls back all new DDL on obstruction, and includes the prior version
+23 in the migration fixture. This schema preparation expires no recipients and
+starts no scheduler; the fenced publisher and runtime wiring remain work.
