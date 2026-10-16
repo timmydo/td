@@ -4885,6 +4885,16 @@ The locally scoped large-enum lint allowance preserves inline custody without
 allocating a box on each turn. Refusal destroys native TLS and the socket
 before returning only the reusable input/output reservations.
 
+The prepared plaintext relay greeting/EHLO owner borrows the same four
+512-byte control cells and retains its socket and prepared TLS reservation
+inline, with a compiled 4 KiB progress ceiling. Its opaque ready value releases
+the EHLO cell borrows, allowing two cells to be reused by the STARTTLS/220
+owner. Each turn performs at most one nonblocking socket operation and parses
+one bounded control line under the original handshake deadline. It retains
+the existing outbound slot and handshake permit; it adds no thread, socket,
+provider buffer or per-turn allocation. Refusal aborts the socket and native
+reservation before returning the reusable TLS wire buffers.
+
 The prepared AUTH owner additionally borrows four 512-byte cells (input and
 three distinct reply readers), a 1280-byte plaintext cell and a 1710-byte
 encoded response cell. These 5038 bytes are reserved before the exchange.

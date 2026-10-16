@@ -78,20 +78,33 @@ pub(super) fn client_starttls_and_server_upgrade_verify_real_tls() {
     let (plain, mut peer) = sockets();
     let mut input = [0; LINE_BYTES];
     let mut reply = [0; LINE_BYTES];
-    let owner = ClientStartTls::new(
-        offer(),
+    let mut cells = [[0; LINE_BYTES]; 4];
+    let initial = initial(
         held(&lease, TlsPolicies::relay(&lease).unwrap(), &pool),
         plain,
-        UpgradeScratch {
-            input: &mut input,
-            reply: &mut reply,
-        },
+        &mut cells,
         material.source.clone(),
-        cap(1000),
         cap(100),
     )
     .ok()
     .unwrap();
+    let ready = initial_drive(
+        initial,
+        &mut peer,
+        b"220-first\r\n220 ready\r\n",
+        b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250-8BITMIME\r\n250 STARTTLS\r\n",
+        1,
+        false,
+    )
+    .ok()
+    .unwrap();
+    let owner = ready
+        .upgrade(UpgradeScratch {
+            input: &mut input,
+            reply: &mut reply,
+        })
+        .ok()
+        .unwrap();
     let mut owner = Some(waiting(waiting(owner)));
     command(&mut peer);
     let mut scratch = [0; LINE_BYTES];
@@ -151,7 +164,28 @@ pub(super) fn client_starttls_and_server_upgrade_verify_real_tls() {
     }
     assert!(complete);
     assert_eq!(pool.available(), 2);
-    drop(client.into_buffers().unwrap());
+    let [input, greeting, reply, command] = &mut cells;
+    let ehlo = crate::smtp_relay_ehlo::Exchange::new(
+        client,
+        "mx.example.test",
+        crate::smtp_relay_ehlo::Scratch {
+            input,
+            greeting,
+            reply,
+            command,
+        },
+        material.source.clone(),
+        cap(1000),
+    )
+    .ok()
+    .unwrap();
+    let ready = relay_ehlo_tests::drive(ehlo, &mut server, b"250 localhost\r\n", 1, false)
+        .ok()
+        .unwrap();
+    assert!(!ready.mechanisms().plain());
+    assert!(!ready.mechanisms().login());
+    assert!(!ready.capabilities().eight_bit_mime());
+    drop(ready.into_buffers().unwrap());
     drop(server.into_buffers().unwrap());
 }
 
@@ -463,4 +497,236 @@ impl Clock for StepClock {
             monotonic: Tick(self.0.fetch_add(1, Ordering::Relaxed)),
         })
     }
+}
+
+type Wire = Box<[u8; TLS_WIRE_BYTES]>;
+type InitialResult<T> = Result<T, SessionRefusal<Wire>>;
+
+fn initial<'a>(
+    prepared: SessionReservation<Box<[u8; TLS_WIRE_BYTES]>>,
+    plain: TcpTransport,
+    cells: &'a mut [[u8; LINE_BYTES]; 4],
+    clock: Arc<dyn Clock>,
+    deadline: Deadline,
+) -> InitialResult<RelayStartTls<'a, Wire>> {
+    let [input, greeting, reply, command] = cells;
+    RelayStartTls::new(
+        prepared,
+        plain,
+        "mx.example.test",
+        RelayEhloScratch {
+            input,
+            greeting,
+            reply,
+            command,
+        },
+        clock,
+        cap(1000),
+        deadline,
+    )
+}
+fn initial_drive(
+    owner: RelayStartTls<'_, Box<[u8; TLS_WIRE_BYTES]>>,
+    peer: &mut TcpTransport,
+    greeting: &[u8],
+    response: &[u8],
+    chunk: usize,
+    eof: bool,
+) -> InitialResult<RelayStartTlsReady<Wire>> {
+    let expected = b"EHLO mx.example.test\r\n";
+    let mut request = Vec::new();
+    let mut greeted = 0;
+    let mut sent = 0;
+    let mut closed = false;
+    let mut owner = Some(owner);
+    for _ in 0..100_000 {
+        if !closed {
+            if greeted < greeting.len() {
+                match peer
+                    .write(&greeting[greeted..greeting.len().min(greeted + chunk)])
+                    .unwrap()
+                {
+                    IoProgress::Bytes(n) => greeted += n,
+                    IoProgress::Pending => {}
+                    IoProgress::Closed => panic!("closed before greeting"),
+                }
+            } else if request.len() < expected.len() {
+                let mut bytes = [0; LINE_BYTES];
+                match peer.read(&mut bytes).unwrap() {
+                    IoProgress::Bytes(n) => request.extend_from_slice(&bytes[..n]),
+                    IoProgress::Pending | IoProgress::Closed => {}
+                }
+                assert!(expected.starts_with(&request));
+            } else if sent < response.len() {
+                match peer
+                    .write(&response[sent..response.len().min(sent + chunk)])
+                    .unwrap()
+                {
+                    IoProgress::Bytes(n) => sent += n,
+                    IoProgress::Pending => {}
+                    IoProgress::Closed => panic!("closed before reply"),
+                }
+            } else if eof {
+                peer.abort();
+                closed = true;
+            }
+        }
+        match owner.take().unwrap().advance() {
+            Ok(RelayStartTlsProgress::Pending(next)) => owner = Some(next),
+            Ok(RelayStartTlsProgress::Ready(ready)) => {
+                assert_eq!(request, expected);
+                return Ok(ready);
+            }
+            Err(failure) => return Err(failure),
+        }
+        std::thread::yield_now();
+    }
+    panic!("initial EHLO did not finish");
+}
+
+#[test]
+fn relay_starttls_requires_complete_offer_and_drops_socket_and_permit_on_refusal() {
+    let _serial = serial();
+    let material = Material::new();
+    let lease = material.published(&configuration());
+    let pool = HandshakePool::new(1).unwrap();
+    for (greeting, response, eof) in [
+        (b"550 unavailable\r\n".as_slice(), b"".as_slice(), false),
+        (b"220 ready\r\n250 injected\r\n", b"", false),
+        (b"220 ready\r\n", b"250-host\r\n250 AUTH PLAIN\r\n", false),
+        (
+            b"220 ready\r\n",
+            b"250-host\r\n250 STARTTLS extra\r\n",
+            false,
+        ),
+        (
+            b"220 ready\r\n",
+            b"250-host\r\n250 STARTTLS\r\n220 injected\r\n",
+            false,
+        ),
+        (b"220 ready\r\n", b"250-host\r\n250-STARTTLS\r\n", true),
+        (b"220 ready\r\n", b"550 no EHLO\r\n", false),
+    ] {
+        let (plain, mut peer) = sockets();
+        let mut cells = [[0; LINE_BYTES]; 4];
+        let owner = initial(
+            held(&lease, TlsPolicies::relay(&lease).unwrap(), &pool),
+            plain,
+            &mut cells,
+            material.source.clone(),
+            cap(100),
+        )
+        .ok()
+        .unwrap();
+        let failure = initial_drive(owner, &mut peer, greeting, response, LINE_BYTES, eof)
+            .err()
+            .unwrap();
+        drop(failure.into_buffers());
+        assert_eq!(pool.available(), 1);
+        if !eof {
+            assert_eq!(peer.read(&mut [0; LINE_BYTES]).unwrap(), IoProgress::Closed);
+        }
+    }
+}
+
+#[test]
+fn relay_starttls_checks_policy_and_original_deadline_before_plaintext() {
+    let _serial = serial();
+    let material = Material::new();
+    let pool = HandshakePool::new(1).unwrap();
+    for mode in 0..5 {
+        let time = Arc::new(InitialClock(std::sync::atomic::AtomicU64::new(0)));
+        let lease = material.published(&if mode == 0 {
+            source(false)
+        } else {
+            configuration()
+        });
+        let id = if mode == 1 {
+            TlsPolicies::listener(&lease, "smtp").unwrap()
+        } else {
+            TlsPolicies::relay(&lease).unwrap()
+        };
+        let (plain, mut peer) = sockets();
+        let mut cells = [[0; LINE_BYTES]; 4];
+        let owner = initial(
+            held(&lease, id, &pool),
+            plain,
+            &mut cells,
+            time.clone(),
+            cap(match mode {
+                2 => 0,
+                3 => 1001,
+                _ => 100,
+            }),
+        );
+        let failure = if mode < 4 {
+            owner.err().unwrap()
+        } else {
+            let owner = owner.ok().unwrap();
+            time.0.store(100, Ordering::Relaxed);
+            owner.advance().err().unwrap()
+        };
+        assert_eq!(
+            failure.error(),
+            if mode == 2 || mode == 4 {
+                Error::Deadline
+            } else {
+                Error::Invalid
+            }
+        );
+        drop(failure.into_buffers());
+        assert_eq!(pool.available(), 1);
+        assert_eq!(peer.read(&mut [0; LINE_BYTES]).unwrap(), IoProgress::Closed);
+    }
+}
+
+struct InitialClock(std::sync::atomic::AtomicU64);
+impl Clock for InitialClock {
+    fn sample(&self) -> Result<Time, Error> {
+        Ok(Time {
+            utc_ms: 1_800_000_000_000,
+            monotonic: Tick(self.0.load(Ordering::Relaxed)),
+        })
+    }
+}
+
+#[test]
+fn relay_starttls_ready_preserves_deadline_and_releases_ehlo_scratch() {
+    let _serial = serial();
+    let material = Material::new();
+    let lease = material.published(&configuration());
+    let pool = HandshakePool::new(1).unwrap();
+    let time = Arc::new(InitialClock(std::sync::atomic::AtomicU64::new(0)));
+    let (plain, mut peer) = sockets();
+    let mut cells = [[0; LINE_BYTES]; 4];
+    let owner = initial(
+        held(&lease, TlsPolicies::relay(&lease).unwrap(), &pool),
+        plain,
+        &mut cells,
+        time.clone(),
+        cap(100),
+    )
+    .ok()
+    .unwrap();
+    let ready = initial_drive(
+        owner,
+        &mut peer,
+        b"220 ready\r\n",
+        b"250-host\r\n250 STARTTLS\r\n",
+        1,
+        false,
+    )
+    .ok()
+    .unwrap();
+    assert_eq!(pool.available(), 0);
+    time.0.store(100, Ordering::Relaxed);
+    let [input, reply, _, _] = &mut cells;
+    let failure = ready
+        .upgrade(UpgradeScratch { input, reply })
+        .err()
+        .unwrap();
+    assert_eq!(failure.error(), Error::Deadline);
+    drop(failure.into_buffers());
+    assert_eq!(pool.available(), 1);
+    assert_eq!(peer.read(&mut [0; LINE_BYTES]).unwrap(), IoProgress::Closed);
 }

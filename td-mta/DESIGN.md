@@ -1233,6 +1233,19 @@ caller-reserved 512-byte cells hold input, greeting, EHLO reply and command.
 The returned session has no authentication, account or queue authority.
 The production relay scheduler remains separate work.
 
+The prepared required-STARTTLS relay owner retains the original plaintext
+socket and configured relay TLS reservation through the initial 220 and EHLO.
+Only a required-STARTTLS policy is admitted. It shares the bounded EHLO wire
+driver with the verified-TLS owner, but exposes only a completed STARTTLS
+offer tied to that same socket and reservation through an opaque upgrade
+owner. No plaintext capabilities or socket can escape it. Upgrade consumes
+that owner into the existing bounded STARTTLS/220 driver; native ClientHello
+bytes remain private until the successful 220. Initial EHLO, STARTTLS and
+handshake retain the original handshake deadline, which may not exceed the
+original job deadline. A fresh verified TLS EHLO still determines AUTH and
+8BITMIME; pre-TLS advertisements confer neither capability. This is a
+prepared owner, not activation of the runtime relay scheduler.
+
 Each compiled relay policy retains a private domain-separated SHA-256 digest
 of the exact decoded username/password, framed by lengths. The completed EHLO
 session can compare supplied bounded printable-ASCII credentials to that

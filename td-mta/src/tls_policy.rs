@@ -27,6 +27,12 @@ pub use starttls::{ServerStartTls, ServerUpgradeProgress};
 mod client_starttls;
 pub use client_starttls::{ClientStartTls, ClientUpgradeProgress, UpgradeScratch};
 
+#[path = "tls_policy_relay_starttls.rs"]
+mod relay_starttls;
+pub use relay_starttls::{
+    RelayEhloScratch, RelayStartTls, RelayStartTlsProgress, RelayStartTlsReady,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaterialKind {
     Chain,
