@@ -3325,3 +3325,24 @@ No runtime route or retry loop is activated here. The PostgreSQL fixture seeds
 elapsed due times and covers both states, bounded batches, terminal/future
 exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
 historical replay and the separate fresh-recipient path.
+
+
+## 118. Clock-confirmed expiry admission
+
+The queue clock guard admits one expiry batch per monotonic second, only
+while explicitly confirmed. Each batch remains limited to 100 recipients by
+the storage publisher. A failed or abandoned attempt consumes its admission;
+there is no refund or catch-up burst. Runtime expiry workers must share one
+guard for their admitted queue and preserve the database-wide owner fences.
+
+The retained token fixes a UTC cutoff and a nonrenewable ten-second maximum
+publication deadline. The publisher must check it again before commit with
+fresh paired database UTC and local monotonic time. Clock holds, confirmation
+replacement, backward UTC and elapsed deadlines permanently retire the token.
+A process-unique checked confirmation identity prevents transfer to another
+guard; these ephemeral tokens and identities are never persisted. Every
+observed UTC regression advances a checked expiry generation, including
+subthreshold steps seen by another user of the shared guard. Recovery of UTC
+does not restore an older token; it cannot erase the intervening observation. The token
+is not a live transport permission. Database expiry mutation and runtime
+scheduler/authenticated confirmation wiring remain separate work.
