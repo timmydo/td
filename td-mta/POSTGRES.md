@@ -4250,3 +4250,30 @@ publication paths, including clock jumps before and after staging, adapter
 failure, persistent holds, wrong-phase and duplicate refusal, missing receipts,
 changed policy/owner/health/expiry, and exact Body RCPT mismatch. Historical
 Body receipt replay and final-capacity checks retain their existing coverage.
+
+## 153. Bounded Body publication ownership
+
+The prepared dispatch worker constructs a non-cloneable BodyResult only after
+known new clock-observed Body publication. Its immutable change binds the exact
+attempt, owner generation, subset and actual RCPT replies. Publication prepays
+the bounded phase allowance and acquires one ordinary slot; the owner retains
+the original earliest job/meter/ten-second Instant limit, not that slot.
+Unknown COMMIT keeps the exact change in the shared Pending barrier and returns
+no BodyResult. Historical settlement cannot reconstruct one, and duplicate
+new-only publication refuses even after settlement or explicit owner drop.
+
+Each current-state check independently prepays the phase allowance, acquires an
+ordinary slot, checks Pending and uses the native live Body reader. The shared
+admission helper also serves FinalResult without changing its retained final
+capacity. No fresh meter or later lease renewal can extend the original owner
+limit. A later phase refuses Body validation. Dropping an owner releases local
+custody only; it does not alter durable phase or recovery state.
+
+The real PostgreSQL worker cases cover mode, budget, slot and deadline refusal,
+exact charging, known new ownership, original expiry, unknown COMMIT retention,
+historical settlement and duplicate refusal. The paired SMTP TLS fixture uses
+BodyResult after actual 354 and validates it before the immutable body transfer;
+after AcceptancePossible it requires Body validation to refuse. This is an
+initial caller check, not yet a body transport owner enforcing every write or
+flush. Actual source matching, repeated transport fencing and scheduler/backend
+activation remain separate work.

@@ -20,6 +20,12 @@ use td_crypto::TrustStore;
 const ATTEMPT_IO: u64 = 2 * 1024 * 1024 + 192 * 1024;
 const PHASE_IO: u64 = 3 * 1024 * 1024 + 128 * 1024;
 
+#[derive(Clone, Copy)]
+enum LivePhase {
+    Body,
+    Possible,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Admission(ports::Error),
@@ -234,7 +240,8 @@ impl Dispatches<'_, '_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, Error> {
-        self.publish_phase_with(value, until, meter, false)
+        self.publish_phase_with(value, until, meter, None)
+            .map(|(outcome, _)| outcome)
     }
     /// Publish only a newly committed AcceptancePossible transition. Refuse
     /// retained receipts; settlement never grants continuing SMTP authority.
@@ -244,15 +251,40 @@ impl Dispatches<'_, '_> {
         until: Deadline,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, Error> {
-        self.publish_phase_with(value, until, meter, true)
+        self.publish_phase_with(value, until, meter, Some(LivePhase::Possible))
+            .map(|(outcome, _)| outcome)
+    }
+    /// Retain the exact Body operation only after known new publication.
+    /// The caller owns actual 354 and the matching immutable body source.
+    pub fn publish_body(
+        &self,
+        claim: &Claim,
+        generation: u64,
+        attempt: AttemptId,
+        accepted: &[(u32, &str)],
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<BodyResult<'_, '_, '_>, Error> {
+        let body = phases::body(claim, generation, attempt, accepted).map_err(Error::Phase)?;
+        let (outcome, limit) =
+            self.publish_phase_with(body.clone(), until, meter, Some(LivePhase::Body))?;
+        if Instant::now() >= limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(BodyResult {
+            worker: self,
+            body,
+            limit,
+            outcome,
+        })
     }
     fn publish_phase_with(
         &self,
         value: Change,
         until: Deadline,
         meter: &mut Meter,
-        new_possible: bool,
-    ) -> Result<phases::Outcome, Error> {
+        new_phase: Option<LivePhase>,
+    ) -> Result<(phases::Outcome, Instant), Error> {
         let mut pending = self
             .pending
             .operation
@@ -267,14 +299,59 @@ impl Dispatches<'_, '_> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        publish_phase(
+        let outcome = publish_phase(
             &self.connection,
             &self.guard,
             &mut pending,
             value,
             limit,
-            new_possible,
+            new_phase,
+        )?;
+        Ok((outcome, limit))
+    }
+
+    fn check_current_phase(
+        &self,
+        value: &Change,
+        original: Instant,
+        meter: &mut Meter,
+        phase: LivePhase,
+    ) -> Result<Instant, Error> {
+        let worker = self;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= original {
+            return Err(ports::Error::Deadline.into());
+        }
+        let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+        let limit = worker
+            .connection
+            .admit(until, meter, PHASE_IO)?
+            .min(original);
+        let _slot = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        let check = match phase {
+            LivePhase::Body => phases::check_current_body,
+            LivePhase::Possible => phases::check_current_possible,
+        };
+        check(
+            worker.connection.request,
+            worker.connection.trust,
+            limit,
+            value,
+            worker.connection.clock.clone(),
+            worker.guard.clone(),
         )
+        .map_err(Error::Phase)
     }
 
     /// Bind local reply storage and publication work to one exact subset before
@@ -333,6 +410,29 @@ impl Dispatches<'_, '_> {
     }
 }
 
+/// Non-cloneable custody of a known new Body publication. Its receipt is
+/// passive; current checks and transport admission remain separate.
+pub struct BodyResult<'w, 'a, 'r> {
+    worker: &'w Dispatches<'a, 'r>,
+    body: Change,
+    limit: Instant,
+    outcome: phases::Outcome,
+}
+impl BodyResult<'_, '_, '_> {
+    pub fn attempt(&self) -> AttemptId {
+        self.body.attempt()
+    }
+    pub fn outcome(&self) -> &phases::Outcome {
+        &self.outcome
+    }
+    /// Charge one fresh live check without extending the original job limit.
+    /// No connection slot or database lock remains held after return.
+    pub fn check_current(&self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.worker
+            .check_current_phase(&self.body, self.limit, meter, LivePhase::Body)
+    }
+}
+
 /// Local final-result capacity bound to one exact phase request. Consuming a
 /// plan requires a second ordinary connection slot for the new publication.
 pub struct FinalPlan<'w, 'a, 'r> {
@@ -372,7 +472,7 @@ impl<'w, 'a, 'r> FinalPlan<'w, 'a, 'r> {
             &mut pending,
             self.possible.clone(),
             limit,
-            true,
+            Some(LivePhase::Possible),
         )?;
         if Instant::now() >= self.work.limit {
             return Err(ports::Error::Deadline.into());
@@ -409,37 +509,12 @@ impl<'w, 'a, 'r> FinalResult<'w, 'a, 'r> {
     /// Recheck the exact live phase under current policy, owner and queue clock.
     /// The returned local cap is passive and never extends the reservation.
     pub fn check_current(&self, meter: &mut Meter) -> Result<Instant, Error> {
-        let worker = self.work.worker;
-        let pending = worker
-            .pending
-            .operation
-            .try_lock()
-            .map_err(|_| ports::Error::Busy)?;
-        if pending.is_some() {
-            return Err(ports::Error::Busy.into());
-        }
-        if Instant::now() >= self.work.limit {
-            return Err(ports::Error::Deadline.into());
-        }
-        let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
-        let limit = worker
-            .connection
-            .admit(until, meter, PHASE_IO)?
-            .min(self.work.limit);
-        let _slot = worker
-            .connection
-            .slots
-            .acquire()
-            .map_err(|_| ports::Error::Busy)?;
-        phases::check_current_possible(
-            worker.connection.request,
-            worker.connection.trust,
-            limit,
+        self.work.worker.check_current_phase(
             &self.possible,
-            worker.connection.clock.clone(),
-            worker.guard.clone(),
+            self.work.limit,
+            meter,
+            LivePhase::Possible,
         )
-        .map_err(Error::Phase)
     }
     /// Consume retained capacity for the actual normalized final DATA reply.
     /// No caller-supplied Change can replace the original attempt or subset.
@@ -556,7 +631,7 @@ impl FinalWork<'_, '_, '_> {
             &mut pending,
             value,
             self.limit,
-            false,
+            None,
         )
     }
 }
@@ -566,23 +641,28 @@ fn publish_phase(
     pending: &mut Option<Operation>,
     value: Change,
     limit: Instant,
-    new_possible: bool,
+    new_phase: Option<LivePhase>,
 ) -> Result<phases::Outcome, Error> {
     *pending = Some(Operation::Phase(value));
     let Some(Operation::Phase(value)) = pending.as_ref() else {
         return Err(ports::Error::Invalid.into());
     };
-    let result = if new_possible {
-        phases::publish_new_possible_observed(
-            connection.request,
-            connection.trust,
-            limit,
-            value,
-            connection.clock.clone(),
-            guard.clone(),
-        )
-    } else {
-        phases::publish(connection.request, connection.trust, limit, value)
+    let result = match new_phase {
+        Some(phase) => {
+            let publish = match phase {
+                LivePhase::Body => phases::publish_new_body_observed,
+                LivePhase::Possible => phases::publish_new_possible_observed,
+            };
+            publish(
+                connection.request,
+                connection.trust,
+                limit,
+                value,
+                connection.clock.clone(),
+                guard.clone(),
+            )
+        }
+        None => phases::publish(connection.request, connection.trust, limit, value),
     };
     match result {
         Ok(outcome) => {

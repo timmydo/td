@@ -110,19 +110,18 @@ pub(super) fn exercise(
             b"354 send body\r\n",
         );
         assert_eq!(data, "354 send body");
-        worker
-            .publish_phase(
-                phases::body(
-                    claim,
-                    generation,
-                    published.dispatch.attempt(),
-                    &[(recipient.ordinal, &rcpt)],
-                )
-                .unwrap(),
+        let body_owner = worker
+            .publish_body(
+                claim,
+                generation,
+                published.dispatch.attempt(),
+                &[(recipient.ordinal, &rcpt)],
                 cap,
                 &mut database,
             )
             .unwrap();
+        assert_eq!(body_owner.attempt(), published.dispatch.attempt());
+        body_owner.check_current(&mut database).unwrap();
         let plan = worker
             .reserve_final_result(
                 claim,
@@ -176,6 +175,11 @@ pub(super) fn exercise(
         .unwrap();
         assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
         let held = plan.publish_possible(&mut database).unwrap();
+        assert_eq!(
+            body_owner.check_current(&mut database),
+            Err(dispatch::Error::Phase(phases::Error::Conflict))
+        );
+        drop(body_owner);
         if refuse {
             sql(fixture,"CREATE FUNCTION public.reject_wire_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire fixture refusal'; END $$; CREATE TRIGGER reject_wire_final BEFORE INSERT ON td_mta.attempt_acceptance_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_final()");
         }

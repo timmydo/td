@@ -194,9 +194,112 @@ pub(super) fn exercise(
         Err(Error::Phase(phases::Error::Owner(owners::Error::Stale)))
     );
     assert_eq!(pending.attempt().unwrap(), None);
-    let published = worker
-        .publish_phase(body.clone(), until(10_000), &mut meter())
+    let accepted = &[(0, "250 first"), (1, "250 second")];
+    assert!(matches!(
+        forbidden.publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Admission(ports::Error::Forbidden))
+    ));
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(0),
+            &mut meter()
+        ),
+        Err(Error::Admission(ports::Error::Deadline))
+    ));
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(10_000),
+            &mut empty
+        ),
+        Err(Error::Admission(ports::Error::Capacity))
+    ));
+    let slot = worker
+        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
         .unwrap();
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
+    drop(slot);
+    let mut budget = meter();
+    let before = budget.remaining();
+    let owner = worker
+        .publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(2000),
+            &mut budget,
+        )
+        .unwrap();
+    assert_eq!(
+        before.io_bytes - budget.remaining().io_bytes,
+        3 * 1024 * 1024 + 128 * 1024
+    );
+    assert_eq!(before.records - budget.remaining().records, 4096);
+    assert_eq!(owner.attempt(), success.outcome.attempt);
+    let published = *owner.outcome();
+    let before = budget.remaining();
+    assert!(owner.check_current(&mut budget).is_ok());
+    assert_eq!(
+        before.io_bytes - budget.remaining().io_bytes,
+        3 * 1024 * 1024 + 128 * 1024
+    );
+    assert_eq!(before.records - budget.remaining().records, 4096);
+    let slot = worker
+        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(
+        owner.check_current(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    drop(slot);
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        owner.check_current(&mut empty),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            success.outcome.attempt,
+            accepted,
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Phase(phases::Error::Conflict))
+    ));
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(
+        owner.check_current(&mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    drop(owner);
     assert_eq!(published.attempt, success.outcome.attempt);
     assert_eq!(published.recipients, 2);
     assert_eq!(pending.attempt().unwrap(), None);
@@ -305,10 +408,30 @@ pub(super) fn exercise(
     let body = phases::body(claim, generation, attempt, &[(0, "250 first")]).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase_worker AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase_worker()");
     assert_eq!(
-        worker.publish_phase(body.clone(), until(1500), &mut meter()),
+        worker
+            .publish_body(
+                claim,
+                generation,
+                attempt,
+                &[(0, "250 first")],
+                until(1500),
+                &mut meter()
+            )
+            .map(|_| ()),
         Err(Error::Phase(phases::Error::Indeterminate))
     );
     assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            attempt,
+            &[(0, "250 first")],
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
     assert_eq!(
         worker.publish_phase(body, until(10_000), &mut meter()),
         Err(Error::Admission(ports::Error::Busy))
@@ -364,6 +487,27 @@ pub(super) fn exercise(
         sequence
     );
     assert_eq!(pending.attempt().unwrap(), None);
+    assert!(matches!(
+        worker.publish_body(
+            claim,
+            generation,
+            attempt,
+            &[(0, "250 first")],
+            until(10_000),
+            &mut meter()
+        ),
+        Err(Error::Phase(phases::Error::Conflict))
+    ));
+    let historical = phases::body(claim, generation, attempt, &[(0, "250 first")]).unwrap();
+    assert!(phases::check_current_body(
+        &runtime,
+        trust,
+        deadline(),
+        &historical,
+        clock.clone(),
+        worker.guard.clone()
+    )
+    .is_ok());
     super::final_work::exercise(fixture, &worker, claim, generation, attempt);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
