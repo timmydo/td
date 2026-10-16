@@ -4502,3 +4502,32 @@ Body/final path. A real negative MAIL reply survives a transaction refusal,
 empty retry budget and occupied slots before successful publication with the
 same receipt. A separately shortened owner retains an actual negative reply
 after expiry and refuses revival by a fresh meter.
+
+## 162. Bound DATA-command result alternatives
+
+EnvelopePlan can reserve a non-cloneable DataPlan for a nonempty ordered
+subset of its admitted recipients and their actual positive RCPT replies.
+Recipients outside the retained envelope refuse before DATA. Construction
+prepares both the exact Body request and negative DATA-command reply storage
+under the retained claim, generation and attempt; no later recipient list or
+RCPT text can replace them. The existing untouched-envelope checks retain the
+minimum original bound through this owner.
+
+Only an actual normalized 354 consumes the plan into new clock-observed Body
+publication. The private Prepared handoff uses the already retained Change,
+preserving all existing deadline, novelty, Pending and live-phase checks.
+A genuine normalized 4xx/5xx instead fills the reserved refusal evidence and
+uses CommandFailure to retain it across failed publication or retry. Both
+paths keep the original identity and deadline; neither admits new SMTP work
+from a historical receipt.
+
+This owner still relies on the caller for actual DATA sequencing, matching
+session, fresh pre-output checks and connection closure on refusal. Negative
+RCPT publication ordering remains an envelope-orchestration responsibility;
+untouched-envelope checks cannot reconstruct a partially progressed batch.
+No scheduler or production backend is activated.
+
+The native SMTP/TLS fixture publishes Body from actual 354 through DataPlan,
+retains an actual negative DATA reply across database refusal and retry,
+refuses a recipient outside the retained envelope before DATA, and rejects
+an actual non-354 reply without publishing Body.

@@ -488,6 +488,13 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             .dispatch
             .body(accepted)
             .map_err(Error::Phase)?;
+        self.publish_body_change(body, meter)
+    }
+    fn publish_body_change(
+        self,
+        body: Change,
+        meter: &mut Meter,
+    ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
         let (outcome, limit) = self.worker.publish_phase_with(
             body.clone(),
             self.until,
@@ -562,6 +569,29 @@ pub struct EnvelopePlan<'w, 'a, 'r> {
     envelope: attempts::Envelope,
 }
 impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
+    /// Bind actual positive RCPT replies before issuing DATA. Both alternative
+    /// result requests retain this owner's exact identity and admitted subset.
+    pub fn reserve_data(self, accepted: &[(u32, &str)]) -> Result<DataPlan<'w, 'a, 'r>, Error> {
+        if accepted.iter().any(|(ordinal, _)| {
+            self.envelope
+                .recipients
+                .binary_search_by_key(ordinal, |recipient| recipient.ordinal)
+                .is_err()
+        }) {
+            return Err(ports::Error::Invalid.into());
+        }
+        let dispatch = &self.prepared.published.dispatch;
+        let body = dispatch.body(accepted).map_err(Error::Phase)?;
+        let reply = dispatch
+            .reserve_data_reply(accepted)
+            .map_err(Error::Phase)?;
+        Ok(DataPlan {
+            envelope: self,
+            body,
+            reply,
+        })
+    }
+
     /// Reserve negative MAIL evidence before sending this envelope's sender.
     /// Live transport checks and actual command sequencing remain required.
     pub fn reserve_mail(self) -> Result<MailPlan<'w, 'a, 'r>, Error> {
@@ -652,6 +682,57 @@ impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
         .publish(meter)
     }
 }
+/// Exact accepted RCPT subset paired with both possible DATA-command results.
+/// Actual DATA sequencing, fresh checks and session matching remain required.
+pub struct DataPlan<'w, 'a, 'r> {
+    envelope: EnvelopePlan<'w, 'a, 'r>,
+    body: Change,
+    reply: phases::CommandReply,
+}
+impl<'w, 'a, 'r> DataPlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.envelope.attempt()
+    }
+    pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.envelope.check_current(meter)
+    }
+    /// Only actual normalized 354 may consume the retained subset into Body.
+    /// No replacement recipient list, reply evidence or deadline is accepted.
+    pub fn publish_body(
+        self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
+        if crate::format::row::smtp_reply_text(reply).is_err()
+            || crate::recipient_sweep::reply_class(Some(reply)) != Some(3)
+            || reply.as_bytes().get(..3) != Some(b"354".as_slice())
+        {
+            return Err(ports::Error::Invalid.into());
+        }
+        self.envelope.prepared.publish_body_change(self.body, meter)
+    }
+    /// Capture genuine negative DATA-command evidence before database admission.
+    /// Failure uses the same bounded retained-command retry owner as MAIL.
+    pub fn record_refusal(
+        self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, CommandFailure<'w, 'a, 'r>> {
+        let value = self.reply.finish(reply).map_err(|error| CommandFailure {
+            error: Error::Phase(error),
+            retained: None,
+        })?;
+        let prepared = self.envelope.prepared;
+        RetainedCommand {
+            worker: prepared.worker,
+            limit: prepared.limit,
+            until: prepared.until,
+            value,
+        }
+        .publish(meter)
+    }
+}
+
 /// Failed publication of actual negative command evidence. Retrying cannot
 /// replace its identity or reply and cannot extend its retained deadline.
 pub struct CommandFailure<'w, 'a, 'r> {

@@ -23,11 +23,14 @@ pub(super) fn exercise(
     generation: u64,
     source: SubmissionId,
 ) {
-    for (n, refuse, mail_refusal) in [
-        (95, false, 0),
-        (96, true, 0),
-        (97, false, 1),
-        (98, false, 2),
+    for (n, refuse, mail_refusal, data_case) in [
+        (95, false, 0, 0),
+        (96, true, 0, 0),
+        (97, false, 1, 0),
+        (98, false, 2, 0),
+        (99, false, 0, 1),
+        (100, false, 0, 2),
+        (101, false, 0, 3),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
@@ -193,6 +196,31 @@ pub(super) fn exercise(
             format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
             b"250 recipient\r\n",
         );
+        if data_case == 2 {
+            assert!(matches!(
+                published.reserve_data(&[(999, &rcpt)]),
+                Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
+            ));
+            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
+            drop(session.into_buffers().unwrap());
+            let cancellation =
+                td_mta::postgres_submission_cancel::prepare(claim, generation, submission).unwrap();
+            td_mta::postgres_submission_cancel::publish(
+                &runtime,
+                trust,
+                deadline(),
+                &cancellation,
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
+        let mut published = published.reserve_data(&[(ordinal, &rcpt)]).unwrap();
+        assert_eq!(published.attempt(), attempt);
+        assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
         let (session, data) = wire::command(
             session,
             &mut peer,
@@ -200,12 +228,70 @@ pub(super) fn exercise(
             cap,
             command::Command::Data,
             b"DATA\r\n",
-            b"354 send body\r\n",
+            match data_case {
+                1 => b"550 data refused\r\n",
+                3 => b"250 wrong status\r\n",
+                _ => b"354 send body\r\n",
+            },
         );
-        assert_eq!(data, "354 send body");
-        let (body_owner, body_request) = published
-            .publish_body(&[(ordinal, &rcpt)], &mut database)
+        if data_case == 1 {
+            assert_eq!(data, "550 data refused");
+            drop(session.into_buffers().unwrap());
+            sql(fixture,"CREATE FUNCTION public.reject_wire_data() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire DATA refusal'; END $$; CREATE TRIGGER reject_wire_data BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_data()");
+            let failure = published.record_refusal(&data, &mut database).unwrap_err();
+            assert_eq!(
+                failure.error,
+                dispatch::Error::Phase(phases::Error::Database)
+            );
+            assert_eq!(failure.attempt(), Some(attempt));
+            sql(
+                fixture,
+                "DROP TRIGGER reject_wire_data ON td_mta.attempt_command_receipts",
+            );
+            let outcome = failure.retry(&mut database).unwrap();
+            let value = phases::refused_data_command(
+                claim,
+                generation,
+                attempt,
+                &[(ordinal, &rcpt)],
+                &data,
+            )
             .unwrap();
+            assert_eq!(
+                phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                Some(outcome)
+            );
+            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|250 recipient|550 data refused");
+            assert_eq!(pending.attempt().unwrap(), None);
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
+        if data_case == 3 {
+            assert_eq!(data, "250 wrong status");
+            assert!(matches!(
+                published.publish_body(&data, &mut database),
+                Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
+            ));
+            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
+            drop(session.into_buffers().unwrap());
+            let cancellation =
+                td_mta::postgres_submission_cancel::prepare(claim, generation, submission).unwrap();
+            td_mta::postgres_submission_cancel::publish(
+                &runtime,
+                trust,
+                deadline(),
+                &cancellation,
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
+        assert_eq!(data, "354 send body");
+        let (body_owner, body_request) = published.publish_body(&data, &mut database).unwrap();
         assert_eq!(body_owner.attempt(), attempt);
         assert_eq!(body_request.attempt(), attempt);
         assert!(body_owner.check_current(&mut database).unwrap() <= prepared_limit);

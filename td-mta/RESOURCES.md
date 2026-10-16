@@ -5066,3 +5066,11 @@ not allocate new reply storage. The sole outbound job owns this allowance
 separately from SMTP/TLS buffers and native database work. This passive
 reservation holds no connection permit and creates no additional pending
 queue or publication deadline.
+
+DataPlan retains both alternative DATA-command requests before transmission:
+the Body request's positive RCPT vector beside CommandReply's positive RCPT
+and reserved negative vectors. At 100 recipients with 4096-byte replies this
+is at most 1228800 reply bytes, plus bounded vectors, claim/envelope metadata
+and inline hash states. Consuming either result drops the unused alternative;
+no new reply-vector allocation is needed after actual 354 or refusal. Native
+database allocations and work admission remain separate.

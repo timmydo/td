@@ -71,6 +71,18 @@ impl Dispatch {
             ordinals,
         )
     }
+    pub(crate) fn reserve_data_reply(
+        &self,
+        accepted: &[(u32, &str)],
+    ) -> Result<crate::postgres_attempt_phases::CommandReply, crate::postgres_attempt_phases::Error>
+    {
+        crate::postgres_attempt_phases::reserve_data_command_reply(
+            &self.claim,
+            self.generation,
+            self.attempt,
+            accepted,
+        )
+    }
     pub(crate) fn body(
         &self,
         accepted: &[(u32, &str)],
