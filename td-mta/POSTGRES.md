@@ -3986,3 +3986,28 @@ This is durable logical capacity only. The relay must still retain independent
 local connection/work/reply capacity, its original attempt deadline and live
 ownership before terminator handoff. Passive phase receipts remain historical
 evidence; BodySent still exposes no terminator API, and no scheduler is enabled.
+
+## 143. Retained local final-result work
+
+The prepared relay publication worker can reserve one process-local connection
+slot and prepay the existing phase I/O/record allowance for a named attempt's
+final positive or negative DATA result. Its non-cloneable FinalWork retains
+that slot until consumption or drop. Consumption accepts only that attempt's
+phase 4/5 Change, uses the already held slot and allowance, and cannot renew
+the reservation's original job/meter/ten-second deadline. A held slot reduces
+ordinary publication capacity, so publishing AcceptancePossible while holding
+it requires another ordinary slot. Settlement still uses independent capacity.
+
+The reservation borrows its original worker, connection configuration and
+pending-operation owner. An unresolved operation refuses reservation or
+consumption. Publication uses the same bounded native phase transaction and
+transfers an uncertain COMMIT request into Pending for historical settlement.
+No second pending queue is introduced. Abandoning an unused local allowance
+releases its connection slot but does not refund charged work or remove any
+durable reservation.
+
+This reserves connection/work capacity only. Bounded reply storage and native
+publication allocations remain separate, as do durable logical claims and live
+ownership. FinalWork does not authorize SMTP output, and a returned receipt
+may be historical. BodySent remains closed; this increment enables no scheduler
+or terminator handoff.

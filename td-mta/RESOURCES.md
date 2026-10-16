@@ -5033,3 +5033,13 @@ The phase/recovery/expiry transactions retain their existing connection byte,
 frame, reply and deadline bounds. These durable logical claims do not reserve
 physical database disk/WAL or the relay's future local connection, work and
 reply storage. Those local reservations remain required before SMTP handoff.
+
+The prepared FinalWork owner retains one ordinary publication ReadPermit and
+prepays the existing 3 MiB plus 128 KiB phase I/O ceiling and 4096 records.
+Its original deadline is fixed at admission, including the ten-second native
+operation cap. The owner contains references, one attempt ID, one Instant and
+one permit; it allocates no queue or reply storage. Concurrent retained owners
+are bounded by the existing slot pool. Consumption neither reacquires a slot
+nor charges again; drop returns only the slot. The selected phase request,
+its native temporary clone and SQL rows retain their separate memory bounds.
+This is only the connection/work part of local final-outcome capacity.

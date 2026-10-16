@@ -7,7 +7,7 @@ use crate::{
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempts::{self as attempts, Dispatch},
     postgres_probe::{Mode, Request},
-    postgres_read::ReadSlots,
+    postgres_read::{ReadPermit, ReadSlots},
     postgres_route_owners::Claim,
     queue_clock::Guard,
 };
@@ -245,21 +245,93 @@ impl Dispatches<'_, '_> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        *pending = Some(Operation::Phase(value));
-        let Some(Operation::Phase(value)) = pending.as_ref() else {
+        publish_phase(&self.connection, &mut pending, value, limit)
+    }
+
+    /// Prepay one final DATA result's publication work and retain its connection
+    /// slot until consumption or drop. This is capacity, not SMTP authority;
+    /// reply storage, durable claims and live ownership remain separate.
+    pub fn reserve_final(
+        &self,
+        attempt: AttemptId,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<FinalWork<'_, '_, '_>, Error> {
+        let pending = self
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let limit = self.connection.admit(until, meter, PHASE_IO)?;
+        let permit = self
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        Ok(FinalWork {
+            worker: self,
+            attempt,
+            limit,
+            _permit: permit,
+        })
+    }
+}
+
+/// One non-cloneable final-result work allowance. Holding it leaves less pool
+/// capacity for ordinary publications; reserve settlement capacity separately.
+/// The original deadline is fixed at reservation and cannot be renewed.
+pub struct FinalWork<'w, 'a, 'r> {
+    worker: &'w Dispatches<'a, 'r>,
+    attempt: AttemptId,
+    limit: Instant,
+    _permit: ReadPermit<'w>,
+}
+impl FinalWork<'_, '_, '_> {
+    /// Consume the allowance for this attempt's positive or negative DATA result.
+    /// Unknown COMMIT transfers the request to the worker's existing Pending.
+    /// No fresh connection slot or work charge is needed at consumption.
+    pub fn publish(self, value: Change) -> Result<phases::Outcome, Error> {
+        if !value.is_final_for(self.attempt) {
             return Err(ports::Error::Invalid.into());
-        };
-        match phases::publish(self.connection.request, self.connection.trust, limit, value) {
-            Ok(outcome) => {
+        }
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let mut pending = self
+            .worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        publish_phase(&self.worker.connection, &mut pending, value, self.limit)
+    }
+}
+fn publish_phase(
+    connection: &Connection<'_, '_>,
+    pending: &mut Option<Operation>,
+    value: Change,
+    limit: Instant,
+) -> Result<phases::Outcome, Error> {
+    *pending = Some(Operation::Phase(value));
+    let Some(Operation::Phase(value)) = pending.as_ref() else {
+        return Err(ports::Error::Invalid.into());
+    };
+    match phases::publish(connection.request, connection.trust, limit, value) {
+        Ok(outcome) => {
+            *pending = None;
+            Ok(outcome)
+        }
+        Err(error) => {
+            if error != phases::Error::Indeterminate {
                 *pending = None;
-                Ok(outcome)
             }
-            Err(error) => {
-                if error != phases::Error::Indeterminate {
-                    *pending = None;
-                }
-                Err(Error::Phase(error))
-            }
+            Err(Error::Phase(error))
         }
     }
 }

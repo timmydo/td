@@ -10432,6 +10432,8 @@ mod attempt_refusal;
 mod attempt_retry;
 #[path = "postgres_probe/final_capacity.rs"]
 mod final_capacity;
+#[path = "postgres_probe/final_work.rs"]
+mod final_work;
 
 fn exercise_dispatch(
     fixture: &Fixture,

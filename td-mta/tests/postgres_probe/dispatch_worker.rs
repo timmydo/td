@@ -224,6 +224,10 @@ pub(super) fn exercise(
         Err(Error::Publication(attempts::Error::Indeterminate))
     );
     let attempt = pending.attempt().unwrap().unwrap();
+    assert!(matches!(
+        worker.reserve_final(attempt, until(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
     assert_eq!(
         worker.publish_phase(
             phases::body(
@@ -366,14 +370,7 @@ pub(super) fn exercise(
         sequence
     );
     assert_eq!(pending.attempt().unwrap(), None);
-    cancel::publish(
-        request,
-        trust,
-        deadline(),
-        &cancel::prepare(claim, generation, submission).unwrap(),
-        |_| Ok(()),
-    )
-    .unwrap();
+    super::final_work::exercise(&worker, claim, generation, attempt);
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

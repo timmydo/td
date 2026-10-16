@@ -48,6 +48,9 @@ pub struct Change {
     digest: [u8; 32],
 }
 impl Change {
+    pub(crate) fn is_final_for(&self, attempt: AttemptId) -> bool {
+        self.attempt == attempt && matches!(self.phase, 4 | 5)
+    }
     pub(crate) const fn attempt(&self) -> AttemptId {
         self.attempt
     }
