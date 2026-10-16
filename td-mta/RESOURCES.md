@@ -4906,3 +4906,12 @@ the remaining command extent before each write attempt, including pending
 I/O; pre/post checks retain the original absolute deadline. No per-turn
 allocation or output growth occurs. The complete reply retains exclusive
 connection custody until the worker copies its result and advances or aborts.
+
+The prepared SMTP DATA encoder has a compile-time 96-byte state ceiling and
+a two-byte pending output cell inside that state. Caller input/output buffers
+and immutable-source custody are external. A poll performs at most 256 state
+transitions and charges one record plus every consumed source/output byte to
+the same original meter. Empty input/output supplies backpressure, and the
+first refusal is sticky. No poll allocates or emits a terminator. Completion
+and consuming finish freshly check the original meter/deadline; neither
+constitutes a durable body/acceptance fence.

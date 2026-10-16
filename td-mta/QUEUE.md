@@ -195,6 +195,22 @@ A positive DATA-command reply alone never permits body bytes: the Body subset
 must be durably fenced first. Runtime wiring, queue fences and scheduling
 remain separate work.
 
+The prepared DATA transparency encoder consumes one declared immutable source
+extent under the original work meter. It preserves source octets and doubles
+a dot only at a line start, including the first source octet. Require strict
+CRLF, at most 998 source content bytes per line, no NUL, and a final CRLF for
+nonempty sources. The extra transparency dot does not count against the line
+limit. Seven-bit mode refuses high-bit octets; eight-bit mode is only a caller
+policy choice and grants no EHLO/MAIL negotiation evidence. It does not
+repair line endings, re-encode MIME, validate headers, or acquire source
+custody. Runtime admission must select a transport-compatible immutable body.
+
+The encoder never emits a DATA terminator, even on completion. Its output is
+provisional until consuming finish; any framing/work refusal requires discard
+and transport abort. Only a later runtime owner may hand terminator bytes to
+TLS after the exact AcceptancePossible subset and final-outcome reservation
+are durable. This codec does not activate body transmission or queue workers.
+
 Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
 bytes and a 20-byte key. A 100-row update is 905100 bytes before transaction and
