@@ -1516,6 +1516,23 @@ The caller output prefix changes only after the final clock check; errors
 preserve it. Configuration borrows, resolver order and generation stay fixed
 for the owner's lifetime, consistent with restart-only resolver changes.
 
+The prepared `outbound_dial` helper runs only on the admitted outbound
+handshake worker while its caller retains the sole outbound slot and configured
+endpoint/TLS policy. It tries at most 16 numeric addresses in order, with no
+ambient name lookup. Each attempt uses the earlier original job/meter deadline
+and a two-second connect cap; fallback never renews either budget. Prepay dial
+and socket-setup work before opening a socket, and check time before and after
+connect and conversion to the exclusively owned nonblocking TcpTransport.
+Failure or late completion drops the socket. No per-peer thread or retained
+failed connection is created. Standard blocking connect retains the documented
+host-kernel failure boundary.
+
+TCP success grants no TLS identity, credential permission or queue authority.
+The caller retains the configured hostname/policy for the existing TLS handoff,
+which must verify it before SMTP authentication. DNS expiry controls cache
+reuse, not the identity of a connection made from the current lookup. Dialing
+itself does not activate delivery or establish a fresh attempt fence.
+
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;

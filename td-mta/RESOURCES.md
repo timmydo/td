@@ -4992,3 +4992,12 @@ miss stages one fixed 16-address set and grants at most 4,000,000 record units,
 deadline. These are work counters, not allocated storage. A hit performs only
 bounded name/key/clock checks and a fixed address copy. No background refresh,
 per-request thread or growing collection is introduced.
+
+The prepared outbound dial helper borrows at most 16 numeric addresses and
+holds at most one socket at a time. Each attempted address prepays two record
+units for connect plus bounded nonblocking socket setup, including failed
+attempts; it sends no application bytes. A two-second per-address connect cap
+is further shortened by the original job and meter deadlines. It allocates no
+per-address collection and hands success to the existing TcpTransport owner;
+refusal drops any opened socket. Only the admitted sole outbound slot may
+occupy a handshake worker for this blocking operation.

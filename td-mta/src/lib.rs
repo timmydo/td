@@ -121,6 +121,7 @@ pub use td_mime::parameter_value as mime_value;
 pub use td_mime::unfold as mime_unfold;
 pub mod observability;
 pub mod operator_files;
+pub mod outbound_dial;
 pub mod ownership;
 pub mod ports;
 pub mod postgres_accounts;
