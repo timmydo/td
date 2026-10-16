@@ -26,6 +26,32 @@ pub fn check_current_possible(
     if value.inner.phase != 3 {
         return Err(Error::Integrity);
     }
+    check_current(request, trust, deadline, value, clock, guard)
+}
+/// Validate the exact live Body subset and its actual retained RCPT replies.
+/// This passive observation ends all database locks before returning; the
+/// caller still owns actual 354, immutable source and transport admission.
+pub fn check_current_body(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<Instant, Error> {
+    if value.inner.phase != 2 {
+        return Err(Error::Integrity);
+    }
+    check_current(request, trust, deadline, value, clock, guard)
+}
+fn check_current(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<Instant, Error> {
     let value = value.inner.clone();
     let observation = Observation { clock, guard };
     let limit = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
@@ -58,10 +84,12 @@ pub fn check_current_possible(
             if completed.is_some() || timestamp>=expires {
                 return Err(Error::ExpiryHold);
             }
-            crate::postgres_final_capacity::check(client, account, attempt, &value.ordinals).await.map_err(capacity)?;
+            if value.phase == 3 {
+                crate::postgres_final_capacity::check(client, account, attempt, &value.ordinals).await.map_err(capacity)?;
+            }
             let rows=client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101", &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
             if rows.len()>100 {return Err(Error::Integrity);}
-            let mut selected=value.ordinals.iter();
+            let mut selected=value.ordinals.iter().enumerate();
             for row in &rows {
                 let found:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
                 let phase:i64=row.try_get(1).map_err(|_|Error::Integrity)?;
@@ -73,7 +101,11 @@ pub fn check_current_possible(
                 if !(0..1000).contains(&found) || !encoded.as_chunks::<4>().0.iter().any(|n|i64::from(u32::from_be_bytes(*n))==found)
                     || reason!=0 || next.is_some() || changed>sequence {return Err(Error::Integrity);}
                 if phase==1 && value.ordinals.binary_search(&found).is_err() {continue;}
-                if phase!=3 || selected.next()!=Some(&found) {return Err(Error::Conflict);}
+                let (index, ordinal) = selected.next().ok_or(Error::Conflict)?;
+                if phase!=value.phase || ordinal!=&found {return Err(Error::Conflict);}
+                if phase==2 && rcpt!=value.replies.get(index).map(String::as_str) {
+                    return Err(Error::Integrity);
+                }
                 if rcpt.is_none_or(|s|!valid_reply(s,false)) || data.is_some() || changed!=published.new_sequence {
                     return Err(Error::Integrity);
                 }

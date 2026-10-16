@@ -215,14 +215,20 @@ pub(super) fn replay(
 
 // A rejected new phase must roll back recipients, sequence and durable claims,
 // while its process-local clock hold survives that rollback.
-pub(super) fn possible(
+pub(super) fn phase(
     fixture: &Fixture,
     request: &Request<'_>,
     trust: &TrustStore,
     claim: &Claim,
     value: &td_mta::postgres_attempt_phases::Change,
+    body: bool,
 ) {
     use td_mta::postgres_attempt_phases as phases;
+    let publish = if body {
+        phases::publish_new_body_observed
+    } else {
+        phases::publish_new_possible_observed
+    };
     let snapshot = || {
         sql(fixture, "SELECT encode(sequence,'hex')||':'||(SELECT count(*) FROM td_mta.attempt_final_reservations)::text||':'||(SELECT md5(string_agg(row_to_json(r)::text,',' ORDER BY account,submission_id,ordinal)) FROM td_mta.recipients r) FROM td_mta.accounts")
     };
@@ -230,7 +236,7 @@ pub(super) fn possible(
     for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
         let (clock, guard) = setup(fixture, false, jump_at, fail);
         assert_eq!(
-            phases::publish_new_possible_observed(
+            publish(
                 request,
                 trust,
                 deadline(),
@@ -254,14 +260,7 @@ pub(super) fn possible(
         assert_eq!(snapshot(), before);
         if !fail {
             assert_eq!(
-                phases::publish_new_possible_observed(
-                    request,
-                    trust,
-                    deadline(),
-                    value,
-                    clock,
-                    guard
-                ),
+                publish(request, trust, deadline(), value, clock, guard),
                 Err(phases::Error::Clock(queue_clock::Error::Unstable))
             );
         }
@@ -288,7 +287,7 @@ pub(super) fn possible(
         ));
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={prior},expires_at={} WHERE operation=decode('{}','hex')", prior+30_000, claim.operation()));
         assert_eq!(
-            phases::publish_new_possible_observed(
+            publish(
                 request,
                 trust,
                 deadline(),
@@ -300,7 +299,7 @@ pub(super) fn possible(
         );
         sql(fixture, &format!("UPDATE td_mta.route_owners SET last_clock={last},expires_at={expires} WHERE operation=decode('{}','hex')", claim.operation()));
         assert_eq!(
-            phases::publish_new_possible_observed(request, trust, deadline(), value, clock, guard),
+            publish(request, trust, deadline(), value, clock, guard),
             Err(phases::Error::Clock(queue_clock::Error::Unstable))
         );
         assert_eq!(
@@ -311,28 +310,69 @@ pub(super) fn possible(
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     let locked = guard.lock().unwrap();
     assert_eq!(
-        phases::publish_new_possible_observed(
-            request,
-            trust,
-            deadline(),
-            value,
-            clock,
-            guard.clone()
-        ),
+        publish(request, trust, deadline(), value, clock, guard.clone()),
         Err(phases::Error::Clock(queue_clock::Error::Invalid))
     );
     drop(locked);
     assert_eq!(snapshot(), before);
 }
-pub(super) fn publish_possible(
+pub(super) fn publish_phase(
     fixture: &Fixture,
     request: &Request<'_>,
     trust: &TrustStore,
     limit: Instant,
     value: &td_mta::postgres_attempt_phases::Change,
+    body: bool,
 ) -> Result<td_mta::postgres_attempt_phases::Outcome, td_mta::postgres_attempt_phases::Error> {
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
-    td_mta::postgres_attempt_phases::publish_new_possible_observed(
-        request, trust, limit, value, clock, guard,
-    )
+    let publish = if body {
+        td_mta::postgres_attempt_phases::publish_new_body_observed
+    } else {
+        td_mta::postgres_attempt_phases::publish_new_possible_observed
+    };
+    publish(request, trust, limit, value, clock, guard)
+}
+
+pub(super) fn current(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    value: &td_mta::postgres_attempt_phases::Change,
+    body: bool,
+) -> Result<Instant, td_mta::postgres_attempt_phases::Error> {
+    use td_mta::postgres_attempt_phases as phases;
+    let check = if body {
+        phases::check_current_body
+    } else {
+        phases::check_current_possible
+    };
+    for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
+        let (clock, guard) = setup(fixture, false, jump_at, fail);
+        assert_eq!(
+            check(
+                request,
+                trust,
+                deadline(),
+                value,
+                clock.clone(),
+                guard.clone()
+            ),
+            Err(phases::Error::Clock(if fail {
+                queue_clock::Error::Invalid
+            } else {
+                queue_clock::Error::Unstable
+            }))
+        );
+        if jump_at == 2 {
+            assert_eq!(clock.samples.load(Ordering::Relaxed), 2);
+        }
+        if !fail {
+            assert_eq!(
+                check(request, trust, deadline(), value, clock, guard),
+                Err(phases::Error::Clock(queue_clock::Error::Unstable))
+            );
+        }
+    }
+    let (clock, guard) = setup(fixture, false, u64::MAX, false);
+    check(request, trust, deadline(), value, clock, guard)
 }

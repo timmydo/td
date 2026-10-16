@@ -16,9 +16,9 @@ use std::{
 use td_crypto::{Crypto, Digest, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
-#[path = "postgres_possible_current.rs"]
+#[path = "postgres_phase_current.rs"]
 mod current;
-pub use current::check_current_possible;
+pub use current::{check_current_body, check_current_possible};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -493,6 +493,29 @@ pub fn publish_new_possible_observed(
         Some(Observation { clock, guard }),
     )
 }
+/// Publish only a new Body transition, observing the persistent queue clock
+/// at admission and before COMMIT. Historical receipts refuse; actual 354 and
+/// live transport admission remain the trusted caller's responsibility.
+pub fn publish_new_body_observed(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<Outcome, Error> {
+    if value.inner.phase != 2 {
+        return Err(Error::Integrity);
+    }
+    publish_inner(
+        request,
+        trust,
+        deadline,
+        value,
+        true,
+        Some(Observation { clock, guard }),
+    )
+}
 struct Observation {
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
@@ -516,11 +539,11 @@ fn publish_inner(
     trust: &TrustStore,
     deadline: Instant,
     value: &Change,
-    new_possible: bool,
+    new_only: bool,
     observation: Option<Observation>,
 ) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
-        return if new_possible {
+        return if new_only {
             Err(Error::Conflict)
         } else {
             Ok(outcome)
@@ -535,7 +558,7 @@ fn publish_inner(
                 .await
                 .map_err(Error::Owner)?;
             if let Some(outcome) = receipt(client, &value).await? {
-                return if new_possible {
+                return if new_only {
                     Err(Error::Conflict)
                 } else {
                     Ok(outcome)

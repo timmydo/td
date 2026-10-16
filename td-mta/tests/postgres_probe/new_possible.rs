@@ -75,6 +75,7 @@ pub(super) fn live_state(
     trust: &TrustStore,
     attempt: AttemptId,
     change: &phases::Change,
+    body: bool,
 ) {
     use std::sync::{Arc, Mutex};
     use td_mta::{
@@ -95,8 +96,29 @@ pub(super) fn live_state(
         })
         .unwrap(),
     ));
+    let current = if body {
+        phases::check_current_body
+    } else {
+        phases::check_current_possible
+    };
+    let wrong = if body {
+        phases::check_current_possible
+    } else {
+        phases::check_current_body
+    };
+    assert_eq!(
+        wrong(
+            request,
+            trust,
+            deadline(),
+            change,
+            clock.clone(),
+            guard.clone()
+        ),
+        Err(phases::Error::Integrity)
+    );
     let check = || {
-        phases::check_current_possible(
+        current(
             request,
             trust,
             deadline(),
@@ -109,6 +131,7 @@ pub(super) fn live_state(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
+    super::attempt_clock::current(fixture, request, trust, change, body).unwrap();
     let limit = check().unwrap();
     assert!(limit > Instant::now());
     assert!(limit <= deadline());
@@ -128,12 +151,30 @@ pub(super) fn live_state(
     sql(fixture,&format!("UPDATE td_mta.submission_attempts SET active=false WHERE attempt_id=decode('{attempt}','hex')"));
     assert_eq!(check(), Err(phases::Error::Missing));
     sql(fixture,&format!("UPDATE td_mta.submission_attempts SET active=true WHERE attempt_id=decode('{attempt}','hex')"));
-    sql(fixture,&format!("CREATE TABLE public.live_claim AS SELECT * FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')"));
-    assert_eq!(check(), Err(phases::Error::Integrity));
-    sql(fixture,"INSERT INTO td_mta.attempt_final_reservations SELECT * FROM public.live_claim; DROP TABLE public.live_claim");
-    sql(fixture,&format!("UPDATE td_mta.recipients SET phase=2 WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+    if !body {
+        sql(fixture,&format!("CREATE TABLE public.live_claim AS SELECT * FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')"));
+        assert_eq!(check(), Err(phases::Error::Integrity));
+        sql(fixture,"INSERT INTO td_mta.attempt_final_reservations SELECT * FROM public.live_claim; DROP TABLE public.live_claim");
+    } else {
+        assert_eq!(
+            sql(
+                fixture,
+                "SELECT count(*) FROM td_mta.attempt_final_reservations"
+            ),
+            "0"
+        );
+        sql(fixture,&format!("CREATE TABLE public.live_reply AS SELECT ordinal,rcpt_reply FROM td_mta.recipients WHERE attempt_id=decode('{attempt}','hex'); UPDATE td_mta.recipients SET rcpt_reply='250 different actual reply' WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+        assert_eq!(check(), Err(phases::Error::Integrity));
+        sql(fixture,&format!("UPDATE td_mta.recipients r SET rcpt_reply=b.rcpt_reply FROM public.live_reply b WHERE r.ordinal=b.ordinal AND r.attempt_id=decode('{attempt}','hex'); DROP TABLE public.live_reply"));
+    }
+    let phase = if body { 2 } else { 3 };
+    let other = if body { 3 } else { 2 };
+    sql(fixture,&format!("UPDATE td_mta.recipients SET phase={other} WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
     assert_eq!(check(), Err(phases::Error::Conflict));
-    sql(fixture,&format!("UPDATE td_mta.recipients SET phase=3 WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+    sql(fixture,&format!("UPDATE td_mta.recipients SET phase={phase} WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+    sql(fixture,&format!("CREATE TABLE public.live_receipt AS SELECT * FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex') AND phase={phase}; DELETE FROM td_mta.attempt_phase_receipts WHERE attempt_id=decode('{attempt}','hex') AND phase={phase}"));
+    assert_eq!(check(), Err(phases::Error::Missing));
+    sql(fixture,"INSERT INTO td_mta.attempt_phase_receipts SELECT * FROM public.live_receipt; DROP TABLE public.live_receipt");
     sql(fixture,"CREATE TABLE public.live_health AS SELECT * FROM td_mta.route_health; DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,t,t+300000,NULL FROM td_mta.route_owners CROSS JOIN (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint t) x");
     assert_eq!(
         check(),

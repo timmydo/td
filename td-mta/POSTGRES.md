@@ -4220,3 +4220,33 @@ transport. Fixture policy and credentials are prepared explicitly, and address
 selection uses a local socket pair. It does not qualify resolver/scheduler
 activation or switch the production backend. Existing isolated component tests
 cover the broader malformed reply, live refusal and uncertainty cases.
+
+## 152. Live Body storage validation
+
+The prepared phase API can publish a known new Body transition with the same
+persistent queue-clock observation used for AcceptancePossible: admission and
+pre-COMMIT checks both use database UTC paired with the runtime monotonic
+adapter. Existing receipts refuse the new-only path. Ordinary publication and
+inspection remain historical settlement, including after later phases.
+
+Live Body validation shares the bounded current-state reader with
+AcceptancePossible. It requires the exact receipt, active attempt and selected
+InFlight Body subset under current policy, owner, route-health and clock checks.
+The retained positive RCPT text must equal each selected recipient's stored
+reply; data replies are absent and changed sequences equal the Body receipt.
+Prepared recipients outside the selected subset remain permitted. Durable final
+capacity is required only for AcceptancePossible, where it is reserved.
+
+The returned local deadline conservatively bounds the current owner lease and
+submission expiry without extending the input limit. All locks end before
+return; validation neither mutates queue state nor grants lasting SMTP
+authority. The trusted caller still owns actual 354, the matching immutable
+source, original transport deadlines and validation before body output. This
+storage increment does not wire a body transport owner or activate a scheduler.
+Section 4's pause/takeover and already-buffered-byte limitation remains.
+
+The real PostgreSQL fixture exercises both phase readers and clock-observed
+publication paths, including clock jumps before and after staging, adapter
+failure, persistent holds, wrong-phase and duplicate refusal, missing receipts,
+changed policy/owner/health/expiry, and exact Body RCPT mismatch. Historical
+Body receipt replay and final-capacity checks retain their existing coverage.

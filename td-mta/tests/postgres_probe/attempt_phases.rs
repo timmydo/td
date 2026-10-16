@@ -92,7 +92,27 @@ pub(super) fn exercise(
         fixture,
         "DROP TRIGGER reject_phase ON td_mta.attempt_phase_receipts",
     );
-    let outcome = phases::publish(request, trust, deadline(), &body).unwrap();
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    super::attempt_clock::phase(fixture, request, trust, claim, &body, true);
+    assert_eq!(
+        super::attempt_clock::publish_phase(
+            fixture,
+            request,
+            trust,
+            deadline(),
+            &final_phase,
+            true
+        ),
+        Err(phases::Error::Integrity)
+    );
+    let outcome =
+        super::attempt_clock::publish_phase(fixture, request, trust, deadline(), &body, true)
+            .unwrap();
+    assert_eq!(
+        super::attempt_clock::publish_phase(fixture, request, trust, deadline(), &body, true),
+        Err(phases::Error::Conflict)
+    );
+    super::new_possible::live_state(fixture, request, trust, attempt, &body, true);
     assert_eq!(outcome.recipients, 100);
     assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
     assert_eq!(
@@ -112,16 +132,17 @@ pub(super) fn exercise(
     );
     super::final_capacity::before_possible(fixture, request, trust, attempt, &final_phase);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
-    super::attempt_clock::possible(fixture, request, trust, claim, &final_phase);
+    super::attempt_clock::phase(fixture, request, trust, claim, &final_phase, false);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase()");
     assert_eq!(
-        super::attempt_clock::publish_possible(
+        super::attempt_clock::publish_phase(
             fixture,
             request,
             trust,
             Instant::now() + Duration::from_millis(1500),
-            &final_phase
+            &final_phase,
+            false
         ),
         Err(phases::Error::Indeterminate)
     );
@@ -158,7 +179,7 @@ pub(super) fn exercise(
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex'); DROP TRIGGER delay_phase ON td_mta.attempt_phase_receipts"));
     super::new_possible::receipt_race(fixture, request, trust, attempt, &final_phase);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
-    super::new_possible::live_state(fixture, request, trust, attempt, &final_phase);
+    super::new_possible::live_state(fixture, request, trust, attempt, &final_phase, false);
     super::final_capacity::competing_writer(fixture, request, trust, binding);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }
