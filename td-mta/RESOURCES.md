@@ -5125,3 +5125,9 @@ allocating or copying reply cells. It drops the retained worker/deadline owner;
 the shared Pending operation, if present, remains separately owned. New
 settlement uses ordinary PHASE_IO/4096-record admission and connection slots
 for each publication; it retains no SMTP slot or transport authority.
+
+Body-aware interrupted RCPT evidence uses the existing at-most-100 positive
+cells and 409600-byte request bound. Its mode and domain-separated digest add
+constant metadata only. Publication counts Prepared updates separately and
+verifies Body cells in the existing bounded locked-row batch; it adds no query,
+reply vector, connection slot or transport owner.

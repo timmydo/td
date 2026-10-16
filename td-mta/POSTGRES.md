@@ -4694,3 +4694,25 @@ A delayed RCPT COMMIT case additionally extracts the pair while Pending is
 occupied, verifies that command publication stays blocked, inspects the exact
 receipt through an independent settlement slot, and only then replays the
 passive refusal and publishes the retained DATA result.
+
+## 169. Interrupted Body publication with exact RCPT evidence
+
+A separately domain-separated interrupted_with_body_rcpt request handles a
+fenced session whose Body publication may have completed. It retains the same
+bounded ordered actual-positive subset as interrupted_with_rcpt. Under current
+ownership and recipient locks, each supplied member must be Prepared or Body.
+Prepared members receive the retained actual RCPT and clear prior DATA;
+already-Body members must already contain byte-identical RCPT evidence and no
+DATA reply, and are not rewritten. Supplied AcceptancePossible, mismatching,
+foreign or settled members refuse. Existing interrupted_with_rcpt remains
+Prepared-only; its digest and ordinary recovery encodings are unchanged.
+
+The request then applies ordinary interrupted recovery atomically with its
+receipt, preserving uncertainty and existing retry/expiry rules. It does not
+infer a missing COMMIT: the bounded worker still blocks on Pending until exact
+receipt inspection. This supplies passive evidence settlement before or after
+Body without manufacturing a transport owner from history.
+
+Native fixtures cover an entirely Body positive subset, mixed Body/Prepared
+members, mismatching replies, AcceptancePossible refusal, expiry hold, rollback
+of replies and sequence, delayed COMMIT inspection/replay, and attempt retirement.

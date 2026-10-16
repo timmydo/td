@@ -47,6 +47,7 @@ pub struct Recovery {
     operation: AttemptRecoveryId,
     digest: [u8; 32],
     current: bool,
+    body_evidence: bool,
     positive_ordinals: Vec<i64>,
     positive_replies: Vec<String>,
 }
@@ -127,6 +128,25 @@ pub fn interrupted_with_rcpt(
     value.digest = hash.finish().map_err(|_| Error::Crypto)?;
     Ok(value)
 }
+/// Settle after fencing transport during Body publication. Prepared recipients
+/// retain these actual replies; already-Body recipients must match them exactly.
+/// A supplied AcceptancePossible recipient always refuses. Unknown COMMIT must
+/// first settle through the worker's Pending owner; this grants no output.
+pub fn interrupted_with_body_rcpt(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    accepted: &[(u32, &str)],
+) -> Result<Recovery, Error> {
+    let mut value = interrupted_with_rcpt(claim, generation, attempt, accepted)?;
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    hash.update(b"td-mta interrupted Body RCPT evidence v1")
+        .map_err(|_| Error::Crypto)?;
+    hash.update(&value.digest).map_err(|_| Error::Crypto)?;
+    value.digest = hash.finish().map_err(|_| Error::Crypto)?;
+    value.body_evidence = true;
+    Ok(value)
+}
 fn prepare_mode(
     claim: &Claim,
     generation: u64,
@@ -168,6 +188,7 @@ fn prepare_mode(
         operation: AttemptRecoveryId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
         current,
+        body_evidence: false,
         positive_ordinals: Vec::new(),
         positive_replies: Vec::new(),
     })
@@ -351,6 +372,7 @@ pub fn publish(
                     .map_err(|_| Error::Capacity)?;
             }
             let mut matched_positive = 0usize;
+            let mut prepared_positive = 0u64;
             for row in &rows {
                 let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let uncertain: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -374,8 +396,16 @@ pub fn publish(
                 {
                     return Err(Error::Integrity);
                 }
-                if value.positive_ordinals.binary_search(&ordinal).is_ok() {
-                    if !value.current || phase != 1 {
+                if let Ok(index) = value.positive_ordinals.binary_search(&ordinal) {
+                    if !value.current {
+                        return Err(Error::Integrity);
+                    }
+                    if phase == 1 {
+                        prepared_positive += 1;
+                    } else if !value.body_evidence
+                        || phase != 2
+                        || rcpt != value.positive_replies.get(index).map(String::as_str)
+                    {
                         return Err(Error::Integrity);
                     }
                     matched_positive += 1;
@@ -426,7 +456,7 @@ pub fn publish(
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
             if !value.positive_ordinals.is_empty()
-                && client.execute("UPDATE td_mta.recipients r SET rcpt_reply=p.reply,data_reply=NULL FROM unnest($4::bigint[],$5::text[]) p(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.attempt_id=$3 AND r.state=2 AND r.phase=1 AND r.ordinal=p.ordinal", &[&account,&submission,&attempt,&value.positive_ordinals,&value.positive_replies]).await.map_err(|_|Error::Database)? != value.positive_ordinals.len() as u64
+                && client.execute("UPDATE td_mta.recipients r SET rcpt_reply=p.reply,data_reply=NULL FROM unnest($4::bigint[],$5::text[]) p(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.attempt_id=$3 AND r.state=2 AND r.phase=1 AND r.ordinal=p.ordinal", &[&account,&submission,&attempt,&value.positive_ordinals,&value.positive_replies]).await.map_err(|_|Error::Database)? != prepared_positive
             {
                 return Err(Error::Integrity);
             }
