@@ -11764,3 +11764,6 @@ mod attempt_envelope;
 
 #[path = "postgres_probe/attempt_clock.rs"]
 mod attempt_clock;
+
+#[path = "postgres_probe/dispatch_worker.rs"]
+mod dispatch_worker;

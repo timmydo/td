@@ -3864,3 +3864,34 @@ refusal followed by restored ownership, and rollback when a discontinuity is
 observed only after the recipient updates. Historical settlement succeeds
 without consulting a failed clock. Existing publication fixtures explicitly
 simulate the stable interval while retaining their storage/receipt assertions.
+
+## 139. Bounded relay attempt publication custody
+
+The prepared relay dispatch worker owns one active or uncertain publication at
+an admitted primary address. It requires a Runtime-mode connection, shares the
+caller's persistent queue guard and runtime monotonic clock, and reserves one
+connection slot before preparing an attempt. Each operation prepays two MiB
+plus 192 KiB of protocol I/O and 4096 records for receipt inspection, publication,
+runtime admission and bounded recipient staging. The earliest input deadline,
+work-meter deadline or ten-second phase limit covers all connection work.
+There is no waiter queue, address fallback or hidden DNS operation.
+
+Known success transfers the opaque Dispatch and passive receipt to the caller;
+known refusal releases the prepared identity. Unknown COMMIT retains exactly
+that Dispatch and refuses another publication. Independent settlement capacity
+only inspects the retained receipt: absence and errors keep it, and a matching
+receipt releases custody without changing account state. Settlement never
+republishes, constructs a replacement attempt or authorizes SMTP. Recovery and
+current transport admission remain separate operations.
+
+The trusted caller selects the primary and owns primary-change notification,
+process-lifetime pending custody, runtime clock/guard sharing and scheduler
+admission. No client-controlled address, credential or route enters this API;
+the supplied Claim binds current policy and the prepared route. Connection
+credentials are borrowed for each call and are not retained with the attempt.
+Production scheduler wiring and backend cutover remain separate work.
+
+The real PostgreSQL fixture checks preparation-mode refusal, exhausted work,
+original deadlines, startup retry hold, fresh publication and envelope access,
+unknown-COMMIT blocking, retained absence/deadline/capacity failures, and
+historical settlement without a second account-sequence increment.

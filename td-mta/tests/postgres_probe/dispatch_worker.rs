@@ -1,0 +1,248 @@
+use super::{deadline, sql, Fixture, PASSWORD};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+use td_crypto::TrustStore;
+use td_mta::{
+    admission::work::{Charge, Meter},
+    clock::RuntimeClock,
+    ids::SubmissionId,
+    ports::{self, Clock, Deadline, Time},
+    postgres_attempts as attempts,
+    postgres_dispatch::{self as dispatch, Error},
+    postgres_probe::{Mode, Request},
+    postgres_read::ReadSlots,
+    postgres_route_owners::{self as owners, Claim},
+    postgres_submission_cancel as cancel,
+    queue_clock::Guard,
+};
+pub(super) fn exercise(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    claim: &Claim,
+    generation: u64,
+    source: SubmissionId,
+) {
+    let submission = SubmissionId::from_bytes([94; 16]);
+    let sub = format!("decode('{submission}','hex')");
+    let src = format!("decode('{source}','hex')");
+    sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,2,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},n,n::text||'@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions CROSS JOIN generate_series(0,1) n WHERE id={sub}"));
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    let clock = Arc::new(RuntimeClock::new());
+    let guard = Arc::new(Mutex::new(
+        Guard::new(Time {
+            utc_ms: sql(
+                fixture,
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .parse()
+            .unwrap(),
+            monotonic: clock.sample().unwrap().monotonic,
+        })
+        .unwrap(),
+    ));
+    let runtime = Request {
+        address: request.address,
+        server_name: request.server_name,
+        user: "mail_runtime",
+        database: request.database,
+        password: PASSWORD,
+        mode: Mode::Runtime,
+    };
+    let slots = ReadSlots::new(1).unwrap();
+    let settlement = ReadSlots::new(1).unwrap();
+    let pending = dispatch::Pending::default();
+    let worker = dispatch::Dispatches {
+        connection: dispatch::Connection {
+            request: &runtime,
+            trust,
+            slots: &slots,
+            clock: clock.clone(),
+        },
+        guard,
+        pending: &pending,
+    };
+    let settle = dispatch::Connection {
+        request: &runtime,
+        trust,
+        slots: &settlement,
+        clock: clock.clone(),
+    };
+    let until = |ms| Deadline::after(clock.sample().unwrap().monotonic, ms).unwrap();
+    let meter = || {
+        Meter::new(
+            until(10_000),
+            Charge {
+                io_bytes: 16 * 1024 * 1024,
+                records: 100_000,
+                ..Default::default()
+            },
+        )
+    };
+    let input = |ms, retry| dispatch::Input {
+        submission,
+        retry,
+        deadline: until(ms),
+    };
+    let preparation = Request {
+        address: runtime.address,
+        server_name: runtime.server_name,
+        user: runtime.user,
+        database: runtime.database,
+        password: runtime.password,
+        mode: Mode::Preparation,
+    };
+    let forbidden = dispatch::Dispatches {
+        connection: dispatch::Connection {
+            request: &preparation,
+            trust,
+            slots: &slots,
+            clock: clock.clone(),
+        },
+        guard: worker.guard.clone(),
+        pending: &pending,
+    };
+    assert_eq!(
+        forbidden
+            .publish(claim, generation, input(10_000, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Forbidden))
+    );
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(10_000, false), &mut empty)
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    assert!(empty.stopped().is_some());
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(0, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    let mut expired = Meter::new(
+        until(0),
+        Charge {
+            io_bytes: u64::MAX,
+            records: u64::MAX,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(10_000, false), &mut expired)
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(10_000, true), &mut meter())
+            .map(|_| ()),
+        Err(Error::Publication(attempts::Error::Clock(
+            td_mta::queue_clock::Error::Unstable
+        )))
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
+    let success = worker
+        .publish(claim, generation, input(10_000, false), &mut meter())
+        .unwrap();
+    assert_eq!(success.outcome.ordinals, vec![0, 1]);
+    assert_eq!(success.dispatch.attempt(), success.outcome.attempt);
+    assert_eq!(
+        attempts::envelope(request, trust, deadline(), &success.dispatch)
+            .unwrap()
+            .recipients
+            .len(),
+        2
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
+    cancel::publish(
+        request,
+        trust,
+        deadline(),
+        &cancel::prepare(claim, generation, submission).unwrap(),
+        |_| Ok(()),
+    )
+    .unwrap();
+    sql(fixture,&format!("UPDATE td_mta.submissions SET completed_at=NULL,notification=0 WHERE id={sub}; UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id={sub}"));
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    sql(fixture,"CREATE FUNCTION public.delay_dispatch_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_dispatch_worker AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_dispatch_worker()");
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(1500, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Publication(attempts::Error::Indeterminate))
+    );
+    let attempt = pending.attempt().unwrap().unwrap();
+    assert_eq!(
+        worker
+            .publish(claim, generation, input(10_000, false), &mut meter())
+            .map(|_| ()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    thread::sleep(Duration::from_secs(4));
+    sql(
+        fixture,
+        "DROP TRIGGER delay_dispatch_worker ON td_mta.submission_attempts",
+    );
+    assert_eq!(
+        pending.settle(&settle, until(0), &mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        pending.settle(&settle, until(10_000), &mut empty),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    // Absence is not proof that the original commit cannot still complete.
+    sql(fixture,&format!("CREATE TABLE public.dispatch_worker_receipt AS SELECT * FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')"));
+    assert_eq!(
+        pending
+            .settle(&settle, until(10_000), &mut meter())
+            .unwrap(),
+        None
+    );
+    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+    sql(fixture,"INSERT INTO td_mta.submission_attempts SELECT * FROM public.dispatch_worker_receipt; DROP TABLE public.dispatch_worker_receipt");
+    let sequence = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    let outcome = pending
+        .settle(&settle, until(10_000), &mut meter())
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.attempt, attempt);
+    assert_eq!(outcome.ordinals, vec![0, 1]);
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        sequence
+    );
+    assert_eq!(pending.attempt().unwrap(), None);
+    assert_eq!(
+        pending
+            .settle(&settle, until(10_000), &mut meter())
+            .unwrap(),
+        None
+    );
+    cancel::publish(
+        request,
+        trust,
+        deadline(),
+        &cancel::prepare(claim, generation, submission).unwrap(),
+        |_| Ok(()),
+    )
+    .unwrap();
+    sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+}
