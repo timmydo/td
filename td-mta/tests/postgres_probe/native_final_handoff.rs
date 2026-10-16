@@ -42,6 +42,8 @@ pub(super) fn exercise(
         (111, false, 0, 12),
         (112, false, 0, 13),
         (113, false, 0, 14),
+        (114, true, 0, 0),
+        (115, true, 0, 0),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
@@ -714,7 +716,7 @@ pub(super) fn exercise(
             Err(phases::Error::Conflict)
         );
         if refuse {
-            sql(fixture,"CREATE FUNCTION public.reject_wire_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire fixture refusal'; END $$; CREATE TRIGGER reject_wire_final BEFORE INSERT ON td_mta.attempt_acceptance_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_final()");
+            sql(fixture,"CREATE OR REPLACE FUNCTION public.reject_wire_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire fixture refusal'; END $$; CREATE TRIGGER reject_wire_final BEFORE INSERT ON td_mta.attempt_acceptance_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_final()");
         }
         let (mut input, mut line, mut reply, mut terminator) =
             ([0; 512], [0; 512], [0; 4096], [0; 3]);
@@ -768,6 +770,107 @@ pub(super) fn exercise(
                     drop(failure.buffers.unwrap());
                     let retained = failure.retained.unwrap();
                     assert_eq!(retained.attempt(), Some(attempt));
+                    if matches!(n, 114 | 115) {
+                        assert_eq!(
+                            retained.error,
+                            dispatch::Error::Phase(phases::Error::Database)
+                        );
+                        if n == 114 {
+                            let short = td_mta::ports::Deadline::after(
+                                clock.sample().unwrap().monotonic,
+                                500,
+                            )
+                            .unwrap();
+                            let retained = retained.retry(&mut wire::meter(short)).unwrap_err();
+                            assert_eq!(
+                                retained.error,
+                                dispatch::Error::Phase(phases::Error::Database)
+                            );
+                            sql(fixture, "DROP TRIGGER reject_wire_final ON td_mta.attempt_acceptance_receipts");
+                            std::thread::sleep(std::time::Duration::from_millis(600));
+                            let until = wire::until(&clock);
+                            let mut settlement = wire::meter(until);
+                            let retained = retained.retry(&mut settlement).unwrap_err();
+                            assert_eq!(
+                                retained.error,
+                                dispatch::Error::Admission(td_mta::ports::Error::Deadline)
+                            );
+                            let other = worker
+                                .reserve_final(attempt, until, &mut settlement)
+                                .unwrap();
+                            assert_eq!(
+                                worker
+                                    .reserve_final(attempt, until, &mut settlement)
+                                    .err()
+                                    .unwrap(),
+                                dispatch::Error::Admission(td_mta::ports::Error::Busy)
+                            );
+                            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')")), "1");
+                            let evidence = retained.into_evidence().unwrap();
+                            let released = worker
+                                .reserve_final(attempt, until, &mut settlement)
+                                .unwrap();
+                            drop((other, released));
+                            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')")), "1");
+                            let mut empty =
+                                td_mta::admission::work::Meter::new(until, Default::default());
+                            assert_eq!(
+                                worker.publish_phase(evidence.clone(), until, &mut empty),
+                                Err(dispatch::Error::Admission(td_mta::ports::Error::Capacity))
+                            );
+                            break worker
+                                .publish_phase(evidence, until, &mut settlement)
+                                .unwrap();
+                        }
+                        sql(
+                            fixture,
+                            "DROP TRIGGER reject_wire_final ON td_mta.attempt_acceptance_receipts",
+                        );
+                        sql(fixture, "CREATE FUNCTION public.delay_extracted_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_extracted_final AFTER INSERT ON td_mta.attempt_acceptance_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_extracted_final()");
+                        let short =
+                            td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1500)
+                                .unwrap();
+                        let retained = retained.retry(&mut wire::meter(short)).unwrap_err();
+                        assert_eq!(
+                            retained.error,
+                            dispatch::Error::Phase(phases::Error::Indeterminate)
+                        );
+                        let evidence = retained.into_evidence().unwrap();
+                        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                        let until = wire::until(&clock);
+                        let mut settlement = wire::meter(until);
+                        assert_eq!(
+                            worker.publish_phase(evidence.clone(), until, &mut settlement),
+                            Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                        sql(fixture, "DROP TRIGGER delay_extracted_final ON td_mta.attempt_acceptance_receipts");
+                        let slots = ReadSlots::new(1).unwrap();
+                        let connection = dispatch::Connection {
+                            request: &runtime,
+                            trust,
+                            slots: &slots,
+                            clock: clock.clone(),
+                        };
+                        let historical =
+                            match pending.settle(&connection, until, &mut settlement).unwrap() {
+                                Some(dispatch::Settlement::Phase(outcome)) => outcome,
+                                other => panic!("expected final settlement, got {other:?}"),
+                            };
+                        assert_eq!(pending.attempt().unwrap(), None);
+                        let first = worker
+                            .reserve_final(attempt, until, &mut settlement)
+                            .unwrap();
+                        let second = worker
+                            .reserve_final(attempt, until, &mut settlement)
+                            .unwrap();
+                        drop((first, second));
+                        let replay = worker
+                            .publish_phase(evidence, until, &mut settlement)
+                            .unwrap();
+                        assert_eq!(replay, historical);
+                        break replay;
+                    }
                     sql(
                         fixture,
                         "DROP TRIGGER reject_wire_final ON td_mta.attempt_acceptance_receipts",
@@ -777,6 +880,7 @@ pub(super) fn exercise(
             }
             std::thread::yield_now();
         };
+        assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')")), "0");
         assert_eq!(written, response.len());
         assert_eq!(
             transferred

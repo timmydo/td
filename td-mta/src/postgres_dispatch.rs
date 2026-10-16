@@ -1444,6 +1444,12 @@ impl<'w, 'a, 'r> RetainedFinal<'w, 'a, 'r> {
     }
 }
 impl<'w, 'a, 'r> FinalFailure<'w, 'a, 'r> {
+    /// After closing transport, move exact final evidence into fresh passive
+    /// settlement. Release the local slot, not the durable final capacity claim;
+    /// unresolved COMMIT remains in the same worker's Pending owner.
+    pub fn into_evidence(self) -> Option<Change> {
+        self.retained.map(|retained| retained.value)
+    }
     pub fn attempt(&self) -> Option<AttemptId> {
         self.retained.as_ref().map(|value| value.value.attempt())
     }

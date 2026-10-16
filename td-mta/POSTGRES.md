@@ -4738,3 +4738,24 @@ The paired TLS/PostgreSQL fixture uses this handoff for mixed successful DATA,
 forces known failure at either publication and delayed Body COMMIT, then fences
 the session and verifies retained actual replies and complete retirement through
 passive recovery. Production scheduling and backend activation remain deferred.
+
+## 171. Passive final DATA evidence after local reservation expiry
+
+FinalFailure may consume its retained genuine final DATA Change after transport
+has closed. Extraction moves existing immutable evidence and releases the held
+local connection permit; it neither releases the durable final-result claim nor
+clears Pending. Invalid reply input that never created retained evidence yields
+None. The value conveys no SMTP session, output owner, work allowance or deadline.
+
+Bounded retry still refuses renewal of its original cap. Separate passive
+publication must prepay fresh ordinary work and obtain a slot through the same
+Dispatches/Pending owner. Uncertain COMMIT blocks until independent receipt
+inspection, and durable ownership, phase, receipt and final-capacity checks still
+apply. A retained receipt is historical only. Confirmed result publication or
+ordinary durable recovery consumes the final claim, never evidence extraction.
+
+The native SMTP/TLS fixture forces final-result rollback, expires its retained
+retry cap, verifies that extraction frees the local slot while preserving exact
+evidence, and settles through fresh admission. A delayed-COMMIT retry additionally
+keeps Pending occupied across extraction and requires independent inspection
+before exact historical replay.

@@ -5140,3 +5140,10 @@ positive recovery vector, at most 1638400 reply bytes plus existing bounded
 metadata and borrowed references. Successful conversion drops DATA alternatives;
 negative/recovery requests together retain at most 409600 reply bytes. Native
 publication copies and protocol buffers keep their separate bounds.
+
+Final evidence extraction moves the existing Change without new reply storage
+and releases its local ReadPermit. Pending may retain a shared reference to the
+same immutable request. Fresh passive publication charges PHASE_IO/4096 records
+and uses an ordinary slot; independent uncertain-COMMIT settlement retains its
+separate slot budget. The durable final-result capacity claim is unchanged by
+extraction and remains charged until its existing terminal transaction consumes it.
