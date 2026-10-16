@@ -5221,3 +5221,18 @@ performs complete qualification plus live validation. The earliest limit
 carries into Possible and final custody. The connection closes before its
 ReadPermit is released, including before Possible needs the second slot.
 This reserves work, not guaranteed body progress or maximum-message capacity.
+
+Bound immutable-source admission prepays 131 MiB I/O and 32768 records before
+opening the snapshot or either fresh attempt admission. This covers their
+130.625 MiB combined protocol ceilings with 384 KiB margin and does not reserve
+that much memory. The existing 512 KiB verified-body cache and frame bounds
+remain unchanged. Two permits from an independent source pool cover the
+snapshot/second-admission overlap; aliasing the ordinary pool refuses.
+Both connections close before source permits return. The original ordinary
+two-slot pool separately covers retained validation and final custody.
+The callback-scoped owner adds no body copy or protocol buffer; it retains
+the existing DATA owner, verified-reader borrow and private completion-sink
+borrow. Scoped progress exposes no final authority. Its callback result and
+private completion stay outside the snapshot's final check so failure can
+close Completed explicitly and preserve an existing transfer refusal. The earliest source admission
+limit carries through Body and final custody without extension.

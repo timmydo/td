@@ -48,6 +48,16 @@ pub(super) fn exercise(
         (144, false, 0, 0),
         (145, false, 0, 0),
         (146, false, 0, 0),
+        (147, false, 0, 0),
+        (148, false, 0, 0),
+        (149, false, 0, 0),
+        (150, false, 0, 0),
+        (151, false, 0, 0),
+        (152, false, 0, 0),
+        (153, false, 0, 0),
+        (154, false, 0, 0),
+        (155, false, 0, 0),
+        (156, false, 0, 0),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
@@ -126,7 +136,7 @@ pub(super) fn exercise(
                 },
                 &mut database,
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("case {n}: prepared publication: {error:?}"));
         let mut published = published
             .admit_envelope(&mut database)
             .unwrap()
@@ -141,7 +151,7 @@ pub(super) fn exercise(
             if data_case >= 4 { 2 } else { 1 }
         );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
-        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143..=146) {
+        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143..=156) {
             let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
             let ready = completed.reserve_body(&mut database).ok().unwrap();
             let body_request = ready.dispatch().clone();
@@ -709,34 +719,76 @@ pub(super) fn exercise(
         let mut transferred = Vec::new();
         let mut validator_pid = None;
         let mut validator_observations = 0;
-        let handoff = attempts::with_body(
-            &runtime,
-            trust,
-            prepared_limit,
-            &body_request,
-            postgres_body::MAX_BODY_BYTES,
-            |metadata, source| {
-                assert_eq!(metadata.attempt, attempt);
+        let source_slots =
+            td_mta::postgres_read::ReadSlots::new(if n == 149 { 1 } else { 2 }).unwrap();
+        let source_cap = if n == 153 {
+            td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 2000).unwrap()
+        } else {
+            cap
+        };
+        let mut source_work = td_mta::admission::work::Meter::new(
+            source_cap,
+            td_mta::admission::work::Charge {
+                io_bytes: 131 * 1024 * 1024 - u64::from(n == 147),
+                records: 32768 - u64::from(n == 148),
+                ..Default::default()
+            },
+        );
+        let mut called = false;
+        let handoff = {
+            let mut run = source_driver(|start| {
+                called = true;
+                if n == 156 {
+                    match start {
+                        SourceStart::Bound(ready) => drop(ready.into_buffers().unwrap()),
+                        _ => panic!("expected bound source"),
+                    }
+                    return Ok(None);
+                }
                 let mut input = [0; body::INPUT_BYTES];
                 let mut output = [0; body::OUTPUT_BYTES];
                 let mut work = wire::meter(cap);
-                if matches!(n, 145 | 146) {
+                if matches!(n, 145 | 146 | 154) {
                     use td_mta::admission::work::{Charge, Meter};
                     let before = sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'");
-                    let mut short = Meter::new(cap, Charge {
-                        io_bytes: 9 * 1024 * 1024 - u64::from(n == 145),
-                        records: 32768 - u64::from(n == 146),
-                        ..Default::default()
-                    });
-                    let refusal = start.begin(source, body::Scratch { input: &mut input, output: &mut output }, &mut work, &mut short).err().unwrap();
-                    assert_eq!(refusal.error, transfer::Error::Publication(dispatch::Error::Admission(td_mta::ports::Error::Capacity)));
-                    drop(refusal.buffers.unwrap());
+                    let mut short = Meter::new(
+                        cap,
+                        Charge {
+                            io_bytes: 9 * 1024 * 1024 - u64::from(matches!(n, 145 | 154)),
+                            records: 32768 - u64::from(n == 146),
+                            ..Default::default()
+                        },
+                    );
+                    let refusal = start
+                        .begin(
+                            body::Scratch {
+                                input: &mut input,
+                                output: &mut output,
+                            },
+                            &mut work,
+                            &mut short,
+                        )
+                        .err()
+                        .unwrap();
+                    assert_eq!(
+                        refusal.error,
+                        transfer::Error::Publication(dispatch::Error::Admission(
+                            td_mta::ports::Error::Capacity
+                        ))
+                    );
                     assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'"), before);
-                    return Ok(None);
+                    if n == 154 {
+                        let pid = sql(fixture, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND state='idle in transaction'");
+                        pid.parse::<u32>().unwrap();
+                        assert_eq!(
+                            sql(fixture, &format!("SELECT pg_terminate_backend({pid},1000)")),
+                            "t"
+                        );
+                    }
+                    return Err(refusal);
                 }
                 let mut exchange = start
                     .begin(
-                        source,
                         body::Scratch {
                             input: &mut input,
                             output: &mut output,
@@ -748,7 +800,10 @@ pub(super) fn exercise(
                     .unwrap();
                 // Competing work has its own meter; it cannot consume the
                 // message's prepaid validation allowance.
-                assert!(matches!(worker.reserve_final(attempt, cap, &mut wire::meter(cap)), Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))));
+                assert!(matches!(
+                    worker.reserve_final(attempt, cap, &mut wire::meter(cap)),
+                    Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+                ));
                 for _ in 0..100_000 {
                     let mut bytes = [0; 4096];
                     if let IoProgress::Bytes(count) = peer.read(&mut bytes).unwrap() {
@@ -756,27 +811,169 @@ pub(super) fn exercise(
                         if matches!(n, 143 | 144) {
                             let pid = sql(fixture, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND state='idle' AND query='ROLLBACK'");
                             pid.parse::<u32>().unwrap();
-                            if let Some(previous) = &validator_pid { assert_eq!(previous, &pid); }
-                            else { validator_pid = Some(pid); }
+                            if let Some(previous) = &validator_pid {
+                                assert_eq!(previous, &pid);
+                            } else {
+                                validator_pid = Some(pid);
+                            }
                             validator_observations += 1;
                         }
                     }
                     match exchange.advance() {
-                        Ok(transfer::Progress::Pending(next)) => exchange = next,
-                        Ok(transfer::Progress::Ready(done)) => return Ok(Some(done)),
+                        Ok(SourceProgress::Pending(next)) => exchange = next,
+                        Ok(SourceProgress::Ready(done)) => {
+                            if n == 152 {
+                                let pid = sql(fixture, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND state='idle in transaction'");
+                                pid.parse::<u32>().unwrap();
+                                assert_eq!(
+                                    sql(
+                                        fixture,
+                                        &format!("SELECT pg_terminate_backend({pid},1000)")
+                                    ),
+                                    "t"
+                                );
+                            }
+                            if n == 155 {
+                                return Err(transfer::Refusal {
+                                    error: transfer::Error::Protocol(
+                                        td_mta::ports::Error::Forbidden,
+                                    ),
+                                    buffers: Err(td_mta::ports::Error::Invalid),
+                                });
+                            }
+                            return Ok(done);
+                        }
                         Err(refusal) if n == 144 => {
-                            assert_eq!(refusal.error, transfer::Error::Publication(dispatch::Error::Admission(td_mta::ports::Error::Capacity)));
-                            drop(refusal.buffers.unwrap());
-                            return Ok(None);
+                            assert_eq!(
+                                refusal.error,
+                                transfer::Error::Publication(dispatch::Error::Admission(
+                                    td_mta::ports::Error::Capacity
+                                ))
+                            );
+                            return Err(refusal);
                         }
                         Err(refusal) => panic!("native body refused: {:?}", refusal.error),
                     }
                     std::thread::yield_now();
                 }
                 panic!("native body did not finish");
+            });
+            match start {
+                BodyStart::Bound(ready) => {
+                    use td_mta::postgres_relay_data::SourceError;
+                    let pool = if n == 150 { &slots } else { &source_slots };
+                    let result = ready.with_source(
+                        pool,
+                        &mut source_work,
+                        if n == 151 {
+                            0
+                        } else {
+                            postgres_body::MAX_BODY_BYTES
+                        },
+                        |ready| run(SourceStart::Bound(ready)).map(|done| assert!(done.is_none())),
+                    );
+                    match result {
+                        Ok(done) => Some(done),
+                        Err(refusal) => {
+                            match n {
+                                144..=148 | 154 => assert_eq!(
+                                    refusal.error,
+                                    if n <= 146 || n == 154 {
+                                        SourceError::Transfer(transfer::Error::Publication(
+                                            dispatch::Error::Admission(
+                                                td_mta::ports::Error::Capacity,
+                                            ),
+                                        ))
+                                    } else {
+                                        SourceError::Admission(dispatch::Error::Admission(
+                                            td_mta::ports::Error::Capacity,
+                                        ))
+                                    }
+                                ),
+                                149 => assert_eq!(
+                                    refusal.error,
+                                    SourceError::Admission(dispatch::Error::Admission(
+                                        td_mta::ports::Error::Busy
+                                    ))
+                                ),
+                                150 => assert_eq!(
+                                    refusal.error,
+                                    SourceError::Admission(dispatch::Error::Admission(
+                                        td_mta::ports::Error::Invalid
+                                    ))
+                                ),
+                                155 => assert_eq!(
+                                    refusal.error,
+                                    SourceError::Transfer(transfer::Error::Protocol(
+                                        td_mta::ports::Error::Forbidden
+                                    ))
+                                ),
+                                156 => assert_eq!(
+                                    refusal.error,
+                                    SourceError::Admission(dispatch::Error::Admission(
+                                        td_mta::ports::Error::Invalid
+                                    ))
+                                ),
+                                151 | 152 => assert!(
+                                    matches!(refusal.error, SourceError::Read(_)),
+                                    "{:?}",
+                                    refusal.error
+                                ),
+                                _ => panic!("native source refused: {:?}", refusal.error),
+                            }
+                            if n == 156 {
+                                assert!(refusal.buffers.is_err());
+                            } else {
+                                drop(refusal.buffers.unwrap());
+                            }
+                            None
+                        }
+                    }
+                }
+                BodyStart::Trusted(plan, session) => Some(
+                    attempts::with_body(
+                        &runtime,
+                        trust,
+                        prepared_limit,
+                        &body_request,
+                        postgres_body::MAX_BODY_BYTES,
+                        |metadata, source| {
+                            assert_eq!(metadata.attempt, attempt);
+                            Ok(run(SourceStart::Trusted(plan, session, source))
+                                .ok()
+                                .unwrap()
+                                .unwrap())
+                        },
+                    )
+                    .unwrap(),
+                ),
+            }
+        };
+        assert_eq!(called, !matches!(n, 147..=151));
+        // Both source permits return before final SMTP or refusal handling.
+        let source_worker = dispatch::Dispatches {
+            connection: dispatch::Connection {
+                request: &runtime,
+                trust,
+                slots: &source_slots,
+                clock: clock.clone(),
             },
-        )
-        .unwrap();
+            guard: worker.guard.clone(),
+            pending: &pending,
+        };
+        let first = source_worker
+            .reserve_final(attempt, cap, &mut wire::meter(cap))
+            .unwrap();
+        let second = if n == 149 {
+            None
+        } else {
+            Some(
+                source_worker
+                    .reserve_final(attempt, cap, &mut wire::meter(cap))
+                    .unwrap(),
+            )
+        };
+        drop((first, second));
         if let Some(pid) = validator_pid {
             assert!(validator_observations >= 2);
             let stop = deadline();
@@ -789,7 +986,7 @@ pub(super) fn exercise(
                 std::thread::yield_now();
             }
         }
-        if matches!(n, 144..=146) {
+        if matches!(n, 144..=152 | 154..=156) {
             assert!(handoff.is_none());
             assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
             assert_eq!(
@@ -797,7 +994,7 @@ pub(super) fn exercise(
                     fixture,
                     &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub}")
                 ),
-                "2"
+                if matches!(n, 152 | 155) { "3" } else { "2" }
             );
             assert_eq!(pending.attempt().unwrap(), None);
             let first = worker
@@ -807,16 +1004,21 @@ pub(super) fn exercise(
                 .reserve_final(attempt, cap, &mut wire::meter(cap))
                 .unwrap();
             drop((first, second));
-            let cancel =
-                td_mta::postgres_submission_cancel::prepare(claim, generation, submission).unwrap();
-            td_mta::postgres_submission_cancel::publish(
-                &runtime,
-                trust,
-                deadline(),
-                &cancel,
-                |_| Ok(()),
-            )
-            .unwrap();
+            if matches!(n, 152 | 155) {
+                retire_possible(fixture, &worker, claim, generation, attempt, cap);
+            } else {
+                let cancel =
+                    td_mta::postgres_submission_cancel::prepare(claim, generation, submission)
+                        .unwrap();
+                td_mta::postgres_submission_cancel::publish(
+                    &runtime,
+                    trust,
+                    deadline(),
+                    &cancel,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            }
             drop(peer.into_buffers().unwrap());
             sql(fixture, &format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
             if n == 144 {
@@ -825,6 +1027,48 @@ pub(super) fn exercise(
             continue;
         }
         let handoff = handoff.unwrap();
+        if n == 153 {
+            let source_end = clock.deadline_instant(source_cap).unwrap();
+            std::thread::sleep(
+                source_end.saturating_duration_since(std::time::Instant::now())
+                    + std::time::Duration::from_millis(20),
+            );
+            assert!(std::time::Instant::now() < prepared_limit);
+            let (mut input, mut line, mut reply, mut terminator) =
+                ([0; 512], [0; 512], [0; 4096], [0; 3]);
+            let mut work = wire::meter(cap);
+            let refusal = handoff
+                .begin_final(
+                    command::Scratch {
+                        input: &mut input,
+                        line: &mut line,
+                        reply: &mut reply,
+                        command: &mut terminator,
+                    },
+                    &mut work,
+                    &mut database,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(
+                refusal.error,
+                finish::Error::Protocol(td_mta::ports::Error::Deadline)
+            );
+            assert!(refusal.retained.is_none());
+            drop(refusal.buffers.unwrap());
+            assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub}")
+                ),
+                "3"
+            );
+            retire_possible(fixture, &worker, claim, generation, attempt, cap);
+            drop(peer.into_buffers().unwrap());
+            sql(fixture, &format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
         assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
         assert_eq!(
             phases::check_current_body(
@@ -1052,17 +1296,31 @@ impl<'w, 'a, 'r> BodyStart<'w, 'a, 'r> {
             Self::Trusted(plan, _) => plan.check_current(database),
         }
     }
+}
+#[allow(clippy::large_enum_variant)]
+enum SourceStart<'s, 'w, 'a, 'r> {
+    Bound(td_mta::postgres_relay_data::BodySourceReady<'s, 'w, 'a, 'r, wire::Buffer>),
+    Trusted(
+        dispatch::BodyPlan<'w, 'a, 'r>,
+        td_mta::smtp_relay_auth::Session<wire::Buffer>,
+        &'s mut dyn td_mta::ports::BlobReader,
+    ),
+}
+impl<'s, 'w, 'a, 'r> SourceStart<'s, 'w, 'a, 'r> {
     fn begin<'m>(
         self,
-        source: &'m mut dyn td_mta::ports::BlobReader,
         scratch: body::Scratch<'m>,
         wire: &'m mut td_mta::admission::work::Meter,
         database: &'m mut td_mta::admission::work::Meter,
-    ) -> Result<transfer::Exchange<'m, 'w, 'a, 'r, wire::Buffer>, transfer::Refusal<wire::Buffer>>
+    ) -> Result<SourceExchange<'m, 'w, 'a, 'r>, transfer::Refusal<wire::Buffer>>
+    where
+        's: 'm,
     {
         match self {
-            Self::Bound(ready) => ready.begin(source, scratch, wire, database),
-            Self::Trusted(plan, session) => transfer::begin(
+            Self::Bound(ready) => ready
+                .begin(scratch, wire, database)
+                .map(SourceExchange::Bound),
+            Self::Trusted(plan, session, source) => transfer::begin(
                 plan,
                 session,
                 source,
@@ -1070,7 +1328,73 @@ impl<'w, 'a, 'r> BodyStart<'w, 'a, 'r> {
                 scratch,
                 wire,
                 database,
-            ),
+            )
+            .map(SourceExchange::Trusted),
         }
     }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum SourceExchange<'m, 'w, 'a, 'r> {
+    Bound(td_mta::postgres_relay_data::SourceExchange<'m, 'w, 'a, 'r, wire::Buffer>),
+    Trusted(transfer::Exchange<'m, 'w, 'a, 'r, wire::Buffer>),
+}
+#[allow(clippy::large_enum_variant)]
+enum SourceProgress<'m, 'w, 'a, 'r> {
+    Pending(SourceExchange<'m, 'w, 'a, 'r>),
+    Ready(Option<transfer::Completed<'w, 'a, 'r, wire::Buffer>>),
+}
+impl<'m, 'w, 'a, 'r> SourceExchange<'m, 'w, 'a, 'r> {
+    fn advance(self) -> Result<SourceProgress<'m, 'w, 'a, 'r>, transfer::Refusal<wire::Buffer>> {
+        match self {
+            Self::Bound(exchange) => match exchange.advance()? {
+                td_mta::postgres_relay_data::SourceProgress::Pending(next) => {
+                    Ok(SourceProgress::Pending(Self::Bound(next)))
+                }
+                td_mta::postgres_relay_data::SourceProgress::Ready => {
+                    Ok(SourceProgress::Ready(None))
+                }
+            },
+            Self::Trusted(exchange) => match exchange.advance()? {
+                transfer::Progress::Pending(next) => {
+                    Ok(SourceProgress::Pending(Self::Trusted(next)))
+                }
+                transfer::Progress::Ready(done) => Ok(SourceProgress::Ready(Some(done))),
+            },
+        }
+    }
+}
+
+// Fix custody lifetimes while allowing each callback's source borrow to vary.
+fn source_driver<'w, 'a: 'w, 'r: 'a>(
+    drive: impl for<'s> FnMut(
+        SourceStart<'s, 'w, 'a, 'r>,
+    ) -> Result<
+        Option<transfer::Completed<'w, 'a, 'r, wire::Buffer>>,
+        transfer::Refusal<wire::Buffer>,
+    >,
+) -> impl for<'s> FnMut(
+    SourceStart<'s, 'w, 'a, 'r>,
+) -> Result<
+    Option<transfer::Completed<'w, 'a, 'r, wire::Buffer>>,
+    transfer::Refusal<wire::Buffer>,
+> {
+    drive
+}
+
+fn retire_possible(
+    fixture: &Fixture,
+    worker: &dispatch::Dispatches<'_, '_>,
+    claim: &Claim,
+    generation: u64,
+    attempt: td_mta::ids::AttemptId,
+    cap: td_mta::ports::Deadline,
+) {
+    let value = td_mta::postgres_attempt_recovery::interrupted(claim, generation, attempt).unwrap();
+    let outcome = worker
+        .publish_recovery(value, cap, &mut wire::meter(cap))
+        .unwrap();
+    assert_eq!(outcome.recipients, 1);
+    assert_eq!(sql(fixture, &format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+    assert_eq!(sql(fixture, &format!("SELECT state,uncertain,phase FROM td_mta.recipients WHERE attempt_id=decode('{attempt}','hex')")), "7|1|4");
 }

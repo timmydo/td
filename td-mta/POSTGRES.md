@@ -4858,7 +4858,7 @@ known new observed Body before the retained cap returns BodyResult, matching
 Dispatch, same session and mode. Historical receipts or uncertain commits never
 construct this handoff. Its consuming reserve_body operation binds final
 capacity before BodyReady begins transfer with the same session and MAIL mode.
-The trusted body stage still owns matching immutable source admission.
+BodyReady binds matching immutable source admission as specified in section 182.
 No body bytes or terminator are sent by this command adapter.
 
 An actual negative DATA reply fences the socket before settlement while keeping
@@ -4936,8 +4936,9 @@ it grants no body or terminator output. Ordinary interrupted-Body recovery still
 owns durable retirement after that closure.
 
 BodyReady exposes the matching passive Dispatch for immutable body admission
-and the existing live phase check. Its consuming begin passes the private
-BodyPlan, session and mode directly to the body adapter. Original shrinking
+and the existing live phase check. Its consuming with_source verifies the exact
+Dispatch and supplies a callback-scoped BodySourceReady; that owner's begin
+passes its private BodyPlan, session, mode and verified source to the adapter. Original shrinking
 limits, per-write checks, Possible publication before terminator and final
 evidence custody remain unchanged. Explicit buffer extraction closes the
 session and drops local reservation custody. No historical receipt constructs
@@ -4946,10 +4947,10 @@ either live owner.
 The native composed success, final rollback, expiry and unknown-COMMIT cases
 use this handoff. A new mixed-RCPT case occupies both local slots after DATA,
 then verifies failed final reservation closes transport without body output,
-preserves Body state and permits fenced recovery. The trusted immutable-source
-boundary remains explicit, as do separate connection/body-work admission and
-the maximum-message throughput limitation in section 155. Production dispatch
-remains inactive.
+preserves Body state and permits fenced recovery. Section 182 binds the
+immutable-source boundary and its separate connection/body-work admission.
+The maximum-message throughput limitation in section 155 remains explicit.
+Production dispatch remains inactive.
 
 ## 178. TLS-sized body output cells
 
@@ -5079,3 +5080,51 @@ opens. Existing standalone checks exercise cumulative protocol exhaustion,
 lock release and changed policy/privileges; the source snapshot separately
 retains its own migration lock while body reading is active. This is bounded
 connection reuse, not maximum-32-MiB throughput or production activation.
+
+## 182. Bound immutable source and explicit source admission
+
+BodyReady.with_source selects only its private Dispatch through the existing
+verified attempt-body reader. Its callback receives BodySourceReady, which
+privately joins the verified reader to the same actual DATA session, MAIL
+mode and final reservation. Its begin accepts no replacement source. The
+callback drives source-scoped Exchange/Progress to Ready and returns unit or
+a transfer Refusal. Scoped wrappers privately borrow a completion sink owned
+by with_source; Ready stores the final handoff there and exposes no final
+operation or completion owner to the callback. Only successful callback and
+post-callback source validation release Completed for final SMTP. The lower trusted body adapter retains its explicit matching-input
+contract for focused interruption fixtures.
+
+Before any source connection, admission checks Pending, Runtime mode and the
+original shrinking limit, prepays 131 MiB I/O and 32768 records, and acquires
+two slots from a distinct body pool. Aliasing the ordinary pool refuses. The
+snapshot profile allows 128 MiB input and 512 KiB output; each of two fresh
+admission profiles allows 1 MiB input and 64 KiB output. The work charge covers
+130.625 MiB of protocol ceilings plus 384 KiB margin, not resident memory.
+Two slots cover the second admission overlapping the immutable snapshot.
+Both remain held until the reader returns and destroys its connections. The
+ordinary two-slot pool still covers final custody and retained Body validation.
+No budget or deadline replenishes. Source admission shortens the retained
+BodyPlan limit, so a shorter source allowance also bounds final custody.
+
+The wrapper retains BodyReady outside verification until callback entry, and
+retains the callback result and private completion sink outside the reader's
+post-callback source check.
+Failure before entry closes the original session. Failure after completion
+closes Completed and returns its buffers without a terminator; durable
+Possible remains conservative. An already returned transfer Refusal keeps its
+original error and buffers even if the later source check fails. Callback
+success without stored completion refuses. A callback error after Ready
+explicitly closes the stored completion and returns its actual buffers.
+Source read failures do not invent an uncertain publication or replace Pending.
+
+Native composed fixtures use the bound source path with exact admitted work.
+They cover one-byte/record-short admission, a one-slot pool, aliasing ordinary
+slots, a source size refusal, snapshot termination after body completion, and a
+shorter source deadline that remains binding before final SMTP. A transfer
+refusal followed by snapshot loss retains the transfer error and buffers.
+Callback success without Ready refuses; callback error after Ready closes the
+private final handoff and returns its buffers. Refusals close the session, preserve the expected Body/Possible phase and send
+no terminator. Source slots are reusable before final exchange or recovery.
+The 64000-byte success still uses the original ordinary message allowance;
+source work is explicitly separate. This adds no production dispatcher or
+maximum-message throughput claim.

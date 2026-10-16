@@ -1336,6 +1336,41 @@ pub struct BodyPlan<'w, 'a, 'r> {
     final_plan: FinalPlan<'w, 'a, 'r>,
 }
 impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
+    pub(crate) fn reserve_source<'s>(
+        &mut self,
+        slots: &'s ReadSlots,
+        meter: &mut Meter,
+    ) -> Result<BodySourceWork<'s, 'a, 'r>, Error> {
+        let worker = self.body.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if std::ptr::eq(slots, worker.connection.slots) {
+            return Err(ports::Error::Invalid.into());
+        }
+        if Instant::now() >= self.work_limit() {
+            return Err(ports::Error::Deadline.into());
+        }
+        let limit = worker
+            .connection
+            .admit_work(self.body.until, meter, 131 * 1024 * 1024, 32768)?
+            .min(self.work_limit());
+        let first = slots.acquire().map_err(|_| ports::Error::Busy)?;
+        let second = slots.acquire().map_err(|_| ports::Error::Busy)?;
+        self.final_plan.work.limit = limit;
+        Ok(BodySourceWork {
+            request: worker.connection.request,
+            trust: worker.connection.trust,
+            limit,
+            _first: first,
+            _second: second,
+        })
+    }
     pub(crate) fn reserve_checks(
         self,
         meter: &mut Meter,
@@ -1404,6 +1439,26 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
     /// body. Unknown COMMIT retains Pending and supplies no final owner.
     pub fn publish_possible(self, meter: &mut Meter) -> Result<FinalResult<'w, 'a, 'r>, Error> {
         self.final_plan.publish_possible(meter)
+    }
+}
+
+// The snapshot and its second admission can overlap. Both connections close
+// inside with_body before either independently reserved source permit drops.
+pub(crate) struct BodySourceWork<'s, 'a, 'r> {
+    request: &'a Request<'r>,
+    trust: &'a TrustStore,
+    limit: Instant,
+    _first: ReadPermit<'s>,
+    _second: ReadPermit<'s>,
+}
+impl BodySourceWork<'_, '_, '_> {
+    pub(crate) fn with_body<T>(
+        &self,
+        value: &Dispatch,
+        maximum: u64,
+        read: impl FnOnce(attempts::BodyMetadata, &mut dyn ports::BlobReader) -> Result<T, ports::Error>,
+    ) -> Result<T, attempts::ReadError> {
+        attempts::with_body(self.request, self.trust, self.limit, value, maximum, read)
     }
 }
 

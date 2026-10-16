@@ -3,8 +3,9 @@ use crate::{
     admission::work::Meter,
     ports,
     postgres_attempt_phases::Outcome,
-    postgres_attempts::Dispatch,
+    postgres_attempts::{Dispatch, ReadError},
     postgres_dispatch::{self as dispatch, BodyResult, RcptDataPlan},
+    postgres_read::ReadSlots,
     postgres_relay_body as transfer, postgres_relay_rcpt,
     smtp_data_encode::Body,
     smtp_relay_auth::Session,
@@ -72,7 +73,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Completed<'w, 'a, 'r, B> {
     }
 }
 /// Actual DATA custody and its exact final reservation, still tied to the same
-/// session and MAIL mode. The caller owns matching immutable source admission.
+/// session and MAIL mode. Source admission selects its exact immutable body.
 pub struct BodyReady<'w, 'a, 'r, B: TlsWireStorage> {
     plan: dispatch::BodyPlan<'w, 'a, 'r>,
     dispatch: Dispatch,
@@ -86,25 +87,142 @@ impl<'w, 'a, 'r, B: TlsWireStorage> BodyReady<'w, 'a, 'r, B> {
     pub fn check_current(&self, database: &mut Meter) -> Result<Instant, dispatch::Error> {
         self.plan.check_current(database)
     }
+    /// Verify and replay this attempt's immutable body. Final SMTP exchange
+    /// starts only after this scope succeeds and releases its source slots.
+    /// The callback drives SourceProgress::Ready before returning Ok(()).
+    pub fn with_source(
+        mut self,
+        slots: &ReadSlots,
+        source_work: &mut Meter,
+        maximum: u64,
+        read: impl for<'s> FnOnce(
+            BodySourceReady<'s, 'w, 'a, 'r, B>,
+        ) -> Result<(), transfer::Refusal<B>>,
+    ) -> Result<transfer::Completed<'w, 'a, 'r, B>, SourceRefusal<B>> {
+        let work = match self.plan.reserve_source(slots, source_work) {
+            Ok(work) => work,
+            Err(error) => {
+                return Err(SourceRefusal {
+                    error: SourceError::Admission(error),
+                    buffers: self.into_buffers(),
+                })
+            }
+        };
+        let dispatch = self.dispatch.clone();
+        let mut owner = Some(self);
+        let mut completion = None;
+        let mut callback = None;
+        let result = work.with_body(&dispatch, maximum, |_, source| {
+            let ready = owner.take().ok_or(ports::Error::Invalid)?;
+            callback = Some(read(BodySourceReady {
+                ready,
+                source,
+                completion: &mut completion,
+            }));
+            Ok(())
+        });
+        if let Some(Err(refusal)) = callback {
+            let buffers = completion.map_or(refusal.buffers, |done| done.into_buffers());
+            return Err(SourceRefusal {
+                error: SourceError::Transfer(refusal.error),
+                buffers,
+            });
+        }
+        match (result, completion) {
+            (Ok(()), Some(done)) => Ok(done),
+            (Err(error), Some(done)) => Err(SourceRefusal {
+                error: SourceError::Read(error),
+                buffers: done.into_buffers(),
+            }),
+            (result, None) => Err(SourceRefusal {
+                error: match result {
+                    Err(error) => SourceError::Read(error),
+                    Ok(()) => {
+                        SourceError::Admission(dispatch::Error::Admission(ports::Error::Invalid))
+                    }
+                },
+                buffers: owner.map_or(Err(ports::Error::Invalid), Self::into_buffers),
+            }),
+        }
+    }
+    pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
+        self.session.into_buffers()
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceError {
+    Admission(dispatch::Error),
+    Read(ReadError),
+    Transfer(transfer::Error),
+}
+pub struct SourceRefusal<B: TlsWireStorage> {
+    pub error: SourceError,
+    pub buffers: Result<(B, B), ports::Error>,
+}
+/// Callback-scoped verified source, inseparable from its actual DATA session.
+pub struct BodySourceReady<'s, 'w, 'a, 'r, B: TlsWireStorage> {
+    ready: BodyReady<'w, 'a, 'r, B>,
+    source: &'s mut dyn ports::BlobReader,
+    completion: &'s mut Option<transfer::Completed<'w, 'a, 'r, B>>,
+}
+impl<'s, 'w, 'a, 'r, B: TlsWireStorage> BodySourceReady<'s, 'w, 'a, 'r, B> {
     pub fn begin<'m>(
         self,
-        source: &'m mut dyn ports::BlobReader,
         scratch: smtp_relay_body::Scratch<'m>,
         wire: &'m mut Meter,
         database: &'m mut Meter,
-    ) -> Result<transfer::Exchange<'m, 'w, 'a, 'r, B>, transfer::Refusal<B>> {
+    ) -> Result<SourceExchange<'m, 'w, 'a, 'r, B>, transfer::Refusal<B>>
+    where
+        's: 'm,
+    {
         transfer::begin(
-            self.plan,
-            self.session,
-            source,
-            self.mode,
+            self.ready.plan,
+            self.ready.session,
+            self.source,
+            self.ready.mode,
             scratch,
             wire,
             database,
         )
+        .map(|inner| SourceExchange {
+            inner,
+            completion: self.completion,
+        })
     }
     pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
-        self.session.into_buffers()
+        self.ready.into_buffers()
+    }
+}
+/// A source-scoped transfer cannot expose final SMTP authority to its callback.
+#[must_use = "drive scoped body transfer or close transport"]
+pub struct SourceExchange<'m, 'w, 'a, 'r, B: TlsWireStorage> {
+    inner: transfer::Exchange<'m, 'w, 'a, 'r, B>,
+    completion: &'m mut Option<transfer::Completed<'w, 'a, 'r, B>>,
+}
+#[must_use = "continue scoped transfer or acknowledge completion"]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Inline TLS custody avoids per-turn allocation."
+)]
+pub enum SourceProgress<'m, 'w, 'a, 'r, B: TlsWireStorage> {
+    Pending(SourceExchange<'m, 'w, 'a, 'r, B>),
+    Ready,
+}
+impl<'m, 'w, 'a, 'r, B: TlsWireStorage> SourceExchange<'m, 'w, 'a, 'r, B> {
+    pub fn advance(self) -> Result<SourceProgress<'m, 'w, 'a, 'r, B>, transfer::Refusal<B>> {
+        match self.inner.advance()? {
+            transfer::Progress::Pending(inner) => Ok(SourceProgress::Pending(Self {
+                inner,
+                completion: self.completion,
+            })),
+            transfer::Progress::Ready(done) => {
+                *self.completion = Some(done);
+                Ok(SourceProgress::Ready)
+            }
+        }
+    }
+    pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
+        self.inner.into_buffers()
     }
 }
 pub struct Rejected<B: TlsWireStorage> {
