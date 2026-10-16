@@ -3581,3 +3581,18 @@ transport or advancing sequence. Ownership and deadline are checked again
 before COMMIT; unknown COMMIT resolves the same operation. Stale attempt
 publication cannot cross into AcceptancePossible after retirement. No HTTP
 endpoint, scheduler or transport is activated by this increment.
+
+## 128. Conditional whole-submission cancellation
+
+Cancellation preparation can bind the caller's expected store epoch and
+account sequence. An epoch mismatch refuses preparation; a fresh publication
+checks the sequence under the account lock before group reservation, transport
+closure or writes. This check also applies to an already-canceled no-op.
+The optional sequence is included in the retained request digest, with absence
+distinct from zero. Unconditional operations retain their existing digest.
+
+Historical receipt settlement still precedes live-state checks: a committed
+conditional cancellation replays after its own sequence advance or later
+account changes. Its receipt must record the original expected sequence.
+This is the storage precondition needed for ifInState, not client credential
+authorization or an activated EmailSubmission/set update endpoint.

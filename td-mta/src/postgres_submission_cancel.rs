@@ -1,6 +1,6 @@
 //! Whole-submission cancellation, reserved before closing owned transport.
 use crate::{
-    ids::{SubmissionCancelId, SubmissionId},
+    ids::{StoreEpoch, SubmissionCancelId, SubmissionId},
     postgres_probe::{self, Request},
     postgres_route_owners::{self as owners, Claim},
 };
@@ -24,6 +24,7 @@ pub enum Error {
     Fence,
     Deadline,
     Conflict,
+    StateMismatch,
     Capacity,
     Integrity,
     Crypto,
@@ -35,6 +36,7 @@ pub struct Cancellation {
     claim: Claim,
     generation: u64,
     submission: SubmissionId,
+    expected: Option<u64>,
     operation: SubmissionCancelId,
     digest: [u8; 32],
 }
@@ -56,6 +58,27 @@ pub fn prepare(
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
+) -> Result<Cancellation, Error> {
+    prepare_inner(claim, generation, submission, None)
+}
+/// Bind a caller's account state to the whole cancellation. Epoch mismatch
+/// refuses preparation; publication checks sequence under the account lock.
+pub fn prepare_if_state(
+    claim: &Claim,
+    generation: u64,
+    submission: SubmissionId,
+    expected: (StoreEpoch, u64),
+) -> Result<Cancellation, Error> {
+    if expected.0 != claim.binding().epoch() {
+        return Err(Error::StateMismatch);
+    }
+    prepare_inner(claim, generation, submission, Some(expected.1))
+}
+fn prepare_inner(
+    claim: &Claim,
+    generation: u64,
+    submission: SubmissionId,
+    expected: Option<u64>,
 ) -> Result<Cancellation, Error> {
     if generation == 0 {
         return Err(Error::Integrity);
@@ -81,10 +104,19 @@ pub fn prepare(
             .map_err(|_| Error::Crypto)?;
         hash.update(field).map_err(|_| Error::Crypto)?;
     }
+    // Preserve unconditional request digests; a conditional request appends
+    // one length-delimited field, distinct even when the expected state is zero.
+    if let Some(expected) = expected {
+        hash.update(&8u64.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(&expected.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+    }
     Ok(Cancellation {
         claim: claim.clone(),
         generation,
         submission,
+        expected,
         operation: SubmissionCancelId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -113,6 +145,7 @@ async fn receipt(client: &Client, value: &Cancellation) -> Result<Option<Outcome
         || !(1..=1000).contains(&count)
         || !(changed == 0 || changed == count)
         || old == 0
+        || value.expected.is_some_and(|expected| expected != old)
         || (if changed == 0 {
             Some(old)
         } else {
@@ -199,6 +232,9 @@ pub fn publish(
                 let old = number(state.try_get(0).map_err(|_| Error::Integrity)?)?;
                 if old == 0 || number(state.try_get(1).map_err(|_| Error::Integrity)?)? > old {
                     return Err(Error::Integrity);
+                }
+                if value.expected.is_some_and(|expected| expected != old) {
+                    return Err(Error::StateMismatch);
                 }
                 let count:i64 = client.query_one("SELECT count(*) FROM (SELECT 1 FROM td_mta.submission_cancel_receipts WHERE account=$1 LIMIT 1024) receipts", &[&account]).await.map_err(|_|Error::Database)?.try_get(0).map_err(|_|Error::Integrity)?;
                 if count >= 1024 {

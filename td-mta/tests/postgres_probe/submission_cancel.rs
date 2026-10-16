@@ -9,7 +9,7 @@ use std::{
 };
 use td_crypto::TrustStore;
 use td_mta::{
-    ids::{BootId, SubmissionId},
+    ids::{BootId, StoreEpoch, SubmissionId},
     postgres_attempt_phases as phases, postgres_attempts as attempts,
     postgres_probe::Request,
     postgres_route_owners as owners,
@@ -59,7 +59,47 @@ pub(super) fn exercise(
         Err(cancel::Error::Capacity)
     );
     reset();
-    let value = prepare();
+    let sequence = u64::from_str_radix(
+        &sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+        ),
+        16,
+    )
+    .unwrap();
+    assert!(matches!(
+        cancel::prepare_if_state(
+            &claim,
+            grant.generation,
+            submission,
+            (StoreEpoch::from_bytes([0; 16]), sequence)
+        ),
+        Err(cancel::Error::StateMismatch)
+    ));
+    let stale = cancel::prepare_if_state(
+        &claim,
+        grant.generation,
+        submission,
+        (binding.epoch(), sequence - 1),
+    )
+    .unwrap();
+    assert_eq!(
+        cancel::publish(request, trust, deadline(), &stale, |_| panic!(
+            "stale state fenced"
+        )),
+        Err(cancel::Error::StateMismatch)
+    );
+    assert_eq!(
+        cancel::inspect(request, trust, deadline(), &stale).unwrap(),
+        None
+    );
+    let value = cancel::prepare_if_state(
+        &claim,
+        grant.generation,
+        submission,
+        (binding.epoch(), sequence),
+    )
+    .unwrap();
     assert_eq!(
         cancel::inspect(request, trust, deadline(), &value).unwrap(),
         None
@@ -131,6 +171,45 @@ pub(super) fn exercise(
         fixture,
         "DROP TRIGGER delay_cancel ON td_mta.submission_cancel_receipts",
     );
+    let stale_noop = cancel::prepare_if_state(
+        &claim,
+        grant.generation,
+        submission,
+        (binding.epoch(), sequence),
+    )
+    .unwrap();
+    assert_eq!(
+        cancel::publish(request, trust, deadline(), &stale_noop, |_| panic!(
+            "stale no-op fenced"
+        )),
+        Err(cancel::Error::StateMismatch)
+    );
+    let conditional_noop = cancel::prepare_if_state(
+        &claim,
+        grant.generation,
+        submission,
+        (binding.epoch(), outcome.new_sequence),
+    )
+    .unwrap();
+    let unchanged = cancel::publish(request, trust, deadline(), &conditional_noop, |_| {
+        panic!("conditional no-op fenced")
+    })
+    .unwrap();
+    assert_eq!(
+        (
+            unchanged.changed,
+            unchanged.old_sequence,
+            unchanged.new_sequence
+        ),
+        (0, outcome.new_sequence, outcome.new_sequence)
+    );
+    let receipt = format!("decode('{}','hex')", value.operation());
+    sql(fixture, &format!("UPDATE td_mta.submission_cancel_receipts SET old_sequence=decode('{:016x}','hex'),new_sequence=decode('{:016x}','hex') WHERE operation={receipt}", sequence+1, sequence+2));
+    assert_eq!(
+        cancel::inspect(request, trust, deadline(), &value),
+        Err(cancel::Error::Integrity)
+    );
+    sql(fixture, &format!("UPDATE td_mta.submission_cancel_receipts SET old_sequence=decode('{:016x}','hex'),new_sequence=decode('{:016x}','hex') WHERE operation={receipt}", sequence, sequence+1));
     let noop = cancel::publish(request, trust, deadline(), &prepare(), |_| {
         panic!("no-op fenced")
     })
