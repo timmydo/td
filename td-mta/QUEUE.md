@@ -216,6 +216,25 @@ and transport abort. Only a later runtime owner may hand terminator bytes to
 TLS after the exact AcceptancePossible subset and final-outcome reservation
 are durable. This codec does not activate body transmission or queue workers.
 
+The prepared body-transfer owner borrows an already admitted immutable
+BlobReader and its original deadline/work meter, and retains the authenticated
+TLS session. Its caller must first bind the source to the selected attempt,
+choose a compatible MAIL/body mode, observe the actual 354, and durably fence
+the exact Body recipient subset. An eight-bit request additionally requires
+the retained TLS EHLO capability; this does not prove which MAIL command was
+sent. These are trusted runtime obligations, not capabilities minted by a
+body-reader implementation or the body-transfer constructor.
+
+Each turn reads at most one 4096-byte source cell, performs one bounded DATA
+codec poll, or attempts one TLS operation. Source implementations must bound
+their own I/O by the original deadline. Short nonzero reads continue from the
+exact returned offset; early EOF, oversized reads, length drift, malformed
+framing and work/time refusal abort the transport. Completion consumes the
+codec and flushes all declared body output. The retained BodySent has no
+terminator API: durable AcceptancePossible and final-outcome capacity still
+precede any future terminator handoff. This prepares protocol machinery and
+does not activate the relay scheduler.
+
 Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
 bytes and a 20-byte key. A 100-row update is 905100 bytes before transaction and

@@ -4915,3 +4915,16 @@ the same original meter. Empty input/output supplies backpressure, and the
 first refusal is sticky. No poll allocates or emits a terminator. Completion
 and consuming finish freshly check the original meter/deadline; neither
 constitutes a durable body/acceptance fence.
+
+The prepared DATA body-transfer owner borrows a 4096-byte input cell and a
+4096-byte encoded output cell, plus an immutable source reader and the original
+meter. Its standard boxed-TLS progress value is compile-time capped at 4 KiB,
+separately from those 8192 caller bytes and TLS reservations. A turn charges a
+record and performs at most one source read, one 256-transition codec poll,
+or one TLS operation. Source reads and TLS writes precharge their bounded
+requested I/O extent; the codec separately charges consumed source and output
+bytes. These conservative layer charges include pending TLS attempts. Clock
+checks precede and follow every turn, including read, flush and completion.
+No per-turn collection grows or heap allocation occurs in this owner.
+Output accumulates across codec turns before one bounded TLS write; only
+a full cell or completed body drains it. Partial writes retain exact offsets.

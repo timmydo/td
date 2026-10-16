@@ -251,5 +251,6 @@ mod receiving_headers;
 
 pub mod smtp_data_encode;
 pub mod smtp_relay_auth;
+pub mod smtp_relay_body;
 pub mod smtp_relay_command;
 pub mod smtp_relay_ehlo;
