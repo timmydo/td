@@ -3319,8 +3319,9 @@ exclusion, current-owner fencing, history and receipt replay use the same
 atomic publisher as first attempts; receipt replay never increments twice.
 
 This is a prepared storage operation, not a retry scheduler. Runtime callers
-must enforce the queue clock guard, shared route backoff and repair generation,
-current transport authority and bounded due scanning before publication.
+supply the persistent queue clock guard; publication enforces it along with
+shared route backoff and repair generation. Current transport authority and
+bounded due scanning remain separate runtime requirements.
 No runtime route or retry loop is activated here. The PostgreSQL fixture seeds
 elapsed due times and covers both states, bounded batches, terminal/future
 exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
@@ -3828,3 +3829,38 @@ Real PostgreSQL cases cover the 100-recipient bound, stable ordinal/address
 mapping, read-only state, unpublished and retired attempts, empty and malformed
 reverse paths, malformed recipients, inconsistent Prepared fields, partial RCPT
 refusal and Body-phase refusal. No scheduler or SMTP transport is activated.
+
+## 138. Mandatory clock admission for attempt publication
+
+Fresh and retry publication now require the caller's persistent process queue
+clock guard and monotonic adapter. Under current policy and the route-owner
+lock, publication pairs database UTC with the adapter's monotonic tick and
+checks the applicable guard status before selecting recipients. The locked
+database sample reaches the guard before owner-clock or lease refusal, so a
+failed ownership check cannot hide a discontinuity from the persistent hold.
+Fresh work is
+allowed at startup; retries require five stable monotonic minutes. A clock
+discontinuity or primary-change hold continues to refuse dispatch until the
+existing explicit confirmation rules are satisfied. The adapter's UTC field
+is never used for queue decisions.
+
+After staging all recipient, submission, change and attempt rows, publication
+rechecks unexpired ownership, database time and the same guard immediately
+before issuing COMMIT. A backward time step within the transaction or elapsed
+submission expiry refuses publication. Failure rolls back the whole staged
+change. Guard access uses try_lock, so contention or poisoning refuses rather
+than waiting outside the connection deadline. No guard lock spans SQL awaits.
+
+Historical receipt settlement precedes clock admission and still grants no
+permission to transmit. An unknown COMMIT retains the same attempt identity;
+SMTP admission must independently revalidate current runtime ownership and
+clock state. There is no unguarded publication entry point. Runtime callers
+must share one guard across dispatch and expiry and notify it of primary
+changes; this increment activates no scheduler or administrator endpoint.
+
+Real PostgreSQL cases prove startup retry refusal, discontinuity holds,
+clock-adapter failure, guard contention, holds despite owner-clock/lease
+refusal followed by restored ownership, and rollback when a discontinuity is
+observed only after the recipient updates. Historical settlement succeeds
+without consulting a failed clock. Existing publication fixtures explicitly
+simulate the stable interval while retaining their storage/receipt assertions.

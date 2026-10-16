@@ -23,7 +23,8 @@ pub(super) fn exercise(
     sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,phase=0,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.submissions SET completed_at=NULL,notification=0,expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
     for batch in 0..3 {
         owners::renew(request, trust, deadline(), claim, generation).unwrap();
-        let attempt = attempts::publish(
+        let attempt = super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),

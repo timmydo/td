@@ -29,7 +29,8 @@ pub(super) fn exercise(
         None
     );
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
@@ -39,17 +40,17 @@ pub(super) fn exercise(
     );
     sql(fixture,&format!("UPDATE td_mta.recipients SET attempt_count=4294967295 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Capacity)
     );
     sql(fixture,&format!("UPDATE td_mta.recipients SET attempt_count=1,next_attempt_at=last_attempt_at+299999 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Integrity)
     );
     sql(fixture,&format!("UPDATE td_mta.recipients SET next_attempt_at=last_attempt_at+300000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET expires_at=send_at WHERE id=decode('{submission}','hex')"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::NotDue)
     );
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000 WHERE id=decode('{submission}','hex')"));
@@ -61,7 +62,7 @@ pub(super) fn exercise(
     );
     sql(fixture,"CREATE FUNCTION public.reject_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_retry BEFORE INSERT ON td_mta.submission_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_retry()");
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Database)
     );
     assert_eq!(
@@ -74,7 +75,8 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=2")),"0");
     sql(fixture,"DROP TRIGGER reject_retry ON td_mta.submission_attempts; CREATE FUNCTION public.delay_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_retry AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_retry()");
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             Instant::now() + Duration::from_millis(1500),
@@ -83,7 +85,8 @@ pub(super) fn exercise(
         Err(attempts::Error::Indeterminate)
     );
     thread::sleep(Duration::from_secs(4));
-    let outcome = attempts::publish(request, trust, deadline(), &value).unwrap();
+    let outcome =
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value).unwrap();
     assert_eq!(outcome.ordinals, (0..100).collect::<Vec<_>>());
     assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
     assert_eq!(
@@ -91,7 +94,7 @@ pub(super) fn exercise(
         Some(outcome.clone())
     );
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value).unwrap(),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &value).unwrap(),
         outcome
     );
     sql(
@@ -102,7 +105,7 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture,&format!("SELECT uncertain FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=0")),"1");
     let next = attempts::retry(claim, generation, submission).unwrap();
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &next),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &next),
         Err(attempts::Error::Busy)
     );
     phases::publish(
@@ -119,7 +122,7 @@ pub(super) fn exercise(
         .unwrap(),
     )
     .unwrap();
-    let second = attempts::publish(request, trust, deadline(), &next).unwrap();
+    let second = super::attempt_clock::publish(fixture, request, trust, deadline(), &next).unwrap();
     assert_eq!(second.ordinals, (100..200).collect::<Vec<_>>());
     phases::publish(
         request,
@@ -136,7 +139,8 @@ pub(super) fn exercise(
     )
     .unwrap();
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
@@ -147,7 +151,8 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture,&format!("SELECT md5(string_agg(concat_ws('|',ordinal,state,uncertain,phase,attempt_count,rcpt_reply,data_reply),',' ORDER BY ordinal)) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal>=200")),unchanged);
     assert_eq!(sql(fixture,&format!("SELECT encode(transmitted_blob_id,'hex'),reverse_path FROM td_mta.submissions WHERE id=decode('{submission}','hex')")),frozen);
     // The explicit first-attempt API still selects only never-attempted work.
-    let fresh = attempts::publish(
+    let fresh = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),

@@ -228,7 +228,8 @@ pub(super) fn exercise(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND rcpt_reply='550 refused' AND attempt_count=1")),"1000");
     reset();
     owners::renew(request, trust, deadline(), &claim, grant.generation).unwrap();
-    let attempt = attempts::publish(
+    let attempt = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),

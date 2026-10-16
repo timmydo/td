@@ -256,9 +256,23 @@ pub(crate) async fn check_locked(
     claim: &Claim,
     generation: u64,
 ) -> Result<i64, Error> {
-    let owner = owner(client, claim).await?.ok_or(Error::Stale)?;
-    let timestamp = now(client).await?;
-    current(&owner, claim, generation, timestamp, true)?;
+    check_locked_observed(client, claim, generation, |_| Ok(())).await
+}
+/// Observe database UTC under the owner lock even when clock or lease checks
+/// will refuse. A discontinuity must not disappear with the failed transaction.
+pub(crate) async fn check_locked_observed<E: From<Error>>(
+    client: &Client,
+    claim: &Claim,
+    generation: u64,
+    observe: impl FnOnce(i64) -> Result<(), E>,
+) -> Result<i64, E> {
+    let owner = owner(client, claim)
+        .await
+        .map_err(E::from)?
+        .ok_or_else(|| E::from(Error::Stale))?;
+    let timestamp = now(client).await.map_err(E::from)?;
+    observe(timestamp)?;
+    current(&owner, claim, generation, timestamp, true).map_err(E::from)?;
     Ok(timestamp)
 }
 

@@ -24,7 +24,8 @@ pub(super) fn exercise(
     for batch in 0..3 {
         owners::renew(request, trust, deadline(), claim, generation).unwrap();
         let prepared = attempts::prepare(claim, generation, submission).unwrap();
-        let attempt = attempts::publish(request, trust, deadline(), &prepared).unwrap();
+        let attempt =
+            super::attempt_clock::publish(fixture, request, trust, deadline(), &prepared).unwrap();
         assert_eq!(
             attempt.ordinals,
             (batch * 100..batch * 100 + 100).collect::<Vec<_>>()

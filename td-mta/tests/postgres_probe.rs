@@ -10416,9 +10416,17 @@ fn exercise_dispatch(
     let claim = owners::prepare(binding, BootId::from_bytes([9; 16])).unwrap();
     let owner = owners::acquire(request, trust, deadline(), &claim).unwrap();
     let value = attempts::prepare(&claim, owner.generation, submission).unwrap();
+    attempt_clock::exercise(
+        fixture,
+        request,
+        trust,
+        &claim,
+        owner.generation,
+        submission,
+    );
     let bad = attempts::prepare(&claim, owner.generation + 1, submission).unwrap();
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &bad),
+        attempt_clock::publish(fixture, request, trust, deadline(), &bad),
         Err(attempts::Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
@@ -10434,7 +10442,7 @@ fn exercise_dispatch(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Policy)
     );
     sql(
@@ -10447,17 +10455,17 @@ fn exercise_dispatch(
     let destination = sql(fixture, &format!("SELECT encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{submission}','hex')"));
     sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode(repeat('00',32),'hex') WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Missing)
     );
     sql(fixture, &format!("UPDATE td_mta.submission_routes SET destination=decode('{destination}','hex') WHERE submission_id=decode('{submission}','hex'); UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at+86400000 WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::NotDue)
     );
     sql(fixture, &format!("UPDATE td_mta.recipients SET next_attempt_at=next_attempt_at-86400000,uncertain=1 WHERE submission_id=decode('{submission}','hex')"));
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Integrity)
     );
     sql(fixture, &format!("UPDATE td_mta.recipients SET uncertain=0 WHERE submission_id=decode('{submission}','hex')"));
@@ -10465,7 +10473,7 @@ fn exercise_dispatch(
     sql(fixture, &format!("INSERT INTO td_mta.recipients(account,submission_id,ordinal,address,state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed) SELECT account,submission_id,n,'recipient'||n||'@example.test',state,uncertain,attempt_count,phase,next_attempt_at,reason,diagnostic,changed FROM td_mta.recipients CROSS JOIN generate_series(2,999) n WHERE submission_id=decode('{submission}','hex') AND ordinal=0; UPDATE td_mta.submissions SET recipient_count=1000 WHERE id=decode('{submission}','hex')"));
     sql(fixture, "CREATE FUNCTION public.reject_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_attempt BEFORE INSERT ON td_mta.submission_attempts FOR EACH ROW EXECUTE FUNCTION public.reject_attempt()");
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value),
         Err(attempts::Error::Database)
     );
     assert_eq!(
@@ -10482,7 +10490,8 @@ fn exercise_dispatch(
     assert_eq!(sql(fixture, &format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=1")),"1000");
     sql(fixture,"DROP TRIGGER reject_attempt ON td_mta.submission_attempts; CREATE FUNCTION public.delay_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_attempt AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_attempt()");
     assert_eq!(
-        attempts::publish(
+        attempt_clock::publish(
+            fixture,
             request,
             trust,
             Instant::now() + Duration::from_millis(1500),
@@ -10496,6 +10505,7 @@ fn exercise_dispatch(
         .unwrap();
     assert_eq!(outcome.ordinals, (0..100).collect::<Vec<_>>());
     assert_eq!(outcome.new_sequence, outcome.old_sequence + 1);
+    attempt_clock::replay(fixture, request, trust, &value, &outcome);
     assert_eq!(outcome.attempt, value.attempt());
     assert_eq!(outcome.submission, submission);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND state=2 AND phase=1 AND attempt_count=1 AND next_attempt_at IS NULL AND attempt_id=decode('{}','hex')",value.attempt())),"100");
@@ -10518,7 +10528,7 @@ fn exercise_dispatch(
     );
     let other = attempts::prepare(&claim, owner.generation, submission).unwrap();
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &other),
+        attempt_clock::publish(fixture, request, trust, deadline(), &other),
         Err(attempts::Error::Busy)
     );
     owners::release(request, trust, deadline(), &claim, owner.generation).unwrap();
@@ -10527,7 +10537,7 @@ fn exercise_dispatch(
     let replacement_attempt =
         attempts::prepare(&replacement, replacement_owner.generation, submission).unwrap();
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &replacement_attempt),
+        attempt_clock::publish(fixture, request, trust, deadline(), &replacement_attempt),
         Err(attempts::Error::Busy)
     );
     owners::release(
@@ -10543,7 +10553,7 @@ fn exercise_dispatch(
         "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
     );
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &value).unwrap(),
+        attempt_clock::publish(fixture, request, trust, deadline(), &value).unwrap(),
         outcome
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex'); DROP TRIGGER delay_attempt ON td_mta.submission_attempts",binding.selection().generation));
@@ -10678,7 +10688,7 @@ fn exercise_attempt_recovery(
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{:016x}','hex'); DROP TRIGGER delay_recovery ON td_mta.attempt_recovery_receipts",binding.selection().generation));
     let next = td_mta::postgres_attempts::prepare(&claim, grant.generation, submission).unwrap();
-    let next = td_mta::postgres_attempts::publish(request, trust, deadline(), &next).unwrap();
+    let next = attempt_clock::publish(fixture, request, trust, deadline(), &next).unwrap();
     assert_eq!(next.ordinals, (100..200).collect::<Vec<_>>());
     attempt_acceptance::exercise(
         fixture,
@@ -11751,3 +11761,6 @@ mod attempt_body;
 
 #[path = "postgres_probe/attempt_envelope.rs"]
 mod attempt_envelope;
+
+#[path = "postgres_probe/attempt_clock.rs"]
+mod attempt_clock;

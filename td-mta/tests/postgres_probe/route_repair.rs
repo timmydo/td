@@ -75,7 +75,8 @@ pub(super) fn exercise(
         Err(Error::Owner(owners::Error::Stale))
     );
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
@@ -148,7 +149,8 @@ pub(super) fn exercise(
         snapshot
     );
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),

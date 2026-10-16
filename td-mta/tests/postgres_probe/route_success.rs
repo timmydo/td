@@ -35,7 +35,8 @@ pub(super) fn exercise(
     )
     .unwrap();
     sql(fixture,&format!("UPDATE td_mta.route_health SET failed_at=failed_at-3600000,next_at=next_at-3600000; UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-3600000,next_attempt_at=next_attempt_at-3600000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
-    let attempt = attempts::publish(
+    let attempt = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),
@@ -52,7 +53,8 @@ pub(super) fn exercise(
     )
     .unwrap();
     sql(fixture, &format!("UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-3600000,next_attempt_at=next_attempt_at-3600000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
-    let attempt = attempts::publish(
+    let attempt = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),

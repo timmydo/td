@@ -243,7 +243,7 @@ pub(super) fn exercise(
         "0"
     );
     let dispatch = attempts::prepare(claim, generation, id(0)).unwrap();
-    attempts::publish(request, trust, deadline(), &dispatch).unwrap();
+    super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap();
     assert!(matches!(
         candidates::scan(
             request,

@@ -107,7 +107,7 @@ pub(super) fn exercise(
     );
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     let next = attempts::prepare(claim, generation, submission).unwrap();
-    let next = attempts::publish(request, trust, deadline(), &next).unwrap();
+    let next = super::attempt_clock::publish(fixture, request, trust, deadline(), &next).unwrap();
     assert_eq!(next.ordinals, (200..300).collect::<Vec<_>>());
     let rcpts: Vec<_> = next
         .ordinals

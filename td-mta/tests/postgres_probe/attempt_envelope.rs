@@ -26,7 +26,9 @@ pub(super) fn exercise(
         attempts::envelope(request, trust, deadline(), &dispatch),
         Err(attempts::Error::Missing)
     );
-    let outcome = attempts::publish(request, trust, deadline(), &dispatch).unwrap();
+    let outcome =
+        super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch)
+            .unwrap();
     assert_eq!(outcome.ordinals.len(), 100);
     let sequence = sql(
         fixture,
@@ -106,7 +108,7 @@ pub(super) fn exercise(
     sql(fixture,&format!("UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,rcpt_reply=NULL,data_reply=NULL,reason=0,diagnostic='' WHERE submission_id={sub}; UPDATE td_mta.submissions SET completed_at=NULL WHERE id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     let dispatch = attempts::prepare(claim, generation, submission).unwrap();
-    attempts::publish(request, trust, deadline(), &dispatch).unwrap();
+    super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch).unwrap();
     let body = phases::body(claim, generation, dispatch.attempt(), &[(0, "250 ok")]).unwrap();
     phases::publish(request, trust, deadline(), &body).unwrap();
     assert_eq!(

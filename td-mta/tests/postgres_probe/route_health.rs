@@ -23,7 +23,8 @@ pub(super) fn exercise(
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
     sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+86400000,completed_at=NULL,notification=0 WHERE id=decode('{submission}','hex'); UPDATE td_mta.recipients SET state=1,uncertain=0,attempt_id=NULL,attempt_count=0,last_attempt_at=NULL,phase=0,next_attempt_at=0,reason=0,rcpt_reply=NULL,data_reply=NULL,diagnostic='' WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
     let dispatch = attempts::prepare(claim, generation, submission).unwrap();
-    let first = attempts::publish(request, trust, deadline(), &dispatch).unwrap();
+    let first =
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap();
     assert_eq!(first.ordinals, vec![0]);
     // Retire a failure without a route-health report, then start a later attempt.
     let abandoned = first;
@@ -35,7 +36,8 @@ pub(super) fn exercise(
     )
     .unwrap();
     sql(fixture, &format!("UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-1200000,next_attempt_at=next_attempt_at-1200000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
-    let first = attempts::publish(
+    let first = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),
@@ -132,11 +134,12 @@ pub(super) fn exercise(
         "DROP TRIGGER delay_health ON td_mta.route_health_receipts",
     );
     assert_eq!(
-        attempts::publish(request, trust, deadline(), &dispatch).unwrap(),
+        super::attempt_clock::publish(fixture, request, trust, deadline(), &dispatch).unwrap(),
         abandoned
     );
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
@@ -152,7 +155,8 @@ pub(super) fn exercise(
     )
     .unwrap();
     sql(fixture,&format!("UPDATE td_mta.route_health SET failed_at=failed_at-1200000,next_at=next_at-1200000; UPDATE td_mta.recipients SET last_attempt_at=last_attempt_at-1200000,next_attempt_at=next_attempt_at-1200000 WHERE submission_id=decode('{submission}','hex') AND ordinal=0"));
-    let second = attempts::publish(
+    let second = super::attempt_clock::publish(
+        fixture,
         request,
         trust,
         deadline(),
@@ -176,7 +180,8 @@ pub(super) fn exercise(
         "UPDATE td_mta.route_health SET failed_at=failed_at-1200000,next_at=next_at-1200000",
     );
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
@@ -198,7 +203,8 @@ pub(super) fn exercise(
     let grant = owners::acquire(request, trust, deadline(), &replacement).unwrap();
     assert!(grant.generation > generation);
     assert_eq!(
-        attempts::publish(
+        super::attempt_clock::publish(
+            fixture,
             request,
             trust,
             deadline(),
