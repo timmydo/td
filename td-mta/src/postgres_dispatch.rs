@@ -178,6 +178,36 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         input: Input,
         meter: &mut Meter,
     ) -> Result<Published, Error> {
+        self.publish_with(claim, generation, input, meter, false)
+            .map(|(published, _)| published)
+    }
+    /// Retain an owner only for a known new Prepared commit within the original
+    /// job limit. Uncertainty retains Pending and yields no owner.
+    pub fn publish_prepared(
+        &self,
+        claim: &Claim,
+        generation: u64,
+        input: Input,
+        meter: &mut Meter,
+    ) -> Result<PreparedResult<'_, 'a, 'r>, Error> {
+        let (published, limit) = self.publish_with(claim, generation, input, meter, true)?;
+        if Instant::now() >= limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(PreparedResult {
+            worker: self,
+            published,
+            limit,
+        })
+    }
+    fn publish_with(
+        &self,
+        claim: &Claim,
+        generation: u64,
+        input: Input,
+        meter: &mut Meter,
+        new_only: bool,
+    ) -> Result<(Published, Instant), Error> {
         let mut pending = self
             .pending
             .operation
@@ -202,7 +232,12 @@ impl<'a, 'r> Dispatches<'a, 'r> {
         let Some(Operation::Dispatch(value)) = pending.as_ref() else {
             return Err(ports::Error::Invalid.into());
         };
-        let result = attempts::publish(
+        let publish = if new_only {
+            attempts::publish_new
+        } else {
+            attempts::publish
+        };
+        let result = publish(
             self.connection.request,
             self.connection.trust,
             limit,
@@ -215,10 +250,13 @@ impl<'a, 'r> Dispatches<'a, 'r> {
                 let Some(Operation::Dispatch(dispatch)) = pending.take() else {
                     return Err(ports::Error::Invalid.into());
                 };
-                Ok(Published {
-                    dispatch: *dispatch,
-                    outcome,
-                })
+                Ok((
+                    Published {
+                        dispatch: *dispatch,
+                        outcome,
+                    },
+                    limit,
+                ))
             }
             Err(error) => {
                 if error != attempts::Error::Indeterminate {
@@ -408,6 +446,60 @@ impl<'a, 'r> Dispatches<'a, 'r> {
             limit,
             _permit: permit,
         })
+    }
+}
+
+/// Non-cloneable custody of a known new Prepared publication. The receipt and
+/// observed envelope are passive; transport orchestration remains separate.
+pub struct PreparedResult<'w, 'a, 'r> {
+    worker: &'w Dispatches<'a, 'r>,
+    published: Published,
+    limit: Instant,
+}
+impl PreparedResult<'_, '_, '_> {
+    pub fn attempt(&self) -> AttemptId {
+        self.published.dispatch.attempt()
+    }
+    pub fn outcome(&self) -> &attempts::Outcome {
+        &self.published.outcome
+    }
+    /// Charge a fresh untouched-envelope observation without extending the
+    /// original deadline. No connection slot or database lock survives return.
+    pub fn observe_envelope(
+        &self,
+        meter: &mut Meter,
+    ) -> Result<(attempts::Envelope, Instant), Error> {
+        let worker = self.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+        let limit = worker
+            .connection
+            .admit(until, meter, ATTEMPT_IO)?
+            .min(self.limit);
+        let _slot = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        attempts::observe_envelope(
+            worker.connection.request,
+            worker.connection.trust,
+            limit,
+            &self.published.dispatch,
+            worker.connection.clock.clone(),
+            worker.guard.clone(),
+        )
+        .map_err(Error::Publication)
     }
 }
 

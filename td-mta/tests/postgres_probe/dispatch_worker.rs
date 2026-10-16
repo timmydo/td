@@ -107,21 +107,21 @@ pub(super) fn exercise(
     };
     assert_eq!(
         forbidden
-            .publish(claim, generation, input(10_000, false), &mut meter())
+            .publish_prepared(claim, generation, input(10_000, false), &mut meter())
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Forbidden))
     );
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
         worker
-            .publish(claim, generation, input(10_000, false), &mut empty)
+            .publish_prepared(claim, generation, input(10_000, false), &mut empty)
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Capacity))
     );
     assert!(empty.stopped().is_some());
     assert_eq!(
         worker
-            .publish(claim, generation, input(0, false), &mut meter())
+            .publish_prepared(claim, generation, input(0, false), &mut meter())
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Deadline))
     );
@@ -135,13 +135,13 @@ pub(super) fn exercise(
     );
     assert_eq!(
         worker
-            .publish(claim, generation, input(10_000, false), &mut expired)
+            .publish_prepared(claim, generation, input(10_000, false), &mut expired)
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Deadline))
     );
     assert_eq!(
         worker
-            .publish(claim, generation, input(10_000, true), &mut meter())
+            .publish_prepared(claim, generation, input(10_000, true), &mut meter())
             .map(|_| ()),
         Err(Error::Publication(attempts::Error::Clock(
             td_mta::queue_clock::Error::Unstable
@@ -149,22 +149,52 @@ pub(super) fn exercise(
     );
     assert_eq!(pending.attempt().unwrap(), None);
     let success = worker
-        .publish(claim, generation, input(10_000, false), &mut meter())
+        .publish_prepared(claim, generation, input(5000, false), &mut meter())
         .unwrap();
-    assert_eq!(success.outcome.ordinals, vec![0, 1]);
-    assert_eq!(success.dispatch.attempt(), success.outcome.attempt);
+    assert_eq!(success.outcome().ordinals, vec![0, 1]);
+    assert_eq!(success.attempt(), success.outcome().attempt);
     assert_eq!(
-        attempts::envelope(request, trust, deadline(), &success.dispatch)
+        success
+            .observe_envelope(&mut meter())
             .unwrap()
+            .0
             .recipients
             .len(),
         2
     );
     assert_eq!(pending.attempt().unwrap(), None);
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    assert_eq!(
+        success.observe_envelope(&mut empty),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    let occupied = worker
+        .reserve_final(success.attempt(), until(10_000), &mut meter())
+        .unwrap();
+    assert_eq!(
+        success.observe_envelope(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
+    drop(occupied);
+    let mut observed_budget = meter();
+    let before = observed_budget.remaining();
+    assert_eq!(
+        success
+            .observe_envelope(&mut observed_budget)
+            .unwrap()
+            .0
+            .attempt,
+        success.attempt()
+    );
+    assert_eq!(
+        before.io_bytes - observed_budget.remaining().io_bytes,
+        2 * 1024 * 1024 + 192 * 1024
+    );
+    assert_eq!(before.records - observed_budget.remaining().records, 4096);
     let body = phases::body(
         claim,
         generation,
-        success.outcome.attempt,
+        success.outcome().attempt,
         &[(0, "250 first"), (1, "250 second")],
     )
     .unwrap();
@@ -185,7 +215,7 @@ pub(super) fn exercise(
     let stale = phases::body(
         claim,
         generation + 1,
-        success.outcome.attempt,
+        success.outcome().attempt,
         &[(0, "250 first"), (1, "250 second")],
     )
     .unwrap();
@@ -199,7 +229,7 @@ pub(super) fn exercise(
         forbidden.publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(10_000),
             &mut meter()
@@ -210,7 +240,7 @@ pub(super) fn exercise(
         worker.publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(0),
             &mut meter()
@@ -222,7 +252,7 @@ pub(super) fn exercise(
         worker.publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(10_000),
             &mut empty
@@ -230,13 +260,13 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Capacity))
     ));
     let slot = worker
-        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
+        .reserve_final(success.outcome().attempt, until(10_000), &mut meter())
         .unwrap();
     assert!(matches!(
         worker.publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(10_000),
             &mut meter()
@@ -250,7 +280,7 @@ pub(super) fn exercise(
         .publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(2000),
             &mut budget,
@@ -261,7 +291,7 @@ pub(super) fn exercise(
         3 * 1024 * 1024 + 128 * 1024
     );
     assert_eq!(before.records - budget.remaining().records, 4096);
-    assert_eq!(owner.attempt(), success.outcome.attempt);
+    assert_eq!(owner.attempt(), success.outcome().attempt);
     let published = *owner.outcome();
     let before = budget.remaining();
     assert!(owner.check_current(&mut budget).is_ok());
@@ -271,7 +301,7 @@ pub(super) fn exercise(
     );
     assert_eq!(before.records - budget.remaining().records, 4096);
     let slot = worker
-        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
+        .reserve_final(success.outcome().attempt, until(10_000), &mut meter())
         .unwrap();
     assert_eq!(
         owner.check_current(&mut meter()),
@@ -287,7 +317,7 @@ pub(super) fn exercise(
         worker.publish_body(
             claim,
             generation,
-            success.outcome.attempt,
+            success.outcome().attempt,
             accepted,
             until(10_000),
             &mut meter()
@@ -295,13 +325,13 @@ pub(super) fn exercise(
         Err(Error::Phase(phases::Error::Conflict))
     ));
     let plan = owner.reserve_final(&mut meter()).unwrap();
-    assert_eq!(plan.attempt(), success.outcome.attempt);
+    assert_eq!(plan.attempt(), success.outcome().attempt);
     assert_eq!(
         plan.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Busy))
     );
     assert!(matches!(
-        worker.reserve_final(success.outcome.attempt, until(10_000), &mut meter()),
+        worker.reserve_final(success.outcome().attempt, until(10_000), &mut meter()),
         Err(Error::Admission(ports::Error::Busy))
     ));
     thread::sleep(Duration::from_millis(2100));
@@ -314,10 +344,10 @@ pub(super) fn exercise(
         Err(Error::Admission(ports::Error::Deadline))
     ));
     let released = worker
-        .reserve_final(success.outcome.attempt, until(10_000), &mut meter())
+        .reserve_final(success.outcome().attempt, until(10_000), &mut meter())
         .unwrap();
     drop(released);
-    assert_eq!(published.attempt, success.outcome.attempt);
+    assert_eq!(published.attempt, success.outcome().attempt);
     assert_eq!(published.recipients, 2);
     assert_eq!(pending.attempt().unwrap(), None);
     assert_eq!(
@@ -339,11 +369,15 @@ pub(super) fn exercise(
     sql(fixture,"CREATE FUNCTION public.delay_dispatch_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_dispatch_worker AFTER INSERT ON td_mta.submission_attempts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_dispatch_worker()");
     assert_eq!(
         worker
-            .publish(claim, generation, input(1500, false), &mut meter())
+            .publish_prepared(claim, generation, input(1500, false), &mut meter())
             .map(|_| ()),
         Err(Error::Publication(attempts::Error::Indeterminate))
     );
     let attempt = pending.attempt().unwrap().unwrap();
+    assert_eq!(
+        success.observe_envelope(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
     assert!(matches!(
         worker.reserve_final(attempt, until(10_000), &mut meter()),
         Err(Error::Admission(ports::Error::Busy))
@@ -364,7 +398,7 @@ pub(super) fn exercise(
     );
     assert_eq!(
         worker
-            .publish(claim, generation, input(10_000, false), &mut meter())
+            .publish_prepared(claim, generation, input(10_000, false), &mut meter())
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Busy))
     );
@@ -455,7 +489,7 @@ pub(super) fn exercise(
     );
     assert_eq!(
         worker
-            .publish(claim, generation, input(10_000, false), &mut meter())
+            .publish_prepared(claim, generation, input(10_000, false), &mut meter())
             .map(|_| ()),
         Err(Error::Admission(ports::Error::Busy))
     );
@@ -525,6 +559,12 @@ pub(super) fn exercise(
         worker.guard.clone()
     )
     .is_ok());
+    // Existing delayed COMMIT cases exceed the original five-second owner
+    // limit. A fresh meter cannot revive the first Prepared owner.
+    assert_eq!(
+        success.observe_envelope(&mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    );
     super::final_work::exercise(fixture, &worker, claim, generation, attempt);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));

@@ -4368,3 +4368,31 @@ clock adapters, guard contention, route backoff and repair, original deadline
 and submission-expiry caps, unchanged account sequence, malformed envelope
 rows, partial RCPT publication, advancement to Body and valid retry envelopes
 that retain previous replies.
+
+## 157. Bounded Prepared publication custody
+
+The worker can publish a Prepared attempt through a new-only path and retain a
+non-cloneable PreparedResult only after a known new commit. Both the initial
+receipt lookup and the locked recheck refuse historical replay on this path.
+The original historical publication API remains passive. Unknown COMMIT keeps
+the exact Dispatch in the shared Pending barrier and returns no owner;
+settlement cannot construct one.
+
+PreparedResult retains the worker, exact publication and earliest original
+job/meter/ten-second Instant cap. It exposes passive identity/outcome references
+and a bounded observed-envelope read. Each read checks Pending and original
+expiry, prepays the attempt allowance and acquires an ordinary slot, then uses
+the native observed reader with the retained cap. A new meter or lease renewal
+cannot extend the original bound. No slot or database lock remains held after
+the read. Drop releases local custody only.
+
+The returned envelope and conservative deadline are still passive evidence.
+SMTP envelope orchestration must retain its minimum bound and carry the
+original job limit into later Body custody; this increment does not compose
+that transport owner or activate a scheduler. Trusted low-level phase APIs
+remain separate.
+
+Native worker cases cover runtime mode, budgets, slots, exact read charging,
+original expiry despite a fresh meter, Pending exclusion, uncertain commit
+retention and historical settlement. Storage cases require new-only replay to
+refuse while historical publication still returns the exact receipt.

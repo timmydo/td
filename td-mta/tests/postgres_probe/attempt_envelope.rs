@@ -30,6 +30,31 @@ pub(super) fn exercise(
         super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch)
             .unwrap();
     assert_eq!(outcome.ordinals.len(), 100);
+    let clock = std::sync::Arc::new(td_mta::clock::RuntimeClock::new());
+    let guard = std::sync::Arc::new(std::sync::Mutex::new(
+        td_mta::queue_clock::Guard::new(td_mta::ports::Time {
+            utc_ms: sql(
+                fixture,
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .parse()
+            .unwrap(),
+            monotonic: td_mta::ports::Clock::sample(clock.as_ref())
+                .unwrap()
+                .monotonic,
+        })
+        .unwrap(),
+    ));
+    assert_eq!(
+        attempts::publish_new(request, trust, deadline(), &dispatch, clock, guard),
+        Err(attempts::Error::Conflict)
+    );
+    assert_eq!(
+        super::attempt_clock::fresh_publish(fixture, request, trust, deadline(), &dispatch)
+            .unwrap(),
+        outcome
+    );
+
     let sequence = sql(
         fixture,
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",

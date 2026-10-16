@@ -225,8 +225,35 @@ pub fn publish(
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<Outcome, Error> {
+    publish_inner(request, trust, deadline, value, clock, guard, false)
+}
+/// Only a newly committed Prepared attempt succeeds. Historical receipt replay
+/// and settlement cannot reconstruct live worker custody.
+pub fn publish_new(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<Outcome, Error> {
+    publish_inner(request, trust, deadline, value, clock, guard, true)
+}
+fn publish_inner(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+    new_only: bool,
+) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
-        return Ok(outcome);
+        return if new_only {
+            Err(Error::Conflict)
+        } else {
+            Ok(outcome)
+        };
     }
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
@@ -237,7 +264,11 @@ pub fn publish(
                 .await
                 .map_err(Error::Owner)?;
             if let Some(outcome) = receipt(client, &value).await? {
-                return Ok(outcome);
+                return if new_only {
+                    Err(Error::Conflict)
+                } else {
+                    Ok(outcome)
+                };
             }
             if !policy {
                 return Err(Error::Policy);
