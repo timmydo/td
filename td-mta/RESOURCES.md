@@ -424,7 +424,12 @@ encoded-header adapters or combined service RSS.
   extracted resources or native allocations; integrated measurements must
   account for those owners without claiming a proven universal maximum.
   The TLS policy compiler reserves at most 18 table entries (16 listeners,
-  relay and ACME). Within one complete compilation it reserves at most 32
+  relay and ACME). Its relay binding adds one 32-byte credential digest, not
+  another plaintext credential allocation. Binding checks hash at most 254
+  username bytes and 1024 password bytes plus fixed domain/length framing,
+  using the provider's inline digest state; they perform no I/O or variable
+  growth. These checks do not authenticate remotely or replace runtime work
+  admission. Within one complete compilation it reserves at most 32
   temporary HTTPS identity cache entries: one per certificate profile with and
   without the JMAP origin binding. Equal views share the same narrowed identity
   across listeners; empty views are cached too. The cache is dropped before

@@ -9,8 +9,8 @@ use crate::{
 };
 use std::{io::Read, net::SocketAddr, sync::Arc};
 use td_crypto::{
-    ClientConfig, ClockHandle, IdentitySelection, ServerConfig, ServerIdentity, TlsProtocol,
-    TlsSession, TlsStatus, TrustStore,
+    ClientConfig, ClockHandle, Crypto, Digest, IdentitySelection, Provider, ServerConfig,
+    ServerIdentity, TlsProtocol, TlsSession, TlsStatus, TrustStore,
 };
 
 const MAX_POLICIES: usize = listener::MAX_LISTENERS + 2;
@@ -91,6 +91,7 @@ enum Binding {
         host: String,
         port: u16,
         transport: outbound::Transport,
+        credentials: [u8; 32],
     },
     Acme {
         host: String,
@@ -316,6 +317,7 @@ impl TlsPolicies {
                 host,
                 port,
                 transport,
+                ..
             } => Some((host, *port, *transport)),
             Binding::Acme { host, port } => Some((host, *port, outbound::Transport::ImplicitTls)),
             Binding::Listener(_) => None,
@@ -869,6 +871,30 @@ fn build<R: Read>(
     Ok(TlsPolicies { policies, coverage })
 }
 
+fn relay_credentials_digest(username: &str, password: &str) -> Result<[u8; 32], Error> {
+    if username.is_empty()
+        || username.len() > outbound::MAX_USERNAME_BYTES
+        || password.is_empty()
+        || password.len() > crate::config::material::MAX_PASSWORD_BYTES
+        || !username
+            .bytes()
+            .chain(password.bytes())
+            .all(|b| (32..=126).contains(&b))
+    {
+        return Err(Error::Invalid);
+    }
+    let mut hash = Provider.sha256()?;
+    for field in [
+        b"td-mta relay credentials v1".as_slice(),
+        username.as_bytes(),
+        password.as_bytes(),
+    ] {
+        hash.update(&(field.len() as u64).to_be_bytes())?;
+        hash.update(field)?;
+    }
+    hash.finish().map_err(Error::from)
+}
+
 fn append_clients<R: Read>(
     policies: &mut Vec<Policy>,
     configuration: &ResolvedText,
@@ -890,6 +916,10 @@ fn append_clients<R: Read>(
                 host: owned(relay.host)?,
                 port: relay.port,
                 transport: relay.transport,
+                credentials: relay_credentials_digest(
+                    relay.username,
+                    configuration.relay_password().map_err(|_| Error::Invalid)?,
+                )?,
             },
             configuration: client(
                 relay.ca_file,

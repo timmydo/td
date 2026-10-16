@@ -57,6 +57,11 @@ impl<B: TlsWireStorage> Session<B> {
     pub fn mechanisms(&self) -> AuthMechanisms {
         self.mechanisms
     }
+    /// Match exact credentials to this retained relay policy. No AUTH command,
+    /// current-generation admission or successful authentication is conferred.
+    pub fn check_credentials(&self, username: &str, password: &str) -> Result<(), Error> {
+        self.connection.check_relay_credentials(username, password)
+    }
     pub fn policy_id(&self) -> TlsPolicyId {
         self.connection.policy_id()
     }

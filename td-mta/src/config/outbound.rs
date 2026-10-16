@@ -2,6 +2,7 @@
 use super::{endpoint, syntax::Location, text, values};
 use std::{fmt, net::SocketAddr, num::NonZeroU64};
 pub const MAX_RESOLVERS: usize = 4;
+pub const MAX_USERNAME_BYTES: usize = 254;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Transport {
     #[default]
@@ -245,7 +246,7 @@ impl Builder {
                 .filter(|port| *port != 0)
                 .ok_or_else(|| err(Code::Port, Some(at)))?;
             if input.username.is_empty()
-                || input.username.len() > 254
+                || input.username.len() > MAX_USERNAME_BYTES
                 || !input.username.bytes().all(|b| (32..=126).contains(&b))
             {
                 return Err(err(Code::Username, Some(at)));

@@ -3,6 +3,8 @@
 mod client_starttls_tests;
 #[path = "tls_policy_client_tests.rs"]
 mod client_tests;
+#[path = "tls_policy_credentials_tests.rs"]
+mod credentials_tests;
 #[path = "tls_gateway_process_tests.rs"]
 mod gateway_process_tests;
 #[path = "https_tests.rs"]

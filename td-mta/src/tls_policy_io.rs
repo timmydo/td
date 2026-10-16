@@ -107,6 +107,26 @@ impl<B: TlsWireStorage> TlsConnection<B> {
         }
     }
 
+    pub(crate) fn check_relay_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<(), Error> {
+        use td_crypto::{Crypto, Provider};
+        self.verified_relay_transport()?;
+        let supplied = super::relay_credentials_digest(username, password)?;
+        let super::Binding::Relay { credentials, .. } =
+            &TlsPolicies::resolve(&self.lease, self.id)?.binding
+        else {
+            return Err(Error::Forbidden);
+        };
+        if Provider.equal_digest(credentials, &supplied) {
+            Ok(())
+        } else {
+            Err(Error::Forbidden)
+        }
+    }
+
     pub const fn policy_id(&self) -> TlsPolicyId {
         self.id
     }

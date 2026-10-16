@@ -130,6 +130,11 @@ fn relay_ehlo_retains_fragmented_capabilities_on_verified_tls_in_both_modes() {
         )
         .ok()
         .unwrap();
+        assert_eq!(ready.check_credentials("private-relay", "password"), Ok(()));
+        assert_eq!(
+            ready.check_credentials("other-relay", "password"),
+            Err(Error::Forbidden)
+        );
         assert!(ready.mechanisms().plain());
         assert!(ready.mechanisms().login());
         assert_eq!(ready.policy_id(), TlsPolicies::relay(&lease).unwrap());

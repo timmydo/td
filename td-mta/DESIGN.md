@@ -1232,6 +1232,17 @@ caller-reserved 512-byte cells hold input, greeting, EHLO reply and command.
 The returned session has no authentication, account or queue authority.
 The production relay scheduler and credential exchange remain separate work.
 
+Each compiled relay policy retains a private domain-separated SHA-256 digest
+of the exact decoded username/password, framed by lengths. The completed EHLO
+session can compare supplied bounded printable-ASCII credentials to that
+retained policy using the provider's fixed-digest constant-time comparison.
+It retains no second plaintext password copy and sends no AUTH bytes. This is
+a local configuration-binding check, not a persisted password verifier,
+current-generation admission or successful remote authentication. Credential
+rotation changes new policies; old sessions continue to identify their old
+snapshot until the runtime retires them. The AUTH owner must perform this
+check before writing credentials and still enforce its live queue/route fences.
+
 The operator configures permitted From/envelope identities; aliases accepted
 inbound are not automatically authorized outbound by Migadu.
 
