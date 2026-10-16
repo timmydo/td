@@ -35,6 +35,11 @@ pub(super) fn exercise(
         "SELECT encode(sequence,'hex') FROM td_mta.accounts",
     );
     let envelope = attempts::envelope(request, trust, deadline(), &dispatch).unwrap();
+    let (observed, limit) =
+        super::attempt_clock::observed_envelope(fixture, request, trust, &dispatch);
+    assert_eq!(observed, envelope);
+    assert!(limit > std::time::Instant::now());
+    assert!(limit <= deadline());
     assert_eq!(envelope.attempt, dispatch.attempt());
     assert_eq!(envelope.submission, submission);
     assert_eq!(
@@ -57,6 +62,43 @@ pub(super) fn exercise(
         ),
         sequence
     );
+    sql(fixture,"CREATE TABLE public.envelope_health AS SELECT * FROM td_mta.route_health; DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,t,t+300000,NULL FROM td_mta.route_owners CROSS JOIN (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint t) x");
+    assert_eq!(
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        Err(attempts::Error::RouteHealth(
+            td_mta::postgres_route_health::Error::Backoff
+        ))
+    );
+    sql(fixture,"UPDATE td_mta.route_health SET reason=4,repair_generation=decode('0000000000000001','hex')");
+    assert_eq!(
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        Err(attempts::Error::RouteHealth(
+            td_mta::postgres_route_health::Error::RepairRequired
+        ))
+    );
+    sql(fixture,"DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT * FROM public.envelope_health; DROP TABLE public.envelope_health");
+    let expires = sql(
+        fixture,
+        &format!("SELECT expires_at FROM td_mta.submissions WHERE id={sub}"),
+    );
+    sql(fixture, &format!("UPDATE td_mta.submissions SET expires_at=(extract(epoch FROM clock_timestamp())*1000)::bigint+5000 WHERE id={sub}"));
+    let ceiling = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (_, cap) =
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch).unwrap();
+    assert!(cap <= ceiling);
+    assert!(cap > std::time::Instant::now());
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.submissions SET expires_at=send_at WHERE id={sub}"),
+    );
+    assert_eq!(
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        Err(attempts::Error::NotDue)
+    );
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.submissions SET expires_at={expires} WHERE id={sub}"),
+    );
     let reverse=sql(fixture,&format!("SELECT encode(convert_to(reverse_path,'UTF8'),'hex') FROM td_mta.submissions WHERE id={sub}"));
     for assignment in [
         "address=E'bad\\r\\naddress'",
@@ -71,6 +113,10 @@ pub(super) fn exercise(
         );
         assert_eq!(
             attempts::envelope(request, trust, deadline(), &dispatch),
+            Err(attempts::Error::Integrity)
+        );
+        assert_eq!(
+            super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
             Err(attempts::Error::Integrity)
         );
         sql(fixture,&format!("UPDATE td_mta.recipients SET address='0@example.test',next_attempt_at=NULL,reason=0 WHERE submission_id={sub} AND ordinal=0"));
@@ -99,6 +145,10 @@ pub(super) fn exercise(
         attempts::envelope(request, trust, deadline(), &dispatch),
         Err(attempts::Error::Conflict)
     );
+    assert_eq!(
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
+        Err(attempts::Error::Conflict)
+    );
     let cancellation = cancel::prepare(claim, generation, submission).unwrap();
     cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
     assert_eq!(
@@ -113,6 +163,10 @@ pub(super) fn exercise(
     phases::publish(request, trust, deadline(), &body).unwrap();
     assert_eq!(
         attempts::envelope(request, trust, deadline(), &dispatch),
+        Err(attempts::Error::Conflict)
+    );
+    assert_eq!(
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &dispatch),
         Err(attempts::Error::Conflict)
     );
     let cancellation = cancel::prepare(claim, generation, submission).unwrap();

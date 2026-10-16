@@ -4,10 +4,15 @@ use crate::{
     config::values::mailbox_key,
     format::row::MAX_ADDRESS,
     ids::{AttemptId, SubmissionId},
+    ports::Clock,
     postgres_probe::{self, Request},
     postgres_route_owners as owners,
+    queue_clock::{self, Guard},
 };
-use std::time::Instant;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use td_crypto::TrustStore;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -43,10 +48,41 @@ pub fn envelope(
     deadline: Instant,
     value: &Dispatch,
 ) -> Result<Envelope, Error> {
+    read(request, trust, deadline, value, None).map(|(envelope, _)| envelope)
+}
+/// Fresh queue-clock and route-health admission for an untouched Prepared
+/// envelope. The returned local bound is conservative passive evidence; it
+/// cannot reconstruct transport ownership from a historical receipt.
+pub fn observe_envelope(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<(Envelope, Instant), Error> {
+    read(request, trust, deadline, value, Some((clock, guard)))
+}
+type Observation = (Arc<dyn Clock>, Arc<Mutex<Guard>>);
+fn read(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Dispatch,
+    observation: Option<Observation>,
+) -> Result<(Envelope, Instant), Error> {
+    let observed = observation.is_some();
     let value = value.clone();
-    postgres_probe::with_mailbox_client(request,trust,deadline,move |client|Box::pin(async move {
+    let result = postgres_probe::with_mailbox_client(request,trust,deadline,move |client|Box::pin(async move {
         if !owners::begin(client,&value.claim,true,false).await.map_err(Error::Owner)? {return Err(Error::Policy);}
-        let timestamp=owners::check_locked(client,&value.claim,value.generation).await.map_err(Error::Owner)?;
+        let check = |utc_ms| match observation.as_ref() {
+            Some((clock, guard)) => queue_clock::admit_database(clock.as_ref(), guard, utc_ms, false).map_err(Error::Clock),
+            None => Ok(()),
+        };
+        let timestamp=owners::check_locked_observed(client,&value.claim,value.generation, &check).await?;
+        if observation.is_some() {
+            crate::postgres_route_health::admit_locked(client, &value.claim, timestamp).await.map_err(Error::RouteHealth)?;
+        }
         let outcome=super::active_receipt(client,&value).await?;
         let binding=value.claim.binding();
         let account=binding.account();
@@ -91,8 +127,20 @@ pub fn envelope(
                 || super::number(row.try_get(8).map_err(|_|Error::Integrity)?)?!=outcome.new_sequence {return Err(Error::Integrity);}
             recipients.push(Recipient{ordinal:*expected,address:address(row.try_get(1).map_err(|_|Error::Integrity)?,false)?,uncertain:uncertain==1});
         }
-        let finished=owners::check_locked(client,&value.claim,value.generation).await.map_err(Error::Owner)?;
+        let started = Instant::now();
+        let (finished, owner_expiry)=owners::check_locked_expiry_observed(client,&value.claim,value.generation, &check).await?;
         if finished>=expires {return Err(Error::NotDue);}
-        Ok(Envelope{attempt:value.attempt,submission:value.submission,reverse_path,recipients})
-    })).map_err(Error::Connection)?
+        let limit = if observation.is_some() {
+            if finished < timestamp {return Err(Error::NotDue);}
+            let remaining = owner_expiry.min(expires).checked_sub(finished)
+                .and_then(|n| n.checked_sub(1)).filter(|n| *n > 0).ok_or(Error::NotDue)?;
+            let millis = u64::try_from(remaining).map_err(|_| Error::Integrity)?;
+            started.checked_add(Duration::from_millis(millis)).ok_or(Error::Capacity)?.min(deadline)
+        } else { deadline };
+        Ok((Envelope{attempt:value.attempt,submission:value.submission,reverse_path,recipients}, limit))
+    })).map_err(Error::Connection)??;
+    if observed && Instant::now() >= result.1 {
+        return Err(Error::NotDue);
+    }
+    Ok(result)
 }

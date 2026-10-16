@@ -4342,3 +4342,29 @@ connections and reread the selected replies per write/flush; their cumulative
 cost must fit the original meter and deadline. Large-body throughput and any
 future admission batching require explicit qualification before activation;
 no allowance or deadline is silently enlarged here.
+
+## 156. Observed Prepared-envelope admission
+
+The native observed-envelope reader shares the untouched Prepared validation
+with the passive envelope reader. Retried Prepared rows retain the previous
+attempt's replies as required by section 117; neither reader treats those
+historical replies as progress in the new attempt. It additionally observes database UTC through
+the caller's shared queue-clock guard before reading the envelope and again
+under the final owner check. Clock failure, a discontinuity or a retained hold
+refuses; failed transactions do not roll back the process guard. Fresh route
+health admission refuses backoff and repair holds.
+
+The returned Instant is the minimum of the caller's original limit and the
+remaining owner lease/submission lifetime measured from the start of the final
+owner query, discarding one millisecond for database timestamp rounding. A
+backwards final timestamp, exhausted lifetime or expired returned bound refuses.
+The reader changes no durable queue state, and all database locks end before
+return. The envelope and deadline are passive observations: historical receipts
+cannot reconstruct transport ownership. A bounded Prepared worker owner and
+SMTP envelope orchestration remain separate work; no scheduler is activated.
+
+Real PostgreSQL cases cover both clock observations, persistent holds, failed
+clock adapters, guard contention, route backoff and repair, original deadline
+and submission-expiry caps, unchanged account sequence, malformed envelope
+rows, partial RCPT publication, advancement to Body and valid retry envelopes
+that retain previous replies.

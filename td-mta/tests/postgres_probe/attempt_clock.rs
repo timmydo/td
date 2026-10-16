@@ -376,3 +376,59 @@ pub(super) fn current(
     let (clock, guard) = setup(fixture, false, u64::MAX, false);
     check(request, trust, deadline(), value, clock, guard)
 }
+
+pub(super) fn observed_envelope(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    value: &attempts::Dispatch,
+) -> (attempts::Envelope, Instant) {
+    for (jump_at, fail) in [(1, false), (2, false), (u64::MAX, true)] {
+        let (clock, guard) = setup(fixture, false, jump_at, fail);
+        assert_eq!(
+            attempts::observe_envelope(
+                request,
+                trust,
+                deadline(),
+                value,
+                clock.clone(),
+                guard.clone()
+            ),
+            Err(attempts::Error::Clock(if fail {
+                queue_clock::Error::Invalid
+            } else {
+                queue_clock::Error::Unstable
+            }))
+        );
+        if jump_at == 2 {
+            assert_eq!(clock.samples.load(Ordering::Relaxed), 2);
+        }
+        if !fail {
+            assert_eq!(
+                attempts::observe_envelope(request, trust, deadline(), value, clock, guard),
+                Err(attempts::Error::Clock(queue_clock::Error::Unstable))
+            );
+        }
+    }
+    let (clock, guard) = setup(fixture, false, u64::MAX, false);
+    let locked = guard.lock().unwrap();
+    assert_eq!(
+        attempts::observe_envelope(request, trust, deadline(), value, clock, guard.clone()),
+        Err(attempts::Error::Clock(queue_clock::Error::Invalid))
+    );
+    drop(locked);
+    let (clock, guard) = setup(fixture, false, u64::MAX, false);
+    let short = Instant::now() + std::time::Duration::from_secs(2);
+    let (_, cap) = attempts::observe_envelope(request, trust, short, value, clock, guard).unwrap();
+    assert_eq!(cap, short);
+    fresh_envelope(fixture, request, trust, value).unwrap()
+}
+pub(super) fn fresh_envelope(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    value: &attempts::Dispatch,
+) -> Result<(attempts::Envelope, Instant), attempts::Error> {
+    let (clock, guard) = setup(fixture, false, u64::MAX, false);
+    attempts::observe_envelope(request, trust, deadline(), value, clock, guard)
+}

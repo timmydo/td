@@ -103,6 +103,16 @@ pub(super) fn exercise(
     );
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal<100 AND state=2 AND phase=1 AND attempt_count=2 AND last_attempt_at={} AND attempt_id=decode('{}','hex') AND next_attempt_at IS NULL AND reason=0 AND diagnostic='' AND rcpt_reply='250 earlier RCPT' AND data_reply='450 earlier DATA'",outcome.prepared_at,outcome.attempt)),"100");
     assert_eq!(sql(fixture,&format!("SELECT uncertain FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex') AND ordinal=0")),"1");
+    // Retry preparation retains previous replies; neither envelope reader may
+    // mistake that durable history for progress in the new attempt.
+    let envelope = attempts::envelope(request, trust, deadline(), &value).unwrap();
+    assert_eq!(envelope.attempt, outcome.attempt);
+    assert_eq!(envelope.recipients.len(), 100);
+    assert!(envelope.recipients.first().unwrap().uncertain);
+    let (observed, limit) =
+        super::attempt_clock::fresh_envelope(fixture, request, trust, &value).unwrap();
+    assert_eq!(observed, envelope);
+    assert!(limit > Instant::now());
     let next = attempts::retry(claim, generation, submission).unwrap();
     assert_eq!(
         super::attempt_clock::publish(fixture, request, trust, deadline(), &next),

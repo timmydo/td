@@ -22,7 +22,7 @@ pub use body::{with_body, BodyMetadata, ReadError};
 
 #[path = "postgres_attempt_envelope.rs"]
 mod envelope_reads;
-pub use envelope_reads::{envelope, Envelope, Recipient};
+pub use envelope_reads::{envelope, observe_envelope, Envelope, Recipient};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
