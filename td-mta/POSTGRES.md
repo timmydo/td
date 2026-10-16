@@ -4470,3 +4470,35 @@ stages through these reservations, with maximum-sized distinct RCPT replies
 and message refusals, partial DATA subsets, stale ownership, transaction
 failure and uncertain COMMIT. Inspection through the legacy constructors
 must find the same receipt, pinning digest compatibility.
+
+## 161. Bound MAIL evidence and retained publication failures
+
+EnvelopePlan can reserve a non-cloneable MailPlan before MAIL transmission.
+The reservation derives the complete Prepared ordinal batch, attempt and
+owner generation from retained publication custody. It pairs the envelope
+with CommandReply storage and exposes the same bounded untouched-envelope
+checks. A normalized actual positive MAIL reply consumes the reservation
+back into the original envelope owner without extending its deadline.
+
+A genuine normalized negative MAIL reply first fills the retained evidence,
+then attempts ordinary bounded native publication. Every admission or database
+failure after preparation returns CommandFailure holding the exact immutable
+Change, original worker and minimum deadline. Invalid reply preparation has
+no retained evidence. Debug output exposes the error only. Explicit retry
+prepays fresh work and acquires an ordinary slot; an admitted shorter meter
+shortens the retained limit even if publication fails. No deadline can renew.
+Unknown COMMIT also remains in the worker's existing Pending owner and must
+settle before another publication attempt. The failed owner adds no second
+pending queue or held connection slot.
+
+These owners do not send SMTP or prove that supplied replies came from their
+session. The caller still owns actual MAIL sequencing, fresh checks before
+output, compatible body mode and connection closure on refusal. Dropping
+CommandFailure abandons local evidence, not durable queue responsibility;
+the runtime must retain or settle it. No scheduler or backend is activated.
+
+The native SMTP/TLS fixture consumes actual positive MAIL before its existing
+Body/final path. A real negative MAIL reply survives a transaction refusal,
+empty retry budget and occupied slots before successful publication with the
+same receipt. A separately shortened owner retains an actual negative reply
+after expiry and refuses revival by a fresh meter.

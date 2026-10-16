@@ -23,7 +23,12 @@ pub(super) fn exercise(
     generation: u64,
     source: SubmissionId,
 ) {
-    for (n, refuse) in [(95, false), (96, true)] {
+    for (n, refuse, mail_refusal) in [
+        (95, false, 0),
+        (96, true, 0),
+        (97, false, 1),
+        (98, false, 2),
+    ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -77,7 +82,11 @@ pub(super) fn exercise(
                 &mut database,
             )
             .unwrap();
-        let mut published = published.admit_envelope(&mut database).unwrap();
+        let mut published = published
+            .admit_envelope(&mut database)
+            .unwrap()
+            .reserve_mail()
+            .unwrap();
         let attempt = published.attempt();
         let prepared_limit = published.check_current(&mut database).unwrap();
         let envelope = published.envelope();
@@ -91,10 +100,89 @@ pub(super) fn exercise(
             cap,
             command::Command::MailFrom(&envelope.reverse_path),
             format!("MAIL FROM:<{}>\r\n", envelope.reverse_path).as_bytes(),
-            b"250 sender\r\n",
+            if mail_refusal != 0 {
+                b"550 sender refused\r\n"
+            } else {
+                b"250 sender\r\n"
+            },
         );
+        if mail_refusal != 0 {
+            assert_eq!(mail, "550 sender refused");
+            drop(session.into_buffers().unwrap());
+            if mail_refusal == 2 {
+                let short = td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000)
+                    .unwrap();
+                published.check_current(&mut wire::meter(short)).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+                let failure = published.record_refusal(&mail, &mut database).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Deadline)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                let failure = failure.retry(&mut wire::meter(cap)).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Deadline)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                drop(failure);
+                assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
+                let cancellation =
+                    td_mta::postgres_submission_cancel::prepare(claim, generation, submission)
+                        .unwrap();
+                td_mta::postgres_submission_cancel::publish(
+                    &runtime,
+                    trust,
+                    deadline(),
+                    &cancellation,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+            } else {
+                sql(fixture,"CREATE FUNCTION public.reject_wire_mail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire MAIL refusal'; END $$; CREATE TRIGGER reject_wire_mail BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_mail()");
+                let failure = published.record_refusal(&mail, &mut database).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Phase(phases::Error::Database)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
+                let failure = failure.retry(&mut empty).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Capacity)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                let failure = failure.retry(&mut database).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Busy)
+                );
+                drop((first, second));
+                sql(
+                    fixture,
+                    "DROP TRIGGER reject_wire_mail ON td_mta.attempt_command_receipts",
+                );
+                let outcome = failure.retry(&mut database).unwrap();
+                let value = phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
+                assert_eq!(
+                    phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                    Some(outcome)
+                );
+                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
+            }
+            assert_eq!(pending.attempt().unwrap(), None);
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
         assert_eq!(mail, "250 sender");
-        let recipient = &envelope.recipients[0];
+        let published = published.accepted(&mail).unwrap();
+        let recipient = &published.envelope().recipients[0];
         let ordinal = recipient.ordinal;
         let (session, rcpt) = wire::command(
             session,

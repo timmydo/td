@@ -562,6 +562,21 @@ pub struct EnvelopePlan<'w, 'a, 'r> {
     envelope: attempts::Envelope,
 }
 impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
+    /// Reserve negative MAIL evidence before sending this envelope's sender.
+    /// Live transport checks and actual command sequencing remain required.
+    pub fn reserve_mail(self) -> Result<MailPlan<'w, 'a, 'r>, Error> {
+        let reply = self
+            .prepared
+            .published
+            .dispatch
+            .reserve_mail_reply(&self.prepared.published.outcome.ordinals)
+            .map_err(Error::Phase)?;
+        Ok(MailPlan {
+            envelope: self,
+            reply,
+        })
+    }
+
     pub fn attempt(&self) -> AttemptId {
         self.prepared.attempt()
     }
@@ -587,6 +602,129 @@ impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
         meter: &mut Meter,
     ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
         self.prepared.publish_body(accepted, meter)
+    }
+}
+
+/// Admitted envelope paired with preallocated negative MAIL evidence.
+/// Actual SMTP command/result custody remains the trusted caller's duty.
+pub struct MailPlan<'w, 'a, 'r> {
+    envelope: EnvelopePlan<'w, 'a, 'r>,
+    reply: phases::CommandReply,
+}
+impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.envelope.attempt()
+    }
+    pub fn envelope(&self) -> &attempts::Envelope {
+        self.envelope.envelope()
+    }
+    pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.envelope.check_current(meter)
+    }
+    /// Return the original owner only for an actual normalized positive MAIL
+    /// reply. This receipt does not authorize another command without checking.
+    pub fn accepted(self, reply: &str) -> Result<EnvelopePlan<'w, 'a, 'r>, Error> {
+        if crate::format::row::smtp_reply_text(reply).is_err()
+            || crate::recipient_sweep::reply_class(Some(reply)) != Some(2)
+        {
+            return Err(ports::Error::Invalid.into());
+        }
+        Ok(self.envelope)
+    }
+    /// Retain the genuine refusal before attempting database admission. Failure
+    /// keeps that exact reply even when the original deadline has elapsed.
+    pub fn record_refusal(
+        self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, CommandFailure<'w, 'a, 'r>> {
+        let value = self.reply.finish(reply).map_err(|error| CommandFailure {
+            error: Error::Phase(error),
+            retained: None,
+        })?;
+        let prepared = self.envelope.prepared;
+        RetainedCommand {
+            worker: prepared.worker,
+            limit: prepared.limit,
+            until: prepared.until,
+            value,
+        }
+        .publish(meter)
+    }
+}
+/// Failed publication of actual negative command evidence. Retrying cannot
+/// replace its identity or reply and cannot extend its retained deadline.
+pub struct CommandFailure<'w, 'a, 'r> {
+    pub error: Error,
+    retained: Option<RetainedCommand<'w, 'a, 'r>>,
+}
+impl std::fmt::Debug for CommandFailure<'_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+struct RetainedCommand<'w, 'a, 'r> {
+    worker: &'w Dispatches<'a, 'r>,
+    limit: Instant,
+    until: Deadline,
+    value: Change,
+}
+impl<'w, 'a, 'r> RetainedCommand<'w, 'a, 'r> {
+    fn publish(mut self, meter: &mut Meter) -> Result<phases::Outcome, CommandFailure<'w, 'a, 'r>> {
+        match self.try_publish(meter) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(CommandFailure {
+                error,
+                retained: Some(self),
+            }),
+        }
+    }
+    fn try_publish(&mut self, meter: &mut Meter) -> Result<phases::Outcome, Error> {
+        let worker = self.worker;
+        let mut pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        self.limit = self
+            .limit
+            .min(worker.connection.admit(self.until, meter, PHASE_IO)?);
+        let _slot = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        publish_phase(
+            &worker.connection,
+            &worker.guard,
+            &mut pending,
+            self.value.clone(),
+            self.limit,
+            None,
+        )
+    }
+}
+impl<'w, 'a, 'r> CommandFailure<'w, 'a, 'r> {
+    pub fn attempt(&self) -> Option<AttemptId> {
+        self.retained
+            .as_ref()
+            .map(|retained| retained.value.attempt())
+    }
+    /// Explicit fresh work/slot admission. Unknown COMMIT must first settle
+    /// through Pending; this retry grants no continuing transport permission.
+    pub fn retry(mut self, meter: &mut Meter) -> Result<phases::Outcome, Self> {
+        match self.retained.take() {
+            Some(retained) => retained.publish(meter),
+            None => Err(self),
+        }
     }
 }
 

@@ -59,6 +59,18 @@ impl Dispatch {
     pub fn attempt(&self) -> AttemptId {
         self.attempt
     }
+    pub(crate) fn reserve_mail_reply(
+        &self,
+        ordinals: &[u32],
+    ) -> Result<crate::postgres_attempt_phases::CommandReply, crate::postgres_attempt_phases::Error>
+    {
+        crate::postgres_attempt_phases::reserve_mail_reply(
+            &self.claim,
+            self.generation,
+            self.attempt,
+            ordinals,
+        )
+    }
     pub(crate) fn body(
         &self,
         accepted: &[(u32, &str)],
