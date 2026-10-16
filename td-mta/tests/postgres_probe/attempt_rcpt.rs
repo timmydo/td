@@ -176,4 +176,5 @@ pub(super) fn exercise(
     }
     super::attempt_command::exercise(fixture, request, trust, claim, generation, submission);
     super::attempt_interrupted::exercise(fixture, request, trust, claim, generation, submission);
+    super::attempt_retry::exercise(fixture, request, trust, claim, generation, submission);
 }

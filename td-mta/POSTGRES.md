@@ -3299,3 +3299,29 @@ This bounded, allocation-free guard supplies scheduling and health decisions
 only. Wiring database sample acquisition, failover detection, authenticated
 clock-confirm, bounded expiry and the production scheduler remains activation
 work. Existing prepared storage publishers do not imply those runtime checks.
+
+
+## 117. Prepared due-retry publication
+
+The attempt publisher has a separate domain-separated retry preparation.
+It selects at most 100 due RetryWait or retryable OutcomeUnknown recipients
+from one supplied submission, in ordinal order. It excludes fresh Queued
+work, Accepted, Failed, terminal OutcomeUnknown and future retry timestamps.
+The first-attempt preparation continues to select only fresh Queued work.
+
+The transaction validates final phase, attempt identity/count, uncertainty
+and retry reason, a due timestamp at least five minutes after the previous
+attempt, and checked count increment. InFlight/Prepared publication preserves
+uncertainty and genuine prior replies, replaces attempt identity and timestamp,
+and clears only next-attempt time, failure reason and local diagnostic.
+Immutable transmitted content and envelope remain unchanged. Active-route
+exclusion, current-owner fencing, history and receipt replay use the same
+atomic publisher as first attempts; receipt replay never increments twice.
+
+This is a prepared storage operation, not a retry scheduler. Runtime callers
+must enforce the queue clock guard, shared route backoff and repair generation,
+current transport authority and bounded due scanning before publication.
+No runtime route or retry loop is activated here. The PostgreSQL fixture seeds
+elapsed due times and covers both states, bounded batches, terminal/future
+exclusion, overflow, minimum interval, expiry, rollback, unknown COMMIT,
+historical replay and the separate fresh-recipient path.

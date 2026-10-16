@@ -1,4 +1,4 @@
-//! Atomic first-attempt publication. Retry/recovery and SMTP remain inactive.
+//! Atomic bounded attempt publication; scheduling and SMTP remain inactive.
 use crate::{
     ids::{AttemptId, SubmissionId},
     postgres_probe::{self, Request},
@@ -36,6 +36,7 @@ pub struct Dispatch {
     submission: SubmissionId,
     attempt: AttemptId,
     digest: [u8; 32],
+    retry: bool,
 }
 impl Dispatch {
     pub fn attempt(&self) -> AttemptId {
@@ -57,6 +58,19 @@ pub fn prepare(
     generation: u64,
     submission: SubmissionId,
 ) -> Result<Dispatch, Error> {
+    prepare_mode(claim, generation, submission, false)
+}
+/// Prepare a due-retry batch. Runtime callers must first enforce queue clock,
+/// route backoff and repair guards; this storage operation is not a scheduler.
+pub fn retry(claim: &Claim, generation: u64, submission: SubmissionId) -> Result<Dispatch, Error> {
+    prepare_mode(claim, generation, submission, true)
+}
+fn prepare_mode(
+    claim: &Claim,
+    generation: u64,
+    submission: SubmissionId,
+    retry: bool,
+) -> Result<Dispatch, Error> {
     if generation == 0 {
         return Err(Error::Integrity);
     }
@@ -68,7 +82,11 @@ pub fn prepare(
     let binding = claim.binding();
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for field in [
-        b"td-mta first dispatch v1".as_slice(),
+        if retry {
+            b"td-mta retry dispatch v1".as_slice()
+        } else {
+            b"td-mta first dispatch v1".as_slice()
+        },
         binding.epoch().as_bytes().as_slice(),
         binding.account().as_bytes().as_slice(),
         claim.operation().as_bytes().as_slice(),
@@ -87,6 +105,7 @@ pub fn prepare(
         submission,
         attempt: AttemptId::from_bytes(attempt),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
+        retry,
     })
 }
 fn number(bytes: &[u8]) -> Result<u64, Error> {
@@ -152,8 +171,8 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
-/// Select up to 100 fresh Queued recipients in ordinal order. Attempted
-/// recipients require the separate retry/recovery path and are never selected.
+/// Select at most 100 fresh Queued or due retry recipients in ordinal order,
+/// according to the retained preparation. Historical replay authorizes no send.
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -218,7 +237,15 @@ pub fn publish(
             if completed.is_some() || timestamp < send_at || timestamp >= expires_at {
                 return Err(Error::NotDue);
             }
-            let rows=client.query("SELECT ordinal,uncertain,attempt_id,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state=1 AND next_attempt_at<=$3 ORDER BY ordinal LIMIT 100 FOR UPDATE", &[&account,&submission,&timestamp]).await.map_err(|_|Error::Database)?;
+            let query = if value.retry {
+                "SELECT ordinal,uncertain,attempt_id,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed,state,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state IN (3,7) AND next_attempt_at<=$3 ORDER BY ordinal LIMIT 100 FOR UPDATE"
+            } else {
+                "SELECT ordinal,uncertain,attempt_id,attempt_count,last_attempt_at,phase,rcpt_reply,data_reply,reason,changed,state,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND state=1 AND next_attempt_at<=$3 ORDER BY ordinal LIMIT 100 FOR UPDATE"
+            };
+            let rows = client
+                .query(query, &[&account, &submission, &timestamp])
+                .await
+                .map_err(|_| Error::Database)?;
             if rows.is_empty() {
                 return Err(Error::NotDue);
             }
@@ -246,7 +273,35 @@ pub fn publish(
                 let reason: i64 = row.try_get(8).map_err(|_| Error::Integrity)?;
                 if ordinal < 0
                     || ordinal >= recipient_count
-                    || uncertain != 0
+                    || number(row.try_get(9).map_err(|_| Error::Integrity)?)? > old
+                {
+                    return Err(Error::Integrity);
+                }
+                if value.retry {
+                    let state: i64 = row.try_get(10).map_err(|_| Error::Integrity)?;
+                    let due: i64 = row.try_get(11).map_err(|_| Error::Integrity)?;
+                    let last = last.ok_or(Error::Integrity)?;
+                    if !matches!((state, uncertain), (3, 0) | (7, 1))
+                        || attempt.is_none_or(|id| id.len() != 16)
+                        || count <= 0
+                        || phase != 4
+                        || last
+                            .checked_add(300_000)
+                            .is_none_or(|minimum| due < minimum)
+                        || !(matches!(reason, 1 | 3 | 4 | 5 | 8) || (reason == 9 && uncertain == 1))
+                        || (reason == 1
+                            && crate::recipient_sweep::reply_class(data.or(rcpt)) != Some(4))
+                    {
+                        return Err(Error::Integrity);
+                    }
+                    if u32::try_from(count)
+                        .ok()
+                        .and_then(|count| count.checked_add(1))
+                        .is_none()
+                    {
+                        return Err(Error::Capacity);
+                    }
+                } else if uncertain != 0
                     || attempt.is_some()
                     || count != 0
                     || last.is_some()
@@ -254,7 +309,6 @@ pub fn publish(
                     || rcpt.is_some()
                     || data.is_some()
                     || reason != 0
-                    || number(row.try_get(9).map_err(|_| Error::Integrity)?)? > old
                 {
                     return Err(Error::Integrity);
                 }
@@ -265,7 +319,7 @@ pub fn publish(
             }
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
-            if client.execute("UPDATE td_mta.recipients SET state=2,attempt_id=$3,attempt_count=1,last_attempt_at=$4,phase=1,next_attempt_at=NULL,reason=0,diagnostic='',changed=$5 WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($6)", &[&account,&submission,&value.attempt.as_bytes().as_slice(),&timestamp,&changed,&selected]).await.map_err(|_|Error::Database)?!=ordinals.len() as u64 {return Err(Error::Integrity)}
+            if client.execute("UPDATE td_mta.recipients SET state=2,attempt_id=$3,attempt_count=attempt_count+1,last_attempt_at=$4,phase=1,next_attempt_at=NULL,reason=0,diagnostic='',changed=$5 WHERE account=$1 AND submission_id=$2 AND ordinal=ANY($6)", &[&account,&submission,&value.attempt.as_bytes().as_slice(),&timestamp,&changed,&selected]).await.map_err(|_|Error::Database)?!=ordinals.len() as u64 {return Err(Error::Integrity)}
             if client
                 .execute(
                     "UPDATE td_mta.submissions SET changed=$3 WHERE account=$1 AND id=$2",

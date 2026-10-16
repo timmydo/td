@@ -10228,6 +10228,8 @@ mod attempt_phases;
 mod attempt_rcpt;
 #[path = "postgres_probe/attempt_refusal.rs"]
 mod attempt_refusal;
+#[path = "postgres_probe/attempt_retry.rs"]
+mod attempt_retry;
 
 fn exercise_dispatch(
     fixture: &Fixture,
