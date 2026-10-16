@@ -169,4 +169,5 @@ pub(super) fn exercise(
         .unwrap(),
     )
     .unwrap();
+    super::queue_expiry::exercise(fixture, request, trust, claim, generation, submission);
 }

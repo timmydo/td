@@ -11604,3 +11604,6 @@ fn exercise_smtp_receiving_owner(
         ),
     );
 }
+
+#[path = "postgres_probe/queue_expiry.rs"]
+mod queue_expiry;

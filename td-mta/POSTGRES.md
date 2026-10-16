@@ -3371,3 +3371,39 @@ mail runtime's ordinary DML grants. Upgrade preserves the epoch and earlier
 material, rolls back all new DDL on obstruction, and includes the prior version
 23 in the migration fixture. This schema preparation expires no recipients and
 starts no scheduler; the fenced publisher and runtime wiring remain work.
+
+
+## 120. Fenced clock-confirmed expiry publisher
+
+The prepared expiry publisher binds a random operation to one submission,
+route-owner claim and generation. Historical receipt inspection precedes
+fresh admission: a completed operation settles after clock holds or owner
+replacement without expiring more recipients. Changed digests conflict.
+Uncertain COMMIT results require settlement of that same retained operation.
+
+New publication requires current policy and unexpired ownership under the
+configuration/account/route locks. Database UTC is paired with the supplied
+runtime clock's monotonic domain and admitted by its shared confirmed guard.
+The database-wide progress row serializes publishers and requires a UTC
+second since its previous publication sample. That persisted bound supplements
+the guard's monotonic interval; neither enables catch-up or bypasses explicit
+clock confirmation. The retained cutoff never advances during the operation.
+
+For an overdue submission, one transaction selects at most 100 pending rows
+in ordinal order. Fresh Queued becomes Failed/Expired with no attempt phase.
+Attempted certain rows become Failed/Expired/Final; an existing uncertainty
+latch or AcceptancePossible instead becomes terminal OutcomeUnknown/Expired.
+No retry time remains. Actual replies, attempt history, transmitted bytes and
+envelope survive. Terminal rows are excluded. Exact ordinal coverage is
+checked before updating completion; the final batch sets completedAt and
+Pending failure notice together. Retired attempts, account sequence, CHANGE,
+receipt and global progress commit with those recipient changes. Each account
+retains at most 1024 expiry receipts until a separately defined reclamation.
+
+The publisher rechecks ownership and the nonrenewable clock token before
+COMMIT; late clock failure rolls back staged changes. A COMMIT handed to the
+server is inherently indeterminate on connection/deadline failure and settles
+through the receipt, never a replacement result. Runtime callers must close
+and fence the route's transport first, including an interrupted current-owner
+attempt, share the process guard and detect primary changes. This API starts
+no transport, scan, scheduler or administrator clock-confirm endpoint.

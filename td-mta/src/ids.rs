@@ -80,6 +80,7 @@ object_ids!(
     DraftOperationId,
     ReceivingOperationId,
     SubmissionOperationId,
+    SubmissionExpiryId,
     RouteClaimId,
     AttemptRecoveryId,
     MailboxOperationId,
