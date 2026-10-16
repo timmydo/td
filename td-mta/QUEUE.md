@@ -164,6 +164,21 @@ attempt. Close the connection after a partial/invalid reply that cannot be
 classified safely. SMTP parser limits must refuse overlong replies, not turn
 a truncated prefix into a successful status.
 
+The shared SMTP wire reader also provides complete-reply normalization for
+persisted RCPT/DATA reply cells. It reuses the strict CRLF, same-code multiline,
+512-byte line and 16 KiB aggregate wire limits. After changing a continuation
+separator to a space, it removes each later line's longest byte prefix shared
+with the first normalized line and joins lines with one space, following
+RFC 8621 section 7. The terminal CRLF is omitted; text whitespace is otherwise
+preserved. The first line remains the reference throughout the reply.
+
+The caller supplies a 512-byte line cell and one 4096-byte reply cell. Overflow,
+malformed framing, mismatched codes and EOF before completion are sticky
+failures. Neither a status code nor normalized text is exposed until the whole
+reply fits and completes. Bytes beyond its final CRLF remain with the caller.
+The reader grants no SMTP command/transport authority and does not activate a
+relay loop; the driver must still bind the reply to its current transaction.
+
 Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
 bytes and a 20-byte key. A 100-row update is 905100 bytes before transaction and

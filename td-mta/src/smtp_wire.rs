@@ -344,6 +344,10 @@ pub fn ehlo_extension<'a>(
     }))
 }
 
+#[path = "smtp_wire_reply.rs"]
+mod normalized;
+pub use normalized::NormalizedReplyReader;
+
 #[cfg(test)]
 #[path = "smtp_wire_tests.rs"]
 mod tests;

@@ -250,7 +250,7 @@ fn prepare<'a>(
     })
 }
 fn valid_reply(reply: &str, negative: bool) -> bool {
-    reply.len() <= crate::format::row::MAX_SMTP_REPLY
+    crate::format::row::smtp_reply_text(reply).is_ok()
         && if negative {
             matches!(
                 crate::recipient_sweep::reply_class(Some(reply)),
@@ -259,7 +259,6 @@ fn valid_reply(reply: &str, negative: bool) -> bool {
         } else {
             crate::recipient_sweep::reply_class(Some(reply)) == Some(2)
         }
-        && !reply.chars().any(char::is_control)
 }
 fn number(bytes: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(
@@ -669,5 +668,21 @@ pub fn publish(
         Ok(result) => result,
         Err(_) if attempted.load(Ordering::Relaxed) => Err(Error::Indeterminate),
         Err(error) => Err(Error::Connection(error)),
+    }
+}
+
+#[cfg(test)]
+mod reply_text_tests {
+    #[test]
+    fn retained_reply_validation_preserves_only_horizontal_tabs() {
+        assert!(super::valid_reply("250 \taccepted", false));
+        assert!(super::valid_reply("550 \trefused", true));
+        assert!(!super::valid_reply("250 \taccepted", true));
+        for control in ['\0', '\r', '\n', '\u{7f}', '\u{85}'] {
+            assert!(!super::valid_reply(
+                &format!("250 {control}accepted"),
+                false
+            ));
+        }
     }
 }

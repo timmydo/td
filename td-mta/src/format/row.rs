@@ -174,6 +174,16 @@ fn text(value: &str, max: usize, nonempty: bool) -> Result<(), Error> {
     }
     Ok(())
 }
+/// Persisted SMTP text preserves HTAB, but no other control character.
+pub(crate) fn smtp_reply_text(value: &str) -> Result<(), Error> {
+    if value.len() > MAX_SMTP_REPLY {
+        return Err(Error::Limit);
+    }
+    if value.is_empty() || value.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(Error::InvalidValue);
+    }
+    Ok(())
+}
 fn address(value: &str, nonempty: bool) -> Result<(), Error> {
     text(value, MAX_ADDRESS, nonempty)?;
     if !value.is_ascii() {
@@ -438,7 +448,7 @@ impl Row<'_> {
             Self::Recipient(v) => {
                 address(v.address, true)?;
                 for reply in [v.rcpt_reply, v.data_reply].into_iter().flatten() {
-                    text(reply, MAX_SMTP_REPLY, true)?;
+                    smtp_reply_text(reply)?;
                 }
                 text(v.diagnostic, MAX_DIAGNOSTIC, false)?;
                 let attempted = v.attempt_count != 0;

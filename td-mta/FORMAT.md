@@ -159,7 +159,8 @@ verification and migration use it for stored records and PUTs. Neither checks li
 address grammar, or queue transitions; those belong to the transaction/protocol
 validators. A checksum alone never substitutes for those validators.
 
-All text below forbids Unicode control characters. Addresses are ASCII with
+All text below forbids Unicode control characters except HTAB in recipient
+rcptReply/dataReply fields, where SMTP normalization preserves it. Addresses are ASCII with
 at most 254 bytes; reverse-path may be empty, recipient addresses may not.
 SMTP grammar and configured identity permission are additional checks, not
 properties inferred from this framing codec. No input is silently truncated.
@@ -221,7 +222,8 @@ present, normalized single-line SMTP replies, separately preserving RCPT and
 message-level results. dataReply also holds an actual negative MAIL/DATA-
 command refusal under QUEUE.md's attribution rules; positive MAIL/interim
 354 replies never substitute for final DATA acceptance. Full reply syntax, multiline normalization and attribution are
-M02c/M17 contracts; the codec enforces bounds and rejects controls. Local
+M02c/M17 contracts; the codec enforces bounds and rejects controls other than
+HTAB in these two reply fields. Local
 failures use reason/diagnostic and must not invent an SMTP response. Callers
 normalize multiline replies per RFC 8621 and replace/escape control characters
 in local diagnostics before constructing rows; do not copy raw OS error text
