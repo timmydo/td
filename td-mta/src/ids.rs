@@ -81,6 +81,7 @@ object_ids!(
     ReceivingOperationId,
     SubmissionOperationId,
     SubmissionExpiryId,
+    SubmissionCancelId,
     RouteClaimId,
     RouteRepairId,
     AttemptRecoveryId,

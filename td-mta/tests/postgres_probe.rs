@@ -10700,6 +10700,7 @@ fn exercise_attempt_recovery(
     );
     route_repair::exercise(fixture, request, trust, binding, submission);
     route_success::exercise(fixture, request, trust, binding, submission);
+    submission_cancel::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(
@@ -11731,3 +11732,6 @@ mod route_repair;
 
 #[path = "postgres_probe/route_success.rs"]
 mod route_success;
+
+#[path = "postgres_probe/submission_cancel.rs"]
+mod submission_cancel;

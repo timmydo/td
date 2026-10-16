@@ -3548,3 +3548,36 @@ reject any Accepted, uncertain or AcceptancePossible recipient, reserve the
 whole mutation before fencing, preserve replies and existing notice/completion
 state, and atomically publish canceled recipients, retired attempts, CHANGE
 and settlement. Already wholly canceled submissions are idempotent successes.
+
+## 127. Whole-submission cancellation publication
+
+A prepared cancellation binds a random operation ID to its current route
+owner, generation and submission. Historical settlement precedes live policy
+and owner checks, survives submission deletion, and never invokes transport
+closure. New publication holds policy/account/route locks through reservation,
+transport closure and commit. The supplied closure must close/fence the owned
+transport locally within the original deadline, with no database work or SMTP
+round trips. This
+storage API does not establish client or operator authorization.
+
+Before invoking that closure, publication validates the complete ordinal group
+with the shared row codec and queue-state validator. Accepted, uncertain or
+AcceptancePossible recipients refuse. It bounds aggregate text before fetching
+rows, reserves and encodes the prospective whole-group rows, and checks the
+transaction byte and operation ceilings. The conservative allowance is 128
+bytes per recipient beyond its text plus 4096 bytes for submission, change,
+account, attempt retirement and settlement. A thousand fresh recipients fit;
+large retained replies may refuse without closing transport. This is bounded
+logical transaction capacity and staging memory, not a reservation of physical
+PostgreSQL disk or WAL space. The connection has two MiB aggregate input and
+2048 frames, unchanged per-frame/authentication limits and 128 KiB output.
+
+Publication changes the whole group to Canceled, retires active attempts,
+advances the account sequence once and records CHANGE and settlement in the
+same transaction. Actual replies, attempt history, diagnostic text, existing
+completion time and failure-notice state are preserved. Cancellation creates
+no notice. A wholly canceled group retains a no-change receipt without closing
+transport or advancing sequence. Ownership and deadline are checked again
+before COMMIT; unknown COMMIT resolves the same operation. Stale attempt
+publication cannot cross into AcceptancePossible after retirement. No HTTP
+endpoint, scheduler or transport is activated by this increment.

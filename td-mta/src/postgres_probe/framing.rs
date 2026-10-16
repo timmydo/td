@@ -45,6 +45,14 @@ impl Input {
         }
     }
 
+    pub(super) fn cancellation() -> Self {
+        Self {
+            bytes: 2 * 1024 * 1024,
+            frames: 2048,
+            ..Self::new()
+        }
+    }
+
     pub(super) fn runtime(self) -> Self {
         Self {
             frames: self.frames.max(1024),
@@ -252,6 +260,25 @@ mod tests {
         let mut input = Input::mutations();
         let packet = frame(b'D', &[0; 128 * 1024 - 4]);
         for _ in 0..7 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
+    }
+
+    #[test]
+    fn cancellation_budget_keeps_authentication_frame_and_byte_limits() {
+        let mut input = Input::cancellation();
+        for _ in 0..2048 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(Input::cancellation().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::cancellation()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
+        let mut input = Input::cancellation();
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        for _ in 0..15 {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());

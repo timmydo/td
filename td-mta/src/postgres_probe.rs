@@ -143,6 +143,23 @@ pub(crate) fn with_mutation_client<T>(
     )
 }
 
+// Whole-submission cancellation: 1000 recipients and schema/protocol overhead.
+pub(crate) fn with_cancellation_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        128 * 1024,
+        Input::cancellation(),
+        operation,
+    )
+}
+
 // Folder names or 100 maximum-length RCPT replies, plus protocol overhead.
 pub(crate) fn with_batch_client<T>(
     request: &Request<'_>,
