@@ -3504,3 +3504,24 @@ This is an explicit prepared storage operation, not an authenticated operator
 endpoint or a configuration-load side effect. Runtime integration must bind
 operator authorization to this operation. Successful-route counter reset is
 a separate operation; repair does not claim that transport has succeeded.
+
+
+## 125. Shared route success reset
+
+The success publisher requires a retired attempt of the exact current owner,
+route and destination, plus its durable positive final-DATA acceptance receipt.
+A Prepared/Body/AcceptancePossible attempt or merely asserted transport
+success cannot reset health. The attempt ID is the shared operation key;
+failure and success classifications cannot both publish for one attempt.
+Fresh failure publication requires an active attempt, so a delayed unreported
+failure from an older retired attempt cannot undo this reset.
+Historical settlement remains available after owner release.
+
+Under current policy/account/route locks, success refuses a repair latch or
+an attempt prepared before the latest route failure. It increments the checked
+revision and resets the consecutive count, reason and failure/retry times to
+the healthy state. Action-3 settlement captures that state in the same commit,
+with the shared health/receipt caps and a final owner/time check. Recipient
+results and account sequence are unchanged. Unknown COMMIT settles the original
+operation. A successful SMTP handoff does not prove final mailbox delivery;
+this operation starts no scheduler or transport and cannot authorize a send.
