@@ -3695,3 +3695,21 @@ Unknown COMMIT or an inconsistent claimed success becomes serverPartialFail,
 never a fabricated refusal or success. A current state mismatch remains a
 method-level stateMismatch. Cancellation creates no creation ID or implicit
 Email/set response in this increment.
+
+
+## 133. Real PostgreSQL cancellation dispatch qualification
+
+The real database scenario now drives validated JMAP requests through response
+preflight, the retained-response coordinator, prepared dispatch, the concrete
+route adapter and authenticated cancellation publication. It checks current
+ifInState, unsupported patches, Accepted-recipient refusal before fencing,
+whole-group success and idempotent no-change responses. Wire old/new states
+are checked against the actual committed sequences; calls retain escaped IDs,
+produce no creation IDs or implicit filing response, and release response
+ownership after encoding in small chunks.
+
+A delayed COMMIT forces serverPartialFail while the worker retains the exact
+operation. Later independent receipt inspection confirms its original state
+and single sequence advance. No uncertain response becomes a guessed refusal
+or success. Private response trees use the shared TempDir guard. This qualifies
+the prepared internal path, not production HTTP/relay ownership or cutover.

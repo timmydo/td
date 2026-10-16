@@ -118,6 +118,18 @@ pub(super) fn exercise(
         Err(Error::Publication(cancel::Error::Fence))
     );
     assert_eq!(pending.operation().unwrap(), None);
+    super::cancel_jmap::exercise(
+        fixture,
+        super::cancel_jmap::Context {
+            loaded: &loaded,
+            binding,
+            device: device.device_id(),
+            password: device.password(),
+            claim,
+            generation,
+            submission,
+        },
+    );
     let closed = Arc::new(AtomicBool::new(false));
     let observed = closed.clone();
     let adapter = td_mta::jmap_request::dispatch::RouteCancellation {

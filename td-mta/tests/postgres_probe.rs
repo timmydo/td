@@ -11739,3 +11739,6 @@ mod submission_cancel;
 
 #[path = "postgres_probe/cancel_worker.rs"]
 mod cancel_worker;
+
+#[path = "postgres_probe/cancel_jmap.rs"]
+mod cancel_jmap;
