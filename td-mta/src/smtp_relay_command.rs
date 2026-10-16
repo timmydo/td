@@ -1,0 +1,275 @@
+//! One bounded envelope/DATA command and its complete normalized SMTP reply.
+use crate::{
+    config::values::mailbox_key,
+    format::row::MAX_ADDRESS,
+    ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Tick, Transport},
+    smtp_relay_auth::Session,
+    smtp_wire::{NormalizedReplyReader, LINE_BYTES},
+    tls_io::TlsWireStorage,
+};
+use std::sync::Arc;
+use td_mime::work::{Charge, Meter, Stop};
+
+/// Only command framing; trusted runtime owns envelope and phase authority.
+#[derive(Clone, Copy)]
+pub enum Command<'a> {
+    MailFrom(&'a str),
+    RcptTo(&'a str),
+    Data,
+}
+/// Reserved before network work. Output is provisional until a complete reply.
+pub struct Scratch<'a> {
+    pub input: &'a mut [u8],
+    pub line: &'a mut [u8],
+    pub reply: &'a mut [u8],
+    pub command: &'a mut [u8],
+}
+enum Phase {
+    Write(usize),
+    Flush,
+    Read,
+}
+#[must_use = "drive the command or recover its reserved buffers"]
+pub struct Exchange<'a, B: TlsWireStorage> {
+    session: Session<B>,
+    clock: Arc<dyn Clock>,
+    deadline: Deadline,
+    meter: &'a mut Meter,
+    phase: Phase,
+    input: &'a mut [u8],
+    command: &'a [u8],
+    reply: NormalizedReplyReader<'a>,
+}
+#[must_use = "continue the exchange or retain its complete reply"]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Inline TLS custody avoids per-turn heap allocation."
+)]
+pub enum Progress<'a, B: TlsWireStorage> {
+    Pending(Exchange<'a, B>),
+    Ready(Reply<'a, B>),
+}
+/// An actual complete reply bound to the same authenticated connection.
+/// Neither positive status nor extracted custody grants durable queue authority.
+pub struct Reply<'a, B: TlsWireStorage> {
+    session: Session<B>,
+    reply: NormalizedReplyReader<'a>,
+}
+impl<B: TlsWireStorage> Reply<'_, B> {
+    pub fn code(&self) -> Result<u16, Error> {
+        self.reply.code().ok_or(Error::Invalid)
+    }
+    pub fn text(&self) -> Result<&str, Error> {
+        self.reply.value().ok_or(Error::Invalid)
+    }
+    /// Retain the reply before advancing. The runtime owns commit/fence ordering.
+    pub fn into_session(self) -> Session<B> {
+        self.session
+    }
+    pub fn into_buffers(self) -> Result<(B, B), Error> {
+        self.session.into_buffers()
+    }
+}
+pub struct Refusal<B: TlsWireStorage> {
+    pub error: Error,
+    buffers: Result<(B, B), Error>,
+}
+impl<B: TlsWireStorage> Refusal<B> {
+    pub fn into_buffers(self) -> Result<(B, B), Error> {
+        self.buffers
+    }
+}
+impl<'a, B: TlsWireStorage> Exchange<'a, B> {
+    /// Commands carry no parameters/extensions and never contain DATA body bytes.
+    /// The original attempt deadline, meter and current queue fences are required.
+    pub fn new(
+        session: Session<B>,
+        command: Command<'_>,
+        scratch: Scratch<'a>,
+        clock: Arc<dyn Clock>,
+        deadline: Deadline,
+        meter: &'a mut Meter,
+    ) -> Result<Self, Refusal<B>> {
+        let init = (|scratch: Scratch<'a>| {
+            let now = check(clock.as_ref(), deadline, meter)?;
+            meter
+                .charge(
+                    now,
+                    Charge {
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(work)?;
+            let input = scratch.input.get_mut(..LINE_BYTES).ok_or(Error::Capacity)?;
+            let reply = NormalizedReplyReader::new(scratch.line, scratch.reply)?;
+            let command = frame(command, scratch.command)?;
+            check(clock.as_ref(), deadline, meter)?;
+            Ok((input, reply, command))
+        })(scratch);
+        match init {
+            Err(error) => Err(refuse(session, error)),
+            Ok((input, reply, command)) => Ok(Self {
+                session,
+                clock,
+                deadline,
+                meter,
+                phase: Phase::Write(0),
+                input,
+                command,
+                reply,
+            }),
+        }
+    }
+    /// At most one TLS operation and 512 received bytes parsed per turn.
+    pub fn advance(mut self) -> Result<Progress<'a, B>, Refusal<B>> {
+        let result = (|| {
+            let now = check(self.clock.as_ref(), self.deadline, self.meter)?;
+            self.meter
+                .charge(
+                    now,
+                    Charge {
+                        records: 1,
+                        ..Charge::default()
+                    },
+                )
+                .map_err(work)?;
+            let ready = self.step(now)?;
+            check(self.clock.as_ref(), self.deadline, self.meter)?;
+            Ok(ready)
+        })();
+        match result {
+            Err(error) => Err(refuse(self.session, error)),
+            Ok(false) => Ok(Progress::Pending(self)),
+            Ok(true) => Ok(Progress::Ready(Reply {
+                session: self.session,
+                reply: self.reply,
+            })),
+        }
+    }
+    fn step(&mut self, now: Tick) -> Result<bool, Error> {
+        match self.phase {
+            Phase::Write(offset) => {
+                let remaining = self.command.get(offset..).ok_or(Error::Invalid)?;
+                self.meter
+                    .charge(
+                        now,
+                        Charge {
+                            io_bytes: remaining.len() as u64,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(work)?;
+                match self.session.connection_mut().write(remaining)? {
+                    IoProgress::Pending => {}
+                    IoProgress::Bytes(n) if n > 0 && n <= remaining.len() => {
+                        let next = offset.checked_add(n).ok_or(Error::Invalid)?;
+                        self.phase = if next == self.command.len() {
+                            Phase::Flush
+                        } else {
+                            Phase::Write(next)
+                        };
+                    }
+                    _ => return Err(Error::Invalid),
+                }
+                Ok(false)
+            }
+            Phase::Flush => {
+                if self.session.connection_mut().flush()? == FlushProgress::Complete {
+                    self.phase = Phase::Read;
+                }
+                Ok(false)
+            }
+            Phase::Read => {
+                self.meter
+                    .charge(
+                        now,
+                        Charge {
+                            io_bytes: LINE_BYTES as u64,
+                            ..Charge::default()
+                        },
+                    )
+                    .map_err(work)?;
+                match self.session.connection_mut().read(self.input)? {
+                    IoProgress::Pending => Ok(false),
+                    IoProgress::Bytes(n) if n > 0 && n <= self.input.len() => {
+                        let progress = self
+                            .reply
+                            .feed(self.input.get(..n).ok_or(Error::Invalid)?)?;
+                        if progress.consumed != n {
+                            return Err(Error::Invalid);
+                        }
+                        if progress.complete {
+                            self.reply.finish()?;
+                        }
+                        Ok(progress.complete)
+                    }
+                    IoProgress::Closed => Err(Error::Tls),
+                    _ => Err(Error::Invalid),
+                }
+            }
+        }
+    }
+    pub fn into_buffers(self) -> Result<(B, B), Error> {
+        self.session.into_buffers()
+    }
+}
+fn frame<'a>(command: Command<'_>, output: &'a mut [u8]) -> Result<&'a [u8], Error> {
+    let output = output.get_mut(..LINE_BYTES).ok_or(Error::Capacity)?;
+    let (prefix, address, suffix) = match command {
+        Command::MailFrom(address) => {
+            if !address.is_empty() {
+                mailbox_key(address, &mut [0; MAX_ADDRESS]).map_err(|_| Error::Invalid)?;
+            }
+            (
+                b"MAIL FROM:<".as_slice(),
+                address.as_bytes(),
+                b">\r\n".as_slice(),
+            )
+        }
+        Command::RcptTo(address) => {
+            mailbox_key(address, &mut [0; MAX_ADDRESS]).map_err(|_| Error::Invalid)?;
+            (
+                b"RCPT TO:<".as_slice(),
+                address.as_bytes(),
+                b">\r\n".as_slice(),
+            )
+        }
+        Command::Data => (b"DATA\r\n".as_slice(), b"".as_slice(), b"".as_slice()),
+    };
+    let mut used = 0usize;
+    for part in [prefix, address, suffix] {
+        let end = used.checked_add(part.len()).ok_or(Error::Capacity)?;
+        output
+            .get_mut(used..end)
+            .ok_or(Error::Capacity)?
+            .copy_from_slice(part);
+        used = end;
+    }
+    output.get(..used).ok_or(Error::Invalid)
+}
+fn work(stop: Stop) -> Error {
+    if stop == Stop::Deadline {
+        Error::Deadline
+    } else {
+        Error::Capacity
+    }
+}
+fn check(clock: &dyn Clock, deadline: Deadline, meter: &mut Meter) -> Result<Tick, Error> {
+    let now = clock.sample()?.monotonic;
+    if deadline.expired(now) {
+        return Err(Error::Deadline);
+    }
+    meter.charge(now, Charge::default()).map_err(work)?;
+    Ok(now)
+}
+fn refuse<B: TlsWireStorage>(mut session: Session<B>, error: Error) -> Refusal<B> {
+    session.connection_mut().abort();
+    Refusal {
+        error,
+        buffers: session.into_buffers(),
+    }
+}
+const _: () = assert!(
+    std::mem::size_of::<Progress<'static, Box<[u8; crate::tls_io::TLS_WIRE_BYTES]>>>() <= 4096
+);

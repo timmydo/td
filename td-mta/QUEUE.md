@@ -179,6 +179,22 @@ reply fits and completes. Bytes beyond its final CRLF remain with the caller.
 The reader grants no SMTP command/transport authority and does not activate a
 relay loop; the driver must still bind the reply to its current transaction.
 
+The prepared relay command exchange consumes an authenticated session and
+sends exactly one MAIL FROM, RCPT TO or DATA command, with no extensions,
+pipelining or body bytes. MAIL permits the empty reverse path; nonempty paths
+use the existing bounded ASCII mailbox grammar. RCPT requires a nonempty
+mailbox. Preserve the supplied local-part quoting/case and domain spelling;
+validation supplies neither identity nor recipient authority.
+
+A complete reply retains that same connection and exposes actual normalized
+code/text, including negative statuses. The worker must classify status in
+its current command/attempt phase and retain reply text before extracting the
+session to advance; this syntax owner performs no queue mutation. Malformed,
+oversized, incomplete or current-cell-tailed replies destroy the connection.
+A positive DATA-command reply alone never permits body bytes: the Body subset
+must be durably fenced first. Runtime wiring, queue fences and scheduling
+remain separate work.
+
 Transaction and WAL reservations cover the whole selected batch and its CHANGE. The
 maximum encoded recipient row is 9019 bytes; a PUT adds 12 operation-header
 bytes and a 20-byte key. A 100-row update is 905100 bytes before transaction and

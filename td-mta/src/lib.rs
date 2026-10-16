@@ -250,4 +250,5 @@ pub mod postgres_mailbox_create;
 mod receiving_headers;
 
 pub mod smtp_relay_auth;
+pub mod smtp_relay_command;
 pub mod smtp_relay_ehlo;

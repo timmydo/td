@@ -84,6 +84,9 @@ impl<B: TlsWireStorage> Session<B> {
     pub fn policy_id(&self) -> TlsPolicyId {
         self.connection.policy_id()
     }
+    pub(crate) fn connection_mut(&mut self) -> &mut TlsConnection<B> {
+        &mut self.connection
+    }
     pub fn into_buffers(self) -> Result<(B, B), Error> {
         self.connection.into_buffers()
     }

@@ -4895,3 +4895,14 @@ the original borrowed meter. These conservative reservations are consumed
 on pending attempts too. Flush turns consume a record under the same fixed
 deadline. Runtime scheduling must supply the admitted work budget and live
 queue/route fences; protocol completion grants neither.
+
+The prepared authenticated command exchange borrows three 512-byte cells
+(input, command and parser line) plus one 4096-byte normalized reply cell.
+Its standard boxed-TLS progress representation is capped at 4 KiB, separately
+from the 5632 caller bytes and TLS reservations. Each turn performs at most
+one TLS operation and parses at most 512 input bytes. The original borrowed
+meter charges a record per turn, 512 I/O bytes before each read attempt and
+the remaining command extent before each write attempt, including pending
+I/O; pre/post checks retain the original absolute deadline. No per-turn
+allocation or output growth occurs. The complete reply retains exclusive
+connection custody until the worker copies its result and advances or aborts.

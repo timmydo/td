@@ -595,3 +595,33 @@ fn relay_auth_maximum_credentials_use_unwrapped_bounded_responses() {
         drop(peer.into_buffers().unwrap());
     }
 }
+
+pub(super) fn authenticated(material: &Material) -> (Ready, Connection) {
+    let (session, mut peer) = ready(material, b"250-local\r\n250 AUTH PLAIN\r\n");
+    let mut cells = Cells::new();
+    let mut meter = meter();
+    let owner = Exchange::new(
+        session,
+        "private-relay",
+        "password",
+        cells.scratch(),
+        material.source.clone(),
+        cap(),
+        &mut meter,
+    )
+    .ok()
+    .unwrap();
+    let session = drive(
+        owner,
+        &mut peer,
+        &[
+            (b"AUTH PLAIN\r\n", b"334 \r\n"),
+            (PLAIN, b"235 authenticated\r\n"),
+        ],
+        512,
+        false,
+    )
+    .ok()
+    .unwrap();
+    (session, peer)
+}
