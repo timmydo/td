@@ -18,6 +18,10 @@ use tokio_postgres::Client;
 mod body;
 pub use body::{with_body, BodyMetadata, ReadError};
 
+#[path = "postgres_attempt_envelope.rs"]
+mod envelope_reads;
+pub use envelope_reads::{envelope, Envelope, Recipient};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
@@ -158,6 +162,30 @@ async fn receipt(client: &Client, value: &Dispatch) -> Result<Option<Outcome>, E
         old_sequence: old,
         new_sequence: new,
     }))
+}
+async fn active_receipt(client: &Client, value: &Dispatch) -> Result<Outcome, Error> {
+    let outcome = receipt(client, value).await?.ok_or(Error::Missing)?;
+    let binding = value.claim.binding();
+    let rows=client.query("SELECT active,owner_boot,owner_operation,generation,route_name,destination FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
+    let row = rows.first().ok_or(Error::Missing)?;
+    let active: bool = row.try_get(0).map_err(|_| Error::Integrity)?;
+    let boot: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
+    let operation: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
+    let generation = number(row.try_get(3).map_err(|_| Error::Integrity)?)?;
+    let route: &str = row.try_get(4).map_err(|_| Error::Integrity)?;
+    let destination: &[u8] = row.try_get(5).map_err(|_| Error::Integrity)?;
+    if !active {
+        return Err(Error::Missing);
+    }
+    if boot != value.claim.boot().as_bytes()
+        || operation != value.claim.operation().as_bytes()
+        || generation != value.generation
+        || route != binding.route().name()
+        || destination != binding.route().destination()
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(outcome)
 }
 pub fn inspect(
     request: &Request<'_>,

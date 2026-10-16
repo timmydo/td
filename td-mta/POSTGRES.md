@@ -3803,3 +3803,28 @@ callback proves that replay holds no account lock, while the admitted snapshot
 continues to return the same bytes within its deadline. A controlled source
 fault during admission checks that deadline or connection loss suppresses the
 callback before it can act.
+
+## 137. Bounded initial attempt envelopes
+
+The prepared attempt API reads an initial envelope only while every retained
+batch ordinal remains InFlight in Prepared for that exact active attempt.
+Current policy, account and route-owner locks cover the complete bounded read;
+route identity, destination, live due submission, account sequences and final
+lease validity are checked before returning. At most 100 recipients are copied
+with fallible reservations in the receipt's original ordinal order. Strict
+shared mailbox syntax validates recipient addresses and any nonempty reverse
+path; an empty reverse path remains representable. The uncertainty latch is
+returned unchanged as passive per-recipient metadata.
+
+Partial recipient results or later DATA phases refuse reconstruction. The
+worker must retain its admitted envelope for the existing transport; these
+values never authorize a new or repeated SMTP transaction. Queue-clock and
+transport admission, phase publication, interruption recovery and cancellation
+remain separate boundaries. No lock survives the call and no account sequence
+or attempt state changes. Body and envelope reads share exact active-attempt
+receipt validation, including its request digest and owner identity.
+
+Real PostgreSQL cases cover the 100-recipient bound, stable ordinal/address
+mapping, read-only state, unpublished and retired attempts, empty and malformed
+reverse paths, malformed recipients, inconsistent Prepared fields, partial RCPT
+refusal and Body-phase refusal. No scheduler or SMTP transport is activated.

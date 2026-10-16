@@ -11748,3 +11748,6 @@ mod queue_candidates;
 
 #[path = "postgres_probe/attempt_body.rs"]
 mod attempt_body;
+
+#[path = "postgres_probe/attempt_envelope.rs"]
+mod attempt_envelope;

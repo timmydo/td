@@ -283,6 +283,7 @@ pub(super) fn exercise(
         .candidates
         .iter()
         .all(|candidate| candidate.submission != id(0)));
+    super::attempt_envelope::exercise(fixture, request, trust, claim, generation, source);
     for n in 0..70 {
         let submission = id(n);
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id=decode('{submission}','hex'); DELETE FROM td_mta.submissions WHERE id=decode('{submission}','hex')"));

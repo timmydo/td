@@ -1,5 +1,5 @@
 //! Verified transmitted bytes for an active prepared attempt, not SMTP authority.
-use super::{Dispatch, Error, Outcome};
+use super::{Dispatch, Error};
 use crate::{
     ids::{AttemptId, BlobId, SubmissionId},
     ports::{self, BlobReader},
@@ -86,7 +86,7 @@ fn admit(
             owners::check_locked(client, &value.claim, value.generation)
                 .await
                 .map_err(Error::Owner)?;
-            active(client, &value).await?;
+            super::active_receipt(client, &value).await?;
             owners::check_locked(client, &value.claim, value.generation)
                 .await
                 .map_err(Error::Owner)?;
@@ -95,30 +95,7 @@ fn admit(
     })
     .map_err(Error::Connection)?
 }
-async fn active(client: &Client, value: &Dispatch) -> Result<Outcome, Error> {
-    let outcome = super::receipt(client, value).await?.ok_or(Error::Missing)?;
-    let binding = value.claim.binding();
-    let rows=client.query("SELECT active,owner_boot,owner_operation,generation,route_name,destination FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2", &[&binding.account().as_bytes().as_slice(),&value.attempt.as_bytes().as_slice()]).await.map_err(|_|Error::Database)?;
-    let row = rows.first().ok_or(Error::Missing)?;
-    let active: bool = row.try_get(0).map_err(|_| Error::Integrity)?;
-    let boot: &[u8] = row.try_get(1).map_err(|_| Error::Integrity)?;
-    let operation: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;
-    let generation = super::number(row.try_get(3).map_err(|_| Error::Integrity)?)?;
-    let route: &str = row.try_get(4).map_err(|_| Error::Integrity)?;
-    let destination: &[u8] = row.try_get(5).map_err(|_| Error::Integrity)?;
-    if !active {
-        return Err(Error::Missing);
-    }
-    if boot != value.claim.boot().as_bytes()
-        || operation != value.claim.operation().as_bytes()
-        || generation != value.generation
-        || route != binding.route().name()
-        || destination != binding.route().destination()
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(outcome)
-}
+
 async fn snapshot(
     client: &Client,
     value: Dispatch,
@@ -132,7 +109,9 @@ async fn snapshot(
         return Err(ReadError::Body(postgres_body::Error::Epoch));
     }
     client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL idle_in_transaction_session_timeout=10000").await.map_err(|_|ReadError::Attempt(Error::Database))?;
-    active(client, &value).await.map_err(ReadError::Attempt)?;
+    super::active_receipt(client, &value)
+        .await
+        .map_err(ReadError::Attempt)?;
     let rows=client.query("SELECT a.sequence,a.floor,b.length,b.digest,b.created_at,b.chunk_count,b.changed,(SELECT count(*) FROM td_mta.blob_chunks c WHERE c.account=b.account AND c.blob_id=b.id),s.transmitted_blob_id,s.changed FROM td_mta.accounts a JOIN td_mta.submissions s ON s.account=a.id JOIN td_mta.submission_routes r ON r.account=s.account AND r.submission_id=s.id LEFT JOIN td_mta.blobs b ON b.account=s.account AND b.id=s.transmitted_blob_id WHERE a.id=$1 AND s.id=$2 AND s.completed_at IS NULL AND r.route_name=$3 AND r.destination=$4", &[&binding.account().as_bytes().as_slice(),&value.submission.as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|ReadError::Attempt(Error::Database))?;
     let row = rows.first().ok_or(ReadError::Attempt(Error::Missing))?;
     let bytes: &[u8] = row
