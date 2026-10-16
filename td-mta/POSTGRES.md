@@ -3525,3 +3525,26 @@ with the shared health/receipt caps and a final owner/time check. Recipient
 results and account sequence are unchanged. Unknown COMMIT settles the original
 operation. A successful SMTP handoff does not prove final mailbox delivery;
 this operation starts no scheduler or transport and cannot authorize a send.
+
+
+## 126. Prepared whole-submission cancellation settlement
+
+Schema version 26 adds independently retained cancellation receipts keyed by
+account and operation. Each binds a request digest and submission identity,
+records the whole recipient count (1 through 1000), the changed count, original
+and resulting account sequences, and the resulting completedAt observation.
+A no-change result preserves the sequence and records zero changed recipients;
+a changing result advances it. The publisher must enforce exact checked
+adjacency, full ordinal coverage and the all-or-refuse cancellation rules.
+The completion timestamp is signed like the submission's existing timestamp:
+canceling a completed failure must preserve its exact historical observation.
+
+The receipt references its account but deliberately not the live submission,
+so eventual authorized submission deletion cannot erase settlement history.
+Ordinary runtime mail DML grants include this table; owner initialization and
+migration remain private. This increment provides no cancellation API or
+transport fence. The future publisher must lock current policy/account/route,
+reject any Accepted, uncertain or AcceptancePossible recipient, reserve the
+whole mutation before fencing, preserve replies and existing notice/completion
+state, and atomically publish canceled recipients, retired attempts, CHANGE
+and settlement. Already wholly canceled submissions are idempotent successes.

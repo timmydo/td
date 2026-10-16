@@ -348,7 +348,7 @@ fn real_postgres_schema_initialization_is_atomic_and_locked() {
     );
     wait_command(&mut shared);
     let receipt = initialize(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 25);
+    assert_eq!(receipt.version, 26);
     assert_eq!(
         inspect(&fixture.request(), &trust, deadline()).unwrap(),
         receipt
@@ -425,7 +425,7 @@ CREATE EVENT TRIGGER td_schema_delay ON ddl_command_end WHEN TAG IN ('CREATE TAB
         inspect(&fixture.request(), &trust, deadline())
             .unwrap()
             .version,
-        25
+        26
     );
     assert_eq!(
         initialize(&fixture.request(), &trust, deadline()),
@@ -550,7 +550,7 @@ fn real_postgres_schema_commands_prepare_and_inspect_one_epoch() {
     };
     assert!(invoke("schema-inspect", 1).contains("schema-operation-failed"));
     let initialized = invoke("schema-init", 0);
-    assert!(initialized.contains("\"schema_version\":25"));
+    assert!(initialized.contains("\"schema_version\":26"));
     assert!(initialized.contains(
         "\"ledger_checked\":true,\"serving_schema_checked\":false,\"profile_checked\":false"
     ));
@@ -725,6 +725,11 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
             access::Error::Privileges,
         ),
         (
+            "REVOKE INSERT ON td_mta.submission_cancel_receipts FROM mail_runtime",
+            "GRANT INSERT ON td_mta.submission_cancel_receipts TO mail_runtime",
+            access::Error::Privileges,
+        ),
+        (
             "REVOKE UPDATE ON td_mta.route_health FROM mail_runtime",
             "GRANT UPDATE ON td_mta.route_health TO mail_runtime",
             access::Error::Privileges,
@@ -785,7 +790,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     }
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=25",
+        "UPDATE td_mta.schema_migrations SET version=99 WHERE version=26",
     );
     assert_eq!(
         probe(&serving, &trust, deadline()),
@@ -793,7 +798,7 @@ fn real_postgres_runtime_credentials_separate_mail_writes_from_owner_authority()
     );
     sql(
         &fixture,
-        "UPDATE td_mta.schema_migrations SET version=25 WHERE version=99",
+        "UPDATE td_mta.schema_migrations SET version=26 WHERE version=99",
     );
     assert_eq!(
         schema::inspect(&serving, &trust, deadline()).unwrap(),
@@ -975,7 +980,7 @@ fn real_postgres_material_schema_upgrade_preserves_epoch_and_rolls_back() {
     );
     wait_command(&mut held);
     let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-    assert_eq!(receipt.version, 25);
+    assert_eq!(receipt.version, 26);
     assert_eq!(receipt.store_epoch.as_bytes(), &[1; 16]);
     assert_eq!(
         upgrade(&fixture.request(), &trust, deadline()).unwrap(),
@@ -1477,7 +1482,7 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
     let digest = "decode(repeat('00',32),'hex')";
     sql(&fixture, &format!("INSERT INTO td_mta.accounts VALUES ({a},{max},{high}),({b},{zero},{zero}); INSERT INTO td_mta.blob_ids VALUES ({a},{a}),({a},{b})"));
     assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r' AND c.relpersistence<>'p'"), "0");
-    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "46");
+    assert_eq!(sql(&fixture, "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='td_mta' AND c.relkind='r'"), "47");
     // Each expected refusal rolls back its own subtransaction. An unexpected
     // success raises a different SQLSTATE and fails psql with ON_ERROR_STOP.
     let refuse = |statement: String, state: &str| {
@@ -1525,6 +1530,43 @@ fn real_postgres_mail_schema_bounds_references_and_rollback() {
             "SELECT count(*) FROM td_mta.submission_expiry_receipts"
         ),
         "1"
+    );
+    // Cancellation settlement survives independently of the submission row.
+    sql(&fixture, &format!("INSERT INTO td_mta.submission_cancel_receipts VALUES({a},{a},{digest},{a},1000,1000,-1,{high},{max}),({a},{b},{digest},{a},1000,0,-1,{high},{high})"));
+    for assignment in [
+        "recipient_count=0",
+        "recipient_count=1001",
+        "changed_count=-1",
+        "changed_count=1001",
+        "changed_count=0",
+        "new_sequence=old_sequence",
+        "old_sequence=decode(repeat('00',8),'hex')",
+        "request_digest=decode(repeat('00',31),'hex')",
+        "submission_id=decode(repeat('00',15),'hex')",
+    ] {
+        refuse(
+            format!(
+                "UPDATE td_mta.submission_cancel_receipts SET {assignment} WHERE operation={a}"
+            ),
+            "23514",
+        );
+    }
+    refuse(
+        format!("UPDATE td_mta.submission_cancel_receipts SET changed_count=1 WHERE operation={b}"),
+        "23514",
+    );
+    refuse(
+        format!(
+            "UPDATE td_mta.submission_cancel_receipts SET new_sequence={zero} WHERE operation={b}"
+        ),
+        "23514",
+    );
+    assert_eq!(
+        sql(
+            &fixture,
+            "SELECT count(*) FROM td_mta.submission_cancel_receipts WHERE completed_at=-1"
+        ),
+        "2"
     );
     sql(&fixture, &format!("INSERT INTO td_mta.route_health VALUES({a},'primary',{digest},{high},1,4,0,300000,{high}); INSERT INTO td_mta.route_health_receipts VALUES({a},{a},{digest},'primary',{digest},1,{zero},{high},1,4,0,300000,{high})"));
     for assignment in [
@@ -1646,7 +1688,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
     use td_crypto::Digest;
     use td_mta::postgres_schema::{inspect, upgrade, Error as SchemaError};
     for previous_version in [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
     ] {
         let fixture = Fixture::new();
         let trust = TrustStore::from_pem(&fixture.ca).unwrap();
@@ -1675,6 +1717,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             include_str!("../src/postgres_attempt_rcpt.sql"),
             include_str!("../src/postgres_attempt_command.sql"),
             include_str!("../src/postgres_queue_expiry.sql"),
+            include_str!("../src/postgres_route_health.sql"),
         ]
         .iter()
         .take(previous_version)
@@ -1721,6 +1764,7 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             22 => "attempt_command_receipts",
             23 => "queue_expiry_progress",
             24 => "route_health_receipts",
+            25 => "submission_cancel_receipts",
             _ => "flag_receipts",
         };
         if previous_version == 8 {
@@ -1754,7 +1798,14 @@ fn real_postgres_mail_schema_upgrade_retains_materials_and_epoch() {
             );
         }
         let receipt = upgrade(&fixture.request(), &trust, deadline()).unwrap();
-        assert_eq!(receipt.version, 25);
+        assert_eq!(receipt.version, 26);
+        assert_eq!(
+            sql(
+                &fixture,
+                "SELECT count(*) FROM td_mta.submission_cancel_receipts"
+            ),
+            "0"
+        );
         assert_eq!(
             sql(&fixture, "SELECT count(*) FROM td_mta.route_health"),
             "0"
