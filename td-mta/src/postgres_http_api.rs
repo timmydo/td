@@ -338,6 +338,7 @@ impl Service<'_, '_, '_> {
                     };
                     let access = dispatch::SubmissionAccess {
                         creator: &submissions,
+                        canceler: None,
                         filer: &updates,
                         clock: self.clock,
                         device: request.device,

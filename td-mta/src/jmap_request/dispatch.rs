@@ -6,6 +6,9 @@ use td_json::{arena, arena_emit::BorrowedEmitter};
 #[path = "submission_set.rs"]
 mod submission_set;
 pub use submission_set::{SubmissionAccess, SubmissionCreator, SubmissionFiler};
+#[path = "submission_cancel.rs"]
+mod submission_cancel;
+pub use submission_cancel::{RouteCancellation, SubmissionCanceler};
 #[path = "email_set.rs"]
 mod email_set;
 pub use email_set::EmailMutator;
@@ -217,7 +220,7 @@ pub fn run_with_postgres_mailboxes<'state, 'c, 's, 'r, 'sr, 'a, P>(
         },
     )
 }
-/// Prepared singleton submission creation and its optional success filing.
+/// Prepared singleton submission creation or cancellation, with creation filing.
 /// The caller supplies freshly authenticated Submission state and the same
 /// clock used by response retention. Mixed draft/send batches remain refused.
 pub fn run_with_postgres_submissions<'state, 'c, 's, 'r, 'sr, 'a, P>(
@@ -269,9 +272,11 @@ pub fn run_with_postgres_send<'state, 'c, 's, 'r, 'sr, 'a, P>(
                     .and_then(|value| value.as_object())
                     .is_none_or(|objects| objects.len() != 1)
         })
-        || calls
-            .next()
-            .is_none_or(|call| call.name != b"EmailSubmission/set")
+        || calls.next().is_none_or(|call| {
+            call.name != b"EmailSubmission/set"
+                || call.arguments.get("update").is_some()
+                || call.arguments.get("#update").is_some()
+        })
     {
         return Err(Error::InvalidArguments);
     }

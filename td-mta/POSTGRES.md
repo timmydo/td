@@ -3666,3 +3666,32 @@ whole-group eligibility, transaction reservation and transport fence remain
 the authenticated publisher's responsibility. A repeated canceled update is
 syntactically valid; only publication can establish its no-change result.
 Dispatch and error projection remain separate from this input boundary.
+
+## 132. Prepared JMAP cancellation dispatch
+
+The prepared singleton EmailSubmission/set path can receive a trusted
+cancellation adapter alongside its creation and filing adapters. A request
+selects one creation or one whole-submission update; mixed operations,
+multiple updates and cancellation filing hooks refuse before effects. The
+ordinary HTTP adapter supplies no cancellation owner yet, so this adds no
+route-worker control or production endpoint activation.
+
+Cancellation validates account and scoped ifInState before object work, then
+uses the bounded patch decoder. Unsupported patches become invalidProperties;
+well-formed unknown external IDs become notFound. A valid local cancellation
+passes the original execution deadline, meter, authenticated device and state
+precondition to the trusted adapter. That adapter must own the current relay
+claim and local transport fence, recheck current authority/state through the
+publisher, and retain unknown COMMIT exactly as the bounded worker requires.
+
+Dispatch reserves its complete response storage before invoking the owner.
+Known changed and no-change outcomes carry the receipt's actual old/new
+sequences, validate the full changed count and checked sequence adjacency,
+and remain retainable after the execution phase expires. CannotUnsend,
+transaction capacity and fence refusal project as cannotUnsend; missing and
+authorization failures project as notFound and forbidden. Work admission and
+connection errors remain method-level failures with no proven mutation.
+Unknown COMMIT or an inconsistent claimed success becomes serverPartialFail,
+never a fabricated refusal or success. A current state mismatch remains a
+method-level stateMismatch. Cancellation creates no creation ID or implicit
+Email/set response in this increment.

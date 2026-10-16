@@ -120,12 +120,21 @@ pub(super) fn exercise(
     assert_eq!(pending.operation().unwrap(), None);
     let closed = Arc::new(AtomicBool::new(false));
     let observed = closed.clone();
-    let success = worker
-        .cancel(input(10_000), claim, generation, &mut meter(), move |_| {
+    let adapter = td_mta::jmap_request::dispatch::RouteCancellation {
+        worker: &worker,
+        claim,
+        generation,
+        close: Arc::new(move |_| {
             observed.store(true, Ordering::Relaxed);
             Ok(())
-        })
-        .unwrap();
+        }),
+    };
+    let success = td_mta::jmap_request::dispatch::SubmissionCanceler::cancel(
+        &adapter,
+        input(10_000),
+        &mut meter(),
+    )
+    .unwrap();
     assert_eq!(success.changed, 1000);
     assert!(closed.load(Ordering::Relaxed));
     assert_eq!(pending.operation().unwrap(), None);

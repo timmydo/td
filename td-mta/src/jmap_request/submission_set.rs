@@ -1,4 +1,4 @@
-//! One prepared submission plus its independently reported success filing.
+//! One prepared submission creation or cancellation, with creation filing.
 use super::{Error, Worker};
 use crate::{
     admission::work::Meter,
@@ -56,6 +56,7 @@ impl SubmissionFiler for filing::Updates<'_> {
 #[derive(Clone, Copy)]
 pub struct SubmissionAccess<'a> {
     pub creator: &'a dyn SubmissionCreator,
+    pub canceler: Option<&'a dyn super::SubmissionCanceler>,
     pub filer: &'a dyn SubmissionFiler,
     pub clock: &'a dyn Clock,
     pub device: DeviceId,
@@ -70,12 +71,14 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
     ) -> Result<Range<u64>, Error> {
         let access = self.submissions.ok_or(Error::State)?;
         let mut fields = call.arguments.as_object().ok_or(Error::InvalidArguments)?;
-        let (mut account, mut create, mut hook, mut expected) = (None, None, None, None);
+        let (mut account, mut create, mut update, mut hook, mut expected) =
+            (None, None, None, None, None);
         while let Some((key, value)) = fields.next_bytes() {
             self.check()?;
             match key {
                 b"accountId" => account = Some(value),
                 b"create" => create = Some(value),
+                b"update" => update = Some(value),
                 b"ifInState" if value.is_null() => (),
                 b"ifInState" => expected = Some(value),
                 b"onSuccessUpdateEmail" if value.is_null() => (),
@@ -107,6 +110,12 @@ impl<P> Worker<'_, '_, '_, '_, '_, '_, P> {
                 Ok((state.epoch, state.sequence.number()))
             })
             .transpose()?;
+        if let Some(update) = update {
+            if create.is_some() || hook.is_some() {
+                return Err(Error::InvalidArguments);
+            }
+            return self.submission_cancel(access, update, expected, maximum);
+        }
         let mut objects = create
             .and_then(|value| value.as_object())
             .ok_or(Error::InvalidArguments)?;
@@ -473,7 +482,11 @@ fn input_error(error: submission_request::Error) -> Error {
         submission_request::Error::Clock => Error::State,
     }
 }
-fn states(output: &mut TextBuffer<'_>, old: DataState, new: DataState) -> Result<(), Error> {
+pub(super) fn states(
+    output: &mut TextBuffer<'_>,
+    old: DataState,
+    new: DataState,
+) -> Result<(), Error> {
     let mut account = [0; wire::IdKind::WIRE_BYTES];
     let account =
         wire::encode_id(old.account, &mut account).map_err(|_| Error::ServerPartialFail)?;

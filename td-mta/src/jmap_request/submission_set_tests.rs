@@ -31,6 +31,8 @@ impl Clock for Now {
 struct Service {
     clock: Arc<Now>,
     creates: AtomicUsize,
+    cancels: AtomicUsize,
+    cancel_mode: u8,
     files: AtomicUsize,
     drafts: AtomicUsize,
     draft_mode: u8,
@@ -42,6 +44,8 @@ impl Service {
         Self {
             clock: Arc::new(Now(AtomicU64::new(1))),
             creates: AtomicUsize::new(0),
+            cancels: AtomicUsize::new(0),
+            cancel_mode: 0,
             files: AtomicUsize::new(0),
             drafts: AtomicUsize::new(0),
             draft_mode: 0,
@@ -245,6 +249,7 @@ fn run(input: td_json::Json, service: &Service) -> Result<td_json::Json, Error> 
     while !preflight.step(&mut [0; 4096]).unwrap() {}
     let access = SubmissionAccess {
         creator: service,
+        canceler: Some(service),
         filer: service,
         clock: &*service.clock,
         device: DEVICE,
@@ -482,6 +487,7 @@ fn output_capacity_and_wrong_typed_overlays_refuse_before_effects() {
                 submission: true,
                 submissions: Some(SubmissionAccess {
                     creator: &service,
+                    canceler: Some(&service),
                     filer: &service,
                     clock: &*service.clock,
                     device: DEVICE,
@@ -747,5 +753,242 @@ fn send_batch_rejects_update_and_destroy_first_calls_before_effects() {
         assert_eq!(service.drafts.load(Ordering::Relaxed), 0);
         assert_eq!(service.creates.load(Ordering::Relaxed), 0);
         assert_eq!(service.files.load(Ordering::Relaxed), 0);
+    }
+}
+
+impl crate::jmap_request::dispatch::SubmissionCanceler for Service {
+    fn cancel(
+        &self,
+        input: crate::postgres_http_cancellations::Input,
+        meter: &mut Meter,
+    ) -> Result<crate::postgres_submission_cancel::Outcome, crate::postgres_http_cancellations::Error>
+    {
+        use crate::{
+            postgres_http_cancellations::Error as Http, postgres_submission_cancel as cancel,
+        };
+        assert_eq!(input.account, ACCOUNT);
+        assert_eq!(input.device, DEVICE);
+        assert_eq!(input.submission, SUBMITTED);
+        assert_eq!(input.deadline, deadline(90));
+        assert_eq!(meter.deadline(), deadline(100).into());
+        self.cancels.fetch_add(1, Ordering::Relaxed);
+        let error = match self.cancel_mode {
+            1 => Some(cancel::Error::CannotUnsend),
+            2 => Some(cancel::Error::Indeterminate),
+            4 => Some(cancel::Error::StateMismatch),
+            5 => Some(cancel::Error::Missing),
+            6 => Some(cancel::Error::Unauthenticated),
+            7 => Some(cancel::Error::Capacity),
+            8 => Some(cancel::Error::Deadline),
+            12 => Some(cancel::Error::Fence),
+            _ => None,
+        };
+        if let Some(error) = error {
+            return Err(Http::Publication(error));
+        }
+        if self.cancel_mode == 9 {
+            return Err(Http::Admission(ports::Error::Capacity));
+        }
+        if self.cancel_mode == 13 {
+            return Err(Http::Admission(ports::Error::Busy));
+        }
+        if self.cancel_mode == 3 {
+            self.clock.0.store(95, Ordering::Relaxed);
+        }
+        Ok(cancel::Outcome {
+            submission: SUBMITTED,
+            recipients: 1000,
+            changed: match self.cancel_mode {
+                10 => 1,
+                11 => 0,
+                _ => 1000,
+            },
+            completed_at: 0,
+            old_sequence: 1,
+            new_sequence: if self.cancel_mode == 11 { 1 } else { 2 },
+        })
+    }
+}
+fn cancellation_input(patch: td_json::Json) -> td_json::Json {
+    td_json::json!({"using":[CORE,MAIL,SUBMISSION],"methodCalls":[["EmailSubmission/set",{
+        "accountId":id(ACCOUNT),"update":{id(SUBMITTED):patch}
+    },"cancel\n☃"]]})
+}
+#[test]
+fn cancellation_dispatch_preserves_committed_and_no_change_results() {
+    for mode in [0, 3, 11] {
+        let mut service = Service::new(0, 0);
+        service.cancel_mode = mode;
+        let result = run(
+            cancellation_input(td_json::json!({"undoStatus":"canceled"})),
+            &service,
+        )
+        .unwrap();
+        let response = &result["methodResponses"][0];
+        assert_eq!(response[0].as_str(), Some("EmailSubmission/set"));
+        assert_eq!(response[2].as_str(), Some("cancel\n☃"));
+        assert!(response[1]["updated"]
+            .get(id(SUBMITTED).as_str())
+            .unwrap()
+            .is_null());
+        assert_eq!(
+            DataState::decode(response[1]["oldState"].as_str().unwrap()).unwrap(),
+            state()
+        );
+        assert_eq!(
+            DataState::decode(response[1]["newState"].as_str().unwrap())
+                .unwrap()
+                .sequence
+                .number(),
+            if mode == 11 { 1 } else { 2 }
+        );
+        assert_eq!(service.cancels.load(Ordering::Relaxed), 1);
+        assert_eq!(service.creates.load(Ordering::Relaxed), 0);
+        assert_eq!(service.files.load(Ordering::Relaxed), 0);
+    }
+}
+#[test]
+fn cancellation_dispatch_distinguishes_refusal_from_uncertainty_and_limits() {
+    for (mode, kind, method) in [
+        (1, "cannotUnsend", false),
+        (2, "serverPartialFail", true),
+        (5, "notFound", false),
+        (6, "forbidden", false),
+        (7, "cannotUnsend", false),
+        (8, "serverUnavailable", true),
+        (9, "serverFail", true),
+        (10, "serverPartialFail", true),
+        (12, "cannotUnsend", false),
+        (13, "serverUnavailable", true),
+    ] {
+        let mut service = Service::new(0, 0);
+        service.cancel_mode = mode;
+        let result = run(
+            cancellation_input(td_json::json!({"undoStatus":"canceled"})),
+            &service,
+        )
+        .unwrap();
+        let response = &result["methodResponses"][0];
+        if method {
+            assert_eq!(response[0].as_str(), Some("error"));
+            assert_eq!(response[1]["type"].as_str(), Some(kind));
+        } else {
+            assert_eq!(response[0].as_str(), Some("EmailSubmission/set"));
+            assert_eq!(
+                response[1]["notUpdated"][id(SUBMITTED).as_str()]["type"].as_str(),
+                Some(kind)
+            );
+        }
+        assert_eq!(service.cancels.load(Ordering::Relaxed), 1);
+    }
+}
+#[test]
+fn cancellation_dispatch_rejects_unsupported_patches_before_publication() {
+    for patch in [
+        td_json::json!({}),
+        td_json::json!({"undoStatus":"pending"}),
+        td_json::json!({"undoStatus":"canceled","emailId":id(EMAIL)}),
+    ] {
+        let service = Service::new(0, 0);
+        let result = run(cancellation_input(patch), &service).unwrap();
+        assert_eq!(
+            result["methodResponses"][0][1]["notUpdated"][id(SUBMITTED).as_str()]["type"].as_str(),
+            Some("invalidProperties")
+        );
+        assert_eq!(service.cancels.load(Ordering::Relaxed), 0);
+    }
+}
+#[test]
+fn cancellation_dispatch_checks_state_before_patch_and_again_at_publication() {
+    let service = Service::new(0, 0);
+    let mut request = cancellation_input(td_json::json!({"undoStatus":"pending"}));
+    let stale = DataState {
+        sequence: Sequence::from_u64(0),
+        ..state()
+    };
+    let _ = args_mut(&mut request).insert(
+        "ifInState",
+        stale.encode(&mut [0; DataState::WIRE_BYTES]).unwrap(),
+    );
+    let result = run(request, &service).unwrap();
+    assert_eq!(
+        result["methodResponses"][0][1]["type"].as_str(),
+        Some("stateMismatch")
+    );
+    assert_eq!(service.cancels.load(Ordering::Relaxed), 0);
+    let mut service = Service::new(0, 0);
+    service.cancel_mode = 4;
+    let mut request = cancellation_input(td_json::json!({"undoStatus":"canceled"}));
+    let _ = args_mut(&mut request).insert(
+        "ifInState",
+        state().encode(&mut [0; DataState::WIRE_BYTES]).unwrap(),
+    );
+    let result = run(request, &service).unwrap();
+    assert_eq!(
+        result["methodResponses"][0][1]["type"].as_str(),
+        Some("stateMismatch")
+    );
+    assert_eq!(service.cancels.load(Ordering::Relaxed), 1);
+}
+#[test]
+fn cancellation_dispatch_refuses_mixed_and_multiple_updates_before_effects() {
+    for variant in 0..3 {
+        let service = Service::new(0, 0);
+        let mut request = cancellation_input(td_json::json!({"undoStatus":"canceled"}));
+        let args = args_mut(&mut request);
+        match variant {
+            0 => {
+                let _ = args.insert(
+                    "create",
+                    td_json::json!({"send":{"emailId":id(EMAIL),"identityId":id(IDENTITY)}}),
+                );
+            }
+            1 => {
+                let _ = args.insert(
+                    "onSuccessUpdateEmail",
+                    td_json::json!({id(SUBMITTED):{"keywords/$draft":null}}),
+                );
+            }
+            _ => {
+                let _ = args
+                    .get_mut("update")
+                    .unwrap()
+                    .insert("other", td_json::json!({"undoStatus":"canceled"}));
+            }
+        }
+        let result = run(request, &service).unwrap();
+        assert_eq!(
+            result["methodResponses"][0][1]["type"].as_str(),
+            Some("invalidArguments")
+        );
+        assert_eq!(service.cancels.load(Ordering::Relaxed), 0);
+        assert_eq!(service.creates.load(Ordering::Relaxed), 0);
+        assert_eq!(service.files.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn send_batch_rejects_cancellation_before_creating_a_draft() {
+    for reference in [false, true] {
+        let service = Service::new(0, 0);
+        let mut request = cancellation_input(td_json::json!({"undoStatus":"canceled"}));
+        if reference {
+            let args = args_mut(&mut request);
+            let _ = args.remove("update");
+            let _ = args.insert(
+                "#update",
+                td_json::json!({"resultOf":"draft-call","name":"Email/set","path":"/created"}),
+            );
+        }
+        let td_json::Json::Arr(calls) = request.get_mut("methodCalls").unwrap() else {
+            panic!("calls");
+        };
+        calls.insert(0, td_json::json!(["Email/set", {"accountId":id(ACCOUNT),"create":{"draft":{"subject":"fixture"}}}, "draft-call"]));
+        assert!(matches!(
+            run(request, &service),
+            Err(Error::InvalidArguments)
+        ));
+        assert_eq!(service.drafts.load(Ordering::Relaxed), 0);
+        assert_eq!(service.cancels.load(Ordering::Relaxed), 0);
     }
 }
