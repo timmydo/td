@@ -77,8 +77,10 @@ pub(super) fn exercise(
                 &mut database,
             )
             .unwrap();
+        let mut published = published.admit_envelope(&mut database).unwrap();
         let attempt = published.attempt();
-        let (envelope, prepared_limit) = published.observe_envelope(&mut database).unwrap();
+        let prepared_limit = published.check_current(&mut database).unwrap();
+        let envelope = published.envelope();
         assert!(prepared_limit < job_limit);
         assert_eq!(envelope.recipients.len(), 1);
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
@@ -93,6 +95,7 @@ pub(super) fn exercise(
         );
         assert_eq!(mail, "250 sender");
         let recipient = &envelope.recipients[0];
+        let ordinal = recipient.ordinal;
         let (session, rcpt) = wire::command(
             session,
             &mut peer,
@@ -113,7 +116,7 @@ pub(super) fn exercise(
         );
         assert_eq!(data, "354 send body");
         let (body_owner, body_request) = published
-            .publish_body(&[(recipient.ordinal, &rcpt)], &mut database)
+            .publish_body(&[(ordinal, &rcpt)], &mut database)
             .unwrap();
         assert_eq!(body_owner.attempt(), attempt);
         assert_eq!(body_request.attempt(), attempt);
@@ -174,7 +177,7 @@ pub(super) fn exercise(
                 &runtime,
                 trust,
                 prepared_limit,
-                &phases::body(claim, generation, attempt, &[(recipient.ordinal, &rcpt)]).unwrap(),
+                &phases::body(claim, generation, attempt, &[(ordinal, &rcpt)]).unwrap(),
                 clock.clone(),
                 worker.guard.clone()
             ),
@@ -252,14 +255,8 @@ pub(super) fn exercise(
                 .count(),
             1
         );
-        let final_value = phases::accepted(
-            claim,
-            generation,
-            attempt,
-            &[recipient.ordinal],
-            "250 queued",
-        )
-        .unwrap();
+        let final_value =
+            phases::accepted(claim, generation, attempt, &[ordinal], "250 queued").unwrap();
         assert_eq!(
             phases::inspect(&runtime, trust, deadline(), &final_value).unwrap(),
             Some(outcome)

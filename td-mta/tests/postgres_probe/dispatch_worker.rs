@@ -148,49 +148,57 @@ pub(super) fn exercise(
         )))
     );
     assert_eq!(pending.attempt().unwrap(), None);
-    let success = worker
+    let mut success = worker
         .publish_prepared(claim, generation, input(5000, false), &mut meter())
+        .unwrap()
+        .admit_envelope(&mut meter())
         .unwrap();
     assert_eq!(success.outcome().ordinals, vec![0, 1]);
     assert_eq!(success.attempt(), success.outcome().attempt);
-    assert_eq!(
-        success
-            .observe_envelope(&mut meter())
-            .unwrap()
-            .0
-            .recipients
-            .len(),
-        2
-    );
+    assert_eq!(success.envelope().recipients.len(), 2);
     assert_eq!(pending.attempt().unwrap(), None);
     let mut empty = Meter::new(until(10_000), Charge::default());
     assert_eq!(
-        success.observe_envelope(&mut empty),
+        success.check_current(&mut empty),
         Err(Error::Admission(ports::Error::Capacity))
     );
     let occupied = worker
         .reserve_final(success.attempt(), until(10_000), &mut meter())
         .unwrap();
     assert_eq!(
-        success.observe_envelope(&mut meter()),
+        success.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Busy))
     );
     drop(occupied);
     let mut observed_budget = meter();
     let before = observed_budget.remaining();
-    assert_eq!(
-        success
-            .observe_envelope(&mut observed_budget)
-            .unwrap()
-            .0
-            .attempt,
-        success.attempt()
-    );
+    assert!(success.check_current(&mut observed_budget).is_ok());
     assert_eq!(
         before.io_bytes - observed_budget.remaining().io_bytes,
         2 * 1024 * 1024 + 192 * 1024
     );
     assert_eq!(before.records - observed_budget.remaining().records, 4096);
+    sql(fixture, &format!("UPDATE td_mta.recipients SET address='changed@example.test' WHERE submission_id={sub} AND ordinal=0"));
+    assert_eq!(
+        success.check_current(&mut meter()),
+        Err(Error::Publication(attempts::Error::Integrity))
+    );
+    assert_eq!(
+        success.envelope().recipients.first().unwrap().address,
+        "0@example.test"
+    );
+    sql(fixture, &format!("UPDATE td_mta.recipients SET address='0@example.test' WHERE submission_id={sub} AND ordinal=0"));
+    let mut short = Meter::new(
+        until(2000),
+        Charge {
+            io_bytes: 16 * 1024 * 1024,
+            records: 100_000,
+            ..Default::default()
+        },
+    );
+    let short_limit = success.check_current(&mut short).unwrap();
+    assert!(success.check_current(&mut meter()).unwrap() <= short_limit);
+
     let body = phases::body(
         claim,
         generation,
@@ -375,7 +383,7 @@ pub(super) fn exercise(
     );
     let attempt = pending.attempt().unwrap().unwrap();
     assert_eq!(
-        success.observe_envelope(&mut meter()),
+        success.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Busy))
     );
     assert!(matches!(
@@ -562,7 +570,7 @@ pub(super) fn exercise(
     // Existing delayed COMMIT cases exceed the original five-second owner
     // limit. A fresh meter cannot revive the first Prepared owner.
     assert_eq!(
-        success.observe_envelope(&mut meter()),
+        success.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Deadline))
     );
     assert_eq!(

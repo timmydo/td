@@ -4421,3 +4421,29 @@ wire/input deadline is longer. It then transfers the verified immutable body
 and exercises actual final publication and retained-reply retry. Worker tests
 also require the handoff to refuse an expired Prepared owner despite a fresh
 meter.
+
+## 159. Retained initial envelope and minimum observed cap
+
+Consuming PreparedResult through initial envelope admission produces a
+non-cloneable EnvelopePlan. It pairs that exact bounded envelope with the
+Prepared owner and clamps the owner's limit to the returned native lease,
+submission and work bound. The public envelope view is borrowed passive data;
+callers cannot replace the stored envelope or construct a plan from a receipt.
+
+A subsequent untouched-envelope check charges and reads through the same
+native path, requires the complete envelope to equal the retained one, and
+only shortens the stored limit. A new meter or renewed lease cannot enlarge
+that minimum. Consuming the plan into Body carries this bound through the
+existing Prepared handoff and final-result chain.
+
+These checks apply while all original recipients remain untouched Prepared.
+They do not reconstruct an envelope after partial RCPT publication, implement
+SMTP command sequencing or prove actual 354. Those transport duties remain
+with the caller until native envelope orchestration is composed. No scheduler
+or production backend is activated.
+
+Native worker tests cover identity substitution refusal and retention of the
+original view, a shortened observation followed by a longer fresh meter,
+capacity/slot/Pending refusal and expiry. The real SMTP/TLS fixture uses the
+retained envelope for MAIL/RCPT and consumes the plan after actual 354 before
+running the existing Body and final-result wrappers.

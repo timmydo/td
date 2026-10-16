@@ -465,6 +465,15 @@ pub struct PreparedResult<'w, 'a, 'r> {
     until: Deadline,
 }
 impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
+    /// Bind the first untouched envelope and its observed cap to this owner.
+    pub fn admit_envelope(mut self, meter: &mut Meter) -> Result<EnvelopePlan<'w, 'a, 'r>, Error> {
+        let (envelope, limit) = self.observe_envelope(meter)?;
+        self.limit = self.limit.min(limit);
+        Ok(EnvelopePlan {
+            prepared: self,
+            envelope,
+        })
+    }
     /// After actual 354, consume this exact Prepared identity into new Body
     /// custody. Return its passive request for the matching immutable read.
     /// The caller supplies actual accepted RCPT replies, never a replacement
@@ -543,6 +552,41 @@ impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
             worker.guard.clone(),
         )
         .map_err(Error::Publication)
+    }
+}
+
+/// Exact admitted envelope paired with Prepared custody. Subsequent untouched
+/// checks preserve its identity and only shorten the retained deadline.
+pub struct EnvelopePlan<'w, 'a, 'r> {
+    prepared: PreparedResult<'w, 'a, 'r>,
+    envelope: attempts::Envelope,
+}
+impl<'w, 'a, 'r> EnvelopePlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.prepared.attempt()
+    }
+    pub fn outcome(&self) -> &attempts::Outcome {
+        self.prepared.outcome()
+    }
+    pub fn envelope(&self) -> &attempts::Envelope {
+        &self.envelope
+    }
+    /// Applies only while the complete batch remains untouched Prepared.
+    pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        let (current, limit) = self.prepared.observe_envelope(meter)?;
+        if current != self.envelope {
+            return Err(Error::Publication(attempts::Error::Integrity));
+        }
+        self.prepared.limit = self.prepared.limit.min(limit);
+        Ok(self.prepared.limit)
+    }
+    /// The caller still owns actual 354, matching session and accepted replies.
+    pub fn publish_body(
+        self,
+        accepted: &[(u32, &str)],
+        meter: &mut Meter,
+    ) -> Result<(BodyResult<'w, 'a, 'r>, Dispatch), Error> {
+        self.prepared.publish_body(accepted, meter)
     }
 }
 
