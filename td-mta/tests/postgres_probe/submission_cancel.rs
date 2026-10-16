@@ -255,6 +255,14 @@ pub(super) fn exercise(
     );
     reset();
     owners::renew(request, trust, deadline(), &claim, grant.generation).unwrap();
+    super::queue_candidates::exercise(
+        fixture,
+        request,
+        trust,
+        &claim,
+        grant.generation,
+        submission,
+    );
     super::cancel_worker::exercise(
         fixture,
         request,

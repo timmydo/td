@@ -32,6 +32,7 @@ pub mod email_preview;
 pub mod email_properties;
 pub mod email_property;
 pub mod email_response;
+pub mod postgres_queue_candidates;
 pub mod postgres_queue_expiry;
 pub mod postgres_submission_cancel;
 pub mod queue_clock;

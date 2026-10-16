@@ -3713,3 +3713,31 @@ operation. Later independent receipt inspection confirms its original state
 and single sequence advance. No uncertain response becomes a guessed refusal
 or success. Private response trees use the shared TempDir guard. This qualifies
 the prepared internal path, not production HTTP/relay ownership or cutover.
+
+
+## 134. Bounded route candidate discovery
+
+The prepared route-owner scanner returns at most 64 due submission hints per
+page, separately for fresh and retry recipients. It holds the current policy,
+account and route-owner locks while checking ownership, route health and the
+absence of an active route attempt. Candidates match the immutable route and
+destination, have a live uncompleted submission, and have eligible recipient
+states due at the database observation time. Each hint carries the minimum
+due time among those recipients. No attempt, receipt or sequence is written.
+
+Pages order by due time then submission ID. An opaque continuation binds the
+last returned key to the same claim, generation and candidate kind; one extra
+row establishes whether more candidates existed at that observation. Pages
+are independent bounded reads, not one stable snapshot. A scheduling pass
+must restart from the beginning to discover newly due or moved earlier work.
+The original absolute connection deadline and existing protocol ceilings
+bound each scan; database query work can still grow with the stored queue.
+
+Hints reserve nothing and grant no permission to transmit. Full recipient
+validation, queue-clock admission, current policy, route health and ownership
+remain required by the attempt owner and publication path. The final owner
+check also refuses a scan that outlives its lease. No scheduler, SMTP driver
+or production backend is activated by this API. The real PostgreSQL scenario
+covers multi-page discovery, eligibility filtering, separate retry discovery,
+stale generations, cursor-kind binding, active-attempt refusal and unchanged
+account state during read-only scans.

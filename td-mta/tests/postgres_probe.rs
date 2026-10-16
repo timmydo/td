@@ -11742,3 +11742,6 @@ mod cancel_worker;
 
 #[path = "postgres_probe/cancel_jmap.rs"]
 mod cancel_jmap;
+
+#[path = "postgres_probe/queue_candidates.rs"]
+mod queue_candidates;
