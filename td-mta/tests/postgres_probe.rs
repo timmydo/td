@@ -11813,3 +11813,6 @@ mod dispatch_worker;
 mod native_final_handoff;
 #[path = "postgres_probe/relay_wire.rs"]
 mod relay_wire;
+
+#[path = "postgres_probe/dispatch_recovery.rs"]
+mod dispatch_recovery;

@@ -5089,3 +5089,12 @@ clones this bounded request for one native operation; the caller and operation
 can therefore retain two such vectors concurrently. Its existing batch client
 admits one MiB of output for the parameter arrays and protocol overhead, with
 the unchanged one-MiB/1088-frame input budget and ten-second job deadline.
+
+Recovery publication uses the existing PHASE_IO allowance (3 MiB + 128 KiB)
+and 4096 records before acquiring one ordinary connection slot. Unknown
+COMMIT retains one boxed Recovery in the worker's existing Pending owner;
+settlement uses independently provisioned slots and the same conservative
+work allowance. At the maximum positive-RCPT subset, a caller retry copy,
+Pending request and native operation clone can hold three 409600-byte reply
+vectors concurrently, plus bounded metadata and existing protocol buffers.
+No second queue, wait list or transport owner is created.

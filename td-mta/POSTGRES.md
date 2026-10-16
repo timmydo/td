@@ -4583,3 +4583,27 @@ The real PostgreSQL fixture covers partial evidence with untouched history,
 refusal of replacing Body/Possible replies, maximum-size old and new reply
 cells, stale/foreign/invalid input, expiry hold, rollback, delayed-COMMIT
 settlement, exact replay and preservation of earlier uncertainty.
+
+## 165. Bounded recovery publication and settlement custody
+
+Dispatches accepts a retained recovery operation only after the caller has
+closed or fenced the affected transport. It prepays ordinary PHASE_IO work
+and 4096 records under the supplied job/meter deadline, acquires an ordinary
+slot, and publishes through the native recovery transaction. Known success
+returns only a passive receipt. A known failure releases Pending; the caller
+retains an operation clone for explicit retry.
+
+Unknown COMMIT leaves the exact recovery operation in the same single Pending
+owner used by dispatch and phase publication. All new dispatch, phase,
+recovery and final-capacity work stays blocked. Settlement prepays fresh work
+and uses the caller's independent settlement slots to inspect that exact
+receipt; absence or error retains custody, and only a found receipt clears it.
+Settlement never republishes or creates continuing SMTP authority. This is a
+bounded settlement job, not a renewal of any expired transport owner.
+No production scheduler or backend is activated.
+
+The real PostgreSQL fixture checks runtime mode, budget/deadline/slot refusal,
+exact work charging, known rollback and retry, delayed COMMIT, blocked new
+work, missing-receipt retention and historical settlement while ordinary
+capacity is occupied. It verifies preserved positive replies, attempt
+retirement, and an unchanged account sequence during receipt inspection.

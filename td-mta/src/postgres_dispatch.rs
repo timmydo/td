@@ -5,6 +5,7 @@ use crate::{
     ids::{AttemptId, SubmissionId},
     ports::{self, Clock, Deadline},
     postgres_attempt_phases::{self as phases, Change},
+    postgres_attempt_recovery as recovery,
     postgres_attempts::{self as attempts, Dispatch},
     postgres_probe::{Mode, Request},
     postgres_read::{ReadPermit, ReadSlots},
@@ -31,6 +32,7 @@ pub enum Error {
     Admission(ports::Error),
     Publication(attempts::Error),
     Phase(phases::Error),
+    Recovery(recovery::Error),
 }
 impl From<ports::Error> for Error {
     fn from(error: ports::Error) -> Self {
@@ -94,20 +96,23 @@ pub struct Pending {
 enum Operation {
     Dispatch(Box<Dispatch>),
     Phase(Change),
+    Recovery(Box<recovery::Recovery>),
 }
 impl Operation {
     fn attempt(&self) -> AttemptId {
         match self {
             Self::Dispatch(value) => value.attempt(),
             Self::Phase(value) => value.attempt(),
+            Self::Recovery(value) => value.attempt(),
         }
     }
 }
-/// Historical evidence only: neither variant permits further SMTP output.
+/// Historical evidence only: no variant permits further SMTP output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Settlement {
     Dispatch(attempts::Outcome),
     Phase(phases::Outcome),
+    Recovery(recovery::Outcome),
 }
 impl Pending {
     pub fn attempt(&self) -> Result<Option<AttemptId>, Error> {
@@ -132,7 +137,7 @@ impl Pending {
         };
         let io = match operation {
             Operation::Dispatch(_) => ATTEMPT_IO,
-            Operation::Phase(_) => PHASE_IO,
+            Operation::Phase(_) | Operation::Recovery(_) => PHASE_IO,
         };
         let limit = connection.admit(until, meter, io)?;
         let _slot = connection.slots.acquire().map_err(|_| ports::Error::Busy)?;
@@ -146,6 +151,11 @@ impl Pending {
                 phases::inspect(connection.request, connection.trust, limit, value)
                     .map_err(Error::Phase)?
                     .map(Settlement::Phase)
+            }
+            Operation::Recovery(value) => {
+                recovery::inspect(connection.request, connection.trust, limit, value)
+                    .map_err(Error::Recovery)?
+                    .map(Settlement::Recovery)
             }
         };
         if outcome.is_some() {
@@ -265,6 +275,49 @@ impl<'a, 'r> Dispatches<'a, 'r> {
                     *pending = None;
                 }
                 Err(Error::Publication(error))
+            }
+        }
+    }
+
+    /// Settle an interrupted or abandoned attempt after transport is fenced.
+    /// The caller retains a clone for known-failure retry; unknown COMMIT moves
+    /// exact custody into Pending and can only be inspected there.
+    pub fn publish_recovery(
+        &self,
+        value: recovery::Recovery,
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<recovery::Outcome, Error> {
+        let mut pending = self
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        let limit = self.connection.admit(until, meter, PHASE_IO)?;
+        let _slot = self
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        *pending = Some(Operation::Recovery(Box::new(value)));
+        let Some(Operation::Recovery(value)) = pending.as_ref() else {
+            return Err(ports::Error::Invalid.into());
+        };
+        let result =
+            recovery::publish(self.connection.request, self.connection.trust, limit, value);
+        match result {
+            Ok(outcome) => {
+                *pending = None;
+                Ok(outcome)
+            }
+            Err(error) => {
+                if error != recovery::Error::Indeterminate {
+                    *pending = None;
+                }
+                Err(Error::Recovery(error))
             }
         }
     }

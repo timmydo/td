@@ -51,6 +51,9 @@ pub struct Recovery {
     positive_replies: Vec<String>,
 }
 impl Recovery {
+    pub(crate) fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
     pub fn operation(&self) -> AttemptRecoveryId {
         self.operation
     }
