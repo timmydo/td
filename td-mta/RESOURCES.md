@@ -5182,3 +5182,11 @@ reply copy, reserves no additional cell and cannot return a session. The cells
 remain borrowed until refusal custody is consumed; callers capture evidence
 before extracting buffers. Adapter publication uses its already reserved reply
 storage and original meters. Partial or malformed input retains no result.
+
+The bound DATA-to-body handoff moves its existing BodyResult, Dispatch, inline
+session and MAIL mode into BodyReady after existing final-capacity reservation.
+It adds no reply copy, protocol buffer, heap allocation or connection. Its
+BodyPlan retains the existing final-result ReadPermit; live checks need their
+ordinary additional slot. Reservation failure closes transport and releases
+local custody, while existing durable phase/recovery rules remain in force.
+Immutable source verification and replay retain their separate bounds.

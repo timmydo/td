@@ -5,9 +5,10 @@ use crate::{
     postgres_attempt_phases::Outcome,
     postgres_attempts::Dispatch,
     postgres_dispatch::{self as dispatch, BodyResult, RcptDataPlan},
-    postgres_relay_rcpt,
+    postgres_relay_body as transfer, postgres_relay_rcpt,
     smtp_data_encode::Body,
     smtp_relay_auth::Session,
+    smtp_relay_body,
     smtp_relay_command::{self as command, Scratch},
     tls_io::TlsWireStorage,
 };
@@ -44,10 +45,66 @@ pub struct Completed<'w, 'a, 'r, B: TlsWireStorage> {
     mode: Body,
 }
 impl<'w, 'a, 'r, B: TlsWireStorage> Completed<'w, 'a, 'r, B> {
-    /// The trusted body stage owns matching immutable source and reserved final
-    /// capacity. This handoff cannot be built from historical phase receipts.
-    pub fn into_parts(self) -> (BodyResult<'w, 'a, 'r>, Dispatch, Session<B>, Body) {
-        (self.body, self.dispatch, self.session, self.mode)
+    /// Reserve final capacity without separating actual DATA custody from its
+    /// session and MAIL mode. Failure closes transport before returning.
+    pub fn reserve_body(
+        self,
+        database: &mut Meter,
+    ) -> Result<BodyReady<'w, 'a, 'r, B>, transfer::Refusal<B>> {
+        let plan = match self.body.reserve_final(database) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(transfer::Refusal {
+                    error: transfer::Error::Publication(error),
+                    buffers: self.session.into_buffers(),
+                });
+            }
+        };
+        Ok(BodyReady {
+            plan,
+            dispatch: self.dispatch,
+            session: self.session,
+            mode: self.mode,
+        })
+    }
+    pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
+        self.session.into_buffers()
+    }
+}
+/// Actual DATA custody and its exact final reservation, still tied to the same
+/// session and MAIL mode. The caller owns matching immutable source admission.
+pub struct BodyReady<'w, 'a, 'r, B: TlsWireStorage> {
+    plan: dispatch::BodyPlan<'w, 'a, 'r>,
+    dispatch: Dispatch,
+    session: Session<B>,
+    mode: Body,
+}
+impl<'w, 'a, 'r, B: TlsWireStorage> BodyReady<'w, 'a, 'r, B> {
+    pub fn dispatch(&self) -> &Dispatch {
+        &self.dispatch
+    }
+    pub fn check_current(&self, database: &mut Meter) -> Result<Instant, dispatch::Error> {
+        self.plan.check_current(database)
+    }
+    pub fn begin<'m>(
+        self,
+        source: &'m mut dyn ports::BlobReader,
+        scratch: smtp_relay_body::Scratch<'m>,
+        wire: &'m mut Meter,
+        database: &'m mut Meter,
+    ) -> Result<transfer::Exchange<'m, 'w, 'a, 'r, B>, transfer::Refusal<B>> {
+        transfer::begin(
+            self.plan,
+            self.session,
+            source,
+            self.mode,
+            scratch,
+            wire,
+            database,
+        )
+    }
+    pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
+        self.session.into_buffers()
     }
 }
 pub struct Rejected<B: TlsWireStorage> {

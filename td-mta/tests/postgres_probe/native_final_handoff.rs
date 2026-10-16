@@ -115,18 +115,13 @@ pub(super) fn exercise(
             if data_case >= 4 { 2 } else { 1 }
         );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
-        let (body_owner, body_request, session, mode, ordinal, rcpt) = if matches!(
-            n,
-            95 | 96 | 114 | 115
-        ) {
+        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115) {
             let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
-            let (body_owner, body_request, session, mode) = completed.into_parts();
-            assert_eq!(mode, Body::SevenBit);
+            let ready = completed.reserve_body(&mut database).ok().unwrap();
+            let body_request = ready.dispatch().clone();
             (
-                body_owner,
+                BodyStart::Bound(ready),
                 body_request,
-                session,
-                mode,
                 0,
                 String::from("250 recipient"),
             )
@@ -672,27 +667,26 @@ pub(super) fn exercise(
                     published.publish_body(&data, &mut database).unwrap();
                 (body_owner, body_request, session)
             };
+            assert_eq!(body_owner.attempt(), attempt);
+            assert!(body_owner.check_current(&mut database).unwrap() <= prepared_limit);
+            let plan = body_owner.reserve_final(&mut database).unwrap();
+            assert_eq!(plan.attempt(), attempt);
             (
-                body_owner,
+                BodyStart::Trusted(plan, session),
                 body_request,
-                session,
-                Body::SevenBit,
                 ordinal,
                 rcpt,
             )
         };
-        assert_eq!(body_owner.attempt(), attempt);
         assert_eq!(body_request.attempt(), attempt);
-        assert!(body_owner.check_current(&mut database).unwrap() <= prepared_limit);
-        let plan = body_owner.reserve_final(&mut database).unwrap();
-        assert_eq!(plan.attempt(), attempt);
+        assert!(start.check_current(&mut database).unwrap() <= prepared_limit);
         let occupied = worker.reserve_final(attempt, cap, &mut database).unwrap();
         assert_eq!(
-            plan.check_current(&mut database),
+            start.check_current(&mut database),
             Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
         );
         drop(occupied);
-        plan.check_current(&mut database).unwrap();
+        start.check_current(&mut database).unwrap();
         let mut transferred = Vec::new();
         let handoff = attempts::with_body(
             &runtime,
@@ -705,20 +699,18 @@ pub(super) fn exercise(
                 let mut input = [0; body::INPUT_BYTES];
                 let mut output = [0; body::OUTPUT_BYTES];
                 let mut work = wire::meter(cap);
-                let mut exchange = transfer::begin(
-                    plan,
-                    session,
-                    source,
-                    mode,
-                    body::Scratch {
-                        input: &mut input,
-                        output: &mut output,
-                    },
-                    &mut work,
-                    &mut database,
-                )
-                .ok()
-                .unwrap();
+                let mut exchange = start
+                    .begin(
+                        source,
+                        body::Scratch {
+                            input: &mut input,
+                            output: &mut output,
+                        },
+                        &mut work,
+                        &mut database,
+                    )
+                    .ok()
+                    .unwrap();
                 for _ in 0..100_000 {
                     let mut bytes = [0; 4096];
                     if let IoProgress::Bytes(n) = peer.read(&mut bytes).unwrap() {
@@ -931,4 +923,47 @@ pub(super) fn exercise(
         sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     }
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
+}
+
+// Focused legacy interruption cases keep their explicit trusted input seam;
+// composed envelope cases enter only through the bound DATA owner.
+#[allow(clippy::large_enum_variant)]
+enum BodyStart<'w, 'a, 'r> {
+    Bound(td_mta::postgres_relay_data::BodyReady<'w, 'a, 'r, wire::Buffer>),
+    Trusted(
+        dispatch::BodyPlan<'w, 'a, 'r>,
+        td_mta::smtp_relay_auth::Session<wire::Buffer>,
+    ),
+}
+impl<'w, 'a, 'r> BodyStart<'w, 'a, 'r> {
+    fn check_current(
+        &self,
+        database: &mut td_mta::admission::work::Meter,
+    ) -> Result<std::time::Instant, dispatch::Error> {
+        match self {
+            Self::Bound(ready) => ready.check_current(database),
+            Self::Trusted(plan, _) => plan.check_current(database),
+        }
+    }
+    fn begin<'m>(
+        self,
+        source: &'m mut dyn td_mta::ports::BlobReader,
+        scratch: body::Scratch<'m>,
+        wire: &'m mut td_mta::admission::work::Meter,
+        database: &'m mut td_mta::admission::work::Meter,
+    ) -> Result<transfer::Exchange<'m, 'w, 'a, 'r, wire::Buffer>, transfer::Refusal<wire::Buffer>>
+    {
+        match self {
+            Self::Bound(ready) => ready.begin(source, scratch, wire, database),
+            Self::Trusted(plan, session) => transfer::begin(
+                plan,
+                session,
+                source,
+                Body::SevenBit,
+                scratch,
+                wire,
+                database,
+            ),
+        }
+    }
 }

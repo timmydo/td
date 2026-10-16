@@ -12,7 +12,6 @@ use td_mta::{
     postgres_relay_data as data,
     postgres_route_owners::{self as owners, Claim},
     queue_clock::Guard,
-    smtp_data_encode::Body,
     smtp_relay_command::Scratch,
 };
 pub(super) fn exercise(
@@ -23,7 +22,7 @@ pub(super) fn exercise(
     generation: u64,
     source: SubmissionId,
 ) {
-    for n in 134..=141 {
+    for n in 134..=142 {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -145,7 +144,7 @@ pub(super) fn exercise(
         .ok()
         .unwrap();
         let response: &[u8] = match n {
-            134 | 137 => b"354 continue\r\n",
+            134 | 137 | 142 => b"354 continue\r\n",
             140 => b"250 invalid DATA\r\n",
             141 => b"421 service unavailable\r\n",
             _ => b"550 DATA refused\r\n",
@@ -199,14 +198,28 @@ pub(super) fn exercise(
         let mut settlement = wire::meter(until);
         match result {
             Ok(Some(done)) => {
-                assert_eq!(n, 134);
-                let (body, dispatch, session, mode) = done.into_parts();
-                assert_eq!(mode, Body::SevenBit);
-                assert_eq!(body.attempt(), attempt);
-                assert_eq!(dispatch.attempt(), attempt);
-                body.check_current(&mut settlement).unwrap();
-                drop(body.reserve_final(&mut settlement).unwrap());
-                drop(session.into_buffers().unwrap());
+                assert!(matches!(n, 134 | 142));
+                if n == 142 {
+                    let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let failure = done.reserve_body(&mut settlement).err().unwrap();
+                    assert_eq!(
+                        failure.error,
+                        td_mta::postgres_relay_body::Error::Publication(
+                            dispatch::Error::Admission(td_mta::ports::Error::Busy)
+                        )
+                    );
+                    drop(failure.buffers.unwrap());
+                    drop((first, second));
+                    let mut bytes = [0; 512];
+                    assert!(!matches!(peer.read(&mut bytes), Ok(IoProgress::Bytes(_))));
+                    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=2")), "1");
+                } else {
+                    let ready = done.reserve_body(&mut settlement).ok().unwrap();
+                    assert_eq!(ready.dispatch().attempt(), attempt);
+                    ready.check_current(&mut settlement).unwrap();
+                    drop(ready.into_buffers().unwrap());
+                }
                 let recovery = recovery::interrupted_with_body_rcpt(
                     claim,
                     generation,

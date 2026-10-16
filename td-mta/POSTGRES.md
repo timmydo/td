@@ -4844,8 +4844,9 @@ An actual complete 354 returned by the command parser enters ordered negative
 RCPT publication and new observed Body publication through RcptDataPlan. Only
 known new observed Body before the retained cap returns BodyResult, matching
 Dispatch, same session and mode. Historical receipts or uncertain commits never
-construct this handoff. The trusted body stage still owns matching immutable
-source and final-capacity reservation; explicit into_parts is that boundary.
+construct this handoff. Its consuming reserve_body operation binds final
+capacity before BodyReady begins transfer with the same session and MAIL mode.
+The trusted body stage still owns matching immutable source admission.
 No body bytes or terminator are sent by this command adapter.
 
 An actual negative DATA reply fences the socket before settlement while keeping
@@ -4912,3 +4913,28 @@ The paired TLS regression cases expire the command clock after the read that
 finishes positive, negative and DATA-continuation replies, and distinguish
 partial and trailing-byte input. This extends evidence retention at the parser
 boundary without granting output authority or changing production activation.
+
+## 177. DATA custody through final reservation and body start
+
+Completed no longer splits live Body, session and MAIL mode into independent
+parts. Its reserve_body operation reserves final capacity against that exact
+BodyResult and returns BodyReady with the same session and mode. A refused
+reservation closes transport and returns the existing body-transfer Refusal;
+it grants no body or terminator output. Ordinary interrupted-Body recovery still
+owns durable retirement after that closure.
+
+BodyReady exposes the matching passive Dispatch for immutable body admission
+and the existing live phase check. Its consuming begin passes the private
+BodyPlan, session and mode directly to the body adapter. Original shrinking
+limits, per-write checks, Possible publication before terminator and final
+evidence custody remain unchanged. Explicit buffer extraction closes the
+session and drops local reservation custody. No historical receipt constructs
+either live owner.
+
+The native composed success, final rollback, expiry and unknown-COMMIT cases
+use this handoff. A new mixed-RCPT case occupies both local slots after DATA,
+then verifies failed final reservation closes transport without body output,
+preserves Body state and permits fenced recovery. The trusted immutable-source
+boundary remains explicit, as do separate connection/body-work admission and
+the maximum-message throughput limitation in section 155. Production dispatch
+remains inactive.
