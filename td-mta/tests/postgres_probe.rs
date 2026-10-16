@@ -11808,3 +11808,8 @@ mod attempt_clock;
 
 #[path = "postgres_probe/dispatch_worker.rs"]
 mod dispatch_worker;
+
+#[path = "postgres_probe/native_final_handoff.rs"]
+mod native_final_handoff;
+#[path = "postgres_probe/relay_wire.rs"]
+mod relay_wire;

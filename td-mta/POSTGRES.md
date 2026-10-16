@@ -4196,3 +4196,27 @@ publication ordering and retention, non-final/malformed/truncated refusal,
 live admission refusal, original work expiry, clock mismatch and exhausted
 wire capacity. The existing real PostgreSQL worker fixture independently
 qualifies native live checks and retained final-result publication/retry.
+
+## 151. Native final-handoff integration fixture
+
+The real PostgreSQL queue fixture drives fresh attempts through the public
+prepared relay components on paired verified TLS connections. It publishes
+Prepared before connecting, reads the matching envelope, performs EHLO and
+PLAIN authentication, and sends actual MAIL/RCPT/DATA commands. Actual positive
+RCPT evidence supplies the Body transition after 354. The immutable stored
+transmitted body is verified and streamed through BodyExchange under the same
+runtime clock and original attempt deadline.
+
+Final capacity is reserved before body handoff. Known new AcceptancePossible
+publication supplies FinalResult; the public final exchange sends the terminator
+and publishes the actual 250. The peer checks that PostgreSQL still records
+phase 3 when the terminator arrives, before sending its reply. The fixture
+requires exactly one terminator and inspects the matching durable final receipt.
+A second transaction injects a final-receipt INSERT refusal, retains the exact
+reply owner, removes the fixture fault and explicitly retries that publication.
+
+This qualifies composition of native phase/result ownership and real SMTP TLS
+transport. Fixture policy and credentials are prepared explicitly, and address
+selection uses a local socket pair. It does not qualify resolver/scheduler
+activation or switch the production backend. Existing isolated component tests
+cover the broader malformed reply, live refusal and uncertainty cases.

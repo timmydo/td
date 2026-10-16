@@ -284,6 +284,7 @@ pub(super) fn exercise(
         .iter()
         .all(|candidate| candidate.submission != id(0)));
     super::attempt_envelope::exercise(fixture, request, trust, claim, generation, source);
+    super::native_final_handoff::exercise(fixture, request, trust, claim, generation, source);
     super::dispatch_worker::exercise(fixture, request, trust, claim, generation, source);
     for n in 0..70 {
         let submission = id(n);
