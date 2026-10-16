@@ -4642,3 +4642,27 @@ for DATA, exercises mixed acceptance/refusal through final handoff, settles an
 all-refused batch without DATA, and interrupts after one positive reply while
 preserving its evidence. Failed DATA planning retains both partial and
 all-negative results for their correct settlement.
+
+## 167. Negative DATA custody across RCPT-refusal publication
+
+RcptDataPlan can capture an actual negative DATA reply into its preallocated
+command cells before either database operation is admitted. Private fields
+prevent substituting either half of the pair; explicit into_parts retains the
+existing caller-managed path and its evidence/order obligations. The caller fences
+the matching SMTP session first. It then publishes any negative RCPT subset
+before the negative DATA result. Both exact operations stay together on a
+known failure; a successful RCPT publication is removed from the retained
+sequence. Unknown COMMIT stays in the existing Pending owner and blocks retry
+until inspection settles it. Receipt replay can only continue passive result
+publication, never SMTP output.
+
+Retries retain the original identity, actual replies and minimum admitted
+limit across both steps. An empty budget, occupied slot or expired deadline
+preserves that custody and cannot renew the cap. This is not post-expiry
+settlement or general SMTP orchestration; no backend is activated. Existing
+low-level paths retain their explicit caller responsibilities.
+
+The native paired TLS fixture captures a mixed RCPT/negative-DATA exchange,
+forces rollback at either publication, checks intermediate state and retained
+identity, refuses retry with an empty budget, and then verifies both exact
+results and attempt retirement.

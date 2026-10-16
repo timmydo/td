@@ -793,12 +793,95 @@ pub struct RcptResult<'w, 'a, 'r> {
     envelope: Box<EnvelopePlan<'w, 'a, 'r>>,
     evidence: phases::RcptEvidence,
 }
-/// Publish any refusal before the DATA result. Actual DATA sequencing and
-/// preserving its reply across a failed refusal publication remain caller duties.
+/// Exact negative-RCPT request paired with DATA alternatives. Actual command
+/// sequencing remains the caller's duty; negative publication retains both steps.
 pub struct RcptDataPlan<'w, 'a, 'r> {
-    pub data: DataPlan<'w, 'a, 'r>,
-    pub refusal: Option<Change>,
+    data: DataPlan<'w, 'a, 'r>,
+    refusal: Option<Change>,
 }
+impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
+    pub fn attempt(&self) -> AttemptId {
+        self.data.attempt()
+    }
+    pub fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        self.data.check_current(meter)
+    }
+    /// Split for explicit caller-managed ordering and evidence retention.
+    pub fn into_parts(self) -> (DataPlan<'w, 'a, 'r>, Option<Change>) {
+        (self.data, self.refusal)
+    }
+    /// Capture actual negative DATA before admitting either database operation.
+    /// The matching SMTP session must be closed/fenced before publication.
+    pub fn record_refusal(
+        self,
+        reply: &str,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, RcptCommandFailure<'w, 'a, 'r>> {
+        let command = self
+            .data
+            .retain_refusal(reply)
+            .map_err(|error| RcptCommandFailure {
+                error,
+                retained: None,
+            })?;
+        RcptCommand {
+            command,
+            refusal: self.refusal,
+        }
+        .publish(meter)
+    }
+}
+/// Failed negative DATA settlement retains both actual command evidence and
+/// any preceding RCPT refusal. It never grants transport authority.
+pub struct RcptCommandFailure<'w, 'a, 'r> {
+    pub error: Error,
+    retained: Option<RcptCommand<'w, 'a, 'r>>,
+}
+impl std::fmt::Debug for RcptCommandFailure<'_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RcptCommandFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+struct RcptCommand<'w, 'a, 'r> {
+    command: RetainedCommand<'w, 'a, 'r>,
+    refusal: Option<Change>,
+}
+impl<'w, 'a, 'r> RcptCommand<'w, 'a, 'r> {
+    fn publish(
+        mut self,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, RcptCommandFailure<'w, 'a, 'r>> {
+        let result = (|| {
+            if let Some(refusal) = self.refusal.as_ref() {
+                self.command.try_publish_value(refusal.clone(), meter)?;
+                self.refusal = None;
+            }
+            self.command.try_publish(meter)
+        })();
+        result.map_err(|error| RcptCommandFailure {
+            error,
+            retained: Some(self),
+        })
+    }
+}
+impl<'w, 'a, 'r> RcptCommandFailure<'w, 'a, 'r> {
+    pub fn attempt(&self) -> Option<AttemptId> {
+        self.retained
+            .as_ref()
+            .map(|retained| retained.command.value.attempt())
+    }
+    /// Unknown COMMIT must first settle through Pending. Retrying preserves
+    /// original identity, evidence, ordering and the earliest admitted cap.
+    pub fn retry(mut self, meter: &mut Meter) -> Result<phases::Outcome, Self> {
+        match self.retained.take() {
+            Some(retained) => retained.publish(meter),
+            None => Err(self),
+        }
+    }
+}
+
 /// Passive exact requests for an already fenced session. Publish refusal first;
 /// unknown COMMIT must settle before recovery. An all-refused complete batch
 /// needs no recovery because refusal publication itself retires the attempt.
@@ -929,18 +1012,22 @@ impl<'w, 'a, 'r> DataPlan<'w, 'a, 'r> {
         reply: &str,
         meter: &mut Meter,
     ) -> Result<phases::Outcome, CommandFailure<'w, 'a, 'r>> {
-        let value = self.reply.finish(reply).map_err(|error| CommandFailure {
-            error: Error::Phase(error),
-            retained: None,
-        })?;
+        self.retain_refusal(reply)
+            .map_err(|error| CommandFailure {
+                error,
+                retained: None,
+            })?
+            .publish(meter)
+    }
+    fn retain_refusal(self, reply: &str) -> Result<RetainedCommand<'w, 'a, 'r>, Error> {
+        let value = self.reply.finish(reply).map_err(Error::Phase)?;
         let prepared = self.envelope.prepared;
-        RetainedCommand {
+        Ok(RetainedCommand {
             worker: prepared.worker,
             limit: prepared.limit,
             until: prepared.until,
             value,
-        }
-        .publish(meter)
+        })
     }
 }
 
@@ -974,6 +1061,13 @@ impl<'w, 'a, 'r> RetainedCommand<'w, 'a, 'r> {
         }
     }
     fn try_publish(&mut self, meter: &mut Meter) -> Result<phases::Outcome, Error> {
+        self.try_publish_value(self.value.clone(), meter)
+    }
+    fn try_publish_value(
+        &mut self,
+        value: Change,
+        meter: &mut Meter,
+    ) -> Result<phases::Outcome, Error> {
         let worker = self.worker;
         let mut pending = worker
             .pending
@@ -998,7 +1092,7 @@ impl<'w, 'a, 'r> RetainedCommand<'w, 'a, 'r> {
             &worker.connection,
             &worker.guard,
             &mut pending,
-            self.value.clone(),
+            value,
             self.limit,
             None,
         )

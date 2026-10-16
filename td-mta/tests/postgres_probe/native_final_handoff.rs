@@ -34,6 +34,8 @@ pub(super) fn exercise(
         (103, false, 0, 4),
         (104, false, 0, 5),
         (105, false, 0, 6),
+        (106, false, 0, 7),
+        (107, false, 0, 8),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
@@ -237,7 +239,7 @@ pub(super) fn exercise(
             assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
             let recipient = published.next_recipient().unwrap();
             let ordinal = recipient.ordinal;
-            let negative = data_case == 5 || (data_case == 4 && ordinal == 1);
+            let negative = data_case == 5 || (matches!(data_case, 4 | 7 | 8) && ordinal == 1);
             let (next, reply) = wire::command(
                 session,
                 &mut peer,
@@ -289,8 +291,67 @@ pub(super) fn exercise(
         assert!(result.evidence().is_complete());
         let (ordinal, rcpt) = result.evidence().accepted().first().unwrap().clone();
         let result = result.reserve_data().unwrap();
-        let mut published = result.data;
-        let refusal = result.refusal;
+        if matches!(data_case, 7 | 8) {
+            let mut result = result;
+            assert!(result.check_current(&mut database).unwrap() <= prepared_limit);
+            let (session, data) = wire::command(
+                session,
+                &mut peer,
+                clock.clone(),
+                cap,
+                command::Command::Data,
+                b"DATA\r\n",
+                b"550 data refused\r\n",
+            );
+            drop(session.into_buffers().unwrap());
+            let table = if data_case == 7 {
+                "attempt_rcpt_receipts"
+            } else {
+                "attempt_command_receipts"
+            };
+            let trigger = format!("reject_mixed_data_{n}");
+            sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'mixed DATA fixture'; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON td_mta.{table} FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
+            let failure = result.record_refusal(&data, &mut database).unwrap_err();
+            assert_eq!(
+                failure.error,
+                dispatch::Error::Phase(phases::Error::Database)
+            );
+            assert_eq!(failure.attempt(), Some(attempt));
+            assert_eq!(pending.attempt().unwrap(), None);
+            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 7 { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
+            sql(
+                fixture,
+                &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+            );
+            let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
+            let failure = failure.retry(&mut empty).unwrap_err();
+            assert_eq!(
+                failure.error,
+                dispatch::Error::Admission(td_mta::ports::Error::Capacity)
+            );
+            assert_eq!(failure.attempt(), Some(attempt));
+            let outcome = failure.retry(&mut database).unwrap();
+            let value = phases::refused_data_command(
+                claim,
+                generation,
+                attempt,
+                &[(ordinal, &rcpt)],
+                &data,
+            )
+            .unwrap();
+            assert_eq!(
+                phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                Some(outcome)
+            );
+            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
+            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_rcpt_receipts WHERE attempt_id=decode('{attempt}','hex')")), "1");
+            assert_eq!(pending.attempt().unwrap(), None);
+            drop(peer.into_buffers().unwrap());
+            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            continue;
+        }
+        let (mut published, refusal) = result.into_parts();
         assert_eq!(published.attempt(), attempt);
         assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
         let (session, data) = wire::command(

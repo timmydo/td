@@ -5110,3 +5110,12 @@ contain at most 409600 reply bytes. Bounded borrowed-reply vectors, envelope,
 claim and hash metadata are additional. Planning failures drop incomplete
 alternatives and retain the original collection. Native publication copies
 and protocol buffers retain their separately documented bounds.
+
+Mixed negative-DATA settlement retains at most the DATA CommandReply's two
+100-by-4096 vectors and the disjoint negative-RCPT cells, bounded by 819200
+reply bytes. Capturing the actual DATA reply drops the unused Body alternative;
+retained failures and Pending phase references share immutable Change storage.
+The envelope box was reserved before RCPT, and no new reply vector is allocated
+between capture and database admission. Metadata and native protocol copies
+retain their separate bounds. Each attempted publication charges PHASE_IO and
+4096 records; successful preceding RCPT work is not repeated on a known retry.
