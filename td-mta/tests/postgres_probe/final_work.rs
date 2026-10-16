@@ -1,4 +1,4 @@
-use super::deadline;
+use super::{deadline, sql, Fixture};
 use std::{thread, time::Duration};
 use td_mta::{
     admission::work::{Charge, Meter},
@@ -11,6 +11,7 @@ use td_mta::{
 };
 
 pub(super) fn exercise(
+    fixture: &Fixture,
     worker: &dispatch::Dispatches<'_, '_>,
     claim: &Claim,
     generation: u64,
@@ -198,7 +199,23 @@ pub(super) fn exercise(
         held.check_current(&mut meter()),
         Err(Error::Admission(ports::Error::Busy))
     );
-    let outcome = held.record("250 queued").unwrap();
+    sql(fixture,"CREATE FUNCTION public.reject_retained_final() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture refusal'; END $$; CREATE TRIGGER reject_retained_final BEFORE INSERT ON td_mta.attempt_acceptance_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_retained_final()");
+    let failed = held.record("250 queued").unwrap_err();
+    assert_eq!(failed.error, Error::Phase(phases::Error::Database));
+    assert_eq!(failed.attempt(), Some(attempt));
+    assert!(matches!(
+        roomy.reserve_final(attempt, until(10_000), &mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
+    sql(
+        fixture,
+        "DROP TRIGGER reject_retained_final ON td_mta.attempt_acceptance_receipts",
+    );
+    let mut empty = Meter::new(until(10_000), Charge::default());
+    let failed = failed.retry(&mut empty).unwrap_err();
+    assert_eq!(failed.error, Error::Admission(ports::Error::Capacity));
+    assert_eq!(failed.attempt(), Some(attempt));
+    let outcome = failed.retry(&mut meter()).unwrap();
     assert_eq!(
         phases::inspect(
             worker.connection.request,

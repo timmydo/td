@@ -364,7 +364,7 @@ pub(super) fn exercise(
         sequence
     );
     assert_eq!(pending.attempt().unwrap(), None);
-    super::final_work::exercise(&worker, claim, generation, attempt);
+    super::final_work::exercise(fixture, &worker, claim, generation, attempt);
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();

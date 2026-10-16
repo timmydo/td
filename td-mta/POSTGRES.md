@@ -4132,3 +4132,26 @@ explains. The future transport owner must call this path internally, retain the
 matching body transaction and final-result capacity, and abort on refusal;
 caller-supplied receipts or Instants cannot authorize terminator output.
 BodySent remains closed and no scheduler is enabled.
+
+## 149. Retained final-publication failures
+
+FinalResult recording returns a non-cloneable FinalFailure when publication
+fails. Once genuine normalized final reply text has been prepared, that failure
+retains the exact immutable Change and original FinalWork slot/deadline. A
+known database refusal no longer discards the actual reply or local capacity.
+Invalid reply preparation has no retained final evidence. Debug output exposes
+only the error, not reply text or connection credentials.
+
+An explicit retry prepays another bounded phase I/O/record allowance while
+using the held slot. It cannot replace the attempt, subset or reply, and its
+deadline can only shorten the original work limit. Budget, deadline and Pending
+refusals return the still-retained failure owner. There is no automatic retry
+or new job lifetime. Unknown COMMIT also keeps the exact request in Pending;
+that operation must settle historically before another publication can proceed.
+
+Success releases the local owner. Explicit drop abandons local custody and
+releases its slot; it neither consumes nor deletes the durable reservation.
+The bounded runtime must retain or settle its actual reply before dropping
+that responsibility, and recovery remains conservative after a crash. The
+low-level FinalWork consuming API remains storage machinery; future handoff
+uses the retained FinalResult failure path. No terminator API is opened here.

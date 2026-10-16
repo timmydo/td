@@ -393,7 +393,7 @@ pub struct FinalResult<'w, 'a, 'r> {
     work: FinalWork<'w, 'a, 'r>,
     outcome: phases::Outcome,
 }
-impl FinalResult<'_, '_, '_> {
+impl<'w, 'a, 'r> FinalResult<'w, 'a, 'r> {
     pub fn attempt(&self) -> AttemptId {
         self.possible.attempt()
     }
@@ -437,9 +437,78 @@ impl FinalResult<'_, '_, '_> {
     }
     /// Consume retained capacity for the actual normalized final DATA reply.
     /// No caller-supplied Change can replace the original attempt or subset.
-    pub fn record(self, reply: &str) -> Result<phases::Outcome, Error> {
-        let value = self.reply.finish(reply).map_err(Error::Phase)?;
-        self.work.publish(value)
+    pub fn record(self, reply: &str) -> Result<phases::Outcome, FinalFailure<'w, 'a, 'r>> {
+        let value = self.reply.finish(reply).map_err(|error| FinalFailure {
+            error: Error::Phase(error),
+            retained: None,
+        })?;
+        RetainedFinal {
+            work: self.work,
+            value,
+        }
+        .publish()
+    }
+}
+
+/// A failed final publication retains genuine reply evidence and its reserved
+/// slot. Dropping it abandons local custody, not the durable capacity claim.
+pub struct FinalFailure<'w, 'a, 'r> {
+    pub error: Error,
+    retained: Option<RetainedFinal<'w, 'a, 'r>>,
+}
+impl std::fmt::Debug for FinalFailure<'_, '_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+struct RetainedFinal<'w, 'a, 'r> {
+    work: FinalWork<'w, 'a, 'r>,
+    value: Change,
+}
+impl<'w, 'a, 'r> RetainedFinal<'w, 'a, 'r> {
+    fn publish(self) -> Result<phases::Outcome, FinalFailure<'w, 'a, 'r>> {
+        match self.work.publish_retained(self.value.clone()) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(FinalFailure {
+                error,
+                retained: Some(self),
+            }),
+        }
+    }
+}
+impl<'w, 'a, 'r> FinalFailure<'w, 'a, 'r> {
+    pub fn attempt(&self) -> Option<AttemptId> {
+        self.retained.as_ref().map(|value| value.value.attempt())
+    }
+    /// Explicitly prepay another publication attempt using the same held slot.
+    /// Admission failures retain custody; the original deadline cannot renew.
+    /// Unknown COMMIT must first settle through the worker's Pending owner.
+    pub fn retry(mut self, meter: &mut Meter) -> Result<phases::Outcome, Self> {
+        let Some(mut retained) = self.retained.take() else {
+            return Err(self);
+        };
+        let admission = (|| {
+            if Instant::now() >= retained.work.limit {
+                return Err(ports::Error::Deadline.into());
+            }
+            let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+            retained
+                .work
+                .worker
+                .connection
+                .admit(until, meter, PHASE_IO)
+        })();
+        match admission {
+            Ok(limit) => retained.work.limit = retained.work.limit.min(limit),
+            Err(error) => {
+                self.error = error;
+                self.retained = Some(retained);
+                return Err(self);
+            }
+        }
+        retained.publish()
     }
 }
 
@@ -457,6 +526,9 @@ impl FinalWork<'_, '_, '_> {
     /// Unknown COMMIT transfers the request to the worker's existing Pending.
     /// No fresh connection slot or work charge is needed at consumption.
     pub fn publish(self, value: Change) -> Result<phases::Outcome, Error> {
+        self.publish_retained(value)
+    }
+    fn publish_retained(&self, value: Change) -> Result<phases::Outcome, Error> {
         if !value.is_final_for(self.attempt) {
             return Err(ports::Error::Invalid.into());
         }
