@@ -1493,6 +1493,29 @@ only after both families complete and the original budget still permits it;
 errors leave caller addresses unchanged. Configured-name admission, worker
 scheduling and cache integration remain separate owners.
 
+The prepared `dns_owner::Configured` implements the Resolver port for one
+exclusively owned fixed worker. Construct it from the active configuration's
+outbound and certificate views, a nonzero configuration generation, the shared
+runtime clock, worker-local entropy and the single reserved packet cell. It
+admits only the configured relay hostname and optional ACME directory hostname,
+case-insensitively. No raw-host registration API admits incoming names, alias
+targets or arbitrary application destinations. The service owner has two fixed
+endpoint slots; offline migration's separately authorized temporary destination
+is outside this service owner. Constructing the port does not start a worker
+or activate outbound delivery.
+
+The cache key is endpoint slot plus configuration generation. Entries retain
+only final addresses and absolute expiry, never alias paths, and a hit requires
+strictly future expiry. Unknown names, expired caller deadlines and insufficient
+output capacity refuse before network work. Expired entries are retired before
+refresh; failures never serve stale data. Every miss creates one bounded work
+meter under the caller's original deadline and uses the configured resolver
+order. Zero-TTL and missing-family results are returned for the current call
+but never inserted. A cache hit that expires before final publication refuses.
+The caller output prefix changes only after the final clock check; errors
+preserve it. Configuration borrows, resolver order and generation stay fixed
+for the owner's lifetime, consistent with restart-only resolver changes.
+
 No design can promise survival of arbitrary dependency panic, kernel OOM kill,
 or storage failure. Do not use catch_unwind as storage recovery. An unexpected
 worker failure makes health fail and the service stop accepting new mutations;

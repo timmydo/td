@@ -517,11 +517,14 @@ assigned slots. A job retaining an incremental body handle or a MIME owner
 borrowing it stays on the worker that opened it until close. Pending
 releases execution time, not that job's thread affinity; main exchanges
 only scalar completion data and caller buffers, never the body owner. A
-waiting network peer never occupies a worker while idle after dial: retain
-state in its existing slot and return Pending to main. The explicit
+waiting SMTP/HTTPS peer never occupies a worker while idle after dial: retain
+state in its existing slot and return Pending to main. The SMTP/HTTPS dial
 exception is std's blocking connect_timeout: only the sole outbound slot
 may dial, so at most one of the two handshake workers is occupied by it.
-The other remains available for inbound handshakes. A pending handshake is
+The other remains available for inbound handshakes. DNS packet exchanges
+separately occupy the sole resolver worker during bounded UDP/TCP waits;
+they do not borrow handshake workers or create replacement threads. Every
+DNS wait retains the original job deadline and the per-operation idle cap. A pending handshake is
 dispatched again after ten milliseconds, at most one queued/running step
 per slot. Each step does bounded nonblocking I/O/crypto and returns one
 completion; it never waits for socket readiness. The compiled
@@ -4977,3 +4980,15 @@ original total deadline and sticky work meter. Boundary/entropy checks charge
 record units in addition to the transport's I/O and decoder charges. No
 per-query collection grows; successful output changes only its returned
 prefix. Cache state is not allocated by this owner.
+
+The configured service resolver uses two endpoint/cache slots (relay and
+optional ACME), within the proposed 128-entry reservation. Each cache entry is
+compile-time capped at 384 bytes and keys final addresses/expiry by endpoint
+index and configuration generation. Names borrow the immutable configuration;
+no CNAME history survives in cache. The owner borrows exactly the single
+65535-byte packet cell and stores at most four numeric server endpoints. A
+miss stages one fixed 16-address set and grants at most 4,000,000 record units,
+64 MiB of attempted I/O and 1 MiB of query output under the original caller
+deadline. These are work counters, not allocated storage. A hit performs only
+bounded name/key/clock checks and a fixed address copy. No background refresh,
+per-request thread or growing collection is introduced.
