@@ -4556,3 +4556,30 @@ batches, including 100 maximum-size distinct replies, and compares publication
 receipts against the existing constructor. It exercises invalid input without
 losing earlier evidence, partial collections, all-positive collections, and
 continues the positive subset through Body using its retained actual text.
+
+## 164. Positive RCPT evidence on current-owner interruption
+
+Current-owner recovery can retain an ordered subset of actual positive RCPT
+replies that has not yet reached Body. interrupted_with_rcpt binds at most
+100 normalized 4096-byte replies to the exact retained recovery operation;
+a domain-separated digest includes their ordinals and text. The existing
+no-evidence interruption and abandoned-recovery encodings stay unchanged.
+
+Publication requires every supplied recipient to remain InFlight/Prepared
+under the current attempt and owner fence. A foreign, settled, Body or
+AcceptancePossible recipient refuses the whole operation. Within the existing
+atomic recovery transaction, supplied positive replies replace prior RCPT
+history and clear prior DATA history before the ordinary interruption state
+transition. Other recipients retain their recorded evidence, and earlier
+uncertainty remains latched. This cannot establish Body or authorize new SMTP
+output: the caller must first close or fence the interrupted session.
+
+The publisher uses the existing bounded batch client so 100 maximum-size
+reply parameters fit within its one-MiB output allowance. Input remains one
+MiB/1088 frames and the original ten-second deadline cannot renew. Existing
+replay, expiry hold, receipt capacity, sequence and unknown-COMMIT rules apply.
+
+The real PostgreSQL fixture covers partial evidence with untouched history,
+refusal of replacing Body/Possible replies, maximum-size old and new reply
+cells, stale/foreign/invalid input, expiry hold, rollback, delayed-COMMIT
+settlement, exact replay and preservation of earlier uncertainty.

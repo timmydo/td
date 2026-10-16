@@ -47,6 +47,8 @@ pub struct Recovery {
     operation: AttemptRecoveryId,
     digest: [u8; 32],
     current: bool,
+    positive_ordinals: Vec<i64>,
+    positive_replies: Vec<String>,
 }
 impl Recovery {
     pub fn operation(&self) -> AttemptRecoveryId {
@@ -67,6 +69,60 @@ pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Rec
 /// must close/fence transport before publication; this never authorizes sends.
 pub fn interrupted(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Recovery, Error> {
     prepare_mode(claim, generation, attempt, true)
+}
+/// Settle an interrupted current attempt with actual positive RCPT replies
+/// not yet published as Body. The caller must fence transport before publish.
+pub fn interrupted_with_rcpt(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    accepted: &[(u32, &str)],
+) -> Result<Recovery, Error> {
+    if accepted.is_empty() || accepted.len() > 100 {
+        return Err(Error::Integrity);
+    }
+    let mut value = prepare_mode(claim, generation, attempt, true)?;
+    value
+        .positive_ordinals
+        .try_reserve_exact(accepted.len())
+        .map_err(|_| Error::Capacity)?;
+    value
+        .positive_replies
+        .try_reserve_exact(accepted.len())
+        .map_err(|_| Error::Capacity)?;
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    hash.update(b"td-mta interrupted positive RCPT evidence v1")
+        .map_err(|_| Error::Crypto)?;
+    hash.update(&value.digest).map_err(|_| Error::Crypto)?;
+    hash.update(&(accepted.len() as u64).to_be_bytes())
+        .map_err(|_| Error::Crypto)?;
+    for (ordinal, reply) in accepted {
+        let ordinal = i64::from(*ordinal);
+        if ordinal >= 1000
+            || value
+                .positive_ordinals
+                .last()
+                .is_some_and(|last| *last >= ordinal)
+            || crate::format::row::smtp_reply_text(reply).is_err()
+            || crate::recipient_sweep::reply_class(Some(reply)) != Some(2)
+        {
+            return Err(Error::Integrity);
+        }
+        let mut retained = String::new();
+        retained
+            .try_reserve_exact(reply.len())
+            .map_err(|_| Error::Capacity)?;
+        retained.push_str(reply);
+        hash.update(&ordinal.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(&(reply.len() as u64).to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(reply.as_bytes()).map_err(|_| Error::Crypto)?;
+        value.positive_ordinals.push(ordinal);
+        value.positive_replies.push(retained);
+    }
+    value.digest = hash.finish().map_err(|_| Error::Crypto)?;
+    Ok(value)
 }
 fn prepare_mode(
     claim: &Claim,
@@ -109,6 +165,8 @@ fn prepare_mode(
         operation: AttemptRecoveryId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
         current,
+        positive_ordinals: Vec::new(),
+        positive_replies: Vec::new(),
     })
 }
 fn number(bytes: &[u8]) -> Result<u64, Error> {
@@ -195,7 +253,7 @@ pub fn publish(
     let mut entropy = SystemEntropy::try_new().map_err(|_| Error::Crypto)?;
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             let policy = owners::begin(client, &value.claim, true, true)
                 .await
@@ -289,6 +347,7 @@ pub fn publish(
                     .try_reserve_exact(rows.len())
                     .map_err(|_| Error::Capacity)?;
             }
+            let mut matched_positive = 0usize;
             for row in &rows {
                 let ordinal: i64 = row.try_get(0).map_err(|_| Error::Integrity)?;
                 let uncertain: i64 = row.try_get(1).map_err(|_| Error::Integrity)?;
@@ -311,6 +370,12 @@ pub fn publish(
                     && (crate::recipient_sweep::reply_class(rcpt) != Some(2) || data.is_some())
                 {
                     return Err(Error::Integrity);
+                }
+                if value.positive_ordinals.binary_search(&ordinal).is_ok() {
+                    if !value.current || phase != 1 {
+                        return Err(Error::Integrity);
+                    }
+                    matched_positive += 1;
                 }
                 if timestamp < last {
                     return Err(Error::Clock);
@@ -335,6 +400,9 @@ pub fn publish(
                 retries.push(retry);
                 reasons.push(reason);
             }
+            if matched_positive != value.positive_ordinals.len() {
+                return Err(Error::Integrity);
+            }
             crate::postgres_final_capacity::consume(client, account, attempt, &possible)
                 .await
                 .map_err(capacity)?;
@@ -354,6 +422,11 @@ pub fn publish(
                 })?;
             let changed = next.to_be_bytes();
             let changed = changed.as_slice();
+            if !value.positive_ordinals.is_empty()
+                && client.execute("UPDATE td_mta.recipients r SET rcpt_reply=p.reply,data_reply=NULL FROM unnest($4::bigint[],$5::text[]) p(ordinal,reply) WHERE r.account=$1 AND r.submission_id=$2 AND r.attempt_id=$3 AND r.state=2 AND r.phase=1 AND r.ordinal=p.ordinal", &[&account,&submission,&attempt,&value.positive_ordinals,&value.positive_replies]).await.map_err(|_|Error::Database)? != value.positive_ordinals.len() as u64
+            {
+                return Err(Error::Integrity);
+            }
             if client.execute("UPDATE td_mta.recipients r SET state=u.state,uncertain=u.uncertain,phase=4,next_attempt_at=u.retry,reason=u.reason,diagnostic='',changed=$8 FROM unnest($3::bigint[],$4::bigint[],$5::bigint[],$6::bigint[],$7::bigint[]) u(ordinal,state,uncertain,retry,reason) WHERE r.account=$1 AND r.submission_id=$2 AND r.ordinal=u.ordinal", &[&account,&submission,&selected,&states,&uncertainties,&retries,&reasons,&changed]).await.map_err(|_|Error::Database)?!=rows.len() as u64 {return Err(Error::Integrity)}
             if client.execute("UPDATE td_mta.submission_attempts SET active=false WHERE account=$1 AND attempt_id=$2 AND active", &[&account,&attempt]).await.map_err(|_|Error::Database)?!=1 {return Err(Error::Integrity)}
             if client

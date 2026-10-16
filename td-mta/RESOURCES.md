@@ -5082,3 +5082,10 @@ Bounded ordinal and result vectors, claim metadata and one retained hash
 context are additional. Finish drops unused cells and creates no reply copies.
 The resulting refusal uses the existing phase publisher's separate database
 memory and admission bounds; positive evidence is passive retained text.
+
+Current-owner interruption may retain 100 positive RCPT replies of 4096 bytes,
+or 409600 reply bytes plus ordered ordinals and operation metadata. Recovery
+clones this bounded request for one native operation; the caller and operation
+can therefore retain two such vectors concurrently. Its existing batch client
+admits one MiB of output for the parameter arrays and protocol overhead, with
+the unchanged one-MiB/1088-frame input budget and ten-second job deadline.
