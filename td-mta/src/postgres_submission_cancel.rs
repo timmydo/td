@@ -1,8 +1,11 @@
 //! Whole-submission cancellation, reserved before closing owned transport.
 use crate::{
-    ids::{StoreEpoch, SubmissionCancelId, SubmissionId},
+    device_credentials::Presented,
+    ids::{DeviceId, StoreEpoch, SubmissionCancelId, SubmissionId},
+    postgres_devices,
     postgres_probe::{self, Request},
     postgres_route_owners::{self as owners, Claim},
+    postgres_runtime_profile::Binding,
 };
 use std::{
     sync::{
@@ -18,6 +21,8 @@ use tokio_postgres::Client;
 pub enum Error {
     Connection(postgres_probe::Error),
     Owner(owners::Error),
+    Credential(postgres_devices::Error),
+    Unauthenticated,
     Policy,
     Missing,
     CannotUnsend,
@@ -37,8 +42,58 @@ pub struct Cancellation {
     generation: u64,
     submission: SubmissionId,
     expected: Option<u64>,
+    authorization: Option<Authorization>,
     operation: SubmissionCancelId,
     digest: [u8; 32],
+}
+#[derive(Clone)]
+struct Authorization {
+    binding: Binding,
+    device: DeviceId,
+}
+/// Passive request identity. Publication checks the current device credential
+/// while holding the same account lock as revocation.
+pub struct ClientRequest<'a> {
+    pub binding: &'a Binding,
+    pub device: DeviceId,
+    pub expected: Option<(StoreEpoch, u64)>,
+}
+fn client_policy(claim: &Claim, binding: &Binding) -> Result<(), Error> {
+    let owner = claim.binding();
+    if !binding.roles().jmap()
+        || binding.account() != owner.account()
+        || binding.epoch() != owner.epoch()
+        || binding.selection() != owner.selection()
+    {
+        return Err(Error::Policy);
+    }
+    Ok(())
+}
+/// Prepare a client cancellation for a relay owner of the same account and
+/// selected configuration. No password or authentication result is retained.
+pub fn prepare_for_device(
+    claim: &Claim,
+    generation: u64,
+    submission: SubmissionId,
+    input: ClientRequest<'_>,
+) -> Result<Cancellation, Error> {
+    client_policy(claim, input.binding)?;
+    if input
+        .expected
+        .is_some_and(|(epoch, _)| epoch != input.binding.epoch())
+    {
+        return Err(Error::StateMismatch);
+    }
+    prepare_inner(
+        claim,
+        generation,
+        submission,
+        input.expected.map(|(_, sequence)| sequence),
+        Some(Authorization {
+            binding: input.binding.clone(),
+            device: input.device,
+        }),
+    )
 }
 impl Cancellation {
     pub fn operation(&self) -> SubmissionCancelId {
@@ -59,7 +114,7 @@ pub fn prepare(
     generation: u64,
     submission: SubmissionId,
 ) -> Result<Cancellation, Error> {
-    prepare_inner(claim, generation, submission, None)
+    prepare_inner(claim, generation, submission, None, None)
 }
 /// Bind a caller's account state to the whole cancellation. Epoch mismatch
 /// refuses preparation; publication checks sequence under the account lock.
@@ -72,13 +127,14 @@ pub fn prepare_if_state(
     if expected.0 != claim.binding().epoch() {
         return Err(Error::StateMismatch);
     }
-    prepare_inner(claim, generation, submission, Some(expected.1))
+    prepare_inner(claim, generation, submission, Some(expected.1), None)
 }
 fn prepare_inner(
     claim: &Claim,
     generation: u64,
     submission: SubmissionId,
     expected: Option<u64>,
+    authorization: Option<Authorization>,
 ) -> Result<Cancellation, Error> {
     if generation == 0 {
         return Err(Error::Integrity);
@@ -112,11 +168,23 @@ fn prepare_inner(
         hash.update(&expected.to_be_bytes())
             .map_err(|_| Error::Crypto)?;
     }
+    if let Some(authority) = &authorization {
+        for field in [
+            b"jmap-device-authorization-v1".as_slice(),
+            authority.binding.profile().as_bytes(),
+            authority.device.as_bytes().as_slice(),
+        ] {
+            hash.update(&(field.len() as u64).to_be_bytes())
+                .map_err(|_| Error::Crypto)?;
+            hash.update(field).map_err(|_| Error::Crypto)?;
+        }
+    }
     Ok(Cancellation {
         claim: claim.clone(),
         generation,
         submission,
         expected,
+        authorization,
         operation: SubmissionCancelId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
@@ -186,7 +254,8 @@ pub fn inspect(
 /// It runs only after the entire mutation fits and its staging memory exists,
 /// under the policy/account/route locks. It must obey the supplied deadline.
 /// Receipt replay and already-canceled submissions do not invoke it.
-/// This storage API does not establish client or operator authorization.
+/// This internal entry point does not establish client/operator authorization.
+/// A fresh device-bound preparation requires `publish_authenticated`.
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -194,9 +263,47 @@ pub fn publish(
     value: &Cancellation,
     close: impl FnOnce(Instant) -> Result<(), Error> + 'static,
 ) -> Result<Outcome, Error> {
+    publish_inner(request, trust, deadline, value, None, close)
+}
+/// Trusted client adapter: new publication requires a device-bound preparation
+/// and a fresh credential. Known receipt settlement grants no new authority
+/// and remains available without the original password after revocation.
+/// The local-close contract of `publish` applies.
+pub fn publish_authenticated(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Cancellation,
+    password: &[u8],
+    close: impl FnOnce(Instant) -> Result<(), Error> + 'static,
+) -> Result<Outcome, Error> {
+    if value.authorization.is_none() {
+        return Err(Error::Policy);
+    }
+    publish_inner(request, trust, deadline, value, Some(password), close)
+}
+fn publish_inner(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Cancellation,
+    password: Option<&[u8]>,
+    close: impl FnOnce(Instant) -> Result<(), Error> + 'static,
+) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
         return Ok(outcome);
     }
+    let presented = if let Some(authority) = &value.authorization {
+        let presented = password
+            .and_then(Presented::parse)
+            .ok_or(Error::Unauthenticated)?;
+        if presented.id() != authority.device {
+            return Err(Error::Unauthenticated);
+        }
+        Some(presented)
+    } else {
+        None
+    };
     let value = value.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
@@ -214,6 +321,24 @@ pub fn publish(
                 }
                 if !policy {
                     return Err(Error::Policy);
+                }
+                match (&value.authorization, presented) {
+                    (Some(authority), Some(presented)) => {
+                        client_policy(&value.claim, &authority.binding)?;
+                        if postgres_devices::authenticate(
+                            client,
+                            authority.binding.account(),
+                            presented,
+                        )
+                        .await
+                        .map_err(Error::Credential)?
+                            != Some(authority.device)
+                        {
+                            return Err(Error::Unauthenticated);
+                        }
+                    }
+                    (None, None) => (),
+                    _ => return Err(Error::Unauthenticated),
                 }
                 let now = owners::check_locked(client, &value.claim, value.generation)
                     .await

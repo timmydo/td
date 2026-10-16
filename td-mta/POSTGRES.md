@@ -3558,7 +3558,8 @@ closure. New publication holds policy/account/route locks through reservation,
 transport closure and commit. The supplied closure must close/fence the owned
 transport locally within the original deadline, with no database work or SMTP
 round trips. This
-storage API does not establish client or operator authorization.
+internal route-owner entry point does not establish client or operator
+authorization.
 
 Before invoking that closure, publication validates the complete ordinal group
 with the shared row codec and queue-state validator. Accepted, uncertain or
@@ -3596,3 +3597,30 @@ conditional cancellation replays after its own sequence advance or later
 account changes. Its receipt must record the original expected sequence.
 This is the storage precondition needed for ifInState, not client credential
 authorization or an activated EmailSubmission/set update endpoint.
+
+
+## 129. Device-authorized cancellation publication
+
+Client cancellation preparation binds a selected JMAP profile and device ID
+alongside the relay owner's claim, submission and optional account state.
+Both profiles must belong to the same account, epoch and selected configuration.
+A relay-only profile cannot supply client authority. The request digest binds
+that client identity; no password or authentication result lives in the
+prepared operation. Internal operations retain their prior digest format.
+
+Fresh client publication requires that device's app password and rechecks its
+account-bound verifier and revocation under the account lock, before group
+reservation, local transport closure or writes. Device revocation takes the
+same lock, so it cannot race a previously cached authentication into a write.
+Missing, malformed, incorrect and other-device credentials refuse identically.
+The internal publication entry point cannot publish a fresh device-bound
+request without credentials; the authenticated entry point refuses preparations
+that lack client identity. Existing policy, ownership and state fences remain.
+
+Known receipt replay still settles without live device authority, including
+after revocation: it performs no new cancellation. These are trusted worker
+APIs whose retained prepared handles are not client-supplied operation IDs;
+an HTTP adapter must authenticate the request before exposing settlement.
+The supplied credential is decoded into the existing zero-on-drop secret
+owner for this call only. No HTTP dispatch, credential format, administration
+policy, scheduler or transport is activated or changed.

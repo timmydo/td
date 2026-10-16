@@ -242,6 +242,17 @@ pub(super) fn exercise(
     cancel::publish(request, trust, deadline(), &prepare(), |_| Ok(())).unwrap();
     assert!(phases::publish(request, trust, deadline(), &late).is_err());
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.submission_attempts WHERE submission_id={sub} AND active")),"0");
+    reset();
+    owners::renew(request, trust, deadline(), &claim, grant.generation).unwrap();
+    exercise_device_authorization(
+        fixture,
+        request,
+        trust,
+        binding,
+        &claim,
+        grant.generation,
+        submission,
+    );
     owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
     assert_eq!(
         cancel::publish(request, trust, deadline(), &value, |_| panic!(
@@ -260,5 +271,149 @@ pub(super) fn exercise(
     assert_eq!(
         cancel::inspect(request, trust, deadline(), &value).unwrap(),
         Some(outcome)
+    );
+}
+
+fn exercise_device_authorization(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    binding: &Binding,
+    claim: &owners::Claim,
+    generation: u64,
+    submission: SubmissionId,
+) {
+    use td_mta::{
+        generations::GenerationSet, postgres_devices as devices,
+        postgres_runtime_profile as runtime, tls_policy::TlsPolicies,
+    };
+    let domain = GenerationSet::<TlsPolicies>::at_startup();
+    let jmap = runtime::load(
+        request,
+        trust,
+        deadline(),
+        binding.epoch(),
+        "desktop",
+        domain.reserve().unwrap(),
+    )
+    .unwrap();
+    let device =
+        devices::prepare_creation(binding.epoch(), binding.account(), "cancel-client", 0).unwrap();
+    devices::publish_creation(request, trust, deadline(), &device).unwrap();
+    let sequence = u64::from_str_radix(
+        &sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+        ),
+        16,
+    )
+    .unwrap();
+    let input = || cancel::ClientRequest {
+        binding: jmap.binding(),
+        device: device.device_id(),
+        expected: Some((binding.epoch(), sequence)),
+    };
+    let value = cancel::prepare_for_device(claim, generation, submission, input()).unwrap();
+    let later = cancel::prepare_for_device(claim, generation, submission, input()).unwrap();
+    assert_eq!(
+        cancel::publish(request, trust, deadline(), &value, |_| panic!(
+            "client preparation bypassed credential"
+        )),
+        Err(cancel::Error::Unauthenticated)
+    );
+    let internal = cancel::prepare(claim, generation, submission).unwrap();
+    assert_eq!(
+        cancel::publish_authenticated(
+            request,
+            trust,
+            deadline(),
+            &internal,
+            device.password(),
+            |_| panic!("unbound request authenticated")
+        ),
+        Err(cancel::Error::Policy)
+    );
+    assert_eq!(
+        cancel::publish_authenticated(request, trust, deadline(), &value, b"bad", |_| panic!(
+            "malformed credential fenced"
+        )),
+        Err(cancel::Error::Unauthenticated)
+    );
+    let mut incorrect = device.password().to_vec();
+    let byte = incorrect.last_mut().unwrap();
+    *byte = if *byte == b'0' { b'1' } else { b'0' };
+    assert_eq!(
+        cancel::publish_authenticated(request, trust, deadline(), &value, &incorrect, |_| panic!(
+            "incorrect credential fenced"
+        )),
+        Err(cancel::Error::Unauthenticated)
+    );
+    let foreign =
+        devices::prepare_creation(binding.epoch(), binding.account(), "cancel-other", 0).unwrap();
+    assert_eq!(
+        cancel::publish_authenticated(
+            request,
+            trust,
+            deadline(),
+            &value,
+            foreign.password(),
+            |_| panic!("different device fenced")
+        ),
+        Err(cancel::Error::Unauthenticated)
+    );
+    let closed = Arc::new(AtomicBool::new(false));
+    let observed = closed.clone();
+    let outcome = cancel::publish_authenticated(
+        request,
+        trust,
+        deadline(),
+        &value,
+        device.password(),
+        move |_| {
+            observed.store(true, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(closed.load(Ordering::Relaxed));
+    assert_eq!(outcome.changed, 1000);
+    let revocation =
+        devices::prepare_revocation(binding.epoch(), binding.account(), device.device_id(), 1)
+            .unwrap();
+    devices::publish_revocation(request, trust, deadline(), &revocation).unwrap();
+    assert_eq!(
+        cancel::publish_authenticated(
+            request,
+            trust,
+            deadline(),
+            &later,
+            device.password(),
+            |_| panic!("revoked credential fenced")
+        ),
+        Err(cancel::Error::Unauthenticated)
+    );
+    assert_eq!(
+        cancel::inspect(request, trust, deadline(), &later).unwrap(),
+        None
+    );
+    assert_eq!(
+        cancel::publish_authenticated(request, trust, deadline(), &value, b"bad", |_| panic!(
+            "historical client replay fenced"
+        )),
+        Ok(outcome)
+    );
+    assert_eq!(
+        cancel::publish(request, trust, deadline(), &value, |_| panic!(
+            "historical settlement fenced"
+        )),
+        Ok(outcome)
+    );
+    sql(
+        fixture,
+        &format!(
+            "DELETE FROM td_mta.devices WHERE account=decode('{}','hex') AND id=decode('{}','hex')",
+            binding.account(),
+            device.device_id()
+        ),
     );
 }
