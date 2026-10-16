@@ -831,6 +831,13 @@ impl<'w, 'a, 'r> RcptDataPlan<'w, 'a, 'r> {
         .publish(meter)
     }
 }
+/// Exact passive command settlement requests. Publish refusal first through
+/// the same worker/Pending; unknown COMMIT must settle before the next request.
+/// No transport owner, slot, deadline or permission survives this extraction.
+pub struct CommandEvidence {
+    pub refusal: Option<Change>,
+    pub command: Change,
+}
 /// Failed negative DATA settlement retains both actual command evidence and
 /// any preceding RCPT refusal. It never grants transport authority.
 pub struct RcptCommandFailure<'w, 'a, 'r> {
@@ -867,6 +874,14 @@ impl<'w, 'a, 'r> RcptCommand<'w, 'a, 'r> {
     }
 }
 impl<'w, 'a, 'r> RcptCommandFailure<'w, 'a, 'r> {
+    /// Consume only after fencing the matching session. Separate bounded
+    /// settlement may admit fresh work; it cannot revive this SMTP attempt.
+    pub fn into_evidence(self) -> Option<CommandEvidence> {
+        self.retained.map(|retained| CommandEvidence {
+            refusal: retained.refusal,
+            command: retained.command.value,
+        })
+    }
     pub fn attempt(&self) -> Option<AttemptId> {
         self.retained
             .as_ref()
@@ -1099,6 +1114,12 @@ impl<'w, 'a, 'r> RetainedCommand<'w, 'a, 'r> {
     }
 }
 impl<'w, 'a, 'r> CommandFailure<'w, 'a, 'r> {
+    /// Extract exact passive evidence after fencing the matching session.
+    /// Fresh settlement admission cannot recreate transport authority, and
+    /// unresolved COMMIT remains blocked by the same worker's Pending owner.
+    pub fn into_evidence(self) -> Option<Change> {
+        self.retained.map(|retained| retained.value)
+    }
     pub fn attempt(&self) -> Option<AttemptId> {
         self.retained
             .as_ref()

@@ -5119,3 +5119,9 @@ The envelope box was reserved before RCPT, and no new reply vector is allocated
 between capture and database admission. Metadata and native protocol copies
 retain their separate bounds. Each attempted publication charges PHASE_IO and
 4096 records; successful preceding RCPT work is not repeated on a known retry.
+
+Passive command-evidence extraction moves existing Change references without
+allocating or copying reply cells. It drops the retained worker/deadline owner;
+the shared Pending operation, if present, remains separately owned. New
+settlement uses ordinary PHASE_IO/4096-record admission and connection slots
+for each publication; it retains no SMTP slot or transport authority.

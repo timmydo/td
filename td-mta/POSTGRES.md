@@ -4666,3 +4666,31 @@ The native paired TLS fixture captures a mixed RCPT/negative-DATA exchange,
 forces rollback at either publication, checks intermediate state and retained
 identity, refuses retry with an empty budget, and then verifies both exact
 results and attempt retirement.
+
+## 168. Passive command evidence after bounded retry custody
+
+CommandFailure and RcptCommandFailure may consume their retained actual
+negative command evidence into immutable passive Change requests after the
+matching SMTP session is closed or fenced. The paired form preserves any
+unpublished negative RCPT step before its exact DATA-command result. Invalid
+input that never created retained evidence yields None. Extraction allocates
+no reply storage and carries no transport owner, connection permit or deadline.
+
+Original command retries still cannot renew their earliest admitted cap.
+Separate settlement explicitly admits fresh bounded database work through the
+same Dispatches/Pending owner and publishes the preceding refusal first. An
+unresolved COMMIT continues to block publication until exact receipt inspection;
+extraction neither clears Pending nor declares an uncertain operation absent.
+Native publication still verifies current durable ownership and phase, or an
+exact retained receipt. Expired route ownership, replacement, cancellation and
+receipt-retention expiry are not bypassed. This separates a local SMTP work
+cap from passive database settlement; it never revives SMTP output permission.
+
+The real TLS/PostgreSQL fixture verifies expired MAIL refusal and mixed DATA
+refusals whose preceding RCPT step either failed or committed. Normal retries
+remain expired despite a fresh meter; extracted evidence then settles through
+fresh database admission and produces exact stored replies and retired attempts.
+A delayed RCPT COMMIT case additionally extracts the pair while Pending is
+occupied, verifies that command publication stays blocked, inspects the exact
+receipt through an independent settlement slot, and only then replays the
+passive refusal and publishes the retained DATA result.
