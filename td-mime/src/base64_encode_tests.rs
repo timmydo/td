@@ -13,9 +13,17 @@ fn meter() -> Meter {
     )
 }
 fn encode(input: &[u8], read: usize, write: usize) -> (Vec<u8>, Charge) {
+    encode_mode(input, read, write, true)
+}
+fn encode_mode(input: &[u8], read: usize, write: usize, wrap: bool) -> (Vec<u8>, Charge) {
     let mut work = meter();
     let before = work.remaining();
-    let mut encoder = Encoder::new(input.len() as u64, Tick(1), &mut work).unwrap();
+    let mut encoder = if wrap {
+        Encoder::new(input.len() as u64, Tick(1), &mut work)
+    } else {
+        Encoder::new_unwrapped(input.len() as u64, Tick(1), &mut work)
+    }
+    .unwrap();
     let mut result = Vec::new();
     let mut position = 0;
     for polls in 1..=10000 {
@@ -259,4 +267,143 @@ fn completed_finish_rejects_fresh_meter_without_debit() {
     );
     assert_eq!(replacement.remaining(), before);
     assert_eq!(replacement.stopped(), None);
+}
+
+#[test]
+fn unwrapped_vectors_binary_and_long_values_have_no_framing_bytes() {
+    for (input, expected) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+    ] {
+        for read in 1..=8 {
+            for write in 1..=8 {
+                let (result, charge) = encode_mode(input.as_bytes(), read, write, false);
+                assert_eq!(result, expected.as_bytes());
+                assert_eq!(charge.io_bytes, input.len() as u64);
+                assert_eq!(charge.output_bytes, expected.len() as u64);
+            }
+        }
+    }
+    let input: Vec<u8> = (0..=255).collect();
+    let expected: Vec<u8> = BINARY_ORACLE
+        .iter()
+        .copied()
+        .filter(|b| !matches!(b, b'\r' | b'\n'))
+        .collect();
+    for read in [1, 2, 3, 56, 57, 58, 255, 4096] {
+        for write in [1, 2, 3, 4, 75, 76, 77, 78, 4096] {
+            let (result, charge) = encode_mode(&input, read, write, false);
+            assert_eq!(result, expected);
+            assert_eq!(charge.io_bytes, 256);
+            assert_eq!(charge.output_bytes, result.len() as u64);
+        }
+    }
+    // Long AUTH values must cross both MIME's line boundary and u8 columns.
+    let (result, charge) = encode_mode(&[0; 1280], 13, 7, false);
+    let expected = [vec![b'A'; 1707], vec![b'=']].concat();
+    assert_eq!(result, expected);
+    assert_eq!(charge.io_bytes, 1280);
+    assert_eq!(charge.output_bytes, 1708);
+}
+
+#[test]
+fn unwrapped_extent_backpressure_completion_and_deadlines_remain_bounded() {
+    let mut work = meter();
+    let mut encoder = Encoder::new_unwrapped(1, Tick(1), &mut work).unwrap();
+    assert_eq!(
+        encoder
+            .poll(&[], &mut [0; 4], Tick(1), &mut work)
+            .unwrap()
+            .status,
+        Status::NeedInput
+    );
+    let step = encoder.poll(b"foo", &mut [], Tick(1), &mut work).unwrap();
+    assert_eq!(step.consumed, 1);
+    assert_eq!(step.status, Status::NeedOutput);
+    let mut output = [0; 4];
+    let step = encoder
+        .poll(b"ignored", &mut output, Tick(1), &mut work)
+        .unwrap();
+    assert_eq!(
+        step,
+        Progress {
+            consumed: 0,
+            written: 4,
+            status: Status::Complete
+        }
+    );
+    assert_eq!(&output, b"Zg==");
+    let before = work.remaining();
+    assert_eq!(
+        encoder
+            .poll(&[], &mut [], Tick(1), &mut work)
+            .unwrap()
+            .status,
+        Status::Complete
+    );
+    assert_eq!(
+        work.remaining(),
+        Charge {
+            records: before.records - 1,
+            ..before
+        }
+    );
+    assert_eq!(
+        encoder.finish(Tick(100), &mut work),
+        Err(Error::Work(Stop::Deadline))
+    );
+    let mut work = meter();
+    let encoder = Encoder::new_unwrapped(1, Tick(1), &mut work).unwrap();
+    assert_eq!(encoder.finish(Tick(1), &mut work), Err(Error::InvalidState));
+}
+
+#[test]
+fn unwrapped_refusals_retire_the_original_work_owner() {
+    for stop in [Stop::IoBytes, Stop::Records, Stop::OutputBytes] {
+        let total = match stop {
+            Stop::IoBytes => 3,
+            Stop::Records => 1,
+            _ => 4,
+        };
+        for cap in 0..total {
+            let mut capacity = meter().remaining();
+            match stop {
+                Stop::IoBytes => capacity.io_bytes = cap,
+                Stop::Records => capacity.records = cap,
+                _ => capacity.output_bytes = cap,
+            }
+            let mut work = Meter::new(Deadline::after(Tick(0), 100).unwrap(), capacity);
+            let mut encoder = Encoder::new_unwrapped(3, Tick(1), &mut work).unwrap();
+            assert_eq!(
+                encoder.poll(b"foo", &mut [0; 16], Tick(1), &mut work),
+                Err(Error::Work(stop))
+            );
+            let mut replacement = meter();
+            let before = replacement.remaining();
+            assert_eq!(
+                encoder.poll(&[], &mut [], Tick(1), &mut replacement),
+                Err(Error::Work(stop))
+            );
+            assert_eq!(replacement.remaining(), before);
+        }
+    }
+    let mut original = meter();
+    let mut encoder = Encoder::new_unwrapped(0, Tick(1), &mut original).unwrap();
+    encoder.poll(&[], &mut [], Tick(1), &mut original).unwrap();
+    let mut replacement = meter();
+    let before = replacement.remaining();
+    assert_eq!(
+        encoder.poll(&[], &mut [], Tick(1), &mut replacement),
+        Err(Error::InvalidOwner)
+    );
+    assert_eq!(replacement.remaining(), before);
+    assert_eq!(
+        encoder.finish(Tick(1), &mut original),
+        Err(Error::InvalidOwner)
+    );
 }

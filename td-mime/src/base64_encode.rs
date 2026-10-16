@@ -1,4 +1,4 @@
-//! Bounded MIME base64 body encoding for composed text and attachments.
+//! Bounded base64 encoding for MIME bodies and unwrapped protocol values.
 use crate::{
     time::Tick,
     work::{Charge, Meter, Owner, Stop},
@@ -56,6 +56,7 @@ pub struct Encoder {
     bits: u32,
     octets: u8,
     column: u8,
+    wrap: bool,
     pending: [u8; 6],
     next: usize,
     end: usize,
@@ -63,7 +64,16 @@ pub struct Encoder {
     failure: Option<Error>,
 }
 impl Encoder {
+    /// MIME body encoding: 76-byte lines and a final CRLF for nonempty input.
     pub fn new(length: u64, now: Tick, meter: &mut Meter) -> Result<Self, Error> {
+        Self::with_wrapping(length, now, meter, true)
+    }
+    /// RFC 4648 standard alphabet and padding, with no line breaks or terminator.
+    /// The caller owns protocol framing, credential handling and transport trust.
+    pub fn new_unwrapped(length: u64, now: Tick, meter: &mut Meter) -> Result<Self, Error> {
+        Self::with_wrapping(length, now, meter, false)
+    }
+    fn with_wrapping(length: u64, now: Tick, meter: &mut Meter, wrap: bool) -> Result<Self, Error> {
         meter.charge(now, Charge::default())?;
         let owner = meter.owner().ok_or(Error::InvalidOwner)?;
         Ok(Self {
@@ -72,6 +82,7 @@ impl Encoder {
             bits: 0,
             octets: 0,
             column: 0,
+            wrap,
             pending: [0; 6],
             next: 0,
             end: 0,
@@ -194,7 +205,9 @@ impl Encoder {
                 .get(((bits >> (18 - 6 * n)) & 63) as usize)
                 .ok_or(Error::InvalidState)?;
         }
-        self.column += 4;
+        if self.wrap {
+            self.column += 4;
+        }
         self.next = 0;
         self.end = if self.column == 76 {
             self.column = 0;

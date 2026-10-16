@@ -196,6 +196,16 @@ output. The encoder has a compiled 80-byte ceiling and the mail allocation probe
 checks zero allocation. No MIME header generation or SMTP framing occurs.
 The wire encoding follows RFC 2045 section 6.8.
 
+The same encoder's explicit unwrapped constructor emits the RFC 4648
+standard alphabet and canonical padding without any line breaks or final
+terminator. Its declared extent, owner binding, per-turn bounds and budget
+charges are identical; only emitted framing bytes differ. The default
+constructor retains MIME framing. Protocol callers, including SMTP AUTH,
+own their line framing, output size admission, credential custody and verified
+transport. The encoder performs no authentication and makes no memory
+zeroization claim. Both modes retain the fixed 80-byte state ceiling.
+
+
 The outgoing header encoder supplies UTF-8 RFC 2047 B words for td-mail's
 Subject, address display names and attachment descriptions. It borrows one
 immutable UTF-8 value. Each word consumes at most 45 source octets without

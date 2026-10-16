@@ -12108,6 +12108,40 @@ fn mime_base64_encode() {
         encoder.finish(Tick(1), &mut replacement),
         Err(Error::Work(Stop::Records))
     );
+    let mut meter = Meter::new(
+        Deadline::after(Tick(0), 100).unwrap(),
+        Charge {
+            io_bytes: 1280,
+            records: 2048,
+            output_bytes: 1708,
+            unlinks: 0,
+        },
+    );
+    let mut encoder = Encoder::new_unwrapped(1280, Tick(1), &mut meter).unwrap();
+    let input = [0; 1280];
+    let mut position = 0;
+    let mut written = 0;
+    loop {
+        let mut byte = [0];
+        let step = encoder
+            .poll(
+                black_box(input.get(position..).unwrap()),
+                &mut byte,
+                Tick(1),
+                &mut meter,
+            )
+            .unwrap();
+        position += step.consumed;
+        if step.written != 0 {
+            assert_eq!(byte[0], if written < 1707 { b'A' } else { b'=' });
+            written += 1;
+        }
+        if step.status == Status::Complete {
+            break;
+        }
+    }
+    encoder.finish(Tick(1), &mut meter).unwrap();
+    assert_eq!((position, written), (1280, 1708));
     let after = COUNTERS.snapshot();
     assert!(!before.invalid && !after.invalid);
     assert_eq!(before, after, "outgoing MIME base64 allocated");
