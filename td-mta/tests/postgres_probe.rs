@@ -10647,6 +10647,7 @@ fn exercise_attempt_recovery(
         grant.generation,
         submission,
     );
+    route_repair::exercise(fixture, request, trust, binding, submission);
 }
 
 fn exercise_submission_query_dispatch(
@@ -11672,3 +11673,6 @@ mod queue_expiry;
 
 #[path = "postgres_probe/route_health.rs"]
 mod route_health;
+
+#[path = "postgres_probe/route_repair.rs"]
+mod route_repair;

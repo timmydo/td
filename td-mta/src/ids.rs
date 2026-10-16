@@ -82,6 +82,7 @@ object_ids!(
     SubmissionOperationId,
     SubmissionExpiryId,
     RouteClaimId,
+    RouteRepairId,
     AttemptRecoveryId,
     MailboxOperationId,
     StoreEpoch,

@@ -105,12 +105,12 @@ pub fn prepare(
         digest: hash.finish().map_err(|_| Error::Crypto)?,
     })
 }
-fn number(bytes: &[u8]) -> Result<u64, Error> {
+pub(crate) fn number(bytes: &[u8]) -> Result<u64, Error> {
     Ok(u64::from_be_bytes(
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-fn state(row: &Row, offset: usize, revision: u64) -> Result<State, Error> {
+pub(crate) fn state(row: &Row, offset: usize, revision: u64) -> Result<State, Error> {
     let count: i64 = row.try_get(offset).map_err(|_| Error::Integrity)?;
     let reason: i64 = row.try_get(offset + 1).map_err(|_| Error::Integrity)?;
     let failed: Option<i64> = row.try_get(offset + 2).map_err(|_| Error::Integrity)?;
@@ -148,7 +148,7 @@ fn state(row: &Row, offset: usize, revision: u64) -> Result<State, Error> {
         repair_generation: repair,
     })
 }
-async fn current(client: &Client, claim: &Claim) -> Result<Option<State>, Error> {
+pub(crate) async fn current(client: &Client, claim: &Claim) -> Result<Option<State>, Error> {
     let binding = claim.binding();
     let rows=client.query("SELECT revision,failure_count,reason,failed_at,next_at,repair_generation FROM td_mta.route_health WHERE account=$1 AND route_name=$2 AND destination=$3", &[&binding.account().as_bytes().as_slice(),&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
     rows.first()

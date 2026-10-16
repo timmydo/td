@@ -139,6 +139,7 @@ pub mod postgres_read;
 pub mod postgres_resolver;
 pub mod postgres_route_health;
 pub mod postgres_route_owners;
+pub mod postgres_route_repair;
 pub mod postgres_routes;
 pub mod postgres_runtime_access;
 pub mod postgres_runtime_profile;

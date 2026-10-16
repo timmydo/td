@@ -3479,3 +3479,28 @@ and does not acquire new transport authority. The local queue-clock guard and
 recipient due times remain separate requirements. No scheduler or transport is
 activated; explicit configuration repair and successful-route reset are the
 next publication operations, and no timer silently clears a repair latch.
+
+
+## 124. Explicit shared route repair
+
+A prepared route-repair operation binds a random retained operation ID to its
+current owner, route, destination and selected configuration generation. It
+requires a TLS/authentication repair latch from a strictly older selection.
+Reselecting validated configuration and resolving a new profile still does
+not clear the latch: the explicit repair publication is separately required.
+The same selection cannot clear its own failure, and a route without a latch
+refuses a new repair. Historical replay can settle after owner release.
+
+Under the configuration/account/route locks, repair increments the checked
+health revision and clears only repair_generation. Failure count, reason,
+failure timestamp and next-attempt timestamp remain byte-for-byte unchanged.
+Dispatch therefore remains blocked until the existing shared minimum interval
+and the separate recipient/clock guards permit it. Receipt action 2 captures
+that repaired state atomically, with the shared 1024-receipt account limit.
+Backward UTC, stale ownership, overflow and write failure refuse publication;
+unknown COMMIT settles the retained operation without applying another repair.
+
+This is an explicit prepared storage operation, not an authenticated operator
+endpoint or a configuration-load side effect. Runtime integration must bind
+operator authorization to this operation. Successful-route counter reset is
+a separate operation; repair does not claim that transport has succeeded.
