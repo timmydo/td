@@ -772,6 +772,15 @@ pub struct RcptPlan<'w, 'a, 'r> {
     replies: phases::RcptReplies,
 }
 impl<'w, 'a, 'r> RcptPlan<'w, 'a, 'r> {
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+        self.envelope.prepared.worker.connection.clock.clone()
+    }
+    pub(crate) fn original_deadline(&self) -> Deadline {
+        self.envelope.prepared.until
+    }
+    pub(crate) fn work_limit(&self) -> Instant {
+        self.envelope.prepared.limit
+    }
     pub fn attempt(&self) -> AttemptId {
         self.envelope.attempt()
     }

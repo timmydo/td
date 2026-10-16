@@ -4790,3 +4790,43 @@ connection slots and changed envelope identity before output, expired local cust
 and a non-final reply class. Interrupted Prepared attempts are recovered only
 after transport closes. This adapter does not activate production dispatch or
 claim complete envelope orchestration or maximum-message throughput.
+
+## 173. Ordered RCPT exchange from successful MAIL
+
+postgres_relay_rcpt begins only from the bound MAIL Accepted owner. It reserves
+all maximum reply cells before the first RCPT, derives each address and ordinal
+from the admitted batch, and keeps the same session and MAIL mode. Every command
+borrows fresh scratch cells and the caller's wire/database meters. A returned
+Cursor permits only the next exact recipient; no separate session, recipient
+address or replacement identity enters this path. Original clock/deadline and
+the shortest admitted local cap survive between commands.
+
+Every write/flush turn rechecks the untouched Prepared envelope before output.
+No negative RCPT publication occurs while collection continues. Complete actual
+2xx/4xx/5xx replies returned by the command parser enter reserved ordered storage before checking whether the
+local cap permits continuation. A wire, current-state, deadline or parser
+failure closes transport and finishes the earlier collection into passive
+RcptResult evidence; a finish-time crypto/integrity error is reported separately
+instead of inventing evidence. Explicit Cursor/Exchange closure follows the
+same fence-before-interruption order. A failed initial reservation closes MAIL
+transport without inventing any RCPT reply.
+
+An actual 421 is retained and closes immediately, even on the last RCPT
+after earlier positive replies; it never returns another command or DATA
+owner (RFC 5321 sections 3.8 and 4.2.2). Complete all-negative collection
+closes automatically and returns passive
+results for ordinary negative publication, with no DATA session. A complete
+batch with positives retains its exact RcptResult, same session and mode; the
+trusted DATA stage must reserve its alternatives and check authority before
+output. Explicit into_parts remains the low-level seam. Completed.close fences
+and retains evidence for passive interruption. Fresh passive settlement must
+publish collected negatives before recovery through the same Pending owner.
+Neither receipt nor collected reply evidence reconstructs output authority.
+
+Native PostgreSQL/TLS cases cover mixed and all-negative batches, closure after
+a positive or negative first reply, invalid next reply, occupied slots and
+changed envelope identity before the next command, and original cap expiry
+between commands, plus intermediate/final 421 shutdown. They verify exact
+commands, no further output on admission
+refusal, retained reply texts and fenced recovery. Production dispatch, DATA
+orchestration and maximum-message throughput remain separate work.

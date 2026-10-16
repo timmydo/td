@@ -317,3 +317,49 @@ pub(super) fn command(
     }
     panic!("native relay command did not finish");
 }
+
+/// Drive bound MAIL and return its same-session positive handoff.
+pub(super) fn accepted_mail<'w, 'a, 'r>(
+    plan: td_mta::postgres_dispatch::MailPlan<'w, 'a, 'r>,
+    session: auth::Session<Buffer>,
+    peer: &mut Peer,
+    cap: Deadline,
+    database: &mut Meter,
+) -> td_mta::postgres_relay_mail::Accepted<'w, 'a, 'r, Buffer> {
+    use td_mta::{postgres_relay_mail as mail, smtp_data_encode::Body};
+    let expected = format!("MAIL FROM:<{}>\r\n", plan.envelope().reverse_path);
+    let mut input = [0; 512];
+    let mut line = [0; 512];
+    let mut reply = [0; 4096];
+    let mut output = [0; 512];
+    let mut network = meter(cap);
+    let mut exchange = mail::begin(
+        plan,
+        session,
+        Body::SevenBit,
+        command::Scratch {
+            input: &mut input,
+            line: &mut line,
+            reply: &mut reply,
+            command: &mut output,
+        },
+        &mut network,
+        database,
+    )
+    .ok()
+    .unwrap();
+    let mut script = Script::new(expected.as_bytes(), b"250 sender\r\n");
+    loop {
+        script.turn(peer);
+        match exchange.advance() {
+            Ok(mail::Progress::Pending(next)) => exchange = next,
+            Ok(mail::Progress::Accepted(accepted)) => {
+                script.complete();
+                return accepted;
+            }
+            Ok(mail::Progress::Rejected(_)) => panic!("unexpected MAIL rejection"),
+            Err(failure) => panic!("bound MAIL failed: {:?}", failure.error),
+        }
+        std::thread::yield_now();
+    }
+}

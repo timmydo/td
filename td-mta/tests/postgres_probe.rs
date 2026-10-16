@@ -11819,3 +11819,6 @@ mod dispatch_recovery;
 
 #[path = "postgres_probe/native_mail_exchange.rs"]
 mod native_mail_exchange;
+
+#[path = "postgres_probe/native_rcpt_exchange.rs"]
+mod native_rcpt_exchange;

@@ -5156,3 +5156,12 @@ bounds. Each write/flush observation charges ATTEMPT_IO/4096 records and acquire
 an ordinary slot only for the database operation. Negative publication retains
 the existing preallocated MAIL evidence and PHASE_IO charge; all known and
 uncertain failure custody follows the existing CommandFailure/Pending bounds.
+
+The ordered RCPT adapter adds no reply copy to RcptPlan's preallocated maximum
+batch cells. A command owns inline TLS/parser state and borrowed scratch/meters;
+its non-borrowing Cursor/Completed handoff releases scratch for the next command.
+No extra command queue, connection reservation or per-turn wrapper allocation is
+introduced. Existing envelope observations retain their native allocation and
+ATTEMPT_IO/4096-record charges. Finishing moves cells into existing RcptResult;
+passive negative/recovery planning and publication retain their established
+reply-vector bounds and fresh admission charges.
