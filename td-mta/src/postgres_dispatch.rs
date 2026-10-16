@@ -270,6 +270,30 @@ impl Dispatches<'_, '_> {
         publish_phase(&self.connection, &mut pending, value, limit, new_possible)
     }
 
+    /// Bind local reply storage and publication work to one exact subset before
+    /// attempting a new AcceptancePossible commit. This is not SMTP authority.
+    pub fn reserve_final_result(
+        &self,
+        claim: &Claim,
+        generation: u64,
+        attempt: AttemptId,
+        ordinals: &[u32],
+        until: Deadline,
+        meter: &mut Meter,
+    ) -> Result<FinalPlan<'_, '_, '_>, Error> {
+        let possible = phases::acceptance_possible(claim, generation, attempt, ordinals)
+            .map_err(Error::Phase)?;
+        let reply = phases::reserve_final_reply(claim, generation, attempt, ordinals)
+            .map_err(Error::Phase)?;
+        let work = self.reserve_final(attempt, until, meter)?;
+        Ok(FinalPlan {
+            possible,
+            reply,
+            work,
+            until,
+        })
+    }
+
     /// Prepay one final DATA result's publication work and retain its connection
     /// slot until consumption or drop. This is capacity, not SMTP authority;
     /// reply storage, durable claims and live ownership remain separate.
@@ -299,6 +323,80 @@ impl Dispatches<'_, '_> {
             limit,
             _permit: permit,
         })
+    }
+}
+
+/// Local final-result capacity bound to one exact phase request. Consuming a
+/// plan requires a second ordinary connection slot for the new publication.
+pub struct FinalPlan<'w, 'a, 'r> {
+    possible: Change,
+    reply: phases::FinalReply,
+    work: FinalWork<'w, 'a, 'r>,
+    until: Deadline,
+}
+impl<'w, 'a, 'r> FinalPlan<'w, 'a, 'r> {
+    /// Retain final-result custody only after a known new commit. An uncertain
+    /// COMMIT remains in Pending and cannot be converted into this owner.
+    pub fn publish_possible(self, meter: &mut Meter) -> Result<FinalResult<'w, 'a, 'r>, Error> {
+        let worker = self.work.worker;
+        let mut pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.work.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let limit = worker
+            .connection
+            .admit(self.until, meter, PHASE_IO)?
+            .min(self.work.limit);
+        let _slot = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        let outcome = publish_phase(
+            &worker.connection,
+            &mut pending,
+            self.possible.clone(),
+            limit,
+            true,
+        )?;
+        if Instant::now() >= self.work.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(FinalResult {
+            possible: self.possible,
+            reply: self.reply,
+            work: self.work,
+            outcome,
+        })
+    }
+}
+/// Non-cloneable final-result custody after known new publication. Its receipt
+/// is passive: live ownership and transport admission remain separate.
+pub struct FinalResult<'w, 'a, 'r> {
+    possible: Change,
+    reply: phases::FinalReply,
+    work: FinalWork<'w, 'a, 'r>,
+    outcome: phases::Outcome,
+}
+impl FinalResult<'_, '_, '_> {
+    pub fn attempt(&self) -> AttemptId {
+        self.possible.attempt()
+    }
+    pub fn outcome(&self) -> &phases::Outcome {
+        &self.outcome
+    }
+    /// Consume retained capacity for the actual normalized final DATA reply.
+    /// No caller-supplied Change can replace the original attempt or subset.
+    pub fn record(self, reply: &str) -> Result<phases::Outcome, Error> {
+        let value = self.reply.finish(reply).map_err(Error::Phase)?;
+        self.work.publish(value)
     }
 }
 

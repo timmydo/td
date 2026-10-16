@@ -126,17 +126,65 @@ pub(super) fn exercise(
         guard: worker.guard.clone(),
         pending: worker.pending,
     };
+    let expired = roomy
+        .reserve_final_result(
+            claim,
+            generation,
+            attempt,
+            &[0, 1],
+            until(1000),
+            &mut meter(),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(1100));
+    assert!(matches!(
+        expired.publish_possible(&mut meter()),
+        Err(Error::Admission(ports::Error::Deadline))
+    ));
+    let dropped = roomy
+        .reserve_final_result(
+            claim,
+            generation,
+            attempt,
+            &[0, 1],
+            until(10_000),
+            &mut meter(),
+        )
+        .unwrap();
+    drop(dropped);
     let mut final_budget = meter();
-    let held = roomy
-        .reserve_final(attempt, until(10_000), &mut final_budget)
+    let plan = roomy
+        .reserve_final_result(
+            claim,
+            generation,
+            attempt,
+            &[0, 1],
+            until(10_000),
+            &mut final_budget,
+        )
         .unwrap();
     let remaining = final_budget.remaining();
     final_budget
         .charge(clock.sample().unwrap().monotonic, remaining)
         .unwrap();
-    let newly_possible = roomy
-        .publish_new_possible(possible.clone(), until(10_000), &mut meter())
+    let held = plan.publish_possible(&mut meter()).unwrap();
+    assert_eq!(held.attempt(), attempt);
+    let newly_possible = *held.outcome();
+    let duplicate = roomy
+        .reserve_final_result(
+            claim,
+            generation,
+            attempt,
+            &[0, 1],
+            until(10_000),
+            &mut meter(),
+        )
         .unwrap();
+    // Both ordinary slots are now held; refusal releases the duplicate's slot.
+    assert!(matches!(
+        duplicate.publish_possible(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    ));
     assert_eq!(
         roomy.publish_new_possible(possible.clone(), until(10_000), &mut meter()),
         Err(Error::Phase(phases::Error::Conflict))
@@ -152,11 +200,35 @@ pub(super) fn exercise(
     let other = roomy
         .reserve_final(attempt, until(10_000), &mut meter())
         .unwrap();
-    let outcome = held.publish(final_change).unwrap();
+    let outcome = held.record("250 queued").unwrap();
+    assert_eq!(
+        phases::inspect(
+            worker.connection.request,
+            worker.connection.trust,
+            deadline(),
+            &final_change
+        )
+        .unwrap(),
+        Some(outcome)
+    );
     assert_eq!(outcome.attempt, attempt);
     assert_eq!(outcome.recipients, 2);
     assert_eq!(worker.pending.attempt().unwrap(), None);
     drop(other);
+    let duplicate = roomy
+        .reserve_final_result(
+            claim,
+            generation,
+            attempt,
+            &[0, 1],
+            until(10_000),
+            &mut meter(),
+        )
+        .unwrap();
+    assert!(matches!(
+        duplicate.publish_possible(&mut meter()),
+        Err(Error::Phase(phases::Error::Conflict))
+    ));
     assert!(roomy
         .reserve_final(attempt, until(10_000), &mut meter())
         .is_ok());

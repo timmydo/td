@@ -4057,3 +4057,27 @@ Known new publication is a prerequisite for future handoff construction, not
 SMTP permission by itself. Independent local work/reply capacity and current
 ownership remain required. No caller-provided Outcome can authorize output;
 BodySent remains closed and no scheduler or terminator path is enabled.
+
+## 146. Bound final-result custody
+
+The publication worker can reserve a non-cloneable FinalPlan that binds one
+exact attempt, owner/generation and ordered recipient subset to both FinalReply
+storage and FinalWork capacity. Its consuming publish_possible operation uses
+the new-only phase-3 path, retaining the local owner only after a known new
+commit. Existing receipts refuse; uncertain COMMIT transfers the exact phase
+request to Pending and releases local capacity. Settlement cannot manufacture
+a FinalResult. A second ordinary connection slot is needed during publication.
+
+FinalResult privately retains the original request, reply storage, work and
+passive receipt. Its consuming record operation accepts only actual normalized
+final DATA reply text; it constructs and publishes the result for the retained
+subset without a caller-supplied replacement Change, fresh slot or work charge.
+The original job/meter/ten-second reservation deadline caps phase publication
+and result consumption; later admission cannot extend it. Expiry after a known
+phase commit refuses the local owner and leaves durable recovery responsible
+for the unresolved phase. Dropping either owner releases local capacity only.
+
+This connects capacity and known publication, not transport authority. Live
+owner/queue-clock admission and custody of the matching SMTP body transaction
+remain required before terminator handoff. Passive outcomes cannot construct
+these private owners. BodySent remains closed and no scheduler is enabled.
