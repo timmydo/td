@@ -112,9 +112,12 @@ pub(super) fn exercise(
     );
     super::final_capacity::before_possible(fixture, request, trust, attempt, &final_phase);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    super::attempt_clock::possible(fixture, request, trust, claim, &final_phase);
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase()");
     assert_eq!(
-        phases::publish_new_possible(
+        super::attempt_clock::publish_possible(
+            fixture,
             request,
             trust,
             Instant::now() + Duration::from_millis(1500),

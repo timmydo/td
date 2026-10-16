@@ -267,7 +267,14 @@ impl Dispatches<'_, '_> {
             .slots
             .acquire()
             .map_err(|_| ports::Error::Busy)?;
-        publish_phase(&self.connection, &mut pending, value, limit, new_possible)
+        publish_phase(
+            &self.connection,
+            &self.guard,
+            &mut pending,
+            value,
+            limit,
+            new_possible,
+        )
     }
 
     /// Bind local reply storage and publication work to one exact subset before
@@ -361,6 +368,7 @@ impl<'w, 'a, 'r> FinalPlan<'w, 'a, 'r> {
             .map_err(|_| ports::Error::Busy)?;
         let outcome = publish_phase(
             &worker.connection,
+            &worker.guard,
             &mut pending,
             self.possible.clone(),
             limit,
@@ -431,6 +439,7 @@ impl FinalWork<'_, '_, '_> {
         }
         publish_phase(
             &self.worker.connection,
+            &self.worker.guard,
             &mut pending,
             value,
             self.limit,
@@ -440,6 +449,7 @@ impl FinalWork<'_, '_, '_> {
 }
 fn publish_phase(
     connection: &Connection<'_, '_>,
+    guard: &Arc<Mutex<Guard>>,
     pending: &mut Option<Operation>,
     value: Change,
     limit: Instant,
@@ -450,7 +460,14 @@ fn publish_phase(
         return Err(ports::Error::Invalid.into());
     };
     let result = if new_possible {
-        phases::publish_new_possible(connection.request, connection.trust, limit, value)
+        phases::publish_new_possible_observed(
+            connection.request,
+            connection.trust,
+            limit,
+            value,
+            connection.clock.clone(),
+            guard.clone(),
+        )
     } else {
         phases::publish(connection.request, connection.trust, limit, value)
     };

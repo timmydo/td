@@ -1,7 +1,7 @@
 //! Atomic bounded attempt publication; scheduling and SMTP remain inactive.
 use crate::{
     ids::{AttemptId, SubmissionId},
-    ports::{Clock, Time},
+    ports::Clock,
     postgres_probe::{self, Request},
     postgres_route_owners::{self as owners, Claim},
     queue_clock::{self, Guard},
@@ -212,33 +212,6 @@ pub fn inspect(
     })
     .map_err(Error::Connection)?
 }
-fn admit_clock(
-    clock: &dyn Clock,
-    guard: &Mutex<Guard>,
-    utc_ms: i64,
-    retry: bool,
-) -> Result<(), Error> {
-    let mut guard = guard
-        .try_lock()
-        .map_err(|_| Error::Clock(queue_clock::Error::Invalid))?;
-    let monotonic = clock
-        .sample()
-        .map_err(|_| Error::Clock(queue_clock::Error::Invalid))?
-        .monotonic;
-    let status = guard
-        .observe(Time { utc_ms, monotonic })
-        .map_err(Error::Clock)?;
-    let admitted = if retry {
-        status.retry
-    } else {
-        status.fresh_dispatch
-    };
-    if admitted {
-        Ok(())
-    } else {
-        Err(Error::Clock(queue_clock::Error::Unstable))
-    }
-}
 /// Select at most 100 fresh Queued or due retry recipients in ordinal order,
 /// according to the retained preparation. All dispatch and expiry callers in a
 /// process share one persistent clock guard and monotonic domain. Database UTC
@@ -271,7 +244,8 @@ pub fn publish(
             }
             let timestamp =
                 owners::check_locked_observed(client, &value.claim, value.generation, |utc_ms| {
-                    admit_clock(clock.as_ref(), &guard, utc_ms, value.retry)
+                    queue_clock::admit_database(clock.as_ref(), &guard, utc_ms, value.retry)
+                        .map_err(Error::Clock)
                 })
                 .await?;
             crate::postgres_route_health::admit_locked(client, &value.claim, timestamp)
@@ -436,7 +410,8 @@ pub fn publish(
             client.execute("INSERT INTO td_mta.submission_attempts VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true)", &[&account,&value.attempt.as_bytes().as_slice(),&value.digest.as_slice(),&submission,&binding.route().name(),&binding.route().destination().as_slice(),&value.claim.boot().as_bytes().as_slice(),&value.claim.operation().as_bytes().as_slice(),&value.generation.to_be_bytes().as_slice(),&timestamp,&encoded,&old.to_be_bytes().as_slice(),&changed]).await.map_err(|_|Error::Database)?;
             let final_time =
                 owners::check_locked_observed(client, &value.claim, value.generation, |utc_ms| {
-                    admit_clock(clock.as_ref(), &guard, utc_ms, value.retry)
+                    queue_clock::admit_database(clock.as_ref(), &guard, utc_ms, value.retry)
+                        .map_err(Error::Clock)
                 })
                 .await?;
             if final_time < timestamp || final_time >= expires_at {

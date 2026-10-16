@@ -4081,3 +4081,27 @@ This connects capacity and known publication, not transport authority. Live
 owner/queue-clock admission and custody of the matching SMTP body transaction
 remain required before terminator handoff. Passive outcomes cannot construct
 these private owners. BodySent remains closed and no scheduler is enabled.
+
+## 147. Queue-clock observation for new phase publication
+
+The bounded worker's new AcceptancePossible path observes authoritative
+PostgreSQL UTC through the process's persistent queue-clock Guard. It pairs
+each observation with the original runtime monotonic clock and ignores the
+adapter's wall time. It checks under the owner lock on admission and again
+immediately before COMMIT, requiring current ownership and an unexpired
+submission at the second check. A backward transaction-time observation also
+refuses. The same database-time admission helper serves initial attempt
+publication; its fresh/retry policy is unchanged.
+
+A clock hold, invalid sample or busy guard refuses the new phase. The SQL
+transaction rolls back recipients, sequence, receipt and durable capacity
+claim, but the process-local clock observation survives. Database time is
+observed before owner-clock/lease refusal, so a failed transaction cannot hide
+a discontinuity. Unknown COMMIT still transfers to Pending. Historical receipt
+inspection and ordinary publication remain historical paths, and duplicate
+new requests still refuse before obtaining any continuing authority.
+
+This is publication admission, not a live transport grant. The low-level
+unobserved phase API remains storage machinery; known new publication alone
+never permits SMTP output. Current ownership/clock validation and matching
+transport custody at actual handoff remain outstanding; BodySent stays closed.

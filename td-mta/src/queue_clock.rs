@@ -2,6 +2,27 @@
 use crate::ports::Time;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Pair authoritative database UTC with the shared process monotonic domain.
+pub(crate) fn admit_database(
+    clock: &dyn crate::ports::Clock,
+    guard: &std::sync::Mutex<Guard>,
+    utc_ms: i64,
+    retry: bool,
+) -> Result<(), Error> {
+    let mut guard = guard.try_lock().map_err(|_| Error::Invalid)?;
+    let monotonic = clock.sample().map_err(|_| Error::Invalid)?.monotonic;
+    let status = guard.observe(Time { utc_ms, monotonic })?;
+    if if retry {
+        status.retry
+    } else {
+        status.fresh_dispatch
+    } {
+        Ok(())
+    } else {
+        Err(Error::Unstable)
+    }
+}
+
 const GUARD_MS: u64 = 300_000;
 static NEXT_CONFIRMATION: AtomicU64 = AtomicU64::new(1);
 

@@ -1,13 +1,15 @@
 //! Durable DATA phases and final replies under the current attempt fence.
 use crate::{
     ids::AttemptId,
+    ports::Clock,
     postgres_probe::{self, Request},
     postgres_route_owners::{self as owners, Claim},
+    queue_clock::{self, Guard},
 };
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -24,6 +26,7 @@ pub enum Error {
     Capacity,
     Crypto,
     ExpiryHold,
+    Clock(queue_clock::Error),
     Conflict,
     Database,
     Indeterminate,
@@ -447,7 +450,7 @@ pub fn publish(
     deadline: Instant,
     value: &Change,
 ) -> Result<Outcome, Error> {
-    publish_inner(request, trust, deadline, value, false)
+    publish_inner(request, trust, deadline, value, false, None)
 }
 /// Publish only a new AcceptancePossible transition. An existing receipt,
 /// including an identical one, refuses; inspect/ordinary publish remain the
@@ -461,7 +464,47 @@ pub fn publish_new_possible(
     if value.inner.phase != 3 {
         return Err(Error::Integrity);
     }
-    publish_inner(request, trust, deadline, value, true)
+    publish_inner(request, trust, deadline, value, true, None)
+}
+/// New publication with persistent queue-clock observation at admission and
+/// before COMMIT. Neither its receipt nor its clock samples authorize SMTP.
+pub fn publish_new_possible_observed(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    value: &Change,
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+) -> Result<Outcome, Error> {
+    if value.inner.phase != 3 {
+        return Err(Error::Integrity);
+    }
+    publish_inner(
+        request,
+        trust,
+        deadline,
+        value,
+        true,
+        Some(Observation { clock, guard }),
+    )
+}
+struct Observation {
+    clock: Arc<dyn Clock>,
+    guard: Arc<Mutex<Guard>>,
+}
+impl Observation {
+    async fn check(&self, client: &Client, value: &Fields) -> Result<i64, Error> {
+        owners::check_locked_observed(client, &value.claim, value.generation, |utc_ms| {
+            queue_clock::admit_database(self.clock.as_ref(), &self.guard, utc_ms, false)
+                .map_err(Error::Clock)
+        })
+        .await
+    }
+}
+impl From<owners::Error> for Error {
+    fn from(error: owners::Error) -> Self {
+        Self::Owner(error)
+    }
 }
 fn publish_inner(
     request: &Request<'_>,
@@ -469,6 +512,7 @@ fn publish_inner(
     deadline: Instant,
     value: &Change,
     new_possible: bool,
+    observation: Option<Observation>,
 ) -> Result<Outcome, Error> {
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
         return if new_possible {
@@ -495,9 +539,13 @@ fn publish_inner(
             if !policy {
                 return Err(Error::Policy);
             }
-            let timestamp = owners::check_locked(client, &value.claim, value.generation)
-                .await
-                .map_err(Error::Owner)?;
+            let timestamp = if let Some(observation) = &observation {
+                observation.check(client, &value).await?
+            } else {
+                owners::check_locked(client, &value.claim, value.generation)
+                    .await
+                    .map_err(Error::Owner)?
+            };
             let binding = value.claim.binding();
             let account_id = binding.account();
             let account = account_id.as_bytes().as_slice();
@@ -816,6 +864,12 @@ fn publish_inner(
                 )
                 .await
                 .map_err(|_| Error::Database)?;
+            if let Some(observation) = &observation {
+                let final_time = observation.check(client, &value).await?;
+                if final_time < timestamp || final_time >= expires {
+                    return Err(Error::ExpiryHold);
+                }
+            }
             marker.store(true, Ordering::Relaxed);
             client
                 .batch_execute("COMMIT")
