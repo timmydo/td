@@ -316,7 +316,8 @@ branch diff; `--path FILE` explains one path's mapping.
 `DEVELOPMENT.md` carries the complete mutation workflow. The always-loaded
 boundaries are:
 
-- change work happens in an isolated worktree branch;
+- change work happens in an isolated worktree branch, at the location
+  specified in `DEVELOPMENT.md`;
 - agent review copies, continuations, and other disposable scratch belong
   under that worktree's `.td-build-cache/agent-scratch/`, never as loose
   `/tmp` trees. Each agent owns its scratch and deletes it before finishing,

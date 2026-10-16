@@ -13,6 +13,33 @@ protection. GitHub and the sr.ht mirror are backup remotes, but shared
 `origin` is the handoff: the integrator reviews and lands from a separate
 clone, so a pushed branch is the PR and there is nothing else to notify.
 
+## Worktree location
+
+Create agent-owned development worktrees under `~/src/td-worktrees/<branch>`.
+Keep `~/src/td` as the primary checkout; do not create development worktrees
+as `~/src/td-*` siblings or inside the primary checkout. This is the path
+to pass to `git worktree add`, including when working through Codex CLI.
+For example, from the primary checkout after fetching `origin`:
+
+```text
+git worktree add -b example-change ~/src/td-worktrees/example-change origin/main
+```
+
+Tool-managed integration and review checkouts keep their documented
+locations. Disposable agent scratch stays inside the owning worktree as
+specified in `AGENTS.md`.
+
+Existing worktrees need not move during active work. To consolidate an idle
+checkout, first check for running agents, builds, services and other process
+use, uncommitted or untracked files, Git operations and worktree locks.
+Leave active or uncertain checkouts in place. Use `git worktree move` without
+force for a clean, inactive checkout; it preserves the branch and private
+Git history while updating Git's worktree registration. Resume sessions
+from the new path; external tools may still remember the old path. Moving
+a checkout does not reclaim its build-cache space. Use the landed-worktree
+cleanup below when removal is appropriate, and preserve retained review
+traces during any cleanup.
+
 ## Choose the branch lifetime
 
 Name every branch for the work it carries. Use a normal descriptive branch for
@@ -776,11 +803,11 @@ Doctests do not reach the runner and run uncapped — cargo wires a runner into
 rustdoc only when cross-compiling.
 
 Which builder gets used matters, because cargo searches ancestor directories
-for `.cargo/config.toml` and worktrees live under the main checkout at
-`.claude/worktrees/*`. A worktree whose branch already carries this file uses
-its own copy and its own `target/release/td-builder`. A worktree branched
-BEFORE it — or any unrelated crate checked out under the td tree — finds the
-main checkout's config instead and execs the main checkout's builder, so a
+for `.cargo/config.toml`. Older worktrees may still live under the primary
+checkout at `.claude/worktrees/*`. A worktree whose branch carries this file
+uses its own copy and its own `target/release/td-builder`. An older nested
+worktree without this file — or an unrelated crate under the td tree —
+finds the primary checkout's config instead and execs its builder, so a
 `cargo clean` there makes its tests fail with `No such file or directory`.
 Build the release binary in whichever checkout supplies the config.
 
