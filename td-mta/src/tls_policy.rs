@@ -960,4 +960,4 @@ fn append_clients<R: Read>(
 
 #[cfg(test)]
 #[path = "tls_policy_tests.rs"]
-mod tests;
+pub(crate) mod tests;

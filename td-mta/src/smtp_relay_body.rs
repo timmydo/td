@@ -53,8 +53,13 @@ pub enum Progress<'a, B: TlsWireStorage> {
 /// This is not AcceptancePossible, remote acceptance or a durable queue result.
 pub struct BodySent<B: TlsWireStorage> {
     session: Session<B>,
+    clock: Arc<dyn Clock>,
+    deadline: Deadline,
 }
 impl<B: TlsWireStorage> BodySent<B> {
+    pub(crate) fn into_parts(self) -> (Session<B>, Arc<dyn Clock>, Deadline) {
+        (self.session, self.clock, self.deadline)
+    }
     pub fn into_buffers(self) -> Result<(B, B), Error> {
         self.session.into_buffers()
     }
@@ -142,6 +147,8 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             Ok(false) => Ok(Progress::Pending(self)),
             Ok(true) => Ok(Progress::Ready(BodySent {
                 session: self.session,
+                clock: self.clock,
+                deadline: self.deadline,
             })),
         }
     }

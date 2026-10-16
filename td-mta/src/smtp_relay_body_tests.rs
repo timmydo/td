@@ -364,3 +364,41 @@ fn relay_body_rechecks_absolute_deadline_after_source_read() {
     assert!(received.is_empty());
     drop(peer.into_buffers().unwrap());
 }
+
+/// A completed empty body on a real authenticated TLS connection.
+type CompletedBodyFixture = (
+    std::sync::MutexGuard<'static, ()>,
+    crate::smtp_relay_body::BodySent<Box<[u8; TLS_WIRE_BYTES]>>,
+    Connection,
+    Arc<dyn Clock>,
+);
+pub(crate) fn completed_body() -> CompletedBodyFixture {
+    let serial = serial();
+    let material = Material::new();
+    let (session, peer) = relay_auth_tests::authenticated(&material);
+    let mut source = Source::new(b"", 4096);
+    let mut input = [0; INPUT_BYTES];
+    let mut output = [0; OUTPUT_BYTES];
+    let mut meter = meter();
+    let mut owner = Exchange::new(
+        session,
+        &mut source,
+        Body::SevenBit,
+        Scratch {
+            input: &mut input,
+            output: &mut output,
+        },
+        material.source.clone(),
+        cap(),
+        &mut meter,
+    )
+    .ok()
+    .unwrap();
+    for _ in 0..100_000 {
+        match owner.advance().ok().unwrap() {
+            Progress::Pending(next) => owner = next,
+            Progress::Ready(body) => return (serial, body, peer, material.source.clone()),
+        }
+    }
+    panic!("empty body did not complete");
+}

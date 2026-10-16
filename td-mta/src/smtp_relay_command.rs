@@ -91,6 +91,25 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         deadline: Deadline,
         meter: &'a mut Meter,
     ) -> Result<Self, Refusal<B>> {
+        Self::new_inner(session, Some(command), scratch, clock, deadline, meter)
+    }
+    pub(crate) fn new_final(
+        session: Session<B>,
+        scratch: Scratch<'a>,
+        clock: Arc<dyn Clock>,
+        deadline: Deadline,
+        meter: &'a mut Meter,
+    ) -> Result<Self, Refusal<B>> {
+        Self::new_inner(session, None, scratch, clock, deadline, meter)
+    }
+    fn new_inner(
+        session: Session<B>,
+        command: Option<Command<'_>>,
+        scratch: Scratch<'a>,
+        clock: Arc<dyn Clock>,
+        deadline: Deadline,
+        meter: &'a mut Meter,
+    ) -> Result<Self, Refusal<B>> {
         let init = (|scratch: Scratch<'a>| {
             let now = check(clock.as_ref(), deadline, meter)?;
             meter
@@ -102,14 +121,20 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                     },
                 )
                 .map_err(work)?;
-            if matches!(command, Command::MailFromEightBit(_))
+            if matches!(command, Some(Command::MailFromEightBit(_)))
                 && !session.capabilities().eight_bit_mime()
             {
                 return Err(Error::Forbidden);
             }
             let input = scratch.input.get_mut(..LINE_BYTES).ok_or(Error::Capacity)?;
             let reply = NormalizedReplyReader::new(scratch.line, scratch.reply)?;
-            let command = frame(command, scratch.command)?;
+            let command = if let Some(command) = command {
+                frame(command, scratch.command)?
+            } else {
+                let output = scratch.command.get_mut(..3).ok_or(Error::Capacity)?;
+                output.copy_from_slice(b".\r\n");
+                output
+            };
             check(clock.as_ref(), deadline, meter)?;
             Ok((input, reply, command))
         })(scratch);
@@ -126,6 +151,9 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 reply,
             }),
         }
+    }
+    pub(crate) fn writes_pending(&self) -> bool {
+        matches!(self.phase, Phase::Write(_) | Phase::Flush)
     }
     /// At most one TLS operation and 512 received bytes parsed per turn.
     pub fn advance(mut self) -> Result<Progress<'a, B>, Refusal<B>> {

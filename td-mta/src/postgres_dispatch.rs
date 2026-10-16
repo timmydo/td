@@ -394,6 +394,12 @@ pub struct FinalResult<'w, 'a, 'r> {
     outcome: phases::Outcome,
 }
 impl<'w, 'a, 'r> FinalResult<'w, 'a, 'r> {
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+        self.work.worker.connection.clock.clone()
+    }
+    pub(crate) fn work_limit(&self) -> Instant {
+        self.work.limit
+    }
     pub fn attempt(&self) -> AttemptId {
         self.possible.attempt()
     }

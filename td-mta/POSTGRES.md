@@ -4155,3 +4155,44 @@ The bounded runtime must retain or settle its actual reply before dropping
 that responsibility, and recovery remains conservative after a crash. The
 low-level FinalWork consuming API remains storage machinery; future handoff
 uses the retained FinalResult failure path. No terminator API is opened here.
+
+## 150. Final DATA transport handoff
+
+The prepared PostgreSQL handoff consumes a non-cloneable FinalResult and the
+matching completed BodySent. Only known new AcceptancePossible publication
+can construct that result owner. The trusted runtime remains responsible for
+the immutable body source, actual 354, durable Body fence and matching attempt
+and recipient subset; BodySent alone proves encoding/flush, not those facts.
+This opens the previously closed terminator boundary through this owner only;
+no scheduler or production PostgreSQL backend is activated.
+
+BodySent retains its original clock and deadline. Handoff requires identity
+with the worker's runtime clock, keeps that body deadline and the original
+final-work Instant cap, and borrows separate wire and database work meters
+through completion. The command adapter privately frames exactly `.CRLF` into
+three reserved bytes and reuses the existing bounded write/flush/reply parser.
+Its public command enum still exposes no terminator or raw command.
+
+Before each terminator write or flush turn, the owner internally rechecks its
+exact live AcceptancePossible state. Each check charges bounded database work
+and uses a second ordinary slot while final-publication capacity stays held.
+The returned lease/submission cap can only shorten the retained local limit;
+original monotonic deadlines are checked before and after transport turns.
+A refused check aborts transport. Database locks never span network work, and
+section 4's pause/takeover and already-buffered-byte race remains explicit.
+
+After flush, only bounded reply reading remains. A complete actual 2xx, 4xx
+or 5xx reply is published through retained FinalResult capacity before reporting
+completion. Once the command owner returns a complete reply, later deadline
+expiry is handled by retained publication refusal; it cannot discard the reply. No later live-state check substitutes for collecting that reply.
+Non-final, malformed, truncated or out-of-budget replies refuse without an
+invented result. Publication failure returns FinalFailure with the exact
+reply and held slot, plus the closed transport buffers; unknown COMMIT also
+remains in Pending. Completion is a passive durable receipt and closed buffers,
+never a reusable session. Callers must retain/settle failed publication custody.
+
+Real paired-TLS tests cover exact terminator framing, fragmented final replies,
+publication ordering and retention, non-final/malformed/truncated refusal,
+live admission refusal, original work expiry, clock mismatch and exhausted
+wire capacity. The existing real PostgreSQL worker fixture independently
+qualifies native live checks and retained final-result publication/retry.
