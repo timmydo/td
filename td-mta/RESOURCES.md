@@ -5190,3 +5190,14 @@ BodyPlan retains the existing final-result ReadPermit; live checks need their
 ordinary additional slot. Reservation failure closes transport and releases
 local custody, while existing durable phase/recovery rules remain in force.
 Immutable source verification and replay retain their separate bounds.
+
+Live Body validation sends at most 100 32-byte RCPT reply witnesses plus bounded
+row metadata, instead of retaining up to 100 full RCPT and DATA strings in
+native result rows. Each local expected digest uses the existing SHA-256
+provider and one transient 32-byte result; no digest vector survives the check.
+The fresh connection retains 1 MiB input and 1088 frames, with 64 KiB output,
+including authentication and runtime qualification. Body-check admission
+charges 1 MiB plus 128 KiB and 4096 records, preserving a 64 KiB margin over
+the protocol byte ceilings. Publication, Possible validation and final-capacity
+reservation keep their existing charges; all slot and shrinking-deadline
+rules are unchanged.

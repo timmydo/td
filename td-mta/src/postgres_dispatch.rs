@@ -20,6 +20,7 @@ use td_crypto::TrustStore;
 
 const ATTEMPT_IO: u64 = 2 * 1024 * 1024 + 192 * 1024;
 const PHASE_IO: u64 = 3 * 1024 * 1024 + 128 * 1024;
+const BODY_CHECK_IO: u64 = 1024 * 1024 + 128 * 1024;
 
 #[derive(Clone, Copy)]
 enum LivePhase {
@@ -429,9 +430,13 @@ impl<'a, 'r> Dispatches<'a, 'r> {
             return Err(ports::Error::Deadline.into());
         }
         let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+        let io_bytes = match phase {
+            LivePhase::Body => BODY_CHECK_IO,
+            LivePhase::Possible => PHASE_IO,
+        };
         let limit = worker
             .connection
-            .admit(until, meter, PHASE_IO)?
+            .admit(until, meter, io_bytes)?
             .min(original);
         let _slot = worker
             .connection

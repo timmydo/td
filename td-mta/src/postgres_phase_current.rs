@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use td_crypto::TrustStore;
+use td_crypto::{Crypto, Digest, Provider, TrustStore};
 
 /// Validate the exact still-active AcceptancePossible subset and its durable
 /// capacity under fresh policy, ownership and queue-clock checks. All database
@@ -52,9 +52,10 @@ fn check_current(
     clock: Arc<dyn Clock>,
     guard: Arc<Mutex<Guard>>,
 ) -> Result<Instant, Error> {
+    let compact_body = value.inner.phase == 2;
     let value = value.inner.clone();
     let observation = Observation { clock, guard };
-    let limit = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
+    let limit = postgres_probe::with_phase_check_client(request, trust, deadline, compact_body, move |client| {
         Box::pin(async move {
             if !owners::begin(client, &value.claim, true, false).await? {
                 return Err(Error::Policy);
@@ -87,14 +88,17 @@ fn check_current(
             if value.phase == 3 {
                 crate::postgres_final_capacity::check(client, account, attempt, &value.ordinals).await.map_err(capacity)?;
             }
-            let rows=client.query("SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101", &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
+            let query = if compact_body {
+                "SELECT ordinal,phase,pg_catalog.sha256(pg_catalog.convert_to(rcpt_reply,'UTF8')),data_reply IS NOT NULL,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
+            } else {
+                "SELECT ordinal,phase,rcpt_reply,data_reply,reason,changed,next_attempt_at FROM td_mta.recipients WHERE account=$1 AND submission_id=$2 AND attempt_id=$3 AND state=2 ORDER BY ordinal LIMIT 101"
+            };
+            let rows=client.query(query, &[&account,&submission,&attempt]).await.map_err(|_|Error::Database)?;
             if rows.len()>100 {return Err(Error::Integrity);}
             let mut selected=value.ordinals.iter().enumerate();
             for row in &rows {
                 let found:i64=row.try_get(0).map_err(|_|Error::Integrity)?;
                 let phase:i64=row.try_get(1).map_err(|_|Error::Integrity)?;
-                let rcpt:Option<&str>=row.try_get(2).map_err(|_|Error::Integrity)?;
-                let data:Option<&str>=row.try_get(3).map_err(|_|Error::Integrity)?;
                 let reason:i64=row.try_get(4).map_err(|_|Error::Integrity)?;
                 let next:Option<i64>=row.try_get(6).map_err(|_|Error::Integrity)?;
                 let changed=number(row.try_get(5).map_err(|_|Error::Integrity)?)?;
@@ -103,10 +107,17 @@ fn check_current(
                 if phase==1 && value.ordinals.binary_search(&found).is_err() {continue;}
                 let (index, ordinal) = selected.next().ok_or(Error::Conflict)?;
                 if phase!=value.phase || ordinal!=&found {return Err(Error::Conflict);}
-                if phase==2 && rcpt!=value.replies.get(index).map(String::as_str) {
-                    return Err(Error::Integrity);
-                }
-                if rcpt.is_none_or(|s|!valid_reply(s,false)) || data.is_some() || changed!=published.new_sequence {
+                let reply_matches = if compact_body {
+                    let expected = reply_digest(value.replies.get(index).ok_or(Error::Integrity)?)?;
+                    let found:Option<&[u8]>=row.try_get(2).map_err(|_|Error::Integrity)?;
+                    let data:bool=row.try_get(3).map_err(|_|Error::Integrity)?;
+                    found == Some(expected.as_slice()) && !data
+                } else {
+                    let rcpt:Option<&str>=row.try_get(2).map_err(|_|Error::Integrity)?;
+                    let data:Option<&str>=row.try_get(3).map_err(|_|Error::Integrity)?;
+                    rcpt.is_some_and(|s|valid_reply(s,false)) && data.is_none()
+                };
+                if !reply_matches || changed!=published.new_sequence {
                     return Err(Error::Integrity);
                 }
             }
@@ -123,6 +134,14 @@ fn check_current(
         return Err(Error::ExpiryHold);
     }
     Ok(limit)
+}
+fn reply_digest(reply: &str) -> Result<[u8; 32], Error> {
+    if !valid_reply(reply, false) {
+        return Err(Error::Integrity);
+    }
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    hash.update(reply.as_bytes()).map_err(|_| Error::Crypto)?;
+    hash.finish().map_err(|_| Error::Crypto)
 }
 fn local_limit(
     started: Instant,

@@ -177,6 +177,25 @@ pub(crate) fn with_batch_client<T>(
     )
 }
 
+// Compact Body checks send only bounded identity/query parameters. Possible
+// retains the batch profile; both include original qualification/frame budgets.
+pub(crate) fn with_phase_check_client<T>(
+    request: &Request<'_>,
+    trust: &TrustStore,
+    deadline: Instant,
+    compact_body: bool,
+    operation: impl for<'a> FnOnce(&'a tokio_postgres::Client) -> Pin<Box<dyn Future<Output = T> + 'a>>,
+) -> Result<T, Error> {
+    with_output_limit(
+        request,
+        trust,
+        deadline,
+        if compact_body { 64 * 1024 } else { 1024 * 1024 },
+        Input::mutations(),
+        operation,
+    )
+}
+
 // One immutable upload: at most 512 chunks in batches of eight.
 pub(crate) fn with_upload_client<T>(
     request: &Request<'_>,

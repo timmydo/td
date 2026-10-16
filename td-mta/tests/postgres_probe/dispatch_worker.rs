@@ -305,9 +305,37 @@ pub(super) fn exercise(
     assert!(owner.check_current(&mut budget).is_ok());
     assert_eq!(
         before.io_bytes - budget.remaining().io_bytes,
-        3 * 1024 * 1024 + 128 * 1024
+        1024 * 1024 + 128 * 1024
     );
     assert_eq!(before.records - budget.remaining().records, 4096);
+    let body_io = 1024 * 1024 + 128 * 1024;
+    let mut short = Meter::new(
+        until(10_000),
+        Charge {
+            io_bytes: body_io - 1,
+            records: 4096,
+            ..Charge::default()
+        },
+    );
+    assert_eq!(
+        owner.check_current(&mut short),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
+    let mut exact = Meter::new(
+        until(10_000),
+        Charge {
+            io_bytes: body_io,
+            records: 4096,
+            ..Charge::default()
+        },
+    );
+    owner.check_current(&mut exact).unwrap();
+    assert_eq!(exact.remaining().io_bytes, 0);
+    assert_eq!(exact.remaining().records, 0);
+    assert_eq!(
+        owner.check_current(&mut exact),
+        Err(Error::Admission(ports::Error::Capacity))
+    );
     let slot = worker
         .reserve_final(success.outcome().attempt, until(10_000), &mut meter())
         .unwrap();

@@ -133,6 +133,25 @@ pub(super) fn live_state(
     );
     super::attempt_clock::current(fixture, request, trust, change, body).unwrap();
     let limit = check().unwrap();
+    if body {
+        let runtime = Request {
+            address: request.address,
+            server_name: request.server_name,
+            user: "mail_runtime",
+            database: request.database,
+            password: super::PASSWORD,
+            mode: td_mta::postgres_probe::Mode::Runtime,
+        };
+        current(
+            &runtime,
+            trust,
+            deadline(),
+            change,
+            clock.clone(),
+            guard.clone(),
+        )
+        .unwrap();
+    }
     assert!(limit > Instant::now());
     assert!(limit <= deadline());
     let selection = sql(
@@ -163,9 +182,14 @@ pub(super) fn live_state(
             ),
             "0"
         );
-        sql(fixture,&format!("CREATE TABLE public.live_reply AS SELECT ordinal,rcpt_reply FROM td_mta.recipients WHERE attempt_id=decode('{attempt}','hex'); UPDATE td_mta.recipients SET rcpt_reply='250 different actual reply' WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+        sql(fixture,&format!("CREATE TABLE public.live_reply AS SELECT ordinal,rcpt_reply FROM td_mta.recipients WHERE attempt_id=decode('{attempt}','hex'); UPDATE td_mta.recipients SET rcpt_reply=overlay(rcpt_reply placing 'y' from char_length(rcpt_reply) for 1) WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+        assert_eq!(check(), Err(phases::Error::Integrity));
+        sql(fixture,&format!("UPDATE td_mta.recipients SET rcpt_reply=NULL WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
         assert_eq!(check(), Err(phases::Error::Integrity));
         sql(fixture,&format!("UPDATE td_mta.recipients r SET rcpt_reply=b.rcpt_reply FROM public.live_reply b WHERE r.ordinal=b.ordinal AND r.attempt_id=decode('{attempt}','hex'); DROP TABLE public.live_reply"));
+        sql(fixture,&format!("UPDATE td_mta.recipients SET data_reply='250 '||repeat('x',4092) WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+        assert_eq!(check(), Err(phases::Error::Integrity));
+        sql(fixture,&format!("UPDATE td_mta.recipients SET data_reply=NULL WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
     }
     let phase = if body { 2 } else { 3 };
     let other = if body { 3 } else { 2 };

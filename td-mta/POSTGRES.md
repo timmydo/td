@@ -4232,8 +4232,9 @@ inspection remain historical settlement, including after later phases.
 Live Body validation shares the bounded current-state reader with
 AcceptancePossible. It requires the exact receipt, active attempt and selected
 InFlight Body subset under current policy, owner, route-health and clock checks.
-The retained positive RCPT text must equal each selected recipient's stored
-reply; data replies are absent and changed sequences equal the Body receipt.
+The retained positive RCPT text must match each selected recipient's stored
+reply through the SHA-256 witness specified in section 179; data replies are
+absent and changed sequences equal the Body receipt.
 Prepared recipients outside the selected subset remain permitted. Durable final
 capacity is required only for AcceptancePossible, where it is reserved.
 
@@ -4262,8 +4263,9 @@ Unknown COMMIT keeps the exact change in the shared Pending barrier and returns
 no BodyResult. Historical settlement cannot reconstruct one, and duplicate
 new-only publication refuses even after settlement or explicit owner drop.
 
-Each current-state check independently prepays the phase allowance, acquires an
-ordinary slot, checks Pending and uses the native live Body reader. The shared
+Each current-state check independently prepays the Body-check allowance in
+section 179, acquires an ordinary slot, checks Pending and uses the native live
+Body reader. The shared
 admission helper also serves FinalResult without changing its retained final
 capacity. No fresh meter or later lease renewal can extend the original owner
 limit. A later phase refuses Body validation. Dropping an owner releases local
@@ -4318,8 +4320,8 @@ or production backend.
 
 Before each body write or flush turn, the wrapper internally checks the exact
 live Body state through the reserved plan. Every check charges the bounded
-phase allowance and acquires a second ordinary slot while final capacity stays
-held. The returned lease/submission bound only shortens its local cap; original
+Body-check allowance and acquires a second ordinary slot while final capacity
+stays held. The returned lease/submission bound only shortens its local cap; original
 Instant limits are checked before and after every transfer turn. Refusal closes
 the transport and releases local ownership. Locks do not span network work;
 section 4's pause/takeover and buffered-byte limitation remains unchanged.
@@ -4338,8 +4340,8 @@ body input and failed possible publication. The full native PostgreSQL/TLS
 fixture now uses the wrapper through actual final-result publication and
 retained-reply retry. These are bounded correctness cases, not maximum-size
 throughput qualification. Full live checks currently open bounded database
-connections and reread the selected replies per write/flush; their cumulative
-cost must fit the original meter and deadline. Large-body throughput and any
+connections and reread selected reply witnesses per write/flush; their
+cumulative cost must fit the original meter and deadline. Large-body throughput and any
 future admission batching require explicit qualification before activation;
 no allowance or deadline is silently enlarged here.
 
@@ -4957,3 +4959,35 @@ dot transparency and its sole terminator, and persists the actual final reply
 under the original ten-second cap and existing meters. This is a bounded
 larger-message qualification, not a maximum-32-MiB throughput claim. Full
 per-write database connections and evidence reads remain as in section 155.
+
+## 179. Compact live Body reply witnesses
+
+The live Body reader projects the SHA-256 of each RCPT reply's UTF-8 bytes and
+whether DATA text is present. Each selected row must have a non-null 32-byte
+digest equal to the digest of its retained, validated positive reply and no
+DATA text. Equality now relies on SHA-256 collision resistance, consistent
+with existing stored-body and operation-receipt digests. The original request
+digest and receipt representation do not change. PostgreSQL's pg_catalog.sha256
+and pg_catalog.convert_to supply the witness; no extension is required.
+
+The query retains exact sorted subset membership, phase, publication receipt,
+active attempt, encoded membership, sequence/floor, reason, retry, policy,
+owner, health, queue-clock and expiry checks. Unselected Prepared rows retain
+their existing handling. AcceptancePossible keeps its full positive reply
+validation and final-capacity checks.
+
+Every check still opens and qualifies a fresh connection, releasing all locks
+by closure before transport work. Body uses at most 1 MiB input, 1088 frames
+and 64 KiB output, including authentication and runtime qualification. The
+frame allowance is the same in preparation mode. Dispatch prepays 1 MiB plus
+128 KiB and 4096 records: both protocol byte ceilings plus the existing 64 KiB
+margin. Publication, final reservation and Possible checks keep their original
+allowances. No counter is replenished and no deadline or slot rule changes.
+
+Native cases check 100 distinct maximum-size replies, including multibyte text
+and HTAB, under runtime qualification; a one-byte change, null reply and
+unexpected maximum DATA text refuse. Exact Body-check budget exhaustion is
+tested independently of publication charges. Existing state, policy, ownership,
+clock and deadline corruption cases remain. This reduces response volume and
+per-check charging; fixed record limits and repeated connection setup still
+preclude a maximum-message throughput claim.

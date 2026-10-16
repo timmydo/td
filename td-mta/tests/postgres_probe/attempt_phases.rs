@@ -35,7 +35,13 @@ pub(super) fn exercise(
         "SELECT encode(generation,'hex') FROM td_mta.config_selection",
     );
     let replies: Vec<_> = (0..100)
-        .map(|n| format!("250 {n:03} {}", "x".repeat(4088)))
+        .map(|n| {
+            if n == 0 {
+                format!("250 {n:03} é\t{}", "x".repeat(4085))
+            } else {
+                format!("250 {n:03} {}", "x".repeat(4088))
+            }
+        })
         .collect();
     assert!(replies.iter().all(|s| s.len() == 4096));
     let accepted: Vec<_> = replies
