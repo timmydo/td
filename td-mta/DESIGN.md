@@ -1255,7 +1255,11 @@ a local configuration-binding check, not a persisted password verifier,
 current-generation admission or successful remote authentication. Credential
 rotation changes new policies; old sessions continue to identify their old
 snapshot until the runtime retires them. The prepared AUTH owner performs this check before writing any AUTH command;
-the runtime must still enforce live queue/route fences.
+the runtime must still enforce live queue/route fences. The prepared native
+PostgreSQL MAIL adapter additionally requires the authenticated session's
+process-local policy ID to match the TLS generation created with the attempt's
+selected-profile Binding. That ID is passive provenance, never persisted
+queue authority. POSTGRES.md section 183 owns this bound-path check.
 
 The prepared AUTH exchange consumes that fresh-EHLO session and borrows the
 original work meter and credential strings. Prefer advertised PLAIN; select

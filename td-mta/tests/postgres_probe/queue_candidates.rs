@@ -17,6 +17,7 @@ pub(super) fn exercise(
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
+    policies: &super::relay_wire::Policies,
 ) {
     // A disjoint ID interval keeps cleanup independent of the shared scenario.
     let id = |n: u8| {
@@ -284,10 +285,18 @@ pub(super) fn exercise(
         .iter()
         .all(|candidate| candidate.submission != id(0)));
     super::attempt_envelope::exercise(fixture, request, trust, claim, generation, source);
-    super::native_final_handoff::exercise(fixture, request, trust, claim, generation, source);
-    super::native_mail_exchange::exercise(fixture, request, trust, claim, generation, source);
-    super::native_rcpt_exchange::exercise(fixture, request, trust, claim, generation, source);
-    super::native_data_exchange::exercise(fixture, request, trust, claim, generation, source);
+    super::native_final_handoff::exercise(
+        fixture, request, trust, claim, generation, source, policies,
+    );
+    super::native_mail_exchange::exercise(
+        fixture, request, trust, claim, generation, source, policies,
+    );
+    super::native_rcpt_exchange::exercise(
+        fixture, request, trust, claim, generation, source, policies,
+    );
+    super::native_data_exchange::exercise(
+        fixture, request, trust, claim, generation, source, policies,
+    );
     super::dispatch_recovery::exercise(fixture, request, trust, claim, generation, source);
     super::dispatch_worker::exercise(fixture, request, trust, claim, generation, source);
     for n in 0..70 {

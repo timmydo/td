@@ -22,6 +22,7 @@ pub(super) fn exercise(
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
+    policies: &wire::Policies,
 ) {
     for (n, refuse, mail_refusal, data_case) in [
         (95, false, 0, 0),
@@ -150,7 +151,7 @@ pub(super) fn exercise(
             envelope.recipients.len(),
             if data_case >= 4 { 2 } else { 1 }
         );
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
+        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
         let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143..=156) {
             let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
             let ready = completed.reserve_body(&mut database).ok().unwrap();

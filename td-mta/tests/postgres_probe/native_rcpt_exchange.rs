@@ -20,6 +20,7 @@ pub(super) fn exercise(
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
+    policies: &wire::Policies,
 ) {
     for n in 124..=133 {
         let submission = SubmissionId::from_bytes([n; 16]);
@@ -81,7 +82,7 @@ pub(super) fn exercise(
             .reserve_mail()
             .unwrap();
         let attempt = published.attempt();
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
+        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
         let accepted = wire::accepted_mail(published, session, &mut peer, cap, &mut database);
         let rcpt_cap = if n == 131 {
             td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000).unwrap()

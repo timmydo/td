@@ -21,6 +21,7 @@ pub(super) fn exercise(
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
+    policies: &wire::Policies,
 ) {
     for n in 134..=142 {
         let submission = SubmissionId::from_bytes([n; 16]);
@@ -82,7 +83,7 @@ pub(super) fn exercise(
             .reserve_mail()
             .unwrap();
         let attempt = published.attempt();
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
+        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
         let accepted = wire::accepted_mail(published, session, &mut peer, cap, &mut database);
         let (first, _) = wire::rcpt_command(
             wire::RcptStart::Mail(accepted),

@@ -56,6 +56,10 @@ pub struct Dispatch {
     retry: bool,
 }
 impl Dispatch {
+    pub(crate) fn relay_policy(&self) -> Option<crate::ports::TlsPolicyId> {
+        self.claim.binding().relay_policy()
+    }
+
     pub fn attempt(&self) -> AttemptId {
         self.attempt
     }

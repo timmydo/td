@@ -19,6 +19,7 @@ use td_mta::{
     transport::TcpTransport,
 };
 pub(super) type Buffer = Box<[u8; TLS_WIRE_BYTES]>;
+pub(super) type Policies = td_mta::generations::GenerationLease<TlsPolicies>;
 pub(super) type Peer = TlsConnection<Buffer>;
 pub(super) fn meter(cap: Deadline) -> Meter {
     Meter::new(
@@ -78,8 +79,34 @@ pub(super) fn authenticated(
     fixture: &Fixture,
     clock: Arc<RuntimeClock>,
     cap: Deadline,
+    policies: &Policies,
 ) -> (auth::Session<Buffer>, Peer) {
-    let source = r#"version = 1
+    authenticate(fixture, clock, cap, Some(policies), false)
+}
+pub(super) fn mismatched(
+    fixture: &Fixture,
+    clock: Arc<RuntimeClock>,
+    cap: Deadline,
+    rotated: bool,
+) -> (auth::Session<Buffer>, Peer) {
+    authenticate(fixture, clock, cap, None, rotated)
+}
+fn authenticate(
+    fixture: &Fixture,
+    clock: Arc<RuntimeClock>,
+    cap: Deadline,
+    policies: Option<&Policies>,
+    rotated: bool,
+) -> (auth::Session<Buffer>, Peer) {
+    let password = if rotated {
+        "rotated-password"
+    } else {
+        "database-password"
+    };
+    let lease = if let Some(policies) = policies {
+        policies.clone()
+    } else {
+        let source = r#"version = 1
 [server]
 hostname = "localhost"
 jmap_origin = "https://localhost"
@@ -117,38 +144,39 @@ kind = "https"
 bind = "127.0.0.1:443"
 certificate = "public"
 "#;
-    let mut scratch = vec![0; stream::SCRATCH_BYTES];
-    let loaded = load::read(
-        storage::Storage::try_new().unwrap(),
-        &mut stanza::Pending::new(),
-        &mut scratch,
-        &mut source.as_bytes(),
-    )
-    .unwrap();
-    let resolved = materialize::read_text(loaded, &mut scratch, |_| {
-        Ok::<_, ports::Error>(Cursor::new(b"database-password"))
-    })
-    .unwrap();
-    let chain = fs::read(fixture.root.join("server.crt")).unwrap();
-    let key = fs::read(fixture.root.join("server.key")).unwrap();
-    let mut set = GenerationSet::at_startup();
-    let prepared = TlsPolicies::prepare(
-        set.reserve().unwrap(),
-        &resolved,
-        Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(
-            clock.clone(),
-        ))),
-        |request| {
-            Ok::<_, ports::Error>(Cursor::new(match request.kind() {
-                MaterialKind::Chain => chain.as_slice(),
-                MaterialKind::Key => key.as_slice(),
-                _ => fixture.ca.as_slice(),
-            }))
-        },
-    )
-    .unwrap();
-    drop(set.publish(prepared).unwrap());
-    let lease = set.current().unwrap();
+        let mut scratch = vec![0; stream::SCRATCH_BYTES];
+        let loaded = load::read(
+            storage::Storage::try_new().unwrap(),
+            &mut stanza::Pending::new(),
+            &mut scratch,
+            &mut source.as_bytes(),
+        )
+        .unwrap();
+        let resolved = materialize::read_text(loaded, &mut scratch, |_| {
+            Ok::<_, ports::Error>(Cursor::new(password.as_bytes()))
+        })
+        .unwrap();
+        let chain = fs::read(fixture.root.join("server.crt")).unwrap();
+        let key = fs::read(fixture.root.join("server.key")).unwrap();
+        let mut set = GenerationSet::at_startup();
+        let prepared = TlsPolicies::prepare(
+            set.reserve().unwrap(),
+            &resolved,
+            Arc::new(td_crypto::ClockHandle::new(TlsClockSource::new(
+                clock.clone(),
+            ))),
+            |request| {
+                Ok::<_, ports::Error>(Cursor::new(match request.kind() {
+                    MaterialKind::Chain => chain.as_slice(),
+                    MaterialKind::Key => key.as_slice(),
+                    _ => fixture.ca.as_slice(),
+                }))
+            },
+        )
+        .unwrap();
+        drop(set.publish(prepared).unwrap());
+        set.current().unwrap()
+    };
     let pool = HandshakePool::new(2).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let left = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -233,7 +261,7 @@ certificate = "public"
     let mut exchange = auth::Exchange::new(
         session,
         "relay-user",
-        "database-password",
+        password,
         auth::Scratch {
             input: &mut input,
             first_reply: &mut first,
@@ -251,7 +279,11 @@ certificate = "public"
     let mut scripts = [
         Script::new(b"AUTH PLAIN\r\n", b"334 \r\n"),
         Script::new(
-            b"AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n",
+            if rotated {
+                b"AHJlbGF5LXVzZXIAcm90YXRlZC1wYXNzd29yZA==\r\n".as_slice()
+            } else {
+                b"AHJlbGF5LXVzZXIAZGF0YWJhc2UtcGFzc3dvcmQ=\r\n".as_slice()
+            },
             b"235 authenticated\r\n",
         ),
     ];

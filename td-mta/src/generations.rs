@@ -156,6 +156,13 @@ pub struct PreparedGeneration<T> {
     retained: GenerationLease<T>,
 }
 
+impl<T> PreparedGeneration<T> {
+    /// Cold identity inspection does not publish or clone the reserved owner.
+    pub(crate) fn inspect(&self) -> (GenerationId, &T) {
+        (self.retained.id(), self.retained.value())
+    }
+}
+
 impl<T> std::fmt::Debug for PreparedGeneration<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PreparedGeneration(<redacted>)")

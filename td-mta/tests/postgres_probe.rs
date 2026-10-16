@@ -8996,7 +8996,7 @@ fn exercise_submission_publication(
         generations::GenerationSet, postgres_delivery_body as delivery_body,
         postgres_runtime_profile as runtime, tls_policy::TlsPolicies,
     };
-    let domain = GenerationSet::<TlsPolicies>::at_startup();
+    let mut domain = GenerationSet::<TlsPolicies>::at_startup();
     let relay = runtime::load(
         request,
         trust,
@@ -9006,8 +9006,11 @@ fn exercise_submission_publication(
         domain.reserve().unwrap(),
     )
     .unwrap();
-    assert!(relay.binding().serves_route(first.route()));
-    exercise_route_owners(fixture, request, trust, relay.binding(), binding);
+    let (relay_binding, _relay_configuration, relay_prepared) = relay.into_parts();
+    drop(domain.publish(relay_prepared).unwrap());
+    let relay_policies = domain.current().unwrap();
+    assert!(relay_binding.serves_route(first.route()));
+    exercise_route_owners(fixture, request, trust, &relay_binding, binding);
     assert_eq!(
         delivery_body::with_submission(
             request,
@@ -9028,7 +9031,7 @@ fn exercise_submission_publication(
             trust,
             deadline(),
             delivery_body::ReadRequest {
-                binding: relay.binding(),
+                binding: &relay_binding,
                 submission: a.submission,
                 maximum: a.length,
             },
@@ -9049,7 +9052,7 @@ fn exercise_submission_publication(
             trust,
             deadline(),
             delivery_body::ReadRequest {
-                binding: relay.binding(),
+                binding: &relay_binding,
                 submission: a.submission,
                 maximum: a.length - 1
             },
@@ -9088,7 +9091,7 @@ fn exercise_submission_publication(
         trust,
         deadline(),
         delivery_body::ReadRequest {
-            binding: relay.binding(),
+            binding: &relay_binding,
             submission: a.submission,
             maximum: a.length,
         },
@@ -9117,7 +9120,7 @@ fn exercise_submission_publication(
             trust,
             deadline(),
             delivery_body::ReadRequest {
-                binding: relay.binding(),
+                binding: &relay_binding,
                 submission: a.submission,
                 maximum: a.length
             },
@@ -9456,7 +9459,14 @@ fn exercise_submission_publication(
     assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id=decode('{}','hex') AND state=1",a.submission)),"2");
     assert_eq!(sql(fixture, &format!("SELECT submitting_profile,route_name,encode(destination,'hex') FROM td_mta.submission_routes WHERE submission_id=decode('{}','hex')", a.submission)), route_row);
     read_outgoing().unwrap();
-    exercise_dispatch(fixture, request, trust, relay.binding(), a.submission);
+    exercise_dispatch(
+        fixture,
+        request,
+        trust,
+        &relay_binding,
+        a.submission,
+        &relay_policies,
+    );
 }
 
 fn exercise_http_submission_owner(
@@ -10445,6 +10455,7 @@ fn exercise_dispatch(
     trust: &TrustStore,
     binding: &td_mta::postgres_runtime_profile::Binding,
     submission: td_mta::ids::SubmissionId,
+    policies: &relay_wire::Policies,
 ) {
     use td_mta::{ids::BootId, postgres_attempts as attempts, postgres_route_owners as owners};
     let claim = owners::prepare(binding, BootId::from_bytes([9; 16])).unwrap();
@@ -10599,6 +10610,7 @@ fn exercise_dispatch(
         binding,
         submission,
         value.attempt(),
+        policies,
     );
 }
 
@@ -10609,6 +10621,7 @@ fn exercise_attempt_recovery(
     binding: &td_mta::postgres_runtime_profile::Binding,
     submission: td_mta::ids::SubmissionId,
     attempt: td_mta::ids::AttemptId,
+    policies: &relay_wire::Policies,
 ) {
     use td_mta::{
         ids::BootId, postgres_attempt_recovery as recovery, postgres_route_owners as owners,
@@ -10753,7 +10766,7 @@ fn exercise_attempt_recovery(
     );
     route_repair::exercise(fixture, request, trust, binding, submission);
     route_success::exercise(fixture, request, trust, binding, submission);
-    submission_cancel::exercise(fixture, request, trust, binding, submission);
+    submission_cancel::exercise(fixture, request, trust, binding, submission, policies);
 }
 
 fn exercise_submission_query_dispatch(

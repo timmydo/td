@@ -33,15 +33,21 @@ pub struct Cursor<'w, 'a, 'r, B: TlsWireStorage> {
     mode: Body,
 }
 /// Full RCPT collection with at least one positive reply. No DATA was sent.
+///
+/// ```compile_fail,E0624
+/// use td_mta::postgres_relay_rcpt::Completed;
+/// fn split(value: Completed<'_, '_, '_, Box<[u8; td_mta::tls_io::TLS_WIRE_BYTES]>>) {
+///     let _ = value.into_parts();
+/// }
+/// ```
 pub struct Completed<'w, 'a, 'r, B: TlsWireStorage> {
     result: RcptResult<'w, 'a, 'r>,
     session: Session<B>,
     mode: Body,
 }
 impl<'w, 'a, 'r, B: TlsWireStorage> Completed<'w, 'a, 'r, B> {
-    /// Explicit trusted DATA handoff; its reservation and current checks remain
-    /// required before output. The original mode and session stay paired here.
-    pub fn into_parts(self) -> (RcptResult<'w, 'a, 'r>, Session<B>, Body) {
+    /// Internal DATA handoff keeps evidence, mode and session paired.
+    pub(crate) fn into_parts(self) -> (RcptResult<'w, 'a, 'r>, Session<B>, Body) {
         (self.result, self.session, self.mode)
     }
     pub fn close(self) -> Closed<'w, 'a, 'r, B> {

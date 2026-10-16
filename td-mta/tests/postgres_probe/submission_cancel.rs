@@ -23,6 +23,7 @@ pub(super) fn exercise(
     trust: &TrustStore,
     binding: &Binding,
     source: SubmissionId,
+    policies: &super::relay_wire::Policies,
 ) {
     let submission = SubmissionId::from_bytes([91; 16]);
     let sub = format!("decode('{submission}','hex')");
@@ -263,6 +264,7 @@ pub(super) fn exercise(
         &claim,
         grant.generation,
         submission,
+        policies,
     );
     super::cancel_worker::exercise(
         fixture,

@@ -22,8 +22,9 @@ pub(super) fn exercise(
     claim: &Claim,
     generation: u64,
     source: SubmissionId,
+    policies: &wire::Policies,
 ) {
-    for n in 116..=123 {
+    for n in (116..=123).chain([157, 158]) {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -83,7 +84,15 @@ pub(super) fn exercise(
             .unwrap();
         let attempt = published.attempt();
         let expected = format!("MAIL FROM:<{}>\r\n", published.envelope().reverse_path);
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
+        let (session, mut peer) = if matches!(n, 157 | 158) {
+            wire::mismatched(fixture, clock.clone(), cap, n == 158)
+        } else {
+            wire::authenticated(fixture, clock.clone(), cap, policies)
+        };
+        assert_eq!(
+            session.policy_id() == td_mta::tls_policy::TlsPolicies::relay(policies).unwrap(),
+            !matches!(n, 157 | 158)
+        );
         if n == 123 {
             sql(fixture, &format!("UPDATE td_mta.submissions SET reverse_path='changed@example.test' WHERE id={sub}"));
         }
@@ -128,7 +137,7 @@ pub(super) fn exercise(
             &mut database,
         );
         let mut terminal = false;
-        if matches!(n, 120 | 121) {
+        if matches!(n, 120 | 121 | 157 | 158) {
             let failure = begin.err().unwrap();
             assert_eq!(
                 failure.error,
@@ -140,6 +149,19 @@ pub(super) fn exercise(
             );
             assert!(failure.retained.is_none());
             drop(failure.buffers.unwrap());
+            if matches!(n, 157 | 158) {
+                if let Ok(IoProgress::Bytes(count)) = peer.read(&mut [0; 512]) {
+                    assert_eq!(count, 0);
+                }
+                assert_eq!(
+                    sql(
+                        fixture,
+                        &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub}")
+                    ),
+                    "1"
+                );
+                assert_eq!(pending.attempt().unwrap(), None);
+            }
         } else {
             let mut exchange = begin.ok().unwrap();
             let response: &[u8] = if matches!(n, 117 | 118) {
@@ -170,16 +192,7 @@ pub(super) fn exercise(
                     Ok(mail::Progress::Pending(next)) => exchange = next,
                     Ok(mail::Progress::Accepted(accepted)) => {
                         assert_eq!(n, 116);
-                        let (envelope, session, retained_mode) = accepted.into_parts();
-                        assert_eq!(envelope.attempt(), attempt);
-                        assert_eq!(retained_mode, Body::SevenBit);
-                        assert_eq!(
-                            envelope.envelope().reverse_path,
-                            expected
-                                .trim_start_matches("MAIL FROM:<")
-                                .trim_end_matches(">\r\n")
-                        );
-                        drop(session.into_buffers().unwrap());
+                        drop(accepted.into_buffers().unwrap());
                         break;
                     }
                     Ok(mail::Progress::Rejected(rejected)) => {

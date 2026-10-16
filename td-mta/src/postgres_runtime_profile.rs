@@ -26,6 +26,7 @@ pub enum Error {
     Configuration(configuration::Error),
     Bootstrap(postgres_accounts::Error),
     Superseded,
+    TlsPolicy(crate::ports::Error),
 }
 
 /// Identity of prepared bytes, not a live policy or device authorization.
@@ -37,6 +38,7 @@ pub struct Binding {
     profile: String,
     roles: Roles,
     route: crate::postgres_routes::Route,
+    relay_policy: Option<crate::ports::TlsPolicyId>,
     quotas: configuration::SharedQuotas,
     upload_maximum: usize,
     upload_expiry_seconds: usize,
@@ -58,6 +60,10 @@ impl std::fmt::Debug for SendingIdentity {
     }
 }
 impl Binding {
+    pub(crate) fn relay_policy(&self) -> Option<crate::ports::TlsPolicyId> {
+        self.relay_policy
+    }
+
     pub fn epoch(&self) -> StoreEpoch {
         self.epoch
     }
@@ -218,6 +224,11 @@ pub fn load(
     postgres_accounts::inspect(request, trust, deadline, epoch, account)
         .map_err(Error::Bootstrap)?;
     let roles = configuration.roles();
+    let relay_policy = if roles.relay() {
+        Some(TlsPolicies::prepared_relay(&policies).map_err(Error::TlsPolicy)?)
+    } else {
+        None
+    };
     let identity_catalog = if roles.jmap() {
         Some(Arc::new(
             crate::identity_catalog::Catalog::prepare(
@@ -257,6 +268,7 @@ pub fn load(
             profile: name,
             roles,
             route,
+            relay_policy,
             quotas,
             upload_maximum,
             upload_expiry_seconds,

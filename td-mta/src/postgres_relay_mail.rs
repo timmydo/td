@@ -24,14 +24,21 @@ pub struct Refusal<'w, 'a, 'r, B: TlsWireStorage> {
     pub buffers: Result<(B, B), ports::Error>,
 }
 /// Successful MAIL keeps the original envelope, same session and MAIL mode.
+///
+/// ```compile_fail,E0624
+/// use td_mta::postgres_relay_mail::Accepted;
+/// fn split(value: Accepted<'_, '_, '_, Box<[u8; td_mta::tls_io::TLS_WIRE_BYTES]>>) {
+///     let _ = value.into_parts();
+/// }
+/// ```
 pub struct Accepted<'w, 'a, 'r, B: TlsWireStorage> {
     envelope: EnvelopePlan<'w, 'a, 'r>,
     session: Session<B>,
     mode: Body,
 }
 impl<'w, 'a, 'r, B: TlsWireStorage> Accepted<'w, 'a, 'r, B> {
-    /// The trusted next stage owns RCPT sequencing and fresh output checks.
-    pub fn into_parts(self) -> (EnvelopePlan<'w, 'a, 'r>, Session<B>, Body) {
+    /// Internal RCPT handoff preserves session, mode and attempt custody.
+    pub(crate) fn into_parts(self) -> (EnvelopePlan<'w, 'a, 'r>, Session<B>, Body) {
         (self.envelope, self.session, self.mode)
     }
     pub fn into_buffers(self) -> Result<(B, B), ports::Error> {
@@ -60,8 +67,8 @@ pub enum Progress<'m, 'w, 'a, 'r, B: TlsWireStorage> {
     Accepted(Accepted<'w, 'a, 'r, B>),
     Rejected(Rejected<B>),
 }
-/// The caller supplies the authenticated route session for this attempt. The
-/// command sender, clock and original deadline come only from the MailPlan.
+/// The authenticated session must come from the same prepared profile's TLS
+/// generation. Sender, clock and original deadline come only from MailPlan.
 pub fn begin<'m, 'w, 'a, 'r, B: TlsWireStorage>(
     plan: MailPlan<'w, 'a, 'r>,
     session: Session<B>,
@@ -70,6 +77,13 @@ pub fn begin<'m, 'w, 'a, 'r, B: TlsWireStorage>(
     wire: &'m mut Meter,
     database: &'m mut Meter,
 ) -> Result<Exchange<'m, 'w, 'a, 'r, B>, Refusal<'w, 'a, 'r, B>> {
+    if !plan.accepts_policy(session.policy_id()) {
+        return Err(Refusal {
+            error: Error::Protocol(ports::Error::Forbidden),
+            retained: None,
+            buffers: session.into_buffers(),
+        });
+    }
     let limit = plan.work_limit();
     if Instant::now() >= limit {
         return Err(Refusal {

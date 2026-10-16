@@ -1346,7 +1346,9 @@ Identity lookup is configuration evidence, not sending authority: submission
 publication must freshly fence the selection and current device. JMAP bindings
 also share the bounded visible Identity catalog, including public text/HTML
 signature bytes. No relay credentials or signature source paths enter the
-binding; diagnostic formatting redacts the visible catalog.
+binding; diagnostic formatting redacts the visible catalog. A relay binding
+also retains the process-local relay policy identity from this exact prepared
+TLS generation (section 183); it contains no credentials or TLS lease.
 
 Before returning, a final primary observation rejects a selection already
 superseded during preparation. This does not freeze future changes: runtime
@@ -4775,9 +4777,11 @@ before exact historical replay.
 ## 172. Bound native MAIL exchange
 
 postgres_relay_mail binds a reserved MailPlan to one authenticated relay
-Session for the duration of MAIL. The trusted caller still selects the matching
-route session; the adapter itself selects the exact admitted reverse path,
-runtime clock and original deadline. SevenBit frames MAIL FROM; EightBit frames
+Session for the duration of MAIL. Before command construction it requires the
+session's policy identity to match the TLS generation prepared with the
+attempt's private selected-profile binding (section 183). The adapter selects
+the exact admitted reverse path, runtime clock and original deadline. SevenBit
+frames MAIL FROM; EightBit frames
 BODY=8BITMIME only when the session retained the negotiated capability. It
 borrows the caller's original wire and database meters through the exchange.
 
@@ -4788,8 +4792,9 @@ command parser and wire budget; before/after transport checks remain in force.
 The pause/takeover and already-buffered-byte boundary in section 4 is unchanged.
 
 An actual normalized 2xx reply returns the same session, original envelope and
-MAIL mode together. Explicit into_parts hands them to the trusted next stage;
-it does not implement RCPT ordering or grant output without fresh checks.
+MAIL mode together. Only the internal RCPT adapter can split this owner;
+external callers continue through the typed RCPT entry or close transport.
+Fresh checks remain required before each command.
 An actual 4xx/5xx reply enters the preallocated negative MAIL publication before
 any further database admission. Known failure retains exact CommandFailure;
 unknown COMMIT also stays in Pending. Rejection, protocol/admission failure and
@@ -4829,9 +4834,9 @@ owner (RFC 5321 sections 3.8 and 4.2.2). Complete all-negative collection
 closes automatically and returns passive
 results for ordinary negative publication, with no DATA session. A complete
 batch with positives retains its exact RcptResult, same session and mode; the
-trusted DATA stage must reserve its alternatives and check authority before
-output. Explicit into_parts remains the low-level seam. Completed.close fences
-and retains evidence for passive interruption. Fresh passive settlement must
+internal DATA stage must reserve its alternatives and check authority before
+output. Its split is crate-private; external callers use the typed DATA
+continuation. Completed.close fences and retains evidence for passive interruption. Fresh passive settlement must
 publish collected negatives before recovery through the same Pending owner.
 Neither receipt nor collected reply evidence reconstructs output authority.
 
@@ -5128,3 +5133,37 @@ no terminator. Source slots are reusable before final exchange or recovery.
 The 64000-byte success still uses the original ordinary message allowance;
 source work is explicitly separate. This adds no production dispatcher or
 maximum-message throughput claim.
+
+## 183. Selected TLS provenance before MAIL
+
+Selected-profile loading records the exact process-local relay TlsPolicyId
+from the TLS generation prepared by that same load. It inspects only the
+reserved owner's ID and borrowed payload, without publishing or exposing its
+TLS lease. Non-relay bindings have no relay policy identity. Binding clones carry this passive
+identity through Claim, Dispatch and MailPlan; no database digest, receipt,
+schema or persisted generation contains it.
+
+Before constructing MAIL, postgres_relay_mail compares Session.policy_id()
+to the plan's private expected identity. Mismatch closes the authenticated
+transport and returns buffers with Forbidden before any MAIL output or new
+database operation. The caller cannot supply a substitute expected ID.
+Generation identities are process-wide and never reused in that process;
+matching host, port, route or credentials cannot substitute for this match.
+The session still proves TLS and AUTH against its retained policy. Original
+selection, ownership, route-health, envelope, clock and work checks remain
+mandatory; local policy identity supplies no renewed queue authority.
+
+Successful MAIL and RCPT owners no longer expose public split operations.
+Only their internal next-stage adapters separate fields; external callers
+continue through bound RCPT/DATA or close and retain passive evidence. Body
+mode remains the caller's existing explicit SevenBit/EightBit choice, with
+negotiated 8BITMIME and encoder validation unchanged.
+
+Native composed fixtures publish and use the exact TLS generation from the
+PostgreSQL profile load. Same-profile transfers still succeed. Separately
+prepared same-destination generations, including rotated credentials, are
+authenticated to the fixture but refuse before MAIL; durable Prepared and
+Pending remain unchanged and buffers return. Existing envelope/deadline
+refusals remain covered. Compile-fail examples pin external split refusal.
+This is preparation for the eventual runtime; no relay scheduling or backend
+activation is enabled.

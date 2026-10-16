@@ -730,6 +730,10 @@ pub struct MailPlan<'w, 'a, 'r> {
     reply: phases::CommandReply,
 }
 impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
+    pub(crate) fn accepts_policy(&self, policy: ports::TlsPolicyId) -> bool {
+        self.envelope.prepared.published.dispatch.relay_policy() == Some(policy)
+    }
+
     pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
         self.envelope.prepared.worker.connection.clock.clone()
     }

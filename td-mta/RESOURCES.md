@@ -5236,3 +5236,10 @@ borrow. Scoped progress exposes no final authority. Its callback result and
 private completion stay outside the snapshot's final check so failure can
 close Completed explicitly and preserve an existing transfer refusal. The earliest source admission
 limit carries through Body and final custody without extension.
+
+A prepared native relay Binding retains one optional TlsPolicyId from its
+same cold-loaded TLS generation. Inspecting the unpublished generation exposes
+only its ID and borrowed payload; the Binding owns no lease, credential copy
+or extra TLS allocation. Claim/Dispatch clones retain this fixed passive identity. MAIL
+compares it before command construction without I/O, allocation or new work
+admission. Existing live database and wire checks retain their original cost.

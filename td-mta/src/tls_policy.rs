@@ -279,6 +279,15 @@ impl TlsPolicies {
                 (Binding::Listener(actual), Binding::Listener(expected)) if actual == expected)
         })
     }
+    /// Passive provenance for the profile prepared in the same generation.
+    pub(crate) fn prepared_relay(
+        prepared: &PreparedGeneration<Self>,
+    ) -> Result<TlsPolicyId, Error> {
+        let (generation, policies) = prepared.inspect();
+        Self::find_in(generation.get(), policies, |policy| {
+            matches!(policy.binding, Binding::Relay { .. })
+        })
+    }
     pub fn relay(lease: &GenerationLease<Self>) -> Result<TlsPolicyId, Error> {
         Self::find(lease, |policy| {
             matches!(policy.binding, Binding::Relay { .. })
@@ -293,14 +302,20 @@ impl TlsPolicies {
         lease: &GenerationLease<Self>,
         predicate: impl Fn(&Policy) -> bool,
     ) -> Result<TlsPolicyId, Error> {
-        let index = lease
-            .value()
+        Self::find_in(lease.id().get(), lease.value(), predicate)
+    }
+    fn find_in(
+        generation: u64,
+        policies: &Self,
+        predicate: impl Fn(&Policy) -> bool,
+    ) -> Result<TlsPolicyId, Error> {
+        let index = policies
             .policies
             .iter()
             .position(predicate)
             .ok_or(Error::NotFound)?;
         Ok(TlsPolicyId {
-            generation: lease.id().get(),
+            generation,
             index: u16::try_from(index).map_err(|_| Error::Invalid)?,
         })
     }
