@@ -1,4 +1,4 @@
-//! Borrowed td-mail submission creation and success-filing input. No authority.
+//! Borrowed submission creation, cancellation and success-filing input. No authority.
 use crate::{
     admission::work::{Charge, Meter, Stop},
     ports::{Clock, Deadline, Tick},
@@ -175,6 +175,27 @@ pub fn filing<'a>(
     })
 }
 
+/// Decode the only client-writeable submission patch. This proves syntax,
+/// not current state, device authority or whether the message can be unsent.
+pub fn cancellation(
+    value: Value<'_>,
+    clock: &dyn Clock,
+    deadline: Deadline,
+    meter: &mut Meter,
+) -> Result<(), Error> {
+    let mut work = Work::new(clock, deadline, meter)?;
+    let mut fields = value.as_object().ok_or(Error::Property("update"))?;
+    if fields.len() != 1 {
+        return Err(Error::Property("update"));
+    }
+    let (key, value) = fields.next_bytes().ok_or(Error::Property("update"))?;
+    work.charge(key.len())?;
+    if key != b"undoStatus" || work.text(value, "undoStatus")? != "canceled" {
+        return Err(Error::Property("undoStatus"));
+    }
+    work.charge(0)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
@@ -284,6 +305,62 @@ mod tests {
                 filing(value, &Now, Deadline::after(Tick(0), 1).unwrap(), meter),
                 Err(Error::Deadline)
             ));
+        });
+    }
+    #[test]
+    fn cancellation_accepts_only_the_whole_submission_patch() {
+        parse(r#"{"undoStatus":"canceled"}"#, |value, meter| {
+            cancellation(value, &Now, until(), meter).unwrap();
+            assert!(meter.remaining().records < 100);
+            assert!(meter.remaining().io_bytes < 4096);
+        });
+        for text in [
+            "null",
+            "[]",
+            "{}",
+            r#"{"undoStatus":"pending"}"#,
+            r#"{"undoStatus":"final"}"#,
+            r#"{"undoStatus":"cancelled"}"#,
+            r#"{"undoStatus":null}"#,
+            r#"{"undoStatus":true}"#,
+            r#"{"undoStatus/status":"canceled"}"#,
+            r#"{"emailId":"email"}"#,
+            r#"{"undoStatus":"canceled","emailId":"email"}"#,
+            r#"{"undoStatus":"canceled","deliveryStatus/a/delivered":"no"}"#,
+        ] {
+            parse(text, |value, meter| {
+                assert!(matches!(
+                    cancellation(value, &Now, until(), meter),
+                    Err(Error::Property(_))
+                ));
+            });
+        }
+    }
+    #[test]
+    fn cancellation_patch_spends_the_original_meter_and_deadline() {
+        parse(r#"{"undoStatus":"canceled"}"#, |value, meter| {
+            let mut empty = Meter::new(until(), Charge::default());
+            assert_eq!(
+                cancellation(value, &Now, until(), &mut empty),
+                Err(Error::Capacity)
+            );
+            assert!(empty.stopped().is_some());
+            assert_eq!(
+                cancellation(value, &Now, Deadline::after(Tick(0), 1).unwrap(), meter),
+                Err(Error::Deadline)
+            );
+            let mut original = Meter::new(
+                Deadline::after(Tick(0), 2).unwrap(),
+                Charge {
+                    records: 100,
+                    io_bytes: 4096,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                cancellation(value, &Now, until(), &mut original),
+                Err(Error::Deadline)
+            );
         });
     }
 }

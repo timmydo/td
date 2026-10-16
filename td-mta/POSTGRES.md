@@ -3652,3 +3652,17 @@ callback, including after device revocation. Neither password nor callback
 survives the foreground call. These are internal owner APIs, not a public
 settlement endpoint; production dispatch, relay-worker ownership/restart
 custody and atomic backend cutover remain separate work.
+
+## 131. Borrowed cancellation patch decoding
+
+The shared submission request decoder accepts exactly one update property,
+`undoStatus: "canceled"`. Empty, non-object, multi-property, partial-recipient,
+nested, read-only and other undoStatus updates refuse. Decoding borrows the
+already bounded JSON arena and charges the original work meter and deadline;
+it allocates no owned request or authority token.
+
+This proves only patch syntax. The selected device, current account state,
+whole-group eligibility, transaction reservation and transport fence remain
+the authenticated publisher's responsibility. A repeated canceled update is
+syntactically valid; only publication can establish its no-change result.
+Dispatch and error projection remain separate from this input boundary.
