@@ -299,11 +299,17 @@ fn relay_auth_refuses_bad_challenges_early_success_and_negative_finals() {
             .err()
             .unwrap();
         assert!(matches!(failure.error, Error::Invalid | Error::Forbidden));
+        assert_eq!(
+            failure.peer_rejection(),
+            (challenge == b"535 denied\r\n").then_some(535)
+        );
         drop(failure.into_buffers().unwrap());
         drop(peer.into_buffers().unwrap());
     }
     for response in [
         b"535 denied\r\n".as_slice(),
+        b"535-denied\r\n535 details\r\n",
+        b"535 denied\r\n250 injected\r\n",
         b"334 again\r\n",
         b"235-first\r\n535 mixed\r\n",
         b"235 ok\r\n250 injected\r\n",
@@ -332,6 +338,10 @@ fn relay_auth_refuses_bad_challenges_early_success_and_negative_finals() {
         )
         .err()
         .unwrap();
+        assert_eq!(
+            failure.peer_rejection(),
+            (response == b"535 denied\r\n").then_some(535)
+        );
         drop(failure.into_buffers().unwrap());
         drop(peer.into_buffers().unwrap());
     }
@@ -389,6 +399,7 @@ fn relay_auth_constructor_rejects_wrong_credentials_unsupported_mechanisms_and_s
                 Error::Forbidden
             }
         );
+        assert_eq!(failure.peer_rejection(), None);
         drop(failure.into_buffers().unwrap());
         if let Ok(IoProgress::Bytes(n)) = peer.read(&mut [0; 512]) {
             assert_eq!(n, 0);

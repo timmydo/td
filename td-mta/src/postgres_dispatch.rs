@@ -554,6 +554,25 @@ pub struct PreparedResult<'w, 'a, 'r> {
     until: Deadline,
 }
 impl<'w, 'a, 'r> PreparedResult<'w, 'a, 'r> {
+    pub(crate) fn restrict_deadline(
+        &mut self,
+        until: td_mime::time::Deadline,
+    ) -> Result<(), Error> {
+        let until = Deadline::after(ports::Tick(0), until.tick().0)?;
+        self.limit = self
+            .limit
+            .min(self.worker.connection.clock.deadline_instant(until)?);
+        self.until = Deadline::after(ports::Tick(0), self.until.tick().0.min(until.tick().0))?;
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn passive_dispatch(&self) -> Dispatch {
+        self.published.dispatch.clone()
+    }
+
     /// Bind the first untouched envelope and its observed cap to this owner.
     pub fn admit_envelope(mut self, meter: &mut Meter) -> Result<EnvelopePlan<'w, 'a, 'r>, Error> {
         let (envelope, limit) = self.observe_envelope(meter)?;
@@ -752,11 +771,25 @@ pub struct MailPlan<'w, 'a, 'r> {
     reply: phases::CommandReply,
 }
 impl<'w, 'a, 'r> MailPlan<'w, 'a, 'r> {
+    pub(crate) fn restrict_deadline(
+        &mut self,
+        until: td_mime::time::Deadline,
+    ) -> Result<(), Error> {
+        self.envelope.prepared.restrict_deadline(until)
+    }
+
+    pub(crate) fn into_failed(
+        self,
+        failure: crate::postgres_route_health::Failure,
+    ) -> FailedPrepared<'w, 'a, 'r> {
+        self.envelope.prepared.into_failed(failure)
+    }
+
     pub(crate) fn accepts_policy(&self, policy: ports::TlsPolicyId) -> bool {
         self.envelope.prepared.published.dispatch.relay_policy() == Some(policy)
     }
 
-    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+    pub(crate) fn runtime_clock(&self) -> Arc<crate::clock::RuntimeClock> {
         self.envelope.prepared.worker.connection.clock.clone()
     }
     pub(crate) fn original_deadline(&self) -> Deadline {

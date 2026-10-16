@@ -9467,6 +9467,7 @@ fn exercise_submission_publication(
         a.submission,
         &relay_policies,
     );
+    native_relay_connect::exercise(fixture, request, trust, binding.epoch(), a.submission);
 }
 
 fn exercise_http_submission_owner(
@@ -11828,6 +11829,8 @@ mod dispatch_worker;
 
 #[path = "postgres_probe/native_final_handoff.rs"]
 mod native_final_handoff;
+#[path = "postgres_probe/native_relay_connect.rs"]
+mod native_relay_connect;
 #[path = "postgres_probe/relay_wire.rs"]
 mod relay_wire;
 

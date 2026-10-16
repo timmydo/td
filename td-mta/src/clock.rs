@@ -26,6 +26,15 @@ impl RuntimeClock {
             .ok_or(Error::Invalid)
     }
 
+    /// Round toward the origin so a converted cap can only become earlier.
+    pub(crate) fn deadline_before(&self, limit: Instant) -> Result<crate::ports::Deadline, Error> {
+        let elapsed = limit
+            .checked_duration_since(self.origin)
+            .ok_or(Error::Invalid)?;
+        let millis = u64::try_from(elapsed.as_millis()).map_err(|_| Error::Invalid)?;
+        crate::ports::Deadline::after(Tick(0), millis)
+    }
+
     fn sample_at(&self, utc: SystemTime, monotonic: Instant) -> Result<Time, Error> {
         let elapsed = monotonic
             .checked_duration_since(self.origin)
@@ -83,6 +92,19 @@ mod tests {
         time::Duration,
     };
     use td_crypto::UtcClock;
+
+    #[test]
+    fn converted_cap_rounds_earlier_and_rejects_before_origin() {
+        let clock = RuntimeClock::new();
+        let limit = clock.origin + Duration::from_micros(1_234_999);
+        let deadline = clock.deadline_before(limit).unwrap();
+        assert_eq!(deadline.tick(), Tick(1234));
+        assert!(clock.deadline_instant(deadline).unwrap() <= limit);
+        assert_eq!(
+            clock.deadline_before(clock.origin - Duration::from_nanos(1)),
+            Err(Error::Invalid)
+        );
+    }
 
     #[test]
     fn runtime_clock_keeps_utc_and_monotonic_domains_separate() {

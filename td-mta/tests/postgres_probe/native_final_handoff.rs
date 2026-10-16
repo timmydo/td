@@ -24,42 +24,89 @@ pub(super) fn exercise(
     source: SubmissionId,
     policies: &wire::Policies,
 ) {
-    for (n, refuse, mail_refusal, data_case) in [
-        (95, false, 0, 0),
-        (96, true, 0, 0),
-        (97, false, 1, 0),
-        (98, false, 2, 0),
-        (99, false, 0, 1),
-        (100, false, 0, 2),
-        (101, false, 0, 3),
-        (103, false, 0, 4),
-        (104, false, 0, 5),
-        (105, false, 0, 6),
-        (106, false, 0, 7),
-        (107, false, 0, 8),
-        (108, false, 0, 9),
-        (109, false, 0, 10),
-        (110, false, 0, 11),
-        (111, false, 0, 12),
-        (112, false, 0, 13),
-        (113, false, 0, 14),
-        (114, true, 0, 0),
-        (115, true, 0, 0),
-        (143, false, 0, 0),
-        (144, false, 0, 0),
-        (145, false, 0, 0),
-        (146, false, 0, 0),
-        (147, false, 0, 0),
-        (148, false, 0, 0),
-        (149, false, 0, 0),
-        (150, false, 0, 0),
-        (151, false, 0, 0),
-        (152, false, 0, 0),
-        (153, false, 0, 0),
-        (154, false, 0, 0),
-        (155, false, 0, 0),
-        (156, false, 0, 0),
-    ] {
+    run(
+        fixture,
+        request,
+        trust,
+        claim,
+        generation,
+        source,
+        policies,
+        &[
+            (95, false, 0, 0),
+            (96, true, 0, 0),
+            (97, false, 1, 0),
+            (98, false, 2, 0),
+            (99, false, 0, 1),
+            (100, false, 0, 2),
+            (101, false, 0, 3),
+            (103, false, 0, 4),
+            (104, false, 0, 5),
+            (105, false, 0, 6),
+            (106, false, 0, 7),
+            (107, false, 0, 8),
+            (108, false, 0, 9),
+            (109, false, 0, 10),
+            (110, false, 0, 11),
+            (111, false, 0, 12),
+            (112, false, 0, 13),
+            (113, false, 0, 14),
+            (114, true, 0, 0),
+            (115, true, 0, 0),
+            (143, false, 0, 0),
+            (144, false, 0, 0),
+            (145, false, 0, 0),
+            (146, false, 0, 0),
+            (147, false, 0, 0),
+            (148, false, 0, 0),
+            (149, false, 0, 0),
+            (150, false, 0, 0),
+            (151, false, 0, 0),
+            (152, false, 0, 0),
+            (153, false, 0, 0),
+            (154, false, 0, 0),
+            (155, false, 0, 0),
+            (156, false, 0, 0),
+        ],
+        None,
+    );
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn connected(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    claim: &Claim,
+    generation: u64,
+    source: SubmissionId,
+    policies: &wire::Policies,
+    setup: &super::native_relay_connect::Setup,
+) {
+    run(
+        fixture,
+        request,
+        trust,
+        claim,
+        generation,
+        source,
+        policies,
+        &[(143, false, 0, 0)],
+        Some(setup),
+    );
+}
+#[allow(clippy::too_many_arguments)]
+fn run(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    claim: &Claim,
+    generation: u64,
+    source: SubmissionId,
+    policies: &wire::Policies,
+    cases: &[(u8, bool, u8, u8)],
+    setup: Option<&super::native_relay_connect::Setup>,
+) {
+    for &(n, refuse, mail_refusal, data_case) in cases {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
@@ -125,7 +172,20 @@ pub(super) fn exercise(
         };
         let cap = wire::until(&clock);
         let job_limit = clock.deadline_instant(cap).unwrap();
-        let mut database = wire::meter(cap);
+        // Configured DNS/TLS/AUTH adds native authority checks before MAIL.
+        // Reserve the complete path up front; never refill between phases.
+        let mut database = if setup.is_some() {
+            td_mta::admission::work::Meter::new(
+                cap,
+                td_mta::admission::work::Charge {
+                    io_bytes: 128 * 1024 * 1024,
+                    records: 131072,
+                    ..Default::default()
+                },
+            )
+        } else {
+            wire::meter(cap)
+        };
         let published = worker
             .publish_prepared(
                 claim,
@@ -138,22 +198,49 @@ pub(super) fn exercise(
                 &mut database,
             )
             .unwrap_or_else(|error| panic!("case {n}: prepared publication: {error:?}"));
-        let mut published = published
-            .admit_envelope(&mut database)
-            .unwrap()
-            .reserve_mail()
-            .unwrap();
         let attempt = published.attempt();
-        let prepared_limit = published.check_current(&mut database).unwrap();
-        let envelope = published.envelope();
-        assert!(prepared_limit < job_limit);
-        assert_eq!(
-            envelope.recipients.len(),
-            if data_case >= 4 { 2 } else { 1 }
-        );
-        let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap, policies);
+        let prepared_limit;
+        let mut connected_body = None;
+        let (published, transport) = if let Some(setup) = setup {
+            prepared_limit = published.observe_envelope(&mut database).unwrap().1;
+            let (connected, mut peer) =
+                setup.connect(published, clock.clone(), cap, &mut database, false, None);
+            let completed =
+                wire::connected_body(connected.ok().unwrap(), &mut peer, cap, &mut database);
+            connected_body = Some((completed, peer));
+            (None, None)
+        } else {
+            let mut published = published
+                .admit_envelope(&mut database)
+                .unwrap()
+                .reserve_mail()
+                .unwrap();
+            prepared_limit = published.check_current(&mut database).unwrap();
+            assert!(prepared_limit < job_limit);
+            assert_eq!(
+                published.envelope().recipients.len(),
+                if data_case >= 4 { 2 } else { 1 }
+            );
+            let transport = wire::authenticated(fixture, clock.clone(), cap, policies);
+            (Some(published), Some(transport))
+        };
+        let (mut peer, completed, published, session) =
+            if let Some((completed, peer)) = connected_body {
+                (peer, Some(completed), None, None)
+            } else {
+                let (session, peer) = transport.unwrap();
+                (peer, None, published, Some(session))
+            };
         let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143..=156) {
-            let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
+            let completed = completed.unwrap_or_else(|| {
+                wire::accepted_body(
+                    published.unwrap(),
+                    session.unwrap(),
+                    &mut peer,
+                    cap,
+                    &mut database,
+                )
+            });
             let ready = completed.reserve_body(&mut database).ok().unwrap();
             let body_request = ready.dispatch().clone();
             (
@@ -163,6 +250,9 @@ pub(super) fn exercise(
                 String::from("250 recipient"),
             )
         } else {
+            let mut published = published.unwrap();
+            let envelope = published.envelope();
+            let session = session.unwrap();
             let (session, mail) = wire::command(
                 session,
                 &mut peer,
@@ -1133,7 +1223,14 @@ pub(super) fn exercise(
                     break result;
                 }
                 Err(failure) => {
-                    assert!(refuse);
+                    assert!(
+                        refuse,
+                        "case {n}: final {:?}, retained={}, bytes={}, reply_bytes={}, turns={turns}",
+                        failure.error,
+                        failure.retained.is_some(),
+                        transferred.len(),
+                        written
+                    );
                     drop(failure.buffers.unwrap());
                     let retained = failure.retained.unwrap();
                     assert_eq!(retained.attempt(), Some(attempt));

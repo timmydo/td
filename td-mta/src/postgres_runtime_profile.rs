@@ -2,7 +2,10 @@
 use crate::{
     clock::{RuntimeClock, TlsClockSource},
     config::{materialize::ResolvedProfile, profile::Roles, stanza, storage, stream, values},
-    generations::{GenerationConstruction, PreparedGeneration},
+    generations::{
+        GenerationConstruction, GenerationLease, GenerationSet, PreparedGeneration,
+        RetiredGeneration,
+    },
     ids::{AccountId, IdentityId, StoreEpoch},
     postgres_accounts,
     postgres_configuration::{self as configuration, ProfileInput},
@@ -127,7 +130,71 @@ pub struct Prepared {
     configuration: ResolvedProfile,
     policies: PreparedGeneration<TlsPolicies>,
 }
+/// Same-load configuration and TLS policy retained for configured relay setup.
+/// Constructed only by cold publication of the original prepared profile.
+pub struct PublishedProfile {
+    binding: Binding,
+    pub(crate) configuration: ResolvedProfile,
+    pub(crate) policies: GenerationLease<TlsPolicies>,
+}
+impl PublishedProfile {
+    pub fn binding(&self) -> &Binding {
+        &self.binding
+    }
+}
+/// Publication changed nothing; the original cold preparation is recoverable.
+#[must_use = "retain or explicitly discard the cold preparation"]
+pub struct PublishRefusal {
+    pub error: crate::ports::Error,
+    prepared: Prepared,
+}
+impl std::fmt::Debug for PublishRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishRefusal")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl PublishRefusal {
+    pub fn into_prepared(self) -> Prepared {
+        self.prepared
+    }
+}
 impl Prepared {
+    /// Run on the cold control worker. Send the explicit retired owner for cold
+    /// disposal; this publishes no listener, worker or database selection.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Cold refusal retains original preparation without another allocation."
+    )]
+    pub fn publish(
+        self,
+        domain: &mut GenerationSet<TlsPolicies>,
+    ) -> Result<(PublishedProfile, RetiredGeneration<TlsPolicies>), PublishRefusal> {
+        let Self {
+            binding,
+            configuration,
+            policies,
+        } = self;
+        match domain.publish_retained(policies) {
+            Ok((policies, retired)) => Ok((
+                PublishedProfile {
+                    binding,
+                    configuration,
+                    policies,
+                },
+                retired,
+            )),
+            Err(refusal) => Err(PublishRefusal {
+                error: refusal.error(),
+                prepared: Prepared {
+                    binding,
+                    configuration,
+                    policies: refusal.into_prepared(),
+                },
+            }),
+        }
+    }
     pub fn binding(&self) -> &Binding {
         &self.binding
     }

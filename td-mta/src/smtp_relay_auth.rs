@@ -51,6 +51,7 @@ pub struct Exchange<'a, B: TlsWireStorage> {
     password: &'a str,
     phase: Phase,
     round: usize,
+    peer_rejection: Option<u16>,
     input: &'a mut [u8],
     used: usize,
     consumed: usize,
@@ -100,9 +101,14 @@ impl<B: TlsWireStorage> Session<B> {
 /// TLS and socket are already torn down. Only reusable buffers remain.
 pub struct Refusal<B: TlsWireStorage> {
     pub error: Error,
+    peer_rejection: Option<u16>,
     buffers: Result<(B, B), Error>,
 }
 impl<B: TlsWireStorage> Refusal<B> {
+    /// Complete isolated 4xx/5xx reply evidence, never local-policy refusal.
+    pub fn peer_rejection(&self) -> Option<u16> {
+        self.peer_rejection
+    }
     pub fn into_buffers(self) -> Result<(B, B), Error> {
         self.buffers
     }
@@ -161,6 +167,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 password,
                 phase: Phase::Write(0),
                 round: 0,
+                peer_rejection: None,
                 input,
                 used: 0,
                 consumed: 0,
@@ -195,7 +202,11 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             Ok(ready)
         })();
         match result {
-            Err(error) => Err(refuse(self.connection, error)),
+            Err(error) => {
+                let mut refusal = refuse(self.connection, error);
+                refusal.peer_rejection = self.peer_rejection;
+                Err(refusal)
+            }
             Ok(false) => Ok(Progress::Pending(self)),
             Ok(true) => Ok(Progress::Ready(Session {
                 connection: self.connection,
@@ -295,6 +306,13 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             return Ok(false);
         }
         let line = reply.line().ok_or(Error::Invalid)?;
+        if (400..600).contains(&line.code)
+            && line.last
+            && reply.complete()
+            && self.consumed == self.used
+        {
+            self.peer_rejection = Some(line.code);
+        }
         let final_reply =
             self.round == 2 || (self.mechanism == Mechanism::Plain && self.round == 1);
         if final_reply {
@@ -466,6 +484,7 @@ fn refuse<B: TlsWireStorage>(mut connection: TlsConnection<B>, error: Error) -> 
     connection.abort();
     Refusal {
         error,
+        peer_rejection: None,
         buffers: connection.into_buffers(),
     }
 }

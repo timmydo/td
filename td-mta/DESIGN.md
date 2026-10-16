@@ -1285,6 +1285,15 @@ verified TLS EHLO capabilities. PLAIN and LOGIN install no SASL security
 layer and do not reset this capability state. This is not account, route,
 queue or current-generation authority. This prepares
 local protocol machinery; production relay scheduling is not activated.
+The inert native Prepared connector now composes configured resolution,
+numeric dialing, implicit TLS or required STARTTLS, fresh EHLO and AUTH.
+It binds same-load profile provenance before network work and rechecks native
+authority before credentials, retaining an opaque same-session MAIL handoff.
+POSTGRES.md section 185 owns its custody and failure contract. AUTH refusals
+may expose an isolated complete peer rejection code; partial, multiline,
+malformed or current-cell-tailed input supplies no such classification.
+Only actual 535 selects this connector's Auth repair continuation.
+
 Credential cells and caller strings must not enter logs; no secure-erasure
 claim is made for caller scratch or native TLS buffers.
 

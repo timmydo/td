@@ -499,12 +499,57 @@ pub(super) fn accepted_body<'w, 'a, 'r>(
     cap: Deadline,
     database: &mut Meter,
 ) -> td_mta::postgres_relay_data::Completed<'w, 'a, 'r, Buffer> {
-    use td_mta::postgres_relay_data as data;
-    assert_eq!(plan.envelope().recipients.len(), 1);
-    let recipient = plan.envelope().recipients.first().unwrap();
-    assert_eq!(recipient.ordinal, 0);
-    let expected = format!("RCPT TO:<{}>\r\n", recipient.address);
+    let recipient = plan.envelope().recipients.first().unwrap().address.clone();
     let accepted = accepted_mail(plan, session, peer, cap, database);
+    accepted_data(accepted, peer, cap, database, &recipient)
+}
+pub(super) fn connected_body<'w, 'a, 'r>(
+    connected: td_mta::postgres_relay_connect::ConnectedPrepared<'w, 'a, 'r, Buffer>,
+    peer: &mut Peer,
+    cap: Deadline,
+    database: &mut Meter,
+) -> td_mta::postgres_relay_data::Completed<'w, 'a, 'r, Buffer> {
+    use td_mta::{postgres_relay_mail as mail, smtp_data_encode::Body};
+    let (mut input, mut line, mut reply, mut output) = ([0; 512], [0; 512], [0; 4096], [0; 512]);
+    let mut work = meter(cap);
+    let mut exchange = connected
+        .begin_mail(
+            Body::SevenBit,
+            command::Scratch {
+                input: &mut input,
+                line: &mut line,
+                reply: &mut reply,
+                command: &mut output,
+            },
+            &mut work,
+            database,
+        )
+        .ok()
+        .unwrap();
+    let mut script = Script::new(b"MAIL FROM:<main@example.test>\r\n", b"250 sender\r\n");
+    let accepted = loop {
+        script.turn(peer);
+        match exchange.advance() {
+            Ok(mail::Progress::Pending(next)) => exchange = next,
+            Ok(mail::Progress::Accepted(accepted)) => {
+                script.complete();
+                break accepted;
+            }
+            _ => panic!("connected MAIL did not succeed"),
+        }
+        std::thread::yield_now();
+    };
+    accepted_data(accepted, peer, cap, database, "0@example.test")
+}
+fn accepted_data<'w, 'a, 'r>(
+    accepted: td_mta::postgres_relay_mail::Accepted<'w, 'a, 'r, Buffer>,
+    peer: &mut Peer,
+    cap: Deadline,
+    database: &mut Meter,
+    recipient: &str,
+) -> td_mta::postgres_relay_data::Completed<'w, 'a, 'r, Buffer> {
+    use td_mta::postgres_relay_data as data;
+    let expected = format!("RCPT TO:<{recipient}>\r\n");
     let (step, received) = rcpt_command(
         RcptStart::Mail(accepted),
         peer,

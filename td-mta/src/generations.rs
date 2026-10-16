@@ -296,6 +296,15 @@ impl<T> GenerationSet<T> {
         })
     }
 
+    /// Cold publication retaining a lease only when the original domain accepts.
+    pub(crate) fn publish_retained(
+        &mut self,
+        prepared: PreparedGeneration<T>,
+    ) -> Result<(GenerationLease<T>, RetiredGeneration<T>), PublicationRefusal<T>> {
+        let lease = prepared.retained.clone();
+        self.publish(prepared).map(|retired| (lease, retired))
+    }
+
     /// Publish under the coordinator's exclusive ownership. A candidate is
     /// valid only in its original domain and against its captured active base.
     /// The coordinator may be main: move the returned retired-owner wrapper to

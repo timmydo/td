@@ -5257,3 +5257,29 @@ cap. Publication acquires one ordinary slot; inspection acquires one slot
 from a separate settlement pool. No slot survives a step. Historical
 reinspection does not renew SMTP work or bypass an outstanding Pending
 operation. Completed outcomes are fixed-size and return without I/O.
+
+
+The inert native relay connector reuses MailPlan's envelope/reply reservation,
+retains one private passive Dispatch and one same-load PublishedProfile lease,
+and borrows five 512-byte control cells, the existing AUTH plain/encoded cells,
+and one resolver packet. A 255-byte local hostname cell crosses the temporary
+configuration graph view; addresses use the fixed sixteen-address DNS array.
+ConnectedPrepared has an 8 KiB compiled ceiling with boxed TLS wire arrays;
+its passive Closed result has a 2 KiB ceiling. Cold publication returns the
+original preparation inline on refusal; setup failures retain passive owners
+inline rather than allocating failure boxes. No body storage is added.
+
+Each unmetered plaintext greeting/EHLO/STARTTLS turn prepays one record and
+512 I/O bytes. Each TLS handshake or encrypted EHLO turn prepays one record
+and twice TLS_WIRE_BYTES, covering one inbound and one outbound record attempt.
+These are conservative work reservations, not measured traffic. Pending
+consumes its reservation; the same wire meter survives all setup transitions.
+AUTH retains its own per-turn/protocol accounting without a second outer
+charge. Pending polling sleeps for at most five milliseconds or the remaining
+cap, then checks the cap again. Work exhaustion remains local Capacity.
+Configured DNS keeps its existing separate per-cache-miss 64 MiB I/O,
+four-million-record and 1 MiB output allowance under that same time cap.
+Numeric dialing retains its two-record/address charge and two-second/address
+ceiling. Fresh native envelope checks keep their existing ATTEMPT_IO and
+4096-record precharge; no slot survives into socket work. The connector runs
+on the caller's admitted worker and creates no thread or queue.

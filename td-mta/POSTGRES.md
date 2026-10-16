@@ -5215,3 +5215,52 @@ and recovery expiry hold. They assert health before retirement, one health
 count and one recovery sequence change, retained Prepared on early failures,
 and candidate refusal by backoff/repair after retirement. This activates
 no scheduler or PostgreSQL backend and changes no schema.
+
+## 185. Configured relay setup bound to Prepared custody
+
+The inert postgres_relay_connect adapter consumes one PreparedResult and a
+PublishedProfile. Cold Prepared.publish constructs that bundle from its own
+Binding, resolved configuration and successfully published TLS generation.
+Publication in another generation domain refuses and returns the original
+preparation. The retired generation remains an explicit cold-disposal result.
+No caller can assemble a bundle from separately loaded credentials or policies.
+
+Before network setup, reserve the existing MailPlan and its negative-reply
+storage. Compare its private policy identity to the bundled relay policy
+before DNS, TCP or credential output. Resolve only the configured relay name
+through the configured numeric DNS servers, dial bounded returned addresses,
+and use the matched policy's endpoint and TLS mode. Required STARTTLS keeps
+the plaintext greeting, EHLO offer and upgrade on the same socket, discards
+plaintext capabilities, and requires a fresh verified TLS EHLO before AUTH.
+Implicit TLS also requires verified TLS, greeting and EHLO before AUTH.
+
+All setup uses the original worker RuntimeClock and the minimum of the
+Prepared limit, original deadline and remaining wire-meter deadline. Instant
+limits convert down to whole milliseconds, never extending them. The wire
+deadline first tightens retained Prepared custody before database admission;
+MAIL entry likewise tightens it before its native check. Fresh native
+authority checks run before resolution, after resolution before dialing,
+before AUTH and before entering MAIL. No database connection or lock survives
+an authority check into network work. A fence is an observation, not a claim
+that remote SMTP output and database revocation are atomic.
+
+Successful setup returns opaque ConnectedPrepared. Its session and MailPlan
+cannot be split; only bound MAIL or explicit closure consumes it. MAIL entry
+retains the existing refusal and any command evidence plus passive recovery
+identity. Every setup refusal closes transport and returns reusable buffers.
+A private Dispatch retained before consuming admission produces only closed
+interruption recovery; failed recovery preparation returns that same passive
+owner. An isolated complete actual 535 AUTH reply instead creates the ordered
+FailedPrepared Auth continuation. Local budget, invalid configuration,
+unsupported capabilities and ambiguous network/TLS errors do not infer a
+remote health classification. There is no automatic retry or alternate AUTH.
+
+Native fixtures exercise configured DNS and actual TCP in both TLS modes,
+then the existing 64,000-byte bound envelope/source/final chain. Separate
+cases prove foreign-domain publication refusal, policy mismatch and empty
+work before DNS/TCP, ownership expiry before AUTH with no credential output,
+blocked SQL under shorter setup and MAIL-entry wire deadlines, and actual
+AUTH refusal followed by health-before-recovery settlement.
+Setup adds no scheduler or backend activation. The eight-turn Body allowance
+and ten-second native job cap still require qualification for maximum-sized
+messages and backpressure before the relay runtime can be called usable.
