@@ -69,10 +69,31 @@ impl BodyChecks {
         clock: Arc<dyn Clock>,
         guard: Arc<Mutex<Guard>>,
     ) -> Result<Self, Error> {
+        Self::open_profile(request, trust, deadline, value, clock, guard, false)
+    }
+    pub(crate) fn transfer(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        value: &Change,
+        clock: Arc<dyn Clock>,
+        guard: Arc<Mutex<Guard>>,
+    ) -> Result<Self, Error> {
+        Self::open_profile(request, trust, deadline, value, clock, guard, true)
+    }
+    fn open_profile(
+        request: &Request<'_>,
+        trust: &TrustStore,
+        deadline: Instant,
+        value: &Change,
+        clock: Arc<dyn Clock>,
+        guard: Arc<Mutex<Guard>>,
+        retained: bool,
+    ) -> Result<Self, Error> {
         if value.inner.phase != 2 {
             return Err(Error::Integrity);
         }
-        let worker = postgres_probe::body_check_worker(request, trust, deadline)
+        let worker = postgres_probe::body_check_worker(request, trust, deadline, retained)
             .map_err(Error::Connection)?;
         Ok(Self {
             worker: Some(worker),
@@ -83,6 +104,10 @@ impl BodyChecks {
             failed: None,
             _thread: PhantomData,
         })
+    }
+    pub(crate) fn check_until(&mut self, limit: Instant) -> Result<Instant, Error> {
+        self.limit = self.limit.min(limit);
+        self.check()
     }
     pub fn check(&mut self) -> Result<Instant, Error> {
         if let Some(error) = self.failed {

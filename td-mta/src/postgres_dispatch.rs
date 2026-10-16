@@ -7,7 +7,7 @@ use crate::{
     postgres_attempt_phases::{self as phases, Change},
     postgres_attempt_recovery as recovery,
     postgres_attempts::{self as attempts, Dispatch},
-    postgres_probe::{Mode, Request},
+    postgres_probe::{Mode, Request, BODY_CHECK_TURNS},
     postgres_read::{ReadPermit, ReadSlots},
     postgres_route_owners::Claim,
     queue_clock::Guard,
@@ -51,6 +51,15 @@ pub struct Connection<'a, 'r> {
 }
 impl Connection<'_, '_> {
     fn admit(&self, until: Deadline, meter: &mut Meter, io_bytes: u64) -> Result<Instant, Error> {
+        self.admit_work(until, meter, io_bytes, 4096)
+    }
+    fn admit_work(
+        &self,
+        until: Deadline,
+        meter: &mut Meter,
+        io_bytes: u64,
+        records: u64,
+    ) -> Result<Instant, Error> {
         if self.request.mode != Mode::Runtime {
             return Err(ports::Error::Forbidden.into());
         }
@@ -74,7 +83,7 @@ impl Connection<'_, '_> {
                 self.clock.sample()?.monotonic,
                 Charge {
                     io_bytes,
-                    records: 4096,
+                    records,
                     ..Default::default()
                 },
             )
@@ -1327,6 +1336,49 @@ pub struct BodyPlan<'w, 'a, 'r> {
     final_plan: FinalPlan<'w, 'a, 'r>,
 }
 impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
+    pub(crate) fn reserve_checks(
+        self,
+        meter: &mut Meter,
+    ) -> Result<BodyTransferPlan<'w, 'a, 'r>, Error> {
+        let worker = self.body.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.work_limit() {
+            return Err(ports::Error::Deadline.into());
+        }
+        let turns = u64::try_from(BODY_CHECK_TURNS).map_err(|_| ports::Error::Capacity)?;
+        let limit = worker
+            .connection
+            .admit_work(self.body.until, meter, BODY_CHECK_IO * turns, 4096 * turns)?
+            .min(self.work_limit());
+        let permit = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        let checks = phases::BodyChecks::transfer(
+            worker.connection.request,
+            worker.connection.trust,
+            limit,
+            &self.body.body,
+            worker.connection.clock.clone(),
+            worker.guard.clone(),
+        )
+        .map_err(Error::Phase)?;
+        Ok(BodyTransferPlan {
+            checks,
+            permit,
+            plan: self,
+            remaining: BODY_CHECK_TURNS,
+            limit,
+        })
+    }
     pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
         self.body.worker.connection.clock.clone()
     }
@@ -1352,6 +1404,74 @@ impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
     /// body. Unknown COMMIT retains Pending and supplies no final owner.
     pub fn publish_possible(self, meter: &mut Meter) -> Result<FinalResult<'w, 'a, 'r>, Error> {
         self.final_plan.publish_possible(meter)
+    }
+}
+
+// Field order closes the connection before releasing its ordinary permit.
+// Final-result capacity remains separate inside the exact Body plan.
+pub(crate) struct BodyTransferPlan<'w, 'a, 'r> {
+    checks: phases::BodyChecks,
+    permit: ReadPermit<'w>,
+    plan: BodyPlan<'w, 'a, 'r>,
+    remaining: usize,
+    limit: Instant,
+}
+impl<'w, 'a, 'r> BodyTransferPlan<'w, 'a, 'r> {
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+        self.plan.runtime_clock()
+    }
+    pub(crate) fn original_deadline(&self) -> Deadline {
+        self.plan.original_deadline()
+    }
+    pub(crate) fn work_limit(&self) -> Instant {
+        self.limit
+    }
+    pub(crate) fn check_current(&mut self, meter: &mut Meter) -> Result<Instant, Error> {
+        let worker = self.plan.body.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or(ports::Error::Capacity)?;
+        self.limit = self.limit.min(worker.connection.admit_work(
+            self.plan.body.until,
+            meter,
+            0,
+            0,
+        )?);
+        self.limit = self
+            .limit
+            .min(self.checks.check_until(self.limit).map_err(Error::Phase)?);
+        if Instant::now() >= self.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        Ok(self.limit)
+    }
+    pub(crate) fn publish_possible(
+        self,
+        meter: &mut Meter,
+    ) -> Result<FinalResult<'w, 'a, 'r>, Error> {
+        let Self {
+            checks,
+            permit,
+            mut plan,
+            limit,
+            ..
+        } = self;
+        drop(checks);
+        drop(permit);
+        plan.final_plan.work.limit = plan.final_plan.work.limit.min(limit);
+        plan.publish_possible(meter)
     }
 }
 

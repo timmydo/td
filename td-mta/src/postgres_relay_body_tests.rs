@@ -51,7 +51,7 @@ impl Authority for Fake {
     fn limit(&self) -> Instant {
         self.limit
     }
-    fn current(&self, _: &mut Meter) -> Result<Instant, dispatch::Error> {
+    fn current(&mut self, _: &mut Meter) -> Result<Instant, dispatch::Error> {
         self.observed.borrow_mut().checks += 1;
         if self.refuse_check {
             Err(dispatch::Error::Admission(ports::Error::Forbidden))

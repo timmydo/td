@@ -4329,10 +4329,11 @@ compatible MAIL mode and source/session matching. This activates no scheduler
 or production backend.
 
 Before each body write or flush turn, the wrapper internally checks the exact
-live Body state through the reserved plan. Every check charges the bounded
-Body-check allowance and acquires a second ordinary slot while final capacity
-stays held. The returned lease/submission bound only shortens its local cap; original
-Instant limits are checked before and after every transfer turn. Refusal closes
+live Body state through the reserved plan. Section 181's retained owner
+prepays its finite check allowance and holds a second ordinary slot while
+final capacity stays held; individual turns spend prepaid credits. The returned
+lease/submission bound only shortens its local cap. Original Instant limits
+are checked before and after every transfer turn. Refusal closes
 the transport and releases local ownership. Locks do not span network work;
 section 4's pause/takeover and buffered-byte limitation remains unchanged.
 
@@ -4349,11 +4350,10 @@ without a terminator, refusal before any output, shortened expiry, malformed
 body input and failed possible publication. The full native PostgreSQL/TLS
 fixture now uses the wrapper through actual final-result publication and
 retained-reply retry. These are bounded correctness cases, not maximum-size
-throughput qualification. Full live checks currently open bounded database
-connections and reread selected reply witnesses per write/flush; their
-cumulative cost must fit the original meter and deadline. Large-body throughput and any
-future admission batching require explicit qualification before activation;
-no allowance or deadline is silently enlarged here.
+throughput qualification. Full live checks reread selected reply witnesses
+per write/flush through the prepaid retained connection in section 181. Their
+cumulative cost must fit its finite allowance and the original deadline.
+Large-body throughput requires explicit qualification before activation.
 
 ## 156. Observed Prepared-envelope admission
 
@@ -4968,7 +4968,8 @@ composed relay fixture transfers a 64000-byte immutable body, checks exact
 dot transparency and its sole terminator, and persists the actual final reply
 under the original ten-second cap and existing meters. This is a bounded
 larger-message qualification, not a maximum-32-MiB throughput claim. Full
-per-write database connections and evidence reads remain as in section 155.
+per-write validation and evidence reads remain as in section 155; section 181
+binds the checks to one prepaid connection.
 
 ## 179. Compact live Body reply witnesses
 
@@ -4986,9 +4987,10 @@ owner, health, queue-clock and expiry checks. Unselected Prepared rows retain
 their existing handling. AcceptancePossible keeps its full positive reply
 validation and final-capacity checks.
 
-Every dispatch check still opens and qualifies a fresh connection. Body
-acknowledges transaction rollback before returning (section 180); Possible
-releases locks by connection closure. Body uses at most 1 MiB input, 1088 frames
+Standalone dispatch checks open fresh qualified connections; retained body
+transfer uses section 181's prepaid profile. Body acknowledges transaction
+rollback before returning (section 180); Possible releases locks by connection
+closure. Standalone Body uses at most 1 MiB input, 1088 frames
 and 64 KiB output, including authentication and runtime qualification. The
 frame allowance is the same in preparation mode. Dispatch prepays 1 MiB plus
 128 KiB and 4096 records: both protocol byte ceilings plus the existing 64 KiB
@@ -5000,8 +5002,8 @@ and HTAB, under runtime qualification; a one-byte change, null reply and
 unexpected maximum DATA text refuse. Exact Body-check budget exhaustion is
 tested independently of publication charges. Existing state, policy, ownership,
 clock and deadline corruption cases remain. This reduces response volume and
-per-check charging; fixed record limits and repeated connection setup still
-preclude a maximum-message throughput claim.
+per-check charging; finite record and turn limits still preclude a
+maximum-message throughput claim.
 
 ## 180. Closed Body validation turns
 
@@ -5009,9 +5011,9 @@ preclude a maximum-message throughput claim.
 change, clock guard and original absolute deadline. It is non-cloneable and
 thread-bound because its worker waker targets the opening thread. It exposes
 only passive validation; it owns no SMTP authority, connection permit or work
-meter. Trusted callers retain connection capacity and admission. The dispatch
-path continues to open one such connection per check and drops it immediately
-when that check returns. No production connection reuse is activated here.
+meter. Trusted callers retain connection capacity and admission. Standalone
+dispatch checks open one such connection per check; the body transport uses
+the prepaid retained owner in section 181. Production dispatch remains inactive.
 
 Each turn begins a READ COMMITTED transaction and obtains the migration key's
 shared transaction-scoped lock before inspecting the full schema ledger and
@@ -5024,8 +5026,9 @@ migration and row locks, and checks its resulting limit again before return.
 A refused check, failed cleanup, expired deadline or broken connection closes
 the worker permanently; a later call returns the retained error without SQL.
 
-The original 1 MiB input, 1088 frames, 64 KiB output and ten-second cap span the
-entire connection, including all turns. A successful rollback replenishes no
+The standalone 1 MiB input, 1088 frames, 64 KiB output and ten-second cap span
+the entire connection, including all turns. The retained transfer profile in
+section 181 separately prepays its larger finite connection budget. A successful rollback replenishes no
 counter and extends no deadline. A returned limit can only tighten the next
 turn's cap. Runtime authentication is connection-bound; schema, durability,
 role, privileges and live dispatch conditions are rechecked each turn.
@@ -5037,4 +5040,42 @@ next check and remain terminal after repair. Repetition exhausts the original
 protocol allowance; time expiry retains the original cap. Terminating the
 backend after the final live clock observation but before rollback produces
 no successful observation. This qualifies a reusable validation boundary,
-not a persistent dispatch connection, scheduler or maximum-body throughput.
+not a scheduler or maximum-body throughput.
+
+## 181. Prepaid Body-transfer validation connection
+
+Starting the bound Body transport consumes BodyPlan into a private retained
+owner. Before connecting, it charges 9 MiB I/O and 32768 records: eight times
+the standalone Body-check allowance, including its margins. One ordinary
+ReadPermit remains held for the validation connection's lifetime, separately
+from the plan's existing final-result permit. The original Body/meter cap can
+only tighten; neither connection establishment nor a successful turn renews it.
+
+The retained profile admits at most 8 MiB cumulative PostgreSQL input, 512 KiB
+output and 8704 frames. Per-frame and authentication limits are unchanged.
+The full profile is prepaid because even the first turn may consume all of
+it. A separate eight-credit counter bounds attempted checks. Each write or
+flush spends a credit, checks Pending and the original meter/deadline, then
+performs the full section 180 transaction with fresh qualification and live
+fences. No protocol counter, credit or meter allowance is replenished. The
+ninth check refuses before SQL; no hidden reconnect is available. Partial
+writes and backpressure can consume credits without useful SMTP progress.
+
+Failure closes SMTP and drops the validator before releasing its connection
+permit. On body completion, the retained owner explicitly drops its checker,
+then releases that permit, then publishes Possible through the original plan.
+It carries the earliest observed limit into publication and final custody.
+This order leaves the second slot available when final capacity already holds
+the first. Ordinary standalone Body/Possible checks retain their profiles.
+
+Native qualification preserves the two-slot pool and original 64 MiB/100000
+record message meters. The 64000-byte composed transfer observes the same idle
+validator backend across multiple checks and completes final publication.
+A competing reservation cannot take the retained slot. A 144000-byte case
+requiring more than eight output cells stops with Capacity, no terminator,
+Body still durable, Pending empty and both local slots returned. One byte or
+record short of the prepaid admission refuses before a validator connection
+opens. Existing standalone checks exercise cumulative protocol exhaustion,
+lock release and changed policy/privileges; the source snapshot separately
+retains its own migration lock while body reading is active. This is bounded
+connection reuse, not maximum-32-MiB throughput or production activation.

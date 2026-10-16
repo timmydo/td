@@ -2,7 +2,7 @@
 use crate::{
     admission::work::Meter,
     ports::{self, BlobReader, Clock, Deadline},
-    postgres_dispatch::{self as dispatch, BodyPlan, FinalResult},
+    postgres_dispatch::{self as dispatch, BodyPlan, BodyTransferPlan, FinalResult},
     postgres_relay_finish as finish,
     smtp_data_encode::Body,
     smtp_relay_auth::Session,
@@ -42,7 +42,7 @@ impl<'w, 'a, 'r, B: TlsWireStorage> Completed<'w, 'a, 'r, B> {
 }
 #[must_use = "drive body transfer or close its transport"]
 pub struct Exchange<'m, 'w, 'a, 'r, B: TlsWireStorage> {
-    inner: Engine<'m, B, BodyPlan<'w, 'a, 'r>>,
+    inner: Engine<'m, B, BodyTransferPlan<'w, 'a, 'r>>,
 }
 #[must_use = "continue body transfer or retain its final handoff"]
 #[allow(
@@ -65,6 +65,15 @@ pub fn begin<'m, 'w, 'a, 'r, B: TlsWireStorage>(
     wire: &'m mut Meter,
     database: &'m mut Meter,
 ) -> Result<Exchange<'m, 'w, 'a, 'r, B>, Refusal<B>> {
+    let plan = match plan.reserve_checks(database) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(Refusal {
+                error: Error::Publication(error),
+                buffers: session.into_buffers(),
+            })
+        }
+    };
     Engine::new(plan, session, source, mode, scratch, wire, database)
         .map(|inner| Exchange { inner })
 }
@@ -87,10 +96,10 @@ trait Authority: Sized {
     fn clock(&self) -> Arc<dyn Clock>;
     fn deadline(&self) -> Deadline;
     fn limit(&self) -> Instant;
-    fn current(&self, meter: &mut Meter) -> Result<Instant, dispatch::Error>;
+    fn current(&mut self, meter: &mut Meter) -> Result<Instant, dispatch::Error>;
     fn possible(self, meter: &mut Meter) -> Result<Self::Final, dispatch::Error>;
 }
-impl<'w, 'a, 'r> Authority for BodyPlan<'w, 'a, 'r> {
+impl<'w, 'a, 'r> Authority for BodyTransferPlan<'w, 'a, 'r> {
     type Final = FinalResult<'w, 'a, 'r>;
     fn clock(&self) -> Arc<dyn Clock> {
         self.runtime_clock()
@@ -101,7 +110,7 @@ impl<'w, 'a, 'r> Authority for BodyPlan<'w, 'a, 'r> {
     fn limit(&self) -> Instant {
         self.work_limit()
     }
-    fn current(&self, meter: &mut Meter) -> Result<Instant, dispatch::Error> {
+    fn current(&mut self, meter: &mut Meter) -> Result<Instant, dispatch::Error> {
         self.check_current(meter)
     }
     fn possible(self, meter: &mut Meter) -> Result<Self::Final, dispatch::Error> {

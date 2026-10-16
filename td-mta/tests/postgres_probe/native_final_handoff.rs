@@ -45,14 +45,19 @@ pub(super) fn exercise(
         (114, true, 0, 0),
         (115, true, 0, 0),
         (143, false, 0, 0),
+        (144, false, 0, 0),
+        (145, false, 0, 0),
+        (146, false, 0, 0),
     ] {
         let submission = SubmissionId::from_bytes([n; 16]);
         let sub = format!("decode('{submission}','hex')");
         let src = format!("decode('{source}','hex')");
         sql(fixture,&format!("INSERT INTO td_mta.submissions SELECT account,{sub},email_id,thread_id,identity_id,transmitted_blob_id,reverse_path,send_at,expires_at,1,NULL,0,NULL,changed FROM td_mta.submissions WHERE id={src}; INSERT INTO td_mta.submission_routes SELECT account,{sub},submitting_profile,route_name,destination FROM td_mta.submission_routes WHERE submission_id={src}; INSERT INTO td_mta.recipients SELECT account,{sub},0,'0@example.test',1,0,NULL,0,NULL,0,send_at,NULL,NULL,0,'',changed FROM td_mta.submissions WHERE id={sub}"));
-        let large_expected = if n == 143 {
-            let source = format!(".{}\r\n", "x".repeat(997)).repeat(64);
-            assert_eq!(source.len(), 64_000);
+        let large_expected = if matches!(n, 143 | 144) {
+            let lines = if n == 143 { 64 } else { 144 };
+            let source = format!(".{}\r\n", "x".repeat(997)).repeat(lines);
+            let length = source.len();
+            let chunks = length.div_ceil(65536);
             let mut hash = Provider.sha256().unwrap();
             hash.update(source.as_bytes()).unwrap();
             let digest = hash
@@ -61,8 +66,12 @@ pub(super) fn exercise(
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            sql(fixture, &format!("INSERT INTO td_mta.blob_ids SELECT account,id FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blobs SELECT account,id,64000,decode('{digest}','hex'),0,changed,1 FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blob_chunks SELECT account,id,0,convert_to(repeat('.'||repeat('x',997)||chr(13)||chr(10),64),'UTF8') FROM td_mta.submissions WHERE id={sub}; UPDATE td_mta.submissions SET transmitted_blob_id=id WHERE id={sub}"));
-            Some(format!("..{}\r\n", "x".repeat(997)).repeat(64).into_bytes())
+            sql(fixture, &format!("INSERT INTO td_mta.blob_ids SELECT account,id FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blobs SELECT account,id,{length},decode('{digest}','hex'),0,changed,{chunks} FROM td_mta.submissions WHERE id={sub}; INSERT INTO td_mta.blob_chunks SELECT account,id,i,substring(convert_to(repeat('.'||repeat('x',997)||chr(13)||chr(10),{lines}),'UTF8') from i*65536+1 for 65536) FROM td_mta.submissions CROSS JOIN generate_series(0,{chunks}-1) i WHERE id={sub}; UPDATE td_mta.submissions SET transmitted_blob_id=id WHERE id={sub}"));
+            Some(
+                format!("..{}\r\n", "x".repeat(997))
+                    .repeat(lines)
+                    .into_bytes(),
+            )
         } else {
             None
         };
@@ -132,7 +141,7 @@ pub(super) fn exercise(
             if data_case >= 4 { 2 } else { 1 }
         );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
-        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143) {
+        let (start, body_request, ordinal, rcpt) = if matches!(n, 95 | 96 | 114 | 115 | 143..=146) {
             let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
             let ready = completed.reserve_body(&mut database).ok().unwrap();
             let body_request = ready.dispatch().clone();
@@ -697,16 +706,9 @@ pub(super) fn exercise(
         };
         assert_eq!(body_request.attempt(), attempt);
         assert!(start.check_current(&mut database).unwrap() <= prepared_limit);
-        if n != 143 {
-            let occupied = worker.reserve_final(attempt, cap, &mut database).unwrap();
-            assert_eq!(
-                start.check_current(&mut database),
-                Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
-            );
-            drop(occupied);
-            start.check_current(&mut database).unwrap();
-        }
         let mut transferred = Vec::new();
+        let mut validator_pid = None;
+        let mut validator_observations = 0;
         let handoff = attempts::with_body(
             &runtime,
             trust,
@@ -718,6 +720,20 @@ pub(super) fn exercise(
                 let mut input = [0; body::INPUT_BYTES];
                 let mut output = [0; body::OUTPUT_BYTES];
                 let mut work = wire::meter(cap);
+                if matches!(n, 145 | 146) {
+                    use td_mta::admission::work::{Charge, Meter};
+                    let before = sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'");
+                    let mut short = Meter::new(cap, Charge {
+                        io_bytes: 9 * 1024 * 1024 - u64::from(n == 145),
+                        records: 32768 - u64::from(n == 146),
+                        ..Default::default()
+                    });
+                    let refusal = start.begin(source, body::Scratch { input: &mut input, output: &mut output }, &mut work, &mut short).err().unwrap();
+                    assert_eq!(refusal.error, transfer::Error::Publication(dispatch::Error::Admission(td_mta::ports::Error::Capacity)));
+                    drop(refusal.buffers.unwrap());
+                    assert_eq!(sql(fixture, "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres'"), before);
+                    return Ok(None);
+                }
                 let mut exchange = start
                     .begin(
                         source,
@@ -730,14 +746,30 @@ pub(super) fn exercise(
                     )
                     .ok()
                     .unwrap();
+                // Competing work has its own meter; it cannot consume the
+                // message's prepaid validation allowance.
+                assert!(matches!(worker.reserve_final(attempt, cap, &mut wire::meter(cap)), Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))));
                 for _ in 0..100_000 {
                     let mut bytes = [0; 4096];
-                    if let IoProgress::Bytes(n) = peer.read(&mut bytes).unwrap() {
-                        transferred.extend_from_slice(&bytes[..n]);
+                    if let IoProgress::Bytes(count) = peer.read(&mut bytes).unwrap() {
+                        transferred.extend_from_slice(&bytes[..count]);
+                        if matches!(n, 143 | 144) {
+                            let pid = sql(fixture, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE application_name='td-mta-postgres' AND state='idle' AND query='ROLLBACK'");
+                            pid.parse::<u32>().unwrap();
+                            if let Some(previous) = &validator_pid { assert_eq!(previous, &pid); }
+                            else { validator_pid = Some(pid); }
+                            validator_observations += 1;
+                        }
                     }
-                    match exchange.advance().ok().unwrap() {
-                        transfer::Progress::Pending(next) => exchange = next,
-                        transfer::Progress::Ready(done) => return Ok(done),
+                    match exchange.advance() {
+                        Ok(transfer::Progress::Pending(next)) => exchange = next,
+                        Ok(transfer::Progress::Ready(done)) => return Ok(Some(done)),
+                        Err(refusal) if n == 144 => {
+                            assert_eq!(refusal.error, transfer::Error::Publication(dispatch::Error::Admission(td_mta::ports::Error::Capacity)));
+                            drop(refusal.buffers.unwrap());
+                            return Ok(None);
+                        }
+                        Err(refusal) => panic!("native body refused: {:?}", refusal.error),
                     }
                     std::thread::yield_now();
                 }
@@ -745,6 +777,54 @@ pub(super) fn exercise(
             },
         )
         .unwrap();
+        if let Some(pid) = validator_pid {
+            assert!(validator_observations >= 2);
+            let stop = deadline();
+            while sql(
+                fixture,
+                &format!("SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE pid={pid}"),
+            ) != "0"
+            {
+                assert!(std::time::Instant::now() < stop);
+                std::thread::yield_now();
+            }
+        }
+        if matches!(n, 144..=146) {
+            assert!(handoff.is_none());
+            assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
+            assert_eq!(
+                sql(
+                    fixture,
+                    &format!("SELECT phase FROM td_mta.recipients WHERE submission_id={sub}")
+                ),
+                "2"
+            );
+            assert_eq!(pending.attempt().unwrap(), None);
+            let first = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            let second = worker
+                .reserve_final(attempt, cap, &mut wire::meter(cap))
+                .unwrap();
+            drop((first, second));
+            let cancel =
+                td_mta::postgres_submission_cancel::prepare(claim, generation, submission).unwrap();
+            td_mta::postgres_submission_cancel::publish(
+                &runtime,
+                trust,
+                deadline(),
+                &cancel,
+                |_| Ok(()),
+            )
+            .unwrap();
+            drop(peer.into_buffers().unwrap());
+            sql(fixture, &format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+            if n == 144 {
+                sql(fixture, &format!("DELETE FROM td_mta.blobs WHERE id={sub}; DELETE FROM td_mta.blob_ids WHERE id={sub}"));
+            }
+            continue;
+        }
+        let handoff = handoff.unwrap();
         assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
         assert_eq!(
             phases::check_current_body(

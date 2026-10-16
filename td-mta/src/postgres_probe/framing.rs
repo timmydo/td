@@ -46,6 +46,15 @@ impl Input {
         }
     }
 
+    pub(super) fn body_checks() -> Self {
+        let single = Self::mutations();
+        Self {
+            bytes: super::BODY_CHECK_TURNS * single.bytes,
+            frames: super::BODY_CHECK_TURNS * single.frames,
+            ..single
+        }
+    }
+
     pub(super) fn cancellation() -> Self {
         Self {
             bytes: 2 * 1024 * 1024,
@@ -264,6 +273,30 @@ mod tests {
             assert!(input.accept(&packet).is_ok());
         }
         assert!(input.accept(&packet).is_err());
+    }
+
+    #[test]
+    fn retained_body_checks_bound_a_hostile_first_turn_and_never_replenish() {
+        let mut input = Input::body_checks();
+        for _ in 0..8704 {
+            assert!(input.accept(&frame(b'N', b"\0")).is_ok());
+        }
+        assert!(input.accept(&frame(b'N', b"\0")).is_err());
+        assert!(input.accept(&authenticated()).is_err());
+        let packet = frame(b'D', &[0; 128 * 1024 - 4]);
+        let mut input = Input::body_checks();
+        for _ in 0..63 {
+            assert!(input.accept(&packet).is_ok());
+        }
+        assert!(input.accept(&packet).is_err());
+        assert!(input.accept(&[]).is_err());
+        assert!(Input::body_checks().accept(&frame(b'Z', b"I")).is_err());
+        assert!(Input::body_checks()
+            .accept(&frame(b'R', &0u32.to_be_bytes()))
+            .is_err());
+        assert!(Input::body_checks()
+            .accept(&frame(b'D', &[0; 128 * 1024]))
+            .is_err());
     }
 
     #[test]

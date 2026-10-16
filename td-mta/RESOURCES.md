@@ -5202,11 +5202,22 @@ the protocol byte ceilings. Publication, Possible validation and final-capacity
 reservation keep their existing charges; all slot and shrinking-deadline
 rules are unchanged.
 
-The BodyChecks connection retains its original 1 MiB input, 1088-frame and
+The standalone BodyChecks connection retains its 1 MiB input, 1088-frame and
 64 KiB output ceilings over every validation turn. It shares the existing
 immutable Change through Arc and owns one worker plus clock/guard handles;
 no per-turn reply vector is retained. Its thread-bound owner closes on any
 refusal, deadline or cleanup failure. Each successful turn acknowledges
 rollback of transaction-scoped migration and row locks before returning.
-Dispatch still uses and charges one fresh connection per Body check; retaining
-this low-level validator does not supply a connection slot or work admission.
+Standalone dispatch checks charge one fresh connection per Body check;
+retaining the low-level validator supplies no slot or work admission.
+
+The bound Body transport instead prepays eight validation turns: 9 MiB I/O
+and 32768 records before opening one retained ordinary connection. Its profile
+caps total input at 8 MiB, output at 512 KiB and frames at 8704; the original
+per-frame/authentication limits remain. A separate eight-credit counter caps
+attempted checks, including Pending writes and flushes. No counter or credit
+is replenished. Every turn checks the original meter/deadline and Pending and
+performs complete qualification plus live validation. The earliest limit
+carries into Possible and final custody. The connection closes before its
+ReadPermit is released, including before Possible needs the second slot.
+This reserves work, not guaranteed body progress or maximum-message capacity.

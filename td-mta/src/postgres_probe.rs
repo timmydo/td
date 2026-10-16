@@ -67,6 +67,7 @@ const QUERY: &str = "SELECT pg_catalog.current_setting('server_version_num'), \
     pg_catalog.current_setting('transaction_read_only'), \
     pg_catalog.current_setting('fsync'), pg_catalog.current_setting('full_page_writes')";
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(10);
+pub(crate) const BODY_CHECK_TURNS: usize = 8;
 
 /// Connect, authenticate, inspect primary/durability settings, and close.
 /// One bounded worker owns every future; no Tokio runtime or background task.
@@ -266,8 +267,14 @@ pub(crate) fn body_check_worker(
     request: &Request<'_>,
     trust: &TrustStore,
     deadline: Instant,
+    retained: bool,
 ) -> Result<Worker, Error> {
-    connect_authenticated(request, trust, deadline, 64 * 1024, Input::mutations())
+    let (output, input) = if retained {
+        (BODY_CHECK_TURNS * 64 * 1024, Input::body_checks())
+    } else {
+        (64 * 1024, Input::mutations())
+    };
+    connect_authenticated(request, trust, deadline, output, input)
 }
 
 fn connect_worker(
