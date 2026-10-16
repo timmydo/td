@@ -175,4 +175,5 @@ pub(super) fn exercise(
         assert_eq!(sql(fixture,&format!("SELECT completed_at IS NOT NULL,notification FROM td_mta.submissions WHERE id=decode('{submission}','hex')")),if batch==2 {"t|1"}else{"f|0"});
     }
     super::attempt_command::exercise(fixture, request, trust, claim, generation, submission);
+    super::attempt_interrupted::exercise(fixture, request, trust, claim, generation, submission);
 }

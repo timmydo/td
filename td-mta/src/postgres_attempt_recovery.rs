@@ -1,4 +1,4 @@
-//! Fenced recovery of abandoned, still-retryable recipient attempts.
+//! Fenced settlement of interrupted or abandoned recipient attempts.
 use crate::{
     ids::{AttemptId, AttemptRecoveryId},
     postgres_probe::{self, Request},
@@ -21,6 +21,7 @@ pub enum Error {
     Policy,
     Missing,
     CurrentOwner,
+    StaleAttempt,
     Integrity,
     Capacity,
     Crypto,
@@ -37,6 +38,7 @@ pub struct Recovery {
     attempt: AttemptId,
     operation: AttemptRecoveryId,
     digest: [u8; 32],
+    current: bool,
 }
 impl Recovery {
     pub fn operation(&self) -> AttemptRecoveryId {
@@ -51,6 +53,19 @@ pub struct Outcome {
     pub new_sequence: u64,
 }
 pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Recovery, Error> {
+    prepare_mode(claim, generation, attempt, false)
+}
+/// Prepare settlement of the current owner's interrupted transport. The caller
+/// must close/fence transport before publication; this never authorizes sends.
+pub fn interrupted(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Recovery, Error> {
+    prepare_mode(claim, generation, attempt, true)
+}
+fn prepare_mode(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    current: bool,
+) -> Result<Recovery, Error> {
     if generation == 0 {
         return Err(Error::Integrity);
     }
@@ -62,7 +77,11 @@ pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Rec
     let binding = claim.binding();
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     for field in [
-        b"td-mta attempt recovery v1".as_slice(),
+        if current {
+            b"td-mta attempt interruption v1".as_slice()
+        } else {
+            b"td-mta attempt recovery v1".as_slice()
+        },
         binding.epoch().as_bytes().as_slice(),
         binding.account().as_bytes().as_slice(),
         claim.operation().as_bytes().as_slice(),
@@ -81,6 +100,7 @@ pub fn prepare(claim: &Claim, generation: u64, attempt: AttemptId) -> Result<Rec
         attempt,
         operation: AttemptRecoveryId::from_bytes(operation),
         digest: hash.finish().map_err(|_| Error::Crypto)?,
+        current,
     })
 }
 fn number(bytes: &[u8]) -> Result<u64, Error> {
@@ -151,8 +171,9 @@ pub(crate) fn retry_delay(entropy: &mut impl Entropy, count: u32) -> Result<i64,
     }
     Err(Error::Crypto)
 }
-/// Recover only an older fencing generation. Near-expiry work remains blocked
-/// for the separate clock-confirmed expiry path; this never declares failure.
+/// Settle an older abandoned generation or the interrupted current attempt.
+/// Near-expiry work waits for clock-confirmed expiry. An unknown COMMIT must
+/// settle historically, without publishing an alternative or resuming transport.
 pub fn publish(
     request: &Request<'_>,
     trust: &TrustStore,
@@ -184,11 +205,20 @@ pub fn publish(
             let account = binding.account();
             let account = account.as_bytes().as_slice();
             let attempt = value.attempt.as_bytes().as_slice();
-            let rows=client.query("SELECT submission_id,generation,ordinals FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND active FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
+            let rows=client.query("SELECT submission_id,generation,ordinals,owner_boot,owner_operation FROM td_mta.submission_attempts WHERE account=$1 AND attempt_id=$2 AND route_name=$3 AND destination=$4 AND active FOR UPDATE", &[&account,&attempt,&binding.route().name(),&binding.route().destination().as_slice()]).await.map_err(|_|Error::Database)?;
             let row = rows.first().ok_or(Error::Missing)?;
             let submission: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
             let prior = number(row.try_get(1).map_err(|_| Error::Integrity)?)?;
-            if prior >= value.generation {
+            if value.current {
+                let boot: &[u8] = row.try_get(3).map_err(|_| Error::Integrity)?;
+                let operation: &[u8] = row.try_get(4).map_err(|_| Error::Integrity)?;
+                if prior != value.generation
+                    || boot != value.claim.boot().as_bytes()
+                    || operation != value.claim.operation().as_bytes()
+                {
+                    return Err(Error::StaleAttempt);
+                }
+            } else if prior >= value.generation {
                 return Err(Error::CurrentOwner);
             }
             let encoded: &[u8] = row.try_get(2).map_err(|_| Error::Integrity)?;

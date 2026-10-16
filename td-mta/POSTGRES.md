@@ -3252,3 +3252,25 @@ replacement, partial RCPT settlement, rollback, expiry holds, permanent
 results after expiry, delayed COMMIT, conflicting replay and completion.
 Transport failures, retry dispatch, capacity reservation and production relay
 activation remain separate work.
+
+
+## 115. Current-owner transport interruption
+
+The attempt recovery publisher also prepares a domain-separated current-owner
+interruption. Unlike abandoned-attempt recovery, it requires the exact current
+generation, boot and owner operation recorded in the active attempt. The caller
+must close or fence transport before publication and cannot resume it from a
+receipt. Unknown COMMIT settles the retained operation historically.
+
+All still-InFlight recipients end together. Prepared and Body become RetryWait
+unless earlier uncertainty is latched; AcceptancePossible latches uncertainty
+and becomes retryable OutcomeUnknown. Genuine replies remain unchanged, and
+already settled RCPT recipients are excluded. Bounded jitter, near-expiry hold,
+account history and attempt retirement reuse the existing recovery transaction
+and its bounded receipts. This operation does not pause a route, certify TLS
+or credentials, reserve final-outcome capacity, or activate production relay.
+
+The PostgreSQL fixture covers each durable phase, mixed remaining Prepared
+recipients, earlier uncertainty, stale owners, refusal of abandoned recovery
+for the current owner, retained replies, exact replay and retry timestamps,
+rollback, expiry hold, delayed COMMIT and exclusion of settled RCPT results.

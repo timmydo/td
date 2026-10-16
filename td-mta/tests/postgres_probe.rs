@@ -10220,6 +10220,8 @@ fn exercise_route_owners(
 mod attempt_acceptance;
 #[path = "postgres_probe/attempt_command.rs"]
 mod attempt_command;
+#[path = "postgres_probe/attempt_interrupted.rs"]
+mod attempt_interrupted;
 #[path = "postgres_probe/attempt_phases.rs"]
 mod attempt_phases;
 #[path = "postgres_probe/attempt_rcpt.rs"]
@@ -10393,6 +10395,15 @@ fn exercise_attempt_recovery(
     let claim = owners::prepare(binding, BootId::from_bytes([11; 16])).unwrap();
     let grant = owners::acquire(request, trust, deadline(), &claim).unwrap();
     let value = recovery::prepare(&claim, grant.generation, attempt).unwrap();
+    assert_eq!(
+        recovery::publish(
+            request,
+            trust,
+            deadline(),
+            &recovery::interrupted(&claim, grant.generation, attempt).unwrap()
+        ),
+        Err(recovery::Error::StaleAttempt)
+    );
     assert_eq!(
         recovery::inspect(request, trust, deadline(), &value).unwrap(),
         None
