@@ -3435,3 +3435,15 @@ holds across ownership changes, and cap health rows and receipts per account.
 Clock guards and due times remain separate dispatch requirements. Both tables
 use the runtime's ordinary mail DML grant set and private owner initialization.
 This schema preparation changes no dispatch behavior or runtime admission.
+
+
+## 122. Account-bootstrap mutation budget
+
+Account creation uses the existing bounded mutation connection allowance:
+1024 input frames, one MiB aggregate input and 128 KiB output, with unchanged
+per-frame, authentication and deadline limits. Its schema-ledger inspection
+and bootstrap writes share that allowance. The ordinary 128-frame probe
+allowance no longer fits this operation at schema version 25; exhausting it
+while reading COMMIT must remain indeterminate and settle the retained creation.
+This changes no transaction or replay semantics. Read-only account inspection
+retains the ordinary probe allowance.

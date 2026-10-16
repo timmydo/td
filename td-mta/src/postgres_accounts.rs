@@ -71,7 +71,7 @@ pub fn publish(
 ) -> Result<(), Error> {
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
-    let result = postgres_probe::with_client(request, trust, deadline, move |client| {
+    let result = postgres_probe::with_mutation_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             let receipt = postgres_schema::lock_and_inspect(client)
                 .await
