@@ -14,6 +14,7 @@ use td_mime::work::{Charge, Meter, Stop};
 #[derive(Clone, Copy)]
 pub enum Command<'a> {
     MailFrom(&'a str),
+    MailFromEightBit(&'a str),
     RcptTo(&'a str),
     Data,
 }
@@ -80,7 +81,7 @@ impl<B: TlsWireStorage> Refusal<B> {
     }
 }
 impl<'a, B: TlsWireStorage> Exchange<'a, B> {
-    /// Commands carry no parameters/extensions and never contain DATA body bytes.
+    /// Only negotiated BODY=8BITMIME is supported; no DATA body bytes.
     /// The original attempt deadline, meter and current queue fences are required.
     pub fn new(
         session: Session<B>,
@@ -101,6 +102,11 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                     },
                 )
                 .map_err(work)?;
+            if matches!(command, Command::MailFromEightBit(_))
+                && !session.capabilities().eight_bit_mime()
+            {
+                return Err(Error::Forbidden);
+            }
             let input = scratch.input.get_mut(..LINE_BYTES).ok_or(Error::Capacity)?;
             let reply = NormalizedReplyReader::new(scratch.line, scratch.reply)?;
             let command = frame(command, scratch.command)?;
@@ -217,14 +223,18 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
 fn frame<'a>(command: Command<'_>, output: &'a mut [u8]) -> Result<&'a [u8], Error> {
     let output = output.get_mut(..LINE_BYTES).ok_or(Error::Capacity)?;
     let (prefix, address, suffix) = match command {
-        Command::MailFrom(address) => {
+        Command::MailFrom(address) | Command::MailFromEightBit(address) => {
             if !address.is_empty() {
                 mailbox_key(address, &mut [0; MAX_ADDRESS]).map_err(|_| Error::Invalid)?;
             }
             (
                 b"MAIL FROM:<".as_slice(),
                 address.as_bytes(),
-                b">\r\n".as_slice(),
+                if matches!(command, Command::MailFromEightBit(_)) {
+                    b"> BODY=8BITMIME\r\n".as_slice()
+                } else {
+                    b">\r\n".as_slice()
+                },
             )
         }
         Command::RcptTo(address) => {

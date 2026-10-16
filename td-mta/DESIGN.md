@@ -1208,8 +1208,9 @@ Verify certificate chains, validity, and the configured hostname; send SNI.
 Never send credentials before verified TLS or downgrade after a TLS failure.
 Support advertised AUTH PLAIN and LOGIN with bounded challenge/reply handling.
 Do not advertise or use an AUTH mechanism merely because a banner suggests it.
-The shared EHLO reader retains only STARTTLS and supported AUTH mechanism
-flags. AUTH keywords are case-insensitive; SASL names are exact uppercase
+The shared EHLO reader retains STARTTLS, supported AUTH mechanism flags and
+8BITMIME. Recognize only a bare case-insensitive 8BITMIME keyword; parameters
+make that line unadvertised. Valid repeated advertisements are unioned. AUTH keywords are case-insensitive; SASL names are exact uppercase
 ASCII names of 1 through 20 letters, digits, hyphens or underscores (RFC 4422).
 Unknown valid mechanisms are ignored. An invalid mechanism invalidates that
 AUTH line's entire list; valid repeated lists are unioned. The greeting line
@@ -1223,7 +1224,7 @@ activate the relay driver.
 The prepared relay EHLO owner accepts only a completed TLS connection with
 verified server-name evidence and the configured relay role. It consumes the
 initial 220 greeting for implicit TLS, or sends a fresh EHLO immediately after
-required STARTTLS. It retains supported AUTH flags together with that same
+required STARTTLS. It retains supported AUTH and 8BITMIME flags together with that same
 exclusive connection. Wrong codes, malformed/overlong replies, EOF, unread
 bytes after a final reply in the current input cell, clock failure and the
 original absolute deadline abort the socket. Each turn performs at most one
@@ -1262,8 +1263,10 @@ bounded codec poll, or one bounded credential preparation. Pre/post clock
 checks and the same borrowed meter apply throughout, including pending I/O.
 No codec, read or write receives a refreshed meter or deadline. Refusal
 releases TLS, socket and retained policy before returning reserved buffers.
-Success retains exclusive connection custody and mechanism evidence; it is
-not account, route, queue or current-generation authority. This prepares
+Success retains exclusive connection custody, mechanism evidence and the
+verified TLS EHLO capabilities. PLAIN and LOGIN install no SASL security
+layer and do not reset this capability state. This is not account, route,
+queue or current-generation authority. This prepares
 local protocol machinery; production relay scheduling is not activated.
 Credential cells and caller strings must not enter logs; no secure-erasure
 claim is made for caller scratch or native TLS buffers.

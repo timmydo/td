@@ -2,7 +2,7 @@
 use crate::{
     config::{outbound, values::certificate_name},
     ports::{Clock, Deadline, Error, FlushProgress, IoProgress, TlsPolicyId, Transport},
-    smtp_wire::{AuthMechanisms, EhloReader, ReplyReader, LINE_BYTES},
+    smtp_wire::{AuthMechanisms, EhloReader, RelayCapabilities, ReplyReader, LINE_BYTES},
     tls_io::TlsWireStorage,
     tls_policy::TlsConnection,
 };
@@ -51,11 +51,14 @@ pub enum Progress<'a, B: TlsWireStorage> {
 /// This is not account/queue authority or proof that authentication succeeded.
 pub struct Session<B: TlsWireStorage> {
     connection: TlsConnection<B>,
-    mechanisms: AuthMechanisms,
+    capabilities: RelayCapabilities,
 }
 impl<B: TlsWireStorage> Session<B> {
     pub fn mechanisms(&self) -> AuthMechanisms {
-        self.mechanisms
+        self.capabilities.auth()
+    }
+    pub fn capabilities(&self) -> RelayCapabilities {
+        self.capabilities
     }
     /// Match exact credentials to this retained relay policy. No AUTH command,
     /// current-generation admission or successful authentication is conferred.
@@ -159,10 +162,10 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                 let Self {
                     connection, ehlo, ..
                 } = self;
-                match ehlo.into_auth_mechanisms(&[]) {
-                    Ok(mechanisms) => Ok(Progress::Ready(Session {
+                match ehlo.into_relay_capabilities(&[]) {
+                    Ok(capabilities) => Ok(Progress::Ready(Session {
                         connection,
-                        mechanisms,
+                        capabilities,
                     })),
                     Err(error) => Err(refuse(connection, error)),
                 }

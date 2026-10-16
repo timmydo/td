@@ -180,8 +180,13 @@ The reader grants no SMTP command/transport authority and does not activate a
 relay loop; the driver must still bind the reply to its current transaction.
 
 The prepared relay command exchange consumes an authenticated session and
-sends exactly one MAIL FROM, RCPT TO or DATA command, with no extensions,
-pipelining or body bytes. MAIL permits the empty reverse path; nonempty paths
+sends exactly one MAIL FROM, RCPT TO or DATA command, without pipelining or
+body bytes. Its explicit eight-bit MAIL variant adds BODY=8BITMIME only if
+the retained verified TLS EHLO advertised 8BITMIME; otherwise refuse before
+writing. No other extensions are supported. This capability permits eight-bit
+MIME body octets, not UTF-8 envelope addresses or headers. The runtime must
+admit a compatible immutable message before transmission; the command neither
+converts content nor authorizes a queue phase. MAIL permits the empty reverse path; nonempty paths
 use the existing bounded ASCII mailbox grammar. RCPT requires a nonempty
 mailbox. Preserve the supplied local-part quoting/case and domain spelling;
 validation supplies neither identity nor recipient authority.

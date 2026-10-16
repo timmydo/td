@@ -306,3 +306,88 @@ fn relay_command_budget_and_post_transport_deadline_are_not_refreshed() {
         drop(peer.into_buffers().unwrap());
     }
 }
+
+#[test]
+fn eight_bit_mail_requires_retained_tls_advertisement_before_writing() {
+    let _serial = serial();
+    let material = Material::new();
+    for (advertisement, offered) in [
+        (
+            b"250-local\r\n250-8BITMIME\r\n250 AUTH PLAIN\r\n".as_slice(),
+            true,
+        ),
+        (b"250-local\r\n250 AUTH PLAIN\r\n", false),
+        (b"250-8BITMIME\r\n250 AUTH PLAIN\r\n", false),
+        (
+            b"250-local\r\n250-8BITMIME bogus\r\n250 AUTH PLAIN\r\n",
+            false,
+        ),
+    ] {
+        for address in ["", "User@Example.test", "\"a> b\"@Example.test"] {
+            let (session, mut peer) =
+                relay_auth_tests::authenticated_with_advertisement(&material, advertisement);
+            assert_eq!(session.capabilities().eight_bit_mime(), offered);
+            let mut cells = Cells::new();
+            let mut meter = meter();
+            let result = Exchange::new(
+                session,
+                Command::MailFromEightBit(address),
+                cells.scratch(),
+                material.source.clone(),
+                cap(),
+                &mut meter,
+            );
+            if offered {
+                let expected = format!("MAIL FROM:<{address}> BODY=8BITMIME\r\n");
+                let reply = drive(
+                    result.ok().unwrap(),
+                    &mut peer,
+                    expected.as_bytes(),
+                    b"250 accepted\r\n",
+                    1,
+                    false,
+                )
+                .ok()
+                .unwrap();
+                assert_eq!(reply.code().unwrap(), 250);
+                assert!(reply.into_session().capabilities().eight_bit_mime());
+            } else {
+                let failure = result.err().unwrap();
+                assert_eq!(failure.error, Error::Forbidden);
+                drop(failure.into_buffers().unwrap());
+                if let Ok(IoProgress::Bytes(n)) = peer.read(&mut [0; 512]) {
+                    assert_eq!(n, 0);
+                }
+            }
+            drop(peer.into_buffers().unwrap());
+        }
+    }
+    for address in [
+        "a@example.test\r\nDATA",
+        "a@example.test SIZE=1",
+        "é@example.test",
+    ] {
+        let (session, mut peer) = relay_auth_tests::authenticated_with_advertisement(
+            &material,
+            b"250-local\r\n250-8BITMIME\r\n250 AUTH PLAIN\r\n",
+        );
+        let mut cells = Cells::new();
+        let mut meter = meter();
+        let failure = Exchange::new(
+            session,
+            Command::MailFromEightBit(address),
+            cells.scratch(),
+            material.source.clone(),
+            cap(),
+            &mut meter,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.error, Error::Invalid);
+        drop(failure.into_buffers().unwrap());
+        if let Ok(IoProgress::Bytes(n)) = peer.read(&mut [0; 512]) {
+            assert_eq!(n, 0);
+        }
+        drop(peer.into_buffers().unwrap());
+    }
+}

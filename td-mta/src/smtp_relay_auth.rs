@@ -3,7 +3,7 @@ use crate::{
     config::{material::MAX_PASSWORD_BYTES, outbound::MAX_USERNAME_BYTES},
     ports::{Clock, Deadline, Error, FlushProgress, IoProgress, Tick, TlsPolicyId, Transport},
     smtp_relay_ehlo,
-    smtp_wire::{ReplyReader, LINE_BYTES},
+    smtp_wire::{RelayCapabilities, ReplyReader, LINE_BYTES},
     tls_io::TlsWireStorage,
     tls_policy::TlsConnection,
 };
@@ -43,6 +43,7 @@ enum Phase {
 pub struct Exchange<'a, B: TlsWireStorage> {
     connection: TlsConnection<B>,
     mechanism: Mechanism,
+    capabilities: RelayCapabilities,
     clock: Arc<dyn Clock>,
     deadline: Deadline,
     meter: &'a mut Meter,
@@ -76,10 +77,15 @@ pub enum Progress<'a, B: TlsWireStorage> {
 pub struct Session<B: TlsWireStorage> {
     connection: TlsConnection<B>,
     mechanism: Mechanism,
+    capabilities: RelayCapabilities,
 }
 impl<B: TlsWireStorage> Session<B> {
     pub fn mechanism(&self) -> Mechanism {
         self.mechanism
+    }
+    /// PLAIN and LOGIN install no SASL security layer; retain this TLS EHLO.
+    pub fn capabilities(&self) -> RelayCapabilities {
+        self.capabilities
     }
     pub fn policy_id(&self) -> TlsPolicyId {
         self.connection.policy_id()
@@ -111,7 +117,8 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         deadline: Deadline,
         meter: &'a mut Meter,
     ) -> Result<Self, Refusal<B>> {
-        let mechanisms = session.mechanisms();
+        let capabilities = session.capabilities();
+        let mechanisms = capabilities.auth();
         let connection = session.into_connection();
         let init = (|scratch: Scratch<'a>| {
             check_time(clock.as_ref(), deadline, meter)?;
@@ -146,6 +153,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             Ok((mechanism, input, replies, plain, encoded)) => Ok(Self {
                 connection,
                 mechanism,
+                capabilities,
                 clock,
                 deadline,
                 meter,
@@ -192,6 +200,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
             Ok(true) => Ok(Progress::Ready(Session {
                 connection: self.connection,
                 mechanism: self.mechanism,
+                capabilities: self.capabilities,
             })),
         }
     }

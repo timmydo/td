@@ -318,6 +318,9 @@ fn ehlo_greeting_is_never_a_starttls_advertisement() {
 }
 
 fn auth_offer(chunks: &[&[u8]]) -> Result<AuthMechanisms, Error> {
+    relay_capabilities(chunks).map(RelayCapabilities::auth)
+}
+fn relay_capabilities(chunks: &[&[u8]]) -> Result<RelayCapabilities, Error> {
     let mut scratch = [0; LINE_BYTES];
     let mut reader = EhloReader::new(&mut scratch)?;
     for (index, chunk) in chunks.iter().enumerate() {
@@ -329,7 +332,7 @@ fn auth_offer(chunks: &[&[u8]]) -> Result<AuthMechanisms, Error> {
                 if chunks[index + 1..].iter().any(|chunk| !chunk.is_empty()) {
                     return Err(Error::Invalid);
                 }
-                return reader.into_auth_mechanisms(&chunk[consumed..]);
+                return reader.into_relay_capabilities(&chunk[consumed..]);
             }
             if progress.complete {
                 reader.advance()?;
@@ -337,7 +340,7 @@ fn auth_offer(chunks: &[&[u8]]) -> Result<AuthMechanisms, Error> {
             assert!(progress.consumed > 0);
         }
     }
-    reader.into_auth_mechanisms(&[])
+    reader.into_relay_capabilities(&[])
 }
 
 #[test]
@@ -435,5 +438,44 @@ fn auth_capabilities_refuse_partial_failed_and_tailed_replies() {
     reader.feed(b"250-AUTH PLAIN\r\n").unwrap();
     reader.advance().unwrap();
     assert_eq!(reader.feed(b"250 bad\n"), Err(Error::Invalid));
-    assert_eq!(reader.into_auth_mechanisms(&[]).err(), Some(Error::Invalid));
+    assert_eq!(
+        reader.into_relay_capabilities(&[]).err(),
+        Some(Error::Invalid)
+    );
+}
+
+#[test]
+fn eight_bit_mime_requires_bare_extension_in_complete_successful_ehlo() {
+    for (wire, offered) in [
+        (b"250-host\r\n250 8BITMIME\r\n".as_slice(), true),
+        (b"250-host\r\n250 8bitMime\r\n", true),
+        (b"250-host\r\n250-8BITMIME\r\n250 8BITMIME\r\n", true),
+        (b"250-host\r\n250-8BITMIME bogus\r\n250 8BITMIME\r\n", true),
+        (b"250 8BITMIME\r\n", false),
+        (b"250-host\r\n250 8BITMIME bogus\r\n", false),
+        (b"250-host\r\n250 8BITMIME \r\n", false),
+        (b"250-host\r\n250 8BITMIME\t\r\n", false),
+        (b"250-host\r\n250 X8BITMIME\r\n", false),
+        (b"250-host\r\n250 AUTH PLAIN\r\n", false),
+    ] {
+        for split in 0..=wire.len() {
+            let caps = relay_capabilities(&[&wire[..split], &wire[split..]]).unwrap();
+            assert_eq!(caps.eight_bit_mime(), offered);
+        }
+        let chunks: Vec<_> = wire.chunks(1).collect();
+        assert_eq!(
+            relay_capabilities(&chunks).unwrap().eight_bit_mime(),
+            offered
+        );
+    }
+    for wire in [
+        b"250-host\r\n250-8BITMIME\r\n".as_slice(),
+        b"550-host\r\n550 8BITMIME\r\n",
+        b"250-host\r\n250-8BITMIME\r\n550 failed\r\n",
+        b"250-host\r\n250 8BITMIME\r\n250 injected\r\n",
+    ] {
+        for split in 0..=wire.len() {
+            assert!(relay_capabilities(&[&wire[..split], &wire[split..]]).is_err());
+        }
+    }
 }

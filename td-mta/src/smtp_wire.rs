@@ -293,17 +293,34 @@ impl AuthMechanisms {
     }
 }
 
-/// Retains only STARTTLS and supported AUTH advertisements, never credentials.
+/// Syntax evidence from one complete EHLO, not transport or queue authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayCapabilities {
+    auth: AuthMechanisms,
+    eight_bit_mime: bool,
+}
+impl RelayCapabilities {
+    pub fn auth(self) -> AuthMechanisms {
+        self.auth
+    }
+    pub fn eight_bit_mime(self) -> bool {
+        self.eight_bit_mime
+    }
+}
+
+/// Retains STARTTLS, supported AUTH and 8BITMIME, never credentials.
 pub struct EhloReader<'a> {
     reply: ReplyReader<'a>,
     offered: bool,
     auth: AuthMechanisms,
+    eight_bit_mime: bool,
 }
 impl<'a> EhloReader<'a> {
     pub fn new(storage: &'a mut [u8]) -> Result<Self, Error> {
         Ok(Self {
             reply: ReplyReader::new(storage)?,
             offered: false,
+            eight_bit_mime: false,
             auth: AuthMechanisms {
                 plain: false,
                 login: false,
@@ -316,6 +333,8 @@ impl<'a> EhloReader<'a> {
         if let Some(line) = self.reply.line() {
             if let Ok(Some(extension)) = ehlo_extension(line, self.reply.first_line()) {
                 self.offered |= extension.keyword.eq_ignore_ascii_case(b"STARTTLS")
+                    && extension.parameters.is_empty();
+                self.eight_bit_mime |= extension.keyword.eq_ignore_ascii_case(b"8BITMIME")
                     && extension.parameters.is_empty();
                 if extension.keyword.eq_ignore_ascii_case(b"AUTH") {
                     if let Some(auth) = AuthMechanisms::parse(extension.parameters) {
@@ -339,7 +358,7 @@ impl<'a> EhloReader<'a> {
     /// Consume a complete successful EHLO with no unread reply bytes. Malformed
     /// AUTH lines contribute no mechanisms; a valid unsupported list is empty.
     /// This syntax result does not establish transport identity or encryption.
-    pub fn into_auth_mechanisms(self, tail: &[u8]) -> Result<AuthMechanisms, Error> {
+    pub fn into_relay_capabilities(self, tail: &[u8]) -> Result<RelayCapabilities, Error> {
         if let Some(error) = self.reply.failure {
             return Err(error);
         }
@@ -352,7 +371,10 @@ impl<'a> EhloReader<'a> {
         if self.reply.line().is_none_or(|line| line.code != 250) {
             return Err(Error::Invalid);
         }
-        Ok(self.auth)
+        Ok(RelayCapabilities {
+            auth: self.auth,
+            eight_bit_mime: self.eight_bit_mime,
+        })
     }
 
     /// Consume pre-TLS capability state. A greeting, partial reply, malformed

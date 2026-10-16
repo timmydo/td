@@ -124,7 +124,7 @@ fn relay_ehlo_retains_fragmented_capabilities_on_verified_tls_in_both_modes() {
         let ready = drive(
             owner,
             &mut peer,
-            b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 SIZE 1000\r\n",
+            b"250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250-8BITMIME\r\n250 SIZE 1000\r\n",
             1,
             false,
         )
@@ -137,6 +137,7 @@ fn relay_ehlo_retains_fragmented_capabilities_on_verified_tls_in_both_modes() {
         );
         assert!(ready.mechanisms().plain());
         assert!(ready.mechanisms().login());
+        assert!(ready.capabilities().eight_bit_mime());
         assert_eq!(ready.policy_id(), TlsPolicies::relay(&lease).unwrap());
         drop(ready.into_buffers().unwrap());
         drop(peer.into_buffers().unwrap());

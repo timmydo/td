@@ -193,9 +193,9 @@ fn relay_auth_plain_and_login_require_complete_positive_replies_on_real_tls() {
     for login in [false, true] {
         for chunk in [1, 512] {
             let advertisement = if login {
-                b"250-local\r\n250 AUTH LOGIN\r\n".as_slice()
+                b"250-local\r\n250-8BITMIME\r\n250 AUTH LOGIN\r\n".as_slice()
             } else {
-                b"250-local\r\n250 AUTH PLAIN LOGIN\r\n".as_slice()
+                b"250-local\r\n250-8BITMIME\r\n250 AUTH PLAIN LOGIN\r\n".as_slice()
             };
             let (session, mut peer) = ready(&material, advertisement);
             let policy = session.policy_id();
@@ -234,6 +234,7 @@ fn relay_auth_plain_and_login_require_complete_positive_replies_on_real_tls() {
             .ok()
             .unwrap();
             assert_eq!(authenticated.policy_id(), policy);
+            assert!(authenticated.capabilities().eight_bit_mime());
             assert_eq!(
                 authenticated.mechanism(),
                 if login {
@@ -597,7 +598,14 @@ fn relay_auth_maximum_credentials_use_unwrapped_bounded_responses() {
 }
 
 pub(super) fn authenticated(material: &Material) -> (Ready, Connection) {
-    let (session, mut peer) = ready(material, b"250-local\r\n250 AUTH PLAIN\r\n");
+    authenticated_with_advertisement(material, b"250-local\r\n250 AUTH PLAIN\r\n")
+}
+pub(super) fn authenticated_with_advertisement(
+    material: &Material,
+    advertisement: &[u8],
+) -> (Ready, Connection) {
+    let (session, mut peer) = ready(material, advertisement);
+    let capabilities = session.capabilities();
     let mut cells = Cells::new();
     let mut meter = meter();
     let owner = Exchange::new(
@@ -623,5 +631,6 @@ pub(super) fn authenticated(material: &Material) -> (Ready, Connection) {
     )
     .ok()
     .unwrap();
+    assert_eq!(session.capabilities(), capabilities);
     (session, peer)
 }
