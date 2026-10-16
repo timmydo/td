@@ -3769,3 +3769,37 @@ recipient states; and exclusion of terminal unknown, Accepted, Canceled,
 completed, live and destination-mismatched submissions. Pagination retains
 its independent-observation semantics and must restart for each scheduling
 pass. No background scheduler or transport is activated.
+
+## 136. Verified active-attempt transmitted bytes
+
+The prepared attempt API can admit its immutable transmitted body through a
+bounded read-only repeatable-read snapshot. The opaque Dispatch binds the
+account, route, destination, owner, generation, attempt and request digest.
+Fresh primary admission checks current policy, unexpired route ownership and
+that exact active attempt before snapshot work. The snapshot binds the live
+submission and blob manifest; the shared blob reader verifies contiguous
+chunks, total length and SHA-256 before exposing any bytes to the callback.
+
+A second fresh primary admission after verification refuses cancellation,
+retirement, ownership loss or policy change observed before that check. Both
+admissions release account/route locks before replay. After the second
+admission, a fresh check of the original snapshot and deadline precedes the
+callback, so snapshot loss during admission cannot enter it. The callback retains one
+immutable snapshot under the original absolute deadline, even if later
+cancellation retires the attempt. It receives passive metadata and a bounded
+BlobReader, not transport authority: current transport ownership and durable
+Body/AcceptancePossible phase publications remain prerequisites for SMTP.
+
+The caller reserves connection and body-work capacity. The existing ten-second
+connection limit, 32 MiB body limit, bounded chunk batches and fixed protocol
+budgets cover this prepared operation. No deadline or snapshot is renewed.
+The authenticated device-body path shares manifest decoding without changing
+its authorization or upload-lease checks. No delivery scheduler is activated.
+
+The real PostgreSQL scenario proves digest-checked replay, size/deadline
+refusal, unpublished/retired attempt refusal and corruption rejection before
+callback admission. Cancellation through an independent connection inside the
+callback proves that replay holds no account lock, while the admitted snapshot
+continues to return the same bytes within its deadline. A controlled source
+fault during admission checks that deadline or connection loss suppresses the
+callback before it can act.

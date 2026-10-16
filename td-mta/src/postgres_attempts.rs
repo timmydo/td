@@ -14,6 +14,10 @@ use std::{
 use td_crypto::{Crypto, Digest, Entropy, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
+#[path = "postgres_attempt_body.rs"]
+mod body;
+pub use body::{with_body, BodyMetadata, ReadError};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),

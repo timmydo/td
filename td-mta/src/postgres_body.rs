@@ -265,6 +265,25 @@ async fn blob_snapshot(
         }
         expires
     };
+    Ok((
+        blob_metadata(row, binding.account(), binding.epoch(), blob, maximum)?,
+        expires,
+    ))
+}
+
+/// Fixed blob-manifest columns shared by authenticated and relay snapshots.
+pub(crate) fn blob_metadata(
+    row: &tokio_postgres::Row,
+    account: AccountId,
+    epoch: StoreEpoch,
+    blob: BlobId,
+    maximum: u64,
+) -> Result<BlobMetadata, Error> {
+    let sequence = number(row, 0)?;
+    let floor = number(row, 1)?;
+    if floor > sequence || number(row, 6)? > sequence {
+        return Err(Error::Integrity);
+    }
     let length: i64 = row.try_get(2).map_err(|_| Error::Integrity)?;
     let length = u64::try_from(length).map_err(|_| Error::Integrity)?;
     if length > MAX_BODY_BYTES {
@@ -279,23 +298,20 @@ async fn blob_snapshot(
     if u64::try_from(chunks).ok() != Some(length.div_ceil(CHUNK)) || chunks != actual {
         return Err(Error::Integrity);
     }
-    Ok((
-        BlobMetadata {
-            identity: ViewIdentity {
-                account: binding.account(),
-                epoch: binding.epoch(),
-                committed_sequence: Sequence::from_u64(sequence),
-                history_floor: Sequence::from_u64(floor),
-            },
-            blob,
-            body: BlobRow {
-                length,
-                digest: digest.try_into().map_err(|_| Error::Integrity)?,
-                created_at: row.try_get(4).map_err(|_| Error::Integrity)?,
-            },
+    Ok(BlobMetadata {
+        identity: ViewIdentity {
+            account,
+            epoch,
+            committed_sequence: Sequence::from_u64(sequence),
+            history_floor: Sequence::from_u64(floor),
         },
-        expires,
-    ))
+        blob,
+        body: BlobRow {
+            length,
+            digest: digest.try_into().map_err(|_| Error::Integrity)?,
+            created_at: row.try_get(4).map_err(|_| Error::Integrity)?,
+        },
+    })
 }
 
 async fn reauthorize_blob(

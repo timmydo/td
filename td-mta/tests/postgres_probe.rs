@@ -11745,3 +11745,6 @@ mod cancel_jmap;
 
 #[path = "postgres_probe/queue_candidates.rs"]
 mod queue_candidates;
+
+#[path = "postgres_probe/attempt_body.rs"]
+mod attempt_body;

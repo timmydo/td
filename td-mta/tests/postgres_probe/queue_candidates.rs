@@ -266,6 +266,7 @@ pub(super) fn exercise(
     let page = expiry();
     assert!(contains(&page, id(0)));
     assert!(contains(&page, expired));
+    super::attempt_body::exercise(fixture, request, trust, claim, generation, id(0), &dispatch);
     let cancellation = cancel::prepare(claim, generation, id(0)).unwrap();
     cancel::publish(request, trust, deadline(), &cancellation, |_| Ok(())).unwrap();
     let page = candidates::scan(
