@@ -302,13 +302,7 @@ pub(super) fn exercise(
         None
     );
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
-    let body = phases::body(
-        claim,
-        generation,
-        attempt,
-        &[(0, "250 first"), (1, "250 second")],
-    )
-    .unwrap();
+    let body = phases::body(claim, generation, attempt, &[(0, "250 first")]).unwrap();
     sql(fixture,"CREATE FUNCTION public.delay_phase_worker() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_phase_worker AFTER INSERT ON td_mta.attempt_phase_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_phase_worker()");
     assert_eq!(
         worker.publish_phase(body.clone(), until(1500), &mut meter()),
@@ -361,7 +355,7 @@ pub(super) fn exercise(
         panic!("wrong phase settlement");
     };
     assert_eq!(outcome.attempt, attempt);
-    assert_eq!(outcome.recipients, 2);
+    assert_eq!(outcome.recipients, 1);
     assert_eq!(
         sql(
             fixture,
@@ -371,6 +365,7 @@ pub(super) fn exercise(
     );
     assert_eq!(pending.attempt().unwrap(), None);
     super::final_work::exercise(&worker, claim, generation, attempt);
+    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1 AND state=2 AND phase=1")),"1");
     sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

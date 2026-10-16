@@ -28,8 +28,8 @@ pub(super) fn exercise(
             },
         )
     };
-    let final_change = phases::accepted(claim, generation, attempt, &[0, 1], "250 queued").unwrap();
-    let possible = phases::acceptance_possible(claim, generation, attempt, &[0, 1]).unwrap();
+    let final_change = phases::accepted(claim, generation, attempt, &[0], "250 queued").unwrap();
+    let possible = phases::acceptance_possible(claim, generation, attempt, &[0]).unwrap();
     let mut budget = meter();
     let preparation = td_mta::postgres_probe::Request {
         address: worker.connection.request.address,
@@ -127,14 +127,7 @@ pub(super) fn exercise(
         pending: worker.pending,
     };
     let expired = roomy
-        .reserve_final_result(
-            claim,
-            generation,
-            attempt,
-            &[0, 1],
-            until(1000),
-            &mut meter(),
-        )
+        .reserve_final_result(claim, generation, attempt, &[0], until(1000), &mut meter())
         .unwrap();
     thread::sleep(Duration::from_millis(1100));
     assert!(matches!(
@@ -146,7 +139,7 @@ pub(super) fn exercise(
             claim,
             generation,
             attempt,
-            &[0, 1],
+            &[0],
             until(10_000),
             &mut meter(),
         )
@@ -158,7 +151,7 @@ pub(super) fn exercise(
             claim,
             generation,
             attempt,
-            &[0, 1],
+            &[0],
             until(10_000),
             &mut final_budget,
         )
@@ -169,13 +162,14 @@ pub(super) fn exercise(
         .unwrap();
     let held = plan.publish_possible(&mut meter()).unwrap();
     assert_eq!(held.attempt(), attempt);
+    assert!(held.check_current(&mut meter()).unwrap() > std::time::Instant::now());
     let newly_possible = *held.outcome();
     let duplicate = roomy
         .reserve_final_result(
             claim,
             generation,
             attempt,
-            &[0, 1],
+            &[0],
             until(10_000),
             &mut meter(),
         )
@@ -200,6 +194,10 @@ pub(super) fn exercise(
     let other = roomy
         .reserve_final(attempt, until(10_000), &mut meter())
         .unwrap();
+    assert_eq!(
+        held.check_current(&mut meter()),
+        Err(Error::Admission(ports::Error::Busy))
+    );
     let outcome = held.record("250 queued").unwrap();
     assert_eq!(
         phases::inspect(
@@ -212,7 +210,7 @@ pub(super) fn exercise(
         Some(outcome)
     );
     assert_eq!(outcome.attempt, attempt);
-    assert_eq!(outcome.recipients, 2);
+    assert_eq!(outcome.recipients, 1);
     assert_eq!(worker.pending.attempt().unwrap(), None);
     drop(other);
     let duplicate = roomy
@@ -220,7 +218,7 @@ pub(super) fn exercise(
             claim,
             generation,
             attempt,
-            &[0, 1],
+            &[0],
             until(10_000),
             &mut meter(),
         )

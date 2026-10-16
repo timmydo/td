@@ -16,11 +16,16 @@ use std::{
 use td_crypto::{Crypto, Digest, Provider, SystemEntropy, TrustStore};
 use tokio_postgres::Client;
 
+#[path = "postgres_possible_current.rs"]
+mod current;
+pub use current::check_current_possible;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Connection(postgres_probe::Error),
     Owner(owners::Error),
     Policy,
+    Health(crate::postgres_route_health::Error),
     Missing,
     Integrity,
     Capacity,

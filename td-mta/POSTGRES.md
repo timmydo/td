@@ -4105,3 +4105,30 @@ This is publication admission, not a live transport grant. The low-level
 unobserved phase API remains storage machinery; known new publication alone
 never permits SMTP output. Current ownership/clock validation and matching
 transport custody at actual handoff remain outstanding; BodySent stays closed.
+
+## 148. Live AcceptancePossible state checks
+
+A retained FinalResult can recheck its exact phase request through a bounded
+native transaction. It requires current policy and owner, the persistent queue
+clock, healthy/due route state, the exact receipt, an active matching attempt,
+an uncompleted/unexpired submission, the entire still-InFlight phase-3 subset,
+and its exact durable final-result reservation. Remaining Prepared recipients
+outside that subset are permitted; no other outside phase is. A historical receipt alone is
+insufficient. Account/configuration/owner locks end before the call returns;
+the operation changes no recipient, receipt, reservation or account sequence.
+
+The worker uses another ordinary connection slot and prepaid bounded work,
+while retaining its final-publication slot. Pending operations refuse the
+check. The original final-work deadline caps the operation. A final owner/clock
+observation also checks submission expiry and time regression. Its returned
+local limit starts before that database observation and subtracts one
+millisecond for timestamp rounding, then caps remaining lease/submission time
+by the original deadline. Database response latency cannot extend that limit.
+An expired response refuses rather than returning an already elapsed bound.
+
+The result is a passive observation, not a transferable SMTP grant. A paused
+worker or policy/takeover change can still race a later write as section 4
+explains. The future transport owner must call this path internally, retain the
+matching body transaction and final-result capacity, and abort on refusal;
+caller-supplied receipts or Instants cannot authorize terminator output.
+BodySent remains closed and no scheduler is enabled.

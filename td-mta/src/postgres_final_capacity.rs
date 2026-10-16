@@ -102,6 +102,21 @@ pub(crate) async fn reserve(
     }
     Ok(())
 }
+/// Check a retained claim without consuming it; the caller pins the account.
+pub(crate) async fn check(
+    client: &Client,
+    account: &[u8],
+    attempt: &[u8],
+    ordinals: &[i64],
+) -> Result<(), Error> {
+    let rows=client.query("SELECT ordinals FROM td_mta.attempt_final_reservations WHERE account=$1 AND attempt_id=$2", &[&account,&attempt]).await.map_err(|_|Error::Database)?;
+    let row = rows.first().ok_or(Error::Integrity)?;
+    let stored: &[u8] = row.try_get(0).map_err(|_| Error::Integrity)?;
+    if stored != encode(ordinals)? {
+        return Err(Error::Integrity);
+    }
+    Ok(())
+}
 /// Consume only the entire still-AcceptancePossible subset in the same final
 /// transaction. Empty means this attempt had no possible remote acceptance.
 pub(crate) async fn consume(

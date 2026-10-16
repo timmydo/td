@@ -68,3 +68,115 @@ pub(super) fn receipt_race(
         "1"
     );
 }
+
+pub(super) fn live_state(
+    fixture: &Fixture,
+    request: &Request<'_>,
+    trust: &TrustStore,
+    attempt: AttemptId,
+    change: &phases::Change,
+) {
+    use std::sync::{Arc, Mutex};
+    use td_mta::{
+        clock::RuntimeClock,
+        ports::{Clock, Time},
+        queue_clock::Guard,
+    };
+    let clock = Arc::new(RuntimeClock::new());
+    let guard = Arc::new(Mutex::new(
+        Guard::new(Time {
+            utc_ms: sql(
+                fixture,
+                "SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint",
+            )
+            .parse()
+            .unwrap(),
+            monotonic: clock.sample().unwrap().monotonic,
+        })
+        .unwrap(),
+    ));
+    let check = || {
+        phases::check_current_possible(
+            request,
+            trust,
+            deadline(),
+            change,
+            clock.clone(),
+            guard.clone(),
+        )
+    };
+    let sequence = sql(
+        fixture,
+        "SELECT encode(sequence,'hex') FROM td_mta.accounts",
+    );
+    let limit = check().unwrap();
+    assert!(limit > Instant::now());
+    assert!(limit <= deadline());
+    let selection = sql(
+        fixture,
+        "SELECT encode(generation,'hex') FROM td_mta.config_selection",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.config_selection SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(check(), Err(phases::Error::Policy));
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex')"),
+    );
+    sql(fixture,&format!("UPDATE td_mta.submission_attempts SET active=false WHERE attempt_id=decode('{attempt}','hex')"));
+    assert_eq!(check(), Err(phases::Error::Missing));
+    sql(fixture,&format!("UPDATE td_mta.submission_attempts SET active=true WHERE attempt_id=decode('{attempt}','hex')"));
+    sql(fixture,&format!("CREATE TABLE public.live_claim AS SELECT * FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex'); DELETE FROM td_mta.attempt_final_reservations WHERE attempt_id=decode('{attempt}','hex')"));
+    assert_eq!(check(), Err(phases::Error::Integrity));
+    sql(fixture,"INSERT INTO td_mta.attempt_final_reservations SELECT * FROM public.live_claim; DROP TABLE public.live_claim");
+    sql(fixture,&format!("UPDATE td_mta.recipients SET phase=2 WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+    assert_eq!(check(), Err(phases::Error::Conflict));
+    sql(fixture,&format!("UPDATE td_mta.recipients SET phase=3 WHERE attempt_id=decode('{attempt}','hex') AND ordinal=0"));
+    sql(fixture,"CREATE TABLE public.live_health AS SELECT * FROM td_mta.route_health; DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT account,route_name,destination,decode('0000000000000001','hex'),1,3,t,t+300000,NULL FROM td_mta.route_owners CROSS JOIN (SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint t) x");
+    assert_eq!(
+        check(),
+        Err(phases::Error::Health(
+            td_mta::postgres_route_health::Error::Backoff
+        ))
+    );
+    sql(fixture,"UPDATE td_mta.route_health SET reason=4,repair_generation=decode('0000000000000001','hex')");
+    assert_eq!(
+        check(),
+        Err(phases::Error::Health(
+            td_mta::postgres_route_health::Error::RepairRequired
+        ))
+    );
+    sql(fixture,"DELETE FROM td_mta.route_health; INSERT INTO td_mta.route_health SELECT * FROM public.live_health; DROP TABLE public.live_health");
+    let owner_generation = sql(
+        fixture,
+        "SELECT encode(generation,'hex') FROM td_mta.route_owners",
+    );
+    sql(
+        fixture,
+        "UPDATE td_mta.route_owners SET generation=decode('0000000000000063','hex')",
+    );
+    assert_eq!(
+        check(),
+        Err(phases::Error::Owner(
+            td_mta::postgres_route_owners::Error::Stale
+        ))
+    );
+    sql(
+        fixture,
+        &format!("UPDATE td_mta.route_owners SET generation=decode('{owner_generation}','hex')"),
+    );
+    let expires=sql(fixture,&format!("SELECT expires_at FROM td_mta.submissions WHERE id=(SELECT submission_id FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'))"));
+    sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at=send_at WHERE id=(SELECT submission_id FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'))"));
+    assert_eq!(check(), Err(phases::Error::ExpiryHold));
+    sql(fixture,&format!("UPDATE td_mta.submissions SET expires_at={expires} WHERE id=(SELECT submission_id FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex'))"));
+    assert!(check().is_ok());
+    assert_eq!(
+        sql(
+            fixture,
+            "SELECT encode(sequence,'hex') FROM td_mta.accounts"
+        ),
+        sequence
+    );
+}

@@ -157,6 +157,8 @@ pub(super) fn exercise(
     );
     sql(fixture,&format!("UPDATE td_mta.config_selection SET generation=decode('{selection}','hex'); DROP TRIGGER delay_phase ON td_mta.attempt_phase_receipts"));
     super::new_possible::receipt_race(fixture, request, trust, attempt, &final_phase);
+    owners::renew(request, trust, deadline(), claim, generation).unwrap();
+    super::new_possible::live_state(fixture, request, trust, attempt, &final_phase);
     super::final_capacity::competing_writer(fixture, request, trust, binding);
     owners::renew(request, trust, deadline(), claim, generation).unwrap();
 }

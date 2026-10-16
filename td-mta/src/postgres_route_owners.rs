@@ -266,6 +266,17 @@ pub(crate) async fn check_locked_observed<E: From<Error>>(
     generation: u64,
     observe: impl FnOnce(i64) -> Result<(), E>,
 ) -> Result<i64, E> {
+    check_locked_expiry_observed(client, claim, generation, observe)
+        .await
+        .map(|(now, _)| now)
+}
+/// Same locked admission with the checked database lease expiry retained.
+pub(crate) async fn check_locked_expiry_observed<E: From<Error>>(
+    client: &Client,
+    claim: &Claim,
+    generation: u64,
+    observe: impl FnOnce(i64) -> Result<(), E>,
+) -> Result<(i64, i64), E> {
     let owner = owner(client, claim)
         .await
         .map_err(E::from)?
@@ -273,7 +284,10 @@ pub(crate) async fn check_locked_observed<E: From<Error>>(
     let timestamp = now(client).await.map_err(E::from)?;
     observe(timestamp)?;
     current(&owner, claim, generation, timestamp, true).map_err(E::from)?;
-    Ok(timestamp)
+    Ok((
+        timestamp,
+        owner.expires_at.ok_or_else(|| E::from(Error::Integrity))?,
+    ))
 }
 
 async fn commit(client: &Client, marker: &AtomicBool) -> Result<(), Error> {

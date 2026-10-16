@@ -400,6 +400,41 @@ impl FinalResult<'_, '_, '_> {
     pub fn outcome(&self) -> &phases::Outcome {
         &self.outcome
     }
+    /// Recheck the exact live phase under current policy, owner and queue clock.
+    /// The returned local cap is passive and never extends the reservation.
+    pub fn check_current(&self, meter: &mut Meter) -> Result<Instant, Error> {
+        let worker = self.work.worker;
+        let pending = worker
+            .pending
+            .operation
+            .try_lock()
+            .map_err(|_| ports::Error::Busy)?;
+        if pending.is_some() {
+            return Err(ports::Error::Busy.into());
+        }
+        if Instant::now() >= self.work.limit {
+            return Err(ports::Error::Deadline.into());
+        }
+        let until = Deadline::after(ports::Tick(0), meter.deadline().tick().0)?;
+        let limit = worker
+            .connection
+            .admit(until, meter, PHASE_IO)?
+            .min(self.work.limit);
+        let _slot = worker
+            .connection
+            .slots
+            .acquire()
+            .map_err(|_| ports::Error::Busy)?;
+        phases::check_current_possible(
+            worker.connection.request,
+            worker.connection.trust,
+            limit,
+            &self.possible,
+            worker.connection.clock.clone(),
+            worker.guard.clone(),
+        )
+        .map_err(Error::Phase)
+    }
     /// Consume retained capacity for the actual normalized final DATA reply.
     /// No caller-supplied Change can replace the original attempt or subset.
     pub fn record(self, reply: &str) -> Result<phases::Outcome, Error> {
