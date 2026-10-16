@@ -43,6 +43,9 @@ pub(super) fn exercise(
             &reply,
         )
         .unwrap();
+        let storage =
+            phases::reserve_final_reply(claim, generation, attempt.attempt, &attempt.ordinals)
+                .unwrap();
         for invalid in ["250 accepted", "354 continue", "550 bad\rreply"] {
             assert!(phases::refused(
                 claim,
@@ -81,6 +84,8 @@ pub(super) fn exercise(
                 .unwrap(),
         )
         .unwrap();
+        let ordinary = refused;
+        let refused = storage.finish(&reply).unwrap();
         let partial =
             phases::refused(claim, generation, attempt.attempt, &[batch * 100], &reply).unwrap();
         assert_eq!(
@@ -135,6 +140,11 @@ pub(super) fn exercise(
         }
         let outcome = phases::publish(request, trust, deadline(), &refused).unwrap();
         assert_eq!(outcome.recipients, 100);
+        assert_eq!(
+            phases::inspect(request, trust, deadline(), &ordinary).unwrap(),
+            Some(outcome)
+        );
+
         assert_eq!(
             phases::inspect(request, trust, deadline(), &refused).unwrap(),
             Some(outcome)

@@ -5019,10 +5019,10 @@ refusal may retain both RCPT and DATA replies, each capped at 4096 bytes per
 recipient. It adds no second pending queue or connection pool. Phase work
 conservatively prepays three MiB plus 128 KiB of protocol I/O and 4096 records
 for receipt inspection plus batch publication; settlement uses the same
-allowance without renewing the original job/meter deadline. The existing
-native phase routine's temporary clone and bounded SQL rows remain charged
-separately from the retained request. This is process work admission, not a
-database disk/WAL reservation or the final-outcome capacity for SMTP handoff.
+allowance without renewing the original job/meter deadline. The native phase
+routine shares the immutable request through Arc; bounded SQL rows remain
+charged separately from that retained request. This is process work admission,
+not a database disk/WAL reservation or the final-outcome capacity for SMTP handoff.
 
 PostgreSQL final-result claims retain at most 1024 account rows, each holding
 one attempt key and at most 400 ordinal bytes. Under the account lock they
@@ -5040,6 +5040,18 @@ Its original deadline is fixed at admission, including the ten-second native
 operation cap. The owner contains references, one attempt ID, one Instant and
 one permit; it allocates no queue or reply storage. Concurrent retained owners
 are bounded by the existing slot pool. Consumption neither reacquires a slot
-nor charges again; drop returns only the slot. The selected phase request,
-its native temporary clone and SQL rows retain their separate memory bounds.
+nor charges again; drop returns only the slot. The selected phase request and
+SQL rows retain their separate memory bounds;
+native receipt/publication owners share that immutable request through Arc.
 This is only the connection/work part of local final-outcome capacity.
+
+FinalReply preallocates at most 100 reply strings of 4096-byte capacity
+(409600 bytes), alongside the existing 100-entry ordinal/string vectors and
+bounded claim metadata. It retains two inline SHA-256 prefix states. Finishing
+fills only those retained buffers and moves the already allocated immutable
+request owner; native phase/receipt copies share its Arc. The sole admitted
+outbound job owns this storage separately from its fixed SMTP/TLS buffers and
+FinalWork connection/record/I/O allowance. No extra pending queue is added.
+
+The pending operation owner boxes its existing bounded Dispatch during cold
+attempt preparation; a phase variant holds only the shared Change owner.

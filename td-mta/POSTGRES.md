@@ -4011,3 +4011,28 @@ publication allocations remain separate, as do durable logical claims and live
 ownership. FinalWork does not authorize SMTP output, and a returned receipt
 may be historical. BodySent remains closed; this increment enables no scheduler
 or terminator handoff.
+
+## 144. Preallocated final-reply evidence
+
+An admitted relay worker can prepare a non-cloneable FinalReply before
+AcceptancePossible for an exact ordered subset of 1..100 recipients. It owns
+one 4096-byte reply buffer per recipient and both possible final-phase digest
+prefixes. Consuming it accepts only a normalized genuine 2xx, 4xx or 5xx final
+DATA reply, fills those existing buffers, and returns the ordinary immutable
+phase Change. Invalid ordinal sets, oversized/control-bearing replies and
+non-final reply classes refuse. It grants neither publication nor SMTP authority.
+
+Change now shares its private immutable fields through Arc. Native receipt
+inspection and publication clone that owner rather than allocate copies of the
+reply/ordinal vectors. The request digest format stays identical to ordinary
+accepted/refused construction, so either form settles or replays the other's
+receipt. DATA-command refusal still completes its private fields before
+exposing a Change; no shared fields can be mutated afterward.
+
+FinalReply finishing uses retained string capacities and inline SHA-256 states.
+It does not allocate new reply buffers or a new Change owner. Native database
+connections, commit markers and bounded SQL rows remain separate allocations;
+this does not promise allocation-free database publication or physical disk/WAL
+availability. The local FinalWork allowance, durable logical claim and live
+ownership are still separate prerequisites. BodySent remains closed and no
+scheduler or terminator path is enabled.

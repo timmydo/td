@@ -38,6 +38,9 @@ fn capacity(error: crate::postgres_final_capacity::Error) -> Error {
 
 #[derive(Clone)]
 pub struct Change {
+    inner: Arc<Fields>,
+}
+struct Fields {
     claim: Claim,
     generation: u64,
     attempt: AttemptId,
@@ -49,10 +52,10 @@ pub struct Change {
 }
 impl Change {
     pub(crate) fn is_final_for(&self, attempt: AttemptId) -> bool {
-        self.attempt == attempt && matches!(self.phase, 4 | 5)
+        self.inner.attempt == attempt && matches!(self.inner.phase, 4 | 5)
     }
-    pub(crate) const fn attempt(&self) -> AttemptId {
-        self.attempt
+    pub(crate) fn attempt(&self) -> AttemptId {
+        self.inner.attempt
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +128,87 @@ pub fn refused(
     )
 }
 
+/// Preallocated storage for one actual final DATA reply. This conveys no
+/// permission to send a terminator or publish a phase.
+pub struct FinalReply {
+    value: Change,
+    positive: td_crypto::Sha256,
+    negative: td_crypto::Sha256,
+}
+/// Allocate bounded final-result evidence before AcceptancePossible. Native
+/// database client and SQL row allocations remain separately bounded.
+pub fn reserve_final_reply(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    ordinals: &[u32],
+) -> Result<FinalReply, Error> {
+    let mut value = prepare(
+        claim,
+        generation,
+        attempt,
+        3,
+        ordinals.iter().map(|n| (*n, "")),
+    )?;
+    let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+    for reply in &mut inner.replies {
+        reply
+            .try_reserve_exact(crate::format::row::MAX_SMTP_REPLY)
+            .map_err(|_| Error::Capacity)?;
+    }
+    Ok(FinalReply {
+        value,
+        positive: hash_prefix(claim, generation, attempt, 4)?,
+        negative: hash_prefix(claim, generation, attempt, 5)?,
+    })
+}
+impl FinalReply {
+    /// Retain only a genuine normalized positive/negative final DATA reply.
+    /// The existing digest format is preserved for replay and settlement.
+    pub fn finish(self, reply: &str) -> Result<Change, Error> {
+        let phase = if valid_reply(reply, false) {
+            4
+        } else if valid_reply(reply, true) {
+            5
+        } else {
+            return Err(Error::Integrity);
+        };
+        let Self {
+            mut value,
+            positive,
+            negative,
+        } = self;
+        let hash = if phase == 4 { positive } else { negative };
+        let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+        inner.phase = phase;
+        inner.digest = fill_final_replies(&inner.ordinals, &mut inner.replies, reply, hash)?;
+        Ok(value)
+    }
+}
+
+fn fill_final_replies(
+    ordinals: &[i64],
+    replies: &mut [String],
+    reply: &str,
+    mut hash: td_crypto::Sha256,
+) -> Result<[u8; 32], Error> {
+    if ordinals.len() != replies.len() {
+        return Err(Error::Integrity);
+    }
+    for (ordinal, retained) in ordinals.iter().zip(replies) {
+        if !retained.is_empty() || retained.capacity() < reply.len() {
+            return Err(Error::Capacity);
+        }
+        retained.push_str(reply);
+        hash.update(&ordinal.to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(&(reply.len() as u64).to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(reply.as_bytes()).map_err(|_| Error::Crypto)?;
+    }
+    hash.finish().map_err(|_| Error::Crypto)
+}
+
 /// Retain all negative RCPT replies collected for one attempt, as one ordered
 /// subset. Other Prepared recipients may subsequently enter Body.
 pub fn refused_rcpt(
@@ -170,14 +254,15 @@ pub fn refused_data_command(
         8,
         accepted.iter().map(|(n, _)| (*n, reply)),
     )?;
-    value
+    let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+    inner
         .rcpt_replies
         .try_reserve_exact(accepted.len())
         .map_err(|_| Error::Capacity)?;
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     hash.update(b"td-mta DATA-command RCPT evidence v1")
         .map_err(|_| Error::Crypto)?;
-    hash.update(&value.digest).map_err(|_| Error::Crypto)?;
+    hash.update(&inner.digest).map_err(|_| Error::Crypto)?;
     for (_, rcpt) in accepted {
         if !valid_reply(rcpt, false) {
             return Err(Error::Integrity);
@@ -190,9 +275,9 @@ pub fn refused_data_command(
         hash.update(&(rcpt.len() as u64).to_be_bytes())
             .map_err(|_| Error::Crypto)?;
         hash.update(rcpt.as_bytes()).map_err(|_| Error::Crypto)?;
-        value.rcpt_replies.push(retained);
+        inner.rcpt_replies.push(retained);
     }
-    value.digest = hash.finish().map_err(|_| Error::Crypto)?;
+    inner.digest = hash.finish().map_err(|_| Error::Crypto)?;
     Ok(value)
 }
 
@@ -214,22 +299,7 @@ fn prepare<'a>(
     replies
         .try_reserve_exact(100)
         .map_err(|_| Error::Capacity)?;
-    let binding = claim.binding();
-    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
-    for field in [
-        b"td-mta attempt phase v1".as_slice(),
-        binding.epoch().as_bytes().as_slice(),
-        binding.account().as_bytes().as_slice(),
-        claim.operation().as_bytes().as_slice(),
-        claim.boot().as_bytes().as_slice(),
-        &generation.to_be_bytes(),
-        attempt.as_bytes().as_slice(),
-        &phase.to_be_bytes(),
-    ] {
-        hash.update(&(field.len() as u64).to_be_bytes())
-            .map_err(|_| Error::Crypto)?;
-        hash.update(field).map_err(|_| Error::Crypto)?;
-    }
+    let mut hash = hash_prefix(claim, generation, attempt, phase)?;
     for (ordinal, reply) in recipients {
         let ordinal = i64::from(ordinal);
         if ordinals.len() == 100
@@ -256,15 +326,41 @@ fn prepare<'a>(
         return Err(Error::Integrity);
     }
     Ok(Change {
-        claim: claim.clone(),
-        generation,
-        attempt,
-        phase,
-        ordinals,
-        replies,
-        rcpt_replies: Vec::new(),
-        digest: hash.finish().map_err(|_| Error::Crypto)?,
+        inner: Arc::new(Fields {
+            claim: claim.clone(),
+            generation,
+            attempt,
+            phase,
+            ordinals,
+            replies,
+            rcpt_replies: Vec::new(),
+            digest: hash.finish().map_err(|_| Error::Crypto)?,
+        }),
     })
+}
+fn hash_prefix(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    phase: i64,
+) -> Result<td_crypto::Sha256, Error> {
+    let binding = claim.binding();
+    let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+    for field in [
+        b"td-mta attempt phase v1".as_slice(),
+        binding.epoch().as_bytes().as_slice(),
+        binding.account().as_bytes().as_slice(),
+        claim.operation().as_bytes().as_slice(),
+        claim.boot().as_bytes().as_slice(),
+        &generation.to_be_bytes(),
+        attempt.as_bytes().as_slice(),
+        &phase.to_be_bytes(),
+    ] {
+        hash.update(&(field.len() as u64).to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(field).map_err(|_| Error::Crypto)?;
+    }
+    Ok(hash)
 }
 fn valid_reply(reply: &str, negative: bool) -> bool {
     crate::format::row::smtp_reply_text(reply).is_ok()
@@ -282,7 +378,7 @@ fn number(bytes: &[u8]) -> Result<u64, Error> {
         bytes.try_into().map_err(|_| Error::Integrity)?,
     ))
 }
-async fn receipt(client: &Client, value: &Change) -> Result<Option<Outcome>, Error> {
+async fn receipt(client: &Client, value: &Fields) -> Result<Option<Outcome>, Error> {
     let query = if value.phase >= 7 {
         "SELECT request_digest,recipient_count,old_sequence,new_sequence FROM td_mta.attempt_command_receipts WHERE account=$1 AND attempt_id=$2 AND phase=$3"
     } else if value.phase == 6 {
@@ -332,7 +428,7 @@ pub fn inspect(
     deadline: Instant,
     value: &Change,
 ) -> Result<Option<Outcome>, Error> {
-    let value = value.clone();
+    let value = value.inner.clone();
     postgres_probe::with_mailbox_client(request, trust, deadline, move |client| {
         Box::pin(async move {
             owners::begin(client, &value.claim, false, false)
@@ -354,7 +450,7 @@ pub fn publish(
     if let Some(outcome) = inspect(request, trust, deadline, value)? {
         return Ok(outcome);
     }
-    let value = value.clone();
+    let value = value.inner.clone();
     let attempted = Arc::new(AtomicBool::new(false));
     let marker = attempted.clone();
     let result = postgres_probe::with_batch_client(request, trust, deadline, move |client| {
@@ -722,5 +818,52 @@ mod reply_text_tests {
                 false
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod final_reply_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn final_reply_filling_preserves_allocations_and_refuses_missing_capacity() {
+        let reply = format!("250 {}", "x".repeat(4092));
+        let mut retained: Vec<_> = (0..2).map(|_| String::with_capacity(4096)).collect();
+        let before: Vec<_> = retained
+            .iter()
+            .map(|s| (s.as_ptr(), s.capacity()))
+            .collect();
+        let digest =
+            fill_final_replies(&[0, 999], &mut retained, &reply, Provider.sha256().unwrap())
+                .unwrap();
+        assert_eq!(
+            digest,
+            [
+                0x4d, 0xcc, 0xc3, 0xa8, 0x5f, 0x2a, 0xb6, 0x63, 0x9b, 0xa3, 0x8a, 0x34, 0x7b, 0x5d,
+                0xbd, 0xb3, 0xda, 0x81, 0xb8, 0xab, 0xca, 0xc2, 0x9c, 0x86, 0x06, 0x7b, 0x83, 0x65,
+                0x47, 0x14, 0x63, 0x8b
+            ]
+        );
+        assert!(retained.iter().all(|s| s == &reply));
+        assert_eq!(
+            retained
+                .iter()
+                .map(|s| (s.as_ptr(), s.capacity()))
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            fill_final_replies(&[0, 999], &mut retained, &reply, Provider.sha256().unwrap()),
+            Err(Error::Capacity)
+        );
+        let mut empty = [String::new()];
+        assert_eq!(
+            fill_final_replies(&[0], &mut empty, &reply, Provider.sha256().unwrap()),
+            Err(Error::Capacity)
+        );
+        assert_eq!(
+            fill_final_replies(&[0, 1], &mut empty, &reply, Provider.sha256().unwrap()),
+            Err(Error::Integrity)
+        );
     }
 }

@@ -256,7 +256,9 @@ is specified in POSTGRES.md §142. AcceptancePossible reserves the selected
 DATA subset's sequence and alternative receipt capacity against every competing
 writer. Recovery or expiry consumes the same durable claim atomically with its
 outcome. This does not supply the separate local runtime reservations or permit
-terminator handoff; the prepared BodySent boundary remains closed.
+terminator handoff; the prepared BodySent boundary remains closed. The local
+connection/work allowance and preallocated reply evidence are specified in
+POSTGRES.md §§143–144; both remain passive and require separate live ownership.
 
 If a SQLite COMMIT has an indeterminate I/O result, stop the writer and
 reopen for SQLite recovery. Read the durable transaction state before retry;

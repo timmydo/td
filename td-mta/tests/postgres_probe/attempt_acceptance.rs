@@ -25,6 +25,25 @@ pub(super) fn exercise(
     assert!(phases::accepted(claim, generation, attempt, &ordinals, "450 refused").is_err());
     let data_reply = format!("250 {}", "y".repeat(4092));
     let accepted = phases::accepted(claim, generation, attempt, &ordinals, &data_reply).unwrap();
+    let storage = phases::reserve_final_reply(claim, generation, attempt, &ordinals).unwrap();
+    for invalid in [vec![], vec![0, 0], vec![1000], (0..101).collect()] {
+        assert!(phases::reserve_final_reply(claim, generation, attempt, &invalid).is_err());
+    }
+    for reply in ["354 continue", "250 bad\rreply", "550 bad\nreply", "250 \0"] {
+        assert!(
+            phases::reserve_final_reply(claim, generation, attempt, &ordinals)
+                .unwrap()
+                .finish(reply)
+                .is_err()
+        );
+    }
+    assert!(
+        phases::reserve_final_reply(claim, generation, attempt, &ordinals)
+            .unwrap()
+            .finish(&format!("250 {}", "x".repeat(4093)))
+            .is_err()
+    );
+
     assert_eq!(
         phases::publish(request, trust, deadline(), &accepted),
         Err(phases::Error::Conflict)
@@ -41,6 +60,9 @@ pub(super) fn exercise(
     );
     let terminator = phases::acceptance_possible(claim, generation, attempt, &ordinals).unwrap();
     phases::publish(request, trust, deadline(), &terminator).unwrap();
+    let ordinary = accepted;
+    let accepted = storage.finish(&data_reply).unwrap();
+
     let partial = phases::accepted(claim, generation, attempt, &[100], "250 queued").unwrap();
     assert_eq!(
         phases::publish(request, trust, deadline(), &partial),
@@ -112,6 +134,11 @@ pub(super) fn exercise(
     );
     sql(fixture,"DELETE FROM td_mta.attempt_acceptance_receipts WHERE request_digest=decode(repeat('fe',32),'hex')");
     assert_eq!(outcome.recipients, 100);
+    assert_eq!(
+        phases::inspect(request, trust, deadline(), &ordinary).unwrap(),
+        Some(outcome)
+    );
+
     assert_eq!(
         phases::publish(request, trust, deadline(), &accepted).unwrap(),
         outcome

@@ -86,7 +86,7 @@ pub struct Pending {
     operation: Mutex<Option<Operation>>,
 }
 enum Operation {
-    Dispatch(Dispatch),
+    Dispatch(Box<Dispatch>),
     Phase(Change),
 }
 impl Operation {
@@ -192,7 +192,7 @@ impl Dispatches<'_, '_> {
             attempts::prepare(claim, generation, input.submission)
         }
         .map_err(Error::Publication)?;
-        *pending = Some(Operation::Dispatch(dispatch));
+        *pending = Some(Operation::Dispatch(Box::new(dispatch)));
         let Some(Operation::Dispatch(value)) = pending.as_ref() else {
             return Err(ports::Error::Invalid.into());
         };
@@ -209,7 +209,10 @@ impl Dispatches<'_, '_> {
                 let Some(Operation::Dispatch(dispatch)) = pending.take() else {
                     return Err(ports::Error::Invalid.into());
                 };
-                Ok(Published { dispatch, outcome })
+                Ok(Published {
+                    dispatch: *dispatch,
+                    outcome,
+                })
             }
             Err(error) => {
                 if error != attempts::Error::Indeterminate {
