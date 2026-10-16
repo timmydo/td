@@ -119,11 +119,28 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
             }
         }
         match self.command.advance() {
-            Err(failure) => Err(Refusal {
-                error: Error::Protocol(failure.error),
-                retained: None,
-                buffers: failure.into_buffers(),
-            }),
+            Err(failure) => {
+                if let Some((_, text)) = failure
+                    .reply()
+                    .filter(|(code, _)| matches!(code / 100, 4 | 5))
+                {
+                    let result = self.plan.record_refusal(text, self.database);
+                    let buffers = failure.into_buffers();
+                    return match result {
+                        Ok(outcome) => Ok(Progress::Rejected(Rejected { outcome, buffers })),
+                        Err(retained) => Err(Refusal {
+                            error: Error::Publication(retained.error),
+                            retained: Some(retained),
+                            buffers,
+                        }),
+                    };
+                }
+                Err(Refusal {
+                    error: Error::Protocol(failure.error),
+                    retained: None,
+                    buffers: failure.into_buffers(),
+                })
+            }
             Ok(command::Progress::Pending(command)) => {
                 let next = Self { command, ..self };
                 if Instant::now() >= next.limit {

@@ -179,11 +179,20 @@ impl<'m, B: TlsWireStorage, A: Authority> Engine<'m, B, A> {
             }
         }
         match self.command.advance() {
-            Err(e) => Err(Failure {
-                retained: None,
-                error: Error::Protocol(e.error),
-                buffers: e.into_buffers(),
-            }),
+            Err(failure) => {
+                if let Some((_, text)) = failure
+                    .reply()
+                    .filter(|(code, _)| matches!(code / 100, 2 | 4 | 5))
+                {
+                    let outcome = self.result.record(text);
+                    return Self::recorded(outcome, failure.into_buffers());
+                }
+                Err(Failure {
+                    retained: None,
+                    error: Error::Protocol(failure.error),
+                    buffers: failure.into_buffers(),
+                })
+            }
             Ok(command::Progress::Pending(command)) => {
                 let next = Self { command, ..self };
                 if Instant::now() >= next.limit {
@@ -218,7 +227,12 @@ impl<'m, B: TlsWireStorage, A: Authority> Engine<'m, B, A> {
             }
         };
         let outcome = result.record(text);
-        let buffers = reply.into_buffers();
+        Self::recorded(outcome, reply.into_buffers())
+    }
+    fn recorded(
+        outcome: Result<Outcome, A::Failure>,
+        buffers: Result<(B, B), ports::Error>,
+    ) -> Result<State<Self, B>, Failure<B, A::Failure>> {
         match outcome {
             Ok(outcome) => Ok(State::Ready(Completed { outcome, buffers })),
             Err(failure) => Err(Failure {

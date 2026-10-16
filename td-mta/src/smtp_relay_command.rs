@@ -75,11 +75,17 @@ impl<B: TlsWireStorage> Reply<'_, B> {
         self.session.into_buffers()
     }
 }
-pub struct Refusal<B: TlsWireStorage> {
+/// Closed transport; a fully parsed reply may survive a post-read refusal.
+pub struct Refusal<'a, B: TlsWireStorage> {
     pub error: Error,
     buffers: Result<(B, B), Error>,
+    reply: Option<(u16, &'a str)>,
 }
-impl<B: TlsWireStorage> Refusal<B> {
+impl<B: TlsWireStorage> Refusal<'_, B> {
+    /// Passive actual evidence only; no session or output authority survives.
+    pub fn reply(&self) -> Option<(u16, &str)> {
+        self.reply
+    }
     pub fn into_buffers(self) -> Result<(B, B), Error> {
         self.buffers
     }
@@ -94,7 +100,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         clock: Arc<dyn Clock>,
         deadline: Deadline,
         meter: &'a mut Meter,
-    ) -> Result<Self, Refusal<B>> {
+    ) -> Result<Self, Refusal<'a, B>> {
         Self::new_inner(session, Some(command), scratch, clock, deadline, meter)
     }
     pub(crate) fn new_final(
@@ -103,7 +109,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         clock: Arc<dyn Clock>,
         deadline: Deadline,
         meter: &'a mut Meter,
-    ) -> Result<Self, Refusal<B>> {
+    ) -> Result<Self, Refusal<'a, B>> {
         Self::new_inner(session, None, scratch, clock, deadline, meter)
     }
     fn new_inner(
@@ -113,7 +119,7 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         clock: Arc<dyn Clock>,
         deadline: Deadline,
         meter: &'a mut Meter,
-    ) -> Result<Self, Refusal<B>> {
+    ) -> Result<Self, Refusal<'a, B>> {
         let init = (|scratch: Scratch<'a>| {
             let now = check(clock.as_ref(), deadline, meter)?;
             meter
@@ -160,7 +166,8 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
         matches!(self.phase, Phase::Write(_) | Phase::Flush)
     }
     /// At most one TLS operation and 512 received bytes parsed per turn.
-    pub fn advance(mut self) -> Result<Progress<'a, B>, Refusal<B>> {
+    pub fn advance(mut self) -> Result<Progress<'a, B>, Refusal<'a, B>> {
+        let mut complete = false;
         let result = (|| {
             let now = check(self.clock.as_ref(), self.deadline, self.meter)?;
             self.meter
@@ -172,12 +179,18 @@ impl<'a, B: TlsWireStorage> Exchange<'a, B> {
                     },
                 )
                 .map_err(work)?;
-            let ready = self.step(now)?;
+            complete = self.step(now)?;
             check(self.clock.as_ref(), self.deadline, self.meter)?;
-            Ok(ready)
+            Ok(complete)
         })();
         match result {
-            Err(error) => Err(refuse(self.session, error)),
+            Err(error) => {
+                let mut failure = refuse(self.session, error);
+                if complete {
+                    failure.reply = self.reply.into_reply();
+                }
+                Err(failure)
+            }
             Ok(false) => Ok(Progress::Pending(self)),
             Ok(true) => Ok(Progress::Ready(Reply {
                 session: self.session,
@@ -305,13 +318,18 @@ fn check(clock: &dyn Clock, deadline: Deadline, meter: &mut Meter) -> Result<Tic
     meter.charge(now, Charge::default()).map_err(work)?;
     Ok(now)
 }
-fn refuse<B: TlsWireStorage>(mut session: Session<B>, error: Error) -> Refusal<B> {
+fn refuse<'a, B: TlsWireStorage>(mut session: Session<B>, error: Error) -> Refusal<'a, B> {
     session.connection_mut().abort();
     Refusal {
         error,
         buffers: session.into_buffers(),
+        reply: None,
     }
 }
 const _: () = assert!(
     std::mem::size_of::<Progress<'static, Box<[u8; crate::tls_io::TLS_WIRE_BYTES]>>>() <= 4096
+);
+
+const _: () = assert!(
+    std::mem::size_of::<Refusal<'static, Box<[u8; crate::tls_io::TLS_WIRE_BYTES]>>>() <= 128
 );

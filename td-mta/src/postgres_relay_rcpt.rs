@@ -176,7 +176,15 @@ impl<'m, 'w, 'a, 'r, B: TlsWireStorage> Exchange<'m, 'w, 'a, 'r, B> {
         }
         match self.command.advance() {
             Err(failure) => {
-                let error = Error::Protocol(failure.error);
+                let mut error = Error::Protocol(failure.error);
+                if let Some((_, text)) = failure
+                    .reply()
+                    .filter(|(code, _)| matches!(code / 100, 2 | 4 | 5))
+                {
+                    if let Err(record) = self.plan.record_reply(self.ordinal, text) {
+                        error = Error::Publication(record);
+                    }
+                }
                 let buffers = failure.into_buffers();
                 Err(Refusal {
                     error,

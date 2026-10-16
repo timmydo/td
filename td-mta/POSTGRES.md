@@ -4885,3 +4885,30 @@ negative-envelope and interrupted-publication cases retain their focused
 low-level paths. This test composition adds no production dispatcher, cached
 authority, output-owner reconstruction, allocation policy or deadline change.
 The maximum-message throughput limitation in section 155 still applies.
+
+## 176. Passive complete reply evidence on post-read refusal
+
+A command turn that fully parses and finishes a normalized reply before its
+post-operation clock or meter check fails still refuses the operation. The
+command Refusal closes transport and releases native TLS ownership first,
+then retains a borrowed view of the existing normalized output cell as passive
+evidence.
+Its reply accessor supplies the actual code and text; it has no session or
+continuation operation. Incomplete, malformed, truncated and trailing-byte
+input cannot populate that evidence, and pre-operation or write/flush failures
+retain no invented reply. Existing pre/post checks and bounded work charges
+remain in force.
+
+Bound MAIL and DATA adapters capture complete negative replies from this
+closed refusal through their existing retained publication owners. Ordered
+RCPT captures any complete valid recipient result before returning fenced
+interruption custody. The final adapter records complete 2xx/4xx/5xx evidence
+through FinalResult. Publication still uses the original allowance and deadline;
+expired or otherwise refused publication preserves its existing failure owner,
+and unknown COMMIT stays in Pending. Positive MAIL and DATA replies from an
+expired operation never construct a live envelope or Body handoff.
+
+The paired TLS regression cases expire the command clock after the read that
+finishes positive, negative and DATA-continuation replies, and distinguish
+partial and trailing-byte input. This extends evidence retention at the parser
+boundary without granting output authority or changing production activation.

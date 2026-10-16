@@ -7,7 +7,7 @@ use crate::{
 use td_mime::work::{Charge, Meter};
 type Connection = TlsConnection<Box<[u8; TLS_WIRE_BYTES]>>;
 type Ready<'a> = Reply<'a, Box<[u8; TLS_WIRE_BYTES]>>;
-type Failed = Refusal<Box<[u8; TLS_WIRE_BYTES]>>;
+type Failed<'a> = Refusal<'a, Box<[u8; TLS_WIRE_BYTES]>>;
 fn cap() -> Deadline {
     Deadline::after(Tick(0), 1000).unwrap()
 }
@@ -53,7 +53,7 @@ fn drive<'a>(
     response: &[u8],
     chunk: usize,
     eof: bool,
-) -> Result<Ready<'a>, Failed> {
+) -> Result<Ready<'a>, Failed<'a>> {
     let mut owner = Some(owner);
     let mut received = Vec::new();
     let mut sent = 0;
@@ -388,6 +388,103 @@ fn eight_bit_mail_requires_retained_tls_advertisement_before_writing() {
         if let Ok(IoProgress::Bytes(n)) = peer.read(&mut [0; 512]) {
             assert_eq!(n, 0);
         }
+        drop(peer.into_buffers().unwrap());
+    }
+}
+
+#[derive(Default)]
+struct PostReadClock(std::sync::atomic::AtomicUsize);
+impl Clock for PostReadClock {
+    fn sample(&self) -> Result<Time, Error> {
+        let left = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        if left > 1 {
+            self.0.store(left - 1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Time {
+            utc_ms: 0,
+            monotonic: Tick(if left == 1 { 1000 } else { 0 }),
+        })
+    }
+}
+#[test]
+fn complete_reply_survives_post_read_expiry_without_session() {
+    let _serial = serial();
+    let material = Material::new();
+    for (response, expected) in [
+        (b"250 queued\r\n".as_slice(), Some((250, "250 queued"))),
+        (b"550 refused\r\n".as_slice(), Some((550, "550 refused"))),
+        (b"354 continue\r\n".as_slice(), Some((354, "354 continue"))),
+        (b"250 partial".as_slice(), None),
+        (b"250 queued\r\nextra".as_slice(), None),
+    ] {
+        let (session, mut peer) = relay_auth_tests::authenticated(&material);
+        let clock = Arc::new(PostReadClock::default());
+        let mut cells = Cells::new();
+        let mut work = meter();
+        let mut exchange = Exchange::new(
+            session,
+            Command::Data,
+            cells.scratch(),
+            clock.clone(),
+            cap(),
+            &mut work,
+        )
+        .ok()
+        .unwrap();
+        for _ in 0..100_000 {
+            if !exchange.writes_pending() {
+                break;
+            }
+            exchange = match exchange.advance().ok().unwrap() {
+                Progress::Pending(next) => next,
+                Progress::Ready(_) => panic!("reply before peer sent one"),
+            };
+        }
+        assert!(!exchange.writes_pending());
+        let mut received = Vec::new();
+        for _ in 0..100_000 {
+            let mut bytes = [0; 512];
+            if let IoProgress::Bytes(n) = peer.read(&mut bytes).unwrap() {
+                received.extend_from_slice(&bytes[..n]);
+            }
+            if received == b"DATA\r\n" {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(received, b"DATA\r\n");
+        let mut sent = 0;
+        let mut flushed = false;
+        for _ in 0..100_000 {
+            if sent < response.len() {
+                if let IoProgress::Bytes(n) = peer.write(&response[sent..]).unwrap() {
+                    sent += n;
+                }
+            }
+            if peer.flush().unwrap() == FlushProgress::Complete && sent == response.len() {
+                flushed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(flushed);
+        // TlsIo receives the five-byte record header before its payload.
+        exchange = match exchange.advance().ok().unwrap() {
+            Progress::Pending(next) => next,
+            Progress::Ready(_) => panic!("plaintext arrived before record payload"),
+        };
+        clock.0.store(2, std::sync::atomic::Ordering::Relaxed);
+        let failure = exchange.advance().err().unwrap();
+        assert_eq!(failure.reply(), expected);
+        assert_eq!(
+            failure.error,
+            if response.ends_with(b"extra") {
+                Error::Invalid
+            } else {
+                Error::Deadline
+            }
+        );
+        drop(failure.into_buffers().unwrap());
         drop(peer.into_buffers().unwrap());
     }
 }

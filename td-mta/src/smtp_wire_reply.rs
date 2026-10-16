@@ -119,6 +119,13 @@ impl<'a> NormalizedReplyReader<'a> {
         self.code()?;
         std::str::from_utf8(self.output.get(..self.used)?).ok()
     }
+    /// Retain completed normalized evidence without retaining parser state.
+    pub(crate) fn into_reply(self) -> Option<(u16, &'a str)> {
+        let code = self.code()?;
+        let Self { output, used, .. } = self;
+        let bytes: &'a [u8] = output;
+        Some((code, std::str::from_utf8(bytes.get(..used)?).ok()?))
+    }
     /// EOF before a complete reply is sticky refusal, never a successful prefix.
     pub fn finish(&mut self) -> Result<&str, Error> {
         if let Some(error) = self.failure {

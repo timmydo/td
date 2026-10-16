@@ -5174,3 +5174,11 @@ storage; the existing TLS buffers and policy slot remain owned until returned
 after bounded publication. Pre-output checks retain ATTEMPT_IO/4096 charges;
 ordered result publication retains PHASE_IO and existing mixed-RCPT/Body failure
 reply-vector bounds. Refusals move existing passive ownership into a typed enum.
+
+A command refusal after complete parsing may keep a code and borrowed view
+of the existing normalized reply cell alongside closed TLS buffers. Its
+standard boxed-TLS representation is compile-time capped at 128 bytes. It makes no
+reply copy, reserves no additional cell and cannot return a session. The cells
+remain borrowed until refusal custody is consumed; callers capture evidence
+before extracting buffers. Adapter publication uses its already reserved reply
+storage and original meters. Partial or malformed input retains no result.
