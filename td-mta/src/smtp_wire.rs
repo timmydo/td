@@ -257,16 +257,57 @@ pub struct StartTlsOffer {
     _private: (),
 }
 
-/// Retains only the STARTTLS capability, never credentials or other EHLO state.
+/// Advertised mechanisms from a complete EHLO reply, never TLS authorization.
+/// The driver must discard pre-TLS capabilities and obtain a fresh reply on
+/// the verified transport before using these flags to select authentication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthMechanisms {
+    plain: bool,
+    login: bool,
+}
+impl AuthMechanisms {
+    pub fn plain(self) -> bool {
+        self.plain
+    }
+    pub fn login(self) -> bool {
+        self.login
+    }
+    fn parse(parameters: &[u8]) -> Option<Self> {
+        let mut value = Self {
+            plain: false,
+            login: false,
+        };
+        for mechanism in parameters.split(|&b| b == b' ') {
+            if mechanism.is_empty()
+                || mechanism.len() > 20
+                || !mechanism.iter().all(|b| {
+                    b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                })
+            {
+                return None;
+            }
+            value.plain |= mechanism == b"PLAIN";
+            value.login |= mechanism == b"LOGIN";
+        }
+        Some(value)
+    }
+}
+
+/// Retains only STARTTLS and supported AUTH advertisements, never credentials.
 pub struct EhloReader<'a> {
     reply: ReplyReader<'a>,
     offered: bool,
+    auth: AuthMechanisms,
 }
 impl<'a> EhloReader<'a> {
     pub fn new(storage: &'a mut [u8]) -> Result<Self, Error> {
         Ok(Self {
             reply: ReplyReader::new(storage)?,
             offered: false,
+            auth: AuthMechanisms {
+                plain: false,
+                login: false,
+            },
         })
     }
 
@@ -276,6 +317,12 @@ impl<'a> EhloReader<'a> {
             if let Ok(Some(extension)) = ehlo_extension(line, self.reply.first_line()) {
                 self.offered |= extension.keyword.eq_ignore_ascii_case(b"STARTTLS")
                     && extension.parameters.is_empty();
+                if extension.keyword.eq_ignore_ascii_case(b"AUTH") {
+                    if let Some(auth) = AuthMechanisms::parse(extension.parameters) {
+                        self.auth.plain |= auth.plain;
+                        self.auth.login |= auth.login;
+                    }
+                }
             }
         }
         Ok(progress)
@@ -287,6 +334,25 @@ impl<'a> EhloReader<'a> {
 
     pub fn complete(&self) -> bool {
         self.reply.complete()
+    }
+
+    /// Consume a complete successful EHLO with no unread reply bytes. Malformed
+    /// AUTH lines contribute no mechanisms; a valid unsupported list is empty.
+    /// This syntax result does not establish transport identity or encryption.
+    pub fn into_auth_mechanisms(self, tail: &[u8]) -> Result<AuthMechanisms, Error> {
+        if let Some(error) = self.reply.failure {
+            return Err(error);
+        }
+        if !tail.is_empty() {
+            return Err(Error::Invalid);
+        }
+        if !self.reply.complete() {
+            return Err(Error::Conflict);
+        }
+        if self.reply.line().is_none_or(|line| line.code != 250) {
+            return Err(Error::Invalid);
+        }
+        Ok(self.auth)
     }
 
     /// Consume pre-TLS capability state. A greeting, partial reply, malformed

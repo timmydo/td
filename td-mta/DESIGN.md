@@ -1208,6 +1208,18 @@ Verify certificate chains, validity, and the configured hostname; send SNI.
 Never send credentials before verified TLS or downgrade after a TLS failure.
 Support advertised AUTH PLAIN and LOGIN with bounded challenge/reply handling.
 Do not advertise or use an AUTH mechanism merely because a banner suggests it.
+The shared EHLO reader retains only STARTTLS and supported AUTH mechanism
+flags. AUTH keywords are case-insensitive; SASL names are exact uppercase
+ASCII names of 1 through 20 letters, digits, hyphens or underscores (RFC 4422).
+Unknown valid mechanisms are ignored. An invalid mechanism invalidates that
+AUTH line's entire list; valid repeated lists are unioned. The greeting line
+is never an advertisement. Capabilities are available only after a complete,
+successful 250 reply with no unread tail, under the shared 512-byte line and
+16 KiB aggregate bounds. These flags are syntax evidence only: the driver
+must discard pre-TLS capabilities and obtain a fresh EHLO on the verified TLS
+transport before selecting AUTH. This parser increment does not send AUTH or
+activate the relay driver.
+
 The operator configures permitted From/envelope identities; aliases accepted
 inbound are not automatically authorized outbound by Migadu.
 

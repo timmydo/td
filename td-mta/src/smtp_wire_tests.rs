@@ -316,3 +316,124 @@ fn ehlo_greeting_is_never_a_starttls_advertisement() {
         }))
     );
 }
+
+fn auth_offer(chunks: &[&[u8]]) -> Result<AuthMechanisms, Error> {
+    let mut scratch = [0; LINE_BYTES];
+    let mut reader = EhloReader::new(&mut scratch)?;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let progress = reader.feed(&chunk[consumed..])?;
+            consumed += progress.consumed;
+            if reader.complete() {
+                if chunks[index + 1..].iter().any(|chunk| !chunk.is_empty()) {
+                    return Err(Error::Invalid);
+                }
+                return reader.into_auth_mechanisms(&chunk[consumed..]);
+            }
+            if progress.complete {
+                reader.advance()?;
+            }
+            assert!(progress.consumed > 0);
+        }
+    }
+    reader.into_auth_mechanisms(&[])
+}
+
+#[test]
+fn auth_capabilities_require_complete_ehlo_and_exact_mechanism_names() {
+    for (wire, plain, login) in [
+        (
+            b"250-host\r\n250 AUTH PLAIN LOGIN\r\n".as_slice(),
+            true,
+            true,
+        ),
+        (b"250-host\r\n250 aUtH LOGIN\r\n", false, true),
+        (b"250-host\r\n250 AUTH PLAIN SCRAM-SHA-256\r\n", true, false),
+        (
+            b"250-host\r\n250 AUTH EXTERNAL X_PRIVATE-2\r\n",
+            false,
+            false,
+        ),
+        (b"250 AUTH PLAIN LOGIN\r\n", false, false),
+        (b"250-host\r\n250 SIZE 1000\r\n", false, false),
+        (
+            b"250-host\r\n250-AUTH PLAIN\r\n250 AUTH LOGIN\r\n",
+            true,
+            true,
+        ),
+    ] {
+        for split in 0..=wire.len() {
+            let mechanisms = auth_offer(&[&wire[..split], &wire[split..]]).unwrap();
+            assert_eq!((mechanisms.plain(), mechanisms.login()), (plain, login));
+        }
+        let chunks: Vec<_> = wire.chunks(1).collect();
+        let mechanisms = auth_offer(&chunks).unwrap();
+        assert_eq!((mechanisms.plain(), mechanisms.login()), (plain, login));
+    }
+}
+
+#[test]
+fn malformed_auth_list_cannot_partially_advertise_mechanisms() {
+    for parameters in [
+        "",
+        "PLAIN ",
+        "PLAIN  LOGIN",
+        "PLAIN\tLOGIN",
+        "plain LOGIN",
+        "PLAIN login",
+        "PLAIN X+BAD",
+        "PLAIN ABCDEFGHIJKLMNOPQRSTU",
+    ] {
+        let wire = format!("250-host\r\n250 AUTH {parameters}\r\n");
+        let mechanisms = auth_offer(&[wire.as_bytes()]).unwrap();
+        assert!(!mechanisms.plain());
+        assert!(!mechanisms.login());
+    }
+    for line in ["AUTH", "AUTH=PLAIN LOGIN", "AUTH\tPLAIN"] {
+        let wire = format!("250-host\r\n250 {line}\r\n");
+        let mechanisms = auth_offer(&[wire.as_bytes()]).unwrap();
+        assert!(!mechanisms.plain());
+        assert!(!mechanisms.login());
+    }
+    let mechanisms =
+        auth_offer(&[b"250-host\r\n250-AUTH PLAIN bad\r\n250 AUTH LOGIN\r\n"]).unwrap();
+    assert!(!mechanisms.plain());
+    assert!(mechanisms.login());
+    let mechanisms = auth_offer(&[b"250-host\r\n250 AUTH PLAIN ABCDEFGHIJKLMNOPQRST\r\n"]).unwrap();
+    assert!(mechanisms.plain());
+}
+
+#[test]
+fn auth_capabilities_refuse_partial_failed_and_tailed_replies() {
+    for (wire, error) in [
+        (b"".as_slice(), Error::Conflict),
+        (b"250-host\r\n250-AUTH PLAIN\r\n", Error::Conflict),
+        (b"250-host\r\n250 AUTH PLAIN\r", Error::Conflict),
+        (b"550-host\r\n550 AUTH PLAIN\r\n", Error::Invalid),
+        (
+            b"250-host\r\n250-AUTH PLAIN\r\n550 denied\r\n",
+            Error::Invalid,
+        ),
+        (b"250-host\r\n250 AUTH PLAIN\n", Error::Invalid),
+        (
+            b"250-host\r\n250 AUTH PLAIN\r\n235 injected\r\n",
+            Error::Invalid,
+        ),
+        (
+            b"250-host\r\n250 AUTH PLAIN\r\n\x16\x03\x03",
+            Error::Invalid,
+        ),
+    ] {
+        assert_eq!(auth_offer(&[wire]).err(), Some(error));
+    }
+    // A correctly advertised mechanism does not survive a later framing failure.
+    let mut scratch = [0; LINE_BYTES];
+    let mut reader = EhloReader::new(&mut scratch).unwrap();
+    reader.feed(b"250-host\r\n").unwrap();
+    reader.advance().unwrap();
+    reader.feed(b"250-AUTH PLAIN\r\n").unwrap();
+    reader.advance().unwrap();
+    assert_eq!(reader.feed(b"250 bad\n"), Err(Error::Invalid));
+    assert_eq!(reader.into_auth_mechanisms(&[]).err(), Some(Error::Invalid));
+}
