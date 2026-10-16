@@ -4866,3 +4866,22 @@ verifies exact reply persistence and retirement after transport closure. Shared
 RCPT fixture drivers are used by both adapters. Full body/final transfer remains
 separately qualified by its existing native fixture; production activation and
 maximum-message throughput are not claimed here.
+
+## 175. Bound envelope through immutable body and final settlement
+
+The native final-handoff fixture now drives the successful transfer, final
+publication rollback, expired final custody, and unknown final COMMIT cases
+through the bound MAIL, ordered RCPT and DATA adapters. The same authenticated
+session passes through their typed completions into the existing immutable
+body reader and body/final transport adapters. The actual DATA completion's
+MAIL mode is carried into body encoding. Exact wire commands and positive
+replies are checked before body transfer; matching attempt identity, the
+shrinking Prepared cap, final-capacity admission, Possible before terminator,
+and exact final settlement remain asserted by the existing fixture.
+
+These four cases cover the composed small-message path, including passive
+final evidence extraction and independent unknown-commit inspection. Existing
+negative-envelope and interrupted-publication cases retain their focused
+low-level paths. This test composition adds no production dispatcher, cached
+authority, output-owner reconstruction, allocation policy or deadline change.
+The maximum-message throughput limitation in section 155 still applies.

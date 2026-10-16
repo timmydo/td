@@ -441,3 +441,64 @@ pub(super) fn rcpt_command<'w, 'a, 'r>(
         return (step, received);
     }
 }
+
+/// Exercise one positive recipient through the bound envelope stages.
+pub(super) fn accepted_body<'w, 'a, 'r>(
+    plan: td_mta::postgres_dispatch::MailPlan<'w, 'a, 'r>,
+    session: auth::Session<Buffer>,
+    peer: &mut Peer,
+    cap: Deadline,
+    database: &mut Meter,
+) -> td_mta::postgres_relay_data::Completed<'w, 'a, 'r, Buffer> {
+    use td_mta::postgres_relay_data as data;
+    assert_eq!(plan.envelope().recipients.len(), 1);
+    let recipient = plan.envelope().recipients.first().unwrap();
+    assert_eq!(recipient.ordinal, 0);
+    let expected = format!("RCPT TO:<{}>\r\n", recipient.address);
+    let accepted = accepted_mail(plan, session, peer, cap, database);
+    let (step, received) = rcpt_command(
+        RcptStart::Mail(accepted),
+        peer,
+        cap,
+        database,
+        expected.as_bytes(),
+        b"250 recipient\r\n",
+    );
+    assert_eq!(received, expected.as_bytes());
+    let RcptStep::Ready(completed) = step else {
+        panic!("single positive RCPT did not complete");
+    };
+    let mut input = [0; 512];
+    let mut line = [0; 512];
+    let mut reply = [0; 4096];
+    let mut output = [0; 512];
+    let mut network = meter(cap);
+    let mut exchange = data::begin(
+        completed,
+        command::Scratch {
+            input: &mut input,
+            line: &mut line,
+            reply: &mut reply,
+            command: &mut output,
+        },
+        &mut network,
+        database,
+    )
+    .ok()
+    .unwrap();
+    let mut script = Script::new(b"DATA\r\n", b"354 send body\r\n");
+    for _ in 0..100_000 {
+        script.turn(peer);
+        match exchange.advance() {
+            Ok(data::Progress::Pending(next)) => exchange = next,
+            Ok(data::Progress::Ready(completed)) => {
+                script.complete();
+                return completed;
+            }
+            Ok(data::Progress::Rejected(_)) => panic!("unexpected DATA rejection"),
+            Err(failure) => panic!("bound DATA failed: {:?}", failure.error),
+        }
+        std::thread::yield_now();
+    }
+    panic!("bound DATA did not finish");
+}

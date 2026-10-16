@@ -115,517 +115,127 @@ pub(super) fn exercise(
             if data_case >= 4 { 2 } else { 1 }
         );
         let (session, mut peer) = wire::authenticated(fixture, clock.clone(), cap);
-        let (session, mail) = wire::command(
-            session,
-            &mut peer,
-            clock.clone(),
-            cap,
-            command::Command::MailFrom(&envelope.reverse_path),
-            format!("MAIL FROM:<{}>\r\n", envelope.reverse_path).as_bytes(),
-            if mail_refusal != 0 {
-                b"550 sender refused\r\n"
-            } else {
-                b"250 sender\r\n"
-            },
-        );
-        if mail_refusal != 0 {
-            assert_eq!(mail, "550 sender refused");
-            drop(session.into_buffers().unwrap());
-            if mail_refusal == 2 {
-                let short = td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000)
-                    .unwrap();
-                published.check_current(&mut wire::meter(short)).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(1100));
-                let failure = published.record_refusal(&mail, &mut database).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Deadline)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                let failure = failure.retry(&mut wire::meter(cap)).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Deadline)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
-                let evidence = failure.into_evidence().unwrap();
-                let until = wire::until(&clock);
-                let outcome = worker
-                    .publish_phase(evidence, until, &mut wire::meter(until))
-                    .unwrap();
-                let expected =
-                    phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
-                assert_eq!(
-                    phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
-                    Some(outcome)
-                );
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
-                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-            } else {
-                sql(fixture,"CREATE FUNCTION public.reject_wire_mail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire MAIL refusal'; END $$; CREATE TRIGGER reject_wire_mail BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_mail()");
-                let failure = published.record_refusal(&mail, &mut database).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Phase(phases::Error::Database)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
-                let failure = failure.retry(&mut empty).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Capacity)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
-                let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
-                let failure = failure.retry(&mut database).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Busy)
-                );
-                drop((first, second));
-                sql(
-                    fixture,
-                    "DROP TRIGGER reject_wire_mail ON td_mta.attempt_command_receipts",
-                );
-                let outcome = failure.retry(&mut database).unwrap();
-                let value = phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
-                assert_eq!(
-                    phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
-                    Some(outcome)
-                );
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
-            }
-            assert_eq!(pending.attempt().unwrap(), None);
-            drop(peer.into_buffers().unwrap());
-            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-            continue;
-        }
-        assert_eq!(mail, "250 sender");
-        let published = published.accepted(&mail).unwrap();
-        if data_case == 2 {
-            let recipient = &published.envelope().recipients[0];
-            let (session, rcpt) = wire::command(
+        let (body_owner, body_request, session, mode, ordinal, rcpt) = if matches!(
+            n,
+            95 | 96 | 114 | 115
+        ) {
+            let completed = wire::accepted_body(published, session, &mut peer, cap, &mut database);
+            let (body_owner, body_request, session, mode) = completed.into_parts();
+            assert_eq!(mode, Body::SevenBit);
+            (
+                body_owner,
+                body_request,
                 session,
-                &mut peer,
-                clock.clone(),
-                cap,
-                command::Command::RcptTo(&recipient.address),
-                format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
-                b"250 recipient\r\n",
-            );
-
-            assert!(matches!(
-                published.reserve_data(&[(999, &rcpt)]),
-                Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
-            ));
-            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
-            drop(session.into_buffers().unwrap());
-            let cancellation =
-                td_mta::postgres_submission_cancel::prepare(claim, generation, submission).unwrap();
-            td_mta::postgres_submission_cancel::publish(
-                &runtime,
-                trust,
-                deadline(),
-                &cancellation,
-                |_| Ok(()),
+                mode,
+                0,
+                String::from("250 recipient"),
             )
-            .unwrap();
-            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-            drop(peer.into_buffers().unwrap());
-            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-            continue;
-        }
-        let mut published = published.reserve_rcpt().unwrap();
-        assert_eq!(published.attempt(), attempt);
-        let mut session = session;
-        while published.next_recipient().is_some() {
-            if data_case == 6 && published.next_recipient().unwrap().ordinal == 1 {
-                break;
-            }
-            assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
-            let recipient = published.next_recipient().unwrap();
-            let ordinal = recipient.ordinal;
-            let negative = data_case == 5 || (matches!(data_case, 4 | 7..=14) && ordinal == 1);
-            let (next, reply) = wire::command(
+        } else {
+            let (session, mail) = wire::command(
                 session,
                 &mut peer,
                 clock.clone(),
                 cap,
-                command::Command::RcptTo(&recipient.address),
-                format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
-                if negative {
-                    b"550 recipient refused\r\n"
+                command::Command::MailFrom(&envelope.reverse_path),
+                format!("MAIL FROM:<{}>\r\n", envelope.reverse_path).as_bytes(),
+                if mail_refusal != 0 {
+                    b"550 sender refused\r\n"
                 } else {
-                    b"250 recipient\r\n"
+                    b"250 sender\r\n"
                 },
             );
-            session = next;
-            published.record_reply(ordinal, &reply).unwrap();
-        }
-        let result = published.finish().unwrap();
-        assert_eq!(result.attempt(), attempt);
-        if data_case == 5 || data_case == 6 {
-            let failure = result.reserve_data().err().unwrap();
-            assert_eq!(
-                failure.error,
-                dispatch::Error::Admission(td_mta::ports::Error::Invalid)
-            );
-            let result = failure.into_retained();
-            assert_eq!(result.evidence().is_complete(), data_case == 5);
-            assert_eq!(
-                result.evidence().accepted().len(),
-                usize::from(data_case == 6)
-            );
-            drop(session.into_buffers().unwrap());
-            let interruption = result.into_interruption().unwrap();
-            assert_eq!(interruption.recovery.is_some(), data_case == 6);
-            if let Some(refusal) = interruption.refusal {
-                worker.publish_phase(refusal, cap, &mut database).unwrap();
-            }
-            if let Some(recovery) = interruption.recovery {
-                worker
-                    .publish_recovery(recovery, cap, &mut database)
-                    .unwrap();
-            }
-            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 5 { "5|550 recipient refused|\n5|550 recipient refused|" } else { "3|250 recipient|\n3||" });
-            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-            assert_eq!(pending.attempt().unwrap(), None);
-            drop(peer.into_buffers().unwrap());
-            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-            continue;
-        }
-        assert!(result.evidence().is_complete());
-        let (ordinal, rcpt) = result.evidence().accepted().first().unwrap().clone();
-        let result = result.reserve_data().unwrap();
-        if matches!(data_case, 7..=11) {
-            let mut result = result;
-            assert!(result.check_current(&mut database).unwrap() <= prepared_limit);
-            let (session, data) = wire::command(
-                session,
-                &mut peer,
-                clock.clone(),
-                cap,
-                command::Command::Data,
-                b"DATA\r\n",
-                b"550 data refused\r\n",
-            );
-            drop(session.into_buffers().unwrap());
-            if data_case == 11 {
-                sql(fixture, "CREATE FUNCTION public.delay_extracted_rcpt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_extracted_rcpt AFTER INSERT ON td_mta.attempt_rcpt_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_extracted_rcpt()");
-                let short = td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1500)
-                    .unwrap();
-                let failure = result
-                    .record_refusal(&data, &mut wire::meter(short))
-                    .unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Phase(phases::Error::Indeterminate)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                let evidence = failure.into_evidence().unwrap();
-                assert!(evidence.refusal.is_some());
-                assert_eq!(pending.attempt().unwrap(), Some(attempt));
-                let until = wire::until(&clock);
-                let mut settlement = wire::meter(until);
-                assert_eq!(
-                    worker.publish_phase(evidence.command.clone(), until, &mut settlement),
-                    Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
-                );
-                std::thread::sleep(std::time::Duration::from_secs(4));
-                sql(
-                    fixture,
-                    "DROP TRIGGER delay_extracted_rcpt ON td_mta.attempt_rcpt_receipts",
-                );
-                let slots = ReadSlots::new(1).unwrap();
-                let connection = dispatch::Connection {
-                    request: &runtime,
-                    trust,
-                    slots: &slots,
-                    clock: clock.clone(),
-                };
-                let historical = match pending.settle(&connection, until, &mut settlement).unwrap()
-                {
-                    Some(dispatch::Settlement::Phase(outcome)) => outcome,
-                    other => panic!("expected RCPT settlement, got {other:?}"),
-                };
-                assert_eq!(pending.attempt().unwrap(), None);
-                let replay = worker
-                    .publish_phase(evidence.refusal.unwrap(), until, &mut settlement)
-                    .unwrap();
-                assert_eq!(replay, historical);
-                let outcome = worker
-                    .publish_phase(evidence.command, until, &mut settlement)
-                    .unwrap();
-                let expected = phases::refused_data_command(
-                    claim,
-                    generation,
-                    attempt,
-                    &[(ordinal, &rcpt)],
-                    &data,
-                )
-                .unwrap();
-                assert_eq!(
-                    phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
-                    Some(outcome)
-                );
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
-                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-                assert_eq!(pending.attempt().unwrap(), None);
-                drop(peer.into_buffers().unwrap());
-                sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-                continue;
-            }
-            let table = if matches!(data_case, 7 | 9) {
-                "attempt_rcpt_receipts"
-            } else {
-                "attempt_command_receipts"
-            };
-            let trigger = format!("reject_mixed_data_{n}");
-            sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'mixed DATA fixture'; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON td_mta.{table} FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
-            let failure = result.record_refusal(&data, &mut database).unwrap_err();
-            assert_eq!(
-                failure.error,
-                dispatch::Error::Phase(phases::Error::Database)
-            );
-            assert_eq!(failure.attempt(), Some(attempt));
-            assert_eq!(pending.attempt().unwrap(), None);
-            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if matches!(data_case, 7 | 9) { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
-            sql(
-                fixture,
-                &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
-            );
-            let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
-            let failure = failure.retry(&mut empty).unwrap_err();
-            assert_eq!(
-                failure.error,
-                dispatch::Error::Admission(td_mta::ports::Error::Capacity)
-            );
-            assert_eq!(failure.attempt(), Some(attempt));
-            let outcome = if data_case >= 9 {
-                let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
-                let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
-                let short = td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000)
-                    .unwrap();
-                let failure = failure.retry(&mut wire::meter(short)).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Busy)
-                );
-                drop((first, second));
-                std::thread::sleep(std::time::Duration::from_millis(1100));
-                let failure = failure.retry(&mut database).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Admission(td_mta::ports::Error::Deadline)
-                );
-                assert_eq!(failure.attempt(), Some(attempt));
-                let evidence = failure.into_evidence().unwrap();
-                assert_eq!(evidence.refusal.is_some(), data_case == 9);
-                let until = wire::until(&clock);
-                let mut settlement = wire::meter(until);
-                if let Some(refusal) = evidence.refusal {
-                    worker
-                        .publish_phase(refusal, until, &mut settlement)
-                        .unwrap();
-                }
-                worker
-                    .publish_phase(evidence.command, until, &mut settlement)
-                    .unwrap()
-            } else {
-                failure.retry(&mut database).unwrap()
-            };
-            let value = phases::refused_data_command(
-                claim,
-                generation,
-                attempt,
-                &[(ordinal, &rcpt)],
-                &data,
-            )
-            .unwrap();
-            assert_eq!(
-                phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
-                Some(outcome)
-            );
-            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
-            assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
-            assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_rcpt_receipts WHERE attempt_id=decode('{attempt}','hex')")), "1");
-            assert_eq!(pending.attempt().unwrap(), None);
-            drop(peer.into_buffers().unwrap());
-            sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-            continue;
-        }
-        let (body_owner, body_request, session) = if matches!(data_case, 4 | 12..=14) {
-            let mut result = result;
-            assert_eq!(result.attempt(), attempt);
-            assert!(result.check_current(&mut database).unwrap() <= prepared_limit);
-            let (session, data) = wire::command(
-                session,
-                &mut peer,
-                clock.clone(),
-                cap,
-                command::Command::Data,
-                b"DATA\r\n",
-                b"354 send body\r\n",
-            );
-            if data_case >= 12 {
-                let table = if data_case == 12 {
-                    "attempt_rcpt_receipts"
-                } else {
-                    "attempt_phase_receipts"
-                };
-                let trigger = format!("body_handoff_{n}");
-                if data_case == 14 {
-                    sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER {trigger} AFTER INSERT ON td_mta.{table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
-                } else {
-                    sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Body handoff fixture'; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON td_mta.{table} FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
-                }
-                let failure = if data_case == 14 {
-                    let short =
-                        td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1500)
-                            .unwrap();
-                    result
-                        .publish_body(&data, &mut wire::meter(short))
-                        .err()
-                        .unwrap()
-                } else {
-                    result.publish_body(&data, &mut database).err().unwrap()
-                };
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Phase(if data_case == 14 {
-                        phases::Error::Indeterminate
-                    } else {
-                        phases::Error::Database
-                    })
-                );
-                assert_eq!(failure.attempt(), attempt);
+            if mail_refusal != 0 {
+                assert_eq!(mail, "550 sender refused");
                 drop(session.into_buffers().unwrap());
-                let interruption = failure.into_interruption().unwrap();
-                assert_eq!(interruption.refusal.is_some(), data_case == 12);
-                assert!(interruption.recovery.is_some());
-                let until = wire::until(&clock);
-                let mut settlement = wire::meter(until);
-                if data_case == 14 {
-                    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                if mail_refusal == 2 {
+                    let short =
+                        td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000)
+                            .unwrap();
+                    published.check_current(&mut wire::meter(short)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(1100));
+                    let failure = published.record_refusal(&mail, &mut database).unwrap_err();
                     assert_eq!(
-                        worker.publish_recovery(
-                            interruption.recovery.as_ref().unwrap().clone(),
-                            until,
-                            &mut settlement
-                        ),
-                        Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Deadline)
                     );
-                    std::thread::sleep(std::time::Duration::from_secs(4));
-                    sql(
-                        fixture,
-                        &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    let failure = failure.retry(&mut wire::meter(cap)).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Deadline)
                     );
-                    let slots = ReadSlots::new(1).unwrap();
-                    let connection = dispatch::Connection {
-                        request: &runtime,
-                        trust,
-                        slots: &slots,
-                        clock: clock.clone(),
-                    };
-                    let historical =
-                        match pending.settle(&connection, until, &mut settlement).unwrap() {
-                            Some(dispatch::Settlement::Phase(outcome)) => outcome,
-                            other => panic!("expected Body settlement, got {other:?}"),
-                        };
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
+                    let evidence = failure.into_evidence().unwrap();
+                    let until = wire::until(&clock);
+                    let outcome = worker
+                        .publish_phase(evidence, until, &mut wire::meter(until))
+                        .unwrap();
                     let expected =
-                        phases::body(claim, generation, attempt, &[(ordinal, &rcpt)]).unwrap();
+                        phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
                     assert_eq!(
                         phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
-                        Some(historical)
+                        Some(outcome)
                     );
-                    assert_eq!(sql(fixture,&format!("SELECT state,phase,rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "2|2|250 recipient");
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
+                    assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
                 } else {
+                    sql(fixture,"CREATE FUNCTION public.reject_wire_mail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire MAIL refusal'; END $$; CREATE TRIGGER reject_wire_mail BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_mail()");
+                    let failure = published.record_refusal(&mail, &mut database).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Phase(phases::Error::Database)
+                    );
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
+                    let failure = failure.retry(&mut empty).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Capacity)
+                    );
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let failure = failure.retry(&mut database).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Busy)
+                    );
+                    drop((first, second));
                     sql(
                         fixture,
-                        &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+                        "DROP TRIGGER reject_wire_mail ON td_mta.attempt_command_receipts",
                     );
-                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 12 { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
+                    let outcome = failure.retry(&mut database).unwrap();
+                    let value =
+                        phases::refused_mail(claim, generation, attempt, &[0], &mail).unwrap();
+                    assert_eq!(
+                        phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                        Some(outcome)
+                    );
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply IS NULL,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|t|550 sender refused");
                 }
-                assert_eq!(pending.attempt().unwrap(), None);
-                if let Some(refusal) = interruption.refusal {
-                    worker
-                        .publish_phase(refusal, until, &mut settlement)
-                        .unwrap();
-                }
-                worker
-                    .publish_recovery(interruption.recovery.unwrap(), until, &mut settlement)
-                    .unwrap();
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "3|250 recipient|\n5|550 recipient refused|");
-                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
                 assert_eq!(pending.attempt().unwrap(), None);
                 drop(peer.into_buffers().unwrap());
                 sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                 continue;
             }
-            let (body_owner, body_request) = result.publish_body(&data, &mut database).unwrap();
-            assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")), "5|550 recipient refused|t");
-            (body_owner, body_request, session)
-        } else {
-            let (mut published, refusal) = result.into_parts();
-            assert_eq!(published.attempt(), attempt);
-            assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
-            let (session, data) = wire::command(
-                session,
-                &mut peer,
-                clock.clone(),
-                cap,
-                command::Command::Data,
-                b"DATA\r\n",
-                match data_case {
-                    1 => b"550 data refused\r\n",
-                    3 => b"250 wrong status\r\n",
-                    _ => b"354 send body\r\n",
-                },
-            );
-            if let Some(refusal) = refusal {
-                let outcome = worker.publish_phase(refusal, cap, &mut database).unwrap();
-                assert_eq!(outcome.recipients, 1);
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")), "5|550 recipient refused|t");
-            }
-            if data_case == 1 {
-                assert_eq!(data, "550 data refused");
-                drop(session.into_buffers().unwrap());
-                sql(fixture,"CREATE FUNCTION public.reject_wire_data() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire DATA refusal'; END $$; CREATE TRIGGER reject_wire_data BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_data()");
-                let failure = published.record_refusal(&data, &mut database).unwrap_err();
-                assert_eq!(
-                    failure.error,
-                    dispatch::Error::Phase(phases::Error::Database)
+            assert_eq!(mail, "250 sender");
+            let published = published.accepted(&mail).unwrap();
+            if data_case == 2 {
+                let recipient = &published.envelope().recipients[0];
+                let (session, rcpt) = wire::command(
+                    session,
+                    &mut peer,
+                    clock.clone(),
+                    cap,
+                    command::Command::RcptTo(&recipient.address),
+                    format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
+                    b"250 recipient\r\n",
                 );
-                assert_eq!(failure.attempt(), Some(attempt));
-                sql(
-                    fixture,
-                    "DROP TRIGGER reject_wire_data ON td_mta.attempt_command_receipts",
-                );
-                let outcome = failure.retry(&mut database).unwrap();
-                let value = phases::refused_data_command(
-                    claim,
-                    generation,
-                    attempt,
-                    &[(ordinal, &rcpt)],
-                    &data,
-                )
-                .unwrap();
-                assert_eq!(
-                    phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
-                    Some(outcome)
-                );
-                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|250 recipient|550 data refused");
-                assert_eq!(pending.attempt().unwrap(), None);
-                drop(peer.into_buffers().unwrap());
-                sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
-                continue;
-            }
-            if data_case == 3 {
-                assert_eq!(data, "250 wrong status");
+
                 assert!(matches!(
-                    published.publish_body(&data, &mut database),
+                    published.reserve_data(&[(999, &rcpt)]),
                     Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
                 ));
                 assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
@@ -646,9 +256,430 @@ pub(super) fn exercise(
                 sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
                 continue;
             }
-            assert_eq!(data, "354 send body");
-            let (body_owner, body_request) = published.publish_body(&data, &mut database).unwrap();
-            (body_owner, body_request, session)
+            let mut published = published.reserve_rcpt().unwrap();
+            assert_eq!(published.attempt(), attempt);
+            let mut session = session;
+            while published.next_recipient().is_some() {
+                if data_case == 6 && published.next_recipient().unwrap().ordinal == 1 {
+                    break;
+                }
+                assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
+                let recipient = published.next_recipient().unwrap();
+                let ordinal = recipient.ordinal;
+                let negative = data_case == 5 || (matches!(data_case, 4 | 7..=14) && ordinal == 1);
+                let (next, reply) = wire::command(
+                    session,
+                    &mut peer,
+                    clock.clone(),
+                    cap,
+                    command::Command::RcptTo(&recipient.address),
+                    format!("RCPT TO:<{}>\r\n", recipient.address).as_bytes(),
+                    if negative {
+                        b"550 recipient refused\r\n"
+                    } else {
+                        b"250 recipient\r\n"
+                    },
+                );
+                session = next;
+                published.record_reply(ordinal, &reply).unwrap();
+            }
+            let result = published.finish().unwrap();
+            assert_eq!(result.attempt(), attempt);
+            if data_case == 5 || data_case == 6 {
+                let failure = result.reserve_data().err().unwrap();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Invalid)
+                );
+                let result = failure.into_retained();
+                assert_eq!(result.evidence().is_complete(), data_case == 5);
+                assert_eq!(
+                    result.evidence().accepted().len(),
+                    usize::from(data_case == 6)
+                );
+                drop(session.into_buffers().unwrap());
+                let interruption = result.into_interruption().unwrap();
+                assert_eq!(interruption.recovery.is_some(), data_case == 6);
+                if let Some(refusal) = interruption.refusal {
+                    worker.publish_phase(refusal, cap, &mut database).unwrap();
+                }
+                if let Some(recovery) = interruption.recovery {
+                    worker
+                        .publish_recovery(recovery, cap, &mut database)
+                        .unwrap();
+                }
+                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 5 { "5|550 recipient refused|\n5|550 recipient refused|" } else { "3|250 recipient|\n3||" });
+                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+                assert_eq!(pending.attempt().unwrap(), None);
+                drop(peer.into_buffers().unwrap());
+                sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                continue;
+            }
+            assert!(result.evidence().is_complete());
+            let (ordinal, rcpt) = result.evidence().accepted().first().unwrap().clone();
+            let result = result.reserve_data().unwrap();
+            if matches!(data_case, 7..=11) {
+                let mut result = result;
+                assert!(result.check_current(&mut database).unwrap() <= prepared_limit);
+                let (session, data) = wire::command(
+                    session,
+                    &mut peer,
+                    clock.clone(),
+                    cap,
+                    command::Command::Data,
+                    b"DATA\r\n",
+                    b"550 data refused\r\n",
+                );
+                drop(session.into_buffers().unwrap());
+                if data_case == 11 {
+                    sql(fixture, "CREATE FUNCTION public.delay_extracted_rcpt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_extracted_rcpt AFTER INSERT ON td_mta.attempt_rcpt_receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.delay_extracted_rcpt()");
+                    let short =
+                        td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1500)
+                            .unwrap();
+                    let failure = result
+                        .record_refusal(&data, &mut wire::meter(short))
+                        .unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Phase(phases::Error::Indeterminate)
+                    );
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    let evidence = failure.into_evidence().unwrap();
+                    assert!(evidence.refusal.is_some());
+                    assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                    let until = wire::until(&clock);
+                    let mut settlement = wire::meter(until);
+                    assert_eq!(
+                        worker.publish_phase(evidence.command.clone(), until, &mut settlement),
+                        Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+                    );
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    sql(
+                        fixture,
+                        "DROP TRIGGER delay_extracted_rcpt ON td_mta.attempt_rcpt_receipts",
+                    );
+                    let slots = ReadSlots::new(1).unwrap();
+                    let connection = dispatch::Connection {
+                        request: &runtime,
+                        trust,
+                        slots: &slots,
+                        clock: clock.clone(),
+                    };
+                    let historical =
+                        match pending.settle(&connection, until, &mut settlement).unwrap() {
+                            Some(dispatch::Settlement::Phase(outcome)) => outcome,
+                            other => panic!("expected RCPT settlement, got {other:?}"),
+                        };
+                    assert_eq!(pending.attempt().unwrap(), None);
+                    let replay = worker
+                        .publish_phase(evidence.refusal.unwrap(), until, &mut settlement)
+                        .unwrap();
+                    assert_eq!(replay, historical);
+                    let outcome = worker
+                        .publish_phase(evidence.command, until, &mut settlement)
+                        .unwrap();
+                    let expected = phases::refused_data_command(
+                        claim,
+                        generation,
+                        attempt,
+                        &[(ordinal, &rcpt)],
+                        &data,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
+                        Some(outcome)
+                    );
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
+                    assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+                    assert_eq!(pending.attempt().unwrap(), None);
+                    drop(peer.into_buffers().unwrap());
+                    sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                    continue;
+                }
+                let table = if matches!(data_case, 7 | 9) {
+                    "attempt_rcpt_receipts"
+                } else {
+                    "attempt_command_receipts"
+                };
+                let trigger = format!("reject_mixed_data_{n}");
+                sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'mixed DATA fixture'; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON td_mta.{table} FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
+                let failure = result.record_refusal(&data, &mut database).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Phase(phases::Error::Database)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                assert_eq!(pending.attempt().unwrap(), None);
+                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if matches!(data_case, 7 | 9) { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
+                sql(
+                    fixture,
+                    &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+                );
+                let mut empty = td_mta::admission::work::Meter::new(cap, Default::default());
+                let failure = failure.retry(&mut empty).unwrap_err();
+                assert_eq!(
+                    failure.error,
+                    dispatch::Error::Admission(td_mta::ports::Error::Capacity)
+                );
+                assert_eq!(failure.attempt(), Some(attempt));
+                let outcome = if data_case >= 9 {
+                    let first = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let second = worker.reserve_final(attempt, cap, &mut database).unwrap();
+                    let short =
+                        td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1000)
+                            .unwrap();
+                    let failure = failure.retry(&mut wire::meter(short)).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Busy)
+                    );
+                    drop((first, second));
+                    std::thread::sleep(std::time::Duration::from_millis(1100));
+                    let failure = failure.retry(&mut database).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Admission(td_mta::ports::Error::Deadline)
+                    );
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    let evidence = failure.into_evidence().unwrap();
+                    assert_eq!(evidence.refusal.is_some(), data_case == 9);
+                    let until = wire::until(&clock);
+                    let mut settlement = wire::meter(until);
+                    if let Some(refusal) = evidence.refusal {
+                        worker
+                            .publish_phase(refusal, until, &mut settlement)
+                            .unwrap();
+                    }
+                    worker
+                        .publish_phase(evidence.command, until, &mut settlement)
+                        .unwrap()
+                } else {
+                    failure.retry(&mut database).unwrap()
+                };
+                let value = phases::refused_data_command(
+                    claim,
+                    generation,
+                    attempt,
+                    &[(ordinal, &rcpt)],
+                    &data,
+                )
+                .unwrap();
+                assert_eq!(
+                    phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                    Some(outcome)
+                );
+                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "5|250 recipient|550 data refused\n5|550 recipient refused|");
+                assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+                assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.attempt_rcpt_receipts WHERE attempt_id=decode('{attempt}','hex')")), "1");
+                assert_eq!(pending.attempt().unwrap(), None);
+                drop(peer.into_buffers().unwrap());
+                sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                continue;
+            }
+            let (body_owner, body_request, session) = if matches!(data_case, 4 | 12..=14) {
+                let mut result = result;
+                assert_eq!(result.attempt(), attempt);
+                assert!(result.check_current(&mut database).unwrap() <= prepared_limit);
+                let (session, data) = wire::command(
+                    session,
+                    &mut peer,
+                    clock.clone(),
+                    cap,
+                    command::Command::Data,
+                    b"DATA\r\n",
+                    b"354 send body\r\n",
+                );
+                if data_case >= 12 {
+                    let table = if data_case == 12 {
+                        "attempt_rcpt_receipts"
+                    } else {
+                        "attempt_phase_receipts"
+                    };
+                    let trigger = format!("body_handoff_{n}");
+                    if data_case == 14 {
+                        sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER {trigger} AFTER INSERT ON td_mta.{table} DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
+                    } else {
+                        sql(fixture, &format!("CREATE FUNCTION public.{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Body handoff fixture'; END $$; CREATE TRIGGER {trigger} BEFORE INSERT ON td_mta.{table} FOR EACH ROW EXECUTE FUNCTION public.{trigger}()"));
+                    }
+                    let failure = if data_case == 14 {
+                        let short =
+                            td_mta::ports::Deadline::after(clock.sample().unwrap().monotonic, 1500)
+                                .unwrap();
+                        result
+                            .publish_body(&data, &mut wire::meter(short))
+                            .err()
+                            .unwrap()
+                    } else {
+                        result.publish_body(&data, &mut database).err().unwrap()
+                    };
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Phase(if data_case == 14 {
+                            phases::Error::Indeterminate
+                        } else {
+                            phases::Error::Database
+                        })
+                    );
+                    assert_eq!(failure.attempt(), attempt);
+                    drop(session.into_buffers().unwrap());
+                    let interruption = failure.into_interruption().unwrap();
+                    assert_eq!(interruption.refusal.is_some(), data_case == 12);
+                    assert!(interruption.recovery.is_some());
+                    let until = wire::until(&clock);
+                    let mut settlement = wire::meter(until);
+                    if data_case == 14 {
+                        assert_eq!(pending.attempt().unwrap(), Some(attempt));
+                        assert_eq!(
+                            worker.publish_recovery(
+                                interruption.recovery.as_ref().unwrap().clone(),
+                                until,
+                                &mut settlement
+                            ),
+                            Err(dispatch::Error::Admission(td_mta::ports::Error::Busy))
+                        );
+                        std::thread::sleep(std::time::Duration::from_secs(4));
+                        sql(
+                            fixture,
+                            &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+                        );
+                        let slots = ReadSlots::new(1).unwrap();
+                        let connection = dispatch::Connection {
+                            request: &runtime,
+                            trust,
+                            slots: &slots,
+                            clock: clock.clone(),
+                        };
+                        let historical =
+                            match pending.settle(&connection, until, &mut settlement).unwrap() {
+                                Some(dispatch::Settlement::Phase(outcome)) => outcome,
+                                other => panic!("expected Body settlement, got {other:?}"),
+                            };
+                        let expected =
+                            phases::body(claim, generation, attempt, &[(ordinal, &rcpt)]).unwrap();
+                        assert_eq!(
+                            phases::inspect(&runtime, trust, deadline(), &expected).unwrap(),
+                            Some(historical)
+                        );
+                        assert_eq!(sql(fixture,&format!("SELECT state,phase,rcpt_reply FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=0")), "2|2|250 recipient");
+                    } else {
+                        sql(
+                            fixture,
+                            &format!("DROP TRIGGER {trigger} ON td_mta.{table}"),
+                        );
+                        assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), if data_case == 12 { "2||\n2||" } else { "2||\n5|550 recipient refused|" });
+                    }
+                    assert_eq!(pending.attempt().unwrap(), None);
+                    if let Some(refusal) = interruption.refusal {
+                        worker
+                            .publish_phase(refusal, until, &mut settlement)
+                            .unwrap();
+                    }
+                    worker
+                        .publish_recovery(interruption.recovery.unwrap(), until, &mut settlement)
+                        .unwrap();
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub} ORDER BY ordinal")), "3|250 recipient|\n5|550 recipient refused|");
+                    assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+                    assert_eq!(pending.attempt().unwrap(), None);
+                    drop(peer.into_buffers().unwrap());
+                    sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                    continue;
+                }
+                let (body_owner, body_request) = result.publish_body(&data, &mut database).unwrap();
+                assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")), "5|550 recipient refused|t");
+                (body_owner, body_request, session)
+            } else {
+                let (mut published, refusal) = result.into_parts();
+                assert_eq!(published.attempt(), attempt);
+                assert!(published.check_current(&mut database).unwrap() <= prepared_limit);
+                let (session, data) = wire::command(
+                    session,
+                    &mut peer,
+                    clock.clone(),
+                    cap,
+                    command::Command::Data,
+                    b"DATA\r\n",
+                    match data_case {
+                        1 => b"550 data refused\r\n",
+                        3 => b"250 wrong status\r\n",
+                        _ => b"354 send body\r\n",
+                    },
+                );
+                if let Some(refusal) = refusal {
+                    let outcome = worker.publish_phase(refusal, cap, &mut database).unwrap();
+                    assert_eq!(outcome.recipients, 1);
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply IS NULL FROM td_mta.recipients WHERE submission_id={sub} AND ordinal=1")), "5|550 recipient refused|t");
+                }
+                if data_case == 1 {
+                    assert_eq!(data, "550 data refused");
+                    drop(session.into_buffers().unwrap());
+                    sql(fixture,"CREATE FUNCTION public.reject_wire_data() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'wire DATA refusal'; END $$; CREATE TRIGGER reject_wire_data BEFORE INSERT ON td_mta.attempt_command_receipts FOR EACH ROW EXECUTE FUNCTION public.reject_wire_data()");
+                    let failure = published.record_refusal(&data, &mut database).unwrap_err();
+                    assert_eq!(
+                        failure.error,
+                        dispatch::Error::Phase(phases::Error::Database)
+                    );
+                    assert_eq!(failure.attempt(), Some(attempt));
+                    sql(
+                        fixture,
+                        "DROP TRIGGER reject_wire_data ON td_mta.attempt_command_receipts",
+                    );
+                    let outcome = failure.retry(&mut database).unwrap();
+                    let value = phases::refused_data_command(
+                        claim,
+                        generation,
+                        attempt,
+                        &[(ordinal, &rcpt)],
+                        &data,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        phases::inspect(&runtime, trust, deadline(), &value).unwrap(),
+                        Some(outcome)
+                    );
+                    assert_eq!(sql(fixture,&format!("SELECT state,rcpt_reply,data_reply FROM td_mta.recipients WHERE submission_id={sub}")), "5|250 recipient|550 data refused");
+                    assert_eq!(pending.attempt().unwrap(), None);
+                    drop(peer.into_buffers().unwrap());
+                    sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                    continue;
+                }
+                if data_case == 3 {
+                    assert_eq!(data, "250 wrong status");
+                    assert!(matches!(
+                        published.publish_body(&data, &mut database),
+                        Err(dispatch::Error::Admission(td_mta::ports::Error::Invalid))
+                    ));
+                    assert_eq!(sql(fixture,&format!("SELECT count(*) FROM td_mta.recipients WHERE submission_id={sub} AND state=2 AND phase=1")), "1");
+                    drop(session.into_buffers().unwrap());
+                    let cancellation =
+                        td_mta::postgres_submission_cancel::prepare(claim, generation, submission)
+                            .unwrap();
+                    td_mta::postgres_submission_cancel::publish(
+                        &runtime,
+                        trust,
+                        deadline(),
+                        &cancellation,
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                    assert_eq!(sql(fixture,&format!("SELECT active FROM td_mta.submission_attempts WHERE attempt_id=decode('{attempt}','hex')")), "f");
+                    drop(peer.into_buffers().unwrap());
+                    sql(fixture,&format!("DELETE FROM td_mta.recipients WHERE submission_id={sub}; DELETE FROM td_mta.submissions WHERE id={sub}"));
+                    continue;
+                }
+                assert_eq!(data, "354 send body");
+                let (body_owner, body_request) =
+                    published.publish_body(&data, &mut database).unwrap();
+                (body_owner, body_request, session)
+            };
+            (
+                body_owner,
+                body_request,
+                session,
+                Body::SevenBit,
+                ordinal,
+                rcpt,
+            )
         };
         assert_eq!(body_owner.attempt(), attempt);
         assert_eq!(body_request.attempt(), attempt);
@@ -678,7 +709,7 @@ pub(super) fn exercise(
                     plan,
                     session,
                     source,
-                    Body::SevenBit,
+                    mode,
                     body::Scratch {
                         input: &mut input,
                         output: &mut output,
