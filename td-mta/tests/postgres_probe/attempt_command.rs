@@ -42,16 +42,37 @@ pub(super) fn exercise(
             .collect();
         let rcpts: Vec<_> = positive.iter().map(|(n, s)| (*n, s.as_str())).collect();
         let reply = format!("{} {}", if temporary { 450 } else { 550 }, "r".repeat(4092));
-        let prepare = |generation, reply: &str| {
+        let reserve = |generation| {
             if data {
-                phases::refused_data_command(claim, generation, attempt.attempt, &rcpts, reply)
+                phases::reserve_data_command_reply(claim, generation, attempt.attempt, &rcpts)
             } else {
-                phases::refused_mail(claim, generation, attempt.attempt, &ordinals, reply)
+                phases::reserve_mail_reply(claim, generation, attempt.attempt, &ordinals)
             }
         };
+        let prepare = |generation, reply: &str| reserve(generation)?.finish(reply);
+        for invalid in [
+            vec![],
+            vec![1000],
+            vec![0, 0],
+            vec![1, 0],
+            (0..101).collect(),
+        ] {
+            assert!(
+                phases::reserve_mail_reply(claim, generation, attempt.attempt, &invalid).is_err()
+            );
+        }
+        assert!(phases::reserve_data_command_reply(
+            claim,
+            generation,
+            attempt.attempt,
+            &[(0, "450 refused")]
+        )
+        .is_err());
         for bad in ["250 positive", "354 interim", "550 injected\r\n"] {
             assert!(prepare(generation, bad).is_err());
         }
+        assert!(prepare(generation, &format!("550 {}", "x".repeat(4093))).is_err());
+        assert!(reserve(0).is_err());
         assert!(phases::refused_data_command(
             claim,
             generation,
@@ -151,6 +172,16 @@ pub(super) fn exercise(
         assert_eq!(
             phases::publish(request, trust, deadline(), &value).unwrap(),
             outcome
+        );
+        let legacy = if data {
+            phases::refused_data_command(claim, generation, attempt.attempt, &rcpts, &reply)
+        } else {
+            phases::refused_mail(claim, generation, attempt.attempt, &ordinals, &reply)
+        }
+        .unwrap();
+        assert_eq!(
+            phases::inspect(request, trust, deadline(), &legacy).unwrap(),
+            Some(outcome)
         );
         let different = prepare(generation, "550 different").unwrap();
         assert_eq!(

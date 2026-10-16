@@ -234,6 +234,87 @@ fn fill_final_replies(
     hash.finish().map_err(|_| Error::Crypto)
 }
 
+/// Preallocated evidence for one actual negative MAIL or DATA-command reply.
+/// This grants neither transport permission nor database publication capacity.
+pub struct CommandReply {
+    value: Change,
+    negative: td_crypto::Sha256,
+    rcpt: Option<td_crypto::Sha256>,
+}
+/// Reserve the whole Prepared batch before MAIL is sent.
+pub fn reserve_mail_reply(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    ordinals: &[u32],
+) -> Result<CommandReply, Error> {
+    let value = acceptance_possible(claim, generation, attempt, ordinals)?;
+    reserve_command_reply(value, 7)
+}
+/// Reserve a DATA-command refusal for the actual positively accepted RCPT
+/// subset. Retain those replies before sending DATA; no body is authorized.
+pub fn reserve_data_command_reply(
+    claim: &Claim,
+    generation: u64,
+    attempt: AttemptId,
+    accepted: &[(u32, &str)],
+) -> Result<CommandReply, Error> {
+    let mut value = body(claim, generation, attempt, accepted)?;
+    let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+    inner.rcpt_replies = std::mem::take(&mut inner.replies);
+    inner
+        .replies
+        .try_reserve_exact(inner.ordinals.len())
+        .map_err(|_| Error::Capacity)?;
+    for _ in &inner.ordinals {
+        inner.replies.push(String::new());
+    }
+    reserve_command_reply(value, 8)
+}
+fn reserve_command_reply(mut value: Change, phase: i64) -> Result<CommandReply, Error> {
+    let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+    inner.phase = phase;
+    for reply in &mut inner.replies {
+        reply
+            .try_reserve_exact(crate::format::row::MAX_SMTP_REPLY)
+            .map_err(|_| Error::Capacity)?;
+    }
+    let negative = hash_prefix(&inner.claim, inner.generation, inner.attempt, phase)?;
+    let rcpt = if phase == 8 {
+        let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
+        hash.update(b"td-mta DATA-command RCPT evidence v1")
+            .map_err(|_| Error::Crypto)?;
+        Some(hash)
+    } else {
+        None
+    };
+    Ok(CommandReply {
+        value,
+        negative,
+        rcpt,
+    })
+}
+impl CommandReply {
+    /// Consume only a genuine normalized 4xx/5xx reply. Reserved reply buffers
+    /// and hash contexts are reused; no caller can replace identity or subset.
+    pub fn finish(self, reply: &str) -> Result<Change, Error> {
+        if !valid_reply(reply, true) {
+            return Err(Error::Integrity);
+        }
+        let Self {
+            mut value,
+            negative,
+            rcpt,
+        } = self;
+        let inner = Arc::get_mut(&mut value.inner).ok_or(Error::Integrity)?;
+        inner.digest = fill_final_replies(&inner.ordinals, &mut inner.replies, reply, negative)?;
+        if let Some(hash) = rcpt {
+            inner.digest = bind_rcpt_replies(hash, &inner.digest, &inner.rcpt_replies)?;
+        }
+        Ok(value)
+    }
+}
+
 /// Retain all negative RCPT replies collected for one attempt, as one ordered
 /// subset. Other Prepared recipients may subsequently enter Body.
 pub fn refused_rcpt(
@@ -287,7 +368,6 @@ pub fn refused_data_command(
     let mut hash = Provider.sha256().map_err(|_| Error::Crypto)?;
     hash.update(b"td-mta DATA-command RCPT evidence v1")
         .map_err(|_| Error::Crypto)?;
-    hash.update(&inner.digest).map_err(|_| Error::Crypto)?;
     for (_, rcpt) in accepted {
         if !valid_reply(rcpt, false) {
             return Err(Error::Integrity);
@@ -297,13 +377,23 @@ pub fn refused_data_command(
             .try_reserve_exact(rcpt.len())
             .map_err(|_| Error::Capacity)?;
         retained.push_str(rcpt);
-        hash.update(&(rcpt.len() as u64).to_be_bytes())
-            .map_err(|_| Error::Crypto)?;
-        hash.update(rcpt.as_bytes()).map_err(|_| Error::Crypto)?;
         inner.rcpt_replies.push(retained);
     }
-    inner.digest = hash.finish().map_err(|_| Error::Crypto)?;
+    inner.digest = bind_rcpt_replies(hash, &inner.digest, &inner.rcpt_replies)?;
     Ok(value)
+}
+fn bind_rcpt_replies(
+    mut hash: td_crypto::Sha256,
+    digest: &[u8; 32],
+    replies: &[String],
+) -> Result<[u8; 32], Error> {
+    hash.update(digest).map_err(|_| Error::Crypto)?;
+    for reply in replies {
+        hash.update(&(reply.len() as u64).to_be_bytes())
+            .map_err(|_| Error::Crypto)?;
+        hash.update(reply.as_bytes()).map_err(|_| Error::Crypto)?;
+    }
+    hash.finish().map_err(|_| Error::Crypto)
 }
 
 fn prepare<'a>(
@@ -955,6 +1045,21 @@ mod reply_text_tests {
 mod final_reply_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn data_command_digest_preserves_v1_suffix() {
+        let mut hash = Provider.sha256().unwrap();
+        hash.update(b"td-mta DATA-command RCPT evidence v1")
+            .unwrap();
+        let replies = ["250 first".to_owned(), "251 second\taccepted".to_owned()];
+        assert_eq!(
+            bind_rcpt_replies(hash, &[0x42; 32], &replies).unwrap(),
+            [
+                0x60, 0xde, 0x3b, 0xf8, 0xe3, 0x5c, 0x5c, 0xa7, 0x94, 0x37, 0x69, 0x3c, 0x85, 0xe3,
+                0xe8, 0x44, 0xbb, 0x33, 0xfa, 0xce, 0x5c, 0x34, 0x89, 0x2a, 0x45, 0x99, 0x4e, 0x41,
+                0x80, 0xc0, 0x3d, 0xdb,
+            ]
+        );
+    }
     #[test]
     fn final_reply_filling_preserves_allocations_and_refuses_missing_capacity() {
         let reply = format!("250 {}", "x".repeat(4092));

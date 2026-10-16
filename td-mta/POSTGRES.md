@@ -4447,3 +4447,26 @@ original view, a shortened observation followed by a longer fresh meter,
 capacity/slot/Pending refusal and expiry. The real SMTP/TLS fixture uses the
 retained envelope for MAIL/RCPT and consumes the plan after actual 354 before
 running the existing Body and final-result wrappers.
+
+## 160. Reserved negative envelope-command reply storage
+
+CommandReply reserves bounded normalized-reply cells and hash contexts before
+MAIL or DATA-command transmission. The MAIL reservation fixes the complete
+Prepared ordinal batch; the DATA reservation fixes the actually accepted
+RCPT subset and retains its positive replies. Finishing consumes only an
+actual normalized 4xx/5xx reply, fills the existing cells and preserves the
+existing command-receipt digest. Positive or interim replies cannot become
+negative evidence. Identity, command stage and subset cannot be replaced at
+finish. At most 100 recipients and 4096 bytes per reply remain the bounds.
+
+These objects contain passive evidence storage, not live Prepared custody,
+transport permission, database capacity or a publication retry owner. They
+are preparation for envelope orchestration: callers still reserve database
+work and retain the resulting Change across failed publication. Native SQL
+allocation remains separate. No scheduler or backend is activated.
+
+The native command fixture exercises both reply classes at both command
+stages through these reservations, with maximum-sized distinct RCPT replies
+and message refusals, partial DATA subsets, stale ownership, transaction
+failure and uncertain COMMIT. Inspection through the legacy constructors
+must find the same receipt, pinning digest compatibility.

@@ -5055,3 +5055,14 @@ FinalWork connection/record/I/O allowance. No extra pending queue is added.
 
 The pending operation owner boxes its existing bounded Dispatch during cold
 attempt preparation; a phase variant holds only the shared Change owner.
+
+CommandReply reserves the same at-most-100 4096-byte negative reply cells
+before MAIL or DATA-command transmission. DATA additionally retains at most
+100 positive RCPT replies of at most 4096 bytes each: 819200 reply bytes
+across both vectors, plus bounded ordinal/string vectors, claim metadata and
+two inline hash states. MAIL fills one reply vector and initializes only the phase hash state.
+Finishing fills retained cells and moves the existing Change owner; it does
+not allocate new reply storage. The sole outbound job owns this allowance
+separately from SMTP/TLS buffers and native database work. This passive
+reservation holds no connection permit and creates no additional pending
+queue or publication deadline.
