@@ -9,7 +9,7 @@ use td_mta::{
     postgres_dispatch as dispatch,
     postgres_probe::{Mode, Request},
     postgres_read::ReadSlots,
-    postgres_relay_finish as finish,
+    postgres_relay_body as transfer, postgres_relay_finish as finish,
     postgres_route_owners::{self as owners, Claim},
     queue_clock::Guard,
     smtp_data_encode::Body,
@@ -134,7 +134,7 @@ pub(super) fn exercise(
         drop(occupied);
         plan.check_current(&mut database).unwrap();
         let mut transferred = Vec::new();
-        let sent = attempts::with_body(
+        let handoff = attempts::with_body(
             &runtime,
             trust,
             job_limit,
@@ -145,7 +145,8 @@ pub(super) fn exercise(
                 let mut input = [0; body::INPUT_BYTES];
                 let mut output = [0; body::OUTPUT_BYTES];
                 let mut work = wire::meter(cap);
-                let mut exchange = body::Exchange::new(
+                let mut exchange = transfer::begin(
+                    plan,
                     session,
                     source,
                     Body::SevenBit,
@@ -153,9 +154,8 @@ pub(super) fn exercise(
                         input: &mut input,
                         output: &mut output,
                     },
-                    clock.clone(),
-                    cap,
                     &mut work,
+                    &mut database,
                 )
                 .ok()
                 .unwrap();
@@ -165,8 +165,8 @@ pub(super) fn exercise(
                         transferred.extend_from_slice(&bytes[..n]);
                     }
                     match exchange.advance().ok().unwrap() {
-                        body::Progress::Pending(next) => exchange = next,
-                        body::Progress::Ready(sent) => return Ok(sent),
+                        transfer::Progress::Pending(next) => exchange = next,
+                        transfer::Progress::Ready(done) => return Ok(done),
                     }
                     std::thread::yield_now();
                 }
@@ -175,7 +175,6 @@ pub(super) fn exercise(
         )
         .unwrap();
         assert!(!transferred.windows(5).any(|v| v == b"\r\n.\r\n"));
-        let held = plan.publish_possible(&mut database).unwrap();
         assert_eq!(
             phases::check_current_body(
                 &runtime,
@@ -199,20 +198,19 @@ pub(super) fn exercise(
         let (mut input, mut line, mut reply, mut terminator) =
             ([0; 512], [0; 512], [0; 4096], [0; 3]);
         let mut work = wire::meter(cap);
-        let mut exchange = finish::begin(
-            held,
-            sent,
-            command::Scratch {
-                input: &mut input,
-                line: &mut line,
-                reply: &mut reply,
-                command: &mut terminator,
-            },
-            &mut work,
-            &mut database,
-        )
-        .ok()
-        .unwrap();
+        let mut exchange = handoff
+            .begin_final(
+                command::Scratch {
+                    input: &mut input,
+                    line: &mut line,
+                    reply: &mut reply,
+                    command: &mut terminator,
+                },
+                &mut work,
+                &mut database,
+            )
+            .ok()
+            .unwrap();
         let response = b"250 queued\r\n";
         let mut written = 0;
         let mut turns = 0;

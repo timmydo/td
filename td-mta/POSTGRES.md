@@ -4306,3 +4306,39 @@ expiry despite a fresh meter, refusal to publish after expiry, and slot release.
 The native paired-TLS fixture derives final capacity from BodyResult, refuses
 live checks while the remaining ordinary slot is occupied, then checks Body,
 streams its immutable bytes and completes the same retained final handoff.
+
+## 155. Native Body transport handoff
+
+The prepared PostgreSQL body wrapper consumes BodyPlan, an authenticated
+session and the matching admitted immutable source. It constructs the bounded
+body encoder with the owner's runtime clock and original deadline, borrowing
+separate wire and database meters. The trusted caller still owns actual 354,
+compatible MAIL mode and source/session matching. This activates no scheduler
+or production backend.
+
+Before each body write or flush turn, the wrapper internally checks the exact
+live Body state through the reserved plan. Every check charges the bounded
+phase allowance and acquires a second ordinary slot while final capacity stays
+held. The returned lease/submission bound only shortens its local cap; original
+Instant limits are checked before and after every transfer turn. Refusal closes
+the transport and releases local ownership. Locks do not span network work;
+section 4's pause/takeover and buffered-byte limitation remains unchanged.
+
+After all declared bytes are encoded and flushed, the wrapper internally
+publishes known new AcceptancePossible using the matching reserved plan.
+Publication refusal closes the transport; unknown COMMIT remains in Pending
+and yields no final owner. Known success returns a non-separable completed-body
+and FinalResult pair. That pair can start the existing final handoff or close
+its transport; callers cannot substitute a different body or result owner.
+No terminator is emitted by the body wrapper itself.
+
+Paired-TLS tests check admission before every write/flush, exact transparency
+without a terminator, refusal before any output, shortened expiry, malformed
+body input and failed possible publication. The full native PostgreSQL/TLS
+fixture now uses the wrapper through actual final-result publication and
+retained-reply retry. These are bounded correctness cases, not maximum-size
+throughput qualification. Full live checks currently open bounded database
+connections and reread the selected replies per write/flush; their cumulative
+cost must fit the original meter and deadline. Large-body throughput and any
+future admission batching require explicit qualification before activation;
+no allowance or deadline is silently enlarged here.

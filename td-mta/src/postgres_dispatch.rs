@@ -467,6 +467,16 @@ pub struct BodyPlan<'w, 'a, 'r> {
     final_plan: FinalPlan<'w, 'a, 'r>,
 }
 impl<'w, 'a, 'r> BodyPlan<'w, 'a, 'r> {
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn Clock> {
+        self.body.worker.connection.clock.clone()
+    }
+    pub(crate) fn original_deadline(&self) -> Deadline {
+        self.body.until
+    }
+    pub(crate) fn work_limit(&self) -> Instant {
+        self.final_plan.work.limit
+    }
+
     pub fn attempt(&self) -> AttemptId {
         self.body.attempt()
     }

@@ -147,6 +147,7 @@ pub mod postgres_materials;
 pub mod postgres_probe;
 pub mod postgres_profile_materials;
 pub mod postgres_read;
+pub mod postgres_relay_body;
 pub mod postgres_relay_finish;
 pub mod postgres_resolver;
 pub mod postgres_route_health;

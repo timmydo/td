@@ -74,6 +74,9 @@ impl<B: TlsWireStorage> Refusal<B> {
     }
 }
 impl<'a, B: TlsWireStorage> Exchange<'a, B> {
+    pub(crate) fn writes_pending(&self) -> bool {
+        matches!(self.phase, Phase::Write(_) | Phase::Flush)
+    }
     pub fn new(
         session: Session<B>,
         source: &'a mut dyn BlobReader,
