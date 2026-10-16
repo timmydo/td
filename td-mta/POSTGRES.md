@@ -3407,3 +3407,31 @@ through the receipt, never a replacement result. Runtime callers must close
 and fence the route's transport first, including an interrupted current-owner
 attempt, share the process guard and detect primary changes. This API starts
 no transport, scan, scheduler or administrator clock-confirm endpoint.
+
+
+## 121. Prepared shared route health storage
+
+Schema version 25 prepares route health keyed by account, route name and
+immutable destination fingerprint, plus independently retained operation
+receipts. Separate destination keys keep a changed endpoint from inheriting
+or erasing the prior endpoint's backoff. Each health revision is nonzero;
+receipt revisions increase and the future publisher must check exact adjacency.
+Receipts capture the resulting state and one of failure, repair or success,
+so later state changes cannot rewrite an earlier operation's settlement.
+
+The stored consecutive failure count is bounded by u32. A zero count is the
+healthy state, with no failure/retry timestamp or repair latch. A nonzero count
+retains failure UTC and a next-attempt time between five minutes and one hour
+later. Reasons are None, Network, Tls, Auth or Protocol. A repair latch, when
+present, names a nonzero configuration-selection generation and is permitted
+only for TLS/authentication failures. Explicit repair may clear that latch
+while preserving the failure count and minimum retry time; successful transport
+may reset the count without resetting the increasing revision. No stored
+field or receipt itself authorizes a send or proves a successful transport.
+
+The future publisher must compare current policy and ownership, use bounded
+shared retry jitter with checked count/revision increments, retain repair
+holds across ownership changes, and cap health rows and receipts per account.
+Clock guards and due times remain separate dispatch requirements. Both tables
+use the runtime's ordinary mail DML grant set and private owner initialization.
+This schema preparation changes no dispatch behavior or runtime admission.

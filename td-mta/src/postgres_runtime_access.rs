@@ -69,6 +69,8 @@ const TABLES: &[(&str, Access)] = &[
     ("attempt_command_receipts", Access::Mail),
     ("submission_expiry_receipts", Access::Mail),
     ("queue_expiry_progress", Access::Mail),
+    ("route_health", Access::Mail),
+    ("route_health_receipts", Access::Mail),
 ];
 
 #[derive(Clone, Copy)]

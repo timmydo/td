@@ -38,8 +38,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("postgres_attempt_rcpt.sql"),
     include_str!("postgres_attempt_command.sql"),
     include_str!("postgres_queue_expiry.sql"),
+    include_str!("postgres_route_health.sql"),
 ];
-const VERSION: u32 = 24;
+const VERSION: u32 = 25;
 const PRIVATE_ACL: &str = "SELECT NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_namespace n,
     LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,
