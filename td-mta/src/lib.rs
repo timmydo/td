@@ -125,6 +125,7 @@ pub mod postgres_body;
 pub mod postgres_bootstrap;
 pub mod postgres_http_api;
 pub mod postgres_http_auth;
+pub mod postgres_http_cancellations;
 pub mod postgres_http_drafts;
 pub mod postgres_http_mailboxes;
 pub mod postgres_http_submissions;

@@ -253,6 +253,17 @@ pub(super) fn exercise(
         grant.generation,
         submission,
     );
+    reset();
+    owners::renew(request, trust, deadline(), &claim, grant.generation).unwrap();
+    super::cancel_worker::exercise(
+        fixture,
+        request,
+        trust,
+        binding,
+        &claim,
+        grant.generation,
+        submission,
+    );
     owners::release(request, trust, deadline(), &claim, grant.generation).unwrap();
     assert_eq!(
         cancel::publish(request, trust, deadline(), &value, |_| panic!(

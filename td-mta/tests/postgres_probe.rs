@@ -11735,3 +11735,6 @@ mod route_success;
 
 #[path = "postgres_probe/submission_cancel.rs"]
 mod submission_cancel;
+
+#[path = "postgres_probe/cancel_worker.rs"]
+mod cancel_worker;

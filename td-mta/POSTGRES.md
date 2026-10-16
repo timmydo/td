@@ -3624,3 +3624,31 @@ an HTTP adapter must authenticate the request before exposing settlement.
 The supplied credential is decoded into the existing zero-on-drop secret
 owner for this call only. No HTTP dispatch, credential format, administration
 policy, scheduler or transport is activated or changed.
+
+## 130. Bounded client cancellation owner
+
+The fixed HTTPS worker's prepared cancellation adapter owns at most one active
+or uncertain operation. It validates its loaded JMAP profile, account, device
+credential shape and optional epoch before admission. The trusted relay owner
+supplies the current claim and generation; the publisher checks current device
+authority, selected configuration, account state and route ownership under its
+existing locks. No request can choose another profile's database or route.
+
+The worker preserves the request/meter's original absolute deadline, with a
+ten-second database phase and a five-second resolver phase. Before database
+work it charges each attempted address for the receipt/publication connection
+ceilings (three MiB plus 192 KiB of protocol I/O and 8192 records, including
+runtime admission and whole-group validation). A transport fallback spends
+another charge, never refreshes the deadline or substitutes another operation.
+The local abort callback must be idempotent: a connection failure after local
+closure but before COMMIT can retry the same operation. It still performs no
+SQL or SMTP round trips and is invoked only after complete reservation.
+
+Known success or refusal releases the prepared operation; unknown COMMIT
+retains it and refuses another cancellation. Independent settlement capacity
+only inspects the exact historical receipt. Absence, deadline and errors keep
+it retained. Confirmation releases it without credentials or a transport
+callback, including after device revocation. Neither password nor callback
+survives the foreground call. These are internal owner APIs, not a public
+settlement endpoint; production dispatch, relay-worker ownership/restart
+custody and atomic backend cutover remain separate work.

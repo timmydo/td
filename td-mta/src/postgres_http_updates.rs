@@ -146,6 +146,7 @@ pub struct Pending {
     pub mailboxes: crate::postgres_http_mailboxes::Pending,
     pub drafts: crate::postgres_http_drafts::Pending,
     pub submissions: crate::postgres_http_submissions::Pending,
+    pub cancellations: crate::postgres_http_cancellations::Pending,
     pub uploads: crate::postgres_http_uploads::Pending,
 }
 impl Pending {
